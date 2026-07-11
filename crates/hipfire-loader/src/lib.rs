@@ -375,7 +375,6 @@ pub struct LoadedModel {
     pub vision_weights: Option<qwen35_vl::VisionWeights>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
-    pub seq_pos: usize,
     pub max_seq: usize,
     pub physical_cap: usize,
     pub eviction: Option<Eviction>,
@@ -442,7 +441,6 @@ impl LoadedModel {
             vision_config: None,
             vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
             max_seq,
             physical_cap,
             eviction: None,
