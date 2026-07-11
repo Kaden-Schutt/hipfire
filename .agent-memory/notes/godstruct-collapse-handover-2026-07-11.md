@@ -11,7 +11,7 @@ Self-contained pickup doc for a fresh session. Branch **`feature/device-mesh`**.
 HEAD **`7e1aa7c2`** (updated after Inc 2 Step E + its leak-fix landed; was `53c9ba4f` at
 original handover). Worktree `/home/bjoern/hipfire/.claude/worktrees/feature+device-mesh`.
 Tree clean. This is one long refactor being landed increment-by-increment behind gates.
-**Next step: G** (F was DEFERRED into ModelParallel — see the step list below; new order G → H → ModelParallel).
+**Next step: H** (F DEFERRED→ModelParallel, G DEFERRED→ImmutableMeta; new order: H → ModelParallel (absorbs F's 4 pp* fields) → ImmutableMeta (absorbs G's 2 eos scalars). H is the only clean standalone fold left).
 
 ## What this is
 
@@ -90,10 +90,15 @@ agent this session; the fold order and hazards:
   `let Qwen35PpState{ref scratch_set, ref mut gpus, ..} = *m.qwen35_pp.as_mut().unwrap()` destructure,
   and the teardown's defensive `if let Some(scratch_set)` at lib.rs:1925 would drop — but fit, not
   mechanics, is why it's deferred.) **Order now: G → H → ModelParallel (absorbs F's four fields).**
-- **G — `deepseek4_eos_tok`/`minimax_eos_tok` → `EpArch::{Ds4,Minimax}` fields.** MEDIUM.
-  These are EP-path carriers (single-GPU ds4/minimax already store eos in the bundle). Hazard:
-  ds4 TP/PP-dense paths REUSE `deepseek4_eos_tok` though their state isn't in `EpArch` — needs
-  a home for those (bundle field or separate). All within `hipfire-loader` (no cross-crate).
+- **G — DEFERRED into `ImmutableMeta` (bjoern 2026-07-11, same trap as F).** Do NOT fold
+  `deepseek4_eos_tok`/`minimax_eos_tok` into `EpArch`. WHY: they're IMMUTABLE per-model `u32`
+  scalars (set once at load, read at generate to detect EOS) used across FOUR ds4 configs —
+  EP (state in `ep`), TP (state in `tp`, lib.rs:1514 comment), PP-dense (state in `pp_dense`,
+  lib.rs:1550), single-GPU — so homing them in one axis's struct (`EpArch::Ds4`) repeats F's
+  cross-axis mistake; TP/PP-dense have no `EpArch` to read from. They're the same CATEGORY as
+  `arch_id`/`model_path`/`chat_template` → fold into `ImmutableMeta` when that step lands.
+  (Single-GPU ds4/minimax also store eos in their bundle — a redundant second home that
+  ImmutableMeta can unify.)
 - **H — `mtp_mode`/`mtp_k` → request params.** LOW but a design choice: these are per-request
   knobs (set from the request), arguably not model state — thread them as generate params
   instead of storing on `LoadedModel`.
