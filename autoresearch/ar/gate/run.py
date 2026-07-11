@@ -26,7 +26,7 @@ from .outcome import decide_pr, format_pr_comment
 from .routing import classify_pr
 
 __all__ = ["changed_files", "diff_lines", "stub_arch_gate", "run_pr_gate",
-           "live_arch_gate", "interpret_results"]
+           "live_arch_gate", "interpret_results", "run_behavior_plan"]
 
 
 def changed_files(base, head, repo, run_git=None) -> list[str]:
@@ -75,15 +75,38 @@ def run_pr_gate(*, base, head, repo, author, is_draft, helpful, cfg: GateConfig,
             "outcome": outcome, "comment": format_pr_comment(outcome, arch_results)}
 
 
+def run_behavior_plan(plan_path, *, repo, verdict_dir, base, head, run_git=None) -> dict:
+    """Load Claude's dispatch plan.json, floor its risk (classify_pr), and run every
+    bespoke behavior test via codex (agent_exec) GENERALLY on-box — the piece that
+    tests behaviors serve_harness cannot reach. Returns {plan, behavior_results}."""
+    from ..agent_exec import run_round        # lazy: real codex shell-out, prod only
+    from . import dispatch
+
+    with open(plan_path) as fh:
+        raw = json.load(fh)
+    plan = dispatch.parse_plan(raw, changed_files(base, head, repo, run_git=run_git))
+    results = dispatch.run_behavior_tests(
+        plan["behavior_tests"], agent_exec_fn=run_round, cwd=repo, verdict_dir=verdict_dir)
+    return {"plan": plan, "behavior_results": results}
+
+
 def interpret_results(*, results_dir, base, head, repo, author, is_draft, helpful,
-                      cfg: GateConfig, run_git=None) -> dict:
+                      cfg: GateConfig, run_git=None, behavior_results=None) -> dict:
     """Aggregate per-arch result JSONs (each an arch-result dict emitted by a matrix
-    job) and decide the PR outcome. This is the ``interpret`` job's core: the matrix
-    runs one arch each, this reduces them all to a single verdict + comment."""
+    job) plus any bespoke behavior-test results, and decide the PR outcome. A failed
+    behavior test folds in as a synthetic REJECT arch (so decide_pr routes to BOD):
+    the verdict is the serve_harness floor AND every behavior test (spec §8)."""
     arch_results = []
     for p in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
         with open(p) as fh:
             arch_results.append(json.load(fh))
+    failed_behaviors = [b for b in (behavior_results or []) if not b.get("passed")]
+    if failed_behaviors:
+        arch_results.append({
+            "arch": "behavior", "verdict": "REJECT",
+            "reasons": [f"behavior:{b.get('what', '?')}" for b in failed_behaviors],
+            "bod": None,
+        })
     files = changed_files(base, head, repo, run_git=run_git)
     pr_class = classify_pr(files, lines_changed=diff_lines(base, head, repo, run_git=run_git))
     outcome = decide_pr(arch_results=arch_results, author=author, is_draft=is_draft,

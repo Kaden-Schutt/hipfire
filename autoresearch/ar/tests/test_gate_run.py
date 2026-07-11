@@ -79,6 +79,24 @@ def test_run_pr_gate_regressing_arch_is_bod():
     assert any(b["arch"] == "gfx1151" for b in r["outcome"]["bod"]["blockers"])
 
 
+def test_interpret_folds_failed_behavior_as_bod(tmp_path):
+    import json as _j
+
+    from autoresearch.ar.gate.run import interpret_results
+
+    rd = tmp_path / "results"
+    rd.mkdir()
+    (rd / "gfx1201.json").write_text(
+        _j.dumps({"arch": "gfx1201", "verdict": "PASS", "reasons": [], "bod": None}))
+    g = _git(name_only="cli/index.ts\n", numstat="5\t0\tcli/index.ts\n")
+    # serve_harness floor is green, but a bespoke behavior test failed -> BOD (spec §8).
+    res = interpret_results(results_dir=str(rd), base="m", head="pr", repo="/r",
+                            author="Kaden-Schutt", is_draft=False, helpful=True, cfg=_cfg(),
+                            run_git=g, behavior_results=[{"what": "cli --foo", "passed": False}])
+    assert res["outcome"]["action"] == "bod"
+    assert any("behavior:cli --foo" in str(b) for b in res["outcome"]["bod"]["blockers"])
+
+
 def test_run_pr_gate_docs_only_is_trivial_and_tags_non_kaden():
     g = _git(name_only="docs/x.md\n", numstat="3\t0\tdocs/x.md\n")
     r = run_pr_gate(base="m", head="pr", repo="/r", author="fivetide", is_draft=False,

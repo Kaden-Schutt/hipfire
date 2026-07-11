@@ -343,13 +343,31 @@ def cmd_gate(a) -> int:
     cfg = load_gate_config(path)
     repo = _repo()
 
+    if getattr(a, "behavior_tests", None):
+        # Run the bespoke codex behavior tests from Claude's plan.json (spec §8) —
+        # tests behaviors serve_harness can't reach. Emits the behavior_results JSON.
+        from .gate.run import run_behavior_plan
+
+        out = run_behavior_plan(
+            a.behavior_tests, repo=repo, verdict_dir=(a.verdict_dir or "/tmp/gate-behavior"),
+            base=a.base, head=a.head,
+        )
+        print(json.dumps(out["behavior_results"], indent=2))
+        return 1 if any(not b["passed"] for b in out["behavior_results"]) else 0
+
     if getattr(a, "interpret", False):
-        # The interpret job: aggregate the matrix's per-arch result JSONs -> decide.
+        # The interpret job: aggregate the matrix's per-arch result JSONs + any
+        # behavior-test results -> decide.
         from .gate.run import interpret_results
 
+        beh = None
+        if getattr(a, "behavior_results", None):
+            with open(a.behavior_results) as fh:
+                beh = json.load(fh)
         res = interpret_results(
             results_dir=a.results, base=a.base, head=a.head, repo=repo,
             author=(a.author or ""), is_draft=a.draft, helpful=(not a.not_helpful), cfg=cfg,
+            behavior_results=beh,
         )
         print(json.dumps({"pr": a.pr, "pr_class": res["pr_class"], "executor": res["route"],
                           "outcome": res["outcome"]}, indent=2))
@@ -551,6 +569,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interpret", action="store_true",
                    help="aggregate per-arch result JSONs in --results and decide the PR outcome")
     s.add_argument("--results", default=None, help="dir of per-arch result JSONs (for --interpret)")
+    s.add_argument("--behavior-tests", dest="behavior_tests", default=None,
+                   help="Claude plan.json — run its bespoke codex behavior tests (spec §8)")
+    s.add_argument("--behavior-results", dest="behavior_results", default=None,
+                   help="behavior_results JSON to fold into --interpret")
+    s.add_argument("--verdict-dir", dest="verdict_dir", default=None,
+                   help="dir for codex behavior-test verdict files (--behavior-tests)")
     s.add_argument("--base", default="origin/master", help="base ref the PR merges into")
     s.add_argument("--head", default="HEAD", help="head ref (the PR)")
     s.add_argument("--pr", default=None, help="PR number (label only)")
