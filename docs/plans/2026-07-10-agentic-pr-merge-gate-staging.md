@@ -17,6 +17,15 @@ the whole train logic is unit-testable with no GPU and no real git. It reuses
 **Tech Stack:** Python 3.11+ (stdlib); pytest via `/home/kaden/.venvs/hipfire-pytest/bin/python`.
 Reuses `autoresearch/ar/gate/merge.py` (`trial_merge`, `default_run_git`).
 
+> **Correction (post-adversarial-review, fix commit `7db68173`).** Task 3's `fold_pr`
+> code below is WRONG: it dispatches `merge_fix_fn` only for a *textual* conflict, so a
+> **semantic clobber** (clean merge, but a recorded behavior fails to reproduce — the
+> exact §10 case) BODs immediately with no fix attempt. Correct form: a single `_try(stg)`
+> returns `("FOLDED", tree) | ("clobber", detail) | ("conflict", None)`; **both** `clobber`
+> and `conflict` attempt `merge_fix_fn` then re-`_try`; BOD only if still unresolved
+> (`reason="clobber"` for a semantic clobber, else `classify_conflict`). Add a test where a
+> semantic clobber + a resolving fixer → FOLDED (the `merge_fix_fn=None` test can't catch it).
+
 ## Global Constraints
 
 - **No-GPU unit-testable** — git / codex merge-fix / recall-reproduce are injected
