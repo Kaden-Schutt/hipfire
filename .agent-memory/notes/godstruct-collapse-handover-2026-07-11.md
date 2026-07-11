@@ -11,7 +11,7 @@ Self-contained pickup doc for a fresh session. Branch **`feature/device-mesh`**.
 HEAD **`7e1aa7c2`** (updated after Inc 2 Step E + its leak-fix landed; was `53c9ba4f` at
 original handover). Worktree `/home/bjoern/hipfire/.claude/worktrees/feature+device-mesh`.
 Tree clean. This is one long refactor being landed increment-by-increment behind gates.
-**Next step: F** (see the hazard-ordered list below).
+**Next step: G** (F was DEFERRED into ModelParallel — see the step list below; new order G → H → ModelParallel).
 
 ## What this is
 
@@ -75,10 +75,21 @@ agent this session; the fold order and hazards:
   `mtp_head` for the DFlash `from_bundle`/`into_bundle` round-trip; `mtp_weights_present` computed.
   The feared move-out borrow was a non-issue — every non-MTP qwen35 site BORROWS the bundle, and
   NLL ends the head-local borrow before each re-pack. See "Landed so far" above.
-- **F — `pp_gpus`/`pp_scratch_set`/`pp_dn_la_to_device` → `Qwen35Bundle` (or a `Qwen35PpState`).**
-  MEDIUM. Hazard: `reset_qwen35_recurrent` (daemon.rs ~5567) borrows `m.state` (for `b.dn_state`)
-  AND `m.pp_gpus` as disjoint fields; moving pp_* under `&mut b` removes that disjointness →
-  may need a split. Also EP teardown unwraps `m.pp_gpus` separately from `m.state.take()`.
+- **F — DEFERRED into `ModelParallel` (bjoern 2026-07-11, after 2-agent adversarial review).** Do
+  NOT fold `pp_gpus`/`pp_scratch_set`/`pp_dn_la_to_device` into an arch struct or a standalone
+  `Qwen35PpState`. WHY: (1) `pp_gpus` is SHARED device topology — the same `&mut gpus` frees the
+  arch tensors that live in `ModelState::Qwen35` (lib.rs:1924-1933) — and the mesh-through-loader
+  design makes `DeviceMesh`/`Gpus::from_mesh` the topology owner; boxing it into an arch-private
+  struct inverts that. (2) A 3-field `Qwen35PpState` is NOT a peer of `PpModel`/`EpState` (which own
+  their FULL state incl weights/KV); qwen35-PP state SPLITS across `ModelState` (primary stage) +
+  these fields (extra stages) → the `PpQwen35` wrap can't be clean. (3) It strands the `pp: usize`
+  scalar, which `model_parallel.rs` ALREADY keys `PpQwen35` on. (4) The umbrella's own migration
+  order says the SEVEN axis fields (`pp`,`pp_gpus`,`pp_scratch_set`,`pp_dn_la_to_device`,`ep`,`tp`,
+  `pp_dense`) move together, LAST, in the ModelParallel step. → These four fold into ModelParallel,
+  not a separate step. (Mechanics were survivable — the borrow at daemon.rs:7750 needs an explicit
+  `let Qwen35PpState{ref scratch_set, ref mut gpus, ..} = *m.qwen35_pp.as_mut().unwrap()` destructure,
+  and the teardown's defensive `if let Some(scratch_set)` at lib.rs:1925 would drop — but fit, not
+  mechanics, is why it's deferred.) **Order now: G → H → ModelParallel (absorbs F's four fields).**
 - **G — `deepseek4_eos_tok`/`minimax_eos_tok` → `EpArch::{Ds4,Minimax}` fields.** MEDIUM.
   These are EP-path carriers (single-GPU ds4/minimax already store eos in the bundle). Hazard:
   ds4 TP/PP-dense paths REUSE `deepseek4_eos_tok` though their state isn't in `EpArch` — needs
