@@ -3633,7 +3633,7 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let vl = m.vision_config.is_some()
+                        let vl = m.vision.is_some()
                             || matches!(m.state, Some(ModelState::DotsOcr(_)));
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {
@@ -4216,7 +4216,7 @@ fn main() {
 
                 let has_image = image_base64.is_some() || image.is_some();
                 let is_dots_ocr = m.arch_id == 8;
-                let has_vl = m.vision_config.is_some() || is_dots_ocr;
+                let has_vl = m.vision.is_some() || is_dots_ocr;
 
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
@@ -13501,7 +13501,7 @@ fn generate_vl(
         max_think_tokens,
     } = *params;
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let vision_config = m.vision_config.as_ref().unwrap();
+    let vision_config = &m.vision.as_ref().unwrap().config;
 
     // Vision special-token IDs resolved from the tokenizer rather than
     // hardcoded constants. Different VL-capable Qwen variants ship with
@@ -13662,7 +13662,7 @@ fn generate_vl(
     let scratch = &b.scratch;
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
-    let vision_weights = m.vision_weights.as_ref().unwrap();
+    let vision_weights = &m.vision.as_ref().unwrap().weights;
 
     // Build the actual prompt token sequence BEFORE running the GPU vision
     // encoder so the hard capacity check uses the real prefill length, not

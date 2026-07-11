@@ -274,6 +274,16 @@ pub use minimax::MiniMaxBundle;
 /// Field-identical to the prior loader-local struct.
 pub use cohere2moe::Cohere2MoeBundle;
 
+/// The qwen35-VL vision tower state (config + weights), grouped so `LoadedModel`
+/// carries ONE optional field instead of two. Loader-side by design: the vision
+/// types live in the `hipfire-arch-qwen35-vl` extension crate, so this is NOT
+/// folded into the base `Qwen35Bundle` (whose crate must not depend on its own
+/// extension). `None` for non-VL qwen35 models.
+pub struct Qwen35Vl {
+    pub config: qwen35_vl::VisionConfig,
+    pub weights: qwen35_vl::VisionWeights,
+}
+
 // ─── SessionState / PersistState ─────────────────────────────────────
 
 /// Per-request state that a context reset wipes. Owns every resettable field, so
@@ -357,9 +367,8 @@ pub struct LoadedModel {
     // against it (so the recurrent MTP-KV never bleeds across requests). None
     // for every other arch and for qwen35 trunks without an MTP head.
     pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
-    // Vision state
-    pub vision_config: Option<qwen35_vl::VisionConfig>,
-    pub vision_weights: Option<qwen35_vl::VisionWeights>,
+    // Vision state (qwen35-VL tower), grouped into one optional field.
+    pub vision: Option<Qwen35Vl>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
     pub max_seq: usize,
@@ -417,8 +426,7 @@ impl LoadedModel {
             mtp_k: 3,
             mtp_weights_present: false,
             qwen35_mtp_head: None,
-            vision_config: None,
-            vision_weights: None,
+            vision: None,
             tokenizer: Some(tokenizer),
             max_seq,
             physical_cap,
@@ -1023,8 +1031,9 @@ fn finish_qwen35_load(
         state,
         eviction,
         speculator,
-        vision_config,
-        vision_weights,
+        vision: vision_config
+            .zip(vision_weights)
+            .map(|(config, weights)| Qwen35Vl { config, weights }),
         max_seq: ctx.max_seq,
         ..LoadedModel::skeleton(
             arch_id,
@@ -1991,8 +2000,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         }
     }
     // Non-core arch weights
-    if let Some(w) = m.vision_weights {
-        w.free_gpu(gpu);
+    if let Some(v) = m.vision {
+        v.weights.free_gpu(gpu);
     }
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
