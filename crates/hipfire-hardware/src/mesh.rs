@@ -198,6 +198,21 @@ impl DeviceMesh {
             axes: self.axes.iter().copied().filter(|a| a.size > 1).collect(),
         }
     }
+
+    /// Every device in the compute grid of the pipeline stage at `coord`: all
+    /// devices sharing `coord`'s `Pp` index, varying every non-`Pp` axis (Tp × Ep).
+    /// This is the placement set for a stage's weights/state — replicated weights
+    /// land on all of them; Tp/Ep-sharded weights are sliced along their axis and
+    /// replicated across the other. Degenerate: no non-`Pp` axis → the stage's
+    /// single device; no `Pp` axis → the whole mesh. Correct for composed meshes
+    /// (pure topology). Ordering is ascending device id, so on a single-axis
+    /// non-`Pp` mesh the index into the returned `Vec` equals the shard rank.
+    pub fn stage_devices(&self, coord: &[usize]) -> Vec<usize> {
+        let pp_idx = self.axes.iter().position(|a| a.kind == DimKind::Pp);
+        (0..self.n_devices())
+            .filter(|&d| pp_idx.is_none_or(|i| self.coord_of(d)[i] == coord[i]))
+            .collect()
+    }
 }
 
 impl Default for DeviceMesh {
@@ -286,5 +301,26 @@ mod tests {
         for d in 0..m.n_devices() {
             assert_eq!(m.device_of(&m.coord_of(d)), d);
         }
+    }
+
+    #[test]
+    fn stage_devices_spans_stage_grid() {
+        // single: exactly one device.
+        assert_eq!(DeviceMesh::single().stage_devices(&[]), vec![0]);
+        // Pp-only: the stage's single device (the coord's Pp index).
+        let pp = DeviceMesh::rect(&[(DimKind::Pp, 3)]);
+        assert_eq!(pp.stage_devices(&[1]), vec![1]);
+        // Ep-only: the whole EP group (every rank runs full attention).
+        let ep = DeviceMesh::rect(&[(DimKind::Ep, 4)]);
+        assert_eq!(ep.stage_devices(&[0]), vec![0, 1, 2, 3]);
+        // Tp-only: the whole TP group.
+        let tp = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        assert_eq!(tp.stage_devices(&[0]), vec![0, 1]);
+        // Composed Pp×Tp: stage 1 = the Tp group at Pp=1 → devices 2,3.
+        let pptp = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]);
+        assert_eq!(pptp.stage_devices(&[1, 0]), vec![2, 3]);
+        // Composed Tp×Ep (no Pp): the full sub-grid.
+        let tpep = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Ep, 2)]);
+        assert_eq!(tpep.stage_devices(&[0, 0]), vec![0, 1, 2, 3]);
     }
 }
