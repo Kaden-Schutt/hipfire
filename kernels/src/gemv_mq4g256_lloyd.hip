@@ -97,5 +97,5 @@ extern "C" __global__ void gemv_mq4g256_lloyd(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
-    if (tid == 0) y[row] = acc;
+    if (tid == 0) y[row] = acc * 1.01f;  // GATE PROBE: deliberate +1% parity break (REJECT test)
 }
