@@ -80,40 +80,57 @@ jobs:
             }
 
   gate:
-    name: gpu-gate / ${{ matrix.arch }}
+    name: gpu-gate / ${{ matrix.box }}
     needs: decide
     if: ${{ needs.decide.outputs.run == 'true' }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [gfx1100, gfx1151, gfx1201]
-    runs-on: [self-hosted, "${{ matrix.arch }}"]
+        # TWO physical runners, not three. gfx1100 + gfx1151 live on ONE box (hipx);
+        # gfx1201 lives on hiptrx. A box is selected by requiring ALL of its arch
+        # labels (a runner is registered with the labels of every GPU it hosts), so
+        # these two entries dispatch to the two different runners. Each box runs its
+        # arch(s) sequentially under a single gpu-lock hold.
+        include:
+          - box: hipx
+            archs: gfx1100 gfx1151
+            labels: '["self-hosted", "gfx1100", "gfx1151"]'
+          - box: hiptrx
+            archs: gfx1201
+            labels: '["self-hosted", "gfx1201"]'
+    runs-on: ${{ fromJSON(matrix.labels) }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Run the arch gate (gpu-lock serialized)
+      - name: Run the box's arch gate(s) (gpu-lock serialized)
         run: |
           set +e
           source scripts/gpu-lock.sh
-          gpu_acquire "gpu-gate-${{ needs.decide.outputs.pr }}-${{ matrix.arch }}"
+          # One lock per box: gfx1100 and gfx1151 share hipx, so they run back-to-back
+          # under a single hold rather than perturbing each other's perf measurement.
+          gpu_acquire "gpu-gate-${{ needs.decide.outputs.pr }}-${{ matrix.box }}"
           trap gpu_release EXIT
           mkdir -p results
-          python3 -m autoresearch.ar gate --run --arch "${{ matrix.arch }}" \
-            --base "${{ needs.decide.outputs.base }}" \
-            --head "${{ needs.decide.outputs.head }}" \
-            --pr "${{ needs.decide.outputs.pr }}" \
-            --author "${{ needs.decide.outputs.author }}" \
-            > "results/${{ matrix.arch }}.json"
-          rc=$?
-          cat "results/${{ matrix.arch }}.json"
+          rc=0
+          # ar gate --arch <arch> resolves the arch's HIP device by the gfxNNNN line
+          # at runtime (never a fixed index — ROCR reorders across reboot/hotplug).
+          for arch in ${{ matrix.archs }}; do
+            python3 -m autoresearch.ar gate --run --arch "$arch" \
+              --base "${{ needs.decide.outputs.base }}" \
+              --head "${{ needs.decide.outputs.head }}" \
+              --pr "${{ needs.decide.outputs.pr }}" \
+              --author "${{ needs.decide.outputs.author }}" \
+              > "results/$arch.json" || rc=1
+            cat "results/$arch.json"
+          done
           exit $rc
-      - name: Upload arch result
+      - name: Upload box results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-result-${{ matrix.arch }}
-          path: results/${{ matrix.arch }}.json
+          name: gate-results-${{ matrix.box }}
+          path: results/*.json
 
   interpret:
     name: interpret + verdict
@@ -127,7 +144,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: results
-          pattern: gate-result-*
+          pattern: gate-results-*
           merge-multiple: true
       - name: Interpret aggregate + decide
         id: interp
