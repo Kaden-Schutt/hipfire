@@ -7035,10 +7035,28 @@ fn generate_qwen35_mtp(
     if let Some(cvs) = cvs_opt {
         if let Err(e) = state.mtp_scratch.ensure_compressed_logits(gpu, cvs) {
             emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
+            state.free_gpu(gpu);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights: target.weights,
+                scratch: target.scratch,
+                kv_cache: target.kv_cache,
+                dn_state: target.dn_state,
+                mtp_head,
+            }));
             return;
         }
         if let Err(e) = state.ensure_compressed_lm_logits(gpu, cvs) {
             emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
+            state.free_gpu(gpu);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights: target.weights,
+                scratch: target.scratch,
+                kv_cache: target.kv_cache,
+                dn_state: target.dn_state,
+                mtp_head,
+            }));
             return;
         }
     }
