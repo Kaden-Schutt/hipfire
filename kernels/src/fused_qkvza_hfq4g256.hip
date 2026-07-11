@@ -89,6 +89,16 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
         const char* gp1 = gp0 + 136;
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        // R4c0_qkvza_spref272: L2-resident BOD (occ~35% mem_busy~41%);
+        // soft-prefetch next quad weights (+272B = 2 groups) while this quad's DOG runs.
+        // gfx12-ONLY: s_prefetch_data needs target feature gfx12-insts. The ENTIRE block is
+        // gated so gfx11/gfx10 (RDNA1-3) compile BYTE-IDENTICALLY to the pre-lever kernel —
+        // zero effect on any other arch's codegen. Hint only; identical load/FMA stream.
+        if (q + 1 < quads) {
+            __builtin_amdgcn_s_prefetch_data((const void*)(gp0 + 272), 0);
+        }
+#endif
 
         float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
         float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
@@ -106,6 +116,39 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
 
         int base = g * 256 + tid * 8;
 
+        // R-hoist_x32 (gfx12): vectorize x as float4 pairs BEFORE the DOG FMAs,
+        // matching the winning gate_up R20c2_hoist_x32. Bit-exact — a float4 load of
+        // contiguous x is the same 8 values as scalar x[base..base+7], just one
+        // 128-bit load instead of 8 scalar loads (more in-flight bytes → higher
+        // mem_busy on the L2-resident-but-mem-busy-41% qkvza). gfx12-gated so
+        // gfx11/gfx10 compile BYTE-IDENTICALLY: the float4 hoist raises VGPR ~72→96,
+        // which only helps where there's occupancy room (gfx1201, occ~35%); on the
+        // gfx1100 launch_bounds target it would cut occupancy.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        const float4 xv0a = *reinterpret_cast<const float4*>(x + base);
+        const float4 xv0b = *reinterpret_cast<const float4*>(x + base + 4);
+        const float4 xv1a = *reinterpret_cast<const float4*>(x + base + 256);
+        const float4 xv1b = *reinterpret_cast<const float4*>(x + base + 260);
+        const float4 xv2a = *reinterpret_cast<const float4*>(x + base + 512);
+        const float4 xv2b = *reinterpret_cast<const float4*>(x + base + 516);
+        const float4 xv3a = *reinterpret_cast<const float4*>(x + base + 768);
+        const float4 xv3b = *reinterpret_cast<const float4*>(x + base + 772);
+        #define DOG_V(pk, sc, zp, a, x0, x1, x2, x3, x4, x5, x6, x7) \
+            (a) += (sc * (float)((pk) & 0xFu)        + zp) * (x0) \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7)
+        DOG_V(pk0, sc0, zp0, acc0, xv0a.x,xv0a.y,xv0a.z,xv0a.w,xv0b.x,xv0b.y,xv0b.z,xv0b.w);
+        DOG_V(pk1, sc1, zp1, acc1, xv1a.x,xv1a.y,xv1a.z,xv1a.w,xv1b.x,xv1b.y,xv1b.z,xv1b.w);
+        DOG_V(pk2, sc2, zp2, acc2, xv2a.x,xv2a.y,xv2a.z,xv2a.w,xv2b.x,xv2b.y,xv2b.z,xv2b.w);
+        DOG_V(pk3, sc3, zp3, acc3, xv3a.x,xv3a.y,xv3a.z,xv3a.w,xv3b.x,xv3b.y,xv3b.z,xv3b.w);
+        #undef DOG_V
+#else
+        // ORIGINAL scalar path — verbatim, so gfx11/gfx10 compile byte-identically.
         #define DOG(pk, sc, zp, b, a) \
             (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
                  + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -115,12 +158,12 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
                  + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
                  + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
                  + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
-
         DOG(pk0, sc0, zp0, base,       acc0);
         DOG(pk1, sc1, zp1, base + 256, acc1);
         DOG(pk2, sc2, zp2, base + 512, acc2);
         DOG(pk3, sc3, zp3, base + 768, acc3);
         #undef DOG
+#endif
     }
 
     // Tail handling: preserve acc[gi] interleaving. See 5302926 bug report.
