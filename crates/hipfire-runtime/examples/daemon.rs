@@ -542,7 +542,18 @@ fn acquire_daemon_lock() -> std::fs::File {
 
     let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
     std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
-    let pid_path = hipfire_dir.join("daemon.pid");
+    // Per-instance pid file when HIPFIRE_DAEMON_ID is set, so MULTIPLE daemons can
+    // co-exist — one pinned to each GPU (autoresearch runs a daemon per
+    // worktree/card in parallel). A distinct id → a distinct flock → no false
+    // "already running". Unset (the normal serve path) keeps the classic
+    // machine-wide ~/.hipfire/daemon.pid singleton, unchanged.
+    let pid_name = match std::env::var("HIPFIRE_DAEMON_ID") {
+        Ok(id) if !id.trim().is_empty() => {
+            format!("daemon.{}.pid", id.trim().replace([',', ':', '/', '.', ' '], "_"))
+        }
+        _ => "daemon.pid".to_string(),
+    };
+    let pid_path = hipfire_dir.join(pid_name);
 
     let mut f = {
         let mut opts = std::fs::OpenOptions::new();
@@ -582,7 +593,36 @@ fn acquire_daemon_lock() -> std::fs::File {
     f.seek(std::io::SeekFrom::Start(0)).ok();
     writeln!(f, "{}", std::process::id()).ok();
     f.flush().ok();
+    warn_if_perf_level_forced_high();
     f
+}
+
+/// Best-effort startup guard: warn (once, non-fatal) if any GPU is pinned to
+/// `power_dpm_force_performance_level=high`. The engine NEVER forces a DPM level
+/// itself — but `high` PINS a MID sclk on RDNA3/4 that UNDER-clocks the GPU ~14%
+/// below `auto`'s boost (measured 2026-07-03: R9700 high=2350MHz/116tok-s vs
+/// auto=2838-3260MHz/132tok-s). Flagging an externally-forced `high` here keeps a
+/// choked clock from being mistaken for a kernel regression. `auto` is the regime
+/// the engine runs best in — do not "optimize" by forcing high.
+fn warn_if_perf_level_forced_high() {
+    let Ok(dir) = std::fs::read_dir("/sys/class/drm") else { return };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // real render nodes are `cardN`; skip connector entries like `card0-DP-1`
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let p = entry.path().join("device/power_dpm_force_performance_level");
+        if let Ok(v) = std::fs::read_to_string(&p) {
+            if v.trim() == "high" {
+                eprintln!(
+                    "  \u{26a0} {name}: perf_level=high is forced — this UNDER-clocks RDNA3/4 (~14% below auto). \
+                     The engine runs best at 'auto'; forcing 'high' chokes performance."
+                );
+            }
+        }
+    }
 }
 
 /// Cap on the *encoded* base64 string length the daemon will accept on the
@@ -613,6 +653,20 @@ fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
 enum ImageSource<'a> {
     Path(&'a str),
     Base64(&'a str),
+}
+
+/// Per-request sampler seed (the initial GPU `rng_state` + the CPU-fallback RNG reset).
+/// The daemon processes requests SERIALLY over the stdio JSON-lines loop, so a process-global set
+/// at request-parse and read at each generate loop's `rng_state` init is race-free and avoids
+/// threading a `seed` param through every generate*() signature. Default `0x13579BDF` preserves the
+/// prior hardcoded behavior when a request omits `seed`; the autoresearch coherence arm sends a
+/// seed-SET (varying this) to sample distinct temp>0 trajectories for the paired rate test.
+static REQUEST_SEED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x13579BDF);
+fn set_request_seed(s: u32) {
+    REQUEST_SEED.store(s, std::sync::atomic::Ordering::Relaxed);
+}
+fn request_seed() -> u32 {
+    REQUEST_SEED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 struct GenerateVLParams<'a> {
@@ -1751,6 +1805,15 @@ fn main() {
                     .get("top_p")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_top_p) as f32;
+                // Optional per-request sampler seed (initial GPU rng_state + CPU-fallback reset).
+                // Omitted -> the prior fixed 0x13579BDF. The autoresearch coherence arm sends a
+                // seed-SET to draw distinct temp>0 trajectories for the paired base/variant rate test.
+                set_request_seed(
+                    msg.get("seed")
+                        .and_then(|v| v.as_u64())
+                        .map(|s| s as u32)
+                        .unwrap_or(0x13579BDF),
+                );
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -3842,6 +3905,12 @@ struct SpecRun {
     prefill_s: f64,
     total_s: f64,
     decode_s: f64,
+    /// Wall time spent strictly inside `spec.step` (forward + sample kernels)
+    /// summed across the decode loop — the kernel-only decode time. Excludes the
+    /// per-token programmatic layer (emit/detok/SSE/detectors/eviction), so
+    /// `generated / kernel_decode_s` is the kernel-only decode rate and
+    /// `decode_s - kernel_decode_s` is the per-token serving overhead.
+    kernel_decode_s: f64,
 }
 
 fn generate_dflash(
@@ -4161,6 +4230,16 @@ fn generate_dflash(
     } else {
         0.0
     };
+    // Kernel-only decode rate: the generated tokens over ONLY the summed
+    // `spec.step` time, excluding the per-token programmatic layer.
+    // `decode_overhead_ms` is that programmatic layer's total cost across the
+    // turn (serve decode time − kernel time).
+    let kernel_decode_tok_s = if run.kernel_decode_s > 0.0 {
+        run.generated as f64 / run.kernel_decode_s
+    } else {
+        decode_tok_s
+    };
+    let decode_overhead_ms = (run.decode_s - run.kernel_decode_s).max(0.0) * 1000.0;
     // New-token count (not full rendered length) so the prefill rate reflects
     // actual work on a cache HIT/resume — matches every other path's numerator.
     let prefill_tok_s = if run.prefill_s > 0.0 {
@@ -4195,7 +4274,7 @@ fn generate_dflash(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"kernel_decode_tok_s":{:.1},"decode_overhead_ms":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
         // `prefill_tokens` is the NEWLY-prefilled count (the suffix actually fed
         // through the model), NOT the full rendered length — the CLI computes
         // `prompt_tokens = cached + prefill`, so reporting the full length here
@@ -4207,6 +4286,8 @@ fn generate_dflash(
         run.prefill_s * 1000.0,
         prefill_tok_s,
         decode_tok_s,
+        kernel_decode_tok_s,
+        decode_overhead_ms,
         run.prefill_s * 1000.0,
         tau,
         run.spec_cycles,
@@ -4491,6 +4572,10 @@ fn generate_spec(
     let mut spec_cycles = 0usize;
     let mut spec_accepted = 0usize;
     let mut generated = 0usize;
+    // Accumulates time strictly inside `spec.step` (forward + sample kernels) so
+    // the done event can report a kernel-only decode rate separately from the
+    // per-token programmatic overhead.
+    let mut kernel_decode_ns: u128 = 0;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
@@ -4590,7 +4675,10 @@ fn generate_spec(
         // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
         // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
         // borrow ends when `step` returns, before the per-token `emit.observe`.
-        let step = match spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar()) {
+        let t_step = Instant::now();
+        let step_result = spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar());
+        kernel_decode_ns += t_step.elapsed().as_nanos();
+        let step = match step_result {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(
@@ -4784,6 +4872,7 @@ fn generate_spec(
         prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
         total_s: t_end.duration_since(t0).as_secs_f64(),
         decode_s: t_end.duration_since(t_prefill).as_secs_f64(),
+        kernel_decode_s: kernel_decode_ns as f64 / 1e9,
     })
 }
 
@@ -6172,7 +6261,7 @@ fn generate_multi(
     // ngram scope: generated tokens only (matches pp=1).
     let ngram_scope_start = m.conversation_tokens.len();
 
-    let mut rng_state: u32 = 0x13579BDFu32;
+    let mut rng_state: u32 = request_seed();
 
     let attractor_pairs: Vec<(u32, u32)> = tool_call_pair
         .into_iter()
@@ -6779,7 +6868,7 @@ fn generate(
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    hipfire_runtime::llama::reset_cpu_sampler_rng(request_seed());
     // Expert-parallel (task #26): route to generate_ep BEFORE any arch
     // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
@@ -8514,7 +8603,7 @@ fn generate(
         // stream as the sample kernel launch, so the copy and compute pipeline
         // naturally.
         let vocab_size = config.vocab_size;
-        let mut rng_state: u32 = 0x13579BDFu32;
+        let mut rng_state: u32 = request_seed();
         // Effective penalty window = request `repeat_window` (default 128),
         // bounded by the GPU repeat_buf capacity (2048). The buffer is sized
         // large so presence/frequency penalties CAN use a wider window when a
@@ -8726,6 +8815,11 @@ fn generate(
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
         // push generated past max_tokens: each loop start rechecks the cap.
+        // Accumulates the per-token programmatic render cost (emit_committed_event
+        // + detok + marker filter + SSE flush) so the done event can report a
+        // kernel-only decode rate (decode time minus this overhead) separately
+        // from the serving overhead.
+        let mut emit_overhead_ns: u128 = 0;
         while generated < max_tokens {
             // Decode-side abort check. Client cancel (Pi 4-min idle
             // timeout firing while the CLI buffers tokens for tool-call
@@ -8780,6 +8874,7 @@ fn generate(
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            let t_emit = Instant::now();
             emit_committed_event(
                 stdout,
                 id,
@@ -8803,6 +8898,7 @@ fn generate(
                 );
                 let _ = stdout.flush();
             }
+            emit_overhead_ns += t_emit.elapsed().as_nanos();
 
             // Write this token's K/V to the cache FIRST so the next turn
             // always starts from a fully-written context. Breaking before
@@ -9414,6 +9510,18 @@ fn generate(
         } else {
             0.0
         };
+        // Kernel-only decode rate: decode time minus the summed per-token
+        // programmatic render cost (emit/detok/filter/SSE). `decode_overhead_ms`
+        // is the serving overhead separating it from the user-facing
+        // `decode_tok_s`.
+        let emit_overhead_s = emit_overhead_ns as f64 / 1e9;
+        let kernel_decode_s = (decode_s - emit_overhead_s).max(0.0);
+        let kernel_decode_tok_s = if kernel_decode_s > 0.0 {
+            generated as f64 / kernel_decode_s
+        } else {
+            decode_tok_s
+        };
+        let decode_overhead_ms = emit_overhead_s * 1000.0;
         // finish_reason carried in `done` so the CLI doesn't have to
         // infer it from whether tool_calls were emitted (matches V4F).
         //
@@ -9437,7 +9545,7 @@ fn generate(
         };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"kernel_decode_tok_s":{:.1},"decode_overhead_ms":{:.1},"ttft_ms":{:.1},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
             id,
             generated,
             tok_s,
@@ -9445,6 +9553,8 @@ fn generate(
             prefill_s * 1000.0,
             prefill_tok_s,
             decode_tok_s,
+            kernel_decode_tok_s,
+            decode_overhead_ms,
             prefill_s * 1000.0,
             cached_tokens_count,
             finish_reason,
@@ -12330,7 +12440,7 @@ fn generate_vl(
     // draws from this global; without the per-request reset it carried RNG state
     // across requests (and across earlier text-path requests) → cross-request
     // nondeterminism. Matches the GPU path's u32 (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    hipfire_runtime::llama::reset_cpu_sampler_rng(request_seed());
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU

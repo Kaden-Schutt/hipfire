@@ -1,0 +1,2 @@
+baseline_v1 sha=35811504 rolled_at_round=79 rolled_at_epoch=1783146326 composed_delta=14.75 new_tok_s=148.95 folded=gemv_hfq4g256_residual_scaled,fused_rmsnorm_mq_rotate,gemv_hfq4g256_residual,gemv_hfq4g256_moe_down_k8_indexed_batched_expanded,moe_topk_renorm_k8,gated_delta_net_q8_fast,gemv_hfq4g256_moe_gate_up_indexed, 2026-07-04T06:25:26Z
+baseline_v2 sha=77e1dfe4 rolled_at_round=92 rolled_at_epoch=1783156402 composed_delta=4.26 new_tok_s=150.45 folded=attention_flash_q8_0_tile, 2026-07-04T09:13:22Z

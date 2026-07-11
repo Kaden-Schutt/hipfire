@@ -12,7 +12,7 @@ cargo test -p rdna-compute --lib
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 
 echo "== Python CPU tests =="
-python3 -m pytest tests scripts/test_astrea.py
+python3 -m pytest tests scripts/test_astrea.py autoresearch/ar/tests
 
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py

@@ -1,0 +1,25 @@
+{"date":"2026-07-03","arch":"gfx1201","model":"0.8b","perf":"auto","tok_s":342.7,"prefill_tok_s":2530.6,"decode_tok_s":367.5,"ttft_ms":9.5,"sclk_mhz":1085,"coherence":"OK","note":"clock-confound-corrected (was measured at high/under-clocked); sclk low = 0.8b too light to boost"}
+{"date":"2026-07-03","arch":"gfx1201","model":"9b","perf":"auto","tok_s":94.8,"prefill_tok_s":994.2,"decode_tok_s":99.5,"ttft_ms":24.1,"sclk_mhz":3188,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1201","model":"a1b","perf":"auto","tok_s":242.4,"prefill_tok_s":null,"decode_tok_s":null,"ttft_ms":null,"sclk_mhz":3101,"coherence":"OK","note":"lfm2moe done-event reports only aggregate tok_s"}
+{"date":"2026-07-03","arch":"gfx1201","model":"27bawq","perf":"auto","tok_s":33.8,"prefill_tok_s":392.2,"decode_tok_s":35.3,"ttft_ms":61.2,"sclk_mhz":3066,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1201","model":"a3bmq4p","perf":"auto","tok_s":93.5,"prefill_tok_s":604.3,"decode_tok_s":101.4,"ttft_ms":39.7,"sclk_mhz":3150,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1201","model":"a3bmq4r","perf":"auto","tok_s":120.4,"prefill_tok_s":691.2,"decode_tok_s":131.9,"ttft_ms":34.7,"sclk_mhz":3125,"coherence":"OK","note":"vs 116 @ high = +13.7% clock uplift"}
+{"date":"2026-07-03","arch":"gfx1100","model":"0.8b","perf":"auto","tok_s":346.3,"prefill_tok_s":1599.0,"decode_tok_s":388.3,"ttft_ms":15.0,"sclk_mhz":1358,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1100","model":"9b","perf":"auto","tok_s":118.6,"prefill_tok_s":734.0,"decode_tok_s":129.0,"ttft_ms":32.7,"sclk_mhz":2864,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1100","model":"a1b","perf":"auto","tok_s":298.1,"prefill_tok_s":null,"decode_tok_s":null,"ttft_ms":null,"sclk_mhz":2610,"coherence":"OK","note":"lfm2moe aggregate tok_s only"}
+{"date":"2026-07-03","arch":"gfx1100","model":"27bawq","perf":"auto","tok_s":42.4,"prefill_tok_s":311.1,"decode_tok_s":45.5,"ttft_ms":77.2,"sclk_mhz":1769,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1100","model":"a3bmq4p","perf":"auto","tok_s":109.2,"prefill_tok_s":517.7,"decode_tok_s":122.0,"ttft_ms":46.4,"sclk_mhz":1770,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1100","model":"a3bmq4r","perf":"auto","tok_s":141.4,"prefill_tok_s":578.0,"decode_tok_s":161.1,"ttft_ms":41.5,"sclk_mhz":1370,"coherence":"OK","note":"FLEET DECODE LEADER; +22% over gfx1201 R9700"}
+{"date":"2026-07-03","arch":"gfx1151","model":"0.8b","perf":"auto","tok_s":217.5,"prefill_tok_s":1269.7,"decode_tok_s":237.9,"ttft_ms":18.9,"sclk_mhz":1461,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1151","model":"9b","perf":"auto","tok_s":43.0,"prefill_tok_s":402.3,"decode_tok_s":45.4,"ttft_ms":59.7,"sclk_mhz":2177,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1151","model":"a1b","perf":"auto","tok_s":138.7,"prefill_tok_s":null,"decode_tok_s":null,"ttft_ms":null,"sclk_mhz":2126,"coherence":"OK","note":"lfm2moe aggregate tok_s only"}
+{"date":"2026-07-03","arch":"gfx1151","model":"27bawq","perf":"auto","tok_s":13.9,"prefill_tok_s":136.2,"decode_tok_s":14.7,"ttft_ms":176.2,"sclk_mhz":2012,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1151","model":"a3bmq4p","perf":"auto","tok_s":53.7,"prefill_tok_s":309.4,"decode_tok_s":58.8,"ttft_ms":77.6,"sclk_mhz":2763,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1151","model":"a3bmq4r","perf":"auto","tok_s":77.4,"prefill_tok_s":365.0,"decode_tok_s":86.6,"ttft_ms":65.8,"sclk_mhz":2818,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1030","model":"0.8b","perf":"auto","tok_s":223.5,"prefill_tok_s":1003.3,"decode_tok_s":251.5,"ttft_ms":23.9,"sclk_mhz":2680,"coherence":"OK","note":"post-reboot dev3/card3 (Navi21 devid 0x73a5)"}
+{"date":"2026-07-03","arch":"gfx1030","model":"9b","perf":"auto","tok_s":64.6,"prefill_tok_s":485.4,"decode_tok_s":69.2,"ttft_ms":49.4,"sclk_mhz":2680,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1030","model":"a1b","perf":"auto","tok_s":177.8,"prefill_tok_s":null,"decode_tok_s":null,"ttft_ms":null,"sclk_mhz":2680,"coherence":"OK","note":"lfm2moe aggregate tok_s only"}
+{"date":"2026-07-03","arch":"gfx1030","model":"27bawq","perf":"auto","tok_s":22.4,"prefill_tok_s":190.7,"decode_tok_s":23.8,"ttft_ms":125.9,"sclk_mhz":2680,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1010","model":"0.8b","perf":"auto","tok_s":185.2,"prefill_tok_s":877.8,"decode_tok_s":207.1,"ttft_ms":27.3,"sclk_mhz":2100,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1010","model":"9b","perf":"auto","tok_s":48.3,"prefill_tok_s":201.4,"decode_tok_s":54.9,"ttft_ms":119.2,"sclk_mhz":2100,"coherence":"OK"}
+{"date":"2026-07-03","arch":"gfx1010","model":"a1b","perf":"auto","tok_s":143.3,"prefill_tok_s":null,"decode_tok_s":null,"ttft_ms":null,"sclk_mhz":2100,"coherence":"OK","note":"lfm2moe aggregate tok_s only"}

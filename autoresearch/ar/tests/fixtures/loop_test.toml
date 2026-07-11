@@ -1,0 +1,36 @@
+# Copyright (c) Kaden Schutt
+# Stable loader/CLI-parsing fixture — a 3-worker gfx1201 loop config OWNED by the
+# tests. Decoupled from the live autoresearch/config/loop_gfx1201.toml so that
+# changing the production worker roster for a campaign (e.g. shrinking to a single
+# Sol worker) never breaks loader/config-verb coverage.
+arch          = "gfx1201"
+baseline_ref  = "loop/gfx1201"
+model         = "qwen3.6-35b-a3b.mq4r"
+kv_mode       = "q8"
+max_tokens    = 128
+prompt_md5    = "d97ec9d3f761ec68093631be27d32441"
+cand_wall     = 3.0
+k_exhaust     = 5
+agent_harness = "codex"
+
+[[workers]]
+card   = 0
+dev    = 0
+model  = "gpt-5.6-luna"
+effort = "max"
+
+[[workers]]
+card   = 1
+dev    = 1
+model  = "gpt-5.6-terra"
+effort = "xhigh"
+
+[[workers]]
+card   = 2
+dev    = 2
+model  = "gpt-5.6-sol"
+effort = "medium"
+
+[bounds]
+call_budget = 400
+wall_ttl_s  = 43200

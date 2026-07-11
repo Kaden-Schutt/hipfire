@@ -1,0 +1,35 @@
+{
+  "arch": "gfx1201",
+  "generated": "2026-07-06 bod-lever-discovery",
+  "profile": "cache-resident (77% L2) -> ALU/instruction-selection class",
+  "queue": [
+    {
+      "order": 1,
+      "kernel": "gemv_hfq4g256_residual",
+      "lever": "5-step __shfl_down tail reduction -> VALU DPP (mov_dpp row_shr:8/4/2/1) + permlanex16 cross-16-lane; byte-identical",
+      "ev": 3.0,
+      "note": "canonical shfl->DPP, highest EV (6.7% wall)"
+    },
+    {
+      "order": 2,
+      "kernel": "gated_delta_net_q8_fast",
+      "lever": "S_tile -> lane-contiguous float4 (b128) relayout; 4 strided ds ops -> 1",
+      "ev": 1.7,
+      "note": "DISASM-VERIFIED 31->8 LDS ops, 0 spills, no occ loss (gfx1201/ROCm7.2)"
+    },
+    {
+      "order": 3,
+      "kernel": "gated_delta_net_q8_fast",
+      "lever": "cross-lane reductions __shfl -> DPP butterfly (permlanex16 + mov_dpp)",
+      "ev": 1.4,
+      "note": "stacks with #2 on LDS-port pressure"
+    },
+    {
+      "order": 4,
+      "kernel": "fused_rmsnorm_mq_rotate",
+      "lever": "4 of 5 FWHT ds_swizzle butterfly stages -> permlane16/DPP row_xmask; keep ds_swizzle for stride-16",
+      "ev": 1.3,
+      "note": "NOISE-risk, near-exhausted; ISA-precheck first"
+    }
+  ]
+}

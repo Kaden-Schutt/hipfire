@@ -195,6 +195,15 @@ matches. Index of currently-available skills:
   here (shared, diffable, travel with the code); personal/fleet notes stay in global
   memory. See `docs/skills/agent-memory.md`.
 
+- **`autoresearch-loop`** — drive the kernel-optimization loop through the
+  role-scoped `ar` CLI (`python -m autoresearch.ar`), never a raw script. **Reach
+  for this when:** you ssh into a GPU box to interact with a running loop, an
+  agent worker is asked to propose a kernel lever, or the operator starts/stops a
+  swarm / folds a win / checks run health. The contract: `ar bod`/`ar why` to
+  read the census + tried levers, then `ar certify` to submit (bounds — EXHAUSTED
+  / off-target / over-budget — are refused mechanically with exit 3). See
+  `docs/skills/autoresearch-loop.md`.
+
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.
 

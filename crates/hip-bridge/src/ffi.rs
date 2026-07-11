@@ -193,6 +193,26 @@ pub struct HipRuntime {
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> u32,
+    // Optional: cooperative launch (all blocks co-resident -> grid.sync()). None if the
+    // HIP runtime lacks the symbol, so init never fails on its account.
+    fn_module_launch_cooperative_kernel: Option<
+        unsafe extern "C" fn(
+            HipFunction,
+            c_uint,
+            c_uint,
+            c_uint,
+            c_uint,
+            c_uint,
+            c_uint,
+            c_uint,
+            HipStream,
+            *mut *mut c_void,
+        ) -> u32,
+    >,
+    // Optional: cooperative-grid occupancy query (companion to the coop launch above).
+    // None if the runtime lacks the symbol.
+    fn_module_occupancy_max_active_blocks:
+        Option<unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32>,
 
     // Events
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
@@ -429,6 +449,27 @@ impl HipRuntime {
                         *mut *mut c_void,
                     ) -> u32
                 ),
+                fn_module_launch_cooperative_kernel: lib
+                    .get::<unsafe extern "C" fn(
+                        HipFunction,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        HipStream,
+                        *mut *mut c_void,
+                    ) -> u32>(b"hipModuleLaunchCooperativeKernel")
+                    .map(|s| *s.into_raw())
+                    .ok(),
+                fn_module_occupancy_max_active_blocks: lib
+                    .get::<unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32>(
+                        b"hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
+                    )
+                    .map(|s| *s.into_raw())
+                    .ok(),
                 fn_event_create: load_fn!(
                     lib,
                     "hipEventCreate",
@@ -1026,6 +1067,70 @@ impl HipRuntime {
         );
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipModuleLaunchKernel")
+    }
+
+    /// Launch a COOPERATIVE kernel: all blocks are co-resident, enabling grid-wide
+    /// `grid.sync()`. Used by the fused MoE megakernel to run multiple dependent phases
+    /// (gate_up -> silu -> down+combine) in one dispatch, collapsing the per-kernel
+    /// launch gap. Errors if the runtime lacks `hipModuleLaunchCooperativeKernel` so the
+    /// caller can fall back to the separate-kernel path.
+    ///
+    /// # Safety
+    /// `params` must contain valid pointers matching the kernel signature; `grid` must fit
+    /// the co-resident limit (query via `hipOccupancyMaxActiveBlocksPerMultiprocessor`).
+    pub unsafe fn launch_cooperative_kernel(
+        &self,
+        func: &Function,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: Option<&Stream>,
+        params: &mut [*mut c_void],
+    ) -> HipResult<()> {
+        let f = self.fn_module_launch_cooperative_kernel.ok_or_else(|| {
+            HipError::new(0, "hipModuleLaunchCooperativeKernel unavailable in this HIP runtime")
+        })?;
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let t = std::time::Instant::now();
+        let code = f(
+            func.0,
+            grid[0],
+            grid[1],
+            grid[2],
+            block[0],
+            block[1],
+            block[2],
+            shared_mem,
+            stream_raw,
+            params.as_mut_ptr(),
+        );
+        crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        self.check(code, "hipModuleLaunchCooperativeKernel")
+    }
+
+    /// Max co-resident blocks per multiprocessor for `func` at the given block size.
+    /// Companion to `launch_cooperative_kernel`: multiply by the device CU count to get
+    /// the largest cooperative grid the hardware can hold at once. Returns `None`-mapped
+    /// error if the runtime lacks the symbol (caller then falls back to the split path).
+    ///
+    /// # Safety
+    /// `func` must be a valid, loaded kernel function handle.
+    pub unsafe fn module_occupancy_max_active_blocks_per_multiprocessor(
+        &self,
+        func: &Function,
+        block_size: i32,
+        dyn_shared_mem: usize,
+    ) -> HipResult<i32> {
+        let f = self.fn_module_occupancy_max_active_blocks.ok_or_else(|| {
+            HipError::new(
+                0,
+                "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor unavailable in this HIP runtime",
+            )
+        })?;
+        let mut num_blocks: c_int = 0;
+        let code = f(&mut num_blocks, func.0, block_size as c_int, dyn_shared_mem);
+        self.check(code, "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor")?;
+        Ok(num_blocks as i32)
     }
 
     /// Launch a kernel using the `extra` path, passing a contiguous kernarg
