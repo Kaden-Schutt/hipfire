@@ -19,3 +19,14 @@ def classify_conflict(pr_ref, master_ref, repo, *, trial_merge_fn=None) -> str:
     'stack' (clean vs master, so it conflicts with an already-folded PR)."""
     tm = trial_merge_fn or (lambda b, h, r: _trial_merge(b, h, r))
     return "stack" if tm(master_ref, pr_ref, repo)["clean"] else "stale"
+
+
+def recall_reproduce(pr_ref, merged_ref, recorded, repo, *, reproduce_fn) -> dict:
+    """Confirm the PR's ALREADY-RECORDED behaviors REPRODUCE on the merged tree
+    (spec §10). Does not re-run the full PR gate or re-measure master — delegates to
+    reproduce_fn, which re-runs only ``recorded`` on ``merged_ref``. Empty recorded
+    -> trivially reproduced (no call)."""
+    if not recorded:
+        return {"reproduced": True, "failures": []}
+    r = reproduce_fn(pr_ref, merged_ref, recorded, repo)
+    return {"reproduced": bool(r.get("reproduced")), "failures": list(r.get("failures", []))}
