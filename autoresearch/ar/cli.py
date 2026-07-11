@@ -343,6 +343,25 @@ def cmd_gate(a) -> int:
     cfg = load_gate_config(path)
     repo = _repo()
 
+    if getattr(a, "dispatch_context", False):
+        # Small deterministic briefing for Claude. This keeps the semantic review
+        # focused while the validator below still recomputes every release floor.
+        from .gate.dispatch import BOXES
+        from .gate.routing import classify_pr
+        from .gate.run import affected_archs, changed_files, diff_lines
+
+        files = changed_files(a.base, a.head, repo)
+        lines = diff_lines(a.base, a.head, repo)
+        print(json.dumps({
+            "changed_files": files,
+            "lines_changed": lines,
+            "floor_risk": classify_pr(files, lines_changed=lines),
+            "required_archs": affected_archs(files, cfg),
+            "box_ownership": {box: list(meta["archs"]) for box, meta in BOXES.items()},
+            "models": {model: list(archs) for model, archs in cfg.fit.items()},
+        }, indent=2))
+        return 0
+
     if getattr(a, "validate_plan", None):
         # Fail-closed release gate for the self-hosted matrix. Claude writes the
         # plan; deterministic path/arch/model floors decide whether any runner
@@ -685,6 +704,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="behavior_results JSON to fold into --interpret")
     s.add_argument("--validate-plan", dest="validate_plan", default=None,
                    help="validate Claude dispatch JSON and emit the dynamic runner matrix")
+    s.add_argument("--dispatch-context", dest="dispatch_context", action="store_true",
+                   help="emit a deterministic compact briefing for Claude dispatch")
     s.add_argument("--validate-action", dest="validate_action", default=None,
                    help="validate Claude action JSON against --interp-json")
     s.add_argument("--interp-json", dest="interp_json", default=None,

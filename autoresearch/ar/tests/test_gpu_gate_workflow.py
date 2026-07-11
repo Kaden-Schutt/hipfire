@@ -34,6 +34,15 @@ def test_missing_claude_plan_has_no_generic_gpu_fallback():
     assert "codex_gate_prompt.txt" not in text
 
 
+def test_claude_can_write_outputs_and_validator_owns_release_signal():
+    text = _text()
+    dispatch = text.split("\n  dispatch:\n", 1)[1].split("\n  no_runner:\n", 1)[0]
+    assert "--dispatch-context" in dispatch
+    assert "--allowedTools Read,Grep,Glob,Write" in dispatch
+    assert "continue-on-error: true" in dispatch
+    assert "--validate-plan dispatch_plan.json" in dispatch
+
+
 def test_selected_runner_uses_mechanical_collect_and_grade_not_agent_verdict():
     text = _text()
     gate = text.split("\n  gate:\n", 1)[1].split("\n  interpret:\n", 1)[0]
@@ -57,7 +66,8 @@ def test_interpret_requires_dispatch_and_downloaded_runner_evidence():
     assert "--validate-action interpret_action.json" in interpret
     assert 'current_head=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)' in interpret
     assert 'if [ "$current_head" != "$HEAD" ]' in interpret
-    assert "continue-on-error: true" not in interpret
+    # Only the Claude process may continue; evidence/action validators remain hard gates.
+    assert interpret.count("continue-on-error: true") == 1
 
 
 def test_gate_comment_cannot_hide_deterministic_reject():
