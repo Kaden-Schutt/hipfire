@@ -214,23 +214,25 @@ recommendation.
 
 **A git-clean merge is NOT clobber-free.** Two PRs can merge with *zero textual
 conflict* yet **semantically clobber** — PR-A changes behavior X, PR-B still assumes
-old X → they merge clean and run broken. Isolation-clean ≠ merge-clean, and
-textual-clean ≠ functional-clean. So Gate 4 performs the actual merge into the
-**staging tip** (§11) and **re-runs the full functional gate — parity / perf /
-coherence + the §8 bespoke behavior tests — on the POST-MERGE tree.** It never
-approves a merge it has not re-validated on the merged result; a clean `git merge`
-alone is never enough.
+old X → they merge clean and run broken. Textual-clean ≠ functional-clean. But Gate 4
+does **not re-derive work already done.** The PR's own gate (earlier in the pipe)
+already validated and **recorded** its behaviors — token-exact parity, the perf delta
+vs master, coherence, and the §8 behavior-test verdicts; the master baseline is known.
+Post-merge, Gate 4 **recalls those recorded behaviors and confirms they REPRODUCE on
+the merged tree** — it re-runs only the PR's already-established behaviors on the
+merged result, **never the full PR gate and never a fresh master measurement**.
 
-The post-merge re-validation checks the merged tree at **three reference points**:
+Three reference points, all **recall-based** (confirm reproduction, don't re-derive):
 
-1. **vs its PR** — the PR's own behavior tests + coherence still pass on the merged
-   tree (the merge did not silently break what the PR does).
-2. **vs master** — the merged tree does not regress perf/coherence vs master (the
-   merge introduced no regression that neither PR had alone).
-3. **vs the staging stack** — the merged result is coherent with every already-folded
-   PR (no PR clobbers another's behavior).
+1. **vs its PR** — re-run the PR's *recorded* behavior tests + coherence on the merged
+   tree; they must REPRODUCE (same pass) — the merge didn't break what the PR does.
+2. **vs master** — measure the merged tree's perf against the **already-known**
+   master/staging baseline (no re-measurement of master); it must not regress.
+3. **vs the staging stack** — every folded PR's recorded behaviors reproduce
+   *together* on the merged result (no PR clobbers another).
 
-The merge stands only if all three are clobber-free.
+A recorded behavior that fails to reproduce on the merged tree = semantic clobber. The
+merge stands only if all three reproduce.
 
 - **Clobber (any of the three fails)** → Claude dispatches a **targeted codex
   merge-fix**, resolved on the agent-owned staging (§11), → **re-runs the functional
