@@ -24,9 +24,11 @@
 //!
 //! Scope: llama-family (arch_id 0/1), Q8 KV, per-token forward (no batched
 //! prefill yet), stateless per request (pos 0). Emulated Pp-N proves the BANDING
-//! logic; per-device weight residency + cross-device transport need real HW (under
-//! `HIPFIRE_EMULATE_GPUS` all stages alias device 0). Whole weights live on the
-//! output stage; real-HW per-stage weight banding (VRAM win) is a follow-up.
+//! logic + per-stage weight/KV residency (each layer's weights + KV load on its
+//! band's device via `Layout::from_gpus`; embed on stage 0, final-norm/lm_head on
+//! the last stage). Under `HIPFIRE_EMULATE_GPUS` all stages still alias device 0,
+//! so cross-device transport is only exercised on real multi-GPU HW; the per-
+//! device VRAM split is real there.
 
 use crate::hfq::HfqFile;
 use crate::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights, PrefillScratch};
@@ -40,14 +42,17 @@ pub struct PpModel {
     gpus: Gpus,
     pp: usize,
     config: LlamaConfig,
-    /// Whole model, resident on the output (last) stage device. Under emulation
-    /// every stage aliases device 0, so the banded forward reads it on any stage;
-    /// real-HW per-stage weight banding is a follow-up (see module doc).
+    /// Model weights distributed across stages: embed on stage 0, final-norm +
+    /// lm_head on the output stage, each layer on its band's device. Full-length
+    /// `layers` Vec; each stage dereferences only its band's (locally resident)
+    /// entries.
     weights: LlamaWeights,
     /// Per-stage decode scratch (the residual `x` + transient buffers).
     scratch: Vec<ForwardScratch>,
-    /// Per-stage KV cache (sized to all layers; each stage writes only its band).
-    kv: Vec<KvCache>,
+    /// One KV cache distributed across stages: layer l's k/v resides on
+    /// `device_for_layer(l)` (global index), so each stage writes its band's
+    /// entries on its own device. Replaces the prior `pp` full-length caches.
+    kv: KvCache,
     /// Layer range owned by each stage (`bands[s]`).
     bands: Vec<Range<usize>>,
     dim: usize,
@@ -89,7 +94,6 @@ impl PpModel {
         let mut gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
 
         // Layer bands from the device mapping (stage s = contiguous run of layers).
-        let out_dev = gpus.output_device;
         let mut bands: Vec<Range<usize>> = Vec::with_capacity(pp);
         {
             let mut s = 0usize;
@@ -111,18 +115,23 @@ impl PpModel {
             ));
         }
 
-        // Whole weights on the output stage device (see struct doc). Under
-        // emulation this is device 0 = every stage.
-        let weights = {
-            let g = &mut gpus.devices[out_dev];
-            g.bind_thread().map_err(|e| format!("bind: {e:?}"))?;
-            crate::hfq::load_weights_hfq(&hfq, &config, g)
-                .map_err(|e| format!("load_weights: {e:?}"))?
-        };
+        // Per-stage-resident weights: embed on stage 0, final-norm/lm_head on the
+        // output stage, each layer on its band's device (Layout::from_gpus uses
+        // the same device_for_layer mapping as `bands`). The forward reads by
+        // global layer index; each stage only touches its band's (locally
+        // resident) entries.
+        let layout = crate::model_load::Layout::from_gpus(&gpus, n_layers);
+        let weights = crate::hfq::load_weights_hfq_distributed(
+            &hfq,
+            &config,
+            &mut gpus.devices,
+            &layout,
+        )
+        .map_err(|e| format!("load_weights: {e:?}"))?;
 
-        // Per-stage scratch + KV on each stage's device.
+        // Per-stage decode scratch (small residual buffers, one set per stage
+        // device).
         let mut scratch = Vec::with_capacity(pp);
-        let mut kv = Vec::with_capacity(pp);
         for s in 0..pp {
             let g = &mut gpus.devices[s];
             g.bind_thread().map_err(|e| format!("bind{s}: {e:?}"))?;
@@ -130,11 +139,17 @@ impl PpModel {
                 ForwardScratch::new_with_max_seq(g, &config, max_seq)
                     .map_err(|e| format!("scratch{s}: {e:?}"))?,
             );
-            kv.push(
-                KvCache::new_gpu_q8(g, n_layers, config.n_kv_heads, config.head_dim, max_seq)
-                    .map_err(|e| format!("kv{s}: {e:?}"))?,
-            );
         }
+        // One distributed KV cache: layer l's k/v on device_for_layer(l), global
+        // index. Replaces the prior `pp` full-length caches (pp× → 1× KV).
+        let kv = KvCache::new_gpu_q8_multi(
+            &mut gpus,
+            n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            max_seq,
+        )
+        .map_err(|e| format!("kv: {e:?}"))?;
 
         // Peer access for the cross-stage boundary copy — enabled AFTER every
         // stage's weights + scratch + KV are live. `enable_peer_all` does not
@@ -185,7 +200,7 @@ impl PpModel {
                 &self.config,
                 self.bands[0].clone(),
                 pos,
-                &mut self.kv[0],
+                &mut self.kv,
                 &self.scratch[0],
             )
             .map_err(herr)?;
@@ -219,7 +234,7 @@ impl PpModel {
                 &self.config,
                 self.bands[s].clone(),
                 pos,
-                &mut self.kv[s],
+                &mut self.kv,
                 &self.scratch[s],
             )
             .map_err(herr)?;
@@ -297,7 +312,7 @@ impl PpModel {
                 &self.config,
                 &x_batch0,
                 self.bands[0].clone(),
-                &mut self.kv[0],
+                &mut self.kv,
                 &positions,
                 &scratch0,
                 n,
@@ -338,7 +353,7 @@ impl PpModel {
                     &self.config,
                     &x_batch_s,
                     self.bands[s].clone(),
-                    &mut self.kv[s],
+                    &mut self.kv,
                     &positions,
                     &scratch_s,
                     n,
@@ -389,26 +404,22 @@ impl PpModel {
         g.download_f32(&self.scratch[last].logits).map_err(herr)
     }
 
-    /// Free every GPU allocation this PP model owns (whole weights on the output
-    /// stage + per-stage scratch + KV), then drain each device pool. Same
+    /// Free every GPU allocation this PP model owns (per-stage-distributed
+    /// weights + KV + per-stage scratch), then drain each device pool. Same
     /// rationale as [`crate::tp_serve::TpModel::free`]: a bare `drop(PpModel)`
     /// reclaimed nothing (no freeing `Drop` on `GpuTensor` / `DeviceBuffer` /
     /// `GpuPool`, and `Gpu::drop` only re-binds), so a load/unload cycle leaked
     /// the model.
     pub fn free(mut self) {
-        // Whole weights live on the output stage device.
-        let out = self.gpus.output_device;
-        {
-            let g = &mut self.gpus.devices[out];
-            let _ = g.bind_thread();
-            self.weights.free_gpu(g);
-        }
-        // Per-stage scratch + KV (stage s was allocated on device s).
-        for (s, (sc, kv)) in self.scratch.into_iter().zip(self.kv).enumerate() {
+        // Distributed weights: free each piece on its owning device.
+        self.weights.free_gpu_multi(&mut self.gpus);
+        // Distributed KV: free each layer's k/v on its owning device.
+        self.kv.free_gpu_multi(&mut self.gpus);
+        // Per-stage scratch (stage s on device s).
+        for (s, sc) in self.scratch.into_iter().enumerate() {
             let g = &mut self.gpus.devices[s];
             let _ = g.bind_thread();
             sc.free_gpu(g);
-            kv.free_gpu(g);
         }
         // Actually release the freed buffers back to the system, per device.
         for dev in self.gpus.devices.iter_mut() {
