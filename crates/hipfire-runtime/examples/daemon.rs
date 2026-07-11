@@ -902,7 +902,7 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         // Stderr phase-label is unified here (the arm distinguishes prefill /
         // post-prefill / decode); logging is diagnostic and NOT part of token
         // parity (assert_token_parity compares committed token IDs only).
-        if let Some(ad) = m.kv_adaptive.as_mut() {
+        if let Some(ad) = m.session.kv_adaptive.as_mut() {
             match ad.maybe_downshift(gpu, kv, seq_pos) {
                 Ok(applied) => {
                     for step in &applied {
@@ -4271,7 +4271,7 @@ fn main() {
                         if let Some(b) = m.deepseek4_mut() {
                             b.state.reset();
                         }
-                        if let Some(ref mut ad) = m.kv_adaptive {
+                        if let Some(ref mut ad) = m.session.kv_adaptive {
                             ad.reset();
                         }
                     }
@@ -5649,7 +5649,7 @@ fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(b) = m.cohere2moe_mut() {
         let _ = b.state.reset(gpu);
     }
-    if let Some(ref mut ad) = m.kv_adaptive {
+    if let Some(ref mut ad) = m.session.kv_adaptive {
         ad.reset();
     }
     // Mesh (multi-GPU) state. The flipped EP/dense serve paths already reset per
@@ -7465,7 +7465,7 @@ fn generate_multi(
         if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
             b.kv_cache.compact_offset = 0;
         }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
+        if let Some(ad) = m.session.kv_adaptive.as_mut() {
             ad.reset();
         }
     }
@@ -10103,7 +10103,7 @@ fn generate(
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
             b.kv.compact_offset = 0;
         }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
+        if let Some(ad) = m.session.kv_adaptive.as_mut() {
             ad.reset();
         }
     }
@@ -13650,7 +13650,7 @@ fn generate_vl(
         if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
             b.kv_cache.compact_offset = 0;
         }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
+        if let Some(ad) = m.session.kv_adaptive.as_mut() {
             ad.reset();
         }
     }

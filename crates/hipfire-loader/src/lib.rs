@@ -232,6 +232,12 @@ impl AsstTurnCache {
     }
 }
 
+impl Default for AsstTurnCache {
+    fn default() -> Self {
+        Self::new_from_env()
+    }
+}
+
 // ─── ModelState ────────────────────────────────────────────────────────
 
 /// Arch-specific core state, dispatched in `LoadedModel.state`.
@@ -269,6 +275,47 @@ pub use minimax::MiniMaxBundle;
 /// n-gram verify seam) lives next to the forward it drives (orphan rule).
 /// Field-identical to the prior loader-local struct.
 pub use cohere2moe::Cohere2MoeBundle;
+
+// ─── SessionState / PersistState ─────────────────────────────────────
+
+/// Per-request state that a context reset wipes. Owns every resettable field, so
+/// `SessionState::reset` is the single, total reset for request-scoped state
+/// (the #462 lever). Fields migrate in over Increment 1; kept minimal here.
+#[derive(Default)]
+pub struct SessionState {
+    pub seq_pos: usize,
+    pub conversation_tokens: Vec<u32>,
+    pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
+}
+
+impl SessionState {
+    /// Total reset of request-scoped state. Frees GPU checkpoint snapshots
+    /// (DeltaNetSnapshot has no Drop) before clearing, then resets scalars.
+    pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+        for (_, snap) in self.prefill_checkpoints.drain(..) {
+            snap.free_gpu(gpu);
+        }
+        for (_, snap) in self.dflash_checkpoints.drain(..) {
+            snap.free_gpu(gpu);
+        }
+        if let Some(ad) = self.kv_adaptive.as_mut() {
+            ad.reset();
+        }
+        self.seq_pos = 0;
+        self.conversation_tokens.clear();
+    }
+}
+
+/// Per-turn state that SURVIVES a context reset: the assistant-turn LCP cache
+/// (keeps multi-turn prefix matches byte-exact) and the lazily-built decoded
+/// vocab (expensive Arc). `reset` must never touch these.
+#[derive(Default)]
+pub struct PersistState {
+    pub asst_turn_cache: AsstTurnCache,
+    pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+}
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
@@ -332,7 +379,8 @@ pub struct LoadedModel {
     pub max_seq: usize,
     pub physical_cap: usize,
     pub eviction: Option<Eviction>,
-    pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
+    pub session: SessionState,
+    pub persist: PersistState,
     pub conversation_tokens: Vec<u32>,
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
@@ -401,7 +449,11 @@ impl LoadedModel {
             max_seq,
             physical_cap,
             eviction: None,
-            kv_adaptive: None,
+            session: SessionState {
+                kv_adaptive: None,
+                ..Default::default()
+            },
+            persist: PersistState::default(),
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
             prefill_checkpoints: Vec::new(),
@@ -489,6 +541,14 @@ impl LoadedModel {
             Some(ModelState::Deepseek4(b)) => Some(b),
             _ => None,
         }
+    }
+
+    /// Disjoint-field borrow of the request-scoped sub-structs. Native
+    /// disjoint-field borrow (no unsafe): the compiler proves these point at
+    /// distinct fields. Grows to also yield `arch`/`parallel` in later
+    /// increments. Call at a method body, do not store alongside `&mut self`.
+    pub fn session_parts_mut(&mut self) -> (&mut SessionState, &mut PersistState) {
+        (&mut self.session, &mut self.persist)
     }
 
     /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
