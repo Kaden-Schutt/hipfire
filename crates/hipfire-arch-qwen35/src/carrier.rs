@@ -15,6 +15,11 @@ pub struct Qwen35Bundle {
     pub scratch: Qwen35Scratch,
     pub kv_cache: KvCache,
     pub dn_state: DeltaNetState,
+    /// Optional native MTP (NextN) head — present only when a `.mq4-mtp` trailer
+    /// or `.mtp` sidecar was loaded. Lives here (not on `LoadedModel`) so it
+    /// travels with the arch state through reset/reload; the loader folds it in
+    /// after `load_bundle` returns. `None` on every non-MTP construction.
+    pub mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
 }
 
 /// Build the Qwen35 GPU bundle from an HFQ source.
@@ -171,6 +176,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         scratch,
         kv_cache: kv,
         dn_state: dn,
+        mtp_head: None,
     })
 }
 

@@ -3663,24 +3663,6 @@ fn main() {
                         // Apply MTP config from load-message params.
                         m.mtp_mode = mtp_mode;
                         m.mtp_k = mtp_k;
-                        // Detect whether MTP weights are present in the loaded
-                        // model. Used by mtp_mode=auto to decide whether to
-                        // enable spec-decode at generate time. Three sources:
-                        //   - DeepSeek V4: the trunk's bundled `mtp_layer`.
-                        //   - DeepSeek V4: a DSpark sidecar (either counts for auto
-                        //     mode; the loader picks whichever applies).
-                        //   - Qwen3.5/3.6: a native MTP (NextN) head loaded by
-                        //     the loader (`qwen35_mtp_head`, set from a bundled
-                        //     `.mq4-mtp` trailer or a `.mtp` sidecar). The loader
-                        //     already set `m.mtp_weights_present = true` in that
-                        //     case; OR it in here so the ds4 probe doesn't clobber
-                        //     it back to false for a qwen35 model.
-                        let ds4_mtp = m
-                            .deepseek4()
-                            .map(|b| b.weights.mtp_layer.is_some() || b.weights.dspark.is_some())
-                            .unwrap_or(false);
-                        m.mtp_weights_present =
-                            ds4_mtp || m.qwen35_mtp_head.is_some() || m.mtp_weights_present;
 
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -6768,7 +6750,7 @@ fn generate_spec(
 /// no recurrent MTP state survives between requests. The trunk's persistent DN
 /// state lives in the bundle and is cold-zeroed at the start of each request
 /// (mirrors `generate_dflash`'s `!cache_hit` reset). The MTP head itself is
-/// persistent (loaded once on `LoadedModel.qwen35_mtp_head`).
+/// persistent (loaded once into `Qwen35Bundle.mtp_head`).
 ///
 /// Gated behind opt-in: this is only reached when `HIPFIRE_QWEN_MTP=1` AND the
 /// head is present (see the dispatch site in `generate`), so the DEFAULT serve
@@ -6948,6 +6930,7 @@ fn generate_qwen35_mtp(
         scratch,
         kv_cache,
         dn_state,
+        mtp_head,
     } = match m.state.take() {
         Some(ModelState::Qwen35(b)) => b,
         _ => {
@@ -6966,6 +6949,7 @@ fn generate_qwen35_mtp(
                 scratch,
                 kv_cache,
                 dn_state,
+                mtp_head,
             }));
             return;
         }
@@ -6980,6 +6964,7 @@ fn generate_qwen35_mtp(
         scratch,
         slot_config: ModelSlotConfig::default(),
         dspark_extract_layers: Vec::new(),
+        mtp_head: None,
     };
 
     // Helper closure analog: every early return must put the bundle back. We
@@ -7015,15 +7000,13 @@ fn generate_qwen35_mtp(
             scratch: target.scratch,
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
+            mtp_head,
         }));
         return;
     }
 
     // ── Allocate a FRESH per-request MtpSpecState (no cross-request bleed) ─
-    let head = m
-        .qwen35_mtp_head
-        .as_ref()
-        .expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
+    let head = mtp_head.as_ref().expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
     // Compressed (cvs) draft head? Copy the Option out now so we don't hold a
     // borrow of `head`/`m` past the state setup — the compressed-logits scratch
     // alloc below needs &mut state + &mut gpu.
@@ -7040,6 +7023,7 @@ fn generate_qwen35_mtp(
                     scratch: target.scratch,
                     kv_cache: target.kv_cache,
                     dn_state: target.dn_state,
+                    mtp_head,
                 }));
                 return;
             }
@@ -7087,7 +7071,7 @@ fn generate_qwen35_mtp(
     let t0 = Instant::now();
 
     // ── Prefill: trunk batched + MTP private-KV fill (trunk-spine) ──────
-    let head = m.qwen35_mtp_head.as_ref().unwrap();
+    let head = mtp_head.as_ref().unwrap();
     let prefill_res = mtp_spec::prefill_trunk_and_mtp_cache(
         gpu,
         &mut target,
@@ -7105,6 +7089,7 @@ fn generate_qwen35_mtp(
             scratch: target.scratch,
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
+            mtp_head,
         }));
         return;
     }
@@ -7124,6 +7109,7 @@ fn generate_qwen35_mtp(
                 scratch: target.scratch,
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
+                mtp_head,
             }));
             return;
         }
@@ -7310,6 +7296,7 @@ fn generate_qwen35_mtp(
         scratch: target.scratch,
         kv_cache: target.kv_cache,
         dn_state: target.dn_state,
+        mtp_head,
     }));
 
     if let Some(e) = step_error {
@@ -9794,7 +9781,7 @@ fn generate(
     // (durable on prose, ≥1.15× AR every genre; proven 27B-3.6 K=3 p_min=0.4
     // compressed-serial). Gated tightly so the DEFAULT path (DFlash/AR) is
     // unchanged: requires the env opt-in `HIPFIRE_QWEN_MTP=1`, a loaded MTP
-    // head (`m.qwen35_mtp_head`), greedy (temp≈0; MTP serve v1 is greedy/
+    // head (`m.qwen35().mtp_head`), greedy (temp≈0; MTP serve v1 is greedy/
     // argmax-match), a qwen3.5/3.6 trunk (arch 5/6), single-GPU, and no
     // budgeted-thinking (which needs the AR </think> splice). Anything not
     // satisfying ALL of these falls through to the existing DFlash/AR routing.
@@ -9826,7 +9813,7 @@ fn generate(
     // (qwen3.6 A3B ships top_k=20) keep its recipe AND get the MTP speedup,
     // instead of silently dropping top_k/min_p or losing MTP.
     if qwen_mtp_opt_in
-        && m.qwen35_mtp_head.is_some()
+        && m.qwen35().map(|b| b.mtp_head.is_some()).unwrap_or(false)
         && (temp <= 1e-6 || mtp_sampled_on)
         && (m.arch_id == 5 || m.arch_id == 6)
         && !budgeted_thinking_needs_ar
@@ -11339,7 +11326,7 @@ fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
         .unwrap_or_else(|| match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
             Some("on") => true,
             Some("off") => false,
-            _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
+            _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present()),
         })
 }
 

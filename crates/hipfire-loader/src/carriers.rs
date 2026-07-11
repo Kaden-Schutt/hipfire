@@ -272,6 +272,7 @@ fn load_qwen35_pp(
         scratch: single_scratch,
         kv_cache: kv,
         dn_state: dn,
+        mtp_head: None,
     };
     Ok(LoadedModel {
         state: Some(ModelState::Qwen35(bundle)),
@@ -462,6 +463,7 @@ impl Carrier for Qwen35Carrier {
                     scratch,
                     kv_cache,
                     dn_state,
+                    mtp_head: None,
                 };
                 Ok(LoadedModel {
                     state: Some(ModelState::Qwen35(bundle)),

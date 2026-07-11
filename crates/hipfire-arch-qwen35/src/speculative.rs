@@ -529,6 +529,11 @@ pub struct ModelSlot {
     /// `set_dflash_extract_layers` / `capture_seed_main_hidden` so the per-window
     /// verify captures hidden at exactly the sidecar's layer ids.
     pub dspark_extract_layers: Vec<usize>,
+    /// Carries the trunk's optional MTP head across the spec-decode transient so
+    /// `from_bundle`/`into_bundle` round-trip it back into `Qwen35Bundle`. `None`
+    /// for draft slots and for the daemon's MTP-serve slot (which keeps the head
+    /// in a local — it needs `&mut ModelSlot` alongside `&head` disjointly).
+    pub mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
 }
 
 impl ModelSlot {
@@ -554,6 +559,7 @@ impl ModelSlot {
             scratch,
             kv_cache,
             dn_state,
+            mtp_head,
         } = bundle;
         Ok(Self {
             name: String::from("target"),
@@ -565,12 +571,14 @@ impl ModelSlot {
             scratch,
             slot_config: ModelSlotConfig::default(),
             dspark_extract_layers: Vec::new(),
+            mtp_head,
         })
     }
 
     /// Disassemble the slot back into a [`Qwen35Bundle`] — the `HfqFile` mmap,
-    /// `name`, and `slot_config` drop here; the five live pieces return to the
-    /// bundle. The inverse of [`from_bundle`](Self::from_bundle); the loader's
+    /// `name`, and `slot_config` drop here; the live pieces (incl. the optional
+    /// MTP head) return to the bundle. The inverse of
+    /// [`from_bundle`](Self::from_bundle); the loader's
     /// guard calls this on `Drop` to restore `ModelState`.
     pub fn into_bundle(self) -> Qwen35Bundle {
         Qwen35Bundle {
@@ -579,6 +587,7 @@ impl ModelSlot {
             scratch: self.scratch,
             kv_cache: self.kv_cache,
             dn_state: self.dn_state,
+            mtp_head: self.mtp_head,
         }
     }
 }
@@ -694,6 +703,7 @@ impl ModelSlot {
             scratch,
             slot_config,
             dspark_extract_layers: Vec::new(),
+            mtp_head: None,
         })
     }
 

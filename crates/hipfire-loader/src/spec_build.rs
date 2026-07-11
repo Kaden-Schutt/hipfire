@@ -113,7 +113,8 @@ impl Drop for Qwen35SlotGuard<'_> {
         let bundle = match self.parked.take() {
             Some(Parked::Bundle(b)) => b,
             // slot.hfq (mmap), slot.name, slot.slot_config drop inside
-            // `into_bundle`; the five live pieces go back into the bundle.
+            // `into_bundle`; the live pieces (incl. the optional MTP head) go
+            // back into the bundle.
             Some(Parked::Slot(slot)) => slot.into_bundle(),
             None => return, // only reachable if `Drop` ran twice — it cannot.
         };

@@ -359,14 +359,6 @@ pub struct LoadedModel {
     // MTP config
     pub mtp_mode: String,
     pub mtp_k: usize,
-    pub mtp_weights_present: bool,
-    // Qwen3.5/3.6 native MTP (NextN) head (arch_id=21). Loaded once at model
-    // load when a bundled `.mq4-mtp` trailer OR a separate `.mtp` sidecar is
-    // present alongside the trunk. Persistent for the life of the model;
-    // `generate_qwen35_mtp` allocates a fresh per-request `MtpSpecState`
-    // against it (so the recurrent MTP-KV never bleeds across requests). None
-    // for every other arch and for qwen35 trunks without an MTP head.
-    pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
     // Vision state (qwen35-VL tower), grouped into one optional field.
     pub vision: Option<Qwen35Vl>,
     // Shared
@@ -424,8 +416,6 @@ impl LoadedModel {
             minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
-            mtp_weights_present: false,
-            qwen35_mtp_head: None,
             vision: None,
             tokenizer: Some(tokenizer),
             max_seq,
@@ -521,6 +511,35 @@ impl LoadedModel {
             Some(ModelState::Deepseek4(b)) => Some(b),
             _ => None,
         }
+    }
+
+    /// Single-arch Qwen3.5/3.6 bundle if loaded (also present under TP/PP — the
+    /// base bundle stays in `ModelState::Qwen35`), else None.
+    pub fn qwen35(&self) -> Option<&hipfire_arch_qwen35::Qwen35Bundle> {
+        match &self.state {
+            Some(ModelState::Qwen35(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn qwen35_mut(&mut self) -> Option<&mut hipfire_arch_qwen35::Qwen35Bundle> {
+        match &mut self.state {
+            Some(ModelState::Qwen35(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Whether the loaded model carries MTP/spec weights that `mtp_mode=auto`
+    /// should treat as spec-eligible. Derived (not cached): DeepSeek V4's bundled
+    /// `mtp_layer` or a DSpark sidecar, OR a Qwen3.5/3.6 native MTP head. Both
+    /// are load-time-fixed, so computing on read is exact and drift-free.
+    pub fn mtp_weights_present(&self) -> bool {
+        let ds4 = self
+            .deepseek4()
+            .map(|b| b.weights.mtp_layer.is_some() || b.weights.dspark.is_some())
+            .unwrap_or(false);
+        let qwen35 = self.qwen35().map(|b| b.mtp_head.is_some()).unwrap_or(false);
+        ds4 || qwen35
     }
 
     /// Disjoint-field borrow of the request-scoped sub-structs. Native
@@ -1026,8 +1045,10 @@ fn finish_qwen35_load(
         }
     };
 
+    let mut bundle = bundle;
+    bundle.mtp_head = qwen35_mtp_head;
     let state = Some(ModelState::Qwen35(bundle));
-    let mut model = LoadedModel {
+    let model = LoadedModel {
         state,
         eviction,
         speculator,
@@ -1044,11 +1065,6 @@ fn finish_qwen35_load(
             chat_template,
         )
     };
-    // `mtp_weights_present` drives the mtp_mode=auto serve decision (mirrors the
-    // ds4 probe set in the daemon's load handler). For qwen35 the presence of a
-    // loaded MTP head IS the signal.
-    model.mtp_weights_present = qwen35_mtp_head.is_some();
-    model.qwen35_mtp_head = qwen35_mtp_head;
     Ok(model)
 }
 
@@ -1945,9 +1961,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         // empty) is still drained below for defense-in-depth.
         spec.free(gpu);
     }
-    if let Some(head) = m.qwen35_mtp_head {
-        head.free_gpu(gpu);
-    }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
     }
@@ -1965,6 +1978,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.weights.free_gpu(gpu);
             }
             ModelState::Qwen35(b) => {
+                if let Some(head) = b.mtp_head {
+                    head.free_gpu(gpu);
+                }
                 b.kv_cache.free_gpu(gpu);
                 b.scratch.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
