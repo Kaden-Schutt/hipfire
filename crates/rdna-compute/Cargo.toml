@@ -10,4 +10,5 @@ deltanet = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+redline-dispatch = { path = "../redline-dispatch" }
 rayon = "1"

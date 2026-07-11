@@ -402,6 +402,8 @@ pub struct Gpu {
     pub active_stream: Option<hip_bridge::Stream>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
+    /// Default-off Redline warmup recorder and fail-closed backend gate.
+    pub replay: crate::replay::ReplayController,
 
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
     pub mmq_screen: MmqScreenState,
@@ -841,6 +843,7 @@ impl Gpu {
                 sample_partials: None,
                 sample_partials_bytes: 0,
             },
+            replay: crate::replay::ReplayController::from_env(),
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,
@@ -1175,6 +1178,8 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        self.replay
+            .record_hip_launch(func_name, grid, block, shared_mem);
         crate::scratch::launch_maybe_blob(
             &self.hip,
             &self.functions,

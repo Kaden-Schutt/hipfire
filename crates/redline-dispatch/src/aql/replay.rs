@@ -1,0 +1,2218 @@
+//! Multi-queue AQL record/replay.
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::time::Duration;
+
+use redline_rocr::abi;
+use redline_rocr::packet::{
+    BARRIER_DEPENDENCY_CAPACITY, BarrierAndPacket, KernelDispatchPacket, LaunchGeometry,
+    PacketError, PacketImage,
+};
+use redline_rocr::{
+    CompletionSignal, DEFAULT_WAIT_TIMEOUT, GpuDevice, KernargBuffer, Kernel, QueueDepthReport,
+    QueueSet, RuntimeError,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuiescenceTransition {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+fn apply_quiescence_transition(
+    in_flight: &mut bool,
+    usable: &mut bool,
+    transition: QuiescenceTransition,
+) {
+    match transition {
+        QuiescenceTransition::Completed => {
+            *in_flight = false;
+        }
+        QuiescenceTransition::Cancelled => {
+            *in_flight = false;
+            *usable = false;
+        }
+        QuiescenceTransition::Failed => {
+            // The runtime did not prove that packet execution stopped. Retain
+            // in-flight state so graph Drop retries queue inactivation.
+            *in_flight = true;
+            *usable = false;
+        }
+    }
+}
+
+/// One immutable recorded dispatch.
+///
+/// Dependencies are indices of earlier `RecordedDispatch` values in the graph.
+/// The `KernargBuffer` and `Kernel` keep argument memory and the executable
+/// alive through every replay.
+#[derive(Debug)]
+pub struct RecordedDispatch {
+    lane: usize,
+    kernel: Kernel,
+    geometry: LaunchGeometry,
+    kernarg: KernargBuffer,
+    dependencies: Vec<usize>,
+}
+
+impl RecordedDispatch {
+    pub fn new(
+        lane: usize,
+        kernel: Kernel,
+        geometry: LaunchGeometry,
+        kernarg: KernargBuffer,
+    ) -> Result<Self, ReplayError> {
+        if kernarg.len() != kernel.metadata().kernarg_segment_size as usize {
+            return Err(ReplayError::KernargMetadataMismatch {
+                kernel: kernel.name().to_owned(),
+                metadata_bytes: kernel.metadata().kernarg_segment_size as usize,
+                buffer_bytes: kernarg.len(),
+            });
+        }
+        if kernarg.agent() != kernel.agent() {
+            return Err(ReplayError::MixedGpuObjects);
+        }
+        Ok(Self {
+            lane,
+            kernel,
+            geometry,
+            kernarg,
+            dependencies: Vec::new(),
+        })
+    }
+
+    /// Dynamic LDS is deliberately rejected by this prototype: the public HSA
+    /// agent query surface does not expose a dependable LDS byte limit against
+    /// which static loader metadata plus this increment can be validated.
+    pub fn with_dynamic_group_bytes(self, bytes: u32) -> Result<Self, ReplayError> {
+        if bytes == 0 {
+            Ok(self)
+        } else {
+            Err(PacketError::DynamicGroupSegmentUnsupported { requested: bytes }.into())
+        }
+    }
+
+    pub fn with_dependencies(mut self, dependencies: impl IntoIterator<Item = usize>) -> Self {
+        self.dependencies.extend(dependencies);
+        self
+    }
+
+    pub fn lane(&self) -> usize {
+        self.lane
+    }
+
+    pub fn dependencies(&self) -> &[usize] {
+        &self.dependencies
+    }
+
+    pub(crate) fn kernarg_mut(&mut self) -> &mut KernargBuffer {
+        &mut self.kernarg
+    }
+}
+
+/// An immutable DAG bound to N distinct public HSA queues.
+///
+/// Each dispatch has a reusable completion signal. Cross-queue dependencies
+/// become barrier-AND packets on the consumer lane. More than five inputs are
+/// emitted as a sequence of barrier packets; because each barrier has its
+/// header barrier bit set, the sequence is a logical AND over every chunk.
+/// Terminal signals are similarly folded on queue zero into one replay signal.
+pub struct RecordedGraph {
+    queues: QueueSet,
+    nodes: Vec<RecordedDispatch>,
+    node_signals: Vec<CompletionSignal>,
+    final_signal: CompletionSignal,
+    terminal_nodes: Vec<usize>,
+    batches: Vec<Vec<PacketImage>>,
+    in_flight: bool,
+    usable: bool,
+}
+
+impl fmt::Debug for RecordedGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordedGraph")
+            .field("queues", &self.queues.queue_ids().collect::<Vec<_>>())
+            .field("node_count", &self.nodes.len())
+            .field("terminal_nodes", &self.terminal_nodes)
+            .field("in_flight", &self.in_flight)
+            .field("usable", &self.usable)
+            .finish()
+    }
+}
+
+impl RecordedGraph {
+    pub fn create(
+        device: &GpuDevice,
+        queue_count: usize,
+        queue_size: u32,
+        nodes: Vec<RecordedDispatch>,
+    ) -> Result<Self, ReplayError> {
+        if nodes.is_empty() {
+            return Err(ReplayError::EmptyGraph);
+        }
+        validate_nodes(device, queue_count, &nodes)?;
+        let queues = QueueSet::create(device, queue_count, queue_size)?;
+        let mut node_signals = Vec::with_capacity(nodes.len());
+        for _ in 0..nodes.len() {
+            node_signals.push(CompletionSignal::new(device)?);
+        }
+        let final_signal = CompletionSignal::new(device)?;
+
+        let mut depended_on = vec![false; nodes.len()];
+        for node in &nodes {
+            for dependency in &node.dependencies {
+                depended_on[*dependency] = true;
+            }
+        }
+        let terminal_nodes = depended_on
+            .iter()
+            .enumerate()
+            .filter_map(|(index, used)| (!used).then_some(index))
+            .collect::<Vec<_>>();
+
+        // Build every potentially failing packet and queue-local batch before
+        // anything can reach a doorbell. Replay reserves each batch in one
+        // operation and rings each queue exactly once.
+        let mut batches = vec![Vec::new(); queue_count];
+        for (index, recorded) in nodes.iter().enumerate() {
+            let dependencies = recorded
+                .dependencies
+                .iter()
+                .map(|dependency| node_signals[*dependency].raw())
+                .collect::<Vec<_>>();
+            for chunk in dependencies.chunks(BARRIER_DEPENDENCY_CAPACITY) {
+                let barrier = BarrierAndPacket::new(chunk, abi::Signal(0))?;
+                batches[recorded.lane].push(PacketImage::barrier(&barrier));
+            }
+            let packet = KernelDispatchPacket::new(
+                recorded.kernel.metadata(),
+                recorded.geometry,
+                0,
+                recorded.kernarg.address(),
+                node_signals[index].raw(),
+            )?;
+            batches[recorded.lane].push(PacketImage::kernel(&packet));
+        }
+        let terminal_signals = terminal_nodes
+            .iter()
+            .map(|index| node_signals[*index].raw())
+            .collect::<Vec<_>>();
+        for chunk in terminal_signals.chunks(BARRIER_DEPENDENCY_CAPACITY) {
+            let barrier = BarrierAndPacket::new(chunk, abi::Signal(0))?;
+            batches[0].push(PacketImage::barrier(&barrier));
+        }
+        let completion = BarrierAndPacket::new(&[], final_signal.raw())?;
+        batches[0].push(PacketImage::barrier(&completion));
+        for (lane, batch) in batches.iter().enumerate() {
+            let capacity = queues.size(lane).expect("queue count is fixed") as usize;
+            if batch.len() > capacity {
+                return Err(ReplayError::BatchExceedsQueue {
+                    lane,
+                    packets: batch.len(),
+                    capacity,
+                });
+            }
+        }
+
+        Ok(Self {
+            queues,
+            nodes,
+            node_signals,
+            final_signal,
+            terminal_nodes,
+            batches,
+            in_flight: false,
+            usable: true,
+        })
+    }
+
+    pub fn queue_ids(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.queues.queue_ids()
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    pub fn doorbell_writes_per_replay(&self) -> usize {
+        self.batches
+            .iter()
+            .filter(|batch| !batch.is_empty())
+            .count()
+    }
+
+    /// Submit one replay and return a completion/cancellation ticket.
+    ///
+    /// A second token cannot be submitted until the first ticket completes.
+    /// This is the token-latency core; a throughput implementation needs a ring
+    /// of signal/kernarg generations and is intentionally left as integration
+    /// work rather than unsafely resetting in-flight signals.
+    ///
+    /// # Safety
+    ///
+    /// Kernarg bytes can contain arbitrary device pointers which this crate
+    /// cannot inspect. Every pointee must remain allocated, accessible to this
+    /// graph's GPU, and free of incompatible host/agent mutation until an
+    /// explicit `wait` or `cancel` returns `Ok`. After any `Err`, or after
+    /// dropping a submission ticket, every pointee must instead remain valid
+    /// through destruction of the graph itself. Only `Ok` proves quiescence.
+    pub unsafe fn submit(&mut self) -> Result<ReplaySubmission<'_>, ReplayError> {
+        if self.in_flight {
+            return Err(ReplayError::AlreadyInFlight);
+        }
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
+        }
+        for signal in &mut self.node_signals {
+            signal.reset();
+        }
+        self.final_signal.reset();
+        if let Err(error) = self.queues.prepare_batches(&self.batches) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        self.in_flight = true;
+        if let Err(error) = self.queues.ring_prepared() {
+            self.in_flight = false;
+            self.usable = false;
+            return Err(error.into());
+        }
+
+        Ok(ReplaySubmission {
+            graph: self,
+            completed: false,
+        })
+    }
+
+    /// Submit and wait using the default finite timeout.
+    ///
+    /// # Safety
+    ///
+    /// The pointer and access contract is identical to [`Self::submit`].
+    pub unsafe fn replay_and_wait(&mut self) -> Result<(), ReplayError> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.submit()? }.wait()
+    }
+
+    fn wait_internal(&mut self, timeout: Duration) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.wait_signal(&self.final_signal, timeout) {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Completed,
+                );
+                Ok(())
+            }
+            Err(wait_error) => match self.queues.inactivate_all() {
+                Ok(()) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Cancelled,
+                    );
+                    Err(wait_error.into())
+                }
+                Err(teardown_error) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Failed,
+                    );
+                    Err(RuntimeError::OperationAndTeardown {
+                        operation: Box::new(wait_error),
+                        teardown: Box::new(teardown_error),
+                    }
+                    .into())
+                }
+            },
+        }
+    }
+
+    fn cancel_internal(&mut self) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.inactivate_all() {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Cancelled,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Failed,
+                );
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl Drop for RecordedGraph {
+    fn drop(&mut self) {
+        // Drop never waits on a completion signal. It retries queue
+        // inactivation when an earlier ticket operation could not prove
+        // quiescence; Queue Drop performs the final destroy attempt.
+        let _ = self.cancel_internal();
+    }
+}
+
+#[must_use = "wait or cancel the AQL submission to observe completion/teardown errors"]
+pub struct ReplaySubmission<'a> {
+    graph: &'a mut RecordedGraph,
+    completed: bool,
+}
+
+impl ReplaySubmission<'_> {
+    /// Wait with the default finite host-polling timeout.
+    ///
+    /// `Ok` proves quiescence. On `Err`, the external-pointee contract from
+    /// [`RecordedGraph::submit`] remains in force through graph destruction.
+    pub fn wait(self) -> Result<(), ReplayError> {
+        self.wait_timeout(DEFAULT_WAIT_TIMEOUT)
+    }
+
+    /// Wait with an explicit finite host-polling timeout.
+    ///
+    /// `Ok` proves quiescence. On `Err`, the external-pointee contract from
+    /// [`RecordedGraph::submit`] remains in force through graph destruction.
+    pub fn wait_timeout(mut self, timeout: Duration) -> Result<(), ReplayError> {
+        let result = self.graph.wait_internal(timeout);
+        self.completed = true;
+        result
+    }
+
+    /// Abort pending queue execution without waiting for a completion signal.
+    /// `Ok` proves quiescence; `Err` requires retaining external pointees
+    /// through graph destruction.
+    pub fn cancel(mut self) -> Result<(), ReplayError> {
+        let result = self.graph.cancel_internal();
+        self.completed = true;
+        result
+    }
+}
+
+impl Drop for ReplaySubmission<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.graph.cancel_internal();
+        }
+    }
+}
+
+/// Packet-header policy for the single-queue fence attribution experiment.
+///
+/// `BoundarySerialized` is the cache/fence-only control: it changes fence
+/// scopes but retains a barrier between every dispatch. `BoundaryIndependent`
+/// additionally clears those dispatch barrier bits and is valid only when the
+/// caller has independently proved the dispatches do not conflict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchFencePolicy {
+    SystemEveryDispatch,
+    SystemAcquireAgentRelease,
+    BoundarySerialized,
+    BoundaryIndependent,
+}
+
+impl BatchFencePolicy {
+    fn dispatch_header(self, index: usize) -> redline_rocr::HeaderPolicy {
+        use redline_rocr::HeaderPolicy;
+        match self {
+            Self::SystemEveryDispatch => HeaderPolicy::RECORDED_DISPATCH,
+            Self::SystemAcquireAgentRelease => HeaderPolicy::TWO_QUEUE_DISPATCH,
+            Self::BoundarySerialized if index == 0 => HeaderPolicy::BATCH_BOUNDARY_FIRST_SERIAL,
+            Self::BoundarySerialized => HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL,
+            Self::BoundaryIndependent if index == 0 => {
+                HeaderPolicy::BATCH_BOUNDARY_FIRST_INDEPENDENT
+            }
+            Self::BoundaryIndependent => HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT,
+        }
+    }
+}
+
+/// GPU timestamps spanning the first through last dispatch of one recorded
+/// batch. Terminal host-export barrier time is intentionally excluded, matching
+/// compute-stage timestamp brackets in the Vulkan and HIP controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuBatchTiming {
+    pub first_start: u64,
+    pub first_end: u64,
+    pub last_start: u64,
+    pub last_end: u64,
+    pub frequency_hz: u64,
+}
+
+/// GPU timestamp span across the first and last profiled dispatches on every
+/// active queue of a derived batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMultiQueueTiming {
+    pub first_start: u64,
+    pub last_end: u64,
+    pub frequency_hz: u64,
+}
+
+impl GpuMultiQueueTiming {
+    pub fn span_microseconds(self) -> f64 {
+        self.last_end.saturating_sub(self.first_start) as f64 * 1_000_000.0
+            / self.frequency_hz as f64
+    }
+}
+
+impl GpuBatchTiming {
+    pub fn span_microseconds(self) -> f64 {
+        self.last_end.saturating_sub(self.first_start) as f64 * 1_000_000.0
+            / self.frequency_hz as f64
+    }
+
+    pub fn dispatch_span_microseconds(self) -> f64 {
+        self.last_end.saturating_sub(self.first_start) as f64 * 1_000_000.0
+            / self.frequency_hz as f64
+    }
+}
+
+/// One prebuilt single-queue dispatch batch used to attribute packet fences.
+///
+/// The graph owns every kernel, kernarg buffer, profiling signal, and queue.
+/// Exactly the first and last dispatch carry profiling signals; the terminal
+/// barrier carries the host completion signal. This avoids attaching a signal
+/// to every dispatch and perturbing the policy under test.
+pub struct SingleQueueBatchGraph {
+    device: GpuDevice,
+    queues: QueueSet,
+    dispatches: Vec<RecordedDispatch>,
+    first_signal: CompletionSignal,
+    last_signal: CompletionSignal,
+    final_signal: CompletionSignal,
+    batch: Vec<PacketImage>,
+    policy: BatchFencePolicy,
+    timestamp_frequency_hz: u64,
+    in_flight: bool,
+    usable: bool,
+}
+
+impl fmt::Debug for SingleQueueBatchGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SingleQueueBatchGraph")
+            .field("queue_ids", &self.queues.queue_ids().collect::<Vec<_>>())
+            .field("dispatch_count", &self.dispatches.len())
+            .field("policy", &self.policy)
+            .field("in_flight", &self.in_flight)
+            .field("usable", &self.usable)
+            .finish()
+    }
+}
+
+impl SingleQueueBatchGraph {
+    pub fn create(
+        device: &GpuDevice,
+        queue_size: u32,
+        dispatches: Vec<RecordedDispatch>,
+        policy: BatchFencePolicy,
+    ) -> Result<Self, ReplayError> {
+        if dispatches.len() < 2 {
+            return Err(ReplayError::InvalidBatchShape(
+                "single-queue profiling batch requires at least two dispatches",
+            ));
+        }
+        validate_nodes(device, 1, &dispatches)?;
+        for dispatch in &dispatches {
+            if dispatch.lane != 0 {
+                return Err(ReplayError::PhaseLaneMismatch {
+                    expected: 0,
+                    actual: dispatch.lane,
+                });
+            }
+            if !dispatch.dependencies.is_empty() {
+                return Err(ReplayError::PhaseHasExplicitDependencies { lane: 0 });
+            }
+        }
+
+        let queues = QueueSet::create(device, 1, queue_size)?;
+        queues.set_profiling(true)?;
+        let first_signal = CompletionSignal::new(device)?;
+        let last_signal = CompletionSignal::new(device)?;
+        let final_signal = CompletionSignal::new(device)?;
+        let mut batch = Vec::with_capacity(dispatches.len() + 1);
+        for (index, dispatch) in dispatches.iter().enumerate() {
+            let completion = if index == 0 {
+                first_signal.raw()
+            } else if index + 1 == dispatches.len() {
+                last_signal.raw()
+            } else {
+                abi::Signal(0)
+            };
+            let packet = KernelDispatchPacket::new_with_policy(
+                dispatch.kernel.metadata(),
+                dispatch.geometry,
+                0,
+                dispatch.kernarg.address(),
+                completion,
+                policy.dispatch_header(index),
+            )?;
+            batch.push(PacketImage::kernel(&packet));
+        }
+        let terminal = BarrierAndPacket::new_two_queue_host_terminal(&[], final_signal.raw())?;
+        batch.push(PacketImage::barrier(&terminal));
+        let capacity = queues.size(0).expect("one queue was created") as usize;
+        if batch.len() > capacity {
+            return Err(ReplayError::BatchExceedsQueue {
+                lane: 0,
+                packets: batch.len(),
+                capacity,
+            });
+        }
+        let timestamp_frequency_hz = device.timestamp_frequency_hz()?;
+
+        Ok(Self {
+            device: device.clone(),
+            queues,
+            dispatches,
+            first_signal,
+            last_signal,
+            final_signal,
+            batch,
+            policy,
+            timestamp_frequency_hz,
+            in_flight: false,
+            usable: true,
+        })
+    }
+
+    pub fn policy(&self) -> BatchFencePolicy {
+        self.policy
+    }
+
+    pub fn dispatch_count(&self) -> usize {
+        self.dispatches.len()
+    }
+
+    pub fn packet_count(&self) -> usize {
+        self.batch.len()
+    }
+
+    pub fn queue_id(&self) -> u64 {
+        self.queues.queue_ids().next().expect("one queue exists")
+    }
+
+    /// # Safety
+    ///
+    /// Every external pointer embedded in the recorded kernargs must remain
+    /// valid and free of incompatible mutation until the ticket returns `Ok`.
+    pub unsafe fn submit(&mut self) -> Result<SingleQueueBatchSubmission<'_>, ReplayError> {
+        if self.in_flight {
+            return Err(ReplayError::AlreadyInFlight);
+        }
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
+        }
+        self.first_signal.reset();
+        self.last_signal.reset();
+        self.final_signal.reset();
+        if let Err(error) = self
+            .queues
+            .prepare_batches(std::slice::from_ref(&self.batch))
+        {
+            self.usable = false;
+            return Err(error.into());
+        }
+        self.in_flight = true;
+        if let Err(error) = self.queues.ring_prepared() {
+            self.in_flight = false;
+            self.usable = false;
+            return Err(error.into());
+        }
+        Ok(SingleQueueBatchSubmission {
+            graph: self,
+            completed: false,
+        })
+    }
+
+    /// # Safety
+    ///
+    /// The pointer contract is identical to [`Self::submit`].
+    pub unsafe fn replay_and_wait(&mut self) -> Result<GpuBatchTiming, ReplayError> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.submit()? }.wait()
+    }
+
+    fn wait_internal(&mut self, timeout: Duration) -> Result<GpuBatchTiming, ReplayError> {
+        if !self.in_flight {
+            return Err(ReplayError::InvalidBatchShape(
+                "single-queue batch has no active submission",
+            ));
+        }
+        match self.queues.wait_signal(&self.final_signal, timeout) {
+            Ok(()) => {
+                self.in_flight = false;
+                let first = self.device.dispatch_time(&self.first_signal);
+                let last = self.device.dispatch_time(&self.last_signal);
+                match (first, last) {
+                    (Ok(first), Ok(last)) => Ok(GpuBatchTiming {
+                        first_start: first.start,
+                        first_end: first.end,
+                        last_start: last.start,
+                        last_end: last.end,
+                        frequency_hz: self.timestamp_frequency_hz,
+                    }),
+                    (Err(error), _) | (_, Err(error)) => {
+                        self.usable = false;
+                        Err(error.into())
+                    }
+                }
+            }
+            Err(wait_error) => match self.queues.inactivate_all() {
+                Ok(()) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Cancelled,
+                    );
+                    Err(wait_error.into())
+                }
+                Err(teardown_error) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Failed,
+                    );
+                    Err(RuntimeError::OperationAndTeardown {
+                        operation: Box::new(wait_error),
+                        teardown: Box::new(teardown_error),
+                    }
+                    .into())
+                }
+            },
+        }
+    }
+
+    fn cancel_internal(&mut self) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.inactivate_all() {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Cancelled,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Failed,
+                );
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl Drop for SingleQueueBatchGraph {
+    fn drop(&mut self) {
+        let _ = self.cancel_internal();
+    }
+}
+
+#[must_use = "wait or cancel the AQL submission"]
+pub struct SingleQueueBatchSubmission<'a> {
+    graph: &'a mut SingleQueueBatchGraph,
+    completed: bool,
+}
+
+impl SingleQueueBatchSubmission<'_> {
+    pub fn wait(self) -> Result<GpuBatchTiming, ReplayError> {
+        self.wait_timeout(DEFAULT_WAIT_TIMEOUT)
+    }
+
+    pub fn wait_timeout(mut self, timeout: Duration) -> Result<GpuBatchTiming, ReplayError> {
+        let result = self.graph.wait_internal(timeout);
+        self.completed = true;
+        result
+    }
+
+    pub fn cancel(mut self) -> Result<(), ReplayError> {
+        let result = self.graph.cancel_internal();
+        self.completed = true;
+        result
+    }
+}
+
+impl Drop for SingleQueueBatchSubmission<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.graph.cancel_internal();
+        }
+    }
+}
+
+/// One globally synchronized phase for the measured two-queue sweet spot.
+///
+/// Dispatches within each lane are FIFO. The phase boundary is represented by
+/// one tail completion signal per lane, not one signal/event per node.
+pub struct TwoQueuePhase {
+    lanes: [Vec<RecordedDispatch>; 2],
+}
+
+impl TwoQueuePhase {
+    pub fn new(
+        lane_zero: Vec<RecordedDispatch>,
+        lane_one: Vec<RecordedDispatch>,
+    ) -> Result<Self, ReplayError> {
+        let lanes = [lane_zero, lane_one];
+        for (lane, dispatches) in lanes.iter().enumerate() {
+            if dispatches.is_empty() {
+                return Err(ReplayError::EmptyPhaseLane { lane });
+            }
+            for dispatch in dispatches {
+                if dispatch.lane != lane {
+                    return Err(ReplayError::PhaseLaneMismatch {
+                        expected: lane,
+                        actual: dispatch.lane,
+                    });
+                }
+                if !dispatch.dependencies.is_empty() {
+                    return Err(ReplayError::PhaseHasExplicitDependencies { lane });
+                }
+            }
+        }
+        Ok(Self { lanes })
+    }
+
+    pub fn dispatch_count(&self, lane: usize) -> Option<usize> {
+        self.lanes.get(lane).map(Vec::len)
+    }
+}
+
+/// Specialized two-queue phase replay for the 4-root -> fan-in -> 4-child
+/// token DAG shape.
+///
+/// For two phases with two roots and two children per queue, the emitted shape
+/// is:
+///
+/// - queue 0: root, root(tail signal), one cross barrier, child,
+///   child(tail signal), terminal fan-in;
+/// - queue 1: root, root(tail signal), one cross barrier, child,
+///   child(tail signal).
+///
+/// The complete queue-local sequence is filled and release-published before a
+/// single doorbell write per queue (two doorbells per replay total).
+///
+/// This specialization uses Agent-release dispatch fences and fence-free
+/// device dependency barriers. Every kernel and kernarg is validated against
+/// the same `GpuDevice`; each following dispatch retains a System acquire, and
+/// the final host-observed fan-in performs the System release.
+pub struct TwoQueuePhasedGraph {
+    queues: QueueSet,
+    phases: Vec<TwoQueuePhase>,
+    phase_tail_signals: Vec<[CompletionSignal; 2]>,
+    final_signal: CompletionSignal,
+    batches: [Vec<PacketImage>; 2],
+    in_flight: bool,
+    usable: bool,
+}
+
+impl fmt::Debug for TwoQueuePhasedGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TwoQueuePhasedGraph")
+            .field("queues", &self.queues.queue_ids().collect::<Vec<_>>())
+            .field("phase_count", &self.phases.len())
+            .field(
+                "batch_packets",
+                &[self.batches[0].len(), self.batches[1].len()],
+            )
+            .field("in_flight", &self.in_flight)
+            .field("usable", &self.usable)
+            .finish()
+    }
+}
+
+impl TwoQueuePhasedGraph {
+    pub fn create(
+        device: &GpuDevice,
+        queue_size: u32,
+        phases: Vec<TwoQueuePhase>,
+    ) -> Result<Self, ReplayError> {
+        if phases.is_empty() {
+            return Err(ReplayError::EmptyPhaseSet);
+        }
+        for phase in &phases {
+            for dispatches in &phase.lanes {
+                for dispatch in dispatches {
+                    if dispatch.kernel.agent() != device.raw_gpu_agent()
+                        || dispatch.kernarg.agent() != device.raw_gpu_agent()
+                    {
+                        return Err(ReplayError::MixedGpuObjects);
+                    }
+                    device.validate_geometry(dispatch.geometry)?;
+                }
+            }
+        }
+
+        let queues = QueueSet::create(device, 2, queue_size)?;
+        let mut phase_tail_signals = Vec::with_capacity(phases.len());
+        for _ in 0..phases.len() {
+            phase_tail_signals.push([
+                CompletionSignal::new(device)?,
+                CompletionSignal::new(device)?,
+            ]);
+        }
+        let final_signal = CompletionSignal::new(device)?;
+        let lane_counts = phases
+            .iter()
+            .map(|phase| [phase.lanes[0].len(), phase.lanes[1].len()])
+            .collect::<Vec<_>>();
+        let packet_counts = two_queue_batch_counts(&lane_counts);
+        let mut batches = [
+            Vec::with_capacity(packet_counts[0]),
+            Vec::with_capacity(packet_counts[1]),
+        ];
+
+        for (phase_index, phase) in phases.iter().enumerate() {
+            if phase_index != 0 {
+                let previous = &phase_tail_signals[phase_index - 1];
+                let dependencies = [previous[0].raw(), previous[1].raw()];
+                for batch in &mut batches {
+                    let barrier = BarrierAndPacket::new_two_queue_dependency(&dependencies)?;
+                    batch.push(PacketImage::barrier(&barrier));
+                }
+            }
+            for (lane, dispatches) in phase.lanes.iter().enumerate() {
+                for (dispatch_index, dispatch) in dispatches.iter().enumerate() {
+                    let is_tail = dispatch_index + 1 == dispatches.len();
+                    let completion = if is_tail {
+                        phase_tail_signals[phase_index][lane].raw()
+                    } else {
+                        abi::Signal(0)
+                    };
+                    let packet = KernelDispatchPacket::new_two_queue(
+                        dispatch.kernel.metadata(),
+                        dispatch.geometry,
+                        0,
+                        dispatch.kernarg.address(),
+                        completion,
+                    )?;
+                    batches[lane].push(PacketImage::kernel(&packet));
+                }
+            }
+        }
+
+        let final_phase = phase_tail_signals.last().expect("phases is nonempty");
+        let completion = BarrierAndPacket::new_two_queue_host_terminal(
+            &[final_phase[0].raw(), final_phase[1].raw()],
+            final_signal.raw(),
+        )?;
+        batches[0].push(PacketImage::barrier(&completion));
+        for (lane, batch) in batches.iter().enumerate() {
+            let capacity = queues.size(lane).expect("two queues were created") as usize;
+            if batch.len() > capacity {
+                return Err(ReplayError::BatchExceedsQueue {
+                    lane,
+                    packets: batch.len(),
+                    capacity,
+                });
+            }
+        }
+
+        Ok(Self {
+            queues,
+            phases,
+            phase_tail_signals,
+            final_signal,
+            batches,
+            in_flight: false,
+            usable: true,
+        })
+    }
+
+    pub fn queue_ids(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.queues.queue_ids()
+    }
+
+    pub fn batch_packet_counts(&self) -> [usize; 2] {
+        [self.batches[0].len(), self.batches[1].len()]
+    }
+
+    pub fn completion_signal_count(&self) -> usize {
+        self.phase_tail_signals.len() * 2 + 1
+    }
+
+    pub fn doorbell_writes_per_replay(&self) -> usize {
+        2
+    }
+
+    /// Submit one two-lane phase replay.
+    ///
+    /// # Safety
+    ///
+    /// Kernarg bytes may encode arbitrary device pointers. Every pointee must
+    /// remain allocated, GPU-accessible, and free of incompatible host/agent
+    /// mutation until an explicit `wait` or `cancel` returns `Ok`. After any
+    /// `Err`, or after dropping a submission ticket, every pointee must instead
+    /// remain valid through destruction of this graph. Only `Ok` proves
+    /// quiescence.
+    pub unsafe fn submit(&mut self) -> Result<TwoQueueSubmission<'_>, ReplayError> {
+        if self.in_flight {
+            return Err(ReplayError::AlreadyInFlight);
+        }
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
+        }
+        for phase in &mut self.phase_tail_signals {
+            for signal in phase {
+                signal.reset();
+            }
+        }
+        self.final_signal.reset();
+        if let Err(error) = self.queues.prepare_batches(&self.batches) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        self.in_flight = true;
+        if let Err(error) = self.queues.ring_prepared() {
+            self.in_flight = false;
+            self.usable = false;
+            return Err(error.into());
+        }
+        Ok(TwoQueueSubmission {
+            graph: self,
+            completed: false,
+        })
+    }
+
+    /// Submit and wait using the default finite timeout.
+    ///
+    /// # Safety
+    ///
+    /// The pointer and access contract is identical to [`Self::submit`].
+    pub unsafe fn replay_and_wait(&mut self) -> Result<(), ReplayError> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.submit()? }.wait()
+    }
+
+    fn wait_internal(&mut self, timeout: Duration) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.wait_signal(&self.final_signal, timeout) {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Completed,
+                );
+                Ok(())
+            }
+            Err(wait_error) => match self.queues.inactivate_all() {
+                Ok(()) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Cancelled,
+                    );
+                    Err(wait_error.into())
+                }
+                Err(teardown_error) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Failed,
+                    );
+                    Err(RuntimeError::OperationAndTeardown {
+                        operation: Box::new(wait_error),
+                        teardown: Box::new(teardown_error),
+                    }
+                    .into())
+                }
+            },
+        }
+    }
+
+    fn cancel_internal(&mut self) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.inactivate_all() {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Cancelled,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Failed,
+                );
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl Drop for TwoQueuePhasedGraph {
+    fn drop(&mut self) {
+        // Retained in-flight state makes this retry a prior failed ticket
+        // cancellation before Queue Drop performs its destroy attempt.
+        let _ = self.cancel_internal();
+    }
+}
+
+#[must_use = "wait or cancel the AQL submission to observe completion/teardown errors"]
+pub struct TwoQueueSubmission<'a> {
+    graph: &'a mut TwoQueuePhasedGraph,
+    completed: bool,
+}
+
+impl TwoQueueSubmission<'_> {
+    /// Wait with the default finite host-polling timeout.
+    ///
+    /// `Ok` proves quiescence. On `Err`, the external-pointee contract from
+    /// [`TwoQueuePhasedGraph::submit`] remains in force through graph
+    /// destruction.
+    pub fn wait(self) -> Result<(), ReplayError> {
+        self.wait_timeout(DEFAULT_WAIT_TIMEOUT)
+    }
+
+    /// Wait with an explicit finite host-polling timeout.
+    ///
+    /// `Ok` proves quiescence. On `Err`, the external-pointee contract from
+    /// [`TwoQueuePhasedGraph::submit`] remains in force through graph
+    /// destruction.
+    pub fn wait_timeout(mut self, timeout: Duration) -> Result<(), ReplayError> {
+        let result = self.graph.wait_internal(timeout);
+        self.completed = true;
+        result
+    }
+
+    /// Abort pending execution. `Ok` proves quiescence; `Err` requires
+    /// retaining external pointees through graph destruction.
+    pub fn cancel(mut self) -> Result<(), ReplayError> {
+        let result = self.graph.cancel_internal();
+        self.completed = true;
+        result
+    }
+}
+
+impl Drop for TwoQueueSubmission<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.graph.cancel_internal();
+        }
+    }
+}
+
+/// A fixed batch of serialized two-queue tokens submitted with one doorbell
+/// write per queue and one final completion wait.
+///
+/// Every token owns a distinct pair of tail signals for every phase. The first
+/// phase of token `n + 1` waits on both final-phase tails from token `n`, so
+/// tokens cannot overlap even though the entire batch is published at once.
+/// Within each token, phase boundaries have the same all-lane fan-in semantics
+/// as [`TwoQueuePhasedGraph`].
+///
+/// The reduced release scopes assume both queues and all dispatch resources
+/// belong to one HSA GPU agent. [`Self::create`] enforces that through the same
+/// mixed-agent validation used by the single-token specialization.
+pub struct TwoQueueSerializedBatchGraph {
+    queues: QueueSet,
+    phases: Vec<TwoQueuePhase>,
+    token_phase_tail_signals: Vec<Vec<[CompletionSignal; 2]>>,
+    final_signal: CompletionSignal,
+    batches: [Vec<PacketImage>; 2],
+    token_count: usize,
+    in_flight: bool,
+    usable: bool,
+    derived_profiling: Option<DerivedProfiling>,
+}
+
+struct DerivedProfiling {
+    device: GpuDevice,
+    signals: Vec<CompletionSignal>,
+    mode: DerivedProfilingMode,
+    frequency_hz: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DerivedProfilingMode {
+    QueueEdges,
+    AllDispatches,
+}
+
+/// Packet policies for generic two-queue phase lowering. The first token may
+/// carry API-entry acquire fences; repeated tokens use device-only scopes.
+pub(crate) struct TwoQueueDerivedPolicies {
+    pub first_dispatches: Vec<[Vec<redline_rocr::HeaderPolicy>; 2]>,
+    pub repeated_dispatches: Vec<[Vec<redline_rocr::HeaderPolicy>; 2]>,
+    pub consolidation: redline_rocr::HeaderPolicy,
+    pub dependency: redline_rocr::HeaderPolicy,
+    pub terminal: redline_rocr::HeaderPolicy,
+    pub profile_all_dispatches: bool,
+}
+
+impl fmt::Debug for TwoQueueSerializedBatchGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TwoQueueSerializedBatchGraph")
+            .field("queues", &self.queues.queue_ids().collect::<Vec<_>>())
+            .field("phase_count", &self.phases.len())
+            .field("token_count", &self.token_count)
+            .field(
+                "batch_packets",
+                &[self.batches[0].len(), self.batches[1].len()],
+            )
+            .field("in_flight", &self.in_flight)
+            .field("usable", &self.usable)
+            .finish()
+    }
+}
+
+impl TwoQueueSerializedBatchGraph {
+    /// Return the queue-local packet counts required to publish `token_count`
+    /// serialized copies of `phases` as one batch.
+    pub fn required_packet_counts(
+        phases: &[TwoQueuePhase],
+        token_count: usize,
+    ) -> Result<[usize; 2], ReplayError> {
+        if phases.is_empty() {
+            return Err(ReplayError::EmptyPhaseSet);
+        }
+        let lane_counts = phases
+            .iter()
+            .map(|phase| [phase.lanes[0].len(), phase.lanes[1].len()])
+            .collect::<Vec<_>>();
+        two_queue_serialized_batch_counts(&lane_counts, token_count)
+    }
+
+    pub fn create(
+        device: &GpuDevice,
+        queue_size: u32,
+        token_count: usize,
+        phases: Vec<TwoQueuePhase>,
+    ) -> Result<Self, ReplayError> {
+        if phases.is_empty() {
+            return Err(ReplayError::EmptyPhaseSet);
+        }
+        validate_two_queue_phases(device, &phases)?;
+        let packet_counts = Self::required_packet_counts(&phases, token_count)?;
+        let signal_count = two_queue_serialized_signal_count(phases.len(), token_count)?;
+
+        let queues = QueueSet::create(device, 2, queue_size)?;
+        let mut token_phase_tail_signals = Vec::with_capacity(token_count);
+        for _ in 0..token_count {
+            let mut phase_signals = Vec::with_capacity(phases.len());
+            for _ in 0..phases.len() {
+                phase_signals.push([
+                    CompletionSignal::new(device)?,
+                    CompletionSignal::new(device)?,
+                ]);
+            }
+            token_phase_tail_signals.push(phase_signals);
+        }
+        debug_assert_eq!(
+            token_phase_tail_signals
+                .iter()
+                .map(|token| token.len() * 2)
+                .sum::<usize>()
+                + 1,
+            signal_count
+        );
+        let final_signal = CompletionSignal::new(device)?;
+        let mut batches = [
+            Vec::with_capacity(packet_counts[0]),
+            Vec::with_capacity(packet_counts[1]),
+        ];
+
+        for token_index in 0..token_count {
+            if token_index != 0 {
+                let previous = token_phase_tail_signals[token_index - 1]
+                    .last()
+                    .expect("phases is nonempty");
+                let dependencies = [previous[0].raw(), previous[1].raw()];
+                for batch in &mut batches {
+                    let barrier = BarrierAndPacket::new_two_queue_dependency(&dependencies)?;
+                    batch.push(PacketImage::barrier(&barrier));
+                }
+            }
+
+            for (phase_index, phase) in phases.iter().enumerate() {
+                if phase_index != 0 {
+                    let previous = &token_phase_tail_signals[token_index][phase_index - 1];
+                    let dependencies = [previous[0].raw(), previous[1].raw()];
+                    for batch in &mut batches {
+                        let barrier = BarrierAndPacket::new_two_queue_dependency(&dependencies)?;
+                        batch.push(PacketImage::barrier(&barrier));
+                    }
+                }
+                for (lane, dispatches) in phase.lanes.iter().enumerate() {
+                    for (dispatch_index, dispatch) in dispatches.iter().enumerate() {
+                        let is_tail = dispatch_index + 1 == dispatches.len();
+                        let completion = if is_tail {
+                            token_phase_tail_signals[token_index][phase_index][lane].raw()
+                        } else {
+                            abi::Signal(0)
+                        };
+                        let packet = KernelDispatchPacket::new_two_queue(
+                            dispatch.kernel.metadata(),
+                            dispatch.geometry,
+                            0,
+                            dispatch.kernarg.address(),
+                            completion,
+                        )?;
+                        batches[lane].push(PacketImage::kernel(&packet));
+                    }
+                }
+            }
+        }
+
+        let final_phase = token_phase_tail_signals
+            .last()
+            .and_then(|token| token.last())
+            .expect("tokens and phases are nonempty");
+        let completion = BarrierAndPacket::new_two_queue_host_terminal(
+            &[final_phase[0].raw(), final_phase[1].raw()],
+            final_signal.raw(),
+        )?;
+        batches[0].push(PacketImage::barrier(&completion));
+        debug_assert_eq!([batches[0].len(), batches[1].len()], packet_counts);
+        for (lane, batch) in batches.iter().enumerate() {
+            let capacity = queues.size(lane).expect("two queues were created") as usize;
+            if batch.len() > capacity {
+                return Err(ReplayError::BatchExceedsQueue {
+                    lane,
+                    packets: batch.len(),
+                    capacity,
+                });
+            }
+        }
+
+        Ok(Self {
+            queues,
+            phases,
+            token_phase_tail_signals,
+            final_signal,
+            batches,
+            token_count,
+            in_flight: false,
+            usable: true,
+            derived_profiling: None,
+        })
+    }
+
+    /// Build the generic hazard-derived form. Unlike the historical
+    /// specialization, each phase ends with a queue-local consolidation
+    /// barrier: a tail dispatch signal cannot cover older barrier-free packets.
+    pub(crate) fn create_derived(
+        device: &GpuDevice,
+        queue_size: u32,
+        token_count: usize,
+        phases: Vec<TwoQueuePhase>,
+        policies: TwoQueueDerivedPolicies,
+    ) -> Result<Self, ReplayError> {
+        if phases.is_empty() {
+            return Err(ReplayError::EmptyPhaseSet);
+        }
+        if token_count == 0 {
+            return Err(ReplayError::EmptyTokenBatch);
+        }
+        validate_two_queue_phases(device, &phases)?;
+        validate_derived_policy_shape(&phases, &policies)?;
+        let base_counts = Self::required_packet_counts(&phases, token_count)?;
+        let extra_consolidations = phases
+            .len()
+            .checked_mul(token_count)
+            .ok_or(ReplayError::BatchShapeOverflow)?;
+        let packet_counts = [
+            base_counts[0]
+                .checked_add(extra_consolidations)
+                .ok_or(ReplayError::BatchShapeOverflow)?,
+            base_counts[1]
+                .checked_add(extra_consolidations)
+                .ok_or(ReplayError::BatchShapeOverflow)?,
+        ];
+        let signal_count = two_queue_serialized_signal_count(phases.len(), token_count)?;
+
+        let covers_batch = policies
+            .repeated_dispatches
+            .last()
+            .is_some_and(|last_phase| {
+                (0..2).all(|lane| last_phase[lane].last().is_some_and(|policy| policy.barrier))
+            });
+        let queues = QueueSet::create(device, 2, queue_size)?;
+        let mut profiling_signals = Vec::new();
+        let profiling_mode = if policies.profile_all_dispatches {
+            Some(DerivedProfilingMode::AllDispatches)
+        } else if covers_batch {
+            Some(DerivedProfilingMode::QueueEdges)
+        } else {
+            None
+        };
+        let timestamp_frequency_hz = if let Some(mode) = profiling_mode {
+            queues.set_profiling(true)?;
+            let count = match mode {
+                DerivedProfilingMode::QueueEdges => 4,
+                DerivedProfilingMode::AllDispatches => phases
+                    .iter()
+                    .map(|phase| phase.lanes[0].len() + phase.lanes[1].len())
+                    .sum::<usize>()
+                    .checked_mul(token_count)
+                    .ok_or(ReplayError::BatchShapeOverflow)?,
+            };
+            profiling_signals.reserve(count);
+            for _ in 0..count {
+                profiling_signals.push(CompletionSignal::new(device)?);
+            }
+            Some(device.timestamp_frequency_hz()?)
+        } else {
+            None
+        };
+        let mut token_phase_tail_signals = Vec::with_capacity(token_count);
+        for _ in 0..token_count {
+            let mut phase_signals = Vec::with_capacity(phases.len());
+            for _ in 0..phases.len() {
+                phase_signals.push([
+                    CompletionSignal::new(device)?,
+                    CompletionSignal::new(device)?,
+                ]);
+            }
+            token_phase_tail_signals.push(phase_signals);
+        }
+        debug_assert_eq!(
+            token_phase_tail_signals
+                .iter()
+                .map(|token| token.len() * 2)
+                .sum::<usize>()
+                + 1,
+            signal_count
+        );
+        let final_signal = CompletionSignal::new(device)?;
+        let mut batches = [
+            Vec::with_capacity(packet_counts[0]),
+            Vec::with_capacity(packet_counts[1]),
+        ];
+        let mut full_profile_index = 0_usize;
+
+        for token_index in 0..token_count {
+            if token_index != 0 {
+                let previous = token_phase_tail_signals[token_index - 1]
+                    .last()
+                    .expect("phases is nonempty");
+                let dependencies = [previous[0].raw(), previous[1].raw()];
+                for batch in &mut batches {
+                    let barrier = BarrierAndPacket::new_with_policy(
+                        &dependencies,
+                        abi::Signal(0),
+                        policies.dependency,
+                    )?;
+                    batch.push(PacketImage::barrier(&barrier));
+                }
+            }
+
+            let dispatch_policies = if token_index == 0 {
+                &policies.first_dispatches
+            } else {
+                &policies.repeated_dispatches
+            };
+            for (phase_index, phase) in phases.iter().enumerate() {
+                if phase_index != 0 {
+                    let previous = &token_phase_tail_signals[token_index][phase_index - 1];
+                    let dependencies = [previous[0].raw(), previous[1].raw()];
+                    for batch in &mut batches {
+                        let barrier = BarrierAndPacket::new_with_policy(
+                            &dependencies,
+                            abi::Signal(0),
+                            policies.dependency,
+                        )?;
+                        batch.push(PacketImage::barrier(&barrier));
+                    }
+                }
+                for (lane, dispatches) in phase.lanes.iter().enumerate() {
+                    for (dispatch_index, dispatch) in dispatches.iter().enumerate() {
+                        let is_first_profile =
+                            token_index == 0 && phase_index == 0 && dispatch_index == 0;
+                        let is_last_profile = token_index + 1 == token_count
+                            && phase_index + 1 == phases.len()
+                            && dispatch_index + 1 == dispatches.len();
+                        if is_first_profile && is_last_profile {
+                            return Err(ReplayError::InvalidBatchShape(
+                                "derived profiling needs distinct first and last dispatches",
+                            ));
+                        }
+                        let completion_signal = if policies.profile_all_dispatches {
+                            let signal = profiling_signals[full_profile_index].raw();
+                            full_profile_index += 1;
+                            signal
+                        } else if covers_batch && is_first_profile {
+                            profiling_signals[lane].raw()
+                        } else if covers_batch && is_last_profile {
+                            profiling_signals[2 + lane].raw()
+                        } else {
+                            abi::Signal(0)
+                        };
+                        let packet = KernelDispatchPacket::new_with_policy(
+                            dispatch.kernel.metadata(),
+                            dispatch.geometry,
+                            0,
+                            dispatch.kernarg.address(),
+                            completion_signal,
+                            dispatch_policies[phase_index][lane][dispatch_index],
+                        )?;
+                        batches[lane].push(PacketImage::kernel(&packet));
+                    }
+                    let consolidation = BarrierAndPacket::new_with_policy(
+                        &[],
+                        token_phase_tail_signals[token_index][phase_index][lane].raw(),
+                        policies.consolidation,
+                    )?;
+                    batches[lane].push(PacketImage::barrier(&consolidation));
+                }
+            }
+        }
+
+        let final_phase = token_phase_tail_signals
+            .last()
+            .and_then(|token| token.last())
+            .expect("tokens and phases are nonempty");
+        if policies.profile_all_dispatches {
+            debug_assert_eq!(full_profile_index, profiling_signals.len());
+        }
+        let completion = BarrierAndPacket::new_with_policy(
+            &[final_phase[0].raw(), final_phase[1].raw()],
+            final_signal.raw(),
+            policies.terminal,
+        )?;
+        batches[0].push(PacketImage::barrier(&completion));
+        debug_assert_eq!([batches[0].len(), batches[1].len()], packet_counts);
+        for (lane, batch) in batches.iter().enumerate() {
+            let capacity = queues.size(lane).expect("two queues were created") as usize;
+            if batch.len() > capacity {
+                return Err(ReplayError::BatchExceedsQueue {
+                    lane,
+                    packets: batch.len(),
+                    capacity,
+                });
+            }
+        }
+
+        Ok(Self {
+            queues,
+            phases,
+            token_phase_tail_signals,
+            final_signal,
+            batches,
+            token_count,
+            in_flight: false,
+            usable: true,
+            derived_profiling: timestamp_frequency_hz.map(|frequency_hz| DerivedProfiling {
+                device: device.clone(),
+                signals: profiling_signals,
+                mode: profiling_mode.expect("frequency implies profiling mode"),
+                frequency_hz,
+            }),
+        })
+    }
+
+    pub fn queue_ids(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.queues.queue_ids()
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    /// Patch stable kernarg allocations while no packet batch is in flight.
+    /// Packet images retain the same kernarg addresses, so replay-time scalar
+    /// values and resource pointers do not require packet reconstruction.
+    pub(crate) fn patch_kernargs<E>(
+        &mut self,
+        mut patch: impl FnMut(usize, usize, usize, &mut KernargBuffer) -> Result<(), E>,
+    ) -> Result<(), E> {
+        assert!(
+            !self.in_flight,
+            "cannot patch kernargs while AQL work is in flight"
+        );
+        for (phase_index, phase) in self.phases.iter_mut().enumerate() {
+            for (lane, dispatches) in phase.lanes.iter_mut().enumerate() {
+                for (dispatch_index, dispatch) in dispatches.iter_mut().enumerate() {
+                    patch(phase_index, lane, dispatch_index, dispatch.kernarg_mut())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn batch_packet_counts(&self) -> [usize; 2] {
+        [self.batches[0].len(), self.batches[1].len()]
+    }
+
+    pub fn completion_signal_count(&self) -> usize {
+        self.token_phase_tail_signals
+            .iter()
+            .map(|token| token.len() * 2)
+            .sum::<usize>()
+            + 1
+    }
+
+    pub fn doorbell_writes_per_replay(&self) -> usize {
+        2
+    }
+
+    pub(crate) fn gpu_batch_timing(&self) -> Result<GpuMultiQueueTiming, ReplayError> {
+        if self.in_flight {
+            return Err(ReplayError::AlreadyInFlight);
+        }
+        let profiling = self
+            .derived_profiling
+            .as_ref()
+            .ok_or(ReplayError::ProfilingUnavailable)?;
+        let mut first_start = u64::MAX;
+        let mut last_end = 0_u64;
+        match profiling.mode {
+            DerivedProfilingMode::QueueEdges => {
+                for signal in &profiling.signals[..2] {
+                    first_start = first_start.min(profiling.device.dispatch_time(signal)?.start);
+                }
+                for signal in &profiling.signals[2..] {
+                    last_end = last_end.max(profiling.device.dispatch_time(signal)?.end);
+                }
+            }
+            DerivedProfilingMode::AllDispatches => {
+                for signal in &profiling.signals {
+                    let time = profiling.device.dispatch_time(signal)?;
+                    first_start = first_start.min(time.start);
+                    last_end = last_end.max(time.end);
+                }
+            }
+        }
+        Ok(GpuMultiQueueTiming {
+            first_start,
+            last_end,
+            frequency_hz: profiling.frequency_hz,
+        })
+    }
+
+    /// Submit the complete serialized token batch.
+    ///
+    /// # Safety
+    ///
+    /// Kernarg bytes may encode arbitrary device pointers. Every pointee must
+    /// remain allocated, GPU-accessible, and free of incompatible host/agent
+    /// mutation until an explicit `wait` or `cancel` returns `Ok`. After any
+    /// `Err`, or after dropping a submission ticket, every pointee must instead
+    /// remain valid through destruction of this graph. Only `Ok` proves
+    /// quiescence.
+    pub unsafe fn submit(&mut self) -> Result<TwoQueueBatchSubmission<'_>, ReplayError> {
+        if self.in_flight {
+            return Err(ReplayError::AlreadyInFlight);
+        }
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
+        }
+        for token in &mut self.token_phase_tail_signals {
+            for phase in token {
+                for signal in phase {
+                    signal.reset();
+                }
+            }
+        }
+        if let Some(profiling) = &mut self.derived_profiling {
+            for signal in &mut profiling.signals {
+                signal.reset();
+            }
+        }
+        self.final_signal.reset();
+        if let Err(error) = self.queues.prepare_batches(&self.batches) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        self.in_flight = true;
+        if let Err(error) = self.queues.ring_prepared() {
+            self.in_flight = false;
+            self.usable = false;
+            return Err(error.into());
+        }
+        Ok(TwoQueueBatchSubmission {
+            graph: self,
+            completed: false,
+        })
+    }
+
+    /// Submit and wait for the complete token batch using the default finite
+    /// timeout.
+    ///
+    /// # Safety
+    ///
+    /// The pointer and access contract is identical to [`Self::submit`].
+    pub unsafe fn replay_and_wait(&mut self) -> Result<(), ReplayError> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.submit()? }.wait()
+    }
+
+    fn wait_internal(&mut self, timeout: Duration) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.wait_signal(&self.final_signal, timeout) {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Completed,
+                );
+                Ok(())
+            }
+            Err(wait_error) => match self.queues.inactivate_all() {
+                Ok(()) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Cancelled,
+                    );
+                    Err(wait_error.into())
+                }
+                Err(teardown_error) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Failed,
+                    );
+                    Err(RuntimeError::OperationAndTeardown {
+                        operation: Box::new(wait_error),
+                        teardown: Box::new(teardown_error),
+                    }
+                    .into())
+                }
+            },
+        }
+    }
+
+    fn wait_with_queue_depth_internal(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<QueueDepthReport, ReplayError> {
+        if !self.in_flight {
+            return Ok(QueueDepthReport::new(self.queues.queue_ids()));
+        }
+        match self
+            .queues
+            .wait_signal_with_queue_depth(&self.final_signal, timeout)
+        {
+            Ok(report) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Completed,
+                );
+                Ok(report)
+            }
+            Err(wait_error) => match self.queues.inactivate_all() {
+                Ok(()) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Cancelled,
+                    );
+                    Err(wait_error.into())
+                }
+                Err(teardown_error) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Failed,
+                    );
+                    Err(RuntimeError::OperationAndTeardown {
+                        operation: Box::new(wait_error),
+                        teardown: Box::new(teardown_error),
+                    }
+                    .into())
+                }
+            },
+        }
+    }
+
+    fn cancel_internal(&mut self) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.inactivate_all() {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Cancelled,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Failed,
+                );
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl Drop for TwoQueueSerializedBatchGraph {
+    fn drop(&mut self) {
+        let _ = self.cancel_internal();
+    }
+}
+
+#[must_use = "wait or cancel the AQL batch submission to observe completion/teardown errors"]
+pub struct TwoQueueBatchSubmission<'a> {
+    graph: &'a mut TwoQueueSerializedBatchGraph,
+    completed: bool,
+}
+
+impl TwoQueueBatchSubmission<'_> {
+    pub fn wait(self) -> Result<(), ReplayError> {
+        self.wait_timeout(DEFAULT_WAIT_TIMEOUT)
+    }
+
+    pub fn wait_timeout(mut self, timeout: Duration) -> Result<(), ReplayError> {
+        let result = self.graph.wait_internal(timeout);
+        self.completed = true;
+        result
+    }
+
+    /// Wait while polling both queues' relaxed read/write indices.
+    ///
+    /// This is a diagnostic path and perturbs host polling. Ordinary `wait`
+    /// and `wait_timeout` do not perform queue-index loads.
+    pub fn wait_with_queue_depth(self) -> Result<QueueDepthReport, ReplayError> {
+        self.wait_timeout_with_queue_depth(DEFAULT_WAIT_TIMEOUT)
+    }
+
+    /// Diagnostic queue-depth wait with an explicit finite timeout.
+    pub fn wait_timeout_with_queue_depth(
+        mut self,
+        timeout: Duration,
+    ) -> Result<QueueDepthReport, ReplayError> {
+        let result = self.graph.wait_with_queue_depth_internal(timeout);
+        self.completed = true;
+        result
+    }
+
+    pub fn cancel(mut self) -> Result<(), ReplayError> {
+        let result = self.graph.cancel_internal();
+        self.completed = true;
+        result
+    }
+}
+
+impl Drop for TwoQueueBatchSubmission<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.graph.cancel_internal();
+        }
+    }
+}
+
+fn two_queue_batch_counts(phases: &[[usize; 2]]) -> [usize; 2] {
+    if phases.is_empty() {
+        return [0, 0];
+    }
+    let boundary_barriers = phases.len() - 1;
+    let mut packets = [boundary_barriers + 1, boundary_barriers];
+    for phase in phases {
+        packets[0] += phase[0];
+        packets[1] += phase[1];
+    }
+    packets
+}
+
+fn validate_derived_policy_shape(
+    phases: &[TwoQueuePhase],
+    policies: &TwoQueueDerivedPolicies,
+) -> Result<(), ReplayError> {
+    for (label, dispatches) in [
+        ("first-token", &policies.first_dispatches),
+        ("repeated-token", &policies.repeated_dispatches),
+    ] {
+        if dispatches.len() != phases.len() {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: format!(
+                    "{label} policy has {} phases, graph has {}",
+                    dispatches.len(),
+                    phases.len()
+                ),
+            });
+        }
+        for (phase_index, (phase, phase_policies)) in phases.iter().zip(dispatches).enumerate() {
+            for lane in 0..2 {
+                if phase_policies[lane].len() != phase.lanes[lane].len() {
+                    return Err(ReplayError::PolicyShapeMismatch {
+                        detail: format!(
+                            "{label} phase {phase_index} lane {lane} has {} policies, {} dispatches",
+                            phase_policies[lane].len(),
+                            phase.lanes[lane].len()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn two_queue_serialized_batch_counts(
+    phases: &[[usize; 2]],
+    token_count: usize,
+) -> Result<[usize; 2], ReplayError> {
+    if token_count == 0 {
+        return Err(ReplayError::EmptyTokenBatch);
+    }
+    if phases.is_empty() {
+        return Err(ReplayError::EmptyPhaseSet);
+    }
+    let phase_barriers = (phases.len() - 1)
+        .checked_mul(token_count)
+        .ok_or(ReplayError::BatchShapeOverflow)?;
+    let token_barriers = token_count - 1;
+    let mut packets = [0_usize; 2];
+    for lane in 0..2 {
+        let dispatches_per_token = phases.iter().try_fold(0_usize, |sum, phase| {
+            sum.checked_add(phase[lane])
+                .ok_or(ReplayError::BatchShapeOverflow)
+        })?;
+        packets[lane] = dispatches_per_token
+            .checked_mul(token_count)
+            .and_then(|count| count.checked_add(phase_barriers))
+            .and_then(|count| count.checked_add(token_barriers))
+            .and_then(|count| count.checked_add(usize::from(lane == 0)))
+            .ok_or(ReplayError::BatchShapeOverflow)?;
+    }
+    Ok(packets)
+}
+
+fn two_queue_serialized_signal_count(
+    phase_count: usize,
+    token_count: usize,
+) -> Result<usize, ReplayError> {
+    if token_count == 0 {
+        return Err(ReplayError::EmptyTokenBatch);
+    }
+    phase_count
+        .checked_mul(token_count)
+        .and_then(|count| count.checked_mul(2))
+        .and_then(|count| count.checked_add(1))
+        .ok_or(ReplayError::BatchShapeOverflow)
+}
+
+fn validate_two_queue_phases(
+    device: &GpuDevice,
+    phases: &[TwoQueuePhase],
+) -> Result<(), ReplayError> {
+    for phase in phases {
+        for dispatches in &phase.lanes {
+            for dispatch in dispatches {
+                if dispatch.kernel.agent() != device.raw_gpu_agent()
+                    || dispatch.kernarg.agent() != device.raw_gpu_agent()
+                {
+                    return Err(ReplayError::MixedGpuObjects);
+                }
+                device.validate_geometry(dispatch.geometry)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_nodes(
+    device: &GpuDevice,
+    queue_count: usize,
+    nodes: &[RecordedDispatch],
+) -> Result<(), ReplayError> {
+    if queue_count == 0 {
+        return Err(ReplayError::Runtime(RuntimeError::ZeroQueues));
+    }
+    for (index, node) in nodes.iter().enumerate() {
+        if node.lane >= queue_count {
+            return Err(ReplayError::LaneOutOfRange {
+                node: index,
+                lane: node.lane,
+                queue_count,
+            });
+        }
+        if node.kernel.agent() != device.raw_gpu_agent()
+            || node.kernarg.agent() != device.raw_gpu_agent()
+        {
+            return Err(ReplayError::MixedGpuObjects);
+        }
+        device.validate_geometry(node.geometry)?;
+        let mut unique = BTreeSet::new();
+        for dependency in &node.dependencies {
+            if *dependency >= index {
+                return Err(ReplayError::DependencyNotEarlier {
+                    node: index,
+                    dependency: *dependency,
+                });
+            }
+            if !unique.insert(*dependency) {
+                return Err(ReplayError::DuplicateDependency {
+                    node: index,
+                    dependency: *dependency,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum ReplayError {
+    Runtime(RuntimeError),
+    Packet(PacketError),
+    EmptyGraph,
+    EmptyPhaseSet,
+    EmptyTokenBatch,
+    InvalidBatchShape(&'static str),
+    BatchShapeOverflow,
+    EmptyPhaseLane {
+        lane: usize,
+    },
+    PhaseLaneMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    PhaseHasExplicitDependencies {
+        lane: usize,
+    },
+    AlreadyInFlight,
+    GraphInactive,
+    LaneOutOfRange {
+        node: usize,
+        lane: usize,
+        queue_count: usize,
+    },
+    DependencyNotEarlier {
+        node: usize,
+        dependency: usize,
+    },
+    DuplicateDependency {
+        node: usize,
+        dependency: usize,
+    },
+    BatchExceedsQueue {
+        lane: usize,
+        packets: usize,
+        capacity: usize,
+    },
+    MixedGpuObjects,
+    KernargMetadataMismatch {
+        kernel: String,
+        metadata_bytes: usize,
+        buffer_bytes: usize,
+    },
+    PolicyShapeMismatch {
+        detail: String,
+    },
+    ProfilingUnavailable,
+    ProfilingDoesNotCoverBatch,
+}
+
+impl From<RuntimeError> for ReplayError {
+    fn from(value: RuntimeError) -> Self {
+        Self::Runtime(value)
+    }
+}
+
+impl From<PacketError> for ReplayError {
+    fn from(value: PacketError) -> Self {
+        Self::Packet(value)
+    }
+}
+
+impl fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime(error) => error.fmt(f),
+            Self::Packet(error) => error.fmt(f),
+            Self::EmptyGraph => write!(f, "cannot record an empty AQL graph"),
+            Self::EmptyPhaseSet => write!(f, "two-queue replay requires at least one phase"),
+            Self::EmptyTokenBatch => {
+                write!(f, "serialized two-queue replay requires at least one token")
+            }
+            Self::InvalidBatchShape(detail) => write!(f, "invalid AQL batch shape: {detail}"),
+            Self::BatchShapeOverflow => {
+                write!(f, "serialized two-queue packet or signal count overflowed")
+            }
+            Self::EmptyPhaseLane { lane } => {
+                write!(f, "two-queue phase lane {lane} has no dispatches")
+            }
+            Self::PhaseLaneMismatch { expected, actual } => write!(
+                f,
+                "two-queue phase expected lane {expected}, dispatch uses lane {actual}"
+            ),
+            Self::PhaseHasExplicitDependencies { lane } => write!(
+                f,
+                "two-queue phase lane {lane} has per-node dependencies; use phase boundaries instead"
+            ),
+            Self::AlreadyInFlight => write!(f, "the previous AQL replay is still in flight"),
+            Self::GraphInactive => write!(
+                f,
+                "the AQL graph was inactivated after cancellation, timeout, or queue fault"
+            ),
+            Self::LaneOutOfRange {
+                node,
+                lane,
+                queue_count,
+            } => write!(
+                f,
+                "node {node} uses lane {lane}, but only {queue_count} queues exist"
+            ),
+            Self::DependencyNotEarlier { node, dependency } => write!(
+                f,
+                "node {node} dependency {dependency} is not earlier in record order"
+            ),
+            Self::DuplicateDependency { node, dependency } => {
+                write!(f, "node {node} repeats dependency {dependency}")
+            }
+            Self::BatchExceedsQueue {
+                lane,
+                packets,
+                capacity,
+            } => write!(
+                f,
+                "lane {lane} recorded batch has {packets} packets; one-doorbell queue capacity is {capacity}"
+            ),
+            Self::MixedGpuObjects => write!(
+                f,
+                "kernel, kernarg allocation, and queue device must use one HSA GPU agent"
+            ),
+            Self::KernargMetadataMismatch {
+                kernel,
+                metadata_bytes,
+                buffer_bytes,
+            } => write!(
+                f,
+                "kernel {kernel:?} metadata requires {metadata_bytes} kernarg bytes, buffer has {buffer_bytes}"
+            ),
+            Self::PolicyShapeMismatch { detail } => {
+                write!(f, "derived packet policy shape mismatch: {detail}")
+            }
+            Self::ProfilingUnavailable => write!(f, "AQL batch profiling is not enabled"),
+            Self::ProfilingDoesNotCoverBatch => write!(
+                f,
+                "last dispatches are barrier-free, so first/last queue timestamps do not cover the batch"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_batch_span_uses_first_and_last_kernel_timestamps() {
+        let timing = GpuBatchTiming {
+            first_start: 100,
+            first_end: 140,
+            last_start: 900,
+            last_end: 1_100,
+            frequency_hz: 1_000_000,
+        };
+        assert_eq!(timing.span_microseconds(), 1_000.0);
+        assert_eq!(timing.dispatch_span_microseconds(), 1_000.0);
+    }
+
+    #[test]
+    fn arbitrary_fan_in_is_chunked_into_five_signal_packets() {
+        let dependencies = (1_u64..=12).map(abi::Signal).collect::<Vec<_>>();
+        let packets = dependencies
+            .chunks(BARRIER_DEPENDENCY_CAPACITY)
+            .map(|chunk| BarrierAndPacket::new(chunk, abi::Signal(0)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].dependency_signals[4], abi::Signal(5));
+        assert_eq!(packets[2].dependency_signals[0], abi::Signal(11));
+        assert_eq!(packets[2].dependency_signals[1], abi::Signal(12));
+        assert_eq!(packets[2].dependency_signals[2], abi::Signal(0));
+    }
+
+    #[test]
+    fn measured_two_phase_shape_is_six_and_five_packets_with_two_doorbells() {
+        // Two roots per queue, one cross-queue phase barrier per queue, two
+        // children per queue, and one final fan-in on queue zero.
+        assert_eq!(two_queue_batch_counts(&[[2, 2], [2, 2]]), [6, 5]);
+    }
+
+    #[test]
+    fn serialized_two_queue_batch_counts_match_one_and_one_hundred_tokens() {
+        let phases = [[2, 2], [2, 2]];
+        assert_eq!(
+            two_queue_serialized_batch_counts(&phases, 1).unwrap(),
+            [6, 5]
+        );
+        assert_eq!(
+            two_queue_serialized_batch_counts(&phases, 100).unwrap(),
+            [600, 599]
+        );
+        assert_eq!(two_queue_serialized_signal_count(2, 1).unwrap(), 5);
+        assert_eq!(two_queue_serialized_signal_count(2, 100).unwrap(), 401);
+    }
+
+    #[test]
+    fn serialized_two_queue_batch_rejects_empty_and_overflowing_shapes() {
+        assert!(matches!(
+            two_queue_serialized_batch_counts(&[[2, 2]], 0),
+            Err(ReplayError::EmptyTokenBatch)
+        ));
+        assert!(matches!(
+            two_queue_serialized_batch_counts(&[[usize::MAX, 1]], 2),
+            Err(ReplayError::BatchShapeOverflow)
+        ));
+        assert!(matches!(
+            two_queue_serialized_signal_count(usize::MAX, 2),
+            Err(ReplayError::BatchShapeOverflow)
+        ));
+    }
+
+    #[test]
+    fn failed_quiescence_retains_in_flight_state_for_drop_retry() {
+        let mut in_flight = true;
+        let mut usable = true;
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Failed);
+        assert!(in_flight);
+        assert!(!usable);
+    }
+
+    #[test]
+    fn only_successful_completion_or_cancellation_clears_in_flight() {
+        let mut in_flight = true;
+        let mut usable = true;
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Completed);
+        assert!(!in_flight);
+        assert!(usable);
+
+        in_flight = true;
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
+        assert!(!in_flight);
+        assert!(!usable);
+    }
+}
