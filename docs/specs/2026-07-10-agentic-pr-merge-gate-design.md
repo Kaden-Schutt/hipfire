@@ -233,21 +233,29 @@ Isolation-clean ≠ merge-clean. Gate 4 performs the actual merge into the
 **derived** branch, deterministically rebuilt from `master + the approved set`
 (so a stale/dropped approval self-heals).
 
-1. A PR that passes gates 0–3b is **folded onto staging**; Gate 4 verifies
-   non-clobber against the **staging tip** (= master + prior approved stack), so
-   each PR stacks coherently on the others, not just on master.
+1. A PR that passes gates 0–3b is **folded onto staging**. Gate 4 trial-merges it
+   against the **staging tip** (= master + prior approved stack). Clean → it folds.
+   **On a clobber the pipeline RESOLVES it — it does not punt.** Gate 4 dispatches
+   the codex merge-fix (§10): rebase the PR onto the staging tip / resolve the
+   specific conflict, then re-trial; the fold succeeds if the fix lands cleanly.
+   Only a conflict codex **cannot** resolve — or a **fork** PR whose branch the
+   agent cannot push the fix to — becomes a BOD, itemized with the split reason:
+   *"rebase on master"* for a stale-vs-master conflict, *"conflicts with approved
+   PR #X"* for a genuine stack interaction (per the §11 dry-run).
 2. Approved PRs **accumulate** on staging (they stay "open" on GitHub; content
    rides staging).
 3. **Any landing event flushes the whole train:** Kaden's auto-merge **or** a
-   maintainer `@claude /merge` lands the **entire staging stack** on master in
-   one non-clobber merge — merging one PR carries **all** currently-approved PRs
-   with it. Folded PRs then **close behind it**.
+   maintainer `/merge` lands the **entire staging stack** on master in one
+   non-clobber merge — merging one PR carries **all** currently-approved PRs with
+   it. Folded PRs then **close behind it**.
 4. staging **re-syncs to master** after every landing (§13) → never stale.
 
-**Only debt = a denied PR the contributor has not re-attempted.** Approved PRs
-are never debt — they are always on the train. The perf baseline for an
-individual PR is the staging tip, so the *stack as a whole* cannot regress; on
-landing the master tip is re-measured for the drift guard (§6.2).
+**Debt = only a conflict codex could not resolve (or a fork it cannot push a fix
+to) — not any conflict.** A clobbering fold first goes through the Gate-4 merge-fix;
+the pipeline **resolves before it punts**. Approved, resolvable PRs are always on
+the train. The perf baseline for an individual PR is the staging tip, so the *stack
+as a whole* cannot regress; on landing the master tip is re-measured for the drift
+guard (§6.2).
 
 **GitHub close semantics:** landing is a real (non-squash) merge so folded
 commits become master ancestors; each folded PR is closed with a
