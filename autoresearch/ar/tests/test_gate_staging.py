@@ -38,3 +38,56 @@ def test_recall_reproduce_empty_recorded_is_trivially_reproduced():
 
     out = recall_reproduce("pr", "merged", [], "/r", reproduce_fn=rf)
     assert out["reproduced"] is True and called["n"] == 0   # nothing to reproduce -> no call
+
+
+from autoresearch.ar.gate.staging import fold_pr
+
+
+def _clean_tm(base, head, repo):
+    return {"clean": True, "merged_tree": "merged-" + head, "conflicts": []}
+
+
+def _conflict_tm(base, head, repo):
+    return {"clean": False, "merged_tree": "t", "conflicts": ["f.rs"]}
+
+
+def _repro(ok):
+    return lambda pr, merged, rec, repo: {"reproduced": ok, "failures": [] if ok else ["behavior:x"]}
+
+
+_K = dict(master_ref="master", repo="/r", recorded=["parity"])
+
+
+def test_clean_fold_reproduces_is_folded():
+    r = fold_pr(pr_ref="pr1", staging_ref="stg", **_K,
+                trial_merge_fn=_clean_tm, merge_fix_fn=None, reproduce_fn=_repro(True))
+    assert r["verdict"] == "FOLDED" and r["staging_ref"] == "merged-pr1"
+
+
+def test_clean_fold_but_behavior_broken_is_bod_clobber():
+    r = fold_pr(pr_ref="pr1", staging_ref="stg", **_K,
+                trial_merge_fn=_clean_tm, merge_fix_fn=None, reproduce_fn=_repro(False))
+    assert r["verdict"] == "BOD" and r["reason"] == "clobber"
+
+
+def test_conflict_no_fixer_is_bod_with_split_reason():
+    # conflicts on staging; clean vs master -> 'stack'
+    def tm(base, head, repo):
+        return {"clean": base == "master", "merged_tree": "t", "conflicts": ["f"]}
+    r = fold_pr(pr_ref="pr1", staging_ref="stg", **_K,
+                trial_merge_fn=tm, merge_fix_fn=None, reproduce_fn=_repro(True))
+    assert r["verdict"] == "BOD" and r["reason"] == "stack"
+
+
+def test_conflict_fixed_then_reproduces_is_folded():
+    calls = {"n": 0}
+
+    def tm(base, head, repo):
+        calls["n"] += 1
+        # first trial (on 'stg') conflicts; after fix, trial on 'fixed' is clean
+        return {"clean": base == "fixed", "merged_tree": "merged", "conflicts": ["f"]}
+
+    fix = lambda pr, stg, repo: {"resolved": True, "staging_ref": "fixed"}
+    r = fold_pr(pr_ref="pr1", staging_ref="stg", **_K,
+                trial_merge_fn=tm, merge_fix_fn=fix, reproduce_fn=_repro(True))
+    assert r["verdict"] == "FOLDED" and r["staging_ref"] == "merged"
