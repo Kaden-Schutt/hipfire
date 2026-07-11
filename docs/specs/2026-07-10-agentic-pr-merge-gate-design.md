@@ -216,7 +216,7 @@ same PR/base/head before interpretation is allowed.
 ### 8.1 Executor routing (Claude tiers codex by the risk it read)
 
 Having classified the diff semantically, Claude sets `(harness, model, effort)`
-for each bespoke behavior test's on-box executor via `agent_exec`. The
+for each bespoke behavior test's bounded, gate-local on-box executor. The
 `classify_pr` floor pins the **minimum** tier; Claude escalates from there. The
 table lives in `pr_gate.toml`, re-tuned from the ledger's per-tier
 false-pass/false-reject rates:
@@ -231,25 +231,15 @@ false-pass/false-reject rates:
 codex authenticates **box-local** on hipx/hiptrx (not a GitHub secret). pi.dev
 slots in as a fourth harness when added (§Phase 6).
 
-**Codex usage-limit resilience.** codex exec can refuse a round when the box's
-codex account is out of usage. `agent_exec.run_round_resilient` (the seam every
-gate codex round runs through — behavior tests §8 *and* the Gate-4 merge-fix §11)
-distinguishes that refusal (nonzero exit **plus** a usage-limit marker in codex's
-output) from a genuine task failure and reacts by tier:
-
-- **non-sol** (luna/terra) round → **fall back to grok** immediately with the
-  identical prompt (grok is a fine substitute at these tiers; `$GATE_GROK_MODEL`,
-  default `grok-4.5`). grok exists on hiptrx; on a box without grok the fallback
-  round simply fails and the PR punts — never a false pass.
-- **sol** (`gpt-5.6-sol`, high-risk / merge-conflict) round → the top
-  intelligence tier is *required*, so we do **not** degrade to grok. We **wait**
-  `CODEX_RESET_POLL_SECS` (default 900s) and retry codex, up to `CODEX_MAX_WAITS`
-  (default 8) times, until codex resets. Exhausting the wait budget returns
-  codex's failing rc (the PR punts) — a sol requirement is never silently
-  downgraded to a lower tier.
-
-A genuine codex error (nonzero exit **without** a usage marker) is returned as-is
-and never masked by a model swap.
+**Bounded behavior executor.** The merge gate does not call autoresearch's
+open-ended `agent_exec` or substitute another model on usage failure. It starts
+the exact dispatched Codex model in its own process group, polls the assigned
+structured-verdict file, and stops Codex plus any daemon/build children as soon
+as a valid verdict exists. `GATE_CODEX_TIMEOUT_SECS` sets the hard per-probe wall
+timeout (900 seconds by default). Timeout, usage refusal, nonzero exit, and
+missing/malformed verdict all fail closed as behavior evidence; none are retried
+or silently downgraded. Gate-4's later merge-fix research remains a separate
+workflow and may use the autoresearch resilience policy described in §11.
 
 ## 9. Offender location → contributor recommendation
 

@@ -51,7 +51,7 @@ def test_parse_plan_accepts_json_string_and_keeps_claude_escalation():
 def _writer(passed, detail="ok"):
     """A mock agent_exec_fn that writes a codex-style verdict file, returns rc 0.
     The verdict_path is embedded in the prompt; parse it out and honor it."""
-    def fn(*, harness, model, effort, prompt, cwd):
+    def fn(*, harness, model, effort, prompt, cwd, verdict_path):
         # extract the verdict path the runner asked codex to write to
         path = prompt.split("write your verdict as JSON to ")[1].split(":")[0].strip()
         with open(path, "w") as fh:
@@ -78,7 +78,7 @@ def test_behavior_test_fail_reports_detail(tmp_path):
 
 def test_behavior_test_missing_verdict_is_fail_not_silent_pass(tmp_path):
     # codex ran (rc 0) but wrote NO verdict -> must FAIL, never silently pass.
-    def no_verdict(*, harness, model, effort, prompt, cwd):
+    def no_verdict(*, harness, model, effort, prompt, cwd, verdict_path):
         return 0
     r = run_behavior_test({"what": "x", "prompt": "p"}, agent_exec_fn=no_verdict, cwd="/r",
                           verdict_path=str(tmp_path / "missing.json"))

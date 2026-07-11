@@ -8,8 +8,8 @@ This module is the deterministic glue around that plan:
   * parse_plan   — parse Claude's plan and apply the classify_pr FLOOR to its risk
                    (escalate-only: Claude can go higher than the path floor, never
                    lower — a kernel PR can't be de-classified to trivial).
-  * run_behavior_test(s) — execute each bespoke test via the injected codex seam
-                   (agent_exec), reading a structured verdict codex writes. This is
+  * run_behavior_test(s) — execute each bespoke test via the injected bounded
+                   gate-local Codex seam, reading a structured verdict Codex writes. This is
                    the "codex tests beyond serve_harness" piece — codex runs the
                    test GENERALLY on-box (build / run the new path / verify), not
                    bound to serve_harness.
@@ -18,7 +18,7 @@ This module is the deterministic glue around that plan:
                    behavior test passed.
 
 Everything here is pure/no-GPU with an injected agent_exec_fn; the only real GPU/
-codex touch is agent_exec itself in production.
+Codex touch is the gate-local executor itself in production.
 """
 from __future__ import annotations
 
@@ -337,7 +337,7 @@ def verify_evidence(plan: dict, *, results_dir, behavior_dir, pr, base_sha, head
 
 def run_behavior_test(bt, *, agent_exec_fn, cwd, verdict_path) -> dict:
     """Run ONE bespoke behavior test via codex. ``agent_exec_fn(harness, model, effort,
-    prompt, cwd) -> int`` is the injected seam (agent_exec.run_round in prod). codex is
+    prompt, cwd, verdict_path) -> int`` is the injected seam. codex is
     told to write a structured verdict to ``verdict_path``; a missing/unreadable verdict
     is a FAIL (never a silent pass). Returns {what, passed, harness, model, detail}."""
     prompt = (
@@ -345,13 +345,14 @@ def run_behavior_test(bt, *, agent_exec_fn, cwd, verdict_path) -> dict:
         + f"\n\nExpected: {bt.get('expect', 'the behavior works correctly')}."
         + f"\nBuild/run whatever is needed to verify this on-box (you are NOT limited to"
         + f" serve_harness). When done, write your verdict as JSON to {verdict_path}:"
-        + ' {"passed": <true|false>, "detail": "<one-line reason>"}.'
+        + ' {"passed": <true|false>, "detail": "<one-line reason>"}. Then STOP immediately.'
     )
     exec_error = None
     try:
         rc = agent_exec_fn(
             harness=bt.get("harness", "codex"), model=bt.get("model"),
             effort=bt.get("effort", "high"), prompt=prompt, cwd=cwd,
+            verdict_path=verdict_path,
         )
     except Exception as e:
         # Executor discovery/auth/process errors are structured behavior failures,

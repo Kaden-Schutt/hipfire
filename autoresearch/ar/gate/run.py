@@ -78,18 +78,16 @@ def run_pr_gate(*, base, head, repo, author, is_draft, helpful, cfg: GateConfig,
 
 def run_behavior_plan(plan_path, *, repo, verdict_dir, base, head, run_git=None) -> dict:
     """Load Claude's dispatch plan.json, floor its risk (classify_pr), and run every
-    bespoke behavior test via codex (agent_exec) GENERALLY on-box — the piece that
+    bespoke behavior test via the bounded gate-local Codex executor on-box — the piece that
     tests behaviors serve_harness cannot reach. Returns {plan, behavior_results}."""
-    from ..agent_exec import run_round_resilient  # lazy: codex shell-out (+grok fallback), prod only
+    from .agent import run_codex_probe
     from . import dispatch
 
     with open(plan_path) as fh:
         raw = json.load(fh)
     plan = dispatch.parse_plan(raw, changed_files(base, head, repo, run_git=run_git))
-    # run_round_resilient: on a codex usage-limit, luna/terra tests fall back to grok;
-    # sol tests wait for codex to reset (no silent downgrade). Drop-in for run_round.
     results = dispatch.run_behavior_tests(
-        plan["behavior_tests"], agent_exec_fn=run_round_resilient, cwd=repo, verdict_dir=verdict_dir)
+        plan["behavior_tests"], agent_exec_fn=run_codex_probe, cwd=repo, verdict_dir=verdict_dir)
     return {"plan": plan, "behavior_results": results}
 
 
