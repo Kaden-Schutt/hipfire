@@ -1047,15 +1047,15 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
     }
 
     fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
-        if self.m.decoded_vocab.is_none() {
+        if self.m.persist.decoded_vocab.is_none() {
             let v: Vec<String> = {
                 let tok = self.m.tokenizer.as_ref().unwrap();
                 let n = tok.vocab_size();
                 (0..n).map(|id| tok.decode(&[id as u32])).collect()
             };
-            self.m.decoded_vocab = Some(std::sync::Arc::new(v));
+            self.m.persist.decoded_vocab = Some(std::sync::Arc::new(v));
         }
-        self.m.decoded_vocab.clone().unwrap()
+        self.m.persist.decoded_vocab.clone().unwrap()
     }
 
     fn has_eviction(&self) -> bool {
@@ -1071,7 +1071,7 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
     }
 
     fn insert_asst_turn(&mut self, fp: u64, seq: Vec<u32>) {
-        self.m.asst_turn_cache.insert(fp, seq);
+        self.m.persist.asst_turn_cache.insert(fp, seq);
     }
 }
 
@@ -1441,15 +1441,15 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
     }
 
     fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
-        if self.m.decoded_vocab.is_none() {
+        if self.m.persist.decoded_vocab.is_none() {
             let v: Vec<String> = {
                 let tok = self.m.tokenizer.as_ref().unwrap();
                 let n = tok.vocab_size();
                 (0..n).map(|id| tok.decode(&[id as u32])).collect()
             };
-            self.m.decoded_vocab = Some(std::sync::Arc::new(v));
+            self.m.persist.decoded_vocab = Some(std::sync::Arc::new(v));
         }
-        self.m.decoded_vocab.clone().unwrap()
+        self.m.persist.decoded_vocab.clone().unwrap()
     }
 
     fn has_eviction(&self) -> bool {
@@ -1465,7 +1465,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
     }
 
     fn insert_asst_turn(&mut self, fp: u64, seq: Vec<u32>) {
-        self.m.asst_turn_cache.insert(fp, seq);
+        self.m.persist.asst_turn_cache.insert(fp, seq);
     }
 }
 
@@ -2230,19 +2230,19 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
     fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
         // The grammar path (tool calls) needs the decoded-vocab table for token
         // masks; ep_serve_ds4 builds it inline (daemon.rs ~4578). Lazy-cache on
-        // m.decoded_vocab, identical to Qwen35Dispatch. Without this override the
+        // m.persist.decoded_vocab, identical to Qwen35Dispatch. Without this override the
         // trait default unimplemented!() panics the moment grammar activates — a
         // gap invisible to the non-grammar dual-run rows (caught by the tool-call
         // parity run, Axis B inc 5).
-        if self.m.decoded_vocab.is_none() {
+        if self.m.persist.decoded_vocab.is_none() {
             let v: Vec<String> = {
                 let tok = self.m.tokenizer.as_ref().unwrap();
                 let n = tok.vocab_size();
                 (0..n).map(|id| tok.decode(&[id as u32])).collect()
             };
-            self.m.decoded_vocab = Some(std::sync::Arc::new(v));
+            self.m.persist.decoded_vocab = Some(std::sync::Arc::new(v));
         }
-        self.m.decoded_vocab.clone().unwrap()
+        self.m.persist.decoded_vocab.clone().unwrap()
     }
 
     fn init_grammar(
@@ -4968,7 +4968,7 @@ fn dense_serve_via_ar_generate(
         let tok = m.tokenizer.as_ref().expect("dense serve: tokenizer");
         plan_prompt_cache(
             tok,
-            &mut m.asst_turn_cache,
+            &mut m.persist.asst_turn_cache,
             &m.session.conversation_tokens,
             m.eviction.is_none(),
             system_prompt,
@@ -5078,7 +5078,7 @@ fn generate_ep(
             prompt,
             think_mode,
             eos_tok,
-            &mut m.asst_turn_cache,
+            &mut m.persist.asst_turn_cache,
         )
     } else {
         let tokenizer = m.tokenizer.as_ref().unwrap();
@@ -5965,7 +5965,7 @@ fn generate_dflash(
             let tok = m.tokenizer.as_ref().unwrap();
             plan_prompt_cache(
                 tok,
-                &mut m.asst_turn_cache,
+                &mut m.persist.asst_turn_cache,
                 &m.session.conversation_tokens,
                 m.eviction.is_none(),
                 system_prompt,
@@ -6103,7 +6103,7 @@ fn generate_dflash(
                 emit_text.chars().take(60).collect::<String>(),
             );
         }
-        m.asst_turn_cache.insert(fp, cached_seq);
+        m.persist.asst_turn_cache.insert(fp, cached_seq);
     }
 
     // ── done envelope (qwen35-flavoured) ─────────────────────────
@@ -7798,7 +7798,7 @@ fn generate_multi(
     // commits to <tool_call>, reproducing the ChatML-noise-in-tool_call-body
     // attractor the single-GPU path masks via the qwen35 Matcher. The decoded
     // vocab is built into a request-local Vec rather than cached on `m`
-    // (m.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
+    // (m.persist.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
     // — pp>1 + tools is uncommon, so the per-request decode is acceptable.
     let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
     let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
@@ -10502,7 +10502,7 @@ fn generate(
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
             };
-            let cache_ref = &mut m.asst_turn_cache;
+            let cache_ref = &mut m.persist.asst_turn_cache;
             let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
                 &frame,
                 history,
@@ -10534,7 +10534,7 @@ fn generate(
                 }
             }
         } else {
-            let cache_ref = &mut m.asst_turn_cache;
+            let cache_ref = &mut m.persist.asst_turn_cache;
             hipfire_runtime::prompt_frame::build_cached_history(
                 tokenizer,
                 system_prompt,
@@ -11406,7 +11406,7 @@ fn generate_deepseek4_spec(
             prompt,
             think_mode,
             eos_tok,
-            &mut m.asst_turn_cache,
+            &mut m.persist.asst_turn_cache,
         )
     };
     if prompt_ids.is_empty() {
@@ -11479,13 +11479,13 @@ fn generate_deepseek4_spec(
     // did internally.
     let decoded_vocab: Option<std::sync::Arc<Vec<String>>> =
         if tools.map_or(false, |t| !t.is_empty()) {
-            if m.decoded_vocab.is_none() {
+            if m.persist.decoded_vocab.is_none() {
                 let tok = m.tokenizer.as_ref().expect("tokenizer present");
                 let n = tok.vocab_size();
                 let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
-                m.decoded_vocab = Some(std::sync::Arc::new(v));
+                m.persist.decoded_vocab = Some(std::sync::Arc::new(v));
             }
-            m.decoded_vocab.clone()
+            m.persist.decoded_vocab.clone()
         } else {
             None
         };
@@ -11622,7 +11622,7 @@ fn generate_deepseek4(
         prompt,
         think_mode,
         eos_tok,
-        &mut m.asst_turn_cache,
+        &mut m.persist.asst_turn_cache,
     );
 
     if prompt_ids.is_empty() {
@@ -11983,20 +11983,20 @@ fn generate_deepseek4(
         // Precompute (or fetch the cached) decoded vocab. `tokenizer.decode`
         // per id over ~129k ids is allocator-heavy enough that doing it
         // per-request adds tens of ms of pure overhead to every tool-
-        // using V4F turn. The cache lives on `LoadedModel.decoded_vocab`
+        // using V4F turn. The cache lives on `LoadedModel.persist.decoded_vocab`
         // as an `Arc<Vec<String>>` and is cleared on model unload.
         //
-        // Borrow note: `m.decoded_vocab` is a disjoint field from
+        // Borrow note: `m.persist.decoded_vocab` is a disjoint field from
         // `m.state` (whose `ModelState::Deepseek4` bundle `state` holds `&mut`
         // to) and from `m.tokenizer` (which `tokenizer` holds `&` to), so the
         // assignment compiles under Rust's split-borrows.
         let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
-            if m.decoded_vocab.is_none() {
+            if m.persist.decoded_vocab.is_none() {
                 let n = tokenizer.vocab_size();
                 let v: Vec<String> = (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
-                m.decoded_vocab = Some(std::sync::Arc::new(v));
+                m.persist.decoded_vocab = Some(std::sync::Arc::new(v));
             }
-            m.decoded_vocab.clone()
+            m.persist.decoded_vocab.clone()
         } else {
             None
         };
@@ -12154,7 +12154,7 @@ fn generate_deepseek4(
                     cached_seq.len(),
                 );
             }
-            m.asst_turn_cache.insert(fp, cached_seq);
+            m.persist.asst_turn_cache.insert(fp, cached_seq);
         }
     }
 

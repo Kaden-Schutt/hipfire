@@ -380,8 +380,6 @@ pub struct LoadedModel {
     pub eviction: Option<Eviction>,
     pub session: SessionState,
     pub persist: PersistState,
-    pub asst_turn_cache: AsstTurnCache,
-    pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
     /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
@@ -445,9 +443,7 @@ impl LoadedModel {
             physical_cap,
             eviction: None,
             session: SessionState::default(),
-            persist: PersistState::default(),
-            asst_turn_cache: AsstTurnCache::new_from_env(),
-            decoded_vocab: None,
+            persist: PersistState { asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None },
             model_path,
             speculator: None,
             chat_template,
