@@ -19,6 +19,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 
 from .config import GateConfig
 from .merge import default_run_git
@@ -117,6 +118,9 @@ def interpret_results(*, results_dir, base, head, repo, author, is_draft, helpfu
             "outcome": outcome, "comment": format_pr_comment(outcome, arch_results)}
 
 
+_ARCH_SUFFIX = re.compile(r"\.(gfx[0-9a-z_]+)\.hip$")
+
+
 def daemon_touched(files) -> bool:
     """True iff the diff changes code COMPILED INTO the daemon (so the daemon binary
     can differ base-vs-head). Changes under autoresearch/, docs/, .github/, cli/,
@@ -125,12 +129,36 @@ def daemon_touched(files) -> bool:
                for f in files)
 
 
+def _file_archs(f, cfg) -> list:
+    """Which GATED archs a single changed file affects.
+    - crates/ or Cargo.*  → ALL archs (shared Rust in the daemon).
+    - kernels/**/*.gfxNNNN.hip → just gfxNNNN (an arch-suffixed kernel is that arch's
+      variant only); a suffix for an arch we don't gate → none.
+    - kernels/** shared (no arch suffix) → ALL archs (conservative — a shared kernel
+      or an internal #if-gated block could touch any arch).
+    - anything else (docs/ar/CI) → none."""
+    if f.startswith("crates/") or f.startswith("Cargo."):
+        return list(cfg.archs)
+    if f.startswith("kernels/"):
+        m = _ARCH_SUFFIX.search(f)
+        if m:
+            a = m.group(1)
+            return [a] if a in cfg.archs else []
+        return list(cfg.archs)
+    return []
+
+
 def affected_archs(files, cfg) -> list:
-    """The archs whose GPU battery must actually run (§4.1 arch→box deferral). A
-    daemon-relevant change conservatively affects ALL fitting archs (narrowing to the
-    specific gfxNNNN a kernel #if-gates is a later optimization); a non-daemon change
-    (docs/ar/CI-only) affects NONE — every box defers to a no-op PASS."""
-    return list(cfg.archs) if daemon_touched(files) else []
+    """The archs whose GPU battery must actually run (§4.1 arch→box deferral), ordered
+    by ``cfg.archs``. An arch-SPECIFIC change (``foo.gfx1201.hip``) affects only that
+    arch, so the other box defers it (hipx runs nothing, hiptrx runs gfx1201); a shared
+    daemon change affects ALL archs; a non-daemon change (docs/ar/CI) affects NONE.
+    Combined with the box→arch matrix ownership, this makes the deferral faithful: a
+    box only ever runs an arch it OWNS *and* the diff affects."""
+    got = set()
+    for f in files:
+        got.update(_file_archs(f, cfg))
+    return [a for a in cfg.archs if a in got]
 
 
 def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, model=None) -> dict:

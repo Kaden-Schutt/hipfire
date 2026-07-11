@@ -56,8 +56,23 @@ def test_daemon_touched_only_for_compiled_paths():
 def test_affected_archs_defers_on_non_daemon_change():
     # docs/ar-only (like #507) -> NO arch affected -> every box defers.
     assert affected_archs(["autoresearch/ar/gate/run.py", "docs/spec.md"], _Cfg()) == []
-    # a kernel change -> all fitting archs affected (conservative).
+    # a SHARED kernel change (no arch suffix) -> all archs (conservative: #if blocks).
     assert affected_archs(["kernels/src/gemv.hip"], _Cfg()) == ["gfx1100", "gfx1151", "gfx1201"]
+    # a Rust/crates change -> all archs (shared daemon code).
+    assert affected_archs(["crates/hipfire-runtime/src/x.rs"], _Cfg()) == ["gfx1100", "gfx1151", "gfx1201"]
+
+
+def test_affected_archs_narrows_to_arch_specific_kernel():
+    # An arch-SUFFIXED kernel affects ONLY that arch -> the OTHER box defers it faithfully.
+    # gfx1201-only change: hiptrx runs gfx1201, hipx runs NOTHING (defers 1100+1151).
+    assert affected_archs(["kernels/src/gemv_mq4g256_lloyd.gfx1201.hip"], _Cfg()) == ["gfx1201"]
+    # gfx1100-only change: hipx runs gfx1100, hiptrx defers gfx1201.
+    assert affected_archs(["kernels/src/fused_qkvza.gfx1100.hip"], _Cfg()) == ["gfx1100"]
+    # a suffix for an arch we DON'T gate (CDNA gfx942) -> affects none of our archs.
+    assert affected_archs(["kernels/src/gemm_bf16_mfma.gfx942.hip"], _Cfg()) == []
+    # mixed: an arch-specific file + a shared file -> union widens back to all.
+    assert affected_archs(["kernels/src/x.gfx1201.hip", "kernels/src/shared.hip"], _Cfg()) \
+        == ["gfx1100", "gfx1151", "gfx1201"]
 
 
 # ---- daemon build: sha-cache + failure mapping (injected git/cmd, no cargo) ----
