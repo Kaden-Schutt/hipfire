@@ -1016,7 +1016,7 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -1165,7 +1165,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
             b.state.reset();
         }
         self.m.seq_pos = 0;
-        self.m.conversation_tokens.clear();
+        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -1253,7 +1253,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -1410,7 +1410,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -1525,7 +1525,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
             b.state.reset();
         }
         self.m.seq_pos = 0;
-        self.m.conversation_tokens.clear();
+        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -1618,7 +1618,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -1689,7 +1689,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
             let _ = b.state.reset(gpu);
         }
         self.m.seq_pos = 0;
-        self.m.conversation_tokens.clear();
+        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -1794,7 +1794,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -1876,7 +1876,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
             let _ = b.state.reset(gpu);
         }
         self.m.seq_pos = 0;
-        self.m.conversation_tokens.clear();
+        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -1958,7 +1958,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -2065,7 +2065,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
             }
         }
         self.m.seq_pos = 0;
-        self.m.conversation_tokens.clear();
+        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -2214,7 +2214,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -2511,7 +2511,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
             }
         }
         self.m.seq_pos = 0;
-        self.m.conversation_tokens.clear();
+        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -2646,7 +2646,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -2736,7 +2736,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for DenseDispatch<'_> {
         // Dense is stateless per request (KV overwritten by re-prefill each turn) —
         // a fresh context just rewinds the driver cursor + token history.
         self.m.seq_pos = 0;
-        self.m.conversation_tokens.clear();
+        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -2808,7 +2808,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for DenseDispatch<'_> {
     }
 
     fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.m.conversation_tokens
+        &mut self.m.session.conversation_tokens
     }
 
     fn vocab_size(&self) -> usize {
@@ -4242,7 +4242,7 @@ fn main() {
                     if m.seq_pos > 0 {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
-                        m.conversation_tokens.clear();
+                        m.session.conversation_tokens.clear();
                         free_checkpoints(&mut m.session.prefill_checkpoints, &mut gpu);
                         free_checkpoints(&mut m.session.dflash_checkpoints, &mut gpu);
                         // The DFlash checkpoint ring now lives inside the
@@ -4461,7 +4461,7 @@ fn main() {
                 // Reset conversation state without unloading the model.
                 if let Some(ref mut m) = model {
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                        eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
+                        eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.session.conversation_tokens.len());
                     }
                     model_reset_context(m, &mut gpu);
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
@@ -4632,7 +4632,7 @@ fn main() {
                 // prefill-on-top-of-prior-state. qwen35 recurrent state lives in
                 // the bundle (ModelState::Qwen35), not the always-None m.dn_state.
                 m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                m.session.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
                 // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
                 // and the per-step scratch share `Qwen2State`. Reset its position
@@ -4804,7 +4804,7 @@ fn main() {
                 // qwen35 recurrent state lives in the bundle (ModelState::Qwen35),
                 // not the always-None m.dn_state.
                 m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                m.session.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
                 // LFM2.5-MoE state carries its own KV + conv-state cache;
                 // reset cursors (takes gpu) so the next request starts cold.
@@ -4969,7 +4969,7 @@ fn dense_serve_via_ar_generate(
         plan_prompt_cache(
             tok,
             &mut m.asst_turn_cache,
-            &m.conversation_tokens,
+            &m.session.conversation_tokens,
             m.eviction.is_none(),
             system_prompt,
             prompt,
@@ -4999,9 +4999,9 @@ fn dense_serve_via_ar_generate(
         return;
     }
     if start_pos == 0 {
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
     } else {
-        m.conversation_tokens.truncate(start_pos);
+        m.session.conversation_tokens.truncate(start_pos);
     }
     m.seq_pos = start_pos;
     let prefill_len = new_tokens.len();
@@ -5241,7 +5241,7 @@ fn ep_reset_ds4_state(m: &mut LoadedModel) {
         }
     }
     m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    m.session.conversation_tokens.clear();
 }
 
 /// Drive ds4 EP AR decode through the unified `ar_generate` driver (Axis B): build
@@ -5355,18 +5355,18 @@ fn ep_serve_minimax_via_ar_generate(
     // LCP partial reuse (mirror generate_minimax + ep_serve_minimax's per-rank rewind):
     // rewind every rank's KV cursor to the common prefix, prefill only the suffix.
     let prefill_ids: Vec<u32> = {
-        let prior_len = m.conversation_tokens.len();
+        let prior_len = m.session.conversation_tokens.len();
         let max_match = prior_len.min(prompt_n);
         let mut lcp = 0usize;
-        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+        while lcp < max_match && m.session.conversation_tokens[lcp] == prompt_ids[lcp] {
             lcp += 1;
         }
         let cache_hit = lcp > 0 && lcp < prompt_n;
         let prefill_from = if cache_hit {
-            m.conversation_tokens.truncate(lcp);
+            m.session.conversation_tokens.truncate(lcp);
             lcp
         } else {
-            m.conversation_tokens.clear();
+            m.session.conversation_tokens.clear();
             0
         };
         if let Some(EpState {
@@ -5614,7 +5614,7 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
 /// function on any LoadedModel is always safe.
 fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    m.session.conversation_tokens.clear();
     free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
     free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
     if let Some(s) = m.speculator.as_mut() {
@@ -5966,7 +5966,7 @@ fn generate_dflash(
             plan_prompt_cache(
                 tok,
                 &mut m.asst_turn_cache,
-                &m.conversation_tokens,
+                &m.session.conversation_tokens,
                 m.eviction.is_none(),
                 system_prompt,
                 prompt,
@@ -6277,7 +6277,7 @@ fn generate_spec(
         };
         let _ = spec.rewind_to(gpu, slot, ckpt);
         m.seq_pos = ckpt;
-        m.conversation_tokens.truncate(ckpt);
+        m.session.conversation_tokens.truncate(ckpt);
     }
 
     if !cache_hit {
@@ -6288,7 +6288,7 @@ fn generate_spec(
         // the old inline path ran here), so only the daemon-side position
         // bookkeeping remains.
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
     } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
@@ -6380,7 +6380,7 @@ fn generate_spec(
             slot.reset_recurrent(gpu);
             spec.reset(gpu);
             m.seq_pos = 0;
-            m.conversation_tokens.clear();
+            m.session.conversation_tokens.clear();
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -6525,7 +6525,7 @@ fn generate_spec(
             slot.reset_recurrent(gpu);
             spec.reset(gpu);
             m.seq_pos = 0;
-            m.conversation_tokens.clear();
+            m.session.conversation_tokens.clear();
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -6708,7 +6708,7 @@ fn generate_spec(
     // so subsequent turns can compute LCP against it. Previously this stored
     // only the decoded portion (`emitted`), making the next non-dflash turn
     // full-reset because no system/user prefix was present.
-    m.conversation_tokens = {
+    m.session.conversation_tokens = {
         let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
         v.extend_from_slice(&prompt_tokens);
         v.extend_from_slice(&emitted);
@@ -6725,7 +6725,7 @@ fn generate_spec(
         eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
         slot.reset_recurrent(gpu);
         spec.reset(gpu);
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
         m.seq_pos = 0;
     }
 
@@ -6929,7 +6929,7 @@ fn generate_qwen35_mtp(
     // recurrent state + reset the KV write head so a fresh prompt prefills
     // from position 0 over clean buffers. (No LCP prompt-cache in v1.)
     m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    m.session.conversation_tokens.clear();
     if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
         let dn = &b.dn_state;
         for s in &dn.s_matrices {
@@ -7312,7 +7312,7 @@ fn generate_qwen35_mtp(
     // reset on their own !cache_hit branch), so we leave it as-is here. Bake an
     // empty conversation tracker (v1 is single-turn / no LCP reuse).
     m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    m.session.conversation_tokens.clear();
     m.state = Some(ModelState::Qwen35(Qwen35Bundle {
         config: orig_config,
         weights: target.weights,
@@ -7420,7 +7420,7 @@ fn generate_multi(
             m.seq_pos, m.max_seq
         );
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
         free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
@@ -7654,7 +7654,7 @@ fn generate_multi(
     // seq_pos > 0` block.
     if try_jinja && m.seq_pos > 0 {
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
         free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
@@ -7760,7 +7760,7 @@ fn generate_multi(
     macro_rules! reset_pp_uncommitted_state {
         () => {{
             m.seq_pos = 0;
-            m.conversation_tokens.clear();
+            m.session.conversation_tokens.clear();
             free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
             free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
             for (i, s) in dn.s_matrices.iter().enumerate() {
@@ -7863,7 +7863,7 @@ fn generate_multi(
         return;
     }
     m.seq_pos += new_tokens.len();
-    m.conversation_tokens.extend_from_slice(&new_tokens);
+    m.session.conversation_tokens.extend_from_slice(&new_tokens);
 
     if check_abort(id) {
         reset_pp_uncommitted_state!();
@@ -7882,7 +7882,7 @@ fn generate_multi(
     }
 
     // ngram scope: generated tokens only (matches pp=1).
-    let ngram_scope_start = m.conversation_tokens.len();
+    let ngram_scope_start = m.session.conversation_tokens.len();
 
     let mut rng_state: u32 = 0x13579BDFu32;
 
@@ -7892,7 +7892,7 @@ fn generate_multi(
         .collect();
 
     // First sample on the output device.
-    let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+    let ngram_scope = &m.session.conversation_tokens[ngram_scope_start..];
     let mut blocked0: Vec<u32> = Vec::new();
     sampler::collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked0);
     let cfg0 = SamplerConfig {
@@ -7984,7 +7984,7 @@ fn generate_multi(
             return;
         }
         generated += 1;
-        m.conversation_tokens.push(next_token);
+        m.session.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
         emit_committed_event(
             stdout,
@@ -8131,7 +8131,7 @@ fn generate_multi(
                         break;
                     }
                     m.seq_pos += 1;
-                    m.conversation_tokens.push(t);
+                    m.session.conversation_tokens.push(t);
                     // hunt3 M-C: keep the grammar matcher in sync over force-closed
                     // </think> tokens, exactly as generate() does (~8591). Without
                     // this a tools request that force-closes <think> leaves the
@@ -8207,7 +8207,7 @@ fn generate_multi(
                     id
                 );
                 let _ = stdout.flush();
-                let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+                let ngram_scope = &m.session.conversation_tokens[ngram_scope_start..];
                 let mut blocked: Vec<u32> = Vec::new();
                 sampler::collect_unclosed_attractor_blocks(
                     ngram_scope,
@@ -8279,7 +8279,7 @@ fn generate_multi(
                 .saturating_add(nl.len());
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
-                    m.conversation_tokens.push(tok);
+                    m.session.conversation_tokens.push(tok);
                     streamed_tokens.push(tok);
                     emit_committed_event(
                         stdout,
@@ -8338,7 +8338,7 @@ fn generate_multi(
         }
 
         // Steady-state sample.
-        let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+        let ngram_scope = &m.session.conversation_tokens[ngram_scope_start..];
         let mut blocked: Vec<u32> = Vec::new();
         sampler::collect_unclosed_attractor_blocks(
             ngram_scope,
@@ -8404,7 +8404,7 @@ fn generate_multi(
     }
 
     // ChatML \n trailer so the next turn opens cleanly.
-    if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+    if im_end_token == Some(*m.session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
             if let Err(e) = qwen35::forward_scratch_multi(
                 gpus,
@@ -8420,7 +8420,7 @@ fn generate_multi(
                 break;
             }
             m.seq_pos += 1;
-            m.conversation_tokens.push(t);
+            m.session.conversation_tokens.push(t);
         }
     }
 
@@ -10057,7 +10057,7 @@ fn generate(
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache GEN-ENTRY] conv_tok={} seq_pos={}",
-            m.conversation_tokens.len(),
+            m.session.conversation_tokens.len(),
             m.seq_pos
         );
     }
@@ -10072,7 +10072,7 @@ fn generate(
             m.seq_pos, m.max_seq
         );
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
         free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // Free the speculator's (relocated) checkpoint ring on reset — this AR
@@ -10458,12 +10458,12 @@ fn generate(
         && messages_history.is_some()
         && m.eviction.is_none()
         && !pflash_active
-        && !m.conversation_tokens.is_empty();
+        && !m.session.conversation_tokens.is_empty();
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} jinja={} conv_tok={}",
             cache_eligible, cache_kill_switch, messages_history.is_some(),
-            m.eviction.is_none(), !pflash_active, jinja_active, m.conversation_tokens.len(),
+            m.eviction.is_none(), !pflash_active, jinja_active, m.session.conversation_tokens.len(),
         );
     }
     let mut cached_tokens_count: usize = 0;
@@ -10572,10 +10572,10 @@ fn generate(
             )
         };
         // LCP detection vs m.conversation_tokens.
-        let prior_len = m.conversation_tokens.len();
+        let prior_len = m.session.conversation_tokens.len();
         let max_match = prior_len.min(rendered.len());
         let mut lcp = 0usize;
-        while lcp < max_match && m.conversation_tokens[lcp] == rendered[lcp] {
+        while lcp < max_match && m.session.conversation_tokens[lcp] == rendered[lcp] {
             lcp += 1;
         }
         if trace_cache {
@@ -10598,8 +10598,8 @@ fn generate(
                         "  common[{}..{}] ids={:?} dec={:?}",
                         pre,
                         lcp,
-                        &m.conversation_tokens[pre..lcp],
-                        tokenizer.decode(&m.conversation_tokens[pre..lcp]),
+                        &m.session.conversation_tokens[pre..lcp],
+                        tokenizer.decode(&m.session.conversation_tokens[pre..lcp]),
                     );
                 }
                 if prior_post > lcp {
@@ -10607,8 +10607,8 @@ fn generate(
                         "  prior_past[{}..{}] ids={:?} dec={:?}",
                         lcp,
                         prior_post,
-                        &m.conversation_tokens[lcp..prior_post],
-                        tokenizer.decode(&m.conversation_tokens[lcp..prior_post]),
+                        &m.session.conversation_tokens[lcp..prior_post],
+                        tokenizer.decode(&m.session.conversation_tokens[lcp..prior_post]),
                     );
                 }
                 if rend_post > lcp {
@@ -10637,13 +10637,13 @@ fn generate(
             // know what each side ends with.
             let pre = lcp.saturating_sub(4);
             let common_dec = if lcp > pre {
-                tokenizer.decode(&m.conversation_tokens[pre..lcp])
+                tokenizer.decode(&m.session.conversation_tokens[pre..lcp])
             } else {
                 String::new()
             };
             let prior_post = (lcp + 12).min(prior_len);
             let prior_past_dec = if prior_post > lcp {
-                tokenizer.decode(&m.conversation_tokens[lcp..prior_post])
+                tokenizer.decode(&m.session.conversation_tokens[lcp..prior_post])
             } else {
                 String::new()
             };
@@ -10654,9 +10654,9 @@ fn generate(
                 String::new()
             };
             let prior_tail = if prior_len >= 4 {
-                tokenizer.decode(&m.conversation_tokens[prior_len - 4..])
+                tokenizer.decode(&m.session.conversation_tokens[prior_len - 4..])
             } else {
-                tokenizer.decode(&m.conversation_tokens[..])
+                tokenizer.decode(&m.session.conversation_tokens[..])
             };
             let rend_tail = if rendered.len() >= 4 {
                 tokenizer.decode(&rendered[rendered.len() - 4..])
@@ -10764,7 +10764,7 @@ fn generate(
                     // `evict_safe` guarantees compact_offset == 0, so setting
                     // seq_pos already points the KV write head at rpos — nothing
                     // to restore (checkpoints are only captured with offset 0).
-                    m.conversation_tokens.truncate(rpos);
+                    m.session.conversation_tokens.truncate(rpos);
                     truncate_checkpoints(&mut m.session.prefill_checkpoints, idx + 1, gpu);
                     cached_tokens_count = rpos;
                     eprintln!(
@@ -10788,7 +10788,7 @@ fn generate(
                     // lives in the bundle (ModelState::Qwen35), not the always-None
                     // m.dn_state/m.kv_cache.
                     m.seq_pos = 0;
-                    m.conversation_tokens.clear();
+                    m.session.conversation_tokens.clear();
                     free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
                     if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
                         let dn = &b.dn_state;
@@ -10840,7 +10840,7 @@ fn generate(
     // `.clear()`) so the checkpoint GPU buffers are freed rather than leaked.
     if jinja_active && !cache_eligible && m.seq_pos > 0 {
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
         free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // Free the speculator's (relocated) checkpoint ring on reset — this AR
@@ -11429,7 +11429,7 @@ fn generate_deepseek4_spec(
     // guard, step-back exact). Pure decision; the GPU teardown is applied below.
     let plan = hipfire_runtime::cache_plan::plan_cache(
         &prompt_ids,
-        &m.conversation_tokens,
+        &m.session.conversation_tokens,
         &hipfire_runtime::cache_plan::CachePolicy::deepseek4(),
         &[],
         false,
@@ -11714,7 +11714,7 @@ fn generate_deepseek4(
     // prefill. For prefix-cache mode the serve stops calling reset for
     // V4F and lets this LCP detection drive cache-hit accounting.
     let lcp: usize = {
-        let prior = &m.conversation_tokens;
+        let prior = &m.session.conversation_tokens;
         if prior.is_empty() || prompt_ids.len() < prior.len() {
             0
         } else {
@@ -11754,7 +11754,7 @@ fn generate_deepseek4(
     // repopulated (a position's hidden state depends on its SWA window, which
     // chains all the way back to token 0), so the correct, robust fix is to fall
     // back to a cold rebuild for partial hits only. Full hits are unaffected.
-    let lcp = if lcp > 0 && lcp < m.conversation_tokens.len() {
+    let lcp = if lcp > 0 && lcp < m.session.conversation_tokens.len() {
         0
     } else {
         lcp
@@ -11770,7 +11770,7 @@ fn generate_deepseek4(
         // unreliable" symptom). Zero them so a fresh conversation reproduces a
         // freshly-launched daemon's clean, deterministic state.
         state.zero_decode_caches(gpu);
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
         // Tear down the captured V4F decode hipGraph alongside the
         // state, same rationale as the daemon's `"reset"` handler:
         // a fresh-context turn invalidates every device-buffer pointer
@@ -11854,11 +11854,11 @@ fn generate_deepseek4(
     //     comparison run off the end of what's actually cached and
     //     make divergent assumptions about ring contents.
     if lcp == 0 {
-        m.conversation_tokens.clear();
-        m.conversation_tokens.extend_from_slice(&prompt_ids);
+        m.session.conversation_tokens.clear();
+        m.session.conversation_tokens.extend_from_slice(&prompt_ids);
     } else {
-        m.conversation_tokens.truncate(lcp);
-        m.conversation_tokens.extend_from_slice(suffix_tokens);
+        m.session.conversation_tokens.truncate(lcp);
+        m.session.conversation_tokens.extend_from_slice(suffix_tokens);
     }
     let cached_tokens: usize = lcp;
 
@@ -12031,7 +12031,7 @@ fn generate_deepseek4(
         // assembled from `<｜DSML｜tool_calls>` blocks). Replaying that
         // here once captures all the logical structure without a
         // second tokenizer pass.
-        let decode_start_tokens_idx = m.conversation_tokens.len();
+        let decode_start_tokens_idx = m.session.conversation_tokens.len();
         let mut emit_text_buf = String::new();
         let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
         use hipfire_arch_deepseek4::dsml::StreamEvent;
@@ -12076,7 +12076,7 @@ fn generate_deepseek4(
                 decode_t0.elapsed().as_millis() as u64,
             );
             let _ = stdout.flush();
-            m.conversation_tokens.push(next_tok);
+            m.session.conversation_tokens.push(next_tok);
             if grammar_active {
                 matcher.advance(&frag);
             }
@@ -12137,9 +12137,9 @@ fn generate_deepseek4(
             !emit_text_buf.trim().is_empty() || !emit_tool_calls_buf.is_empty();
         if have_replayable_payload
             && generated_count > 0
-            && m.conversation_tokens.len() > decode_start_tokens_idx
+            && m.session.conversation_tokens.len() > decode_start_tokens_idx
         {
-            let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
+            let cached_seq: Vec<u32> = m.session.conversation_tokens[decode_start_tokens_idx..].to_vec();
             let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
             if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
@@ -12395,7 +12395,7 @@ fn generate_lfm2moe(
     // multi-turn is preserved (validated: Bjorn/axolotl recall).
     let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
     m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    m.session.conversation_tokens.clear();
 
     // After the reset the KV starts at 0, so the only overflow risk is a SINGLE
     // prompt+generation larger than the whole context — the prefill decode_step
@@ -12630,7 +12630,7 @@ fn generate_minimax(
         eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
         m.minimax_mut().unwrap().state.reset();
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
 
         // O2b-2 capacity guard (minimax single): the reset above recovers a
         // grown multi-turn conversation, but a SINGLE prompt larger than the
@@ -12671,10 +12671,10 @@ fn generate_minimax(
     // steady-state per-turn prefill is just {last visible answer} + {new user}.
     let prefill_ids: Vec<u32> =
         {
-            let prior_len = m.conversation_tokens.len();
+            let prior_len = m.session.conversation_tokens.len();
             let max_match = prior_len.min(prompt_ids.len());
             let mut lcp = 0usize;
-            while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+            while lcp < max_match && m.session.conversation_tokens[lcp] == prompt_ids[lcp] {
                 lcp += 1;
             }
             // A usable common prefix that leaves at least one fresh token to prefill
@@ -12698,14 +12698,14 @@ fn generate_minimax(
                 // `state.n_tokens` as its base position, so n_tokens is the only
                 // KV state the rewind must touch (plus the mirror token history).
                 m.minimax_mut().unwrap().state.n_tokens = lcp;
-                m.conversation_tokens.truncate(lcp);
+                m.session.conversation_tokens.truncate(lcp);
                 m.seq_pos = lcp;
                 prompt_ids[lcp..].to_vec()
             } else {
                 if prior_len > 0 {
                     m.minimax_mut().unwrap().state.reset();
                     m.seq_pos = 0;
-                    m.conversation_tokens.clear();
+                    m.session.conversation_tokens.clear();
                 }
                 prompt_ids.clone()
             }
@@ -13229,7 +13229,7 @@ fn generate_cohere2moe(
         );
         let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
         return;
     }
     // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
@@ -13243,10 +13243,10 @@ fn generate_cohere2moe(
     // tail is never attended. We rewind `n_tokens` to `lcp` and re-prefill the
     // suffix; the reused prefix GROWS with the conversation.
     let prefill_ids: Vec<u32> = {
-        let prior_len = m.conversation_tokens.len();
+        let prior_len = m.session.conversation_tokens.len();
         let max_match = prior_len.min(prompt_ids.len());
         let mut lcp = 0usize;
-        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+        while lcp < max_match && m.session.conversation_tokens[lcp] == prompt_ids[lcp] {
             lcp += 1;
         }
         // A usable common prefix that leaves at least one fresh token to prefill.
@@ -13268,14 +13268,14 @@ fn generate_cohere2moe(
             // base position, so n_tokens is the only KV state the rewind must
             // touch (plus the mirror token history).
             m.cohere2moe_mut().unwrap().state.n_tokens = lcp;
-            m.conversation_tokens.truncate(lcp);
+            m.session.conversation_tokens.truncate(lcp);
             m.seq_pos = lcp;
             prompt_ids[lcp..].to_vec()
         } else {
             if prior_len > 0 {
                 let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
                 m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                m.session.conversation_tokens.clear();
             }
             prompt_ids.clone()
         }
@@ -13416,7 +13416,7 @@ fn generate_qwen2(
         );
         state.reset();
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
 
         // O2b-2 capacity guard (qwen2 single): the reset above (next_pos=0)
         // recovers a grown multi-turn conversation, but a SINGLE prompt larger
@@ -13624,7 +13624,7 @@ fn generate_vl(
             m.seq_pos, m.max_seq
         );
         m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.session.conversation_tokens.clear();
         free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // Free the speculator's (relocated) checkpoint ring on reset.
@@ -13792,14 +13792,14 @@ fn generate_vl(
         }
     }
 
-    m.conversation_tokens.extend_from_slice(&prompt_tokens);
+    m.session.conversation_tokens.extend_from_slice(&prompt_tokens);
 
     // hunt3 M-D: repeat-penalty / n-gram-block history must be scoped to the
     // GENERATED tokens only (mirrors the text path's `ngram_scope_start` set to
     // conversation_tokens.len() after prefill). Passing the full conversation
     // makes the trailing window prompt-dominated, suppressing the names/numbers
     // a VL transcription task must reproduce.
-    let vl_ngram_scope_start = m.conversation_tokens.len();
+    let vl_ngram_scope_start = m.session.conversation_tokens.len();
 
     // Generate. CPU-side sampling — VL path predates the GPU sampler
     // and downloads logits each step. The order of ops is preserved
@@ -13813,7 +13813,7 @@ fn generate_vl(
     // GPU memcpy + redownload — saves a full vocab-sized DMA per token.
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     if let Some((open, close)) = think_pair {
-        block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+        block_attractor_unclosed_cpu(&mut logits, &m.session.conversation_tokens, open, close, 20, 2);
     }
     let vl_cfg_first = SamplerConfig {
         temperature: temp,
@@ -13859,7 +13859,7 @@ fn generate_vl(
 
     while generated < max_tokens {
         generated += 1;
-        m.conversation_tokens.push(next_token);
+        m.session.conversation_tokens.push(next_token);
         emit_committed_event(
             stdout,
             id,
@@ -13924,10 +13924,10 @@ fn generate_vl(
         }
         logits = gpu.download_f32(&scratch.logits).unwrap();
         // hunt3 M-D: scope ngram-block + repeat-penalty history to generated-only.
-        let vl_ngram_scope = &m.conversation_tokens[vl_ngram_scope_start..];
+        let vl_ngram_scope = &m.session.conversation_tokens[vl_ngram_scope_start..];
         llama::apply_ngram_block(&mut logits, vl_ngram_scope);
         if let Some((open, close)) = think_pair {
-            block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+            block_attractor_unclosed_cpu(&mut logits, &m.session.conversation_tokens, open, close, 20, 2);
         }
 
         next_token = sampler::sample_cpu(&mut logits, vl_ngram_scope, &vl_cfg);
@@ -13967,7 +13967,7 @@ fn generate_vl(
                                 m.seq_pos = new_phys;
                             }
                         }
-                        m.conversation_tokens.push(t);
+                        m.session.conversation_tokens.push(t);
                         streamed_tokens.push(t);
                         // hunt3 H-F: emit the committed-token event for force-closed
                         // </think> tokens too, BEFORE `generated += 1`, so the
@@ -14013,7 +14013,7 @@ fn generate_vl(
                     logits = gpu.download_f32(&scratch.logits).unwrap();
                     block_attractor_unclosed_cpu(
                         &mut logits,
-                        &m.conversation_tokens,
+                        &m.session.conversation_tokens,
                         open,
                         close,
                         20,
@@ -14022,7 +14022,7 @@ fn generate_vl(
                     // hunt3 M-D: generated-only repeat-penalty scope.
                     next_token = sampler::sample_cpu(
                         &mut logits,
-                        &m.conversation_tokens[vl_ngram_scope_start..],
+                        &m.session.conversation_tokens[vl_ngram_scope_start..],
                         &vl_cfg,
                     );
                 }
@@ -14031,7 +14031,7 @@ fn generate_vl(
     }
 
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
-    if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+    if im_end_token == Some(*m.session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
             qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
@@ -14044,7 +14044,7 @@ fn generate_vl(
                     m.seq_pos = new_phys;
                 }
             }
-            m.conversation_tokens.push(t);
+            m.session.conversation_tokens.push(t);
         }
     }
 
