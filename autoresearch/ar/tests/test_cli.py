@@ -162,8 +162,8 @@ def test_operator_ingest_rebuilds_db(tmp_path, monkeypatch, capsys):
     assert conn.execute("SELECT count(*) FROM attempts").fetchone()[0] == out["ingested"]
 
 
-def test_operator_config_prints_resolved(capsys):
-    rc = main(["--role", "operator", "config", "--config", "autoresearch/config/loop_gfx1201.toml", "--json"])
+def test_operator_config_prints_resolved(capsys, loop_toml):
+    rc = main(["--role", "operator", "config", "--config", loop_toml, "--json"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out.strip())  # config --json is indented multi-line
     assert out["arch"] == "gfx1201" and out["model"].endswith("mq4r")

@@ -2,8 +2,8 @@
 from autoresearch.ar.config import load_config
 
 
-def test_loads_workers_and_bounds(tmp_path):
-    cfg = load_config("autoresearch/config/loop_gfx1201.toml")
+def test_loads_workers_and_bounds(loop_toml):
+    cfg = load_config(loop_toml)
     assert cfg.arch == "gfx1201"
     assert cfg.model.endswith("mq4r")
     assert cfg.k_exhaust == 5

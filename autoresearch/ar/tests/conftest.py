@@ -49,3 +49,10 @@ def mini_ledger():
 def bod_gfx1201():
     """Absolute path to the gfx1201 BOD census fixture (derived from state/bod_gfx1201.json)."""
     return os.path.join(_FIXTURES, "bod_gfx1201.json")
+
+
+@pytest.fixture
+def loop_toml():
+    """Absolute path to the stable 3-worker loop-config fixture. Decouples
+    loader/config-verb tests from the campaign-mutable loop_gfx1201.toml."""
+    return os.path.join(_FIXTURES, "loop_test.toml")
