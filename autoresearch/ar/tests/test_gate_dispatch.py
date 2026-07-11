@@ -85,6 +85,20 @@ def test_behavior_test_missing_verdict_is_fail_not_silent_pass(tmp_path):
     assert r["passed"] is False and "verdict unreadable" in r["detail"]
 
 
+def test_behavior_test_executor_exception_is_structured_fail(tmp_path):
+    def missing_executor(**kwargs):
+        raise FileNotFoundError("codex")
+
+    r = run_behavior_test(
+        {"id": "x", "what": "x", "prompt": "p"},
+        agent_exec_fn=missing_executor, cwd="/r",
+        verdict_path=str(tmp_path / "missing.json"),
+    )
+    assert r["passed"] is False
+    assert r["id"] == "x"
+    assert "executor error: FileNotFoundError: codex" in r["detail"]
+
+
 def test_run_behavior_tests_all(tmp_path):
     tests = [{"what": "a", "prompt": "pa"}, {"what": "b", "prompt": "pb"}]
     res = run_behavior_tests(tests, agent_exec_fn=_writer(True), cwd="/r",

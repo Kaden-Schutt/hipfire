@@ -53,6 +53,13 @@ def test_selected_runner_uses_mechanical_collect_and_grade_not_agent_verdict():
     assert "codex exec" not in collect
 
 
+def test_box_behavior_executor_adds_authenticated_local_binary_path():
+    text = _text()
+    behavior = text.split("- name: Run assigned bespoke behavior tests", 1)[1]
+    behavior = behavior.split("- name: Upload box evidence", 1)[0]
+    assert 'export PATH="$HOME/.local/bin:$PATH"' in behavior
+
+
 def test_interpret_requires_dispatch_and_downloaded_runner_evidence():
     text = _text()
     interpret = text.split("\n  interpret:\n", 1)[1]

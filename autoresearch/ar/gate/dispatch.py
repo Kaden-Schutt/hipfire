@@ -347,18 +347,26 @@ def run_behavior_test(bt, *, agent_exec_fn, cwd, verdict_path) -> dict:
         + f" serve_harness). When done, write your verdict as JSON to {verdict_path}:"
         + ' {"passed": <true|false>, "detail": "<one-line reason>"}.'
     )
-    rc = agent_exec_fn(
-        harness=bt.get("harness", "codex"), model=bt.get("model"),
-        effort=bt.get("effort", "high"), prompt=prompt, cwd=cwd,
-    )
-    passed, detail = False, f"no verdict written (exec rc={rc})"
+    exec_error = None
+    try:
+        rc = agent_exec_fn(
+            harness=bt.get("harness", "codex"), model=bt.get("model"),
+            effort=bt.get("effort", "high"), prompt=prompt, cwd=cwd,
+        )
+    except Exception as e:
+        # Executor discovery/auth/process errors are structured behavior failures,
+        # not uncaught tracebacks that leave an empty, unjoinable artifact.
+        rc = 127
+        exec_error = f"executor error: {type(e).__name__}: {e}"
+    passed, detail = False, exec_error or f"no verdict written (exec rc={rc})"
     try:
         with open(verdict_path) as fh:
             v = json.load(fh)
         passed = bool(v.get("passed"))
         detail = str(v.get("detail", ""))
     except Exception as e:  # missing / malformed verdict -> FAIL, do not silently pass
-        detail = f"verdict unreadable ({e}); exec rc={rc}"
+        if exec_error is None:
+            detail = f"verdict unreadable ({e}); exec rc={rc}"
     return {"id": bt.get("id"), "what": bt.get("what", "behavior"), "passed": passed,
             "harness": bt.get("harness", "codex"), "model": bt.get("model"), "detail": detail}
 
