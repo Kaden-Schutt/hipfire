@@ -57,6 +57,19 @@ def test_gate_validate_plan_emits_empty_matrix_for_trivial_skip(tmp_path, pr_gat
     assert parsed["valid"] is True and parsed["matrix"] == {"include": []}
 
 
+def test_gate_dispatch_context_is_compact_and_deterministic(pr_gate_toml):
+    rc, out = _run(["gate", "--dispatch-context", "--base", "HEAD", "--head", "HEAD",
+                    "--gate-config", pr_gate_toml])
+    assert rc == 0
+    parsed = json.loads(out)
+    assert parsed["changed_files"] == []
+    assert parsed["floor_risk"] == "trivial"
+    assert parsed["required_archs"] == []
+    assert parsed["box_ownership"] == {
+        "hipx": ["gfx1100", "gfx1151"], "hiptrx": ["gfx1201"],
+    }
+
+
 def test_gate_validate_action_refuses_green_for_bod(tmp_path):
     interp = tmp_path / "interp.json"
     action = tmp_path / "action.json"
