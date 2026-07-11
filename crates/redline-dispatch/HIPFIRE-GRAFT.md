@@ -64,7 +64,7 @@ code object; unsupported scratch or implicit-SGPR contracts fail closed.
 The daemon coherence seam established the cache policy instruction by
 instruction. `CS_PARTIAL_FLUSH` orders dependent dispatches, while gfx12
 `ACQUIRE_MEM` is retained around the full-scope repeat-interleave, RoPE,
-MQ-rotation, and fused-SiLU boundaries. Three proven-independent sibling pairs
+MQ-rotation, and fused-SiLU boundaries. Four proven-independent sibling pairs
 omit their intermediate compute-idle wait and fan in at the next dependent
 boundary. Fifteen consecutive positions remain bit-exact for logits, KV, and
 recurrent state on both models.
@@ -75,6 +75,31 @@ auto-capture PM4 route:
 
 - Qwen3.5 0.8B: 363.682 -> 392.248 tok/s, **1.07855x**.
 - Qwen3.5 9B: 97.727 -> 98.775 tok/s, **1.01073x**.
+
+## Qwen3.6 A3B kernel-oracle integration (2026-07-11, automatic clocks)
+
+The same transport was grafted onto `origin/feat/rdna-kernel-oracle` at
+`35502d550`; that branch contains the `loop/gfx1201` winning kernels through
+`53aab4775`. Redline does not replace those kernels. It retains and replays the
+833-launch ordinary-AR tape emitted by that already-tuned branch. Two replay
+artifact aliases bind runtime-specialized launch names to their actual loaded
+code objects: the shared residual-scale GEMV and the indexed K=8 MoE gate/up
+GEMV.
+
+The A3B tape contains 26 kernels and has sequence hash `8d5620ca2ca8a536`.
+The initial conservative PM4 policy measured 164.220 tok/s through HipGraph and
+174.087 tok/s through retained replay (**1.06009x**). The shared-expert down and
+routed-expert gate/up launches are independent: they read distinct activation
+buffers, write distinct result buffers, and join only at the later MoE combine.
+Removing their intermediate compute-idle wait at all 40 layer boundaries raised
+the matched 10-by-100 median to 165.839 -> 178.320 tok/s (**1.07526x**).
+
+The expanded policy remained bit-exact for logits, KV, recurrent state, and the
+captured HIP kernarg blobs across 15 consecutive positions. It uses automatic
+clocks throughout. The raw reports are
+`.redline-work/a3b-r3/product-pm4-mq4r-overlap.json` and
+`.redline-work/a3b-r3/shadow15-overlap.json` in the isolated hiptrx checkout;
+they are measurement artifacts rather than source inputs.
 
 The product lifecycle must arm capture at the first eligible plain-AR forward;
 recording from model load accidentally mixes prefill setup into the decode tape

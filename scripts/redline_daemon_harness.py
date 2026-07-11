@@ -110,6 +110,11 @@ def main():
     parser.add_argument("--out", default=str(REPO / ".redline-work/redline-daemon-phases.json"))
     parser.add_argument("--log", default=str(REPO / ".redline-work/redline-daemon-phases.log"))
     parser.add_argument("--prefill", type=int, nargs="+", default=[128, 512])
+    parser.add_argument(
+        "--skip-prefill",
+        action="store_true",
+        help="run only the decode capture, contract probe, and shadow parity gate",
+    )
     parser.add_argument("--decode-context", type=int, default=128)
     parser.add_argument("--capture-repeats", type=int, default=2)
     parser.add_argument("--measure-repeats", type=int, default=5)
@@ -163,7 +168,7 @@ def main():
             flush=True,
         )
 
-        for tokens in args.prefill:
+        for tokens in ([] if args.skip_prefill else args.prefill):
             captures = [
                 daemon.request(
                     {

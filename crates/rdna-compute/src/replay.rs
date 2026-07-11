@@ -45,6 +45,19 @@ impl ReplayTransport {
     }
 }
 
+fn independent_sibling(previous: &str, current: &str) -> bool {
+    matches!(
+        (previous, current),
+        ("fused_sigmoid_alpha_gate_f32", "conv1d_silu_split_f32")
+            | ("rmsnorm_f32", "rmsnorm_f32")
+            | ("kv_cache_write_q8_0", "kv_cache_write_q8_0")
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed",
+            )
+    )
+}
+
 impl ReplayBackendRequest {
     fn from_env() -> Self {
         match std::env::var("HIPFIRE_REPLAY_BACKEND")
@@ -481,13 +494,7 @@ impl ReplayController {
         for index in 1..headers.len() {
             let previous = self.recorded[index - 1].kernel.as_str();
             let current = self.recorded[index].kernel.as_str();
-            let independent_sibling = matches!(
-                (previous, current),
-                ("fused_sigmoid_alpha_gate_f32", "conv1d_silu_split_f32")
-                    | ("rmsnorm_f32", "rmsnorm_f32")
-                    | ("kv_cache_write_q8_0", "kv_cache_write_q8_0")
-            );
-            if independent_sibling {
+            if independent_sibling(previous, current) {
                 headers[index] = HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT;
             }
         }
@@ -607,13 +614,7 @@ impl ReplayController {
             if index != 0 {
                 let previous = self.recorded[index - 1].kernel.as_str();
                 let current = self.recorded[index].kernel.as_str();
-                let independent_sibling = matches!(
-                    (previous, current),
-                    ("fused_sigmoid_alpha_gate_f32", "conv1d_silu_split_f32")
-                        | ("rmsnorm_f32", "rmsnorm_f32")
-                        | ("kv_cache_write_q8_0", "kv_cache_write_q8_0")
-                );
-                if !independent_sibling {
+                if !independent_sibling(previous, current) {
                     commands.wait_compute_idle();
                 }
                 if matches!(
@@ -939,6 +940,18 @@ mod tests {
             gpu_timed: true,
             speedup_over_hip: speedup,
         }
+    }
+
+    #[test]
+    fn moe_shared_down_and_routed_gate_up_are_independent_siblings() {
+        assert!(independent_sibling(
+            "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed",
+        ));
+        assert!(!independent_sibling(
+            "gemv_hfq4g256_moe_gate_up_k8_indexed",
+            "fused_silu_mul_mq_rotate",
+        ));
     }
 
     #[test]

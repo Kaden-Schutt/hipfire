@@ -1192,6 +1192,17 @@ impl Gpu {
                         "deinterleave_f32_batched" => {
                             self.compiler.compiled_kernels().get("deinterleave_batched")
                         }
+                        name
+                            if name.starts_with(
+                                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                            ) => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_residual_scaled"),
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed" => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_moe_gate_up_indexed"),
                         name if name.starts_with("gemv_hfq4g256_multirow_r") => self
                             .compiler
                             .compiled_kernels()
