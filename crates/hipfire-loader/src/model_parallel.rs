@@ -10,7 +10,7 @@
 //! The axis-first early-return order in `generate()` (daemon.rs):
 //!   1. `m.parallel` is Tp           → TP path
 //!   2. `m.parallel` is Pp(Dense)    → dense-PP path
-//!   3. `m.ep.is_some()`             → EP path
+//!   3. `m.parallel` is Ep(_)        → EP path (Task 5: migrated from m.ep)
 //!   4. `m.pp > 1`                   → qwen35 pipeline-parallel
 //!   5. (everything else)            → Single
 //!
@@ -31,7 +31,7 @@ pub enum ModelParallelKind {
     Tp,
     /// Pipeline-parallel dense multi-GPU (`m.parallel` is `Pp(Dense)`).
     PpDense,
-    /// Expert-parallel MoE multi-GPU (`m.ep.is_some()`).
+    /// Expert-parallel MoE multi-GPU (`m.parallel` is `Ep(_)`).
     Ep,
     /// Pipeline-parallel qwen35 single-GPU sharding (`m.pp > 1`).
     PpQwen35,
@@ -46,7 +46,7 @@ impl ModelParallelKind {
     /// matching the early-return order in `generate()` (daemon.rs):
     ///   [0] tp_some     → `m.parallel` is `Tp`
     ///   [1] pp_dense    → `m.parallel` is `Pp(Dense)`
-    ///   [2] ep_some     → `m.ep.is_some()`
+    ///   [2] ep_some     → `m.parallel` is `Ep(_)` (Task 5)
     ///   [3] pp_qwen35   → `m.pp > 1`
     #[allow(dead_code)]
     pub fn priority(flags: &[bool; 4]) -> ModelParallelKind {

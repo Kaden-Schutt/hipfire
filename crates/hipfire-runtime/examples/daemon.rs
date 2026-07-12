@@ -2049,14 +2049,14 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
     }
 
     fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
-        // EP reaches its own devices via `m.ep.gpus`, NOT the single-GPU param
-        // (which is inert here). Mirror ep_serve_ds4's per-rank cross-conversation
+        // EP reaches its own devices via `m.parallel` (Ep variant), NOT the single-GPU
+        // param (which is inert here). Mirror ep_serve_ds4's per-rank cross-conversation
         // reset (daemon.rs:4522): `reset()` rewinds n_tokens; `zero_decode_caches`
         // clears the position-indexed SWA-ring / compressed+full KV / indexer
         // scratch; `invalidate_graph_state` drops the captured HIP graph. Zeroing
         // the decode caches is load-bearing — `reset()` alone bleeds the prior
         // turn's residue into the next conversation.
-        if let Some(EpState { gpus, inner }) = self.m.ep.as_mut() {
+        if let ModelParallel::Ep(EpState { gpus, inner }) = &mut self.m.parallel {
             if let EpArch::Ds4 { state, .. } = inner {
                 for (rank, s) in state.iter_mut().enumerate() {
                     let g = &mut gpus.devices[rank];
@@ -2080,7 +2080,9 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
         let ForwardCtx::Mesh = ctx else {
             unreachable!("deepseek4-EP dispatch received Single ctx")
         };
-        let EpState { gpus, inner } = self.m.ep.as_mut().ok_or("prefill_forward: no ep state")?;
+        let ModelParallel::Ep(EpState { gpus, inner }) = &mut self.m.parallel else {
+            return Err("prefill_forward: no ep state".into());
+        };
         let EpArch::Ds4 {
             config,
             weights,
@@ -2119,11 +2121,9 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
         let ForwardCtx::Mesh = ctx else {
             unreachable!("deepseek4-EP dispatch received Single ctx")
         };
-        let EpState { gpus, inner } = self
-            .m
-            .ep
-            .as_mut()
-            .ok_or("decode_step_forward: no ep state")?;
+        let ModelParallel::Ep(EpState { gpus, inner }) = &mut self.m.parallel else {
+            return Err("decode_step_forward: no ep state".into());
+        };
         let EpArch::Ds4 {
             config,
             weights,
@@ -2167,7 +2167,9 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
         // inc 3) is applied to the downloaded logits HERE before the draw
         // (`apply_mask_to_logits` stays internal to EP, per the design).
         let _ = (vocab_size, ngram_scope, rng_state);
-        let EpState { gpus, inner } = self.m.ep.as_mut().ok_or("sample: no ep state")?;
+        let ModelParallel::Ep(EpState { gpus, inner }) = &mut self.m.parallel else {
+            return Err("sample: no ep state".into());
+        };
         let EpArch::Ds4 { state, .. } = inner else {
             return Err("sample: EP arch mismatch (expected ds4)".into());
         };
@@ -2195,8 +2197,8 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
     fn seq_pos(&self) -> usize {
         // The EP KV cursor is rank-0's `state.n_tokens` (advanced internally by
         // forward_ep); seed the driver's local from it.
-        match self.m.ep.as_ref() {
-            Some(EpState {
+        match &self.m.parallel {
+            ModelParallel::Ep(EpState {
                 inner: EpArch::Ds4 { state, .. },
                 ..
             }) => state[0].n_tokens as usize,
@@ -2206,8 +2208,8 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
 
     fn set_seq_pos(&mut self, seq_pos: usize) {
         let _ = seq_pos;
-        let np = match self.m.ep.as_ref() {
-            Some(EpState {
+        let np = match &self.m.parallel {
+            ModelParallel::Ep(EpState {
                 inner: EpArch::Ds4 { state, .. },
                 ..
             }) => state[0].n_tokens as usize,
@@ -2221,8 +2223,8 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
     }
 
     fn vocab_size(&self) -> usize {
-        match self.m.ep.as_ref() {
-            Some(EpState {
+        match &self.m.parallel {
+            ModelParallel::Ep(EpState {
                 inner: EpArch::Ds4 { config, .. },
                 ..
             }) => config.vocab_size,
@@ -2506,7 +2508,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
         // decode caches (matches the deleted ep_serve_minimax's reset). The per-TURN
         // LCP prefix rewind is the arm's preamble, not this hook (ar_generate doesn't
         // call reset).
-        if let Some(EpState { inner, .. }) = self.m.ep.as_mut() {
+        if let ModelParallel::Ep(EpState { inner, .. }) = &mut self.m.parallel {
             if let EpArch::Minimax { state, .. } = inner {
                 for s in state.iter_mut() {
                     s.reset();
@@ -2526,7 +2528,9 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
         let ForwardCtx::Mesh = ctx else {
             unreachable!("minimax-EP dispatch received Single ctx")
         };
-        let EpState { gpus, inner } = self.m.ep.as_mut().ok_or("prefill_forward: no ep state")?;
+        let ModelParallel::Ep(EpState { gpus, inner }) = &mut self.m.parallel else {
+            return Err("prefill_forward: no ep state".into());
+        };
         let EpArch::Minimax {
             config,
             weights,
@@ -2562,11 +2566,9 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
         let ForwardCtx::Mesh = ctx else {
             unreachable!("minimax-EP dispatch received Single ctx")
         };
-        let EpState { gpus, inner } = self
-            .m
-            .ep
-            .as_mut()
-            .ok_or("decode_step_forward: no ep state")?;
+        let ModelParallel::Ep(EpState { gpus, inner }) = &mut self.m.parallel else {
+            return Err("decode_step_forward: no ep state".into());
+        };
         let EpArch::Minimax {
             config,
             weights,
@@ -2605,7 +2607,9 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
         // EP host full-dist sampler over rank-0 logits (ep_serve_minimax). No grammar
         // for minimax EP, so grammar_mask is always None; ngram_scope/rng_state inert.
         let _ = (vocab_size, ngram_scope, grammar_mask, rng_state);
-        let EpState { gpus, inner } = self.m.ep.as_mut().ok_or("sample: no ep state")?;
+        let ModelParallel::Ep(EpState { gpus, inner }) = &mut self.m.parallel else {
+            return Err("sample: no ep state".into());
+        };
         let EpArch::Minimax { state, .. } = inner else {
             return Err("sample: EP arch mismatch (expected minimax)".into());
         };
@@ -2627,8 +2631,8 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
     }
 
     fn seq_pos(&self) -> usize {
-        match self.m.ep.as_ref() {
-            Some(EpState {
+        match &self.m.parallel {
+            ModelParallel::Ep(EpState {
                 inner: EpArch::Minimax { state, .. },
                 ..
             }) => state[0].n_tokens,
@@ -2638,8 +2642,8 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
 
     fn set_seq_pos(&mut self, seq_pos: usize) {
         let _ = seq_pos;
-        let np = match self.m.ep.as_ref() {
-            Some(EpState {
+        let np = match &self.m.parallel {
+            ModelParallel::Ep(EpState {
                 inner: EpArch::Minimax { state, .. },
                 ..
             }) => state[0].n_tokens,
@@ -2653,8 +2657,8 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
     }
 
     fn vocab_size(&self) -> usize {
-        match self.m.ep.as_ref() {
-            Some(EpState {
+        match &self.m.parallel {
+            ModelParallel::Ep(EpState {
                 inner: EpArch::Minimax { config, .. },
                 ..
             }) => config.vocab_size,
@@ -4579,7 +4583,7 @@ fn main() {
                 // Task 3: m.tp removed; TP now detected via m.parallel. NOTE: full
                 // kind() match consolidation deferred to Task 7.
                 if m.pp > 1
-                    || m.ep.is_some()
+                    || matches!(m.parallel.kind(), ModelParallelKind::Ep)
                     || matches!(m.parallel.kind(), ModelParallelKind::Tp)
                 {
                     let _ = writeln!(
@@ -5221,7 +5225,7 @@ fn generate_ep(
 /// inc-5 flip calls it per turn before `ep_serve_ds4_via_ar_generate` (EP has no
 /// LCP → every turn re-prefills the full prompt from a clean state).
 fn ep_reset_ds4_state(m: &mut LoadedModel) {
-    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+    if let ModelParallel::Ep(EpState { gpus, inner }) = &mut m.parallel {
         if let EpArch::Ds4 { state, .. } = inner {
             for (rank, s) in state.iter_mut().enumerate() {
                 let g = &mut gpus.devices[rank];
@@ -5361,10 +5365,10 @@ fn ep_serve_minimax_via_ar_generate(
             m.session.conversation_tokens.clear();
             0
         };
-        if let Some(EpState {
+        if let ModelParallel::Ep(EpState {
             inner: EpArch::Minimax { state, .. },
             ..
-        }) = m.ep.as_mut()
+        }) = &mut m.parallel
         {
             for s in state.iter_mut() {
                 s.n_tokens = prefill_from;
@@ -5647,8 +5651,9 @@ fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // re-prefill from pos 0), so this is belt-and-suspenders — but it makes the
     // `reset` command EXPLICITLY correct instead of relying on the per-turn-reset
     // invariant (the eos-checklist lesson: "confirm model_reset_context resets the
-    // arch"). Uses `m.ep.gpus`, NOT the passed single-GPU `gpu` (distinct handles).
-    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+    // arch"). Uses EP `gpus` from `m.parallel`, NOT the passed single-GPU `gpu`
+    // (distinct handles).
+    if let ModelParallel::Ep(EpState { gpus, inner }) = &mut m.parallel {
         match inner {
             EpArch::Ds4 { state, .. } => {
                 for (rank, s) in state.iter_mut().enumerate() {
@@ -9387,7 +9392,7 @@ fn generate(
     // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
     // would unwrap-panic / error on the missing config.
-    if m.ep.is_some() {
+    if matches!(m.parallel.kind(), ModelParallelKind::Ep) {
         // EP serve (ds4/minimax): thread the SAME resolved sampling the
         // single-GPU handler computed (request field > m.rec_* > arch-default
         // ladder, all done at the call site above) into the EP decode loops.

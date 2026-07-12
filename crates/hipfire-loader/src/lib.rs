@@ -331,7 +331,6 @@ pub struct LoadedModel {
     pub arch_id: u32,
     pub pp: usize,
     pub pp_gpus: Option<Gpus>,
-    pub ep: Option<EpState>,
     /// Owning parallelism enum — the single-value answer to "which axis?".
     /// `Tp` owns the TpModel (migrated Task 3). `Pp(Dense)` owns the PpModel (migrated Task 4).
     /// Legacy `pp`/`pp_gpus`/`ep` fields kept while remaining axes migrate.
@@ -398,7 +397,6 @@ impl LoadedModel {
         LoadedModel {
             arch_id,
             pp: 1,
-            ep: None,
             parallel: ModelParallel::Single,
             pp_gpus: None,
             state: None,
@@ -1648,7 +1646,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
     };
     // chat_template + rec extracted pre-allocation above (gfx12 hipGraph hazard).
     Ok(LoadedModel {
-        ep: Some(EpState {
+        parallel: ModelParallel::Ep(EpState {
             gpus,
             inner: EpArch::Ds4 {
                 config,
@@ -1782,7 +1780,7 @@ fn load_model_ep_minimax(
     };
     // chat_template + rec extracted pre-allocation above (gfx12 hipGraph hazard).
     Ok(LoadedModel {
-        ep: Some(EpState {
+        parallel: ModelParallel::Ep(EpState {
             gpus,
             inner: EpArch::Minimax {
                 config,
@@ -1832,78 +1830,79 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             let _ = gpu;
             return;
         }
+        // EP unload-free (Task 5: EP now owned by m.parallel). An EP model owns its
+        // own `Gpus` (the daemon's single `gpu` is unused for ep>1). Without this
+        // arm a SUCCESSFUL EP unload leaked every per-rank weight / state / partial.
+        // Free per-rank weights → state → partials on each owning device, invalidate
+        // caches + graph state, drain each pool, then drop the `Gpus` (tears down
+        // comms + devices). The daemon's `gpu` is untouched.
+        // (The `partials` free here is what reclaims the ds4/minimax per-rank dummy
+        // all-reduce buffer that would otherwise leak per load/unload cycle.)
+        ModelParallel::Ep(ep) => {
+            let EpState { mut gpus, inner } = ep;
+            match inner {
+                EpArch::Ds4 {
+                    weights,
+                    state,
+                    partials,
+                    ..
+                } => {
+                    for (r, w) in weights.into_iter().enumerate() {
+                        if let Some(dev) = gpus.devices.get_mut(r) {
+                            let _ = dev.bind_thread();
+                            w.free_gpu(dev);
+                        }
+                    }
+                    for (r, s) in state.into_iter().enumerate() {
+                        if let Some(dev) = gpus.devices.get_mut(r) {
+                            let _ = dev.bind_thread();
+                            s.free_gpu(dev);
+                        }
+                    }
+                    for (r, p) in partials.into_iter().enumerate() {
+                        if let Some(dev) = gpus.devices.get_mut(r) {
+                            let _ = dev.bind_thread();
+                            let _ = dev.free_tensor(p);
+                        }
+                    }
+                }
+                EpArch::Minimax {
+                    weights,
+                    state,
+                    partials,
+                    ..
+                } => {
+                    for (r, w) in weights.into_iter().enumerate() {
+                        if let Some(dev) = gpus.devices.get_mut(r) {
+                            let _ = dev.bind_thread();
+                            w.free_gpu(dev);
+                        }
+                    }
+                    for (r, s) in state.into_iter().enumerate() {
+                        if let Some(dev) = gpus.devices.get_mut(r) {
+                            let _ = dev.bind_thread();
+                            s.free_gpu(dev);
+                        }
+                    }
+                    for (r, p) in partials.into_iter().enumerate() {
+                        if let Some(dev) = gpus.devices.get_mut(r) {
+                            let _ = dev.bind_thread();
+                            let _ = dev.free_tensor(p);
+                        }
+                    }
+                }
+            }
+            for dev in gpus.devices.iter_mut() {
+                let _ = dev.bind_thread();
+                dev.invalidate_weight_caches();
+                dev.invalidate_graph_state();
+                dev.drain_pool();
+            }
+            let _ = gpu;
+            // `gpus` drops here, tearing down comms + devices.
+            return;
+        }
         _ => {}
-    }
-    // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
-    // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
-    // per-rank weight / state / partial. Free per-rank weights → state → partials
-    // on each owning device, invalidate caches + graph state, drain each pool, then
-    // drop the `Gpus` (tears down comms + devices). The daemon's `gpu` is untouched.
-    // (The `partials` free here is what reclaims the ds4/minimax per-rank dummy
-    // all-reduce buffer that would otherwise leak per load/unload cycle.)
-    if let Some(ep) = m.ep.take() {
-        let EpState { mut gpus, inner } = ep;
-        match inner {
-            EpArch::Ds4 {
-                weights,
-                state,
-                partials,
-                ..
-            } => {
-                for (r, w) in weights.into_iter().enumerate() {
-                    if let Some(dev) = gpus.devices.get_mut(r) {
-                        let _ = dev.bind_thread();
-                        w.free_gpu(dev);
-                    }
-                }
-                for (r, s) in state.into_iter().enumerate() {
-                    if let Some(dev) = gpus.devices.get_mut(r) {
-                        let _ = dev.bind_thread();
-                        s.free_gpu(dev);
-                    }
-                }
-                for (r, p) in partials.into_iter().enumerate() {
-                    if let Some(dev) = gpus.devices.get_mut(r) {
-                        let _ = dev.bind_thread();
-                        let _ = dev.free_tensor(p);
-                    }
-                }
-            }
-            EpArch::Minimax {
-                weights,
-                state,
-                partials,
-                ..
-            } => {
-                for (r, w) in weights.into_iter().enumerate() {
-                    if let Some(dev) = gpus.devices.get_mut(r) {
-                        let _ = dev.bind_thread();
-                        w.free_gpu(dev);
-                    }
-                }
-                for (r, s) in state.into_iter().enumerate() {
-                    if let Some(dev) = gpus.devices.get_mut(r) {
-                        let _ = dev.bind_thread();
-                        s.free_gpu(dev);
-                    }
-                }
-                for (r, p) in partials.into_iter().enumerate() {
-                    if let Some(dev) = gpus.devices.get_mut(r) {
-                        let _ = dev.bind_thread();
-                        let _ = dev.free_tensor(p);
-                    }
-                }
-            }
-        }
-        for dev in gpus.devices.iter_mut() {
-            let _ = dev.bind_thread();
-            dev.invalidate_weight_caches();
-            dev.invalidate_graph_state();
-            dev.drain_pool();
-        }
-        let _ = gpu;
-        return;
-        // `gpus` drops here, tearing down comms + devices.
     }
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
