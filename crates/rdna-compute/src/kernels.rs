@@ -1223,6 +1223,8 @@ pub const GEMV_HFQ4G256_MOE_DOWN_SRC: &str =
 /// to need — required for hipGraph capture of MoE decode.
 pub const MOE_SOFTMAX_TOPK_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_softmax_topk_k8.hip");
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip");
 
 /// MoE top-K + renorm only, given pre-softmaxed probs. Companion to
 /// the regular softmax_f32 kernel; the dispatch site runs softmax_f32

@@ -430,14 +430,26 @@ pub fn run_moe_decode(
             }
         }
     }
-    hip!(gpu.softmax_f32(p.router_logits))?;
-    hip!(gpu.moe_topk_renorm_k8(
-        p.router_logits,
-        p.topk_indices,
-        p.topk_weights,
-        p.n_exp,
-        p.norm_topk_prob
-    ))?;
+    let wave64_router = ctx.arch.is_gfx1201()
+        && std::env::var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0");
+    if wave64_router {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else {
+        hip!(gpu.softmax_f32(p.router_logits))?;
+        hip!(gpu.moe_topk_renorm_k8(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    }
 
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is

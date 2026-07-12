@@ -5510,6 +5510,53 @@ impl Gpu {
         result
     }
 
+    /// gfx1201 wave64 zero-LDS fused router. The source carries the required
+    /// whole-translation-unit `-mwavefrontsize64` compiler flag.
+    pub fn moe_router_softmax_topk_k8_wave64(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = "moe_router_softmax_topk_k8_wave64";
+        self.ensure_kernel(
+            name,
+            kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC,
+            name,
+        )?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = i32::from(norm_topk);
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        )
+    }
+
     /// MoE top-K + renorm given pre-softmaxed probs. Companion to the
     /// regular `softmax_f32`. The dispatch site runs `softmax_f32` first,
     /// then this kernel — same softmax math everywhere, no 1-ULP

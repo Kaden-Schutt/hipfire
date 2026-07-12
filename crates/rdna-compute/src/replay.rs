@@ -94,6 +94,9 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    if kernel == "moe_router_softmax_topk_k8_wave64" {
+        return Some(vec![read(0), write(8), write(16)]);
+    }
     match kernel {
         "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "fused_qkvza_hfq4g256" => Some(vec![
@@ -183,6 +186,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel == "moe_router_softmax_topk_k8_wave64" {
+        return Some(32);
+    }
     match kernel {
         "softmax_f32" => Some(16),
         "fused_qk_l2_norm_scale_f32"
@@ -1514,6 +1520,7 @@ mod tests {
         "gemv_hfq4g256_wide",
         "softmax_f32",
         "moe_topk_renorm_k8",
+        "moe_router_softmax_topk_k8_wave64",
         "fused_silu_mul_mq_rotate",
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
