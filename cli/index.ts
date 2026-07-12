@@ -1255,6 +1255,13 @@ interface ModelEntry {
   /// `crates/hipfire-arch-deepseek4/src/arch.rs`), so no explicit env var
   /// is required once the file is in MODELS_DIR.
   mtp?: { file: string };
+  /// Optional published DSpark 3-stage drafter sidecar — currently DeepSeek V4
+  /// only. When set, `hipfire pull` also fetches the file next to the weights.
+  /// The deepseek4 loader auto-discovers it via the `<stem>-dspark.<ext>`
+  /// sibling convention (see `crates/hipfire-arch-deepseek4/src/arch.rs`) at
+  /// load time, so no explicit env var is required once the file is in
+  /// MODELS_DIR; under `--spec dspark`/auto it wins over the in-trunk MTP head.
+  dspark?: { file: string };
   /// Optional per-model KV-cache default (the registry is the per-model card).
   /// When present it takes precedence over the q8 default in resolveKvMode (but
   /// still loses to HIPFIRE_KV_MODE env and per-model config). This is the
@@ -2424,6 +2431,36 @@ async function pull(tag: string): Promise<string> {
         }
       } catch (e) {
         console.error(`  WARN: MTP sidecar fetch error: ${e} — non-fatal.`);
+      }
+    }
+  }
+
+  // DSpark 3-stage drafter sidecar — same `<stem>-dspark.<ext>` sibling
+  // convention (see arch-deepseek4/src/arch.rs); missing sidecar = MTP/plain
+  // decode only, no DSpark spec-decode.
+  if (entry.dspark?.file) {
+    const sidecarDest = join(MODELS_DIR, entry.dspark.file);
+    if (existsSync(sidecarDest)) {
+      console.error(`  DSpark sidecar already present: ${entry.dspark.file}`);
+    } else {
+      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.dspark.file}`;
+      console.error(`  Fetching DSpark sidecar: ${entry.dspark.file}`);
+      try {
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
+        if (!sres.ok) {
+          console.error(`  WARN: DSpark sidecar fetch failed (${sres.status} ${sres.statusText}) — base is usable; DSpark spec-decode unavailable until sidecar present.`);
+        } else {
+          const sTmp = sidecarDest + ".tmp";
+          const sWriter = Bun.file(sTmp).writer();
+          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
+          await sWriter.end();
+          const { renameSync } = await import("fs");
+          renameSync(sTmp, sidecarDest);
+          const ssz = (statSync(sidecarDest).size / 1e9).toFixed(2);
+          console.error(`  Saved: ${sidecarDest} (${ssz}GB)`);
+        }
+      } catch (e) {
+        console.error(`  WARN: DSpark sidecar fetch error: ${e} — non-fatal.`);
       }
     }
   }

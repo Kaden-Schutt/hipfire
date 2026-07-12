@@ -53,11 +53,14 @@
       "mtp": {
         "file": "deepseek-v4-flash-mtp.mq2lloyd"
       },
+      "dspark": {
+        "file": "deepseek-v4-flash-dspark.mq2lloyd"
+      },
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 1.0
       },
-      "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code). temp=1.0 is safety-critical: greedy/low-temp falls into token loops on the quant."
+      "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code) and a DSpark 3-stage drafter sidecar (auto-wins over MTP under --spec dspark/auto). temp=1.0 is safety-critical: greedy/low-temp falls into token loops on the quant."
     },
     "minimax-m2.7": {
       "repo": "hipfire-models/hipfire-MiniMax-M2.7",
