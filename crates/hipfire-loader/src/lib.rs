@@ -13,7 +13,7 @@ pub use carriers::*;
 pub mod model_parallel;
 pub mod session_state;
 pub mod spec_build;
-pub use model_parallel::{ModelParallel, PipelineImpl};
+pub use model_parallel::{ModelParallel, ModelParallelKind, PipelineImpl};
 
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
@@ -332,19 +332,14 @@ pub struct LoadedModel {
     pub pp: usize,
     pub pp_gpus: Option<Gpus>,
     pub ep: Option<EpState>,
-    /// Dense tensor-parallel served model (PB-TP5, the `Tp` axis). Distinct from
-    /// `ep` (expert-parallel, `Ep` axis): dense row/col sharding of a llama-family
-    /// model. When `Some`, the daemon serves via `generate_tp`.
-    pub tp: Option<hipfire_runtime::tp_serve::TpModel>,
     /// Dense pipeline-parallel served model (P-C, the `Pp` axis): a llama-family
     /// model banded across stages. Distinct from the qwen35 hand-coded PP path
     /// (`pp_gpus` / `Qwen35Bundle.pipeline`). When `Some`, the daemon serves via
     /// `generate_pp` (through the shared `generate_dense` loop).
     pub pp_dense: Option<hipfire_runtime::pp_serve::PpModel>,
     /// Owning parallelism enum — the single-value answer to "which axis?".
-    /// Set to `Single` at every construction site; migrated to the real axis
-    /// variant in later increments. Legacy `pp`/`pp_gpus`/`ep`/`tp`/`pp_dense`
-    /// fields are KEPT for now while readers migrate.
+    /// `Tp` owns the TpModel (migrated from the old `m.tp` field in Task 3).
+    /// Legacy `pp`/`pp_gpus`/`ep`/`pp_dense` fields kept while remaining axes migrate.
     pub parallel: ModelParallel,
     // Shared arch state
     pub state: Option<ModelState>,
@@ -409,7 +404,6 @@ impl LoadedModel {
             arch_id,
             pp: 1,
             ep: None,
-            tp: None,
             pp_dense: None,
             parallel: ModelParallel::Single,
             pp_gpus: None,
@@ -1508,8 +1502,8 @@ pub fn load_model_tp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
     let eos_tok = tp_model.eos_token();
 
     Ok(LoadedModel {
-        tp: Some(tp_model),
-        deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (TP state is in `tp`, not `state`)
+        parallel: ModelParallel::Tp(tp_model), // Task 3: TP axis migrated from m.tp
+        deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (TP state is in parallel, not state)
         rec_temperature: rec.and_then(|r| r.temperature),
         rec_top_p: rec.and_then(|r| r.top_p),
         rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
@@ -1822,14 +1816,13 @@ fn load_model_ep_minimax(
 // ─── Unload ───────────────────────────────────────────────────────────
 
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
-    // Dense-TP unload (PB-TP5): the `TpModel` owns its own `Gpus` + `WeightStore`
-    // + per-rank buffers. `TpModel::free` frees every owned tensor and drains
-    // each device pool, THEN drops the `Gpus`. A bare `drop(tp)` reclaimed
-    // nothing — none of `GpuTensor` / `DeviceBuffer` / `GpuPool` has a freeing
-    // `Drop`, so it leaked the whole model per load/unload cycle (mirrors the EP
-    // arm below, which frees explicitly for the same reason). The daemon's
-    // single `gpu` is untouched (unused for tp>1).
-    if let Some(tp) = m.tp.take() {
+    // Dense-TP unload (PB-TP5, Task 3): TpModel is now owned by `m.parallel`.
+    // Replace with Single so the moved-out TpModel can be freed; the daemon's
+    // single `gpu` is untouched (unused for tp>1). TpModel::free frees every
+    // owned tensor + drains each device pool (bare drop() leaks — no freeing Drop).
+    if let ModelParallel::Tp(tp) =
+        std::mem::replace(&mut m.parallel, ModelParallel::Single)
+    {
         tp.free();
     }
     // Dense-PP unload (P-C): PpModel owns its own Gpus + per-stage scratch/KV.
