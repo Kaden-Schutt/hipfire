@@ -1107,7 +1107,14 @@ impl ReplayController {
             Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
             Pm4RegisterPolicy::Stateful => Gfx12Pm4CommandBuffer::new_stateful(),
         };
-        commands.acquire_system();
+        let gfx12_gcr_trim = std::env::var("HIPFIRE_REPLAY_PM4_GCR_TRIM")
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
+        if gfx12_gcr_trim {
+            commands.acquire_system_gfx12();
+        } else {
+            commands.acquire_system();
+        }
         let mut wait_audit = Pm4WaitAudit::default();
         let mut resource_frontier = ResourceFrontier::default();
         for index in 0..prefix {
@@ -1143,7 +1150,11 @@ impl ReplayController {
                     .pm4_mid_acquire_policy
                     .acquire_between(previous, current)
                 {
-                    commands.acquire_system();
+                    if gfx12_gcr_trim {
+                        commands.acquire_inter_node_gfx12();
+                    } else {
+                        commands.acquire_system();
+                    }
                 }
             } else {
                 resource_frontier.advance(&self.recorded[index], false);

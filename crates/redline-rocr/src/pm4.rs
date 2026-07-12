@@ -96,6 +96,34 @@ impl Gfx12Pm4CommandBuffer {
         ]);
     }
 
+    /// GFX12 ownership-boundary acquire derived from the gfx12 GCR fields.
+    /// This preserves system-scope L2 writeback/invalidate plus instruction,
+    /// scalar, and vector cache visibility without carrying removed gfx11
+    /// GL1/metadata bits into the merged RDNA4 hierarchy.
+    pub fn acquire_system_gfx12(&mut self) {
+        self.emit_acquire_gcr(0x1c1d1);
+    }
+
+    /// Same-agent inter-node acquire for one retained gfx12 tape. Kernel code
+    /// is immutable and L2/MALL remains coherent, so only scalar/vector read
+    /// caches plus forward sequencing are invalidated.
+    pub fn acquire_inter_node_gfx12(&mut self) {
+        self.emit_acquire_gcr(0x10180);
+    }
+
+    fn emit_acquire_gcr(&mut self, gcr_cntl: u32) {
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_ACQUIRE_MEM, 7, false),
+            0,
+            u32::MAX,
+            0xff,
+            0,
+            0,
+            4,
+            gcr_cntl,
+        ]);
+    }
+
     /// Append one zero-scratch wave32 dispatch using the exact loaded code
     /// entry and descriptor resources reported by the HSA loader.
     pub fn dispatch(
@@ -315,10 +343,16 @@ mod tests {
     fn acquire_and_compute_idle_have_stable_rocr_encodings() {
         let mut commands = Gfx12Pm4CommandBuffer::new();
         commands.acquire_system();
+        commands.acquire_system_gfx12();
+        commands.acquire_inter_node_gfx12();
         commands.wait_compute_idle();
         assert_eq!(commands.dwords()[0], 0xc006_5800);
         assert_eq!(commands.dwords()[7], 0x1c3f1);
-        assert_eq!(&commands.dwords()[8..], &[0xc000_4600, 0x407]);
+        assert_eq!(commands.dwords()[8], 0xc006_5800);
+        assert_eq!(commands.dwords()[15], 0x1c1d1);
+        assert_eq!(commands.dwords()[16], 0xc006_5800);
+        assert_eq!(commands.dwords()[23], 0x10180);
+        assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x407]);
     }
 
     #[test]
