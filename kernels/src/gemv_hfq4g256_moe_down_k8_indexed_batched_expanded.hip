@@ -70,6 +70,12 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     const char* row_ptr2 = A + (long long)(have_row2 ? row2 : row0) * row_stride;
     const char* row_ptr3 = A + (long long)(have_row3 ? row3 : row0) * row_stride;
     const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto row_rsrc0 = HIPFIRE_WEIGHT_RSRC(row_ptr0);
+    const auto row_rsrc1 = HIPFIRE_WEIGHT_RSRC(row_ptr1);
+    const auto row_rsrc2 = HIPFIRE_WEIGHT_RSRC(row_ptr2);
+    const auto row_rsrc3 = HIPFIRE_WEIGHT_RSRC(row_ptr3);
+#endif
 
     // gfx12: initiate the four first-demand group-0 cacheline fetches while
     // the existing x float4 hoist provides independent VMEM work.  Group 1
@@ -87,10 +93,10 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     float ccc0 = 0.0f, ccc1 = 0.0f;
     float dcc0 = 0.0f, dcc1 = 0.0f;
 
-    #define DOG_X8(gp, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
-        unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
+    #define DOG_X8(gp, rsrc, weight_offset, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, gp, weight_offset)); \
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 4, (weight_offset) + 4)); \
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
              + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
@@ -109,23 +115,23 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     const float4 xv1b = *reinterpret_cast<const float4*>(x + base0 + 260);
 
     // Group 0 → pairwise slot 0 (matches baseline tail g=0 → acc0).
-    DOG_X8(row_ptr0 + 0 * 136, acc0,
+    DOG_X8(row_ptr0 + 0 * 136, row_rsrc0, 0 * 136, acc0,
            xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-    DOG_X8(row_ptr1 + 0 * 136, bcc0,
+    DOG_X8(row_ptr1 + 0 * 136, row_rsrc1, 0 * 136, bcc0,
            xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-    DOG_X8(row_ptr2 + 0 * 136, ccc0,
+    DOG_X8(row_ptr2 + 0 * 136, row_rsrc2, 0 * 136, ccc0,
            xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-    DOG_X8(row_ptr3 + 0 * 136, dcc0,
+    DOG_X8(row_ptr3 + 0 * 136, row_rsrc3, 0 * 136, dcc0,
            xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
 
     // Group 1 → pairwise slot 1 (matches baseline tail g=1 → acc1).
-    DOG_X8(row_ptr0 + 1 * 136, acc1,
+    DOG_X8(row_ptr0 + 1 * 136, row_rsrc0, 1 * 136, acc1,
            xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-    DOG_X8(row_ptr1 + 1 * 136, bcc1,
+    DOG_X8(row_ptr1 + 1 * 136, row_rsrc1, 1 * 136, bcc1,
            xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-    DOG_X8(row_ptr2 + 1 * 136, ccc1,
+    DOG_X8(row_ptr2 + 1 * 136, row_rsrc2, 1 * 136, ccc1,
            xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-    DOG_X8(row_ptr3 + 1 * 136, dcc1,
+    DOG_X8(row_ptr3 + 1 * 136, row_rsrc3, 1 * 136, dcc1,
            xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
     #undef DOG_X8
 
@@ -154,4 +160,3 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         if (have_row3) expert_outputs[out_base + row3] = dcc;
     }
 }
-

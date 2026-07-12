@@ -179,6 +179,30 @@ impl FeatureFlags {
             _ => 2,
         };
 
+        let mut hipcc_extra_flags = std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
+        if arch == "gfx1201" {
+            let policy_flag = match std::env::var("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY")
+                .ok()
+                .as_deref()
+            {
+                None | Some("") | Some("rt") => None,
+                Some("global") => Some("-DHIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS=1"),
+                Some("ht") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=18"),
+                Some("nt-rt") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=20"),
+                Some("nt-ht") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=22"),
+                Some(other) => {
+                    eprintln!("unknown HIPFIRE_GFX12_WEIGHT_LOAD_POLICY={other:?}; using rt");
+                    None
+                }
+            };
+            if let Some(flag) = policy_flag {
+                if !hipcc_extra_flags.is_empty() {
+                    hipcc_extra_flags.push(' ');
+                }
+                hipcc_extra_flags.push_str(flag);
+            }
+        }
+
         Self {
             arch: arch.to_string(),
 
@@ -297,7 +321,7 @@ impl FeatureFlags {
                 .and_then(|s| s.parse::<u32>().ok()),
 
             // Compiler.rs
-            hipcc_extra_flags: std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default(),
+            hipcc_extra_flags,
 
             // Interpreter Phase 2a
             force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")

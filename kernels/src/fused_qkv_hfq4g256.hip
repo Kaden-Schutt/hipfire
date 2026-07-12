@@ -54,6 +54,9 @@ extern "C" __global__ void fused_qkv_hfq4g256(
     const int groups_per_row = K / 256;
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
+#endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
@@ -66,19 +69,19 @@ extern "C" __global__ void fused_qkv_hfq4g256(
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
 
-        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
-        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
-        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
-        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
-        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
-        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
-        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
-        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
+        float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
+        float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
+        float sc1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 136));
+        float zp1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4, (g + 1) * 136 + 4));
+        float sc2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136));
+        float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
+        float sc3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136));
+        float zp3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4));
 
-        unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
-        unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
-        unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
-        unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
+        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
+        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
+        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
 
         int base = g * 256 + tid * 8;
 

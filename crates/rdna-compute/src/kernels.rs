@@ -1318,7 +1318,11 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 /// Observed lift: 387 → ~900 GiB/s on R9700/gfx1201 (no K_TOP-way atomic
 /// contention per output cell).
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
+    concat!(
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+    );
 
 /// Fused atomic-free MoE down: GEMV + K_TOP weighted-accumulate + residual
 /// add in a single kernel. Replaces the two-launch
@@ -2286,7 +2290,11 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
 // loop as gemv_hfq4g256.hip; grid = sum of the four projections' output
 // row counts. Works on every RDNA generation — see the kernel header.
 pub const FUSED_QKVZA_HFQ4G256_SRC: &str =
-    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip");
+    concat!(
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+    );
 
 // CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
@@ -2302,7 +2310,11 @@ pub const FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str =
 // wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
 // variant; grid = q_m + k_m + v_m. Cross-arch.
 pub const FUSED_QKV_HFQ4G256_SRC: &str =
-    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip");
+    concat!(
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+    );
 
 // CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
 // block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
