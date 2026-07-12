@@ -272,6 +272,14 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
     const int boff = tid * 4;
+    const unsigned int row_weight_offset0 = (unsigned int)((long long)row0 * row_stride);
+    const unsigned int row_weight_offset1 =
+        (unsigned int)((long long)(have_row1 ? row1 : row0) * row_stride);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    // The full lm-head matrix fits the raw-buffer 32-bit offset range; one SRD
+    // avoids extending the live descriptor set in this 94-VGPR kernel.
+    const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
+#endif
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
@@ -284,10 +292,10 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
         const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
         const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
 
-    #define DOG_X8(gp, a, pfx) do { \
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
-        unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
+    #define DOG_X8(gp, weight_offset, a, pfx) do { \
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)); \
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)); \
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * pfx##0 \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * pfx##1 \
              + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * pfx##2 \
@@ -309,14 +317,14 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
         LOAD_X8_INTO(base0 + 768, xd);
 
         // Branchless dual-row DOG with all x resident (no mid-quad x reload).
-        DOG_X8(row_ptr0 + g * 136, a0, xa);
-        DOG_X8(row_ptr1 + g * 136, b0, xa);
-        DOG_X8(row_ptr0 + (g + 1) * 136, a1, xb);
-        DOG_X8(row_ptr1 + (g + 1) * 136, b1, xb);
-        DOG_X8(row_ptr0 + (g + 2) * 136, a2, xc);
-        DOG_X8(row_ptr1 + (g + 2) * 136, b2, xc);
-        DOG_X8(row_ptr0 + (g + 3) * 136, a3, xd);
-        DOG_X8(row_ptr1 + (g + 3) * 136, b3, xd);
+        DOG_X8(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a0, xa);
+        DOG_X8(row_ptr1 + g * 136, row_weight_offset1 + g * 136, b0, xa);
+        DOG_X8(row_ptr0 + (g + 1) * 136, row_weight_offset0 + (g + 1) * 136, a1, xb);
+        DOG_X8(row_ptr1 + (g + 1) * 136, row_weight_offset1 + (g + 1) * 136, b1, xb);
+        DOG_X8(row_ptr0 + (g + 2) * 136, row_weight_offset0 + (g + 2) * 136, a2, xc);
+        DOG_X8(row_ptr1 + (g + 2) * 136, row_weight_offset1 + (g + 2) * 136, b2, xc);
+        DOG_X8(row_ptr0 + (g + 3) * 136, row_weight_offset0 + (g + 3) * 136, a3, xd);
+        DOG_X8(row_ptr1 + (g + 3) * 136, row_weight_offset1 + (g + 3) * 136, b3, xd);
     }
 
     // Tail uses sequential x (at most 3 groups; hoist buys little).
@@ -326,10 +334,10 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
         const float x0 = xv0.x, x1 = xv0.y, x2 = xv0.z, x3 = xv0.w; \
         const float x4 = xv1.x, x5 = xv1.y, x6 = xv1.z, x7 = xv1.w
 
-    #define DOG_X8_TAIL(gp, a) do { \
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
-        unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
+    #define DOG_X8_TAIL(gp, weight_offset, a) do { \
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)); \
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)); \
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
              + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
@@ -344,22 +352,22 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
         const int g = quads << 2;
         const int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8_TAIL(row_ptr0 + g * 136, a0);
-        DOG_X8_TAIL(row_ptr1 + g * 136, b0);
+        DOG_X8_TAIL(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a0);
+        DOG_X8_TAIL(row_ptr1 + g * 136, row_weight_offset1 + g * 136, b0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         const int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8_TAIL(row_ptr0 + g * 136, a1);
-        DOG_X8_TAIL(row_ptr1 + g * 136, b1);
+        DOG_X8_TAIL(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a1);
+        DOG_X8_TAIL(row_ptr1 + g * 136, row_weight_offset1 + g * 136, b1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         const int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8_TAIL(row_ptr0 + g * 136, a2);
-        DOG_X8_TAIL(row_ptr1 + g * 136, b2);
+        DOG_X8_TAIL(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a2);
+        DOG_X8_TAIL(row_ptr1 + g * 136, row_weight_offset1 + g * 136, b2);
     }
     #undef DOG_X8_TAIL
     #undef LOAD_X8

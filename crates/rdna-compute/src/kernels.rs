@@ -1156,7 +1156,11 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 pub const GEMV_HFQ4G256_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip");
+    concat!(
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+    );
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str =
@@ -2281,7 +2285,11 @@ pub const GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC: &str =
 pub const GEMV_HFQ4G256_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.gfx1100.hip");
 pub const GEMV_HFQ4G256_MULTIROW_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip");
+    concat!(
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
+    );
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
 
