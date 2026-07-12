@@ -332,14 +332,9 @@ pub struct LoadedModel {
     pub pp: usize,
     pub pp_gpus: Option<Gpus>,
     pub ep: Option<EpState>,
-    /// Dense pipeline-parallel served model (P-C, the `Pp` axis): a llama-family
-    /// model banded across stages. Distinct from the qwen35 hand-coded PP path
-    /// (`pp_gpus` / `Qwen35Bundle.pipeline`). When `Some`, the daemon serves via
-    /// `generate_pp` (through the shared `generate_dense` loop).
-    pub pp_dense: Option<hipfire_runtime::pp_serve::PpModel>,
     /// Owning parallelism enum — the single-value answer to "which axis?".
-    /// `Tp` owns the TpModel (migrated from the old `m.tp` field in Task 3).
-    /// Legacy `pp`/`pp_gpus`/`ep`/`pp_dense` fields kept while remaining axes migrate.
+    /// `Tp` owns the TpModel (migrated Task 3). `Pp(Dense)` owns the PpModel (migrated Task 4).
+    /// Legacy `pp`/`pp_gpus`/`ep` fields kept while remaining axes migrate.
     pub parallel: ModelParallel,
     // Shared arch state
     pub state: Option<ModelState>,
@@ -404,7 +399,6 @@ impl LoadedModel {
             arch_id,
             pp: 1,
             ep: None,
-            pp_dense: None,
             parallel: ModelParallel::Single,
             pp_gpus: None,
             state: None,
@@ -1537,9 +1531,9 @@ pub fn load_model_pp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
     let eos_tok = pp_model.eos_token();
 
     Ok(LoadedModel {
-        pp: mesh.size_of(DimKind::Pp), // requested degree (informational; PP state lives in pp_dense)
-        pp_dense: Some(pp_model),
-        deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (PP state is in `pp_dense`)
+        pp: mesh.size_of(DimKind::Pp), // requested degree (informational; PP state lives in parallel)
+        parallel: ModelParallel::Pp(crate::model_parallel::PipelineImpl::Dense(pp_model)),
+        deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (PP state is in parallel)
         rec_temperature: rec.and_then(|r| r.temperature),
         rec_top_p: rec.and_then(|r| r.top_p),
         rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
@@ -1816,29 +1810,29 @@ fn load_model_ep_minimax(
 // ─── Unload ───────────────────────────────────────────────────────────
 
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
-    // Dense-TP unload (PB-TP5, Task 3): TpModel is now owned by `m.parallel`.
-    // Replace with Single so the moved-out TpModel can be freed; the daemon's
-    // single `gpu` is untouched (unused for tp>1). TpModel::free frees every
-    // owned tensor + drains each device pool (bare drop() leaks — no freeing Drop).
-    if let ModelParallel::Tp(tp) =
-        std::mem::replace(&mut m.parallel, ModelParallel::Single)
-    {
-        tp.free();
-    }
-    // Dense-PP unload (P-C): PpModel owns its own Gpus + per-stage scratch/KV.
-    // `PpModel::free` frees them + drains each stage pool before dropping the
-    // `Gpus` (same no-freeing-`Drop` leak as the TP arm). Daemon `gpu` untouched.
-    if let Some(pp) = m.pp_dense.take() {
-        pp.free();
-        // Return here (like the EP arm below): a dense-PP model owns its entire
-        // mesh (Gpus + per-stage scratch/KV) inside the PpModel, so dropping it
-        // is the whole teardown. Without this return a dense-PP unload falls
-        // through into the qwen35-PP `if m.pp > 1` arm — true because
-        // load_model_pp sets an informational `pp>=2` — and panics at
-        // `m.pp_gpus.expect(...)` (dense PP leaves `pp_gpus`/`state` None). See
-        // .agent-memory/notes/dense-pp-unload-panic-pp-gpus-expect.md.
-        let _ = gpu;
-        return;
+    // Dense-TP / dense-PP unload: both axes are owned by `m.parallel`.
+    // Replace with Single to move out the owned model, then dispatch by variant.
+    // The single replace is correct because TP and PP are mutually exclusive.
+    //
+    // TP arm (PB-TP5, Task 3): TpModel::free frees every owned tensor + drains
+    // each device pool (bare drop() leaks — no freeing Drop). Daemon `gpu` untouched.
+    //
+    // PP arm (P-C, Task 4): PpModel owns its own Gpus + per-stage scratch/KV.
+    // PpModel::free frees them + drains each stage pool. Return here: dense-PP owns
+    // its entire mesh inside PpModel, so this is the whole teardown. Without the
+    // return a dense-PP unload falls through into the qwen35-PP `if m.pp > 1` arm
+    // (true because load_model_pp sets an informational pp>=2) and panics at
+    // pp_gpus.expect. See .agent-memory/notes/dense-pp-unload-panic-pp-gpus-expect.md.
+    match std::mem::replace(&mut m.parallel, ModelParallel::Single) {
+        ModelParallel::Tp(tp) => {
+            tp.free();
+        }
+        ModelParallel::Pp(crate::model_parallel::PipelineImpl::Dense(pp)) => {
+            pp.free();
+            let _ = gpu;
+            return;
+        }
+        _ => {}
     }
     // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
     // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every

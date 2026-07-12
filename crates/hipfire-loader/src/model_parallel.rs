@@ -7,12 +7,12 @@
 //!
 //! # Real dispatch precedence (verified against daemon.rs `fn generate()`)
 //!
-//! The axis-first early-return order in `generate()` (daemon.rs ~6891–7374):
-//!   1. `m.tp.is_some()`       → line 6891
-//!   2. `m.pp_dense.is_some()` → line 6940
-//!   3. `m.ep.is_some()`       → line 6990
-//!   4. `m.pp > 1`             → line 7374  (qwen35 pipeline-parallel)
-//!   5. (everything else)      → Single
+//! The axis-first early-return order in `generate()` (daemon.rs):
+//!   1. `m.parallel` is Tp           → TP path
+//!   2. `m.parallel` is Pp(Dense)    → dense-PP path
+//!   3. `m.ep.is_some()`             → EP path
+//!   4. `m.pp > 1`                   → qwen35 pipeline-parallel
+//!   5. (everything else)            → Single
 //!
 //! NOTE: The brief guessed `ep > tp > pp_dense > pp_qwen35 > single`.
 //! The REAL order is `tp > pp_dense > ep > pp_qwen35 > single`.
@@ -29,7 +29,7 @@ use crate::EpState;
 pub enum ModelParallelKind {
     /// Tensor-parallel dense multi-GPU (`m.tp.is_some()`).
     Tp,
-    /// Pipeline-parallel dense multi-GPU (`m.pp_dense.is_some()`).
+    /// Pipeline-parallel dense multi-GPU (`m.parallel` is `Pp(Dense)`).
     PpDense,
     /// Expert-parallel MoE multi-GPU (`m.ep.is_some()`).
     Ep,
@@ -43,9 +43,9 @@ impl ModelParallelKind {
     /// Classify from the four axis-present flags in dispatch priority order.
     ///
     /// `flags` = `[tp_some, pp_dense_some, ep_some, pp_qwen35]`,
-    /// matching the early-return order in `generate()` (daemon.rs ~6891–7374):
-    ///   [0] tp_some     → `m.tp.is_some()`
-    ///   [1] pp_dense    → `m.pp_dense.is_some()`
+    /// matching the early-return order in `generate()` (daemon.rs):
+    ///   [0] tp_some     → `m.parallel` is `Tp`
+    ///   [1] pp_dense    → `m.parallel` is `Pp(Dense)`
     ///   [2] ep_some     → `m.ep.is_some()`
     ///   [3] pp_qwen35   → `m.pp > 1`
     #[allow(dead_code)]

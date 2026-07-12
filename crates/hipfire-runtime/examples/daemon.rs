@@ -50,6 +50,7 @@ use std::time::Instant;
 use hipfire_hardware::DimKind;
 use hipfire_loader::{
     AsstTurnCache, EpArch, EpState, LoadedModel, ModelParallel, ModelParallelKind, ModelState,
+    PipelineImpl,
 };
 use hipfire_runtime::spec::{
     ClientEvent, EvictRetain, FinishSummary, PrefillOutcome, SpecEmit, StopReason,
@@ -2673,28 +2674,22 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
 }
 
 /// Dense multi-GPU (TP / dense-PP) AR dispatch — the THIRD mesh dispatch. Wraps a
-/// `DenseServed` model (TpModel when `!is_pp`, PpModel when `is_pp`) whose `Gpus`
-/// lives inside `m.parallel` (Tp variant, Task 3) / `m.pp_dense`, so `ForwardCtx::Mesh`
-/// reaches it through `&mut self`. Folds `generate_dense`: per-token `forward_token`
-/// (batched `prefill` at pos 0, per-token suffix on an LCP hit), host `sample_cpu`
-/// over `logits()`, `is_eos = eos || is_terminator`. Lean — no think / grammar /
+/// `DenseServed` model (TpModel or PpModel) whose `Gpus` lives inside `m.parallel`
+/// (Tp variant Task 3, Pp(Dense) variant Task 4), so `ForwardCtx::Mesh` reaches it
+/// through `&mut self`. Folds `generate_dense`: per-token `forward_token` (batched
+/// `prefill` at pos 0, per-token suffix on an LCP hit), host `sample_cpu` over
+/// `logits()`, `is_eos = eos || is_terminator`. Lean — no think / grammar /
 /// eviction / checkpoints. Dense models track no cursor, so the gate preamble seeds
 /// `m.session.seq_pos` from the LCP start_pos and ar_generate advances it.
 #[allow(dead_code)]
 struct DenseDispatch<'m> {
     m: &'m mut LoadedModel,
-    /// false = TP (m.parallel::Tp), true = dense-PP (m.pp_dense).
-    is_pp: bool,
 }
 
 impl DenseDispatch<'_> {
     fn dense_model(&mut self) -> &mut dyn DenseServed {
-        if self.is_pp {
-            self.m.pp_dense.as_mut().expect("DenseDispatch: no pp_dense") as &mut dyn DenseServed
-        } else {
-            // Task 3: TP model lives in m.parallel; delegate to the free fn.
-            dense_model_mut(self.m).expect("DenseDispatch: no dense model")
-        }
+        // Task 4: both TP and Pp(Dense) are inside m.parallel; delegate to free fn.
+        dense_model_mut(self.m).expect("DenseDispatch: no dense model")
     }
 }
 
@@ -2705,14 +2700,11 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for DenseDispatch<'_> {
     }
 
     fn eos_token(&self) -> u32 {
-        if self.is_pp {
-            self.m.pp_dense.as_ref().map(|p| p.eos_token()).unwrap_or(0)
-        } else {
-            // Task 3: TP eos_token via m.parallel (was m.tp.as_ref()).
-            match &self.m.parallel {
-                ModelParallel::Tp(t) => t.eos_token(),
-                _ => 0,
-            }
+        // Task 4: both TP and Pp(Dense) are inside m.parallel.
+        match &self.m.parallel {
+            ModelParallel::Tp(t) => t.eos_token(),
+            ModelParallel::Pp(PipelineImpl::Dense(p)) => p.eos_token(),
+            _ => 0,
         }
     }
 
@@ -4928,18 +4920,18 @@ impl DenseServed for hipfire_runtime::pp_serve::PpModel {
 
 /// Select the DenseServed driver from the parallelism axis (F1: DenseServed is
 /// daemon-private so this match cannot live on the loader-side enum).
-/// Task 3 adds the Tp arm; Task 4 will add Pp(Dense) (commented below).
+/// Task 3 adds the Tp arm; Task 4 adds the Pp(Dense) arm.
 fn dense_model_mut(m: &mut LoadedModel) -> Option<&mut dyn DenseServed> {
     match &mut m.parallel {
         ModelParallel::Tp(t) => Some(t),
-        // ModelParallel::Pp(hipfire_loader::PipelineImpl::Dense(p)) => Some(p),  // Task 4
+        ModelParallel::Pp(PipelineImpl::Dense(p)) => Some(p),
         _ => None,
     }
 }
 
 /// Drive dense multi-GPU (TP / dense-PP) AR decode through the unified `ar_generate`
-/// driver — folds `generate_dense`. Shared by the tp + pp_dense gates (`is_pp`
-/// selects). Mirrors the gate preamble: `plan_prompt_cache` (LCP the rendered
+/// driver — folds `generate_dense`. Shared by the Tp and Pp(Dense) gates (both
+/// now in `m.parallel`). Mirrors the gate preamble: `plan_prompt_cache` (LCP the rendered
 /// conversation vs `conversation_tokens`) → leave `conversation_tokens ==
 /// rendered[0..start_pos]` (truncate on a pure-extension hit, clear on a miss) so
 /// ar_generate's `extend(new_tokens)` + per-token push rebuilds `rendered +
@@ -4948,7 +4940,6 @@ fn dense_model_mut(m: &mut LoadedModel) -> Option<&mut dyn DenseServed> {
 #[allow(clippy::too_many_arguments)]
 fn dense_serve_via_ar_generate(
     m: &mut LoadedModel,
-    is_pp: bool,
     stdout: &mut std::io::Stdout,
     id: &str,
     system_prompt: Option<&str>,
@@ -5007,7 +4998,7 @@ fn dense_serve_via_ar_generate(
     m.session.seq_pos = start_pos;
     let prefill_len = new_tokens.len();
     let t0 = std::time::Instant::now();
-    let mut disp = DenseDispatch { m, is_pp };
+    let mut disp = DenseDispatch { m };
     ar_generate(
         &mut disp,
         ForwardCtx::Mesh,
@@ -5679,7 +5670,7 @@ fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
             }
         }
     }
-    // Dense TP/PP (m.parallel::Tp / m.pp_dense) are stateless per request — KV is
+    // Dense TP/PP (m.parallel::Tp / m.parallel::Pp(Dense)) are stateless per request — KV is
     // overwritten by the next turn's re-prefill from pos 0, so clearing
     // seq_pos/conversation_tokens above is sufficient; the models expose no reset and need none.
 }
@@ -9379,20 +9370,15 @@ fn generate(
     hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
     // Dense multi-GPU serve (PB-TP5 Tp / P-C Pp): route through the unified
     // ar_generate driver (dense_serve_via_ar_generate) BEFORE any arch short-circuit
-    // / EP. TP model lives in m.parallel::Tp (Task 3); PP model in m.pp_dense.
+    // / EP. Both TP and dense-PP now live in m.parallel (Task 3/4).
     // Disjoint field borrows: `m.tokenizer` (read) + the model field (mut).
-    if matches!(m.parallel.kind(), ModelParallelKind::Tp) {
-        // Dense TP AR decode on the unified ar_generate driver (folds generate_dense).
+    if matches!(
+        m.parallel.kind(),
+        ModelParallelKind::Tp | ModelParallelKind::PpDense
+    ) {
+        // Dense TP / dense-PP AR decode on the unified ar_generate driver.
         dense_serve_via_ar_generate(
-            m, false, stdout, id, system_prompt, prompt, assistant_prefix,
-            messages_history, temp, top_p, top_k, min_p, max_tokens, stop,
-        );
-        return;
-    }
-    if m.pp_dense.is_some() {
-        // Dense-PP AR decode on the unified ar_generate driver (folds generate_dense).
-        dense_serve_via_ar_generate(
-            m, true, stdout, id, system_prompt, prompt, assistant_prefix,
+            m, stdout, id, system_prompt, prompt, assistant_prefix,
             messages_history, temp, top_p, top_k, min_p, max_tokens, stop,
         );
         return;

@@ -44,8 +44,8 @@ fn main() {
         let m = hipfire_loader::load_model_pp(model_path, MAX_SEQ, &mesh)
             .unwrap_or_else(|e| panic!("cycle {cycle}: load_model_pp failed: {e}"));
         assert!(
-            m.pp_dense.is_some(),
-            "cycle {cycle}: dense PP model is missing pp_dense"
+            matches!(m.parallel.kind(), hipfire_loader::ModelParallelKind::PpDense),
+            "cycle {cycle}: dense PP model is not ModelParallel::Pp(Dense)"
         );
         assert!(
             m.pp_gpus.is_none(),
