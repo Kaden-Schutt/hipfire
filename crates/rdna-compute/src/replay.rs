@@ -365,7 +365,7 @@ impl Pm4RegisterPolicy {
 
     fn from_env() -> Self {
         let value =
-            std::env::var("HIPFIRE_REPLAY_PM4_STATEFUL").unwrap_or_else(|_| "static".to_owned());
+            std::env::var("HIPFIRE_REPLAY_PM4_STATEFUL").unwrap_or_else(|_| "stateful".to_owned());
         Self::from_value(&value).unwrap_or_else(|| {
             eprintln!(
                 "WARNING: unknown HIPFIRE_REPLAY_PM4_STATEFUL={value:?}; \
