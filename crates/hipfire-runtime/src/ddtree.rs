@@ -1220,9 +1220,10 @@ mod tests {
         let vocab = 6usize;
         let drafts = [2u32, 1];
         let mut logits = vec![0.0f32; (drafts.len() + 1) * vocab];
-        logits[0 * vocab + 2] = 10.0; // pos 0 argmax = 2 (== draft 0 ⇒ accept)
-        logits[1 * vocab + 4] = 10.0; // pos 1 argmax = 4 (!= draft 1 ⇒ stop)
-        logits[2 * vocab + 5] = 10.0; // pos 2 argmax = 5 (unused)
+        let at = |pos: usize, tok: usize| pos * vocab + tok;
+        logits[at(0, 2)] = 10.0; // pos 0 argmax = 2 (== draft 0 ⇒ accept)
+        logits[at(1, 4)] = 10.0; // pos 1 argmax = 4 (!= draft 1 ⇒ stop)
+        logits[at(2, 5)] = 10.0; // pos 2 argmax = 5 (unused)
         let mut rng = 0x1u64;
         let (accepted, bonus) = naive_sample_chain(&logits, &drafts, vocab, 0.0, &mut rng);
         assert_eq!(accepted, 1);
