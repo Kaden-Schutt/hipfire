@@ -1988,18 +1988,19 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
 
 /// Deepseek4 (arch 9) EXPERT-PARALLEL (multi-GPU) AR dispatch — the FIRST mesh
 /// `ArchDispatch`. Unlike the six single-GPU impls, its device (`Gpus`) lives
-/// INSIDE `m.ep` (`EpState.gpus`), i.e. inside the same `&mut m` this dispatch
-/// borrows — so every forward hook matches `ForwardCtx::Mesh` and reaches the
-/// mesh through `&mut self`; `Single` is `unreachable!()`. Mirrors `ep_serve_ds4`
-/// (daemon.rs): per-token `forward_ep` for both prefill and decode, rank-0 logits
-/// download, and the HOST full-distribution sampler `llama::sample_full_dist`
-/// (NOT the GPU sampler / `sample_cpu`). EP AR is MTP-free (spec-decode is the
-/// separate `generate_deepseek4_spec`). No eviction / adaptive-KV / prefill
-/// checkpoints → the tangle hooks keep their trait-default no-ops.
+/// inside `ModelParallel::Ep(EpState { gpus, .. })`, i.e. inside the same `&mut m`
+/// this dispatch borrows — so every forward hook matches `ForwardCtx::Mesh` and
+/// reaches the mesh through `&mut self`; `Single` is `unreachable!()`. Mirrors
+/// `ep_serve_ds4` (daemon.rs): per-token `forward_ep` for both prefill and decode,
+/// rank-0 logits download, and the HOST full-distribution sampler
+/// `llama::sample_full_dist` (NOT the GPU sampler / `sample_cpu`). EP AR is
+/// MTP-free (spec-decode is the separate `generate_deepseek4_spec`). No eviction /
+/// adaptive-KV / prefill checkpoints → the tangle hooks keep their trait-default
+/// no-ops.
 ///
 /// NOTE (Axis B inc 2): build-only groundwork — NOT wired/flipped. Inc 3 adds the
-/// DSML grammar/stream-parser output; inc 4 routes the `m.ep.is_some()` gate
-/// through `ar_generate`; inc 5 validates the FNV anchor + dual-run parity.
+/// DSML grammar/stream-parser output; inc 4 routes the `matches!(Ep)` gate through
+/// `ar_generate`; inc 5 validates the FNV anchor + dual-run parity.
 #[allow(dead_code)]
 struct Deepseek4EpDispatch<'m> {
     m: &'m mut LoadedModel,
@@ -2455,7 +2456,7 @@ impl hipfire_runtime::stream_parser::StreamParser for Deepseek4StreamParser {
 
 /// MiniMax-M2 (arch 10) EXPERT-PARALLEL (multi-GPU) AR dispatch — the second mesh
 /// dispatch (after Deepseek4EpDispatch). Same shape: `ForwardCtx::Mesh` reaches
-/// `m.ep.gpus` through `&mut self`; per-token `forward_ep` prefill(loop)/decode;
+/// `EpState::gpus` (via `ModelParallel::Ep`) through `&mut self`; per-token `forward_ep` prefill(loop)/decode;
 /// rank-0 `download_f32` + HOST `sample_full_dist`. OUTPUT is plain text (NOT DSML) —
 /// so it reuses MinimaxDispatch's hooks: the `[e~[` eos filter + the DEFAULT
 /// StreamParser (no grammar, no tool-call channel). The LCP prefix-cache rewind +
@@ -4580,12 +4581,7 @@ fn main() {
                 // tensors live on Gpus instead. Refuse cleanly per snapshot
                 // review patch f253472. A pp>1 prefill bench is out of scope
                 // for v1.
-                // Task 3: m.tp removed; TP now detected via m.parallel. NOTE: full
-                // kind() match consolidation deferred to Task 7.
-                if m.parallel.is_pipelined()
-                    || matches!(m.parallel.kind(), ModelParallelKind::Ep)
-                    || matches!(m.parallel.kind(), ModelParallelKind::Tp)
-                {
+                if !matches!(m.parallel.kind(), ModelParallelKind::Single) {
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"error","message":"bench_prefill requires a single-GPU model (pp=1, non-EP/TP); multi-GPU/EP/TP bench not implemented"}}"#
@@ -5167,7 +5163,7 @@ fn generate_ep(
         return;
     }
     let eos_tok = if m.arch_id == 10 {
-        // MiniMax EP state lives in `m.ep`, not `m.state`, so `minimax()` is
+        // MiniMax EP state lives in `ModelParallel::Ep`, not `m.state`, so `minimax()` is
         // None here — read the EP eos carried on LoadedModel (set at load).
         m.minimax_eos_tok
     } else {
@@ -5221,9 +5217,10 @@ fn generate_ep(
 /// zero_decode_caches → invalidate_graph_state` on each rank's own device, then
 /// the generic `seq_pos=0 / conversation_tokens.clear()`. Mirrors ep_serve_ds4's
 /// start-of-turn reset (which it does internally). No single-GPU `gpu` needed: EP
-/// reaches its devices via `m.ep.gpus`. Used between the inc-4 dual-run arms; the
-/// inc-5 flip calls it per turn before `ep_serve_ds4_via_ar_generate` (EP has no
-/// LCP → every turn re-prefills the full prompt from a clean state).
+/// reaches its devices via `ModelParallel::Ep(EpState { gpus, .. })`. Used between
+/// the inc-4 dual-run arms; the inc-5 flip calls it per turn before
+/// `ep_serve_ds4_via_ar_generate` (EP has no LCP → every turn re-prefills the full
+/// prompt from a clean state).
 fn ep_reset_ds4_state(m: &mut LoadedModel) {
     if let ModelParallel::Ep(EpState { gpus, inner }) = &mut m.parallel {
         if let EpArch::Ds4 { state, .. } = inner {
@@ -7508,7 +7505,7 @@ fn generate_multi(
 
     // PFlash compression on first turn (seq_pos == 0). Drafter runs on the
     // daemon's single-GPU `gpu` handle, which binds to the same physical
-    // device as `pp_gpus.devices[0]` (HIP enumerates within ROCR_VISIBLE).
+    // device as rank-0 in the PP mesh (HIP enumerates within ROCR_VISIBLE).
     // VRAM is shared between the two Gpu handles via the HIP heap, so
     // drafter weights coexist with the target's dev 0 portion. Output is
     // a Vec<u32> of kept token IDs which feeds forward_prefill_batch_multi
@@ -9377,54 +9374,53 @@ fn generate(
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
     hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
-    // Dense multi-GPU serve (PB-TP5 Tp / P-C Pp): route through the unified
-    // ar_generate driver (dense_serve_via_ar_generate) BEFORE any arch short-circuit
-    // / EP. Both TP and dense-PP now live in m.parallel (Task 3/4).
+    // Multi-GPU dispatch: one exhaustive match on the parallelism axis (Task 7).
+    // Match on the Copy kind() value so the borrow of m ends before the
+    // per-arch arms reborrow m mutably (a direct `match &m.parallel` would
+    // conflict with `dense_serve_via_ar_generate(m,…)`).
     // Disjoint field borrows: `m.tokenizer` (read) + the model field (mut).
-    if matches!(
-        m.parallel.kind(),
-        ModelParallelKind::Tp | ModelParallelKind::PpDense
-    ) {
-        // Dense TP / dense-PP AR decode on the unified ar_generate driver.
-        dense_serve_via_ar_generate(
-            m, stdout, id, system_prompt, prompt, assistant_prefix,
-            messages_history, temp, top_p, top_k, min_p, max_tokens, stop,
-        );
-        return;
-    }
-    // Expert-parallel (task #26): route to generate_ep BEFORE any arch
-    // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
-    // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
-    // would unwrap-panic / error on the missing config.
-    if matches!(m.parallel.kind(), ModelParallelKind::Ep) {
-        // EP serve (ds4/minimax): thread the SAME resolved sampling the
-        // single-GPU handler computed (request field > m.rec_* > arch-default
-        // ladder, all done at the call site above) into the EP decode loops.
-        // Previously the EP path dropped these to a hardcoded greedy argmax,
-        // which loops on ds4's quantized instruct model (card mandates
-        // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
-        // called above, so the host-side draw in ep_serve_* is deterministic.
-        let ep_sampling = EpSampling {
-            temp,
-            top_p,
-            top_k,
-            min_p,
-        };
-        generate_ep(
-            m,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            max_tokens,
-            max_think_tokens,
-            think_mode,
-            tools,
-            messages_history,
-            stop,
-            ep_sampling,
-        );
-        return;
+    match m.parallel.kind() {
+        ModelParallelKind::Tp | ModelParallelKind::PpDense => {
+            // Dense TP / dense-PP AR decode on the unified ar_generate driver.
+            dense_serve_via_ar_generate(
+                m, stdout, id, system_prompt, prompt, assistant_prefix,
+                messages_history, temp, top_p, top_k, min_p, max_tokens, stop,
+            );
+            return;
+        }
+        ModelParallelKind::Ep => {
+            // EP serve (ds4/minimax): thread the SAME resolved sampling the
+            // single-GPU handler computed (request field > m.rec_* > arch-default
+            // ladder, all done at the call site above) into the EP decode loops.
+            // Previously the EP path dropped these to a hardcoded greedy argmax,
+            // which loops on ds4's quantized instruct model (card mandates
+            // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
+            // called above, so the host-side draw in ep_serve_* is deterministic.
+            let ep_sampling = EpSampling {
+                temp,
+                top_p,
+                top_k,
+                min_p,
+            };
+            generate_ep(
+                m,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                max_tokens,
+                max_think_tokens,
+                think_mode,
+                tools,
+                messages_history,
+                stop,
+                ep_sampling,
+            );
+            return;
+        }
+        ModelParallelKind::Single | ModelParallelKind::PpQwen35 => {
+            // Fall through to the per-arch single-GPU / qwen35-PP short-circuit below.
+        }
     }
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at

@@ -3,20 +3,17 @@
 
 //! Classifies which parallelism axis a loaded model uses, so daemon dispatch
 //! can `match` one value instead of a chain of `is_some()` early-returns.
-//! Inc 0: classifier only (borrows nothing). The owning enum lands in Inc N+1.
 //!
 //! # Real dispatch precedence (verified against daemon.rs `fn generate()`)
 //!
-//! The axis-first early-return order in `generate()` (daemon.rs):
-//!   1. `m.parallel` is Tp                   → TP path
-//!   2. `m.parallel` is Pp(Dense)            → dense-PP path
-//!   3. `m.parallel` is Ep(_)               → EP path (Task 5: migrated from m.ep)
-//!   4. `m.parallel` is Pp(ArchResident(_)) → qwen35 pipeline-parallel (Task 6)
-//!   5. (everything else)                    → Single
+//! `generate()` does one `match m.parallel.kind()` (Task 7) with this order:
+//!   1. `ModelParallel::Tp`                  → TP path   (dense_serve_via_ar_generate)
+//!   2. `ModelParallel::Pp(Dense)`           → PP-dense  (dense_serve_via_ar_generate)
+//!   3. `ModelParallel::Ep(_)`              → EP path   (generate_ep)
+//!   4. `ModelParallel::Pp(ArchResident(_))`→ qwen35 PP (fall-through)
+//!   5. `ModelParallel::Single`             → single-GPU (fall-through)
 //!
-//! NOTE: The brief guessed `ep > tp > pp_dense > pp_qwen35 > single`.
-//! The REAL order is `tp > pp_dense > ep > pp_qwen35 > single`.
-//! Both `priority()` and the test reflect the real order.
+//! Real order: `Tp > PpDense > Ep > PpQwen35 > Single`.
 
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::{pp_serve::PpModel, tp_serve::TpModel};
@@ -25,39 +22,20 @@ use crate::EpState;
 /// Which parallelism axis is active for a loaded model.
 ///
 /// Variants are ordered by dispatch priority (highest → lowest).
+/// Produced by `ModelParallel::kind()`; used in the `match` dispatch head
+/// in `generate()` (daemon.rs) and the bench-prefill guard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelParallelKind {
-    /// Tensor-parallel dense multi-GPU (`m.tp.is_some()`).
+    /// Tensor-parallel dense multi-GPU (`ModelParallel::Tp`).
     Tp,
-    /// Pipeline-parallel dense multi-GPU (`m.parallel` is `Pp(Dense)`).
+    /// Pipeline-parallel dense multi-GPU (`ModelParallel::Pp(Dense)`).
     PpDense,
-    /// Expert-parallel MoE multi-GPU (`m.parallel` is `Ep(_)`).
+    /// Expert-parallel MoE multi-GPU (`ModelParallel::Ep(_)`).
     Ep,
-    /// Pipeline-parallel qwen35 arch-resident (`m.parallel` is `Pp(ArchResident)`).
+    /// Pipeline-parallel qwen35 arch-resident (`ModelParallel::Pp(ArchResident(…))`).
     PpQwen35,
     /// No multi-GPU axis — standard single-GPU path.
     Single,
-}
-
-impl ModelParallelKind {
-    /// Classify from the four axis-present flags in dispatch priority order.
-    ///
-    /// `flags` = `[tp_some, pp_dense_some, ep_some, pp_qwen35]`,
-    /// matching the early-return order in `generate()` (daemon.rs):
-    ///   [0] tp_some     → `m.parallel` is `Tp`
-    ///   [1] pp_dense    → `m.parallel` is `Pp(Dense)`
-    ///   [2] ep_some     → `m.parallel` is `Ep(_)` (Task 5)
-    ///   [3] pp_qwen35   → `m.parallel` is `Pp(ArchResident(_))` (Task 6)
-    #[allow(dead_code)]
-    pub fn priority(flags: &[bool; 4]) -> ModelParallelKind {
-        match flags {
-            [true, _, _, _] => ModelParallelKind::Tp,
-            [_, true, _, _] => ModelParallelKind::PpDense,
-            [_, _, true, _] => ModelParallelKind::Ep,
-            [_, _, _, true] => ModelParallelKind::PpQwen35,
-            _ => ModelParallelKind::Single,
-        }
-    }
 }
 
 /// Where a loaded model runs — the parallelism axis. No variant names a model.
@@ -108,29 +86,13 @@ mod tests {
     }
 
     #[test]
-    fn kind_classifier_is_exhaustive_and_ordered() {
-        // Real dispatch order from daemon.rs generate() (~6891–7374):
-        // Tp wins over PpDense wins over Ep wins over PpQwen35 wins over Single.
-        // flags = [tp_some, pp_dense_some, ep_some, pp_qwen35]
-        assert_eq!(
-            ModelParallelKind::priority(&[true, false, false, false]),
-            ModelParallelKind::Tp
-        );
-        assert_eq!(
-            ModelParallelKind::priority(&[false, true, false, false]),
-            ModelParallelKind::PpDense
-        );
-        assert_eq!(
-            ModelParallelKind::priority(&[false, false, true, false]),
-            ModelParallelKind::Ep
-        );
-        assert_eq!(
-            ModelParallelKind::priority(&[false, false, false, true]),
-            ModelParallelKind::PpQwen35
-        );
-        assert_eq!(
-            ModelParallelKind::priority(&[false, false, false, false]),
-            ModelParallelKind::Single
-        );
+    fn bench_reject_matches_legacy_predicate() {
+        use ModelParallelKind::*;
+        // legacy: pp>1 || ep || tp.  pp>1 is true iff PpDense or PpQwen35 (dense-PP sets
+        // pp=mesh>=2; PpModel::load errors for pp<2). New: !matches!(Single).
+        let legacy = |k| matches!(k, PpDense | PpQwen35 | Ep | Tp);
+        for k in [Single, Tp, PpDense, Ep, PpQwen35] {
+            assert_eq!(legacy(k), k != Single, "kind {k:?}");
+        }
     }
 }
