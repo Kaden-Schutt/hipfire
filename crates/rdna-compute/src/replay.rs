@@ -43,6 +43,10 @@ enum RecordedAccessMode {
 struct RecordedResourceAccess {
     allocation_base: u64,
     allocation_bytes: u64,
+    // Diagnostic pointer start within the allocation. Scheduling remains
+    // allocation-wide; this proves whether a blocked boundary has any exact
+    // producer/consumer pointer dependency before byte ranges are considered.
+    access_base: u64,
     mode: RecordedAccessMode,
 }
 
@@ -54,6 +58,11 @@ impl RecordedResourceAccess {
     fn conflicts(self, other: Self) -> bool {
         let overlaps = self.allocation_base < other.end() && other.allocation_base < self.end();
         overlaps
+            && (self.mode == RecordedAccessMode::Write || other.mode == RecordedAccessMode::Write)
+    }
+
+    fn same_start_conflicts(self, other: Self) -> bool {
+        self.access_base == other.access_base
             && (self.mode == RecordedAccessMode::Write || other.mode == RecordedAccessMode::Write)
     }
 }
@@ -214,7 +223,7 @@ fn recorded_resource_accesses(
         return None;
     }
     let effects = pointer_effects(kernel)?;
-    let mut allocations = BTreeMap::<u64, (u64, RecordedAccessMode)>::new();
+    let mut accesses = BTreeMap::<(u64, u64), (u64, RecordedAccessMode)>::new();
     for effect in effects {
         let bytes: [u8; 8] = kernarg
             .get(effect.offset..effect.offset + 8)?
@@ -227,7 +236,9 @@ fn recorded_resource_accesses(
         let (base, size) = hip.mem_get_address_range(address as usize as *mut _).ok()?;
         let base = base as usize as u64;
         let size = u64::try_from(size).ok()?;
-        let entry = allocations.entry(base).or_insert((size, effect.mode));
+        let entry = accesses
+            .entry((base, address))
+            .or_insert((size, effect.mode));
         if entry.0 != size {
             return None;
         }
@@ -236,12 +247,13 @@ fn recorded_resource_accesses(
         }
     }
     Some(
-        allocations
+        accesses
             .into_iter()
             .map(
-                |(allocation_base, (allocation_bytes, mode))| RecordedResourceAccess {
+                |((allocation_base, access_base), (allocation_bytes, mode))| RecordedResourceAccess {
                     allocation_base,
                     allocation_bytes,
+                    access_base,
                     mode,
                 },
             )
@@ -269,6 +281,18 @@ impl ResourceFrontier {
                 .accesses
                 .iter()
                 .any(|left| current.iter().any(|right| left.conflicts(*right)))
+    }
+
+    fn independent_by_exact_start(&self, current: &RecordedHipLaunch) -> bool {
+        let Some(current) = &current.accesses else {
+            return false;
+        };
+        self.known
+            && !self.accesses.iter().any(|left| {
+                current
+                    .iter()
+                    .any(|right| left.same_start_conflicts(*right))
+            })
     }
 
     fn advance(&mut self, current: &RecordedHipLaunch, independent: bool) {
@@ -383,6 +407,7 @@ struct Pm4WaitAudit {
     resource_independent: usize,
     allowlist_only: BTreeMap<(String, String), usize>,
     resource_only: BTreeMap<(String, String), usize>,
+    suballocation_candidates: BTreeMap<(String, String), usize>,
 }
 
 impl Pm4WaitAudit {
@@ -392,6 +417,7 @@ impl Pm4WaitAudit {
         current: &RecordedHipLaunch,
         allowlist_independent: bool,
         resource_independent: bool,
+        exact_start_independent: bool,
         resource_covered: bool,
     ) {
         self.boundaries += 1;
@@ -402,9 +428,12 @@ impl Pm4WaitAudit {
         self.resource_independent += usize::from(resource_independent);
         let pair = (previous.kernel.clone(), current.kernel.clone());
         if allowlist_independent && !resource_independent {
-            *self.allowlist_only.entry(pair).or_default() += 1;
+            *self.allowlist_only.entry(pair.clone()).or_default() += 1;
         } else if resource_independent && !allowlist_independent {
-            *self.resource_only.entry(pair).or_default() += 1;
+            *self.resource_only.entry(pair.clone()).or_default() += 1;
+        }
+        if resource_covered && exact_start_independent && !resource_independent {
+            *self.suballocation_candidates.entry(pair).or_default() += 1;
         }
     }
 
@@ -412,13 +441,14 @@ impl Pm4WaitAudit {
         eprintln!(
             "[redline] PM4 wait audit policy={policy:?} boundaries={} covered={} \
              allowlist_independent={} resource_independent={} allowlist_only={:?} \
-             resource_only={:?}",
+             resource_only={:?} suballocation_candidates={:?}",
             self.boundaries,
             self.covered,
             self.allowlist_independent,
             self.resource_independent,
             self.allowlist_only,
             self.resource_only,
+            self.suballocation_candidates,
         );
     }
 }
@@ -1089,11 +1119,14 @@ impl ReplayController {
                 let allowlist_independent = independent_sibling(previous, current);
                 let resource_covered = resource_frontier.covered(current_launch);
                 let resources_independent = resource_frontier.independent(current_launch);
+                let exact_start_independent =
+                    resource_frontier.independent_by_exact_start(current_launch);
                 wait_audit.observe(
                     previous_launch,
                     current_launch,
                     allowlist_independent,
                     resources_independent,
+                    exact_start_independent,
                     resource_covered,
                 );
                 let independent = match self.pm4_wait_policy {
@@ -1602,11 +1635,13 @@ mod tests {
         let read_a = RecordedResourceAccess {
             allocation_base: 0x1000,
             allocation_bytes: 0x1000,
+            access_base: 0x1000,
             mode: RecordedAccessMode::Read,
         };
         let read_same = RecordedResourceAccess {
             allocation_base: 0x1800,
             allocation_bytes: 0x100,
+            access_base: 0x1800,
             mode: RecordedAccessMode::Read,
         };
         let write_same = RecordedResourceAccess {
@@ -1616,11 +1651,35 @@ mod tests {
         let write_other = RecordedResourceAccess {
             allocation_base: 0x3000,
             allocation_bytes: 0x100,
+            access_base: 0x3000,
             mode: RecordedAccessMode::Write,
         };
         assert!(!read_a.conflicts(read_same));
         assert!(read_a.conflicts(write_same));
         assert!(!read_a.conflicts(write_other));
+    }
+
+    #[test]
+    fn exact_start_audit_separates_subviews_from_true_dependencies() {
+        let write_left = RecordedResourceAccess {
+            allocation_base: 0x1000,
+            allocation_bytes: 0x1000,
+            access_base: 0x1100,
+            mode: RecordedAccessMode::Write,
+        };
+        let read_right = RecordedResourceAccess {
+            access_base: 0x1800,
+            mode: RecordedAccessMode::Read,
+            ..write_left
+        };
+        let read_left = RecordedResourceAccess {
+            mode: RecordedAccessMode::Read,
+            ..write_left
+        };
+
+        assert!(write_left.conflicts(read_right));
+        assert!(!write_left.same_start_conflicts(read_right));
+        assert!(write_left.same_start_conflicts(read_left));
     }
 
     #[test]
@@ -1639,6 +1698,7 @@ mod tests {
             RecordedResourceAccess {
                 allocation_base: 0x1000,
                 allocation_bytes: 0x100,
+                access_base: 0x1000,
                 mode: RecordedAccessMode::Write,
             },
         );
@@ -1647,6 +1707,7 @@ mod tests {
             RecordedResourceAccess {
                 allocation_base: 0x2000,
                 allocation_bytes: 0x100,
+                access_base: 0x2000,
                 mode: RecordedAccessMode::Write,
             },
         );

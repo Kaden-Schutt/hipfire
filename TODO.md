@@ -32,9 +32,13 @@ clocks, exact-output/coherence gates, and the sampled eight-turn serve harness.
    measured −0.005% at 8K and −0.72% at 2K, where 240/256 tile rows were
    removed. Empty-tile early exits are effectively free on this workload; the
    mutable replay machinery was not retained.
-3. **Suballocation-aware dependency boundaries.** Census every repeated wait
-   and distinguish real producer-consumer edges from disjoint ranges of the
-   same allocation before removing any additional per-layer boundary.
+3. **Suballocation-aware dependency boundaries (closed: no candidates).** The
+   live 833-launch tape has 832 covered boundaries and 130 resource-independent
+   edges. An exact pointer-start census found zero remaining waits caused only
+   by different subviews of one allocation: every blocked edge includes a true
+   read/write or write/write dependency at the same device pointer. Keep the
+   allocation-wide fail-closed policy; no additional wait is safely removable
+   through subrange metadata.
 4. **256-token FWHT attention tiles.** Test against the current long-context
    attention path under the selected context buckets.
 5. **Compatible K/V writer fusion.** Apply only after the tile shape is chosen;
