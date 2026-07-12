@@ -5,11 +5,12 @@
 Ordered after the first product PM4 replay win. Every arm keeps automatic GPU
 clocks, exact-output/coherence gates, and the sampled eight-turn serve harness.
 
-1. **Fence/coherence specialization (in progress).** The first A/B is complete:
-   preserve the HIP-to-PM4 entry acquire, repeat-interleave/RoPE acquires, and
-   terminal compute idle; fused-SiLU/MQ-rotation acquires were redundant and
-   are removed by the certified `required-only` default. Next, derive RAW/WAW
-   waits from declared resources instead of the current kernel-name allowlist.
+1. **Fence/coherence specialization (complete).** Preserve the HIP-to-PM4 entry
+   acquire, repeat-interleave/RoPE acquires, and terminal compute idle;
+   fused-SiLU/MQ-rotation acquires were redundant and are removed by the
+   certified `required-only` default. PM4 compute waits are now derived from
+   allocation-wide read/write effects across the full outstanding frontier;
+   unknown kernels or pointers fail closed instead of relying on kernel names.
 2. **Stateful PM4 encoding.** Elide repeated program/resource/workgroup register
    writes when adjacent dispatches retain the same state.
 3. **GFX12 temporal cache policy.** Fresh-process A/B for streamed weight loads

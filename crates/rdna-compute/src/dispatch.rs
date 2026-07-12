@@ -1229,7 +1229,8 @@ impl Gpu {
                             .and_then(|name| self.compiler.compiled_kernels().get(name))
                     })
                     .cloned();
-                self.replay.record_hip_launch(
+                self.replay.record_hip_launch_typed(
+                    &self.hip,
                     func_name,
                     artifact,
                     grid,

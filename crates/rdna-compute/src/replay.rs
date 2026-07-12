@@ -13,10 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
-    load_symbols, BatchFencePolicy, Executable, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuSelector,
-    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, RecordedDispatch, Runtime,
-    SingleQueueBatchGraph, SingleQueuePm4Ib,
+    BatchFencePolicy, Executable, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuSelector, HeaderPolicy,
+    KernargBuffer, KernargPool, Kernel, LaunchGeometry, RecordedDispatch, Runtime,
+    SingleQueueBatchGraph, SingleQueuePm4Ib, load_symbols,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +31,258 @@ pub enum ReplayBackendRequest {
 enum ReplayTransport {
     AqlPackets,
     Pm4Ib,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordedAccessMode {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecordedResourceAccess {
+    allocation_base: u64,
+    allocation_bytes: u64,
+    mode: RecordedAccessMode,
+}
+
+impl RecordedResourceAccess {
+    fn end(self) -> u64 {
+        self.allocation_base + self.allocation_bytes
+    }
+
+    fn conflicts(self, other: Self) -> bool {
+        let overlaps = self.allocation_base < other.end() && other.allocation_base < self.end();
+        overlaps
+            && (self.mode == RecordedAccessMode::Write || other.mode == RecordedAccessMode::Write)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PointerEffect {
+    offset: usize,
+    mode: RecordedAccessMode,
+}
+
+const fn read(offset: usize) -> PointerEffect {
+    PointerEffect {
+        offset,
+        mode: RecordedAccessMode::Read,
+    }
+}
+
+const fn write(offset: usize) -> PointerEffect {
+    PointerEffect {
+        offset,
+        mode: RecordedAccessMode::Write,
+    }
+}
+
+/// Pointer fields and memory effects for kernels admitted to Qwen AR replay.
+///
+/// A non-const kernel pointer is conservatively classified as `Write`, which
+/// also covers read-modify-write effects. Unknown kernels fail closed and keep
+/// their compute-idle boundaries. Offsets are the naturally aligned HIP
+/// kernarg ABI offsets verified by the captured-blob/loader parity gate.
+fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    match kernel {
+        "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
+        "fused_qkvza_hfq4g256" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ]),
+        "fused_sigmoid_alpha_gate_f32" => Some(vec![write(0), write(8), read(16), read(24)]),
+        "conv1d_silu_split_f32" => Some(vec![
+            write(0),
+            write(8),
+            write(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
+        "fused_qk_l2_norm_scale_f32" => Some(vec![write(0), write(8)]),
+        "repeat_interleave_qk_f32" => Some(vec![read(0), read(8), write(16), write(24)]),
+        "gated_delta_net_q8_fast" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(80),
+        ]),
+        "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
+        "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
+        "gemv_hfq4g256_residual" | "gemv_hfq4g256_multirow_r2" => {
+            Some(vec![read(0), read(8), write(16)])
+        }
+        "softmax_f32" => Some(vec![write(0)]),
+        "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
+        "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
+        "gemv_hfq4g256_residual_sigmoid_scaled_gpu" => {
+            Some(vec![read(0), read(8), write(16), read(24)])
+        }
+        "gemv_hfq4g256_moe_gate_up_k8_indexed" => {
+            Some(vec![read(0), read(8), read(16), write(24), write(32)])
+        }
+        "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded" => {
+            Some(vec![read(0), read(8), read(16), write(24)])
+        }
+        "moe_down_combine_k8_batched" => Some(vec![read(0), read(8), write(16)]),
+        "fused_qkv_hfq4g256" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+            write(48),
+        ]),
+        "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
+        "rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
+        "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
+        "kv_cache_write_asym_k_fwht3" => {
+            Some(vec![write(0), read(8), read(16), read(24), read(32)])
+        }
+        "kv_cache_write_q8_0" => Some(vec![write(0), read(8), read(16)]),
+        "attention_flash_fwht3_tile" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            read(32),
+            read(40),
+            read(48),
+        ]),
+        "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
+        "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
+        _ => None,
+    }
+}
+
+fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    match kernel {
+        "softmax_f32" => Some(16),
+        "fused_qk_l2_norm_scale_f32"
+        | "gemv_hfq4g256_residual"
+        | "gemv_hfq4g256_multirow_r2"
+        | "deinterleave_f32"
+        | "kv_cache_write_q8_0"
+        | "moe_down_combine_k8_batched"
+        | "moe_topk_renorm_k8"
+        | "rmsnorm_f32"
+        | "sigmoid_mul_f32" => Some(32),
+        "attention_flash_q8_0_reduce"
+        | "fused_rmsnorm_mq_rotate"
+        | "fused_sigmoid_alpha_gate_f32"
+        | "fused_silu_mul_mq_rotate"
+        | "gated_norm_f32"
+        | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed"
+        | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        | "kv_cache_write_asym_k_fwht3"
+        | "mq_rotate_x"
+        | "repeat_interleave_qk_f32"
+        | "rope_partial_halfsplit_f32" => Some(48),
+        "conv1d_silu_split_f32" => Some(64),
+        "fused_qkv_hfq4g256" => Some(80),
+        "attention_flash_fwht3_tile" | "fused_qkvza_hfq4g256" | "gated_delta_net_q8_fast" => {
+            Some(96)
+        }
+        _ => None,
+    }
+}
+
+fn recorded_resource_accesses(
+    hip: &HipRuntime,
+    kernel: &str,
+    kernarg: &[u8],
+) -> Option<Vec<RecordedResourceAccess>> {
+    if std::mem::size_of::<usize>() != 8 {
+        return None;
+    }
+    if kernarg.len() != expected_kernarg_bytes(kernel)? {
+        return None;
+    }
+    let effects = pointer_effects(kernel)?;
+    let mut allocations = BTreeMap::<u64, (u64, RecordedAccessMode)>::new();
+    for effect in effects {
+        let bytes: [u8; 8] = kernarg
+            .get(effect.offset..effect.offset + 8)?
+            .try_into()
+            .ok()?;
+        let address = u64::from_ne_bytes(bytes);
+        if address == 0 {
+            continue;
+        }
+        let (base, size) = hip.mem_get_address_range(address as usize as *mut _).ok()?;
+        let base = base as usize as u64;
+        let size = u64::try_from(size).ok()?;
+        let entry = allocations.entry(base).or_insert((size, effect.mode));
+        if entry.0 != size {
+            return None;
+        }
+        if effect.mode == RecordedAccessMode::Write {
+            entry.1 = RecordedAccessMode::Write;
+        }
+    }
+    Some(
+        allocations
+            .into_iter()
+            .map(
+                |(allocation_base, (allocation_bytes, mode))| RecordedResourceAccess {
+                    allocation_base,
+                    allocation_bytes,
+                    mode,
+                },
+            )
+            .collect(),
+    )
+}
+
+#[derive(Default)]
+struct ResourceFrontier {
+    accesses: Vec<RecordedResourceAccess>,
+    known: bool,
+}
+
+impl ResourceFrontier {
+    fn covered(&self, current: &RecordedHipLaunch) -> bool {
+        self.known && current.accesses.is_some()
+    }
+
+    fn independent(&self, current: &RecordedHipLaunch) -> bool {
+        let Some(current) = &current.accesses else {
+            return false;
+        };
+        self.known
+            && !self
+                .accesses
+                .iter()
+                .any(|left| current.iter().any(|right| left.conflicts(*right)))
+    }
+
+    fn advance(&mut self, current: &RecordedHipLaunch, independent: bool) {
+        if !independent {
+            self.accesses.clear();
+            self.known = true;
+        }
+        let Some(current) = &current.accesses else {
+            self.accesses.clear();
+            self.known = false;
+            return;
+        };
+        self.accesses.extend_from_slice(current);
+    }
 }
 
 impl ReplayTransport {
@@ -60,6 +313,84 @@ enum Pm4MidAcquirePolicy {
     WithoutFusedSiluRotate,
     WithoutMqRotate,
     WithoutRope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pm4WaitPolicy {
+    Allowlist,
+    ResourceAudit,
+    Resource,
+}
+
+impl Pm4WaitPolicy {
+    fn from_value(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "" | "allowlist" | "conservative" => Some(Self::Allowlist),
+            "resource-audit" | "resource_audit" | "audit" => Some(Self::ResourceAudit),
+            "resource" | "resources" => Some(Self::Resource),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Self {
+        let value = std::env::var("HIPFIRE_REPLAY_PM4_WAIT_POLICY")
+            .unwrap_or_else(|_| "resource".to_owned());
+        Self::from_value(&value).unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unknown HIPFIRE_REPLAY_PM4_WAIT_POLICY={value:?}; \
+                     retaining the certified allowlist wait policy"
+            );
+            Self::Allowlist
+        })
+    }
+}
+
+#[derive(Default)]
+struct Pm4WaitAudit {
+    boundaries: usize,
+    covered: usize,
+    allowlist_independent: usize,
+    resource_independent: usize,
+    allowlist_only: BTreeMap<(String, String), usize>,
+    resource_only: BTreeMap<(String, String), usize>,
+}
+
+impl Pm4WaitAudit {
+    fn observe(
+        &mut self,
+        previous: &RecordedHipLaunch,
+        current: &RecordedHipLaunch,
+        allowlist_independent: bool,
+        resource_independent: bool,
+        resource_covered: bool,
+    ) {
+        self.boundaries += 1;
+        if resource_covered {
+            self.covered += 1;
+        }
+        self.allowlist_independent += usize::from(allowlist_independent);
+        self.resource_independent += usize::from(resource_independent);
+        let pair = (previous.kernel.clone(), current.kernel.clone());
+        if allowlist_independent && !resource_independent {
+            *self.allowlist_only.entry(pair).or_default() += 1;
+        } else if resource_independent && !allowlist_independent {
+            *self.resource_only.entry(pair).or_default() += 1;
+        }
+    }
+
+    fn report(&self, policy: Pm4WaitPolicy) {
+        eprintln!(
+            "[redline] PM4 wait audit policy={policy:?} boundaries={} covered={} \
+             allowlist_independent={} resource_independent={} allowlist_only={:?} \
+             resource_only={:?}",
+            self.boundaries,
+            self.covered,
+            self.allowlist_independent,
+            self.resource_independent,
+            self.allowlist_only,
+            self.resource_only,
+        );
+    }
 }
 
 impl Pm4MidAcquirePolicy {
@@ -189,9 +520,12 @@ pub struct RecordedHipLaunch {
     pub block: [u32; 3],
     pub shared_mem: u32,
     /// Exact naturally-aligned, tail-padded bytes passed through HIP's
-    /// contiguous `extra` launch ABI. Pointer values intentionally remain
-    /// opaque here; the model adapter owns their lifetime contract.
+    /// contiguous `extra` launch ABI. The model adapter owns the lifetime
+    /// contract for pointer values recovered into allocation-wide effects.
     pub kernarg: Vec<u8>,
+    /// Allocation-wide effects recovered from typed kernel signatures and
+    /// `hipMemGetAddressRange`. `None` means the launch must remain serialized.
+    accesses: Option<Vec<RecordedResourceAccess>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -318,6 +652,7 @@ pub struct ReplayController {
     request: ReplayBackendRequest,
     transport: ReplayTransport,
     pm4_mid_acquire_policy: Pm4MidAcquirePolicy,
+    pm4_wait_policy: Pm4WaitPolicy,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
     certified_speedups: Vec<f64>,
@@ -361,6 +696,7 @@ impl ReplayController {
             request,
             transport: ReplayTransport::from_env(),
             pm4_mid_acquire_policy: Pm4MidAcquirePolicy::from_env(),
+            pm4_wait_policy: Pm4WaitPolicy::from_env(),
             state,
             recorded: Vec::new(),
             certified_speedups: Vec::new(),
@@ -706,19 +1042,42 @@ impl ReplayController {
 
         let mut commands = Gfx12Pm4CommandBuffer::new();
         commands.acquire_system();
+        let mut wait_audit = Pm4WaitAudit::default();
+        let mut resource_frontier = ResourceFrontier::default();
         for index in 0..prefix {
             if index != 0 {
-                let previous = self.recorded[index - 1].kernel.as_str();
-                let current = self.recorded[index].kernel.as_str();
-                if !independent_sibling(previous, current) {
+                let previous_launch = &self.recorded[index - 1];
+                let current_launch = &self.recorded[index];
+                let previous = previous_launch.kernel.as_str();
+                let current = current_launch.kernel.as_str();
+                let allowlist_independent = independent_sibling(previous, current);
+                let resource_covered = resource_frontier.covered(current_launch);
+                let resources_independent = resource_frontier.independent(current_launch);
+                wait_audit.observe(
+                    previous_launch,
+                    current_launch,
+                    allowlist_independent,
+                    resources_independent,
+                    resource_covered,
+                );
+                let independent = match self.pm4_wait_policy {
+                    Pm4WaitPolicy::Allowlist | Pm4WaitPolicy::ResourceAudit => {
+                        allowlist_independent
+                    }
+                    Pm4WaitPolicy::Resource => resources_independent,
+                };
+                if !independent {
                     commands.wait_compute_idle();
                 }
+                resource_frontier.advance(current_launch, resources_independent);
                 if self
                     .pm4_mid_acquire_policy
                     .acquire_between(previous, current)
                 {
                     commands.acquire_system();
                 }
+            } else {
+                resource_frontier.advance(&self.recorded[index], false);
             }
             commands
                 .dispatch(
@@ -730,6 +1089,9 @@ impl ReplayController {
                 .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
         }
         commands.wait_compute_idle();
+        if self.pm4_wait_policy != Pm4WaitPolicy::Allowlist {
+            wait_audit.report(self.pm4_wait_policy);
+        }
         let command_dwords = commands.len_dwords();
         let graph = SingleQueuePm4Ib::create(&device, &pool, &commands)
             .map_err(|error| error.to_string())?;
@@ -834,7 +1196,24 @@ impl ReplayController {
         }
     }
 
-    pub(crate) fn record_hip_launch(
+    pub(crate) fn record_hip_launch_typed(
+        &mut self,
+        hip: &HipRuntime,
+        kernel: &str,
+        artifact: Option<PathBuf>,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernarg: &[u8],
+    ) {
+        let accesses = recorded_resource_accesses(hip, kernel, kernarg);
+        self.record_hip_launch_with_accesses(
+            kernel, artifact, grid, block, shared_mem, kernarg, accesses,
+        );
+    }
+
+    #[cfg(test)]
+    fn record_hip_launch(
         &mut self,
         kernel: &str,
         artifact: Option<PathBuf>,
@@ -842,6 +1221,21 @@ impl ReplayController {
         block: [u32; 3],
         shared_mem: u32,
         kernarg: &[u8],
+    ) {
+        self.record_hip_launch_with_accesses(
+            kernel, artifact, grid, block, shared_mem, kernarg, None,
+        );
+    }
+
+    fn record_hip_launch_with_accesses(
+        &mut self,
+        kernel: &str,
+        artifact: Option<PathBuf>,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernarg: &[u8],
+        accesses: Option<Vec<RecordedResourceAccess>>,
     ) {
         if !self.is_recording() {
             return;
@@ -857,6 +1251,7 @@ impl ReplayController {
             block,
             shared_mem,
             kernarg: kernarg.to_vec(),
+            accesses,
         });
     }
 
@@ -1018,6 +1413,36 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    const A3B_REPLAY_KERNELS: &[&str] = &[
+        "fused_rmsnorm_mq_rotate",
+        "fused_qkvza_hfq4g256",
+        "fused_sigmoid_alpha_gate_f32",
+        "conv1d_silu_split_f32",
+        "fused_qk_l2_norm_scale_f32",
+        "repeat_interleave_qk_f32",
+        "gated_delta_net_q8_fast",
+        "gated_norm_f32",
+        "mq_rotate_x",
+        "gemv_hfq4g256_residual",
+        "softmax_f32",
+        "moe_topk_renorm_k8",
+        "fused_silu_mul_mq_rotate",
+        "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed",
+        "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+        "moe_down_combine_k8_batched",
+        "fused_qkv_hfq4g256",
+        "deinterleave_f32",
+        "rmsnorm_f32",
+        "rope_partial_halfsplit_f32",
+        "kv_cache_write_asym_k_fwht3",
+        "kv_cache_write_q8_0",
+        "attention_flash_fwht3_tile",
+        "attention_flash_q8_0_reduce",
+        "sigmoid_mul_f32",
+        "gemv_hfq4g256_multirow_r2",
+    ];
+
     fn passing(speedup: f64) -> ShadowValidation {
         ShadowValidation {
             bit_exact: true,
@@ -1085,6 +1510,120 @@ mod tests {
                 .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256")
         );
         assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
+    }
+
+    #[test]
+    fn resource_wait_policy_and_a3b_pointer_catalog_fail_closed() {
+        assert_eq!(
+            Pm4WaitPolicy::from_value("resource-audit"),
+            Some(Pm4WaitPolicy::ResourceAudit)
+        );
+        assert_eq!(
+            Pm4WaitPolicy::from_value("resource"),
+            Some(Pm4WaitPolicy::Resource)
+        );
+        assert_eq!(Pm4WaitPolicy::from_value("invalid"), None);
+        assert!(pointer_effects("unknown_kernel").is_none());
+        assert!(expected_kernarg_bytes("unknown_kernel").is_none());
+        for kernel in A3B_REPLAY_KERNELS {
+            let effects = pointer_effects(kernel).unwrap_or_else(|| panic!("missing {kernel}"));
+            let kernarg_bytes = expected_kernarg_bytes(kernel)
+                .unwrap_or_else(|| panic!("missing ABI size for {kernel}"));
+            assert!(!effects.is_empty(), "empty pointer signature for {kernel}");
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| effect.offset + 8 <= kernarg_bytes),
+                "pointer offset exceeds kernarg ABI in {kernel}"
+            );
+            let offsets = effects
+                .iter()
+                .map(|effect| effect.offset)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                offsets.len(),
+                effects.len(),
+                "duplicate pointer offset in {kernel}"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_wide_hazards_include_subviews_and_ignore_read_read() {
+        let read_a = RecordedResourceAccess {
+            allocation_base: 0x1000,
+            allocation_bytes: 0x1000,
+            mode: RecordedAccessMode::Read,
+        };
+        let read_same = RecordedResourceAccess {
+            allocation_base: 0x1800,
+            allocation_bytes: 0x100,
+            mode: RecordedAccessMode::Read,
+        };
+        let write_same = RecordedResourceAccess {
+            mode: RecordedAccessMode::Write,
+            ..read_same
+        };
+        let write_other = RecordedResourceAccess {
+            allocation_base: 0x3000,
+            allocation_bytes: 0x100,
+            mode: RecordedAccessMode::Write,
+        };
+        assert!(!read_a.conflicts(read_same));
+        assert!(read_a.conflicts(write_same));
+        assert!(!read_a.conflicts(write_other));
+    }
+
+    #[test]
+    fn resource_frontier_catches_non_adjacent_hazards() {
+        let launch = |kernel: &str, access: RecordedResourceAccess| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_mem: 0,
+            kernarg: Vec::new(),
+            accesses: Some(vec![access]),
+        };
+        let write_a = launch(
+            "write_a",
+            RecordedResourceAccess {
+                allocation_base: 0x1000,
+                allocation_bytes: 0x100,
+                mode: RecordedAccessMode::Write,
+            },
+        );
+        let write_b = launch(
+            "write_b",
+            RecordedResourceAccess {
+                allocation_base: 0x2000,
+                allocation_bytes: 0x100,
+                mode: RecordedAccessMode::Write,
+            },
+        );
+        let read_a = launch(
+            "read_a",
+            RecordedResourceAccess {
+                mode: RecordedAccessMode::Read,
+                ..write_a.accesses.as_ref().unwrap()[0]
+            },
+        );
+
+        let mut frontier = ResourceFrontier::default();
+        frontier.advance(&write_a, false);
+        assert!(frontier.independent(&write_b));
+        frontier.advance(&write_b, true);
+        assert!(!frontier.independent(&read_a));
+        frontier.advance(&read_a, false);
+        assert_eq!(frontier.accesses, read_a.accesses.clone().unwrap());
+
+        let unknown = RecordedHipLaunch {
+            accesses: None,
+            ..write_b.clone()
+        };
+        assert!(!frontier.independent(&unknown));
+        frontier.advance(&unknown, false);
+        assert!(!frontier.independent(&write_b));
     }
 
     #[test]
