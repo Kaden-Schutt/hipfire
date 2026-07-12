@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 class Daemon:
-    def __init__(self, binary: Path, log_path: Path, timeout_s: float):
+    def __init__(self, binary: Path, log_path: Path, timeout_s: float, kv_mode: str):
         self.timeout_s = timeout_s
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = log_path.open("w")
@@ -33,7 +33,7 @@ class Daemon:
         env.update(
             HIPFIRE_REPLAY_BACKEND="shadow",
             HIPFIRE_REPLAY_MANUAL_CAPTURE="1",
-            HIPFIRE_KV_MODE="q8",
+            HIPFIRE_KV_MODE=kv_mode,
             HIPFIRE_CASK_OFF="1",
             HIPFIRE_AR_GRAPH="0",
             HIPFIRE_GRAPH="0",
@@ -116,6 +116,12 @@ def main():
         help="run only the decode capture, contract probe, and shadow parity gate",
     )
     parser.add_argument("--decode-context", type=int, default=128)
+    parser.add_argument(
+        "--kv-mode",
+        choices=("q8", "fwht2", "fwht3", "fwht4"),
+        default="q8",
+        help="KV layout used by capture, shadow replay, and the HIP oracle",
+    )
     parser.add_argument("--capture-repeats", type=int, default=2)
     parser.add_argument("--measure-repeats", type=int, default=5)
     parser.add_argument("--decode-iterations", type=int, default=100)
@@ -146,17 +152,22 @@ def main():
         "model": str(model),
         "model_bytes": model.stat().st_size,
         "daemon": str(daemon_path),
+        "kv_mode": args.kv_mode,
         "automatic_clocks_required": True,
         "prefill": {},
         "decode": {},
     }
-    daemon = Daemon(daemon_path, Path(args.log), args.timeout)
+    daemon = Daemon(daemon_path, Path(args.log), args.timeout, args.kv_mode)
     try:
         loaded = daemon.request(
             {
                 "type": "load",
                 "model": str(model),
-                "params": {"max_seq": args.max_seq, "kv_mode": "q8", "dflash_mode": "off"},
+                "params": {
+                    "max_seq": args.max_seq,
+                    "kv_mode": args.kv_mode,
+                    "dflash_mode": "off",
+                },
             }
         )
         if loaded.get("type") != "loaded":

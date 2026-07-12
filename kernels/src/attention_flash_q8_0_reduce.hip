@@ -4,8 +4,10 @@
 
 // Flash attention reduce kernel — 2-pass combination of tile partials.
 //
-// Grid: [n_heads, 1, 1]. Block: [32, 1, 1] (one WAVE32).
-// Zero shared memory.
+// Grid: [n_heads, 1, 1]. Block: [256, 1, 1] (eight WAVE32s).
+// Dynamic shared memory: max_tiles floats for the cross-tile correction
+// factors. One thread retains the original sequential scalar reduction order;
+// the wider block parallelizes the independent output dimensions.
 //
 // CRITICAL: uses 2-pass reduction (find global max first, then accumulate)
 // instead of online softmax. Online softmax introduces ~1e-5 error per
@@ -26,7 +28,7 @@
 // - global_sum = Σ tile_sum * exp(tile_max - global_max) — exact
 #include <hip/hip_runtime.h>
 
-extern "C" __launch_bounds__(32, 16)
+extern "C" __launch_bounds__(256, 4)
 __global__ void attention_flash_q8_0_reduce(
     const float* __restrict__ partials,  // [n_heads, max_tiles, 2 + head_dim]
     float* __restrict__ out,             // [n_heads, head_dim]
@@ -43,54 +45,48 @@ __global__ void attention_flash_q8_0_reduce(
     const int seq_len = pos_buf[0] + 1;
     const int n_tiles = min((seq_len + tile_size - 1) / tile_size, max_tiles);
 
-    // ═══ Pass 1: find global max across all tiles ═══
-    float global_max = -1e30f;
-    for (int tile = 0; tile < n_tiles; tile++) {
-        const float* p = partials + (h * max_tiles + tile) * stride;
-        float tile_sum = p[1];
-        if (tile_sum > 0.0f)
-            global_max = fmaxf(global_max, p[0]);
-    }
+    extern __shared__ float corr_lut[]; // [max_tiles]
+    __shared__ float global_max_shared;
+    __shared__ float global_sum_shared;
 
-    // ═══ Pass 2: accumulate with single correction factor per tile ═══
-    //
-    // head_dim coverage: 32 threads × 4 dims = 128 dims per half. Qwen 3.5
-    // uses head_dim=256, so we loop over `n_halves = head_dim / 128` and
-    // cover both halves. Without this loop, dims 128..255 were never written
-    // to the output — attention's top half was effectively zeroed, which
-    // tolerated on some weight distributions (4B) but collapses output
-    // into the pad token on others (9B, 27B). Matches the 2-pass pattern
-    // used by kv_cache_write_asym_k_givens4_batched.
-    //
-    // global_sum is scalar and identical across halves — compute it once
-    // during the half=0 pass and reuse for half>0.
-    const int n_halves = head_dim / 128;
-    float global_sum = 0.0f;
-    for (int half = 0; half < n_halves; half++) {
-        const int d_base = half * 128 + tid * 4;
-        float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
-
+    // Preserve the reference kernel's increasing-tile fmax order exactly.
+    if (tid == 0) {
+        float global_max = -1e30f;
         for (int tile = 0; tile < n_tiles; tile++) {
             const float* p = partials + (h * max_tiles + tile) * stride;
-            float tile_max = p[0];
-            float tile_sum = p[1];
-            if (tile_sum <= 0.0f) continue;
-
-            // Single correction: exp(tile_max - global_max).
-            // This is exact: no running corrections, no compounding error.
-            float corr = expf(tile_max - global_max);
-
-            g0 += p[2 + d_base + 0] * corr;
-            g1 += p[2 + d_base + 1] * corr;
-            g2 += p[2 + d_base + 2] * corr;
-            g3 += p[2 + d_base + 3] * corr;
-            if (half == 0) global_sum += tile_sum * corr;
+            if (p[1] > 0.0f)
+                global_max = fmaxf(global_max, p[0]);
         }
+        global_max_shared = global_max;
+    }
+    __syncthreads();
 
-        float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
-        out[h * head_dim + d_base + 0] = g0 * inv_sum;
-        out[h * head_dim + d_base + 1] = g1 * inv_sum;
-        out[h * head_dim + d_base + 2] = g2 * inv_sum;
-        out[h * head_dim + d_base + 3] = g3 * inv_sum;
+    // Compute each correction once. The old 32-thread kernel recomputed the
+    // same exp for every lane and for both 128-dimension halves.
+    for (int tile = tid; tile < n_tiles; tile += blockDim.x) {
+        const float* p = partials + (h * max_tiles + tile) * stride;
+        corr_lut[tile] = p[1] > 0.0f ? expf(p[0] - global_max_shared) : 0.0f;
+    }
+    __syncthreads();
+
+    // Preserve the reference kernel's increasing-tile global-sum order.
+    if (tid == 0) {
+        float global_sum = 0.0f;
+        for (int tile = 0; tile < n_tiles; tile++) {
+            const float* p = partials + (h * max_tiles + tile) * stride;
+            global_sum += p[1] * corr_lut[tile];
+        }
+        global_sum_shared = global_sum;
+    }
+    __syncthreads();
+
+    const float inv_sum = global_sum_shared > 0.0f ? 1.0f / global_sum_shared : 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float g = 0.0f;
+        for (int tile = 0; tile < n_tiles; tile++) {
+            const float* p = partials + (h * max_tiles + tile) * stride;
+            g += p[2 + d] * corr_lut[tile];
+        }
+        out[h * head_dim + d] = g * inv_sum;
     }
 }

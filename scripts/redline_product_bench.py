@@ -25,7 +25,15 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 class Daemon:
-    def __init__(self, binary: Path, backend: str, transport: str, log_path: Path, timeout: float):
+    def __init__(
+        self,
+        binary: Path,
+        backend: str,
+        transport: str,
+        log_path: Path,
+        timeout: float,
+        kv_mode: str,
+    ):
         self.timeout = timeout
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = log_path.open("w")
@@ -33,7 +41,7 @@ class Daemon:
         env.update(
             HIPFIRE_REPLAY_BACKEND=backend,
             HIPFIRE_REPLAY_TRANSPORT=transport,
-            HIPFIRE_KV_MODE="q8",
+            HIPFIRE_KV_MODE=kv_mode,
             HIPFIRE_CASK_OFF="1",
             HIPFIRE_AR_GRAPH="1",
             HIPFIRE_GRAPH="1",
@@ -86,6 +94,7 @@ def run_arm(args, backend):
         args.transport,
         Path(args.work_dir) / f"product-{backend}.log",
         args.timeout,
+        args.kv_mode,
     )
     try:
         loaded = daemon.request(
@@ -94,7 +103,7 @@ def run_arm(args, backend):
                 "model": str(Path(args.model).expanduser().resolve()),
                 "params": {
                     "max_seq": args.max_seq,
-                    "kv_mode": "q8",
+                    "kv_mode": args.kv_mode,
                     "dflash_mode": "off",
                 },
             }
@@ -132,6 +141,12 @@ def main():
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--transport", choices=("aql", "pm4"), default="aql")
+    parser.add_argument(
+        "--kv-mode",
+        choices=("q8", "fwht2", "fwht3", "fwht4"),
+        default="q8",
+        help="KV layout used by both the HipGraph and retained-replay arms",
+    )
     parser.add_argument("--max-seq", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--work-dir", default=str(REPO / ".redline-work"))
@@ -146,6 +161,7 @@ def main():
         "warmups": args.warmups,
         "runs": args.runs,
         "transport": args.transport,
+        "kv_mode": args.kv_mode,
         "hip": run_arm(args, "hip"),
         "auto": run_arm(args, "auto"),
     }
