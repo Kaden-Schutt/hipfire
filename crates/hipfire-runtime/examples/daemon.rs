@@ -733,8 +733,8 @@ struct Qwen35Dispatch<'m> {
 #[allow(dead_code)]
 impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
     fn arch_id(&self) -> u32 {
-        // Direct field read — mirrors every `m.arch_id` branch in the daemon.
-        self.m.arch_id
+        // Direct field read — mirrors every `m.meta.arch_id` branch in the daemon.
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
@@ -1066,7 +1066,7 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
     }
 
     fn physical_cap(&self) -> usize {
-        self.m.physical_cap
+        self.m.meta.physical_cap
     }
 
     fn eviction_window(&self) -> Option<usize> {
@@ -1118,7 +1118,7 @@ struct Qwen2Dispatch<'m> {
 #[allow(dead_code)]
 impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
     fn arch_id(&self) -> u32 {
-        self.m.arch_id
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
@@ -1289,7 +1289,7 @@ struct LlamaDispatch<'m> {
 #[allow(dead_code)]
 impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
     fn arch_id(&self) -> u32 {
-        self.m.arch_id
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
@@ -1460,7 +1460,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
     }
 
     fn physical_cap(&self) -> usize {
-        self.m.physical_cap
+        self.m.meta.physical_cap
     }
 
     fn eviction_window(&self) -> Option<usize> {
@@ -1491,7 +1491,7 @@ struct MinimaxDispatch<'m> {
 #[allow(dead_code)]
 impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
     fn arch_id(&self) -> u32 {
-        self.m.arch_id
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
@@ -1658,7 +1658,7 @@ struct Cohere2MoeDispatch<'m> {
 #[allow(dead_code)]
 impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
     fn arch_id(&self) -> u32 {
-        self.m.arch_id
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
@@ -1843,7 +1843,7 @@ struct Lfm2MoeDispatch<'m> {
 
 impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
     fn arch_id(&self) -> u32 {
-        self.m.arch_id
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
@@ -2018,13 +2018,13 @@ struct Deepseek4EpDispatch<'m> {
 #[allow(dead_code)]
 impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
     fn arch_id(&self) -> u32 {
-        self.m.arch_id
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
-        // ds4 EP eos: the loader-resolved carrier `m.deepseek4_eos_tok`
-        // (ep_serve_ds4 takes `eos_tok = m.deepseek4_eos_tok`, daemon.rs:4246).
-        self.m.deepseek4_eos_tok
+        // ds4 EP eos: the loader-resolved carrier `m.meta.eos_tok`
+        // (ep_serve_ds4 takes `eos_tok = m.meta.eos_tok`, daemon.rs:4246).
+        self.m.meta.eos_tok
     }
 
     // is_eos = trait default (tok == eos_token): ep_serve_ds4 breaks on
@@ -2472,13 +2472,13 @@ struct MinimaxEpDispatch<'m> {
 #[allow(dead_code)]
 impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
     fn arch_id(&self) -> u32 {
-        self.m.arch_id
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
         // EP eos: minimax EP state lives in m.ep (minimax() is None), so the eos is
-        // carried on LoadedModel (ep_serve_minimax reads m.minimax_eos_tok).
-        self.m.minimax_eos_tok
+        // carried on LoadedModel (ep_serve_minimax reads m.meta.eos_tok).
+        self.m.meta.eos_tok
     }
 
     // is_eos = trait default (tok == eos): ep_serve_minimax breaks on `next==eos_tok`.
@@ -2701,7 +2701,7 @@ impl DenseDispatch<'_> {
 #[allow(dead_code)]
 impl hipfire_runtime::arch_dispatch::ArchDispatch for DenseDispatch<'_> {
     fn arch_id(&self) -> u32 {
-        self.m.arch_id
+        self.m.meta.arch_id
     }
 
     fn eos_token(&self) -> u32 {
@@ -3626,7 +3626,7 @@ fn main() {
                                 hipfire_loader::unload_model(old, &mut gpu);
                             }
                         }
-                        let arch = match m.arch_id {
+                        let arch = match m.meta.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
                             7 => "qwen2",
@@ -3665,10 +3665,8 @@ fn main() {
                         };
 
                         // Apply MTP config from load-message params.
-                        m.mtp_mode = mtp_mode;
-                        m.mtp_k = mtp_k;
-                        m.meta.mtp_mode = m.mtp_mode.clone();
-                        m.meta.mtp_k = m.mtp_k;
+                        m.meta.mtp_mode = mtp_mode;
+                        m.meta.mtp_k = mtp_k;
 
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -3714,7 +3712,7 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
+                        let cache_capable = matches!(m.meta.arch_id, 5 | 6 | 9 | 10 | 12);
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#,
@@ -3992,14 +3990,14 @@ fn main() {
                 // both. Explicit per-request values still override either.
                 // Hardcoded arch ladder — the LAST-RESORT fallback for the
                 // sampling defaults. The author-recommended values baked into
-                // the .hfq `generation_config` (m.rec_temperature/m.rec_top_p,
+                // the .hfq `generation_config` (m.meta.rec_temperature/m.meta.rec_top_p,
                 // populated at load time via HfqFile::recommended_sampling) take
                 // precedence over this ladder; an explicit per-request field
                 // (set below via `msg.get(...)`) overrides both. The CLI's
                 // curated registry `recommended_settings` reach this handler as
                 // explicit request fields (CLI explicit-send guard), so they sit
                 // above the .hfq layer on that path.
-                let (arch_default_temp, arch_default_top_p) = if m.arch_id == 11 {
+                let (arch_default_temp, arch_default_top_p) = if m.meta.arch_id == 11 {
                     // LFM2.5 (11): Liquid's model card recommends temperature=0.1,
                     // top_k=50, repetition_penalty=1.05. The daemon sampler is
                     // temp + top_p + repeat_penalty (no user-facing top_k — the
@@ -4008,7 +4006,7 @@ fn main() {
                     // top_p=0.80; at temp 0.1 the top_k-vs-top_p choice is near
                     // moot (the distribution is already peaked).
                     (0.1_f64, 0.80_f64)
-                } else if m.arch_id == 9 {
+                } else if m.meta.arch_id == 9 {
                     // DeepSeek V4 Flash (9): MTP spec-decode is greedy-only and,
                     // since the k=2 + K+1 shared-accept-core work, ~3× faster than
                     // AR (measured 81.7% accept / 24 vs 7.8 tok/s on the
@@ -4018,12 +4016,12 @@ fn main() {
                     // greedy-only). Was 1.0 to dodge block-level attractors at low
                     // temp — coherence-gate-deepseek4-mtp re-validates greedy.
                     (0.0_f64, 1.0_f64)
-                } else if m.arch_id == 10 {
+                } else if m.meta.arch_id == 10 {
                     // MiniMax-M2 (10): quantized instruct model that falls into
                     // block-level attractors at lower temperatures — keep the
                     // card-recommended temp=1.0/top_p=1.0.
                     (1.0_f64, 1.0_f64)
-                } else if m.arch_id == 12 {
+                } else if m.meta.arch_id == 12 {
                     // Cohere2-MoE / North-Mini-Code: Cohere-style agentic
                     // markers are sampled best with the model-card nucleus
                     // defaults.
@@ -4035,10 +4033,10 @@ fn main() {
                 // ladder. Per-knob: a model that bakes only `temperature` still
                 // gets the arch-ladder `top_p`.
                 let default_temp = m
-                    .rec_temperature
+                    .meta.rec_temperature
                     .map(|x| x as f64)
                     .unwrap_or(arch_default_temp);
-                let default_top_p = m.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
+                let default_top_p = m.meta.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
                 let temp = msg
                     .get("temperature")
                     .and_then(|v| v.as_f64())
@@ -4073,7 +4071,7 @@ fn main() {
                 // Clients can still opt in to a non-1.0 value per request.
                 // LFM2.5-MoE (arch_id 11): Liquid's card recommends
                 // repetition_penalty=1.05; default to it (others stay 1.0/off).
-                let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+                let default_repeat_penalty = if m.meta.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
                 // Accept HF-style `repetition_penalty` as a request ALIAS for our
                 // `repeat_penalty` field, used only when the canonical key is
                 // absent. (OpenAI/HF clients send `repetition_penalty`.)
@@ -4102,15 +4100,15 @@ fn main() {
                 // block-level repetition loops on long reasoning generations.
                 // Clamp negatives to 0 (negative would REWARD repetition).
                 // Fallback ladder: explicit request `presence_penalty` >
-                // .hfq-baked `m.rec_presence_penalty` > 0.0 (off). The .hfq's
+                // .hfq-baked `m.meta.rec_presence_penalty` > 0.0 (off). The .hfq's
                 // generation_config does not carry presence_penalty today, so
-                // m.rec_presence_penalty is always None on the load path; the
+                // m.meta.rec_presence_penalty is always None on the load path; the
                 // field is wired so a curated registry card value still flows in
                 // as an explicit request field (CLI explicit-send guard). presence_penalty IS honored by the sampler.
                 let presence_penalty = (msg
                     .get("presence_penalty")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(m.rec_presence_penalty.unwrap_or(0.0) as f64)
+                    .unwrap_or(m.meta.rec_presence_penalty.unwrap_or(0.0) as f64)
                     as f32)
                     .max(0.0);
                 let frequency_penalty = (msg
@@ -4127,13 +4125,13 @@ fn main() {
                     .get("top_k")
                     .and_then(|v| v.as_u64())
                     .map(|k| k as u32)
-                    .or_else(|| m.rec_top_k.map(|k| k as u32))
+                    .or_else(|| m.meta.rec_top_k.map(|k| k as u32))
                     .filter(|&k| k > 0);
                 let min_p: Option<f32> = msg
                     .get("min_p")
                     .and_then(|v| v.as_f64())
                     .map(|p| p as f32)
-                    .or(m.rec_min_p)
+                    .or(m.meta.rec_min_p)
                     .filter(|&p| p > 0.0);
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
@@ -4203,7 +4201,7 @@ fn main() {
                 };
 
                 let has_image = image_base64.is_some() || image.is_some();
-                let is_dots_ocr = m.arch_id == 8;
+                let is_dots_ocr = m.meta.arch_id == 8;
                 let has_vl = m.vision.is_some() || is_dots_ocr;
 
                 if has_image && !has_vl {
@@ -4491,7 +4489,7 @@ fn main() {
                 let has_model = model.is_some();
                 let model_arch = model
                     .as_ref()
-                    .map(|m| match m.arch_id {
+                    .map(|m| match m.meta.arch_id {
                         5 => "qwen3_5",
                         6 => "qwen3_5_moe",
                         7 => "qwen2",
@@ -4596,11 +4594,11 @@ fn main() {
                 // generate request against the loaded model still has room. We guard
                 // on the *physical* buffer (not the advertised max_seq) because this
                 // bench intentionally bypasses eviction to measure raw prefill.
-                if n.saturating_add(32) > m.physical_cap {
+                if n.saturating_add(32) > m.meta.physical_cap {
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded physical_cap={}"}}"#,
-                        n, m.physical_cap
+                        n, m.meta.physical_cap
                     );
                     let _ = stdout.flush();
                     continue;
@@ -4639,7 +4637,7 @@ fn main() {
                 // completion (kernel launches are async by default).
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
-                let run_ok = if m.arch_id == 5 || m.arch_id == 6 {
+                let run_ok = if m.meta.arch_id == 5 || m.meta.arch_id == 6 {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -4653,7 +4651,7 @@ fn main() {
                         None, None,
                     )
                     .is_ok()
-                } else if m.arch_id == 7 {
+                } else if m.meta.arch_id == 7 {
                     // Qwen2 has no batched prefill kernel yet — per-token loop
                     // mirroring the LLaMA fallback path. The loop seeds
                     // position via `state.next_pos` (already reset above to 0).
@@ -4671,7 +4669,7 @@ fn main() {
                         }
                     }
                     ok
-                } else if m.arch_id == 9 {
+                } else if m.meta.arch_id == 9 {
                     // DeepSeek V4 warm-pass: per-token decode_step. Saturates
                     // the kernel cache (HC, indexer, compressor,
                     // attention, MoE) on a short synthetic prompt
@@ -4694,7 +4692,7 @@ fn main() {
                         }
                     }
                     ok
-                } else if m.arch_id == 11 {
+                } else if m.meta.arch_id == 11 {
                     // LFM2.5-MoE warm-pass: per-token decode_step over the
                     // synthetic prompt. Saturates the conv + GQA + QK-norm +
                     // RoPE + top-4 MoE kernel set before any user-facing
@@ -4716,7 +4714,7 @@ fn main() {
                         }
                     }
                     ok
-                } else if m.arch_id == 10 {
+                } else if m.meta.arch_id == 10 {
                     // MiniMax-M2 warm-pass: per-token decode_step over the
                     // synthetic prompt. Saturates the GQA + QK-norm + RoPE +
                     // MoE kernel set before any user-facing generate. This IS
@@ -4737,7 +4735,7 @@ fn main() {
                         }
                     }
                     ok
-                } else if m.arch_id == 12 {
+                } else if m.meta.arch_id == 12 {
                     // Cohere2-MoE warm-pass: per-token decode_step over the
                     // synthetic prompt. This primes attention + MoE dispatch
                     // without mutating qwen/minimax-specific state.
@@ -4983,11 +4981,11 @@ fn dense_serve_via_ar_generate(
     // max_tokens decode tokens. Return BEFORE mutating state. Mirrors the ds4/minimax
     // EP via-helpers.
     let rendered_n = start_pos.saturating_add(new_tokens.len());
-    if rendered_n.saturating_add(max_tokens) > m.physical_cap {
+    if rendered_n.saturating_add(max_tokens) > m.meta.physical_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-            id, rendered_n, max_tokens, m.physical_cap
+            id, rendered_n, max_tokens, m.meta.physical_cap
         );
         let _ = stdout.flush();
         return;
@@ -5060,10 +5058,10 @@ fn generate_ep(
     // `primed_think` records whether the render ended on the MiniMax `<think>`
     // generation primer (re-emitted display-only in ep_serve_minimax). ──
     let mut primed_think = false;
-    let prompt_ids: Vec<u32> = if m.arch_id == 9 {
+    let prompt_ids: Vec<u32> = if m.meta.arch_id == 9 {
         primed_think = false;
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let eos_tok = m.deepseek4_eos_tok;
+        let eos_tok = m.meta.eos_tok;
         build_deepseek4_dsml_prompt(
             tokenizer,
             system_prompt,
@@ -5076,7 +5074,7 @@ fn generate_ep(
         )
     } else {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        if let Some(template) = m.chat_template.as_ref() {
+        if let Some(template) = m.meta.chat_template.as_ref() {
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
@@ -5150,7 +5148,7 @@ fn generate_ep(
         let tk = m.tokenizer.as_ref().unwrap();
         eprintln!(
             "[ep prompt dump] arch={} {} tokens, decoded:\n>>>\n{}\n<<<",
-            m.arch_id,
+            m.meta.arch_id,
             prompt_ids.len(),
             tk.decode(&prompt_ids)
         );
@@ -5164,14 +5162,9 @@ fn generate_ep(
         let _ = stdout.flush();
         return;
     }
-    let eos_tok = if m.arch_id == 10 {
-        // MiniMax EP state lives in `ModelParallel::Ep`, not `m.state`, so `minimax()` is
-        // None here — read the EP eos carried on LoadedModel (set at load).
-        m.minimax_eos_tok
-    } else {
-        m.deepseek4_eos_tok
-    };
-    match m.arch_id {
+    // Both ds4 and minimax EP eos are unified into m.meta.eos_tok at load time.
+    let eos_tok = m.meta.eos_tok;
+    match m.meta.arch_id {
         10 => {
             // minimax-EP FLIP (inc M3): runs on the unified ar_generate driver
             // (ep_serve_minimax deleted). No per-turn reset — the LCP preamble inside
@@ -5179,7 +5172,7 @@ fn generate_ep(
             // common prefix and re-prefills the suffix. Validated pre-flip by the
             // dual-run token-parity (ep_serve_minimax == ar_generate+EP on
             // capital/code, emulated EP-2). eos_tok is now the ds4 arm's; minimax
-            // reads m.minimax_eos_tok via MinimaxEpDispatch::eos_token.
+            // reads m.meta.eos_tok via MinimaxEpDispatch::eos_token.
             let _ = eos_tok;
             ep_serve_minimax_via_ar_generate(
                 m,
@@ -5267,11 +5260,11 @@ fn ep_serve_ds4_via_ar_generate(
     // BEFORE prefill, exactly as ep_serve_ds4 did. saturating_add so an adversarial
     // max_tokens can't wrap usize and slip under the cap.
     let prompt_n = prompt_ids.len();
-    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+    if prompt_n.saturating_add(max_tokens) > m.meta.physical_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-            id, prompt_n, max_tokens, m.physical_cap
+            id, prompt_n, max_tokens, m.meta.physical_cap
         );
         let _ = stdout.flush();
         return;
@@ -5338,11 +5331,11 @@ fn ep_serve_minimax_via_ar_generate(
     let prompt_n = prompt_ids.len();
     // Capacity guard (mirror ep_serve_minimax): absolute KV span is prompt_n +
     // max_tokens; overrunning drives forward_ep past the per-rank KV buffer.
-    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+    if prompt_n.saturating_add(max_tokens) > m.meta.physical_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-            id, prompt_n, max_tokens, m.physical_cap
+            id, prompt_n, max_tokens, m.meta.physical_cap
         );
         let _ = stdout.flush();
         return;
@@ -5857,9 +5850,9 @@ fn generate_dflash(
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
+        let template = m.meta.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
@@ -6220,7 +6213,7 @@ fn generate_spec(
     // through for BOTH the target borrow and the emitter (the daemon never
     // arch-matches for spec-decode). `&'static dyn Carrier` borrows nothing from
     // `m`, so it coexists with the `tokenizer`/`&mut m.state` borrows below.
-    let arch_id = m.arch_id;
+    let arch_id = m.meta.arch_id;
     let carrier = match hipfire_loader::carrier_for(arch_id) {
         Some(c) => c,
         None => {
@@ -6234,11 +6227,11 @@ fn generate_spec(
         }
     };
     // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
-    // (`m.model_path` is a disjoint field → no borrow conflict with the
+    // (`m.meta.model_path` is a disjoint field → no borrow conflict with the
     // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
     // HfqFile (restored on Drop); the pure-attention arms borrow in place. The
     // boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way.
-    let mut guard = match carrier.spec_target_guard(&mut m.state, &m.model_path) {
+    let mut guard = match carrier.spec_target_guard(&mut m.state, &m.meta.model_path) {
         Ok(g) => g,
         Err(e) => {
             let _ = writeln!(
@@ -6299,7 +6292,7 @@ fn generate_spec(
     // writes it per-token without chunking. Error returns just `return` — the
     // slot guard restores the bundle into m.state on the way out.
     let eff_prompt_cap = if m.eviction.is_some() {
-        m.physical_cap
+        m.meta.physical_cap
     } else {
         ctx_capacity
     };
@@ -6841,9 +6834,9 @@ fn generate_qwen35_mtp(
 
     // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
+        let template = m.meta.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
@@ -6962,7 +6955,7 @@ fn generate_qwen35_mtp(
         }
     };
     let target_config = orig_config.clone();
-    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
+    let hfq = match HfqFile::open(Path::new(&m.meta.model_path)) {
         Ok(h) => h,
         Err(e) => {
             emit_error_with_id(stdout, id, format!("reopen model: {e}"));
@@ -7000,7 +6993,7 @@ fn generate_qwen35_mtp(
 
     // Capacity guard: worst case per cycle writes max_n+1 verify slots before
     // the rollback truncates. seq budget must hold prompt + max*(max_n+1).
-    let max_seq_total = m.physical_cap;
+    let max_seq_total = m.meta.physical_cap;
     if prompt_tokens
         .len()
         .saturating_add(max_tokens.saturating_mul(max_n + 1))
@@ -7440,11 +7433,11 @@ fn generate_multi(
     if m.session.seq_pos
         .saturating_add(prompt_est)
         .saturating_add(max_tokens)
-        > m.max_seq
+        > m.meta.max_seq
     {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
-            m.session.seq_pos, m.max_seq
+            m.session.seq_pos, m.meta.max_seq
         );
         m.session.seq_pos = 0;
         m.session.conversation_tokens.clear();
@@ -7608,9 +7601,9 @@ fn generate_multi(
     // Now Jinja renders the full conversation every turn; the cold-reset block
     // below (guarded on seq_pos > 0) re-zeros recurrent state so the full render
     // writes from position 0 instead of appending to the prior turn's KV/DeltaNet.
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
     let new_tokens = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
+        let template = m.meta.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
@@ -7742,7 +7735,7 @@ fn generate_multi(
         .saturating_add(new_tokens.len())
         .saturating_add(max_tokens)
         .saturating_add(trailer)
-        > m.physical_cap
+        > m.meta.physical_cap
     {
         let _ = writeln!(
             stdout,
@@ -7752,7 +7745,7 @@ fn generate_multi(
             new_tokens.len(),
             max_tokens,
             trailer,
-            m.physical_cap
+            m.meta.physical_cap
         );
         let _ = stdout.flush();
         return;
@@ -8314,7 +8307,7 @@ fn generate_multi(
                         .saturating_sub(nudge_len),
                 )
                 .saturating_add(nl.len());
-            if nudge_len > 0 && need_kv <= m.physical_cap {
+            if nudge_len > 0 && need_kv <= m.meta.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
                     m.session.conversation_tokens.push(tok);
                     streamed_tokens.push(tok);
@@ -8500,7 +8493,7 @@ fn generate_multi(
 /// verbatim-in-behavior from the qwen35 AR arm of `generate` (arch 5/6), but
 /// every arch-coupled op routes through `ArchDispatch` hooks and all loop state
 /// (seq_pos, streamed tokens, think/budget counters, rng) is local. DEAD CODE
-/// this stage: NOT routed at the `if m.arch_id==5||6` dispatch point. The 1.4c
+/// this stage: NOT routed at the `if m.meta.arch_id==5||6` dispatch point. The 1.4c
 /// dual-run parity harness validates token-identity vs the old arm on GPU.
 ///
 /// Faithfulness note (for the 1.4c reviewer): `ngram_scope` uses the local
@@ -9452,7 +9445,7 @@ fn generate(
         .as_ref()
         .map(|s| !s.requires_greedy())
         .unwrap_or(false);
-    if m.arch_id == 7 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
+    if m.meta.arch_id == 7 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -9481,7 +9474,7 @@ fn generate(
         );
         return;
     }
-    if m.arch_id == 7 {
+    if m.meta.arch_id == 7 {
         // Silence the qwen35/llama-only params we deliberately don't
         // honor on this path. See generate_qwen2 doc for the deferral
         // list.
@@ -9511,7 +9504,7 @@ fn generate(
         );
         return;
     }
-    if m.arch_id == 9 {
+    if m.meta.arch_id == 9 {
         // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
         // shape as the qwen2 short-circuit above. PFlash / DFlash / VL
         // / multi-GPU / sampler-budget / ChatML scaffolding all bypass.
@@ -9582,7 +9575,7 @@ fn generate(
     // (lfm2moe `SpecTarget`, conv-state snapshot/rollback) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10). Without a speculator
     // it falls through to the plain `generate_lfm2moe` short-circuit below.
-    if m.arch_id == 11 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
+    if m.meta.arch_id == 11 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -9611,7 +9604,7 @@ fn generate(
         );
         return;
     }
-    if m.arch_id == 11 {
+    if m.meta.arch_id == 11 {
         // arch_id=11 (LFM2.5-8B-A1B). Standalone bring-up — same shape as
         // the deepseek4 short-circuit above. PFlash / DFlash / VL / multi-GPU
         // / sampler-budget scaffolding all bypass. We honour `system_prompt`,
@@ -9647,7 +9640,7 @@ fn generate(
     // state machine + empty-turn / think-budget generation guards) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10) / lfm2moe (11).
     // Without a speculator it falls through to the plain `generate_cohere2moe`.
-    if m.arch_id == 12 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
+    if m.meta.arch_id == 12 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -9676,7 +9669,7 @@ fn generate(
         );
         return;
     }
-    if m.arch_id == 12 {
+    if m.meta.arch_id == 12 {
         // arch_id=12 (Cohere2-MoE / North-Mini-Code). Standalone bring-up
         // with Cohere agentic marker parsing, batched prefill when supported,
         // and prefix-cache reuse. PFlash / DFlash / VL / multi-GPU /
@@ -9710,7 +9703,7 @@ fn generate(
     // (minimax `SpecTarget`) routes to the arch-generic spec loop, exactly like
     // qwen2 (7) above. Without a speculator it falls through to the plain
     // `generate_minimax` short-circuit below.
-    if m.arch_id == 10 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
+    if m.meta.arch_id == 10 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -9739,7 +9732,7 @@ fn generate(
         );
         return;
     }
-    if m.arch_id == 10 {
+    if m.meta.arch_id == 10 {
         // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
         // deepseek4 / lfm2moe short-circuits above. PFlash / DFlash / VL /
         // multi-GPU / sampler-budget / grammar / tools-execution all bypass.
@@ -9867,7 +9860,7 @@ fn generate(
     if qwen_mtp_opt_in
         && m.qwen35().map(|b| b.mtp_head.is_some()).unwrap_or(false)
         && (temp <= 1e-6 || mtp_sampled_on)
-        && (m.arch_id == 5 || m.arch_id == 6)
+        && (m.meta.arch_id == 5 || m.meta.arch_id == 6)
         && !budgeted_thinking_needs_ar
     {
         generate_qwen35_mtp(
@@ -9961,7 +9954,7 @@ fn generate(
         && !dflash_min_p_present
         && !temp_spec_env_off;
     // qwen3.5/3.6: greedy always; temp>0 via ddtree-SWOR or chain rejection sampling.
-    let qwen_dflash_route = (m.arch_id == 5 || m.arch_id == 6)
+    let qwen_dflash_route = (m.meta.arch_id == 5 || m.meta.arch_id == 6)
         && (temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
     // llama (arch 0/1): #483 built + validated dense DFlash with ddtree tree-SWOR, so
     // temp>0 engages ddtree-SWOR here (bare temp). DSpark (qwen3) adds a validated
@@ -9969,13 +9962,13 @@ fn generate(
     // temp+top_p+top_k and beats AR at temp>0 — so `chain_sample_route` now engages
     // llama temp>0 too. (Non-DSpark chain-mode llama has no such path and stays on
     // AR via `spec_can_sample`/`supports_temp_swor` gating.)
-    let llama_dflash_route = (m.arch_id == 0 || m.arch_id == 1)
+    let llama_dflash_route = (m.meta.arch_id == 0 || m.meta.arch_id == 1)
         && (temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
     // Operator visibility: a temp>0 request on a DFlash-capable arch that did NOT
     // qualify for spec silently runs AR (correct, but slower). Name the reason.
     if temp > 1e-6
         && m.speculator.is_some()
-        && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
+        && (m.meta.arch_id == 5 || m.meta.arch_id == 6 || m.meta.arch_id == 0 || m.meta.arch_id == 1)
         && !qwen_dflash_route
         && !llama_dflash_route
         && !budgeted_thinking_needs_ar
@@ -10095,11 +10088,11 @@ fn generate(
         && m.session.seq_pos
             .saturating_add(prompt_est)
             .saturating_add(max_tokens)
-            > m.max_seq
+            > m.meta.max_seq
     {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
-            m.session.seq_pos, m.max_seq
+            m.session.seq_pos, m.meta.max_seq
         );
         m.session.seq_pos = 0;
         m.session.conversation_tokens.clear();
@@ -10367,9 +10360,9 @@ fn generate(
     // Plain branch (which dropped the system prompt and lost the Jinja
     // template). The cold-reset further down (`jinja_active && seq_pos > 0`)
     // re-prefills this full render from position 0.
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
     let new_tokens = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
+        let template = m.meta.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
@@ -10478,7 +10471,7 @@ fn generate(
     // Cache-with-Jinja is a future project (would require Jinja-side
     // assistant-turn replay).
     let jinja_active = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
-        && m.chat_template.is_some();
+        && m.meta.chat_template.is_some();
     // Cache-with-Jinja (item #37): `jinja_active` is NO LONGER a disqualifier.
     // When jinja is active the prompt-build below routes through
     // `build_cached_history_jinja` (verbatim assistant-turn splice through the
@@ -10523,7 +10516,7 @@ fn generate(
                     _ => Vec::new(),
                 }
             };
-            let template = m.chat_template.as_ref().unwrap();
+            let template = m.meta.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
@@ -10926,7 +10919,7 @@ fn generate(
             .saturating_add(new_tokens.len())
             .saturating_add(max_tokens)
             .saturating_add(trailer)
-            > m.physical_cap
+            > m.meta.physical_cap
         {
             let _ = writeln!(
                 stdout,
@@ -10936,7 +10929,7 @@ fn generate(
                 new_tokens.len(),
                 max_tokens,
                 trailer,
-                m.physical_cap
+                m.meta.physical_cap
             );
             let _ = stdout.flush();
             return;
@@ -10945,7 +10938,7 @@ fn generate(
         .saturating_add(new_tokens.len())
         .saturating_add(max_tokens)
         .saturating_add(trailer)
-        > m.max_seq
+        > m.meta.max_seq
     {
         let _ = writeln!(
             stdout,
@@ -10955,7 +10948,7 @@ fn generate(
             new_tokens.len(),
             max_tokens,
             trailer,
-            m.max_seq
+            m.meta.max_seq
         );
         let _ = stdout.flush();
         return;
@@ -10988,7 +10981,7 @@ fn generate(
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
-    if m.arch_id == 5 || m.arch_id == 6 {
+    if m.meta.arch_id == 5 || m.meta.arch_id == 6 {
         // Qwen3.5 / Qwen3.5-MoE AR decode via the generic ArchDispatch driver
         // (Inc 1 Task 1.4d — flipped from the legacy inline arm after the dual-run
         // shadow-parity gate proved token-identity, single-GPU + emulated-2, FP32
@@ -11378,7 +11371,7 @@ fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
         .unwrap_or_else(|| match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
             Some("on") => true,
             Some("off") => false,
-            _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present()),
+            _ => m.meta.mtp_mode == "on" || (m.meta.mtp_mode == "auto" && m.mtp_weights_present()),
         })
 }
 
@@ -11475,7 +11468,7 @@ fn generate_deepseek4_spec(
         .start_pos
         .saturating_add(suffix.len())
         .saturating_add(max_tokens)
-        > m.physical_cap
+        > m.meta.physical_cap
     {
         emit_error_with_id(
             stdout,
@@ -11484,7 +11477,7 @@ fn generate_deepseek4_spec(
                 "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
                 plan.start_pos + suffix.len(),
                 max_tokens,
-                m.physical_cap
+                m.meta.physical_cap
             ),
         );
         return;
@@ -11820,14 +11813,14 @@ fn generate_deepseek4(
     // O2b-2 capacity guard (ds4 single-GPU): after any cache reset above, the
     // KV ends at start_pos + suffix_tokens.len() (== prompt_ids.len()) and
     // decode appends max_tokens. forward_prefill_batch_chunked writes into a KV
-    // sized for m.physical_cap; overrunning it is a KV-overrun panic that takes
+    // sized for m.meta.physical_cap; overrunning it is a KV-overrun panic that takes
     // down serve. Emit a clean error and return BEFORE prefill.
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
     if (start_pos as usize)
         .saturating_add(suffix_tokens.len())
         .saturating_add(max_tokens)
-        > m.physical_cap
+        > m.meta.physical_cap
     {
         let _ = writeln!(
             stdout,
@@ -11835,7 +11828,7 @@ fn generate_deepseek4(
             id,
             start_pos as usize + suffix_tokens.len(),
             max_tokens,
-            m.physical_cap
+            m.meta.physical_cap
         );
         let _ = stdout.flush();
         return;
@@ -12295,9 +12288,9 @@ fn generate_lfm2moe(
         // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
         // ChatML/Plain). Falls back to Plain automatically when no template resolves.
         let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
         if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
+            let template = m.meta.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
@@ -12559,9 +12552,9 @@ fn generate_minimax(
         // template).
         // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
         let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
         if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
+            let template = m.meta.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
@@ -13127,9 +13120,9 @@ fn generate_cohere2moe(
         // jinja on (falls back to Plain only when the .hfq carries no template).
         // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
         let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
         if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
+            let template = m.meta.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
@@ -13642,11 +13635,11 @@ fn generate_vl(
         && m.session.seq_pos
             .saturating_add(prompt_est)
             .saturating_add(max_tokens)
-            > m.max_seq
+            > m.meta.max_seq
     {
         eprintln!(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
-            m.session.seq_pos, m.max_seq
+            m.session.seq_pos, m.meta.max_seq
         );
         m.session.seq_pos = 0;
         m.session.conversation_tokens.clear();
@@ -13680,14 +13673,14 @@ fn generate_vl(
         }
     }
 
-    if m.eviction.is_none() && prompt_est.saturating_add(max_tokens) > m.max_seq {
+    if m.eviction.is_none() && prompt_est.saturating_add(max_tokens) > m.meta.max_seq {
         write_error(
             stdout,
             id,
             &format!(
                 "request size ({} tokens) exceeds loaded KV budget ({})",
                 prompt_est.saturating_add(max_tokens),
-                m.max_seq,
+                m.meta.max_seq,
             ),
         );
         return;
@@ -13739,19 +13732,19 @@ fn generate_vl(
             .saturating_add(prompt_tokens.len())
             .saturating_add(max_tokens)
             .saturating_add(trailer)
-            > m.physical_cap
+            > m.meta.physical_cap
     } else {
         absolute_pos_vl
             .saturating_add(prompt_tokens.len())
             .saturating_add(max_tokens)
             .saturating_add(trailer)
-            > m.max_seq
+            > m.meta.max_seq
     };
     if over_budget {
         write_error(stdout, id, &format!(
             "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
             m.session.seq_pos, prompt_tokens.len(), max_tokens, trailer,
-            if m.eviction.is_none() { m.physical_cap } else { m.max_seq },
+            if m.eviction.is_none() { m.meta.physical_cap } else { m.meta.max_seq },
         ));
         return;
     }
@@ -14184,7 +14177,7 @@ fn generate_vl_dots_ocr(
         img.grid_h, img.grid_w, n_patches, n_visual
     );
 
-    let max_seq = m.max_seq;
+    let max_seq = m.meta.max_seq;
 
     // 2. Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();

@@ -351,59 +351,31 @@ pub struct ModelMeta {
 }
 
 pub struct LoadedModel {
-    pub arch_id: u32,
     /// Owning parallelism enum — the single-value answer to "which axis?".
     /// `Tp` owns the TpModel (migrated Task 3). `Pp(Dense)` owns the PpModel (migrated Task 4).
     /// `Pp(ArchResident)` carries the qwen35-PP mesh (migrated Task 6).
     pub parallel: ModelParallel,
     // Shared arch state
     pub state: Option<ModelState>,
-    // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
-    // `ep` (EpArch::Ds4), NOT in `state`, so there is no Deepseek4Bundle for EP
-    // models — the eos must be carried here (mirrors `minimax_eos_tok`).
-    pub deepseek4_eos_tok: u32,
-    // MiniMax-M2 (arch_id=10) EP serve eos. The EP path stores model state in
-    // `ep` (EpArch::Minimax), NOT in `state`, so `minimax()` is None for EP
-    // models — the eos must be carried here (mirrors `deepseek4_eos_tok`).
-    pub minimax_eos_tok: u32,
     // LFM2.5-8B-A1B (arch_id=11) and MiniMax-M2 (arch_id=10) live in
     // `state` as ModelState::{Lfm2Moe,Minimax} so unload teardown is
     // compiler-enforced (see ModelState).
-    // MTP config
-    pub mtp_mode: String,
-    pub mtp_k: usize,
     // Vision state (qwen35-VL tower), grouped into one optional field.
     pub vision: Option<Qwen35Vl>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
-    pub max_seq: usize,
-    pub physical_cap: usize,
     pub eviction: Option<Eviction>,
     pub session: SessionState,
     pub persist: PersistState,
-    pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
     /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
     /// DFlash chain / DDTree tree / future MTP). Replaces the old
     /// `dflash: Option<DflashState>` field — the `DflashState` now lives inside
     /// the `DflashSpeculator` impl behind this trait object.
     pub speculator: Option<Box<dyn Speculator>>,
-    pub chat_template: Option<String>,
-    // Author-recommended sampling defaults, baked into the .hfq's
-    // `generation_config` metadata and read at load time on the HFQ source
-    // path (raw-safetensors PP path leaves them `None`). The generate handler
-    // falls back to these when the request omits the matching knob, before the
-    // arch-ladder defaults. `rec_min_p` / `rec_presence_penalty` are NOT carried
-    // in generation_config (they reach the daemon only via the request), so they
-    // stay `None` on the load path.
-    pub rec_temperature: Option<f32>,
-    pub rec_top_p: Option<f32>,
-    pub rec_top_k: Option<f32>,
-    pub rec_min_p: Option<f32>,
-    pub rec_presence_penalty: Option<f32>,
-    /// Immutable per-model config (populated at load, never per-request). Dual-homed
-    /// alongside the flat fields during the additive Task 1 phase; Task 2 removes the
-    /// flat fields and makes `meta` the single source of truth.
+    /// Immutable per-model config (populated at load, never per-request).
+    /// Single source of truth for arch_id, eos_tok, mtp_mode/mtp_k,
+    /// max_seq, physical_cap, model_path, chat_template, rec_* sampling defaults.
     pub meta: ModelMeta,
 }
 
@@ -420,32 +392,18 @@ impl LoadedModel {
         chat_template: Option<String>,
     ) -> Self {
         LoadedModel {
-            arch_id,
             parallel: ModelParallel::Single,
             state: None,
-            deepseek4_eos_tok: 0,
-            minimax_eos_tok: 0,
-            mtp_mode: "auto".to_string(),
-            mtp_k: 3,
             vision: None,
             tokenizer: Some(tokenizer),
-            max_seq,
-            physical_cap,
             eviction: None,
             session: SessionState::default(),
             persist: PersistState { asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None },
-            model_path: model_path.clone(),
             speculator: None,
-            chat_template: chat_template.clone(),
-            rec_temperature: None,
-            rec_top_p: None,
-            rec_top_k: None,
-            rec_min_p: None,
-            rec_presence_penalty: None,
             meta: ModelMeta {
                 arch_id,
-                model_path,          // moves the original; flat field got clone above
-                chat_template,       // moves the original; flat field got clone above
+                model_path,
+                chat_template,
                 max_seq,
                 physical_cap,
                 eos_tok: 0,
@@ -1076,7 +1034,6 @@ fn finish_qwen35_load(
         vision: vision_config
             .zip(vision_weights)
             .map(|(config, weights)| Qwen35Vl { config, weights }),
-        max_seq: ctx.max_seq,
         ..LoadedModel::skeleton(
             arch_id,
             tokenizer,
@@ -1228,9 +1185,6 @@ pub fn load_model(
     // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
     // is the gfx12 hipGraph-replay regression root-caused above.
     if let Some(rec) = rec_sampling {
-        result.rec_temperature = rec.temperature;
-        result.rec_top_p = rec.top_p;
-        result.rec_top_k = rec.top_k.map(|k| k as f32);
         result.meta.rec_temperature = rec.temperature;
         result.meta.rec_top_p = rec.top_p;
         result.meta.rec_top_k = rec.top_k.map(|k| k as f32);
@@ -1532,10 +1486,6 @@ pub fn load_model_tp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
 
     Ok(LoadedModel {
         parallel: ModelParallel::Tp(tp_model), // Task 3: TP axis migrated from m.tp
-        deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (TP state is in parallel, not state)
-        rec_temperature: rec.and_then(|r| r.temperature),
-        rec_top_p: rec.and_then(|r| r.top_p),
-        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
         meta: ModelMeta {
             arch_id,
             model_path: path.to_string(),
@@ -1582,10 +1532,6 @@ pub fn load_model_pp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
 
     Ok(LoadedModel {
         parallel: ModelParallel::Pp(crate::model_parallel::PipelineImpl::Dense(pp_model)),
-        deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (PP state is in parallel)
-        rec_temperature: rec.and_then(|r| r.temperature),
-        rec_top_p: rec.and_then(|r| r.top_p),
-        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
         meta: ModelMeta {
             arch_id,
             model_path: path.to_string(),
@@ -1722,10 +1668,6 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
                 partials_i64,
             },
         }),
-        deepseek4_eos_tok: eos_tok,
-        rec_temperature: rec.and_then(|r| r.temperature),
-        rec_top_p: rec.and_then(|r| r.top_p),
-        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
         meta: ModelMeta {
             arch_id,
             model_path: path.to_string(),
@@ -1871,10 +1813,6 @@ fn load_model_ep_minimax(
                 partials_i64,
             },
         }),
-        minimax_eos_tok: eos_tok,
-        rec_temperature: rec.and_then(|r| r.temperature),
-        rec_top_p: rec.and_then(|r| r.top_p),
-        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
         meta: ModelMeta {
             arch_id,
             model_path: path.to_string(),
