@@ -26,9 +26,12 @@ clocks, exact-output/coherence gates, and the sampled eight-turn serve harness.
 1. **MoE gate/up buffer RT (complete).** Zero-scratch, bit-identical, and
    isolated to gfx1201. The corrected real-grid microbench and sampled
    eight-turn serve battery both retain matching outputs.
-2. **Context-bucketed retained tapes.** Keep replay plans for bounded context
-   ranges so flash attention does not launch the physical-capacity grid when
-   most tiles would immediately return.
+2. **Context-bucketed retained tapes (closed: neutral/regressive).** A retained
+   AQL/PM4 geometry patch reduced every FWHT3 FA grid from the 32K physical
+   capacity to the exact live 128-token tile bucket. It was bit-identical but
+   measured −0.005% at 8K and −0.72% at 2K, where 240/256 tile rows were
+   removed. Empty-tile early exits are effectively free on this workload; the
+   mutable replay machinery was not retained.
 3. **Suballocation-aware dependency boundaries.** Census every repeated wait
    and distinguish real producer-consumer edges from disjoint ranges of the
    same allocation before removing any additional per-layer boundary.
