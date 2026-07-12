@@ -9,6 +9,14 @@ use hipfire_runtime::kv_mode::{self, ResolveResult};
 use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
+/// qwen35 pipeline-parallel scratch, present iff this bundle is served PP (pp>1).
+/// One payload so scratch + layer→device map are inseparable (no "one without the
+/// other" illegal state).
+pub struct Qwen35PipelineState {
+    pub scratch_set: crate::qwen35::Qwen35ScratchSet,
+    pub dn_la_to_device: Vec<u8>,
+}
+
 pub struct Qwen35Bundle {
     pub config: Qwen35Config,
     pub weights: Qwen35Weights,
@@ -20,6 +28,10 @@ pub struct Qwen35Bundle {
     /// travels with the arch state through reset/reload; the loader folds it in
     /// after `load_bundle` returns. `None` on every non-MTP construction.
     pub mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
+    /// PP scratch — `Some` only for the qwen35 pp>1 serve path; `None` single-GPU.
+    /// Carried here (not on `LoadedModel`) so it travels with arch state and its
+    /// teardown is arm-local to `ModelState::Qwen35`.
+    pub pipeline: Option<Qwen35PipelineState>,
 }
 
 /// Build the Qwen35 GPU bundle from an HFQ source.
@@ -177,6 +189,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         kv_cache: kv,
         dn_state: dn,
         mtp_head: None,
+        pipeline: None,
     })
 }
 

@@ -18,7 +18,6 @@ use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
-use hipfire_arch_qwen35::qwen35::Qwen35ScratchSet;
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -331,8 +330,6 @@ pub struct LoadedModel {
     pub arch_id: u32,
     pub pp: usize,
     pub pp_gpus: Option<Gpus>,
-    pub pp_scratch_set: Option<Qwen35ScratchSet>,
-    pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
     /// Dense tensor-parallel served model (PB-TP5, the `Tp` axis). Distinct from
     /// `ep` (expert-parallel, `Ep` axis): dense row/col sharding of a llama-family
@@ -340,7 +337,7 @@ pub struct LoadedModel {
     pub tp: Option<hipfire_runtime::tp_serve::TpModel>,
     /// Dense pipeline-parallel served model (P-C, the `Pp` axis): a llama-family
     /// model banded across stages. Distinct from the qwen35 hand-coded PP path
-    /// (`pp_gpus`/`pp_scratch_set`). When `Some`, the daemon serves via
+    /// (`pp_gpus` / `Qwen35Bundle.pipeline`). When `Some`, the daemon serves via
     /// `generate_pp` (through the shared `generate_dense` loop).
     pub pp_dense: Option<hipfire_runtime::pp_serve::PpModel>,
     // Shared arch state
@@ -409,8 +406,6 @@ impl LoadedModel {
             tp: None,
             pp_dense: None,
             pp_gpus: None,
-            pp_scratch_set: None,
-            pp_dn_la_to_device: None,
             state: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
@@ -550,9 +545,9 @@ impl LoadedModel {
         (&mut self.session, &mut self.persist)
     }
 
-    /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
-    /// they cannot be set piecemeal (a dropped `pp_scratch_set` is a silent
-    /// VRAM leak; `pp_gpus`/`pp_dn_la_to_device` are `.expect()`ed in unload).
+    /// pp>1 skeleton — sets the load-bearing multi-GPU fields together so they
+    /// cannot be set piecemeal. The qwen35 PP scratch is now carried inside
+    /// `Qwen35Bundle.pipeline` (not on `LoadedModel`); only `pp_gpus` lives here.
     pub fn skeleton_pp(
         arch_id: u32,
         tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -562,14 +557,10 @@ impl LoadedModel {
         chat_template: Option<String>,
         pp: usize,
         pp_gpus: Gpus,
-        pp_scratch_set: Qwen35ScratchSet,
-        pp_dn_la_to_device: Vec<u8>,
     ) -> Self {
         LoadedModel {
             pp,
             pp_gpus: Some(pp_gpus),
-            pp_scratch_set: Some(pp_scratch_set),
-            pp_dn_la_to_device: Some(pp_dn_la_to_device),
             ..LoadedModel::skeleton(
                 arch_id,
                 tokenizer,
@@ -1922,14 +1913,13 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
-        if let Some(scratch_set) = m.pp_scratch_set {
-            scratch_set.free_gpu_multi(&mut gpus);
-        }
         match m.state.take() {
             Some(ModelState::Qwen35(b)) => {
+                if let Some(pl) = b.pipeline {
+                    pl.scratch_set.free_gpu_multi(&mut gpus);
+                    b.dn_state.free_gpu_multi(&mut gpus, &pl.dn_la_to_device);
+                }
                 b.kv_cache.free_gpu_multi(&mut gpus);
-                let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
-                b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
                 b.weights.free_gpu_multi(&mut gpus);
             }
             // Only Qwen35 supports pp>1 today, so the other carriers can never

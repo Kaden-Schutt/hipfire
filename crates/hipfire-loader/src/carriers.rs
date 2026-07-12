@@ -273,6 +273,10 @@ fn load_qwen35_pp(
         kv_cache: kv,
         dn_state: dn,
         mtp_head: None,
+        pipeline: Some(hipfire_arch_qwen35::carrier::Qwen35PipelineState {
+            scratch_set,
+            dn_la_to_device: la_to_device,
+        }),
     };
     Ok(LoadedModel {
         state: Some(ModelState::Qwen35(bundle)),
@@ -285,8 +289,6 @@ fn load_qwen35_pp(
             meta.chat_template,
             pp,
             gpus,
-            scratch_set,
-            la_to_device,
         )
     })
 }
@@ -464,6 +466,7 @@ impl Carrier for Qwen35Carrier {
                     kv_cache,
                     dn_state,
                     mtp_head: None,
+                    pipeline: None,
                 };
                 Ok(LoadedModel {
                     state: Some(ModelState::Qwen35(bundle)),

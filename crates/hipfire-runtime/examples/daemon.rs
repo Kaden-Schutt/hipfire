@@ -5544,26 +5544,28 @@ fn plan_prompt_cache(
 /// no double-free). Mirrors the per-LA-device memset for pp>1. No-op off qwen35.
 fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if m.pp > 1 {
-        if let (Some(ModelState::Qwen35(b)), Some(gpus), Some(la)) = (
+        if let (Some(ModelState::Qwen35(b)), Some(gpus)) = (
             m.state.as_ref(),
             m.pp_gpus.as_mut(),
-            m.pp_dn_la_to_device.as_ref(),
         ) {
-            let dn = &b.dn_state;
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            if let Some(pl) = b.pipeline.as_ref() {
+                let la = &pl.dn_la_to_device;
+                let dn = &b.dn_state;
+                for (i, s) in dn.s_matrices.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for (i, s) in dn.s_scales.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for (i, s) in dn.conv_states.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
             }
         }
     } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
@@ -6931,6 +6933,7 @@ fn generate_qwen35_mtp(
         kv_cache,
         dn_state,
         mtp_head,
+        pipeline: orig_pipeline,
     } = match m.state.take() {
         Some(ModelState::Qwen35(b)) => b,
         _ => {
@@ -6950,6 +6953,7 @@ fn generate_qwen35_mtp(
                 kv_cache,
                 dn_state,
                 mtp_head,
+                pipeline: orig_pipeline,
             }));
             return;
         }
@@ -7001,6 +7005,7 @@ fn generate_qwen35_mtp(
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
             mtp_head,
+            pipeline: orig_pipeline,
         }));
         return;
     }
@@ -7024,6 +7029,7 @@ fn generate_qwen35_mtp(
                     kv_cache: target.kv_cache,
                     dn_state: target.dn_state,
                     mtp_head,
+                    pipeline: orig_pipeline,
                 }));
                 return;
             }
@@ -7043,6 +7049,7 @@ fn generate_qwen35_mtp(
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
                 mtp_head,
+                pipeline: orig_pipeline,
             }));
             return;
         }
@@ -7056,6 +7063,7 @@ fn generate_qwen35_mtp(
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
                 mtp_head,
+                pipeline: orig_pipeline,
             }));
             return;
         }
@@ -7108,6 +7116,7 @@ fn generate_qwen35_mtp(
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
             mtp_head,
+            pipeline: orig_pipeline,
         }));
         return;
     }
@@ -7128,6 +7137,7 @@ fn generate_qwen35_mtp(
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
                 mtp_head,
+                pipeline: orig_pipeline,
             }));
             return;
         }
@@ -7315,6 +7325,7 @@ fn generate_qwen35_mtp(
         kv_cache: target.kv_cache,
         dn_state: target.dn_state,
         mtp_head,
+        pipeline: orig_pipeline,
     }));
 
     if let Some(e) = step_error {
@@ -7424,26 +7435,28 @@ fn generate_multi(
         // because a `&tokenizer` borrow of `m` is live here; covers both the
         // pp>1 per-LA-device path and the single-GPU path.
         if m.pp > 1 {
-            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus), Some(ref la)) = (
+            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus)) = (
                 m.state.as_ref(),
                 m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
             ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                if let Some(pl) = b.pipeline.as_ref() {
+                    let la = &pl.dn_la_to_device;
+                    let dn = &b.dn_state;
+                    for (i, s) in dn.s_matrices.iter().enumerate() {
+                        let g = &mut gpus.devices[la[i] as usize];
+                        let _ = g.bind_thread();
+                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                    }
+                    for (i, s) in dn.s_scales.iter().enumerate() {
+                        let g = &mut gpus.devices[la[i] as usize];
+                        let _ = g.bind_thread();
+                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                    }
+                    for (i, s) in dn.conv_states.iter().enumerate() {
+                        let g = &mut gpus.devices[la[i] as usize];
+                        let _ = g.bind_thread();
+                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                    }
                 }
             }
         } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
@@ -7656,26 +7669,28 @@ fn generate_multi(
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
         if m.pp > 1 {
-            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus), Some(ref la)) = (
+            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus)) = (
                 m.state.as_ref(),
                 m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
             ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                if let Some(pl) = b.pipeline.as_ref() {
+                    let la = &pl.dn_la_to_device;
+                    let dn = &b.dn_state;
+                    for (i, s) in dn.s_matrices.iter().enumerate() {
+                        let g = &mut gpus.devices[la[i] as usize];
+                        let _ = g.bind_thread();
+                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                    }
+                    for (i, s) in dn.s_scales.iter().enumerate() {
+                        let g = &mut gpus.devices[la[i] as usize];
+                        let _ = g.bind_thread();
+                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                    }
+                    for (i, s) in dn.conv_states.iter().enumerate() {
+                        let g = &mut gpus.devices[la[i] as usize];
+                        let _ = g.bind_thread();
+                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                    }
                 }
             }
         } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
@@ -7747,11 +7762,12 @@ fn generate_multi(
     };
     let config = &b.config;
     let weights = &b.weights;
-    let scratch_set = m.pp_scratch_set.as_ref().unwrap();
+    let pl = b.pipeline.as_ref().expect("pp>1 qwen35 must carry pipeline scratch");
+    let scratch_set = &pl.scratch_set;
+    let dn_la_to_device = &pl.dn_la_to_device;
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
     let gpus = m.pp_gpus.as_mut().unwrap();
-    let dn_la_to_device = m.pp_dn_la_to_device.as_ref().unwrap();
 
     macro_rules! reset_pp_uncommitted_state {
         () => {{

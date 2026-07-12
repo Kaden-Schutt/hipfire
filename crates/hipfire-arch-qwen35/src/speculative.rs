@@ -560,6 +560,7 @@ impl ModelSlot {
             kv_cache,
             dn_state,
             mtp_head,
+            pipeline: _,
         } = bundle;
         Ok(Self {
             name: String::from("target"),
@@ -588,6 +589,7 @@ impl ModelSlot {
             kv_cache: self.kv_cache,
             dn_state: self.dn_state,
             mtp_head: self.mtp_head,
+            pipeline: None,
         }
     }
 }
