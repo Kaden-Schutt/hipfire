@@ -3667,6 +3667,8 @@ fn main() {
                         // Apply MTP config from load-message params.
                         m.mtp_mode = mtp_mode;
                         m.mtp_k = mtp_k;
+                        m.meta.mtp_mode = m.mtp_mode.clone();
+                        m.meta.mtp_k = m.mtp_k;
 
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //

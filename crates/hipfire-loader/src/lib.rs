@@ -327,6 +327,29 @@ pub struct PersistState {
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
+/// Per-model config, set during load and read-only afterward (NOT reset). Written at
+/// three load-time sites — carrier/`load_model_*` construction, `load_model`'s rec_*
+/// finalization, and the daemon load-message handler (mtp_*) — never per-request. Pub
+/// fields: it crosses into the daemon crate, so immutability is by convention, not
+/// enforced (hence `ModelMeta`, not `ImmutableMeta`).
+pub struct ModelMeta {
+    pub arch_id: u32,
+    pub model_path: String,
+    pub chat_template: Option<String>,
+    pub max_seq: usize,
+    pub physical_cap: usize,
+    /// Resolved EOS for the EP serve path (ds4 OR minimax — mutually exclusive; `0` if
+    /// neither). Unifies the old `deepseek4_eos_tok` + `minimax_eos_tok`.
+    pub eos_tok: u32,
+    pub mtp_mode: String,
+    pub mtp_k: usize,
+    pub rec_temperature: Option<f32>,
+    pub rec_top_p: Option<f32>,
+    pub rec_top_k: Option<f32>,
+    pub rec_min_p: Option<f32>,
+    pub rec_presence_penalty: Option<f32>,
+}
+
 pub struct LoadedModel {
     pub arch_id: u32,
     /// Owning parallelism enum — the single-value answer to "which axis?".
@@ -378,6 +401,10 @@ pub struct LoadedModel {
     pub rec_top_k: Option<f32>,
     pub rec_min_p: Option<f32>,
     pub rec_presence_penalty: Option<f32>,
+    /// Immutable per-model config (populated at load, never per-request). Dual-homed
+    /// alongside the flat fields during the additive Task 1 phase; Task 2 removes the
+    /// flat fields and makes `meta` the single source of truth.
+    pub meta: ModelMeta,
 }
 
 impl LoadedModel {
@@ -407,14 +434,29 @@ impl LoadedModel {
             eviction: None,
             session: SessionState::default(),
             persist: PersistState { asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None },
-            model_path,
+            model_path: model_path.clone(),
             speculator: None,
-            chat_template,
+            chat_template: chat_template.clone(),
             rec_temperature: None,
             rec_top_p: None,
             rec_top_k: None,
             rec_min_p: None,
             rec_presence_penalty: None,
+            meta: ModelMeta {
+                arch_id,
+                model_path,          // moves the original; flat field got clone above
+                chat_template,       // moves the original; flat field got clone above
+                max_seq,
+                physical_cap,
+                eos_tok: 0,
+                mtp_mode: "auto".to_string(),
+                mtp_k: 3,
+                rec_temperature: None,
+                rec_top_p: None,
+                rec_top_k: None,
+                rec_min_p: None,
+                rec_presence_penalty: None,
+            },
         }
     }
 
@@ -530,8 +572,8 @@ impl LoadedModel {
     /// disjoint-field borrow (no unsafe): the compiler proves these point at
     /// distinct fields. Grows to also yield `arch`/`parallel` in later
     /// increments. Call at a method body, do not store alongside `&mut self`.
-    pub fn session_parts_mut(&mut self) -> (&mut SessionState, &mut PersistState) {
-        (&mut self.session, &mut self.persist)
+    pub fn session_parts_mut(&mut self) -> (&mut SessionState, &mut PersistState, &ModelMeta) {
+        (&mut self.session, &mut self.persist, &self.meta)
     }
 
     /// pp>1 skeleton — sets the load-bearing multi-GPU fields together so they
@@ -1189,6 +1231,9 @@ pub fn load_model(
         result.rec_temperature = rec.temperature;
         result.rec_top_p = rec.top_p;
         result.rec_top_k = rec.top_k.map(|k| k as f32);
+        result.meta.rec_temperature = rec.temperature;
+        result.meta.rec_top_p = rec.top_p;
+        result.meta.rec_top_k = rec.top_k.map(|k| k as f32);
     }
     Ok(result)
 }
@@ -1491,6 +1536,21 @@ pub fn load_model_tp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
         rec_temperature: rec.and_then(|r| r.temperature),
         rec_top_p: rec.and_then(|r| r.top_p),
         rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        meta: ModelMeta {
+            arch_id,
+            model_path: path.to_string(),
+            chat_template: chat_template.clone(),
+            max_seq,
+            physical_cap: max_seq,
+            eos_tok,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            rec_temperature: rec.and_then(|r| r.temperature),
+            rec_top_p: rec.and_then(|r| r.top_p),
+            rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+            rec_min_p: None,
+            rec_presence_penalty: None,
+        },
         ..LoadedModel::skeleton(
             arch_id,
             tokenizer,
@@ -1526,6 +1586,21 @@ pub fn load_model_pp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
         rec_temperature: rec.and_then(|r| r.temperature),
         rec_top_p: rec.and_then(|r| r.top_p),
         rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        meta: ModelMeta {
+            arch_id,
+            model_path: path.to_string(),
+            chat_template: chat_template.clone(),
+            max_seq,
+            physical_cap: max_seq,
+            eos_tok,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            rec_temperature: rec.and_then(|r| r.temperature),
+            rec_top_p: rec.and_then(|r| r.top_p),
+            rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+            rec_min_p: None,
+            rec_presence_penalty: None,
+        },
         ..LoadedModel::skeleton(
             arch_id,
             tokenizer,
@@ -1651,6 +1726,21 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
         rec_temperature: rec.and_then(|r| r.temperature),
         rec_top_p: rec.and_then(|r| r.top_p),
         rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        meta: ModelMeta {
+            arch_id,
+            model_path: path.to_string(),
+            chat_template: chat_template.clone(),
+            max_seq,
+            physical_cap: max_seq,
+            eos_tok,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            rec_temperature: rec.and_then(|r| r.temperature),
+            rec_top_p: rec.and_then(|r| r.top_p),
+            rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+            rec_min_p: None,
+            rec_presence_penalty: None,
+        },
         ..LoadedModel::skeleton(
             arch_id,
             tokenizer,
@@ -1785,6 +1875,21 @@ fn load_model_ep_minimax(
         rec_temperature: rec.and_then(|r| r.temperature),
         rec_top_p: rec.and_then(|r| r.top_p),
         rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        meta: ModelMeta {
+            arch_id,
+            model_path: path.to_string(),
+            chat_template: chat_template.clone(),
+            max_seq,
+            physical_cap: max_seq,
+            eos_tok,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            rec_temperature: rec.and_then(|r| r.temperature),
+            rec_top_p: rec.and_then(|r| r.top_p),
+            rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+            rec_min_p: None,
+            rec_presence_penalty: None,
+        },
         ..LoadedModel::skeleton(
             arch_id,
             tokenizer,
