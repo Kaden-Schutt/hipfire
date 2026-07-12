@@ -67,6 +67,39 @@ eight-turn serve run because it failed the 195 tok/s tg128 gate. Prefill is
 unchanged by construction: this experiment only selected the single-token
 HFQ4 GEMV path; batched prefill continues to use the existing GEMM kernels.
 
+## Follow-up: spend VGPRs on a deeper wave64 load window
+
+The follow-up tested whether the first wave64 kernel was simply too lean. It
+combined buffer-RT weight loads with a source-hoisted window containing twelve
+weight values and all 32 x values for one group-quad. LLVM initially sank the
+x definitions toward their consumers and produced an even leaner 49-VGPR
+kernel. Adding stock `__builtin_amdgcn_sched_barrier(0)` after the load
+prologue made the requested window real:
+
+```text
+wavefront_size: 64
+vgpr_count: 59
+sgpr_count: 14
+private_segment_fixed_size: 0
+vgpr_spill_count: 0
+loadcnt consume ladder: 14 -> 6 -> 4 -> 2 -> 0
+```
+
+The forced-window arm remained exact for 15 consecutive PM4/HIP positions,
+but the 30-row retained-PM4 median was 192.977 tok/s versus the matched
+193.426 control: **-0.232%**. It also lost 0.54% against the simpler 52-VGPR
+wave64 arm's 194.023 result. The extra per-wave MLP did not repay the reduced
+wave residency, so the experimental selector and source changes were reverted.
+
+The proposed two-wave32 cooperative R1 form is dominated by the existing R2
+kernel. R2 computes both rows inside one wave and shares all 32 x values in
+VGPRs. Two R1 waves would need an 8 KiB LDS stage plus a workgroup barrier to
+share x, while still reading the same two disjoint row-weight streams. Separate
+R1 kernel launches cannot explicitly reserve shared L2 lines and would add a
+dispatch boundary; they only receive the cache sharing already available to
+the current adjacent rows. Neither form removes the model-sized weight traffic
+that the invalid missing-odd-row run accidentally halved.
+
 ## Shipping outcome
 
 - Keep the `[64,1,1]` launch correction for `gemv_hfq4g256_wide`; `[32,1,1]`
@@ -86,4 +119,7 @@ Artifacts on `hiptrx`:
   gemv-wide-wave64-candidate-30.json
   gemv-wide-wave64-reverse-candidate-30.json
   gemv-wide-wave64-reverse-control-30.json
+  gemv-wide-wave64-deep-fenced.gfx1201.hsaco
+  gemv-wide-wave64-deep-fenced-shadow15.json
+  gemv-wide-wave64-deep-fenced-candidate-30.json
 ```
