@@ -1,5 +1,29 @@
 # TODO
 
+## Redline retained-replay optimization
+
+Ordered after the first product PM4 replay win. Every arm keeps automatic GPU
+clocks, exact-output/coherence gates, and the sampled eight-turn serve harness.
+
+1. **Fence/coherence specialization (in progress).** The first A/B is complete:
+   preserve the HIP-to-PM4 entry acquire, repeat-interleave/RoPE acquires, and
+   terminal compute idle; fused-SiLU/MQ-rotation acquires were redundant and
+   are removed by the certified `required-only` default. Next, derive RAW/WAW
+   waits from declared resources instead of the current kernel-name allowlist.
+2. **Stateful PM4 encoding.** Elide repeated program/resource/workgroup register
+   writes when adjacent dispatches retain the same state.
+3. **GFX12 temporal cache policy.** Fresh-process A/B for streamed weight loads
+   versus reusable KV/scratch loads; verify the intended ISA hint changes and
+   do not rely on the unavailable GL2/GCEA counters.
+4. **Context-bucketed retained tapes.** Keep replay plans for bounded context
+   ranges so flash attention does not launch the physical-capacity grid when
+   most tiles would immediately return.
+5. **Attention traffic reductions.** Test 256-token FWHT tiles, then compatible
+   K/V writer fusion; retain only exact, long-context serve wins.
+
+Closed for this workload: wider queue counts, CU partitioning/priority, and
+explicit shared-LDS GQA reuse.
+
 ## FWHT Residual QJL Transform
 
 - Implement a Johnson-Lindenstrauss / QJL transformation on the residual in the FWHT path. The current FWHT path applies a signed-FWHT rotation to Q/K for attention and leaves the residual stream without a separate QJL transform.

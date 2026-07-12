@@ -45,6 +45,100 @@ impl ReplayTransport {
     }
 }
 
+/// Experimental cache-acquire policy inside one retained PM4 tape.
+///
+/// The entry acquire remains unconditional: HIP populated model state and
+/// kernargs before ownership crosses to the ROCr queue. `EntryOnly` removes
+/// only the conservative full-system acquires between PM4 dispatches; compute
+/// dependency waits and the terminal idle remain unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pm4MidAcquirePolicy {
+    Conservative,
+    EntryOnly,
+    RequiredOnly,
+    WithoutRepeatInterleave,
+    WithoutFusedSiluRotate,
+    WithoutMqRotate,
+    WithoutRope,
+}
+
+impl Pm4MidAcquirePolicy {
+    fn from_value(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "" | "conservative" | "all" => Some(Self::Conservative),
+            "entry-only" | "entry_only" | "none" => Some(Self::EntryOnly),
+            "required-only" | "required_only" => Some(Self::RequiredOnly),
+            "without-repeat-interleave" => Some(Self::WithoutRepeatInterleave),
+            "without-fused-silu-rotate" => Some(Self::WithoutFusedSiluRotate),
+            "without-mq-rotate" => Some(Self::WithoutMqRotate),
+            "without-rope" => Some(Self::WithoutRope),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Self {
+        let value = std::env::var("HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY")
+            .unwrap_or_else(|_| "required-only".to_owned());
+        Self::from_value(&value).unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unknown HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY={value:?}; \
+                 retaining conservative mid-tape acquires"
+            );
+            Self::Conservative
+        })
+    }
+
+    fn acquire_between(self, previous: &str, current: &str) -> bool {
+        match self {
+            Self::Conservative => conservative_mid_acquire_except(previous, current, None),
+            Self::EntryOnly => false,
+            Self::RequiredOnly => required_mid_acquire(previous, current),
+            Self::WithoutRepeatInterleave => {
+                conservative_mid_acquire_except(previous, current, Some("repeat_interleave_qk_f32"))
+            }
+            Self::WithoutFusedSiluRotate => {
+                conservative_mid_acquire_except(previous, current, Some("fused_silu_mul_mq_rotate"))
+            }
+            Self::WithoutMqRotate => {
+                conservative_mid_acquire_except(previous, current, Some("mq_rotate_x"))
+            }
+            Self::WithoutRope => conservative_mid_acquire_except(
+                previous,
+                current,
+                Some("rope_partial_halfsplit_f32"),
+            ),
+        }
+    }
+}
+
+fn required_mid_acquire(previous: &str, current: &str) -> bool {
+    matches!(
+        previous,
+        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+    ) || matches!(
+        current,
+        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+    )
+}
+
+fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
+    (Some(previous) != excluded
+        && matches!(
+            previous,
+            "repeat_interleave_qk_f32"
+                | "fused_silu_mul_mq_rotate"
+                | "mq_rotate_x"
+                | "rope_partial_halfsplit_f32"
+        ))
+        || (Some(current) != excluded
+            && matches!(
+                current,
+                "repeat_interleave_qk_f32"
+                    | "fused_silu_mul_mq_rotate"
+                    | "rope_partial_halfsplit_f32"
+            ))
+}
+
 fn independent_sibling(previous: &str, current: &str) -> bool {
     matches!(
         (previous, current),
@@ -223,6 +317,7 @@ impl ShadowValidation {
 pub struct ReplayController {
     request: ReplayBackendRequest,
     transport: ReplayTransport,
+    pm4_mid_acquire_policy: Pm4MidAcquirePolicy,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
     certified_speedups: Vec<f64>,
@@ -265,6 +360,7 @@ impl ReplayController {
         Self {
             request,
             transport: ReplayTransport::from_env(),
+            pm4_mid_acquire_policy: Pm4MidAcquirePolicy::from_env(),
             state,
             recorded: Vec::new(),
             certified_speedups: Vec::new(),
@@ -617,18 +713,10 @@ impl ReplayController {
                 if !independent_sibling(previous, current) {
                     commands.wait_compute_idle();
                 }
-                if matches!(
-                    previous,
-                    "repeat_interleave_qk_f32"
-                        | "fused_silu_mul_mq_rotate"
-                        | "mq_rotate_x"
-                        | "rope_partial_halfsplit_f32"
-                ) || matches!(
-                    current,
-                    "repeat_interleave_qk_f32"
-                        | "fused_silu_mul_mq_rotate"
-                        | "rope_partial_halfsplit_f32"
-                ) {
+                if self
+                    .pm4_mid_acquire_policy
+                    .acquire_between(previous, current)
+                {
                     commands.acquire_system();
                 }
             }
@@ -952,6 +1040,51 @@ mod tests {
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
             "fused_silu_mul_mq_rotate",
         ));
+    }
+
+    #[test]
+    fn pm4_mid_acquire_policies_preserve_required_boundaries() {
+        assert_eq!(
+            Pm4MidAcquirePolicy::from_value("conservative"),
+            Some(Pm4MidAcquirePolicy::Conservative)
+        );
+        assert_eq!(
+            Pm4MidAcquirePolicy::from_value("entry-only"),
+            Some(Pm4MidAcquirePolicy::EntryOnly)
+        );
+        assert_eq!(
+            Pm4MidAcquirePolicy::from_value("required-only"),
+            Some(Pm4MidAcquirePolicy::RequiredOnly)
+        );
+        assert!(
+            Pm4MidAcquirePolicy::Conservative
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            !Pm4MidAcquirePolicy::EntryOnly
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(!Pm4MidAcquirePolicy::Conservative.acquire_between("rmsnorm_f32", "gemv_hfq4g256"));
+        assert!(
+            !Pm4MidAcquirePolicy::WithoutRope
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            Pm4MidAcquirePolicy::WithoutRope
+                .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            !Pm4MidAcquirePolicy::WithoutMqRotate.acquire_between("mq_rotate_x", "gemv_hfq4g256")
+        );
+        assert!(
+            Pm4MidAcquirePolicy::RequiredOnly
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            !Pm4MidAcquirePolicy::RequiredOnly
+                .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256")
+        );
+        assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
     }
 
     #[test]
