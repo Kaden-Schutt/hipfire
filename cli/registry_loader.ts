@@ -44,6 +44,7 @@ export interface RegistryModelEntryV1 {
   /// Tool-call wire format expected by this model card. Missing/null lets the
   /// CLI use its conservative family heuristic.
   default_tool_format?: "hermes" | "qwen_xml" | null;
+  dspark?: RegistrySidecarV1;
   sha256?: string | null;
   size_bytes?: number | null;
   arch_id?: number | null;
@@ -141,6 +142,7 @@ function validEntry(v: unknown): v is RegistryModelEntryV1 {
   ) {
     return false;
   }
+  if (v.dspark !== undefined && !validSidecar(v.dspark)) return false;
   // Fail-closed on default_kv_mode: a present value must be a known KV mode.
   // null/undefined means "no per-model recommendation" → arch fallback.
   if (v.default_kv_mode !== undefined && v.default_kv_mode !== null) {

@@ -80,11 +80,16 @@
         "sha256": "596ab559d40319fd070baa34b24f8addcb64245cd0dd61fb468264fded89bfc7",
         "size_bytes": 1998047355
       },
+      "dspark": {
+        "file": "deepseek-v4-flash-dspark.mq2lloyd",
+        "sha256": "0ec4cdbadfd8f5b1e8eead5b864ec3ec2233839f266221e6111839efd5813375",
+        "size_bytes": 5996334814
+      },
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 1.0
       },
-      "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code). temp=1.0 is safety-critical: greedy/low-temp falls into token loops on the quant.",
+      "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code) and a DSpark 3-stage drafter sidecar (auto-wins over MTP under --spec dspark/auto). temp=1.0 is safety-critical: greedy/low-temp falls into token loops on the quant.",
       "sha256": "ab8a8900f6792199975e7e2b15854bb869a023ca3fddf62981c1b9cd600e9b96",
       "size_bytes": 86184307283,
       "arch_id": 9,
