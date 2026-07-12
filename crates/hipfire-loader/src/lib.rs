@@ -13,6 +13,7 @@ pub use carriers::*;
 pub mod model_parallel;
 pub mod session_state;
 pub mod spec_build;
+pub use model_parallel::{ModelParallel, PipelineImpl};
 
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
@@ -340,6 +341,11 @@ pub struct LoadedModel {
     /// (`pp_gpus` / `Qwen35Bundle.pipeline`). When `Some`, the daemon serves via
     /// `generate_pp` (through the shared `generate_dense` loop).
     pub pp_dense: Option<hipfire_runtime::pp_serve::PpModel>,
+    /// Owning parallelism enum — the single-value answer to "which axis?".
+    /// Set to `Single` at every construction site; migrated to the real axis
+    /// variant in later increments. Legacy `pp`/`pp_gpus`/`ep`/`tp`/`pp_dense`
+    /// fields are KEPT for now while readers migrate.
+    pub parallel: ModelParallel,
     // Shared arch state
     pub state: Option<ModelState>,
     // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
@@ -405,6 +411,7 @@ impl LoadedModel {
             ep: None,
             tp: None,
             pp_dense: None,
+            parallel: ModelParallel::Single,
             pp_gpus: None,
             state: None,
             deepseek4_eos_tok: 0,
