@@ -10,8 +10,8 @@ This immutable table records the sole bootstrap correction to IDs published befo
 
 | Initial published ID | Meaning in `7115135e` and the initial PR mirror | Corrected ID | Correction date | Correction commit |
 |---|---|---|---|---|
-| `PAR-003` | Optional TP x EP composition scope decision | `COMP-001` | 2026-07-12 | Pending |
-| `COMP-001` | Final validation and merge gate | `DOC-002` | 2026-07-12 | Pending |
+| `PAR-003` | Optional TP x EP composition scope decision | `COMP-001` | 2026-07-12 | `754e68bc` |
+| `COMP-001` | Final validation and merge gate | `DOC-002` | 2026-07-12 | `754e68bc` |
 
 The alias rows are historical provenance only. They do not define active dependencies, and they must not be copied into the PR checklist when it is next synchronized. Because the correction was simultaneous, `COMP-001` has one explicit bootstrap collision: its retired `final validation and merge gate` meaning must never be reused, while the current `COMP-001` ID refers only to optional TP x EP composition. `DOC-002` is the only current final-gate ID.
 
