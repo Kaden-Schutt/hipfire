@@ -4572,7 +4572,10 @@ impl Gpu {
             self.launch_maybe_blob(
                 "gemv_hfq4g256_wide",
                 [grid, 1, 1],
-                [32, 1, 1],
+                // The wide kernel maps warp_id 0/1 to the two rows owned by
+                // each block. Launching one wave silently skipped every odd
+                // row while preserving valid memory accesses.
+                [64, 1, 1],
                 0,
                 &mut params,
                 blob_builder,

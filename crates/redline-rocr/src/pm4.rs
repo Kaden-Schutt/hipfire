@@ -35,6 +35,8 @@ const GFX12_LDS_GRANULE: u32 = 512;
 const ENABLE_SGPR_KERNARG_SEGMENT_PTR: u16 = 1 << 3;
 const ENABLE_WAVEFRONT_SIZE32: u16 = 1 << 10;
 const SUPPORTED_KERNEL_PROPERTIES: u16 = ENABLE_SGPR_KERNARG_SEGMENT_PTR | ENABLE_WAVEFRONT_SIZE32;
+const DISPATCH_INITIATOR_BASE: u32 = (1 << 0) | (1 << 2) | (1 << 5);
+const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
 
 /// Retained GFX12 PM4 command words suitable for one PM4 indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -124,7 +126,7 @@ impl Gfx12Pm4CommandBuffer {
         ]);
     }
 
-    /// Append one zero-scratch wave32 dispatch using the exact loaded code
+    /// Append one zero-scratch dispatch using the exact loaded code
     /// entry and descriptor resources reported by the HSA loader.
     pub fn dispatch(
         &mut self,
@@ -147,9 +149,7 @@ impl Gfx12Pm4CommandBuffer {
         if unsupported != 0 {
             return Err(Pm4BuildError::UnsupportedKernelProperties(unsupported));
         }
-        if pm4.kernel_code_properties & ENABLE_WAVEFRONT_SIZE32 == 0 {
-            return Err(Pm4BuildError::Wave64Unsupported);
-        }
+        let wave32 = pm4.kernel_code_properties & ENABLE_WAVEFRONT_SIZE32 != 0;
         let needs_kernarg = pm4.kernel_code_properties & ENABLE_SGPR_KERNARG_SEGMENT_PTR != 0;
         if needs_kernarg && kernarg_address.is_null() {
             return Err(Pm4BuildError::NullKernarg);
@@ -194,10 +194,10 @@ impl Gfx12Pm4CommandBuffer {
 
         self.dwords.push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
         self.dwords.extend_from_slice(&geometry.grid_workitems);
-        // COMPUTE_SHADER_EN | FORCE_START_AT_000 | USE_THREAD_DIMENSIONS |
-        // CS_W32_EN. These are the bits ROCr programs when lowering an AQL
-        // wave32 dispatch to PM4.
-        self.dwords.push((1 << 0) | (1 << 2) | (1 << 5) | (1 << 15));
+        // COMPUTE_SHADER_EN | FORCE_START_AT_000 | USE_THREAD_DIMENSIONS,
+        // with CS_W32_EN derived from the kernel descriptor. A mixed-wave
+        // retained tape must never inherit this bit from the preceding node.
+        self.dwords.push(dispatch_initiator(wave32));
         Ok(())
     }
 
@@ -279,6 +279,15 @@ fn packet3(opcode: u32, body_dwords: u32, compute: bool) -> u32 {
     (3 << 30) | ((body_dwords - 1) << 16) | (opcode << 8) | if compute { 1 << 1 } else { 0 }
 }
 
+fn dispatch_initiator(wave32: bool) -> u32 {
+    DISPATCH_INITIATOR_BASE
+        | if wave32 {
+            DISPATCH_INITIATOR_CS_W32_EN
+        } else {
+            0
+        }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Pm4BuildError {
     MissingKernelDescriptor,
@@ -287,7 +296,6 @@ pub enum Pm4BuildError {
         dynamic_callstack: bool,
     },
     UnsupportedKernelProperties(u16),
-    Wave64Unsupported,
     NullKernarg,
     GroupSegmentOverflow,
     GroupSegmentTooLarge(u32),
@@ -310,9 +318,6 @@ impl fmt::Display for Pm4BuildError {
                 formatter,
                 "kernel requires unsupported implicit SGPR properties 0x{bits:04x}"
             ),
-            Self::Wave64Unsupported => {
-                write!(formatter, "PM4 dispatch currently requires a wave32 kernel")
-            }
             Self::NullKernarg => write!(formatter, "kernel requires a non-null kernarg pointer"),
             Self::GroupSegmentOverflow => {
                 write!(formatter, "static plus dynamic group segment overflowed")
@@ -337,6 +342,12 @@ mod tests {
         assert_eq!(packet3(PACKET3_DISPATCH_DIRECT, 4, true), 0xc003_1502);
         assert_eq!(packet3(PACKET3_EVENT_WRITE, 1, false), 0xc000_4600);
         assert_eq!(packet3(PACKET3_ACQUIRE_MEM, 7, false), 0xc006_5800);
+    }
+
+    #[test]
+    fn dispatch_initiator_tracks_kernel_descriptor_wave_size() {
+        assert_eq!(dispatch_initiator(false), 0x25);
+        assert_eq!(dispatch_initiator(true), 0x8025);
     }
 
     #[test]

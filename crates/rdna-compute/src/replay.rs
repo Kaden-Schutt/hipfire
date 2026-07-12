@@ -131,7 +131,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
-        "gemv_hfq4g256_residual" | "gemv_hfq4g256_multirow_r2" => {
+        "gemv_hfq4g256_residual"
+        | "gemv_hfq4g256_wide"
+        | "gemv_hfq4g256_multirow_r2"
+        | "gemv_hfq4g256_multirow_r4"
+        | "gemv_hfq4g256_multirow_r8" => {
             Some(vec![read(0), read(8), write(16)])
         }
         "softmax_f32" => Some(vec![write(0)]),
@@ -183,7 +187,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "softmax_f32" => Some(16),
         "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256_residual"
+        | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
+        | "gemv_hfq4g256_multirow_r4"
+        | "gemv_hfq4g256_multirow_r8"
         | "deinterleave_f32"
         | "kv_cache_write_q8_0"
         | "moe_down_combine_k8_batched"
@@ -1504,6 +1511,7 @@ mod tests {
         "gated_norm_f32",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
+        "gemv_hfq4g256_wide",
         "softmax_f32",
         "moe_topk_renorm_k8",
         "fused_silu_mul_mq_rotate",
@@ -1521,6 +1529,8 @@ mod tests {
         "attention_flash_q8_0_reduce",
         "sigmoid_mul_f32",
         "gemv_hfq4g256_multirow_r2",
+        "gemv_hfq4g256_multirow_r4",
+        "gemv_hfq4g256_multirow_r8",
     ];
 
     fn passing(speedup: f64) -> ShadowValidation {
