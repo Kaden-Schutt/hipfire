@@ -4582,7 +4582,7 @@ fn main() {
                 // for v1.
                 // Task 3: m.tp removed; TP now detected via m.parallel. NOTE: full
                 // kind() match consolidation deferred to Task 7.
-                if m.pp > 1
+                if m.parallel.is_pipelined()
                     || matches!(m.parallel.kind(), ModelParallelKind::Ep)
                     || matches!(m.parallel.kind(), ModelParallelKind::Tp)
                 {
@@ -5561,10 +5561,11 @@ fn plan_prompt_cache(
 /// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
 /// no double-free). Mirrors the per-LA-device memset for pp>1. No-op off qwen35.
 fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
-    if m.pp > 1 {
-        if let (Some(ModelState::Qwen35(b)), Some(gpus)) = (
+    if m.parallel.is_pipelined() {
+        if let (Some(ModelState::Qwen35(b)),
+                ModelParallel::Pp(PipelineImpl::ArchResident(gpus))) = (
             m.state.as_ref(),
-            m.pp_gpus.as_mut(),
+            &mut m.parallel,
         ) {
             // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
             if let Some(pl) = b.pipeline.as_ref() {
@@ -7454,10 +7455,11 @@ fn generate_multi(
         // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
         // because a `&tokenizer` borrow of `m` is live here; covers both the
         // pp>1 per-LA-device path and the single-GPU path.
-        if m.pp > 1 {
-            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus)) = (
+        if m.parallel.is_pipelined() {
+            if let (Some(ModelState::Qwen35(b)),
+                    ModelParallel::Pp(PipelineImpl::ArchResident(ref mut gpus))) = (
                 m.state.as_ref(),
-                m.pp_gpus.as_mut(),
+                &mut m.parallel,
             ) {
                 // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
                 if let Some(pl) = b.pipeline.as_ref() {
@@ -7689,10 +7691,11 @@ fn generate_multi(
         free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
-        if m.pp > 1 {
-            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus)) = (
+        if m.parallel.is_pipelined() {
+            if let (Some(ModelState::Qwen35(b)),
+                    ModelParallel::Pp(PipelineImpl::ArchResident(ref mut gpus))) = (
                 m.state.as_ref(),
-                m.pp_gpus.as_mut(),
+                &mut m.parallel,
             ) {
                 // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
                 if let Some(pl) = b.pipeline.as_ref() {
@@ -7789,7 +7792,8 @@ fn generate_multi(
     let dn_la_to_device = &pl.dn_la_to_device;
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
-    let gpus = m.pp_gpus.as_mut().unwrap();
+    let ModelParallel::Pp(PipelineImpl::ArchResident(gpus)) = &mut m.parallel
+        else { unreachable!("qwen35 pp>1 forward without ArchResident mesh") };
 
     macro_rules! reset_pp_uncommitted_state {
         () => {{
@@ -9771,10 +9775,10 @@ fn generate(
     }
     // Expert-parallel dispatch (task #26). ep.is_some() → generate_ep (AR via
     // forward_ep, full sampler on rank-0 logits). Refusals enforced at load.
-    // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
-    // at load when DFlash / CASK / PFlash / VL is requested, so this branch
+    // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). qwen35 ArchResident PP
+    // is refused at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
-    if m.pp > 1 {
+    if matches!(m.parallel, ModelParallel::Pp(PipelineImpl::ArchResident(_))) {
         generate_multi(
             m,
             gpu,
@@ -10753,7 +10757,7 @@ fn generate(
             // stream), this resume becomes unsound: re-validate with a per-checkpoint
             // prefix hash (llama.cpp's tokens_hash contract) or cold-recompute.
             // Guarded by scripts/test-qwen35-abort-resume.sh.
-            let evict_safe = m.pp <= 1
+            let evict_safe = !m.parallel.is_pipelined()
                 && m.eviction.is_none()
                 && m.state.as_ref().map_or(true, |s| match s {
                     ModelState::Llama(b) => b.kv.compact_offset == 0,

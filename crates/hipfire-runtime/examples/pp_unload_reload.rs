@@ -4,11 +4,9 @@
 
 //! Regression: dense pipeline-parallel LOAD -> UNLOAD -> RELOAD must not panic.
 //!
-//! Guards the dense-PP unload bug: `load_model_pp` sets an *informational*
-//! `pp >= 2` (the requested degree) but leaves `pp_gpus` None (dense-PP state
-//! lives in `pp_dense`). Before the fix, `unload_model`'s `pp_dense` arm did not
-//! early-return, so a dense-PP unload fell through into the qwen35-PP
-//! `if m.pp > 1` arm and panicked at `pp_gpus.expect("pp>1 must carry pp_gpus")`.
+//! Guards the dense-PP unload bug: before the fix, `unload_model`'s
+//! `pp_dense` arm did not early-return, so a dense-PP unload fell through into
+//! the qwen35-PP `if m.pp > 1` arm and panicked.
 //! See `.agent-memory/notes/dense-pp-unload-panic-pp-gpus-expect.md`.
 //!
 //! This exercises the LOADER path (`hipfire_loader::load_model_pp` +
@@ -47,12 +45,7 @@ fn main() {
             matches!(m.parallel.kind(), hipfire_loader::ModelParallelKind::PpDense),
             "cycle {cycle}: dense PP model is not ModelParallel::Pp(Dense)"
         );
-        assert!(
-            m.pp_gpus.is_none(),
-            "cycle {cycle}: dense PP unexpectedly carries pp_gpus (the informational \
-             pp>=2 + a present pp_gpus is the qwen35-PP shape, not dense)"
-        );
-        // Pre-fix: panics here at unload_model:1708 `pp_gpus.expect(...)`.
+        // Pre-fix: panics here at unload_model falling into the qwen35-PP arm.
         hipfire_loader::unload_model(m, &mut gpu);
         println!("cycle {cycle}: load -> unload OK");
     }

@@ -329,11 +329,9 @@ pub struct PersistState {
 
 pub struct LoadedModel {
     pub arch_id: u32,
-    pub pp: usize,
-    pub pp_gpus: Option<Gpus>,
     /// Owning parallelism enum — the single-value answer to "which axis?".
     /// `Tp` owns the TpModel (migrated Task 3). `Pp(Dense)` owns the PpModel (migrated Task 4).
-    /// Legacy `pp`/`pp_gpus`/`ep` fields kept while remaining axes migrate.
+    /// `Pp(ArchResident)` carries the qwen35-PP mesh (migrated Task 6).
     pub parallel: ModelParallel,
     // Shared arch state
     pub state: Option<ModelState>,
@@ -396,9 +394,7 @@ impl LoadedModel {
     ) -> Self {
         LoadedModel {
             arch_id,
-            pp: 1,
             parallel: ModelParallel::Single,
-            pp_gpus: None,
             state: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
@@ -539,8 +535,9 @@ impl LoadedModel {
     }
 
     /// pp>1 skeleton — sets the load-bearing multi-GPU fields together so they
-    /// cannot be set piecemeal. The qwen35 PP scratch is now carried inside
-    /// `Qwen35Bundle.pipeline` (not on `LoadedModel`); only `pp_gpus` lives here.
+    /// cannot be set piecemeal. The qwen35 PP scratch is carried inside
+    /// `Qwen35Bundle.pipeline`; the mesh is carried in `parallel` as
+    /// `Pp(ArchResident(gpus))`.
     pub fn skeleton_pp(
         arch_id: u32,
         tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -548,12 +545,10 @@ impl LoadedModel {
         physical_cap: usize,
         model_path: String,
         chat_template: Option<String>,
-        pp: usize,
-        pp_gpus: Gpus,
+        gpus: Gpus,
     ) -> Self {
         LoadedModel {
-            pp,
-            pp_gpus: Some(pp_gpus),
+            parallel: ModelParallel::Pp(crate::model_parallel::PipelineImpl::ArchResident(gpus)),
             ..LoadedModel::skeleton(
                 arch_id,
                 tokenizer,
@@ -1187,9 +1182,6 @@ pub fn load_model(
         ));
     }
     let mut result = carrier.load(src, &mut ctx)?;
-    if result.pp > 1 && result.pp_gpus.is_none() {
-        return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
-    }
     // Apply the author-recommended sampling extracted pre-allocation (see above).
     // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
     // is the gfx12 hipGraph-replay regression root-caused above.
@@ -1529,7 +1521,6 @@ pub fn load_model_pp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
     let eos_tok = pp_model.eos_token();
 
     Ok(LoadedModel {
-        pp: mesh.size_of(DimKind::Pp), // requested degree (informational; PP state lives in parallel)
         parallel: ModelParallel::Pp(crate::model_parallel::PipelineImpl::Dense(pp_model)),
         deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (PP state is in parallel)
         rec_temperature: rec.and_then(|r| r.temperature),
@@ -1818,9 +1809,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // PP arm (P-C, Task 4): PpModel owns its own Gpus + per-stage scratch/KV.
     // PpModel::free frees them + drains each stage pool. Return here: dense-PP owns
     // its entire mesh inside PpModel, so this is the whole teardown. Without the
-    // return a dense-PP unload falls through into the qwen35-PP `if m.pp > 1` arm
-    // (true because load_model_pp sets an informational pp>=2) and panics at
-    // pp_gpus.expect. See .agent-memory/notes/dense-pp-unload-panic-pp-gpus-expect.md.
+    // return a dense-PP unload would fall through into the qwen35-PP ArchResident arm.
+    // See .agent-memory/notes/dense-pp-unload-panic-pp-gpus-expect.md.
     match std::mem::replace(&mut m.parallel, ModelParallel::Single) {
         ModelParallel::Tp(tp) => {
             tp.free();
@@ -1904,8 +1894,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         }
         _ => {}
     }
-    if m.pp > 1 {
-        let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
+    if let ModelParallel::Pp(crate::model_parallel::PipelineImpl::ArchResident(mut gpus)) =
+        m.parallel
+    {
         match m.state.take() {
             Some(ModelState::Qwen35(b)) => {
                 if let Some(pl) = b.pipeline {

@@ -287,7 +287,6 @@ fn load_qwen35_pp(
             ctx.max_seq,
             ctx.path.to_string(),
             meta.chat_template,
-            pp,
             gpus,
         )
     })
