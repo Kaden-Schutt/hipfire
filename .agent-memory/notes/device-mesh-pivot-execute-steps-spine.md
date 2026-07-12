@@ -4,6 +4,8 @@ date: 2026-07-06
 tags: [device-mesh, parallel-expansion, execute_steps, dense_forward, run_layer_program, superop, forward_bindings, tp, pp, ep, pivot, phase2]
 ---
 
+> **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](../../.agent-progress/device-mesh-refactor-tracker.md).
+
 **Branch:** `feature/device-mesh` (worktree `.claude/worktrees/feature+device-mesh`), phase-2 branch off
 `feature/parallel-expansion` (which carries `HIPFIRE_EMULATE_GPUS`). Plan doc:
 `docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md` — see the `## PIVOT` section

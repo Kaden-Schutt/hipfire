@@ -7,11 +7,20 @@ updated: 2026-07-11
 
 # External review findings — device-mesh branch (2026-07-10)
 
+> **HISTORICAL REVIEW SNAPSHOT:** The
+> [canonical device-mesh refactor tracker](../../.agent-progress/device-mesh-refactor-tracker.md)
+> is authoritative for current status. This note preserves the review's original findings and
+> wording as evidence; later closure updates are called out explicitly below.
+
 External reviewer graded the branch "8/10 foundation, 4/10 integration —
 emulated proofs labeled as production." 6 findings, all code-verified against
 HEAD (c9d36d0e). Status as of 2026-07-11:
 
 ## #1 Dense PP emulation-only (REAL, known follow-up)
+
+**CURRENT STATUS: OPEN.** Physical dense PP validation remains required; see `HW-003` in the
+canonical tracker. Emulated parity does not close the physical multi-GPU placement, transfer,
+and teardown gate.
 
 pp_serve.rs loads whole weights on out_dev; module doc admitted real-HW per-stage
 banding is a follow-up. No capacity benefit on real multi-GPU; cross-device pointer
@@ -42,6 +51,10 @@ Moved after all allocs in tp_serve/pp_serve. Emulation-invisible. **FIXED @ 17fc
 weight_manifest.rs:68 `_ => group_along(Tp)` → singleton on Ep-only mesh (a test
 asserts device-0-only). Live EP uses hand forward_ep, not the manifest, so latent.
 NOT fixed. Status: **OPEN — LATENT.**
+
+**CURRENT STATUS: CLOSED.** EP manifest replication was fixed by commits `4f55a274`,
+`8c441c76`, and `be5c4bdb`. The original finding above is intentionally preserved as the
+historical review record.
 
 ## #5 ArchDispatch "dead end/unrouted" (STALE)
 

@@ -1,3 +1,5 @@
+> **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](device-mesh-refactor-tracker.md).
+
 # Device-mesh — HANDOVER for the next session
 
 > ⚠️ **PIVOT (2026-07-06) — the executor plan changed. Read the plan's `## PIVOT` section BEFORE

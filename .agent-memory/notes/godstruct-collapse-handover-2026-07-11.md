@@ -1,8 +1,85 @@
 ---
-title: HANDOVER — LoadedModel god-struct collapse (Increment 2 E–H → ModelParallel → ImmutableMeta)
-tags: [device-mesh, god-struct, loadedmodel, modelstate, handover, refactor, "462"]
+title: HANDOVER — LoadedModel god-struct field collapse COMPLETE at 9c57148d (historical handover)
+tags: [device-mesh, god-struct, loadedmodel, modelstate, modelparallel, handover, refactor, "462"]
 created: 2026-07-11
-updated: 2026-07-11
+updated: 2026-07-12
+---
+
+# ✅✅ UPDATE 2026-07-12 (later) — GOD-STRUCT FIELD COLLAPSE **COMPLETE at commit 9c57148d**
+
+**Current status:** Field collapse is **COMPLETE at `9c57148d`**. The
+[canonical device-mesh refactor tracker](../../.agent-progress/device-mesh-refactor-tracker.md)
+is authoritative for all remaining work; this handover is retained as historical evidence.
+
+`LoadedModel` is now exactly **9 fields**: `parallel: ModelParallel` · `state: ModelState` ·
+`vision: Option<Qwen35Vl>` · `tokenizer` · `eviction: Option<Eviction>` · `session:
+SessionState` · `persist: PersistState` · `speculator` · `meta: ModelMeta`. Down from the
+original ~50-field / ~20-Option god-struct.
+
+**Final step — `ModelMeta` collapse LANDED** (2 tasks, commits `8be7bf63` additive dual-home,
+`9c57148d` flip+delete): 13 loose immutable-after-load scalars → one `pub struct ModelMeta`
+(arch_id, model_path, chat_template, max_seq, physical_cap, eos_tok, mtp_mode, mtp_k, rec_*×5).
+`deepseek4_eos_tok`+`minimax_eos_tok` UNIFIED → `meta.eos_tok` (mutually exclusive; the
+`if arch_id==10` eos select collapsed to one read). Named `ModelMeta` NOT `ImmutableMeta` (pub
+fields cross into the daemon crate + written at 3 load-time sites: carrier construction,
+`load_model` rec_* finalize lib.rs:1231, daemon load-handler mtp daemon.rs:3670 — immutable
+only AFTER load; enforcement by convention). `session_parts_mut` extended to a 3-tuple
+returning `&ModelMeta` (review F1: `&mut self` splitter refs conflict with a concurrent
+`self.m.meta` read). Byte-identical; serve-multiturn + coherence PASS. Design/plan:
+`docs/superpowers/{specs,plans}/2026-07-12-{immutablemeta-collapse-design,modelmeta-collapse}.md`.
+
+**god-struct = DONE.** Remaining housekeeping (all OUTSIDE the collapse): (1) `mtp_k` wiring
+bug — the field is grouped in `meta` but generate still reads `HIPFIRE_MTP_K` env, not
+`meta.mtp_k`; re-wire deliberately. (2) `eviction` → the umbrella wanted it in `SessionState`
+(resettable) — still top-level, a future SessionState fold. (3) `vision` stays top-level
+(arch-extension crate, Step D). (4) EP token-gen validation gap (librccl absent — see the
+ModelParallel section below).
+
+---
+
+# HISTORICAL SNAPSHOT BELOW — SUPERSEDED
+
+The remaining sections preserve the earlier handover state, including statements that
+`ImmutableMeta` remains. Those statements are historical and were superseded by the completed
+`ModelMeta` collapse at `9c57148d`; do not use them as current status.
+
+# ✅ UPDATE 2026-07-12 — ModelParallel enum collapse LANDED (7 tasks, HEAD 79921b33)
+
+The **ModelParallel** step is DONE. `LoadedModel`'s 7 loose parallelism fields
+(`pp`,`pp_gpus`,`pp_scratch_set`,`pp_dn_la_to_device`,`ep`,`tp`,`pp_dense`) collapsed to
+ONE `parallel: ModelParallel` field. Model-AGNOSTIC taxonomy (no variant names a model):
+`ModelParallel { Single, Tp(TpModel), Pp(PipelineImpl), Ep(EpState) }` +
+`PipelineImpl { Dense(PpModel), ArchResident(Gpus) }` (nested because PP is one axis, two
+impls — generic dense driver vs qwen35 arch-resident mesh; `pp_serve.rs:82` is llama-only,
+no DeltaNet sharding). qwen35 PP scratch folded into `Qwen35Bundle.pipeline:
+Option<Qwen35PipelineState>`. Sentinel (old lib.rs:1206) + `pp` scalar DISSOLVED
+(unrepresentable). `ModelParallelKind` KEPT as the `Copy` dispatch discriminant (`kind()`);
+`generate()` dispatches via `match m.parallel.kind()` (borrow-free — avoids `&mut m.parallel`
+live across `dense_serve(m,…)`). `DenseServed` selection is a daemon-side `dense_model_mut`
+(F1: trait is daemon-private, can't live on the loader enum).
+
+Spec: `docs/superpowers/specs/2026-07-12-modelparallel-enum-collapse-design.md` (gitignored).
+Plan: `docs/superpowers/plans/2026-07-12-modelparallel-enum-collapse.md`.
+Ledger: `.superpowers/sdd/progress.md` (7-task detail, all reviewed).
+Commits: c3ac4814(+83ce1525) 3e99918c 8c3d7f85 a4211e3c a4583dbc 0fe02058 79921b33.
+Byte-identical per-axis, GPU-validated: TP tp=2 20-tok identical; dense-PP llama_store_pp
+max|Δ|=0 + unload/reload; qwen35 pp=2 (ArchResident) coherent; bench-guard equivalence unit
+test. serve-multiturn + coherence gates PASS.
+
+**⚠ EP-VALIDATION GAP (ONLY open item):** end-to-end EP TOKEN-GEN not runnable on halo —
+`librccl.so` NOT installed (RCCL absent) so emulated same-device EP-2 all-reduce fails at
+`RcclComms::init_all`; `ep_deepseek4` example defaults tp=4 → 4 emulated ranks OOM. BUT the
+daemon EP-2 ds4 serve executed the ENTIRE migrated path (load_model_ep→ModelParallel::Ep→
+generate_ep→EpState destructure→forward_ep→moe-step L0) before the untouched RCCL boundary,
+proving the migration wires correctly; the 15+ `m.ep` destructure flips were verified
+byte-identical by code review (95% confidence). To fully close: `apt install rccl` (or
+`/opt/rocm/lib/librccl.so.1`) then re-run the daemon EP-2 ds4+minimax serve, OR real multi-GPU.
+
+**REMAINING god-struct work: ONLY `ImmutableMeta`** — fold `arch_id`/`model_path`/
+`chat_template`/`rec_*`/`deepseek4_eos_tok`/`minimax_eos_tok`/`mtp_mode` into one immutable
+group. Plus the separate **`mtp_k` wiring bug** (load-message knob ignored; only `HIPFIRE_MTP_K`
+env works — deliberate re-wire, outside god-struct).
+
 ---
 
 # HANDOVER: LoadedModel god-struct collapse — resume here

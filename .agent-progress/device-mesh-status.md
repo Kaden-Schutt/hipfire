@@ -1,3 +1,5 @@
+> **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](device-mesh-refactor-tracker.md).
+
 # Device-mesh implementation — consolidated status
 
 Branch: feature/device-mesh (off feature/parallel-expansion; has HIPFIRE_EMULATE_GPUS)

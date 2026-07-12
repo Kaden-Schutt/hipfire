@@ -1,3 +1,5 @@
+> **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](device-mesh-refactor-tracker.md).
+
 # Device-mesh implementation — progress
 
 Plan: docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md

@@ -4,6 +4,8 @@ date: 2026-07-09
 tags: [device-mesh, god-struct, loadedmodel, archdispatch, modelparallel, sessionstate, 462, state-bleed, daemon, dispatch, refactor, design, phase3, trait-object, parity-harness]
 ---
 
+> **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](../../.agent-progress/device-mesh-refactor-tracker.md).
+
 **Branch:** `feature/device-mesh` (worktree `.claude/worktrees/feature+device-mesh`). Full spec (gitignored-local per branch convention): `docs/superpowers/specs/2026-07-09-daemon-god-struct-archdispatch-design.md`. Parent: [[device-mesh-pivot-execute-steps-spine]] ("the one structural unification still worth doing"). **Independent of** the MoE/DeltaNet Step-decomposition thread (P-D/P-E): that delivers parallelism *transparency*; this collapses the daemon dispatch god-struct + makes #462 state-bleed structurally impossible.
 
 ## Decisions locked (bjoern, 2026-07-09)

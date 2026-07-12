@@ -5,6 +5,8 @@ created: 2026-07-11
 updated: 2026-07-11
 ---
 
+> **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](../../.agent-progress/device-mesh-refactor-tracker.md).
+
 # HANDOVER: tackle these two next (device-mesh review leftovers)
 
 Context: the 2026-07-10 external review had 6 findings (see
