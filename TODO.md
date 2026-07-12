@@ -11,8 +11,11 @@ clocks, exact-output/coherence gates, and the sampled eight-turn serve harness.
    certified `required-only` default. PM4 compute waits are now derived from
    allocation-wide read/write effects across the full outstanding frontier;
    unknown kernels or pointers fail closed instead of relying on kernel names.
-2. **Stateful PM4 encoding.** Elide repeated program/resource/workgroup register
-   writes when adjacent dispatches retain the same state.
+2. **Stateful PM4 encoding (complete).** Queue-global invariant register writes
+   are retained by default, reducing the FWHT3 tape by 30.4% with a measured
+   +0.61% at 8K and neutral `tg128`. Full program/resource/workgroup retention
+   remains opt-in because it reduced the tape further but slightly regressed
+   `tg128`.
 3. **GFX12 temporal cache policy.** Fresh-process A/B for streamed weight loads
    versus reusable KV/scratch loads; verify the intended ISA hint changes and
    do not rely on the unavailable GL2/GCEA counters.

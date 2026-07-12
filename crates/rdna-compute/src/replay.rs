@@ -322,6 +322,36 @@ enum Pm4WaitPolicy {
     Resource,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pm4RegisterPolicy {
+    Legacy,
+    Static,
+    Stateful,
+}
+
+impl Pm4RegisterPolicy {
+    fn from_value(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "off" | "legacy" => Some(Self::Legacy),
+            "static" | "static-only" | "static_only" => Some(Self::Static),
+            "1" | "true" | "on" | "stateful" => Some(Self::Stateful),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Self {
+        let value =
+            std::env::var("HIPFIRE_REPLAY_PM4_STATEFUL").unwrap_or_else(|_| "static".to_owned());
+        Self::from_value(&value).unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unknown HIPFIRE_REPLAY_PM4_STATEFUL={value:?}; \
+                     retaining legacy full-register emission"
+            );
+            Self::Legacy
+        })
+    }
+}
+
 impl Pm4WaitPolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -653,6 +683,7 @@ pub struct ReplayController {
     transport: ReplayTransport,
     pm4_mid_acquire_policy: Pm4MidAcquirePolicy,
     pm4_wait_policy: Pm4WaitPolicy,
+    pm4_register_policy: Pm4RegisterPolicy,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
     certified_speedups: Vec<f64>,
@@ -697,6 +728,7 @@ impl ReplayController {
             transport: ReplayTransport::from_env(),
             pm4_mid_acquire_policy: Pm4MidAcquirePolicy::from_env(),
             pm4_wait_policy: Pm4WaitPolicy::from_env(),
+            pm4_register_policy: Pm4RegisterPolicy::from_env(),
             state,
             recorded: Vec::new(),
             certified_speedups: Vec::new(),
@@ -1040,7 +1072,11 @@ impl ReplayController {
             geometries.push(geometry);
         }
 
-        let mut commands = Gfx12Pm4CommandBuffer::new();
+        let mut commands = match self.pm4_register_policy {
+            Pm4RegisterPolicy::Legacy => Gfx12Pm4CommandBuffer::new(),
+            Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
+            Pm4RegisterPolicy::Stateful => Gfx12Pm4CommandBuffer::new_stateful(),
+        };
         commands.acquire_system();
         let mut wait_audit = Pm4WaitAudit::default();
         let mut resource_frontier = ResourceFrontier::default();
@@ -1523,6 +1559,19 @@ mod tests {
             Some(Pm4WaitPolicy::Resource)
         );
         assert_eq!(Pm4WaitPolicy::from_value("invalid"), None);
+        assert_eq!(
+            Pm4RegisterPolicy::from_value("legacy"),
+            Some(Pm4RegisterPolicy::Legacy)
+        );
+        assert_eq!(
+            Pm4RegisterPolicy::from_value("1"),
+            Some(Pm4RegisterPolicy::Stateful)
+        );
+        assert_eq!(
+            Pm4RegisterPolicy::from_value("static"),
+            Some(Pm4RegisterPolicy::Static)
+        );
+        assert_eq!(Pm4RegisterPolicy::from_value("invalid"), None);
         assert!(pointer_effects("unknown_kernel").is_none());
         assert!(expected_kernarg_bytes("unknown_kernel").is_none());
         for kernel in A3B_REPLAY_KERNELS {

@@ -5,6 +5,7 @@
 //! `DISPATCH_DIRECT` packet used by ROCr's own command builder. Unsupported
 //! implicit-SGPR contracts fail closed instead of guessing queue internals.
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt;
 
@@ -39,11 +40,35 @@ const SUPPORTED_KERNEL_PROPERTIES: u16 = ENABLE_SGPR_KERNARG_SEGMENT_PTR | ENABL
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Gfx12Pm4CommandBuffer {
     dwords: Vec<u32>,
+    register_state: Option<BTreeMap<u32, u32>>,
+    cache_dynamic_registers: bool,
 }
 
 impl Gfx12Pm4CommandBuffer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a command buffer which omits writes to SH registers whose
+    /// values are already live earlier in this same retained indirect buffer.
+    /// The first write to every register is always emitted.
+    pub fn new_stateful() -> Self {
+        Self {
+            dwords: Vec::new(),
+            register_state: Some(BTreeMap::new()),
+            cache_dynamic_registers: true,
+        }
+    }
+
+    /// Retain only queue-global invariant register values. Program, resource,
+    /// workgroup, user-data, and dispatch state are still written exactly as
+    /// in the legacy encoder.
+    pub fn new_static_stateful() -> Self {
+        Self {
+            dwords: Vec::new(),
+            register_state: Some(BTreeMap::new()),
+            cache_dynamic_registers: false,
+        }
     }
 
     /// Invalidate the agent caches at the HIP/HSA-to-PM4 ownership boundary.
@@ -176,6 +201,44 @@ impl Gfx12Pm4CommandBuffer {
 
     fn set_sh_regs(&mut self, first: u32, values: &[u32]) {
         debug_assert!(!values.is_empty());
+        let static_registers = matches!(
+            first,
+            COMPUTE_TMPRING_SIZE | COMPUTE_RESOURCE_LIMITS | COMPUTE_STATIC_THREAD_MGMT_SE0
+        );
+        if !self.cache_dynamic_registers && !static_registers {
+            self.emit_set_sh_regs(first, values);
+            return;
+        }
+        let Some(register_state) = self.register_state.as_mut() else {
+            self.emit_set_sh_regs(first, values);
+            return;
+        };
+
+        let mut changed_runs = Vec::<(u32, Vec<u32>)>::new();
+        let mut run_first = None;
+        let mut run_values = Vec::new();
+        for (offset, value) in values.iter().copied().enumerate() {
+            let register = first + offset as u32;
+            if register_state.get(&register).copied() == Some(value) {
+                if let Some(run_first) = run_first.take() {
+                    changed_runs.push((run_first, std::mem::take(&mut run_values)));
+                }
+                continue;
+            }
+            register_state.insert(register, value);
+            run_first.get_or_insert(register);
+            run_values.push(value);
+        }
+        if let Some(run_first) = run_first {
+            changed_runs.push((run_first, run_values));
+        }
+
+        for (run_first, run_values) in changed_runs {
+            self.emit_set_sh_regs(run_first, &run_values);
+        }
+    }
+
+    fn emit_set_sh_regs(&mut self, first: u32, values: &[u32]) {
         self.dwords
             .push(packet3(PACKET3_SET_SH_REG, 1 + values.len() as u32, true));
         self.dwords.push(first);
@@ -256,5 +319,54 @@ mod tests {
         assert_eq!(commands.dwords()[0], 0xc006_5800);
         assert_eq!(commands.dwords()[7], 0x1c3f1);
         assert_eq!(&commands.dwords()[8..], &[0xc000_4600, 0x407]);
+    }
+
+    #[test]
+    fn stateful_register_writes_emit_only_changed_contiguous_runs() {
+        let mut commands = Gfx12Pm4CommandBuffer::new_stateful();
+        commands.set_sh_regs(0x210, &[1, 2, 3, 4]);
+        let first_len = commands.len_dwords();
+        commands.set_sh_regs(0x210, &[1, 2, 3, 4]);
+        assert_eq!(commands.len_dwords(), first_len);
+
+        commands.set_sh_regs(0x210, &[5, 2, 6, 4]);
+        assert_eq!(
+            &commands.dwords()[first_len as usize..],
+            &[
+                packet3(PACKET3_SET_SH_REG, 2, true),
+                0x210,
+                5,
+                packet3(PACKET3_SET_SH_REG, 2, true),
+                0x212,
+                6,
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_register_writes_remain_byte_stable() {
+        let mut commands = Gfx12Pm4CommandBuffer::new();
+        commands.set_sh_regs(0x210, &[1, 2]);
+        let once = commands.dwords().to_vec();
+        commands.set_sh_regs(0x210, &[1, 2]);
+        assert_eq!(commands.dwords().len(), once.len() * 2);
+        assert_eq!(&commands.dwords()[once.len()..], once);
+    }
+
+    #[test]
+    fn static_stateful_caches_only_queue_global_registers() {
+        let mut commands = Gfx12Pm4CommandBuffer::new_static_stateful();
+        commands.set_sh_regs(COMPUTE_RESOURCE_LIMITS, &[0x3ff]);
+        let static_len = commands.len_dwords();
+        commands.set_sh_regs(COMPUTE_RESOURCE_LIMITS, &[0x3ff]);
+        assert_eq!(commands.len_dwords(), static_len);
+
+        commands.set_sh_regs(COMPUTE_PGM_LO, &[1, 2]);
+        let dynamic_len = commands.len_dwords();
+        commands.set_sh_regs(COMPUTE_PGM_LO, &[1, 2]);
+        assert_eq!(
+            commands.len_dwords() - dynamic_len,
+            dynamic_len - static_len
+        );
     }
 }
