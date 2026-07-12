@@ -589,6 +589,7 @@ impl ModelSlot {
             kv_cache: self.kv_cache,
             dn_state: self.dn_state,
             mtp_head: self.mtp_head,
+            // ModelSlot is MTP-only (non-PP), so it never carries pipeline scratch — None is correct.
             pipeline: None,
         }
     }

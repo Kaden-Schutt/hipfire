@@ -5548,6 +5548,7 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
             m.state.as_ref(),
             m.pp_gpus.as_mut(),
         ) {
+            // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
             if let Some(pl) = b.pipeline.as_ref() {
                 let la = &pl.dn_la_to_device;
                 let dn = &b.dn_state;
@@ -7439,6 +7440,7 @@ fn generate_multi(
                 m.state.as_ref(),
                 m.pp_gpus.as_mut(),
             ) {
+                // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
                 if let Some(pl) = b.pipeline.as_ref() {
                     let la = &pl.dn_la_to_device;
                     let dn = &b.dn_state;
@@ -7673,6 +7675,7 @@ fn generate_multi(
                 m.state.as_ref(),
                 m.pp_gpus.as_mut(),
             ) {
+                // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
                 if let Some(pl) = b.pipeline.as_ref() {
                     let la = &pl.dn_la_to_device;
                     let dn = &b.dn_state;
