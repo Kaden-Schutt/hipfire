@@ -22,10 +22,18 @@
 #define HIPFIRE_WEIGHT_LOAD_U32(rsrc, byte_offset) \
     __builtin_amdgcn_raw_buffer_load_b32( \
         (rsrc), (unsigned int)(byte_offset), 0, HIPFIRE_GFX12_WEIGHT_CPOL_AUX)
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_U32(rsrc, vector_offset, scalar_offset) \
+    __builtin_amdgcn_raw_buffer_load_b32( \
+        (rsrc), (unsigned int)(vector_offset), (unsigned int)(scalar_offset), \
+        HIPFIRE_GFX12_WEIGHT_CPOL_AUX)
 #define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, byte_offset) \
     HIPFIRE_WEIGHT_LOAD_U32((rsrc), (byte_offset))
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(rsrc, ptr, vector_offset, scalar_offset) \
+    HIPFIRE_WEIGHT_LOAD_SPLIT_U32((rsrc), (vector_offset), (scalar_offset))
 #else
 #define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 0
 #define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, byte_offset) \
+    (*(const unsigned int*)(ptr))
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(rsrc, ptr, vector_offset, scalar_offset) \
     (*(const unsigned int*)(ptr))
 #endif

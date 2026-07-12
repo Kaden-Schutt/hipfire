@@ -56,6 +56,14 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
     const char* gate_ptr = A + (long long)row * groups_per_row * 136;
     const char* up_ptr = A + (long long)(row + mi) * groups_per_row * 136;
     const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    // One expert-wide SRD. Keep row/group displacement in scalar `soffset`
+    // and only the lane's packed-weight byte displacement in `voffset`.
+    const unsigned int row_stride = (unsigned int)groups_per_row * 136u;
+    const unsigned int gate_row_offset = (unsigned int)row * row_stride;
+    const unsigned int up_row_offset = (unsigned int)(row + mi) * row_stride;
+    const auto expert_rsrc = HIPFIRE_WEIGHT_RSRC(A);
+#endif
 
     float gacc0 = 0.0f, gacc1 = 0.0f, gacc2 = 0.0f, gacc3 = 0.0f;
     float uacc0 = 0.0f, uacc1 = 0.0f, uacc2 = 0.0f, uacc3 = 0.0f;
@@ -74,6 +82,11 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
              + ((sc) * (float)(((pk) >> 24) & 0xFu) + (zp)) * (x6) \
              + ((sc) * (float)(((pk) >> 28) & 0xFu) + (zp)) * (x7); \
     } while (0)
+
+    #define LOAD_UNIFORM_U32(ptr, vector_offset, scalar_offset) \
+        HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(expert_rsrc, ptr, vector_offset, scalar_offset)
+    #define LOAD_PACKED_U32(ptr, vector_offset, scalar_offset) \
+        HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(expert_rsrc, ptr, boff + vector_offset, scalar_offset)
 
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
@@ -95,37 +108,25 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         const char* gg1 = gg0 + 136;
         const char* gg2 = gg1 + 136;
         const char* gg3 = gg2 + 136;
-        float gsc0 = __builtin_bit_cast(float, *(const unsigned int*)(gg0));
-        float gzp0 = __builtin_bit_cast(float, *(const unsigned int*)(gg0 + 4));
-        float gsc1 = __builtin_bit_cast(float, *(const unsigned int*)(gg1));
-        float gzp1 = __builtin_bit_cast(float, *(const unsigned int*)(gg1 + 4));
-        float gsc2 = __builtin_bit_cast(float, *(const unsigned int*)(gg2));
-        float gzp2 = __builtin_bit_cast(float, *(const unsigned int*)(gg2 + 4));
-        float gsc3 = __builtin_bit_cast(float, *(const unsigned int*)(gg3));
-        float gzp3 = __builtin_bit_cast(float, *(const unsigned int*)(gg3 + 4));
-        unsigned int gpk0 = *(const unsigned int*)(gg0 + 8 + boff);
-        unsigned int gpk1 = *(const unsigned int*)(gg1 + 8 + boff);
-        unsigned int gpk2 = *(const unsigned int*)(gg2 + 8 + boff);
-        unsigned int gpk3 = *(const unsigned int*)(gg3 + 8 + boff);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int gate_base = gate_row_offset + (unsigned int)g * 136u;
+#endif
+        float gsc0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg0, 0, gate_base));
+        float gzp0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg0 + 4, 4, gate_base));
+        float gsc1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg1, 136, gate_base));
+        float gzp1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg1 + 4, 140, gate_base));
+        float gsc2 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg2, 272, gate_base));
+        float gzp2 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg2 + 4, 276, gate_base));
+        float gsc3 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg3, 408, gate_base));
+        float gzp3 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg3 + 4, 412, gate_base));
+        unsigned int gpk0 = LOAD_PACKED_U32(gg0 + 8 + boff, 8, gate_base);
+        unsigned int gpk1 = LOAD_PACKED_U32(gg1 + 8 + boff, 144, gate_base);
+        unsigned int gpk2 = LOAD_PACKED_U32(gg2 + 8 + boff, 280, gate_base);
+        unsigned int gpk3 = LOAD_PACKED_U32(gg3 + 8 + boff, 416, gate_base);
 
-        const char* uu0 = up_ptr + g * 136;
-        const char* uu1 = uu0 + 136;
-        const char* uu2 = uu1 + 136;
-        const char* uu3 = uu2 + 136;
-        float usc0 = __builtin_bit_cast(float, *(const unsigned int*)(uu0));
-        float uzp0 = __builtin_bit_cast(float, *(const unsigned int*)(uu0 + 4));
-        float usc1 = __builtin_bit_cast(float, *(const unsigned int*)(uu1));
-        float uzp1 = __builtin_bit_cast(float, *(const unsigned int*)(uu1 + 4));
-        float usc2 = __builtin_bit_cast(float, *(const unsigned int*)(uu2));
-        float uzp2 = __builtin_bit_cast(float, *(const unsigned int*)(uu2 + 4));
-        float usc3 = __builtin_bit_cast(float, *(const unsigned int*)(uu3));
-        float uzp3 = __builtin_bit_cast(float, *(const unsigned int*)(uu3 + 4));
-        unsigned int upk0 = *(const unsigned int*)(uu0 + 8 + boff);
-        unsigned int upk1 = *(const unsigned int*)(uu1 + 8 + boff);
-        unsigned int upk2 = *(const unsigned int*)(uu2 + 8 + boff);
-        unsigned int upk3 = *(const unsigned int*)(uu3 + 8 + boff);
-
-        // VALU phase: cluster G0..G3 then U0..U3 (same destinations as baseline).
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        // Release the gate header registers before loading the up stream. The
+        // global-load control retains the original all-weights-ahead schedule.
         DOG_X8(gsc0, gzp0, gpk0, gacc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
         DOG_X8(gsc1, gzp1, gpk1, gacc1,
@@ -134,6 +135,39 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
                xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
         DOG_X8(gsc3, gzp3, gpk3, gacc3,
                xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
+#endif
+
+        const char* uu0 = up_ptr + g * 136;
+        const char* uu1 = uu0 + 136;
+        const char* uu2 = uu1 + 136;
+        const char* uu3 = uu2 + 136;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int up_base = up_row_offset + (unsigned int)g * 136u;
+#endif
+        float usc0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu0, 0, up_base));
+        float uzp0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu0 + 4, 4, up_base));
+        float usc1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu1, 136, up_base));
+        float uzp1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu1 + 4, 140, up_base));
+        float usc2 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu2, 272, up_base));
+        float uzp2 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu2 + 4, 276, up_base));
+        float usc3 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu3, 408, up_base));
+        float uzp3 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu3 + 4, 412, up_base));
+        unsigned int upk0 = LOAD_PACKED_U32(uu0 + 8 + boff, 8, up_base);
+        unsigned int upk1 = LOAD_PACKED_U32(uu1 + 8 + boff, 144, up_base);
+        unsigned int upk2 = LOAD_PACKED_U32(uu2 + 8 + boff, 280, up_base);
+        unsigned int upk3 = LOAD_PACKED_U32(uu3 + 8 + boff, 416, up_base);
+
+        // VALU phase: cluster G0..G3 then U0..U3 (same destinations as baseline).
+#if !HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        DOG_X8(gsc0, gzp0, gpk0, gacc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(gsc1, gzp1, gpk1, gacc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(gsc2, gzp2, gpk2, gacc2,
+               xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
+        DOG_X8(gsc3, gzp3, gpk3, gacc3,
+               xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
+#endif
 
         DOG_X8(usc0, uzp0, upk0, uacc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
@@ -150,12 +184,16 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         int base = g * 256 + tid * 8;
         const float4 xa = *reinterpret_cast<const float4*>(x + base);
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
-        float gsc = __builtin_bit_cast(float, *(const unsigned int*)(gate_ptr + g * 136));
-        float gzp = __builtin_bit_cast(float, *(const unsigned int*)(gate_ptr + g * 136 + 4));
-        unsigned int gpk = *(const unsigned int*)(gate_ptr + g * 136 + 8 + boff);
-        float usc = __builtin_bit_cast(float, *(const unsigned int*)(up_ptr + g * 136));
-        float uzp = __builtin_bit_cast(float, *(const unsigned int*)(up_ptr + g * 136 + 4));
-        unsigned int upk = *(const unsigned int*)(up_ptr + g * 136 + 8 + boff);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int goff = gate_row_offset + (unsigned int)g * 136u;
+        const unsigned int uoff = up_row_offset + (unsigned int)g * 136u;
+#endif
+        float gsc = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gate_ptr + g * 136, 0, goff));
+        float gzp = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gate_ptr + g * 136 + 4, 4, goff));
+        unsigned int gpk = LOAD_PACKED_U32(gate_ptr + g * 136 + 8 + boff, 8, goff);
+        float usc = __builtin_bit_cast(float, LOAD_UNIFORM_U32(up_ptr + g * 136, 0, uoff));
+        float uzp = __builtin_bit_cast(float, LOAD_UNIFORM_U32(up_ptr + g * 136 + 4, 4, uoff));
+        unsigned int upk = LOAD_PACKED_U32(up_ptr + g * 136 + 8 + boff, 8, uoff);
         DOG_X8(gsc, gzp, gpk, gacc0,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(usc, uzp, upk, uacc0,
@@ -166,12 +204,16 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         int base = g * 256 + tid * 8;
         const float4 xa = *reinterpret_cast<const float4*>(x + base);
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
-        float gsc = __builtin_bit_cast(float, *(const unsigned int*)(gate_ptr + g * 136));
-        float gzp = __builtin_bit_cast(float, *(const unsigned int*)(gate_ptr + g * 136 + 4));
-        unsigned int gpk = *(const unsigned int*)(gate_ptr + g * 136 + 8 + boff);
-        float usc = __builtin_bit_cast(float, *(const unsigned int*)(up_ptr + g * 136));
-        float uzp = __builtin_bit_cast(float, *(const unsigned int*)(up_ptr + g * 136 + 4));
-        unsigned int upk = *(const unsigned int*)(up_ptr + g * 136 + 8 + boff);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int goff = gate_row_offset + (unsigned int)g * 136u;
+        const unsigned int uoff = up_row_offset + (unsigned int)g * 136u;
+#endif
+        float gsc = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gate_ptr + g * 136, 0, goff));
+        float gzp = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gate_ptr + g * 136 + 4, 4, goff));
+        unsigned int gpk = LOAD_PACKED_U32(gate_ptr + g * 136 + 8 + boff, 8, goff);
+        float usc = __builtin_bit_cast(float, LOAD_UNIFORM_U32(up_ptr + g * 136, 0, uoff));
+        float uzp = __builtin_bit_cast(float, LOAD_UNIFORM_U32(up_ptr + g * 136 + 4, 4, uoff));
+        unsigned int upk = LOAD_PACKED_U32(up_ptr + g * 136 + 8 + boff, 8, uoff);
         DOG_X8(gsc, gzp, gpk, gacc1,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(usc, uzp, upk, uacc1,
@@ -182,17 +224,23 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         int base = g * 256 + tid * 8;
         const float4 xa = *reinterpret_cast<const float4*>(x + base);
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
-        float gsc = __builtin_bit_cast(float, *(const unsigned int*)(gate_ptr + g * 136));
-        float gzp = __builtin_bit_cast(float, *(const unsigned int*)(gate_ptr + g * 136 + 4));
-        unsigned int gpk = *(const unsigned int*)(gate_ptr + g * 136 + 8 + boff);
-        float usc = __builtin_bit_cast(float, *(const unsigned int*)(up_ptr + g * 136));
-        float uzp = __builtin_bit_cast(float, *(const unsigned int*)(up_ptr + g * 136 + 4));
-        unsigned int upk = *(const unsigned int*)(up_ptr + g * 136 + 8 + boff);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int goff = gate_row_offset + (unsigned int)g * 136u;
+        const unsigned int uoff = up_row_offset + (unsigned int)g * 136u;
+#endif
+        float gsc = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gate_ptr + g * 136, 0, goff));
+        float gzp = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gate_ptr + g * 136 + 4, 4, goff));
+        unsigned int gpk = LOAD_PACKED_U32(gate_ptr + g * 136 + 8 + boff, 8, goff);
+        float usc = __builtin_bit_cast(float, LOAD_UNIFORM_U32(up_ptr + g * 136, 0, uoff));
+        float uzp = __builtin_bit_cast(float, LOAD_UNIFORM_U32(up_ptr + g * 136 + 4, 4, uoff));
+        unsigned int upk = LOAD_PACKED_U32(up_ptr + g * 136 + 8 + boff, 8, uoff);
         DOG_X8(gsc, gzp, gpk, gacc2,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(usc, uzp, upk, uacc2,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
     }
+    #undef LOAD_PACKED_U32
+    #undef LOAD_UNIFORM_U32
     #undef DOG_X8
 
     float gacc = (gacc0 + gacc1) + (gacc2 + gacc3);

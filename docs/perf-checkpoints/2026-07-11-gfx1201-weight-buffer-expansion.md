@@ -55,8 +55,11 @@ repeatably improves the residual pair, so both surviving kernels ship together.
 
 ## Resource gate
 
-Both kernels use one matrix-wide SRD. This avoids the descriptor pressure that
-made the earlier MoE gate/up conversion spill private memory.
+Both kernels use one matrix-wide SRD and remain zero-scratch. This did not prove
+that descriptor count caused the earlier MoE gate/up spill: its first
+expert-wide one-SRD arm also spilled. Follow-up work localized the pressure to
+address and loaded-value lifetimes, then cleared it with scalar row/group
+offsets and separate gate/up load-consume stages.
 
 | Kernel | Global resources | Buffer-RT resources | Scratch |
 | --- | --- | --- | ---: |

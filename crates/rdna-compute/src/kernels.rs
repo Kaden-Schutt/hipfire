@@ -1245,7 +1245,11 @@ pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
 /// expert-pointers table. hipGraph-capture-safe replacement for the
 /// kernarg-pointer variant.
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip");
+    concat!(
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+    );
 
 /// NUM_ROWS register row-tile of the indexed MoE gate_up GEMV (opt-in,
 /// HIPFIRE_MOE_GATE_UP_FUSED=1). Each block owns NUM_ROWS output rows/expert,

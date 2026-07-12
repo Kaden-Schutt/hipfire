@@ -16,14 +16,29 @@ clocks, exact-output/coherence gates, and the sampled eight-turn serve harness.
    +0.61% at 8K and neutral `tg128`. Full program/resource/workgroup retention
    remains opt-in because it reduced the tape further but slightly regressed
    `tg128`.
-3. **GFX12 temporal cache policy.** Fresh-process A/B for streamed weight loads
-   versus reusable KV/scratch loads; verify the intended ISA hint changes and
-   do not rely on the unavailable GL2/GCEA counters.
-4. **Context-bucketed retained tapes.** Keep replay plans for bounded context
+3. **GFX12 temporal/cache policy (complete).** Default RT raw-buffer addressing
+   covers the zero-scratch hot HFQ4 family. The indexed MoE gate/up path uses one
+   expert-wide SRD, scalar row/group offsets, and separate gate/up load-consume
+   stages; this clears the earlier private-memory spill.
+
+### Next ordinary-AR work
+
+1. **MoE gate/up buffer RT (complete).** Zero-scratch, bit-identical, and
+   isolated to gfx1201. The corrected real-grid microbench and sampled
+   eight-turn serve battery both retain matching outputs.
+2. **Context-bucketed retained tapes.** Keep replay plans for bounded context
    ranges so flash attention does not launch the physical-capacity grid when
    most tiles would immediately return.
-5. **Attention traffic reductions.** Test 256-token FWHT tiles, then compatible
-   K/V writer fusion; retain only exact, long-context serve wins.
+3. **Suballocation-aware dependency boundaries.** Census every repeated wait
+   and distinguish real producer-consumer edges from disjoint ranges of the
+   same allocation before removing any additional per-layer boundary.
+4. **256-token FWHT attention tiles.** Test against the current long-context
+   attention path under the selected context buckets.
+5. **Compatible K/V writer fusion.** Apply only after the tile shape is chosen;
+   retain only exact long-context wins.
+6. **Multi-token retained replay (deferred).** Do not touch this during items
+   1-5. It is expected to matter more for future MTP/speculative draft-verify
+   overlap, potentially including independent lm-head work.
 
 Closed for this workload: wider queue counts, CU partitioning/priority, and
 explicit shared-LDS GQA reuse.
