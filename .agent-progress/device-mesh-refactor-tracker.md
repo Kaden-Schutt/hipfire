@@ -2,11 +2,22 @@
 
 ## Authority Rule
 
-This file is the authoritative source of current status for the device-mesh refactor. [PR #527](https://github.com/fivetide/hipfire/pull/527) mirrors the active task IDs for contributor visibility. If the PR, a handover, a task report, a design note, or any other status document disagrees with this tracker, this tracker wins. Historical documents remain evidence, not status authorities.
+This file is the authoritative source of current status for the device-mesh refactor. [PR #527](https://github.com/Kaden-Schutt/hipfire/pull/527) mirrors the active task IDs for contributor visibility. If the PR, a handover, a task report, a design note, or any other status document disagrees with this tracker, this tracker wins. Historical documents remain evidence, not status authorities.
+
+## Task ID Migration
+
+This immutable table records the sole bootstrap correction to IDs published before implementation began. The old IDs are retired aliases: they must never be reused for another task, and all current or future references must use the corrected IDs.
+
+| Initial published ID | Meaning in `7115135e` and the initial PR mirror | Corrected ID | Correction date | Correction commit |
+|---|---|---|---|---|
+| `PAR-003` | Optional TP x EP composition scope decision | `COMP-001` | 2026-07-12 | Pending |
+| `COMP-001` | Final validation and merge gate | `DOC-002` | 2026-07-12 | Pending |
+
+The alias rows are historical provenance only. They do not define active dependencies, and they must not be copied into the PR checklist when it is next synchronized. Because the correction was simultaneous, `COMP-001` has one explicit bootstrap collision: its retired `final validation and merge gate` meaning must never be reused, while the current `COMP-001` ID refers only to optional TP x EP composition. `DOC-002` is the only current final-gate ID.
 
 ## Completion Definition
 
-The refactor is complete only when every active task below is `Complete`, including all physical-hardware gates. Completion means:
+The refactor is complete only when every active task below is `complete`, including all physical-hardware gates. Completion means:
 
 - RCCL expert-parallel serving is validated for DeepSeek4 and MiniMax on distinct physical GPUs.
 - Dense PP, Qwen35 PP, and TP teardown are validated on distinct physical GPUs with correct placement, transfer, output, and bounded post-unload VRAM.
@@ -35,7 +46,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### HW-001 DeepSeek4 RCCL EP Validation
 
-- **Status:** Blocked
+- **Status:** blocked
 - **Dependencies:** STEP-002
 - **Goal:** Validate the production RCCL expert-parallel path for DeepSeek4 without the peer-all-reduce fallback.
 - **Acceptance criteria:** Pin the DeepSeek4 model artifact SHA-256 and prompt-file MD5 before testing; capture the existing peer-all-reduce `ep_decode_parity` committed-token hash as the oracle; on at least two distinct GPUs, the RCCL run must produce the identical committed-token hash, pass the same multi-turn assertions, complete four load/generate/reset/unload cycles without hangs or invalid access, and return each GPU to within 64 MiB of its post-first-unload baseline with no monotonic growth across cycles 2-4.
@@ -45,7 +56,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### HW-002 MiniMax RCCL EP Validation
 
-- **Status:** Blocked
+- **Status:** blocked
 - **Dependencies:** STEP-002
 - **Goal:** Validate the production RCCL expert-parallel path for MiniMax without the peer-all-reduce fallback.
 - **Acceptance criteria:** Pin the MiniMax model artifact SHA-256 and deterministic prompt-file MD5 before testing; capture the emulated/peer EP committed-token hashes for cold prefill, LCP reuse, and the Tokyo-then-Germany multi-turn fixture as oracles; RCCL on at least two distinct GPUs must match every hash, complete four load/generate/unload cycles, and return each GPU to within 64 MiB of its post-first-unload baseline with no monotonic growth across cycles 2-4.
@@ -55,7 +66,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### HW-003 Physical Dense PP Validation
 
-- **Status:** Blocked
+- **Status:** blocked
 - **Dependencies:** None
 - **Goal:** Prove dense pipeline placement and boundary transfer on physically separate devices.
 - **Acceptance criteria:** Using `qwen3-0.6b-llama.mq4` in `llama_store_pp`, PP=2 must preserve the established single-device oracle of `max |delta| = 0` across logits; the 28 layers must remain banded 14/14 with embed on stage 0 and output norm/lm_head on stage 1; allocation inspection must show no stage-owned weight page on the wrong GPU; four load/forward/unload cycles must return each GPU to within 64 MiB of its post-first-unload baseline with no monotonic growth across cycles 2-4.
@@ -65,7 +76,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### HW-004 Physical Qwen35 PP Validation
 
-- **Status:** Blocked
+- **Status:** blocked
 - **Dependencies:** GEN-001
 - **Goal:** Prove Qwen35 arch-resident pipeline execution and teardown on physically separate devices.
 - **Acceptance criteria:** Before the physical run, pin the Qwen35 model SHA-256 and prompt-file MD5 and capture single-device committed-token hashes for cold generation and a two-turn recurrent-reset fixture; PP=2 on distinct GPUs must match both hashes, place every hybrid attention/recurrent weight and state allocation on its assigned stage, use the peer boundary path, and return each GPU to within 64 MiB of its post-first-unload baseline after four cycles with no monotonic growth across cycles 2-4.
@@ -75,7 +86,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### HW-005 Physical TP Teardown Validation
 
-- **Status:** Blocked
+- **Status:** blocked
 - **Dependencies:** None
 - **Goal:** Confirm TP teardown frees allocations, pools, streams, and communicator resources on real multi-GPU hardware.
 - **Acceptance criteria:** Pin the TP-capable model SHA-256 and prompt-file MD5 and capture its single-device committed-token hash before testing; at least four TP=2 load/generate/unload cycles on distinct GPUs must reproduce that hash, leave no live model stream or communicator after unload, return each GPU to within 64 MiB of its post-first-unload baseline, and show no monotonic VRAM growth across cycles 2-4.
@@ -85,7 +96,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### COR-001 Wire `mtp_k` Metadata
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** None
 - **Goal:** Make the configured/load-message `mtp_k` value the deliberate source used by generation, or remove the unsupported knob rather than silently ignoring it.
 - **Acceptance criteria:** `ModelMeta` receives the configured value exactly once; native/spec generation reads that value with documented environment precedence; no stale flat field or self-assignment remains; CLI metadata exposes the setting; tests cover default, configured, and environment-override behavior.
@@ -95,7 +106,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### COR-002 Make Reset Total
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** COR-004
 - **Goal:** Define and implement the single authoritative reset contract: request-owned state is cleared by `SessionState`, architecture-owned state is reset through exhaustive dispatch, and speculative state is reset by the same entry point.
 - **Acceptance criteria:** One reset entry point and ownership contract cover abort, overflow, reset command, normal completion, VL, single, PP, TP, EP, speculative, recurrent, and conv state; adding a model-state variant cannot silently omit its reset arm. Integration tasks do not redefine reset semantics: they only implement their architecture adapter and prove conformance to COR-002.
@@ -105,7 +116,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### COR-003 Finalize Parser On Pending EOS
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** None
 - **Goal:** Ensure EOS and request termination always finalize buffered parser output exactly once.
 - **Acceptance criteria:** Every stop mode invokes parser finalization when bytes, reasoning markers, tool-call fragments, or forced tokens remain pending; injected EOS semantics remain pre-commit where required; no output is duplicated, dropped, or leaked across turns.
@@ -115,7 +126,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### COR-004 Decide Eviction Ownership
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** None
 - **Goal:** Decide and enforce whether eviction is resettable request state in `SessionState` or persistent/model-owned state.
 - **Acceptance criteria:** The ownership decision is documented with lifecycle rationale; the field is moved or explicitly retained accordingly; reset, reuse, and speculative commit semantics follow that decision; tests prevent cross-request eviction bleed and accidental loss of intentionally persistent state.
@@ -125,7 +136,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### GEN-001 Complete Qwen35 Arch-Resident PP
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** COR-002, STEP-001, STEP-003
 - **Goal:** Complete Qwen35 PP through the arch-resident `ModelParallel::Pp(PipelineImpl::ArchResident)` path for hybrid attention and DeltaNet layers.
 - **Acceptance criteria:** Load, prefill, decode, recurrent/conv state, sampling, and unload use the generic PP ownership and stage interfaces; the Qwen35 adapter implements the COR-002 reset contract without creating a second reset authority; no legacy `pp`/`pp_gpus` side channel or duplicate Qwen35 PP loop remains; emulated PP parity is byte- or token-identical before physical validation.
@@ -135,7 +146,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### GEN-002 Add DeepSeek4 Single-GPU Fallback
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** COR-002
 - **Goal:** Provide an ordinary single-GPU DeepSeek4 generation path when EP is not selected or available.
 - **Acceptance criteria:** DeepSeek4 selects a single-device ArchDispatch/AR path without constructing EP state; DSML grammar/parser behavior matches the EP path; its adapter implements and proves the COR-002 reset contract; deterministic output, tool calls, and unload are coherent; unsupported model sizes fail explicitly on insufficient VRAM.
@@ -145,7 +156,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### SPEC-001 Unify AR And Speculative Orchestration
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** COR-001, COR-002, COR-003
 - **Goal:** Share request framing, reset, prefill, parser, streaming, accounting, and finalization above AR and speculative strategies.
 - **Acceptance criteria:** AR and speculative/MTP execution are strategies under one request lifecycle; accepted-token commit semantics remain strategy-specific; duplicate request orchestration is removed; Qwen35's RAII spec-target guard is represented safely; `ArchDispatch::as_spec_target` is either implemented with a fitting contract or deleted with all dead scaffolding and TODOs removed; strategy adapters conform to COR-002 rather than owning reset semantics.
@@ -155,7 +166,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### SPEC-002 Native Qwen MTP
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** COR-001, SPEC-001
 - **Goal:** Integrate native Qwen MTP as a first-class speculative strategy using model metadata and the shared lifecycle.
 - **Acceptance criteria:** Native Qwen MTP loads only when compatible weights are present; uses configured `mtp_mode` and `mtp_k`; commits only accepted target tokens; falls back explicitly to AR when disabled or unavailable; its adapter implements the COR-002 contract for all MTP scratch/state; quality and performance reporting uses fixed fixtures.
@@ -165,7 +176,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### VL-001 Adopt Shared Lifecycle For Qwen35-VL
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** COR-002, COR-003
 - **Goal:** Route Qwen35-VL post-prefill AR generation through the shared request lifecycle while preserving image-conditioned prefill.
 - **Acceptance criteria:** This task is AR-only: vision preprocessing and multimodal prefill remain architecture-owned; post-prefill AR parsing, accounting, COR-002 reset conformance, and finalization use shared orchestration; image state cannot bleed across requests; text-only Qwen35 behavior is unchanged. VL target/draft or native-MTP speculation is out of scope until a model-specific quality fixture exists and must be added as a separate SPEC/VL follow-up depending on SPEC-001.
@@ -175,7 +186,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### VL-002 Adopt Shared Lifecycle For dots.ocr
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** COR-002, COR-003, SPEC-001
 - **Goal:** Route dots.ocr post-image-prefill AR and existing model-free n-gram decoding through the shared request lifecycle without changing its custom framing or vision tower.
 - **Acceptance criteria:** Image encoding and custom prompt framing remain dots.ocr-owned; post-prefill AR and existing n-gram selection, parser finalization, accounting, COR-002 reset conformance, and unload use shared orchestration; OCR output preserves the canonical fixture quality; image state is request-local. Target/draft and native-MTP VL speculation are out of scope and require a separate follow-up with a dots.ocr quality oracle.
@@ -185,7 +196,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### STEP-001 Adopt Step/Manifest For DeltaNet
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** None
 - **Goal:** Represent Qwen35 DeltaNet weights, state, and forward execution through manifests and the Step spine.
 - **Acceptance criteria:** The Qwen35 weight manifest covers layer-type-specific fused projections, norms, convolution, recurrent parameters, and dense/MoE variants; placement derives from policy; DeltaNet forward emits/executes Steps without a parallel bespoke layer loop; single-device output remains identical.
@@ -195,7 +206,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### STEP-002 Adopt Step/Manifest For MoE
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** PAR-001
 - **Goal:** Fold routed-expert execution and its EP collectives into the common Step/manifest path.
 - **Acceptance criteria:** Expert ownership, compact shard layout, routing, zero/dummy handling, and collective hints derive from the manifest/mesh; DeepSeek4, MiniMax, and Qwen35 MoE variants no longer require an independent executor; single and already-supported EP behavior preserve accepted output. This task adopts existing architecture forwards and does not add a new PP/TP/EP support cell.
@@ -205,7 +216,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### STEP-003 Adopt Step/Manifest For Recurrent And Conv State
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** COR-002, STEP-001
 - **Goal:** Represent recurrent and convolution operations/state in Step execution with mesh-aware placement and reset.
 - **Acceptance criteria:** Recurrent and conv state manifests encode layer ownership; Step execution handles prefill/decode state updates on the owning stage/device; boundary movement is explicit; the adapter implements the COR-002 reset contract; bespoke recurrent/conv forward loops are removed after parity.
@@ -215,7 +226,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### STEP-004 Migrate Remaining Forward Paths
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** STEP-001, STEP-002, STEP-003, PAR-001
 - **Goal:** Adopt Step/manifest for every remaining architecture forward path that already has a supported Single/PP/TP/EP cell, or record a justified non-decoder exception.
 - **Acceptance criteria:** An inventory names every architecture and forward entry point; existing supported decoder paths use Step/manifest; encode-only or vision-only exceptions have explicit boundaries and ownership; obsolete executors and duplicate placement logic are deleted; each migration has parity evidence. This task does not create support for a new parallel axis; PAR-002 owns those implementations.
@@ -225,7 +236,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### PAR-001 Decide Model-Family PP/TP/EP Support
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** None
 - **Goal:** Define the supported parallel axes and explicit refusal behavior for every registered model family.
 - **Acceptance criteria:** A maintained matrix covers Single, PP, TP, and EP for every family; each cell is supported, planned with a task dependency, or explicitly unsupported with a technical reason; runtime selection and errors enforce the matrix; tests prevent accidental claims or silent fallback.
@@ -235,7 +246,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### PAR-002 Implement Required Additional PP/TP/EP Paths
 
-- **Status:** Blocked
+- **Status:** blocked
 - **Dependencies:** COR-002, PAR-001, STEP-004
 - **Goal:** Implement only the new model-family PP/TP/EP support cells that PAR-001 marks required for this refactor.
 - **Acceptance criteria:** Every newly required matrix cell has mesh-derived placement, reuses the architecture's STEP-004-adopted forward path, implements the COR-002 reset contract, covers lifecycle/unload and explicit unsupported combinations, and has deterministic parity. Architecture-forward migration itself remains STEP-004 scope.
@@ -243,39 +254,39 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 - **Hardware:** Determined by the new cells in PAR-001; physical multi-GPU closure is mandatory for production support.
 - **Evidence:** Pending
 
-### PAR-003 Gate Optional TP x EP Composition
+### COMP-001 Gate Optional TP x EP Composition
 
-- **Status:** Ready
+- **Status:** ready
 - **Dependencies:** None
 - **Goal:** Make an unconditional scope decision for TP x EP composition in this refactor.
-- **Acceptance criteria:** Record one decision: either TP x EP is out of scope and `TP>1 && EP>1` is explicitly rejected, or a concrete deployment requirement names the model, topology, owner, and measurable success target. In the latter case, create a new conditional PAR task for design/implementation/physical validation; PAR-003 itself completes when the decision and refusal-or-follow-up are recorded and never waits on implementation or hardware.
+- **Acceptance criteria:** Record one decision: either TP x EP is out of scope and `TP>1 && EP>1` is explicitly rejected, or a concrete deployment requirement names the model, topology, owner, and measurable success target. In the latter case, create a new conditional COMP task for design/implementation/physical validation; COMP-001 itself completes when the decision and refusal-or-follow-up are recorded and never waits on implementation or hardware.
 - **Validation:** Review the requirement record and support matrix; for the out-of-scope decision, run configuration/refusal tests; for the required decision, verify the new follow-up ID exists with dependencies and acceptance criteria.
 - **Hardware:** None
 - **Evidence:** Pending
 
 ### DOC-001 Consolidate Stale Status Documentation
 
-- **Status:** Ready
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Prevent historical device-mesh reports from presenting stale plans as current status.
-- **Acceptance criteria:** The stale handover/status/phase, follow-up, review, pivot, ArchDispatch, god-struct, and SDD progress documents named in `docs/superpowers/specs/2026-07-12-device-mesh-tracking-design.md` carry an appropriate superseded or chronological-evidence notice linking here; historical evidence is preserved; conclusively closed findings are labeled accurately.
-- **Validation:** Search the named documents for unqualified authority/current-status claims; verify every notice links to this file; inspect the diff to confirm no forensic history was deleted or rewritten.
+- **Acceptance criteria:** Complete: every stale handover/status/phase, follow-up, review, pivot, ArchDispatch, god-struct, and SDD progress document named in `docs/superpowers/specs/2026-07-12-device-mesh-tracking-design.md` carries an appropriate superseded or chronological-evidence notice linking here; historical evidence remains preserved; conclusively closed findings are labeled accurately.
+- **Validation:** Complete in `7115135e`: all named documents were checked for authority links and stale current-status claims; the focused diff preserved forensic history while adding banners and status corrections.
 - **Hardware:** None
-- **Evidence:** Pending
+- **Evidence:** `7115135e` (`docs(device-mesh): establish canonical completion tracker`); acceptance checks completed in the committed documentation diff.
 
-### COMP-001 Final Validation And Merge Gate
+### DOC-002 Final Validation And Merge Gate
 
-- **Status:** Blocked
-- **Dependencies:** HW-001, HW-002, HW-003, HW-004, HW-005, COR-001, COR-002, COR-003, COR-004, GEN-001, GEN-002, SPEC-001, SPEC-002, VL-001, VL-002, STEP-001, STEP-002, STEP-003, STEP-004, PAR-001, PAR-002, PAR-003, DOC-001
+- **Status:** blocked
+- **Dependencies:** HW-001, HW-002, HW-003, HW-004, HW-005, COR-001, COR-002, COR-003, COR-004, GEN-001, GEN-002, SPEC-001, SPEC-002, VL-001, VL-002, STEP-001, STEP-002, STEP-003, STEP-004, PAR-001, PAR-002, COMP-001, DOC-001
 - **Goal:** Establish that the completed refactor is correct, production-honest, documented, and ready to merge.
-- **Acceptance criteria:** Every listed dependency and every conditional follow-up created by PAR-003 is `Complete` with evidence; every row in the Final Validation Matrix passes against its named fixture/oracle; HW-001 through HW-005 meet the 64 MiB/no-monotonic-growth thresholds; no stale active checklist conflicts with this tracker; PR #527 mirrors all IDs, required CI checks pass, and no blocking review finding remains.
+- **Acceptance criteria:** Every listed dependency and every conditional follow-up created by COMP-001 is `complete` with evidence; every row in the Final Validation Matrix passes against its named fixture/oracle; HW-001 through HW-005 meet the 64 MiB/no-monotonic-growth thresholds; no stale active checklist conflicts with this tracker; PR #527 mirrors all IDs, required CI checks pass, and no blocking review finding remains.
 - **Validation:** Execute and archive every row in the Final Validation Matrix, rerun tracker schema and documentation-link checks, inspect the final branch diff and PR checks/reviews, and attach the physical PP/TP/EP reports with artifact/prompt digests and per-cycle VRAM.
 - **Hardware:** The union of hardware required by HW-001 through HW-005 and each supported model-family validation cell.
 - **Evidence:** Pending
 
 ## Final Validation Matrix
 
-COMP-001 cannot complete from a generic “tests pass” statement. Its evidence must enumerate these rows with exact command, commit, fixture digest, result, and report path:
+DOC-002 cannot complete from a generic “tests pass” statement. Its evidence must enumerate these rows with exact command, commit, fixture digest, result, and report path:
 
 | Area | Required fixture or oracle | Pass condition |
 |---|---|---|
@@ -300,8 +311,8 @@ COMP-001 cannot complete from a generic “tests pass” statement. Its evidence
 3. COR-004 feeds COR-002; COR-001 through COR-003 feed SPEC-001; SPEC-001 feeds SPEC-002 and VL-002 only. VL-001 depends only on COR-002 and COR-003.
 4. STEP-001 feeds STEP-003; PAR-001 feeds STEP-002; STEP-001, STEP-002, STEP-003, and PAR-001 feed STEP-004.
 5. COR-002 plus STEP-001/STEP-003 feed GEN-001; GEN-001 feeds physical Qwen35 validation HW-004.
-6. PAR-001 and STEP-004 define PAR-002. PAR-003 independently decides TP x EP scope; if required, it creates a conditional implementation follow-up with its own dependencies.
-7. COMP-001 is the only final closure task and cannot complete while any dependency is open.
+6. PAR-001 and STEP-004 define PAR-002. COMP-001 independently decides TP x EP scope; if required, it creates a conditional COMP implementation follow-up with its own dependencies.
+7. DOC-002 is the only final closure task and cannot complete while any dependency is open.
 
 ## Parallel Streams
 
@@ -314,9 +325,9 @@ COMP-001 cannot complete from a generic “tests pass” statement. Its evidence
 
 ## Update Protocol
 
-1. Keep task IDs stable and unique. Add a new prefixed ID rather than renumbering existing tasks.
-2. Before implementation, set only the selected task to `In Progress`; record a newly discovered blocker or follow-up immediately.
-3. Do not set `Complete` until every acceptance criterion and validation item passes. Emulation never closes a physical-hardware criterion.
+1. After the one-time bootstrap correction recorded in the immutable Task ID Migration table, task IDs must never be renamed, renumbered, or reused. Add a new stable prefixed ID for newly discovered work.
+2. Before implementation, set only the selected task to `in progress`; record a newly discovered blocker or follow-up immediately.
+3. Do not set `complete` until every acceptance criterion and validation item passes. Emulation never closes a physical-hardware criterion.
 4. Replace `Evidence: Pending` with commit hashes, exact commands/results, hardware topology, GPU architecture, ROCm/RCCL versions, and artifact/report links as applicable. Use `None` only when evidence or a field genuinely does not apply.
 5. Update this tracker in the same change that alters task status. After pushing, synchronize the matching checklist IDs in PR #527.
 6. If the PR and tracker diverge, correct the PR mirror; never edit historical evidence to manufacture agreement.

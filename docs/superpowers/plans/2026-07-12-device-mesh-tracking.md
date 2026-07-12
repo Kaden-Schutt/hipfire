@@ -31,7 +31,7 @@
 
 - [ ] **Step 1: Write the tracker header and authority rule**
 
-Add a current-status header naming this file as authoritative, linking PR #527, and stating that committed tracker state wins on divergence.
+Add a current-status header naming this file as authoritative, linking [PR #527](https://github.com/Kaden-Schutt/hipfire/pull/527), and stating that committed tracker state wins on divergence.
 
 - [ ] **Step 2: Record completed foundations as evidence**
 
@@ -49,13 +49,17 @@ SPEC shared AR/speculative request lifecycle
 VL   multimodal lifecycle
 STEP Step/manifest architecture adoption
 PAR  additional parallel architecture support
-COMP optional composed topology
-DOC  documentation and merge readiness
+COMP optional composed-topology scope decisions and conditional implementation
+DOC  documentation cleanup, final validation, and merge readiness
 ```
+
+Keep optional TP x EP composition under `COMP-*`. Keep documentation cleanup and the final completion/merge gate under `DOC-*`; do not use `PAR-*` for composition or `COMP-*` for final completion.
+
+The tracker contains one immutable bootstrap migration table because `7115135e` and the initial PR mirror published `PAR-003` for optional TP x EP composition and `COMP-001` for the final gate before implementation began. Their corrected IDs are `COMP-001` and `DOC-002`; the old ID-to-meaning mappings are retired aliases that must never be reused, and IDs must not be renamed after this recorded correction. The simultaneous correction creates one documented token collision: current `COMP-001` means optional composition only, while final completion is exclusively `DOC-002`.
 
 - [ ] **Step 4: Add complete task contracts**
 
-For every active task include status, dependencies, goal, acceptance criteria, validation commands, hardware requirements, and evidence. Initialize unfinished evidence fields to `Pending`. Use `None` where a dependency or hardware requirement does not exist; do not omit fields.
+For every active task include status, dependencies, goal, acceptance criteria, validation commands, hardware requirements, and evidence. Status must be exactly one lowercase schema value: `blocked`, `ready`, `in progress`, or `complete`. Initialize unfinished evidence fields to `Pending`. Use `None` where a dependency or hardware requirement does not exist; do not omit fields.
 
 - [ ] **Step 5: Add dependency order and update protocol**
 
@@ -70,7 +74,7 @@ rg -n '^### [A-Z]+-[0-9]+' .agent-progress/device-mesh-refactor-tracker.md
 rg -n 'Status:|Dependencies:|Acceptance criteria:|Validation:|Hardware:|Evidence:' .agent-progress/device-mesh-refactor-tracker.md
 ```
 
-Expected: every task ID appears once and every task has all six contract fields.
+Expected: every task ID appears once, every task has all seven contract fields, and every status matches the lowercase schema.
 
 ### Task 2: Archive Stale Top-Level Status Documents
 
