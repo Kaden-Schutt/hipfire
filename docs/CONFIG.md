@@ -80,15 +80,16 @@ behavior exactly.
 | `dflash_mode` | off | on / off / auto | Draft-model speculation. `auto` enables on dense Qwen 3.5+ and skips configs known to lose (e.g. A3B without a sidecar). |
 | `dflash_adaptive_b` | true | true / false | Adaptive draft block size. |
 | `dflash_ngram_block` | auto | true / false / auto | n-gram cache prefilling (DFlash verify-path defense). |
-| `mtp_mode` | auto | off / on / auto | Built-in Multi-Token-Prediction head. `auto` enables when MTP weights are present — **DeepSeek V4 (arch_id=9)** only. (qwen3.5 `.mq4-mtp` MTP is gated separately by the `HIPFIRE_QWEN35_MTP=1` env var, not by `mtp_mode`/`speculation`.) |
-| `mtp_k` | 3 | 1–10 | MTP draft tokens per window. |
+| `mtp_mode` | auto | off / on / auto | Load-time MTP eligibility. DeepSeek V4 uses its in-weights MTP path. Qwen native MTP is disabled pending SPEC-003: `off` and `auto` stay AR-only without inspecting a head; `on` rejects the Qwen load before head preflight, head open, or GPU upload. |
+| `mtp_k` | 3 | 1–8 | MTP draft tokens per window. |
 | `ngram_mode` | off | off / on / auto | Model-free n-gram drafter — **byte-identical to AR** (no draft weights). `on` joins the auto cascade (lowest priority); `auto` = last-resort. |
 | `ngram_k` | 12 | 2–32 | n-gram draft window K. Acceptance saturates ~12. |
 | `ngram_min_count` | 2 | 1–10 | Min n-gram match count before proposing. |
 
 **Which to use.** DFlash is genre-conditional: large win on code, modest on
-instruct, can be a net loss on prose (see [BENCHMARKS.md](BENCHMARKS.md)). MTP
-needs a model that ships an MTP head. n-gram needs nothing and never changes the
+instruct, can be a net loss on prose (see [BENCHMARKS.md](BENCHMARKS.md)). DeepSeek
+V4 MTP needs in-weights MTP support; Qwen native MTP is unavailable pending
+SPEC-003. n-gram needs nothing and never changes the
 output — it just speeds up high-repetition workloads (verbatim copy,
 long-context retrieval, structured output) and is a wash-to-slight-loss on prose.
 
@@ -107,9 +108,15 @@ hipfire run qwen3.5:9b --spec ngram --draft-max 16 "..."      # window of active
 ```
 
 Legacy env vars `HIPFIRE_NGRAM_DRAFT` / `HIPFIRE_NGRAM_DRAFT_K` /
-`HIPFIRE_NGRAM_MIN_COUNT` (n-gram) and `HIPFIRE_DEEPSEEK4_SPEC_DECODE` /
-`HIPFIRE_DEEPSEEK4_SPEC_K` (MTP) continue to work and, like all env vars, sit at
-the **top** of the ladder.
+`HIPFIRE_NGRAM_MIN_COUNT` (n-gram) continue to work. MTP K resolves as
+`HIPFIRE_MTP_K` → `--draft-max` → per-model config → global config → `3`.
+At daemon model-load time, direct `HIPFIRE_MTP_K` overrides a request `params.mtp_k`
+and direct `HIPFIRE_MTP_MODE` overrides `params.mtp_mode`. DeepSeek (arch 9) also
+honors its legacy `HIPFIRE_DEEPSEEK4_SPEC_K` direct-daemon override; non-DeepSeek
+models ignore it. Qwen `mtp_mode=on` is explicitly rejected pending SPEC-003; Qwen
+`auto` and `off` do not inspect or load a native MTP head and use AR. Generation uses
+only the resulting immutable model metadata; it does not re-read MTP eligibility
+environment variables. Sampling controls are request parameters.
 
 ## Attention
 

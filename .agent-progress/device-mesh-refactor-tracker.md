@@ -96,13 +96,14 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### COR-001 Wire `mtp_k` Metadata
 
-- **Status:** ready
+- **Status:** in progress
 - **Dependencies:** None
 - **Goal:** Make the configured/load-message `mtp_k` value the deliberate source used by generation, or remove the unsupported knob rather than silently ignoring it.
 - **Acceptance criteria:** `ModelMeta` receives the configured value exactly once; native/spec generation reads that value with documented environment precedence; no stale flat field or self-assignment remains; CLI metadata exposes the setting; tests cover default, configured, and environment-override behavior.
 - **Validation:** Run targeted Rust metadata/generation tests, `cli/config_meta.test.ts`, and searches proving generation no longer bypasses `meta.mtp_k`.
 - **Hardware:** None
-- **Evidence:** Pending
+- **Completion blockers:** Run `nix develop --command ./scripts/coherence-gate-deepseek4-mtp.sh` against the available DeepSeek V4 target/add-on fixture; archive its report and confirm the K=2 and K=3 runs consume the load-resolved metadata rather than a generation-time environment read. CI-scoped formatting passes through `scripts/ci-rustfmt-changed.sh`, but the required workspace `cargo clippy --all-targets -- -D warnings` gate fails on pre-existing lint debt in untouched crates; resolve that baseline or approve a scoped validation exception before committing.
+- **Evidence:** In progress: `bun test cli/mtp_k_config.test.ts` (10 passed), `bun test cli/config_meta.test.ts` (1 passed), `nix develop --command bash -lc 'cargo test -p hipfire-loader --lib --locked && cargo test -p hipfire-runtime --example daemon mtp_k_tests --locked'` (13 loader and 15 daemon tests passed), and `nix develop --command ./scripts/coherence-gate-dflash.sh` passed with no hard errors (`/tmp/coherence-dflash-20260713-105546.md`).
 
 ### COR-002 Make Reset Total
 
@@ -173,6 +174,16 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 - **Validation:** Run MTP-off/auto/on selection tests, deterministic acceptance/accounting tests, AR fallback, COR-002 reset conformance, unload loops, coherence gate, and fixed-prompt performance measurements with prompt and binary hashes.
 - **Hardware:** A supported AMD GPU with a Qwen model containing native MTP weights.
 - **Evidence:** Pending
+
+### SPEC-003 Transactional Qwen MTP Loading And Allocation Safety
+
+- **Status:** deferred
+- **Dependencies:** COR-001
+- **Goal:** Make native Qwen MTP loading and per-request scratch allocation transactional, so malformed or incompatible heads and every fallible allocation path return a normal error without leaking GPU memory, panicking, or silently changing serving behavior.
+- **Acceptance criteria:** Head preflight validates actual on-disk payload length, metadata, GQA geometry, vocab-map bounds, trunk/head compatibility, supported dense and MoE tensor layouts, and reports errors without panics; `mtp_mode=on` is rejected explicitly on unsupported Qwen load paths while `auto` remains AR-only; one native head has one GPU owner; all fallible steps after trunk/head/vision/CASK allocation and all MTP scratch allocations roll back every owned GPU tensor on error; no direct allocation relies on `Drop`; fixed failure-injection tests prove every staged resource is explicitly freed; MTP-off/auto/on policy and the 1..8 K range are consistent across CLI, TUI, loader, and documentation.
+- **Validation:** Run CPU malformed-container, physical-truncation, GQA/vocab-map, head/trunk mismatch, dense/MoE preflight, and staged rollback tests; run MTP-off/auto/on tests for single, PP, and safetensors routes; run GPU fault-injection for head upload, CASK/vision post-head setup, and MTP scratch allocation while checking VRAM before/after; run repeated load/generate/unload cycles plus coherence and multi-turn reset tests on a fixed native-MTP fixture.
+- **Hardware:** A supported AMD GPU with a native-MTP Qwen fixture; CPU tests cover preflight and staged-owner contracts.
+- **Evidence:** Deferred by priority decision on 2026-07-13. Native Qwen MTP allocation safety predates the device-mesh work; COR-001 metadata wiring exposed it but did not introduce it. The task remains mandatory before final merge, but does not block higher-priority lifecycle, mesh, and architecture work.
 
 ### VL-001 Adopt Shared Lifecycle For Qwen35-VL
 
@@ -277,7 +288,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 ### DOC-002 Final Validation And Merge Gate
 
 - **Status:** blocked
-- **Dependencies:** HW-001, HW-002, HW-003, HW-004, HW-005, COR-001, COR-002, COR-003, COR-004, GEN-001, GEN-002, SPEC-001, SPEC-002, VL-001, VL-002, STEP-001, STEP-002, STEP-003, STEP-004, PAR-001, PAR-002, COMP-001, DOC-001
+- **Dependencies:** HW-001, HW-002, HW-003, HW-004, HW-005, COR-001, COR-002, COR-003, COR-004, GEN-001, GEN-002, SPEC-001, SPEC-002, SPEC-003, VL-001, VL-002, STEP-001, STEP-002, STEP-003, STEP-004, PAR-001, PAR-002, COMP-001, DOC-001
 - **Goal:** Establish that the completed refactor is correct, production-honest, documented, and ready to merge.
 - **Acceptance criteria:** Every listed dependency and every conditional follow-up created by COMP-001 is `complete` with evidence; every row in the Final Validation Matrix passes against its named fixture/oracle; HW-001 through HW-005 meet the 64 MiB/no-monotonic-growth thresholds; no stale active checklist conflicts with this tracker; PR #527 mirrors all IDs, required CI checks pass, and no blocking review finding remains.
 - **Validation:** Execute and archive every row in the Final Validation Matrix, rerun tracker schema and documentation-link checks, inspect the final branch diff and PR checks/reviews, and attach the physical PP/TP/EP reports with artifact/prompt digests and per-cycle VRAM.
@@ -308,7 +319,7 @@ DOC-002 cannot complete from a generic “tests pass” statement. Its evidence 
 
 1. HW-003 and HW-005 can start immediately when suitable machines are available; HW-001 and HW-002 wait for STEP-002 so physical RCCL validation exercises the final Step/manifest EP path; HW-004 waits for GEN-001.
 2. COR-001, COR-003, COR-004, PAR-001, STEP-001, and DOC-001 are independent starting points.
-3. COR-004 feeds COR-002; COR-001 through COR-003 feed SPEC-001; SPEC-001 feeds SPEC-002 and VL-002 only. VL-001 depends only on COR-002 and COR-003.
+3. COR-004 feeds COR-002; COR-001 through COR-003 feed SPEC-001; SPEC-001 feeds SPEC-002; VL-001 depends only on COR-002 and COR-003. SPEC-003 is deferred until final closure and blocks DOC-002 only.
 4. STEP-001 feeds STEP-003; PAR-001 feeds STEP-002; STEP-001, STEP-002, STEP-003, and PAR-001 feed STEP-004.
 5. COR-002 plus STEP-001/STEP-003 feed GEN-001; GEN-001 feeds physical Qwen35 validation HW-004.
 6. PAR-001 and STEP-004 define PAR-002. COMP-001 independently decides TP x EP scope; if required, it creates a conditional COMP implementation follow-up with its own dependencies.
@@ -318,7 +329,7 @@ DOC-002 cannot complete from a generic “tests pass” statement. Its evidence 
 
 - **Physical validation:** HW-003 and HW-005 can run independently; HW-001 and HW-002 follow STEP-002; HW-004 follows GEN-001.
 - **Correctness ownership:** COR-001, COR-003, and COR-004 initially; COR-002 follows the eviction decision.
-- **Generation/spec:** GEN-002 can proceed alongside SPEC-001; SPEC-002 follows metadata and shared orchestration.
+- **Generation/spec:** GEN-002 can proceed alongside SPEC-001; SPEC-002 follows metadata and shared orchestration. SPEC-003 is deferred to final closure.
 - **Multimodal:** VL-001 follows only COR-002/COR-003 and can proceed independently of SPEC-001; VL-002 waits for SPEC-001 because it adopts the existing n-gram strategy through shared speculative orchestration.
 - **Execution/placement:** STEP-001 and PAR-001 can start together; STEP-002 and STEP-003 then proceed largely independently before STEP-004.
 - **Documentation:** DOC-001 can proceed without runtime or hardware work.

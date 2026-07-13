@@ -7,8 +7,8 @@
 use crate::spec_build::Qwen35SlotGuard;
 use crate::Carrier;
 use crate::{
-    finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
-    ModelState,
+    finish_qwen35_load, reject_qwen_native_mtp, resolve_chat_template,
+    resolve_chat_template_overrides, LoadedModel, ModelState,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
@@ -137,14 +137,8 @@ impl Carrier for Qwen2Carrier {
         // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). Qwen2
         // (arch_id=7, e.g. VibeThinker) impls `SpecTarget`, so it can be driven by
         // the arch-generic spec loop with no draft model. `None` ⇒ AR-only.
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(ModelState::Qwen2(bundle)),
             speculator,
@@ -155,6 +149,8 @@ impl Carrier for Qwen2Carrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                ctx.mtp_mode,
+                ctx.mtp_k,
             )
         })
     }
@@ -287,6 +283,8 @@ fn load_qwen35_pp(
             ctx.max_seq,
             ctx.path.to_string(),
             meta.chat_template,
+            ctx.mtp_mode,
+            ctx.mtp_k,
             gpus,
         )
     })
@@ -317,6 +315,7 @@ impl Carrier for Qwen35Carrier {
         matches!(arch_id, 5 | 6)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        reject_qwen_native_mtp(ctx.mtp_mode)?;
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
         if ctx.pp > 1 {
@@ -476,6 +475,8 @@ impl Carrier for Qwen35Carrier {
                         ctx.max_seq,
                         ctx.path.to_string(),
                         meta.chat_template,
+                        ctx.mtp_mode,
+                        ctx.mtp_k,
                     )
                 })
             }
@@ -749,7 +750,6 @@ impl Carrier for LlamaCarrier {
                     crate::spec_build::build_speculator(
                         meta.arch_id,
                         None,
-                        None,
                         true,
                         ctx.max_seq,
                         ctx.spec,
@@ -763,7 +763,6 @@ impl Carrier for LlamaCarrier {
                     crate::spec_build::build_speculator(
                         meta.arch_id,
                         None,
-                        None,
                         true,
                         ctx.max_seq,
                         ctx.spec,
@@ -772,14 +771,7 @@ impl Carrier for LlamaCarrier {
             }
         } else {
             // No draft configured: opt-in model-free n-gram (HIPFIRE_NGRAM_DRAFT=1) or None.
-            crate::spec_build::build_speculator(
-                meta.arch_id,
-                None,
-                None,
-                true,
-                ctx.max_seq,
-                ctx.spec,
-            )
+            crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq, ctx.spec)
         };
         Ok(LoadedModel {
             state: Some(ModelState::Llama(bundle)),
@@ -791,6 +783,8 @@ impl Carrier for LlamaCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                ctx.mtp_mode,
+                ctx.mtp_k,
             )
         })
     }
@@ -847,20 +841,16 @@ impl Carrier for DotsOcrCarrier {
         // output is densely self-repeating. The daemon's `generate_vl_dots_ocr`
         // routes to the spec decode loop when this is `Some` (vision prefill is
         // unchanged; only the decode phase becomes speculative).
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
-            state: Some(crate::ModelState::DotsOcr(hipfire_arch_dots_ocr::DotsOcrBundle {
-                config,
-                weights,
-                state,
-            })),
+            state: Some(crate::ModelState::DotsOcr(
+                hipfire_arch_dots_ocr::DotsOcrBundle {
+                    config,
+                    weights,
+                    state,
+                },
+            )),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -869,6 +859,8 @@ impl Carrier for DotsOcrCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                ctx.mtp_mode,
+                ctx.mtp_k,
             )
         })
     }
@@ -991,17 +983,7 @@ impl Carrier for Deepseek4Carrier {
                 .map_err(|e| format!("deepseek4 DSpark speculator build failed: {e}"))?,
             )
         } else if weights.mtp_layer.is_some() {
-            // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
-            // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
-            let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or_else(|| {
-                    std::env::var("HIPFIRE_MTP_K")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                })
-                .unwrap_or(2);
+            let max_n = ctx.mtp_k;
             let ctx_capacity = config.max_position_embeddings;
             eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
             Some(
@@ -1029,6 +1011,8 @@ impl Carrier for Deepseek4Carrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                ctx.mtp_mode,
+                ctx.mtp_k,
             )
         })
     }
@@ -1110,14 +1094,8 @@ impl Carrier for MinimaxCarrier {
         // (arch_id=10) impls `SpecTarget` (pure GQA, no recurrent state), so it
         // can be driven by the arch-generic spec loop with no draft model.
         // `None` ⇒ AR-only (the bespoke `generate_minimax` path).
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(ModelState::Minimax(crate::MiniMaxBundle {
                 config,
@@ -1133,6 +1111,8 @@ impl Carrier for MinimaxCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                ctx.mtp_mode,
+                ctx.mtp_k,
             )
         })
     }
@@ -1201,14 +1181,8 @@ impl Carrier for Lfm2MoeCarrier {
         // (arch_id=11) impls `SpecTarget` with conv-state snapshot/rollback in
         // `verify_block`/`commit_prefix`, so it can be driven by the arch-generic
         // spec loop with no draft model. `None` ⇒ AR-only (`generate_lfm2moe`).
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
                 config,
@@ -1224,6 +1198,8 @@ impl Carrier for Lfm2MoeCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                ctx.mtp_mode,
+                ctx.mtp_k,
             )
         })
     }
@@ -1275,12 +1251,18 @@ impl Carrier for Cohere2MoeCarrier {
                 let tokenizer =
                     hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                         .map_err(|e| format!("cohere2moe: tokenizer not found: {e}"))?;
-                let mut lm =
-                    crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)?;
+                let mut lm = crate::load_cohere2moe(
+                    hfq,
+                    tokenizer,
+                    ctx.gpu,
+                    ctx.max_seq,
+                    ctx.path,
+                    ctx.mtp_mode,
+                    ctx.mtp_k,
+                )?;
                 // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1).
                 lm.speculator = crate::spec_build::build_speculator(
                     meta.arch_id,
-                    None,
                     None,
                     true,
                     ctx.max_seq,
@@ -1309,7 +1291,6 @@ impl Carrier for Cohere2MoeCarrier {
                 let speculator = crate::spec_build::build_speculator(
                     meta.arch_id,
                     None,
-                    None,
                     true,
                     ctx.max_seq,
                     ctx.spec,
@@ -1329,6 +1310,8 @@ impl Carrier for Cohere2MoeCarrier {
                         ctx.max_seq,
                         ctx.path.to_string(),
                         meta.chat_template,
+                        ctx.mtp_mode,
+                        ctx.mtp_k,
                     )
                 })
             }

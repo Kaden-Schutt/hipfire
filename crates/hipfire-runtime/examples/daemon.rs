@@ -30,15 +30,11 @@ use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
-// Used by generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
-// it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
-use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::arch_dispatch::ForwardCtx;
 use hipfire_runtime::emit_text::{currently_in_think, extract_tool_calls_from_text};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -55,6 +51,79 @@ use hipfire_loader::{
 use hipfire_runtime::spec::{
     ClientEvent, EvictRetain, FinishSummary, PrefillOutcome, SpecEmit, StopReason,
 };
+
+/// An explicitly invalid operator environment is a load error even when the
+/// request carries a valid parameter; configuration must not be ignored.
+fn mtp_k_from_env(name: &str) -> Result<Option<usize>, String> {
+    match std::env::var(name) {
+        Ok(value)
+            if matches!(
+                value.as_str(),
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8"
+            ) =>
+        {
+            Ok(Some(value.parse().expect("validated single-digit MTP K")))
+        }
+        Ok(value) => Err(format!("{name} must be an integer in 1..=8, got {value:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("{name} is invalid: {error}")),
+    }
+}
+
+fn resolve_mtp_k(
+    load_param: Option<&serde_json::Value>,
+    is_deepseek: bool,
+) -> Result<usize, String> {
+    let value = if is_deepseek {
+        mtp_k_from_env("HIPFIRE_DEEPSEEK4_SPEC_K")?
+    } else {
+        None
+    }
+    .or(mtp_k_from_env("HIPFIRE_MTP_K")?)
+    .unwrap_or(match load_param {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("params.mtp_k must be an integer in 1..=8, got {value}"))?,
+        None => 3,
+    });
+    if (1..=8).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("MTP K must be in 1..=8, got {value}"))
+    }
+}
+
+fn resolve_mtp_mode(load_param: Option<&serde_json::Value>) -> Result<Option<bool>, String> {
+    match std::env::var("HIPFIRE_MTP_MODE") {
+        Ok(value) => {
+            return match value.as_str() {
+                "auto" => Ok(None),
+                "on" => Ok(Some(true)),
+                "off" => Ok(Some(false)),
+                _ => Err(format!(
+                    "HIPFIRE_MTP_MODE must be one of off, on, auto, got {value:?}"
+                )),
+            }
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(format!("HIPFIRE_MTP_MODE is invalid: {error}")),
+    }
+    match load_param {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) => match value.as_str() {
+            "auto" => Ok(None),
+            "on" => Ok(Some(true)),
+            "off" => Ok(Some(false)),
+            _ => Err(format!(
+                "params.mtp_mode must be one of off, on, auto, got {value:?}"
+            )),
+        },
+        Some(value) => Err(format!(
+            "params.mtp_mode must be one of off, on, auto, got {value}"
+        )),
+    }
+}
 
 /// Abort-target request ID. Set asynchronously by the background
 /// stdin-reader thread when it sees `{type:"abort","id":"..."}`;
@@ -855,10 +924,12 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
     ) -> Option<Box<dyn hipfire_runtime::arch_dispatch::GrammarMatcher>> {
         let schemas: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = tool_schemas
             .iter()
-            .map(|(name, required)| hipfire_arch_qwen35::grammar::ToolSchema {
-                name: name.clone(),
-                required: required.clone(),
-            })
+            .map(
+                |(name, required)| hipfire_arch_qwen35::grammar::ToolSchema {
+                    name: name.clone(),
+                    required: required.clone(),
+                },
+            )
             .collect();
         Some(Box::new(Qwen35GrammarMatcher(
             hipfire_arch_qwen35::grammar::Matcher::new(schemas),
@@ -1364,7 +1435,14 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
         // Single-token decode via the batched-prefill path (writes scratch.logits
         // without sampling). Perf follow-up: forward_scratch decode kernel.
         llama::forward_prefill_batch(
-            gpu, &b.weights, &b.config, &[token], seq_pos, &mut b.kv, &b.scratch, None,
+            gpu,
+            &b.weights,
+            &b.config,
+            &[token],
+            seq_pos,
+            &mut b.kv,
+            &b.scratch,
+            None,
         )
         .map_err(|e| format!("llama decode forward_prefill_batch: {:?}", e))
     }
@@ -1540,7 +1618,10 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
         let ForwardCtx::Single(gpu) = ctx else {
             unreachable!("single-GPU dispatch received Mesh ctx")
         };
-        let b = self.m.minimax_mut().ok_or("prefill_forward: no minimax bundle")?;
+        let b = self
+            .m
+            .minimax_mut()
+            .ok_or("prefill_forward: no minimax bundle")?;
         let batched = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL").map_or(true, |v| v != "0")
             && minimax::forward::forward_batch_supported(&b.weights);
         let mut pos = seq_pos;
@@ -1552,8 +1633,15 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
             }
         } else {
             for &tok in chunk {
-                minimax::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, tok, pos as u32)
-                    .map_err(|e| format!("minimax decode_step (prefill): {e}"))?;
+                minimax::forward::decode_step(
+                    &b.config,
+                    &b.weights,
+                    &mut b.state,
+                    gpu,
+                    tok,
+                    pos as u32,
+                )
+                .map_err(|e| format!("minimax decode_step (prefill): {e}"))?;
                 pos += 1;
             }
         }
@@ -1569,10 +1657,20 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
         let ForwardCtx::Single(gpu) = ctx else {
             unreachable!("single-GPU dispatch received Mesh ctx")
         };
-        let b = self.m.minimax_mut().ok_or("decode_step_forward: no minimax bundle")?;
-        minimax::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, token, seq_pos as u32)
-            .map(|_| ())
-            .map_err(|e| format!("minimax decode_step (decode): {e}"))
+        let b = self
+            .m
+            .minimax_mut()
+            .ok_or("decode_step_forward: no minimax bundle")?;
+        minimax::forward::decode_step(
+            &b.config,
+            &b.weights,
+            &mut b.state,
+            gpu,
+            token,
+            seq_pos as u32,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("minimax decode_step (decode): {e}"))
     }
 
     fn sample(
@@ -1666,7 +1764,10 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
     }
 
     fn is_eos(&self, tok: u32) -> bool {
-        self.m.cohere2moe().map(|b| tok == b.eos_tok).unwrap_or(false)
+        self.m
+            .cohere2moe()
+            .map(|b| tok == b.eos_tok)
+            .unwrap_or(false)
     }
 
     fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
@@ -1716,8 +1817,15 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
             // reduction order), so a different chunk size shifts the logits and flips
             // an argmax a few tokens into decode → dual-run temp0 parity fails.
             for sub in chunk.chunks(256) {
-                cohere2moe::forward::forward_batch(&b.config, &b.weights, &mut b.state, gpu, sub, pos)
-                    .map_err(|e| format!("cohere2moe forward_batch (prefill): {e}"))?;
+                cohere2moe::forward::forward_batch(
+                    &b.config,
+                    &b.weights,
+                    &mut b.state,
+                    gpu,
+                    sub,
+                    pos,
+                )
+                .map_err(|e| format!("cohere2moe forward_batch (prefill): {e}"))?;
                 pos += sub.len();
             }
         } else {
@@ -1750,9 +1858,16 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
             .m
             .cohere2moe_mut()
             .ok_or("decode_step_forward: no cohere2moe bundle")?;
-        cohere2moe::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, token, seq_pos as u32)
-            .map(|_| ())
-            .map_err(|e| format!("cohere2moe decode_step (decode): {e}"))
+        cohere2moe::forward::decode_step(
+            &b.config,
+            &b.weights,
+            &mut b.state,
+            gpu,
+            token,
+            seq_pos as u32,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("cohere2moe decode_step (decode): {e}"))
     }
 
     fn sample(
@@ -1801,7 +1916,10 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
     }
 
     fn vocab_size(&self) -> usize {
-        self.m.cohere2moe().map(|b| b.config.vocab_size).unwrap_or(0)
+        self.m
+            .cohere2moe()
+            .map(|b| b.config.vocab_size)
+            .unwrap_or(0)
     }
 
     fn stream_parser(
@@ -1892,7 +2010,10 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
             unreachable!("single-GPU dispatch received Mesh ctx")
         };
         // Per-token decode_step (no batched prefill kernel for lfm2moe).
-        let b = self.m.lfm2moe_mut().ok_or("prefill_forward: no lfm2moe bundle")?;
+        let b = self
+            .m
+            .lfm2moe_mut()
+            .ok_or("prefill_forward: no lfm2moe bundle")?;
         let mut pos = seq_pos as u32;
         for &tok in chunk {
             lfm2moe::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, tok, pos)
@@ -1911,10 +2032,20 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
         let ForwardCtx::Single(gpu) = ctx else {
             unreachable!("single-GPU dispatch received Mesh ctx")
         };
-        let b = self.m.lfm2moe_mut().ok_or("decode_step_forward: no lfm2moe bundle")?;
-        lfm2moe::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, token, seq_pos as u32)
-            .map(|_| ())
-            .map_err(|e| format!("lfm2moe decode_step (decode): {e}"))
+        let b = self
+            .m
+            .lfm2moe_mut()
+            .ok_or("decode_step_forward: no lfm2moe bundle")?;
+        lfm2moe::forward::decode_step(
+            &b.config,
+            &b.weights,
+            &mut b.state,
+            gpu,
+            token,
+            seq_pos as u32,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("lfm2moe decode_step (decode): {e}"))
     }
 
     fn sample(
@@ -2394,9 +2525,7 @@ impl Deepseek4StreamParser {
                     // {"type":"tool_calls","id":..,"calls":<array>} (daemon.rs:8718).
                     let arr: Vec<serde_json::Value> = calls
                         .into_iter()
-                        .map(|c| {
-                            serde_json::json!({ "name": c.name, "arguments": c.arguments })
-                        })
+                        .map(|c| serde_json::json!({ "name": c.name, "arguments": c.arguments }))
                         .collect();
                     acts.push(StreamAction::ToolCalls(serde_json::Value::Array(arr)));
                 }
@@ -3196,20 +3325,50 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                // MTP speculative decode config. `mtp_mode` gates weight
-                // discovery at load time (off=skip, on=error-if-missing,
-                // auto=scan+log). `mtp_k` sets the draft window size.
-                let mtp_mode = msg
-                    .get("params")
-                    .and_then(|p| p.get("mtp_mode"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("auto")
-                    .to_string();
-                let mtp_k: usize = msg
-                    .get("params")
-                    .and_then(|p| p.get("mtp_k"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(3) as usize;
+                // MTP load config. DeepSeek (arch 9) uses its in-weights MTP
+                // draft window; `mtp_k` resolves once into model metadata. Qwen
+                // native MTP is disabled pending SPEC-003: on rejects before any
+                // native-head preflight, while auto/off use AR.
+                let mtp_mode_param = msg.get("params").and_then(|p| p.get("mtp_mode"));
+                let mtp_mode = match resolve_mtp_mode(mtp_mode_param) {
+                    Ok(mode) => mode,
+                    Err(error) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({ "type": "error", "message": error })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let mtp_k_param = msg.get("params").and_then(|p| p.get("mtp_k"));
+                let source_arch_id = match hipfire_runtime::loader_api::ModelSource::from_path(path)
+                {
+                    Ok(hipfire_runtime::loader_api::ModelSource::Hfq(hfq)) => hfq.arch_id,
+                    Ok(hipfire_runtime::loader_api::ModelSource::Dir(source)) => source.arch_id(),
+                    Err(error) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({ "type": "error", "message": error })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let mtp_k = match resolve_mtp_k(mtp_k_param, source_arch_id == 9) {
+                    Ok(k) => k,
+                    Err(error) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({ "type": "error", "message": error })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 // Model-free n-gram speculator config, forwarded by the CLI after
                 // resolving the `speculation` selector + legacy knobs through the
@@ -3219,6 +3378,8 @@ fn main() {
                 // driven daemon with `HIPFIRE_NGRAM_DRAFT=1` still works). Absent
                 // params leave the fields `None` → loader defaults / env.
                 let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
+                    mtp_mode,
+                    mtp_k: Some(mtp_k),
                     ngram_draft: msg
                         .get("params")
                         .and_then(|p| p.get("ngram_draft"))
@@ -3563,11 +3724,7 @@ fn main() {
                     ) {
                         Ok(bands) => bands,
                         Err(msg) => {
-                            let _ = writeln!(
-                                stdout,
-                                r#"{{"type":"error","message":"{}"}}"#,
-                                msg
-                            );
+                            let _ = writeln!(stdout, r#"{{"type":"error","message":"{}"}}"#, msg);
                             let _ = stdout.flush();
                             continue;
                         }
@@ -3576,11 +3733,11 @@ fn main() {
                     None
                 };
                 let loaded = if mesh.has_axis(DimKind::Ep) {
-                    hipfire_loader::load_model_ep(path, max_seq, &mesh)
+                    hipfire_loader::load_model_ep(path, max_seq, &mesh, spec_cfg)
                 } else if mesh.has_axis(DimKind::Tp) {
-                    hipfire_loader::load_model_tp(path, max_seq, &mesh)
+                    hipfire_loader::load_model_tp(path, max_seq, &mesh, spec_cfg)
                 } else if dense_llama_pp {
-                    hipfire_loader::load_model_pp(path, max_seq, &mesh)
+                    hipfire_loader::load_model_pp(path, max_seq, &mesh, spec_cfg)
                 } else {
                     // NOT single-GPU only: this arm still carries qwen35 (arch 5/6)
                     // pp>1 pipeline-parallel serving. qwen35 PP: mesh carries pp
@@ -3601,7 +3758,7 @@ fn main() {
                     )
                 };
                 match loaded {
-                    Ok(mut m) => {
+                    Ok(m) => {
                         // FIX #1 (deferred EP unload): the new EP model loaded
                         // successfully — NOW it's safe to free the prior model
                         // (single-GPU/pp models were already unloaded eagerly
@@ -3637,8 +3794,8 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let vl = m.vision.is_some()
-                            || matches!(m.state, Some(ModelState::DotsOcr(_)));
+                        let vl =
+                            m.vision.is_some() || matches!(m.state, Some(ModelState::DotsOcr(_)));
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
@@ -3663,10 +3820,6 @@ fn main() {
                             ),
                             _ => (0, 0, 0),
                         };
-
-                        // Apply MTP config from load-message params.
-                        m.meta.mtp_mode = mtp_mode;
-                        m.meta.mtp_k = mtp_k;
 
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -4033,10 +4186,15 @@ fn main() {
                 // ladder. Per-knob: a model that bakes only `temperature` still
                 // gets the arch-ladder `top_p`.
                 let default_temp = m
-                    .meta.rec_temperature
+                    .meta
+                    .rec_temperature
                     .map(|x| x as f64)
                     .unwrap_or(arch_default_temp);
-                let default_top_p = m.meta.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
+                let default_top_p = m
+                    .meta
+                    .rec_top_p
+                    .map(|x| x as f64)
+                    .unwrap_or(arch_default_top_p);
                 let temp = msg
                     .get("temperature")
                     .and_then(|v| v.as_f64())
@@ -4071,7 +4229,11 @@ fn main() {
                 // Clients can still opt in to a non-1.0 value per request.
                 // LFM2.5-MoE (arch_id 11): Liquid's card recommends
                 // repetition_penalty=1.05; default to it (others stay 1.0/off).
-                let default_repeat_penalty = if m.meta.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+                let default_repeat_penalty = if m.meta.arch_id == 11 {
+                    1.05_f64
+                } else {
+                    1.0_f64
+                };
                 // Accept HF-style `repetition_penalty` as a request ALIAS for our
                 // `repeat_penalty` field, used only when the canonical key is
                 // absent. (OpenAI/HF clients send `repetition_penalty`.)
@@ -4954,8 +5116,7 @@ fn dense_serve_via_ar_generate(
     stop: &[String],
 ) {
     let hist: &[hipfire_runtime::prompt_frame::Message] = messages_history.unwrap_or(&[]);
-    let cache_disabled =
-        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     let plan = {
         let tok = m.tokenizer.as_ref().expect("dense serve: tokenizer");
         plan_prompt_cache(
@@ -5018,13 +5179,13 @@ fn dense_serve_via_ar_generate(
         0,   // max_think_tokens (dense is lean, no think)
         hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
         stop,
-        None,        // tools (dense has no grammar)
-        new_tokens,  // new_tokens: the post-LCP suffix
-        &[],         // im_end (dense stops via is_eos / is_terminator)
-        &[],         // nl
-        None,        // im_end_token
-        None,        // tool_call_pair
-        None,        // think_pair
+        None,       // tools (dense has no grammar)
+        new_tokens, // new_tokens: the post-LCP suffix
+        &[],        // im_end (dense stops via is_eos / is_terminator)
+        &[],        // nl
+        None,       // im_end_token
+        None,       // tool_call_pair
+        None,       // think_pair
         prefill_len,
         start_pos, // cached_tokens_count
         None,      // pflash_summary
@@ -5399,14 +5560,14 @@ fn ep_serve_minimax_via_ar_generate(
         "",  // budget_alert_text
         0,   // max_think_tokens (no force-close think on minimax)
         hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        stop, // user stop sequences (DefaultStreamParser honors them)
-        None, // tools (minimax EP has no grammar)
+        stop,        // user stop sequences (DefaultStreamParser honors them)
+        None,        // tools (minimax EP has no grammar)
         prefill_ids, // new_tokens: the post-LCP suffix
-        &[],  // im_end (minimax stops via is_eos / [e~[ filter)
-        &[],  // nl
-        None, // im_end_token
-        None, // tool_call_pair
-        None, // think_pair (primer emitted display-only above)
+        &[],         // im_end (minimax stops via is_eos / [e~[ filter)
+        &[],         // nl
+        None,        // im_end_token
+        None,        // tool_call_pair
+        None,        // think_pair (primer emitted display-only above)
         prefill_len,
         cached_tokens_count,
         None, // pflash_summary
@@ -5554,11 +5715,9 @@ fn plan_prompt_cache(
 /// no double-free). Mirrors the per-LA-device memset for pp>1. No-op off qwen35.
 fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if m.parallel.is_pipelined() {
-        if let (Some(ModelState::Qwen35(b)),
-                ModelParallel::Pp(PipelineImpl::ArchResident(gpus))) = (
-            m.state.as_ref(),
-            &mut m.parallel,
-        ) {
+        if let (Some(ModelState::Qwen35(b)), ModelParallel::Pp(PipelineImpl::ArchResident(gpus))) =
+            (m.state.as_ref(), &mut m.parallel)
+        {
             // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
             if let Some(pl) = b.pipeline.as_ref() {
                 let la = &pl.dn_la_to_device;
@@ -6744,664 +6903,6 @@ fn generate_spec(
     })
 }
 
-/// Qwen3.5/3.6 native-MTP (NextN) speculative decode serve path.
-///
-/// Analog of [`generate_deepseek4`]'s spec branch and [`generate_dflash`], but
-/// drafts via the Qwen MTP head ([`hipfire_arch_qwen35::mtp_spec`]) instead of
-/// the diffusion drafter. The proven-durable config (27B-3.6 genre sweep, all
-/// genres ≥1.15× AR, lossless): K=3, p_min=0.4, compressed-serial.
-///
-/// Call sequence (mirrors `mtp_only_demo`):
-///   1. cold-reset trunk DeltaNet/KV (v1 is single-turn — no LCP cache),
-///   2. `prefill_trunk_and_mtp_cache` (trunk batched prefill + MTP private KV
-///      fill over the prompt positions),
-///   3. seed token = trunk argmax at the last prefill position,
-///   4. loop `spec_step_mtp_compressed_serial` (the production path), committing
-///      `result.committed` and advancing `cur_pos += result.advance` each cycle.
-///
-/// Per-request lifecycle (state-bleed guard, the serve-multiturn class): the
-/// `MtpSpecState` (which owns the trunk DN snapshot + the MTP-private KV cache)
-/// is allocated FRESH at the top of this function and freed at EVERY exit — so
-/// no recurrent MTP state survives between requests. The trunk's persistent DN
-/// state lives in the bundle and is cold-zeroed at the start of each request
-/// (mirrors `generate_dflash`'s `!cache_hit` reset). The MTP head itself is
-/// persistent (loaded once into `Qwen35Bundle.mtp_head`).
-///
-/// Gated behind opt-in: this is only reached when `HIPFIRE_QWEN_MTP=1` AND the
-/// head is present (see the dispatch site in `generate`), so the DEFAULT serve
-/// path (DFlash/AR) is unchanged.
-#[allow(clippy::too_many_arguments)]
-fn generate_qwen35_mtp(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    stop: &[String],
-    // Request-resolved temp. 0.0 → greedy/argmax-match (p_min confidence cutoff
-    // applies). >0 → lossless residual-acceptance sampling (set_sampling below;
-    // mutually exclusive with p_min). Reached with temp>0 only when the dispatch
-    // gate saw HIPFIRE_MTP_SAMPLED=1 and a temp+top_p-only request.
-    temp: f32,
-    // Nucleus (top_p) cutoff for the sampled MTP path. Applied to BOTH draft +
-    // target nuclei (independent per-side truncation → lossless == AR-at-top_p).
-    // Ignored on the greedy path. <= 0.0 is treated as disabled (1.0).
-    top_p: f32,
-    // Top-k cutoff for the sampled MTP path (request- or card-recommended; e.g.
-    // qwen3.6 A3B ships top_k=20). Applied to BOTH draft + target nuclei
-    // alongside top_p, so it stays lossless == AR-at-(top_k,top_p). None / 0 →
-    // disabled (top_p-only). Ignored on the greedy path.
-    top_k: Option<u32>,
-    // Nucleus min-prob floor for the sampled MTP path: keep tokens with prob >=
-    // min_p * max_prob, folded into the GPU kernel's tau alongside top_p/top_k and
-    // applied to BOTH draft + target nuclei → lossless == AR-at-(min_p,top_k,top_p).
-    // 0.0 = disabled. Ignored on the greedy path.
-    min_p: f32,
-) {
-    use hipfire_arch_qwen35::mtp_head::MtpKvMode;
-    use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
-    use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
-
-    // ── Resolve the proven-durable MTP config ──────────────────────────
-    // K defaults to 3 (max_n); p_min defaults to 0.4. Both env-overridable so
-    // the GPU-validation thread can sweep. `set_p_min(0.4)` is applied below
-    // unconditionally (the MtpSpecState::new default p_min is arch-derived; we
-    // pin the proven value for the serve path and let HIPFIRE_MTP_P_MIN win).
-    let max_n: usize = std::env::var("HIPFIRE_MTP_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|k| (1..=8).contains(k))
-        .unwrap_or(3);
-    let p_min: f32 = std::env::var("HIPFIRE_MTP_P_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|p: &f32| (0.0..=1.0).contains(p))
-        .unwrap_or(0.4);
-
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            emit_error_with_id(stdout, id, "tokenizer not loaded");
-            return;
-        }
-    };
-
-    // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-    let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
-    let prompt_tokens: Vec<u32> = if try_jinja {
-        let template = m.meta.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: system_prompt,
-            user: prompt,
-            enable_thinking: max_think_tokens != 1,
-            bos_token: None,
-        };
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(h) => h,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                    }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        tool_plan: String::new(),
-                    });
-                    synthesized = v;
-                    &synthesized
-                }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
-        };
-        match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
-            Err(e) => {
-                eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: system_prompt,
-                    user: prompt,
-                    assistant_prefix,
-                    raw: false,
-                }
-                .build()
-            }
-        }
-    } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: system_prompt,
-            user: prompt,
-            assistant_prefix,
-            raw: false,
-        }
-        .build()
-    };
-
-    if prompt_tokens.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
-        return;
-    }
-
-    let im_end = tokenizer.encode("<|im_end|>");
-    let im_end_token = if im_end.len() == 1 {
-        Some(im_end[0])
-    } else {
-        None
-    };
-
-    // ── Cold-reset the trunk recurrent state (v1 = single-turn) ─────────
-    // Like generate_dflash's !cache_hit branch: zero the bundle's DeltaNet
-    // recurrent state + reset the KV write head so a fresh prompt prefills
-    // from position 0 over clean buffers. (No LCP prompt-cache in v1.)
-    m.session.seq_pos = 0;
-    m.session.conversation_tokens.clear();
-    if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.s_scales {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.conv_states {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-    }
-    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-        b.kv_cache.compact_offset = 0;
-    }
-
-    // ── Take the bundle → build a transient ModelSlot ───────────────────
-    // The mtp_spec helpers take `&mut ModelSlot`; the daemon owns the qwen35
-    // pieces in the bundle. Take them, build the slot, run, put them back at
-    // every exit (mirrors generate_dflash). The HfqFile is re-opened (mmap,
-    // few µs) because ModelSlot carries it; the MTP path doesn't read it.
-    let Qwen35Bundle {
-        config: orig_config,
-        weights,
-        scratch,
-        kv_cache,
-        dn_state,
-        mtp_head,
-        pipeline: orig_pipeline,
-    } = match m.state.take() {
-        Some(ModelState::Qwen35(b)) => b,
-        _ => {
-            emit_error_with_id(stdout, id, "qwen35 MTP serve: model state is not Qwen35");
-            return;
-        }
-    };
-    let target_config = orig_config.clone();
-    let hfq = match HfqFile::open(Path::new(&m.meta.model_path)) {
-        Ok(h) => h,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("reopen model: {e}"));
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights,
-                scratch,
-                kv_cache,
-                dn_state,
-                mtp_head,
-                pipeline: orig_pipeline,
-            }));
-            return;
-        }
-    };
-    let mut target = ModelSlot {
-        name: String::from("target"),
-        hfq,
-        config: target_config,
-        weights,
-        kv_cache,
-        dn_state,
-        scratch,
-        slot_config: ModelSlotConfig::default(),
-        dspark_extract_layers: Vec::new(),
-        mtp_head: None,
-    };
-
-    // Helper closure analog: every early return must put the bundle back. We
-    // do it inline (Rust closures can't move `target` piecewise + keep using
-    // `m`), so each exit re-packs Qwen35Bundle from target's fields.
-    let eos_token = target.config.eos_token;
-    let dim = target.config.dim;
-    let vocab = target.config.vocab_size;
-
-    // Capacity guard: worst case per cycle writes max_n+1 verify slots before
-    // the rollback truncates. seq budget must hold prompt + max*(max_n+1).
-    let max_seq_total = m.meta.physical_cap;
-    if prompt_tokens
-        .len()
-        .saturating_add(max_tokens.saturating_mul(max_n + 1))
-        .saturating_add(16)
-        > max_seq_total
-    {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "prompt ({}) + max ({}) × (max_n+1) ({}) exceeds context capacity {} — reload with a larger max_seq",
-                prompt_tokens.len(),
-                max_tokens,
-                max_n + 1,
-                max_seq_total
-            ),
-        );
-        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-            mtp_head,
-            pipeline: orig_pipeline,
-        }));
-        return;
-    }
-
-    // ── Allocate a FRESH per-request MtpSpecState (no cross-request bleed) ─
-    let head = mtp_head.as_ref().expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
-    // Compressed (cvs) draft head? Copy the Option out now so we don't hold a
-    // borrow of `head`/`m` past the state setup — the compressed-logits scratch
-    // alloc below needs &mut state + &mut gpu.
-    let cvs_opt = head.weights.compressed_vocab_size;
-    let kv_mode = MtpKvMode::Q8;
-    let mut state =
-        match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, max_n, kv_mode) {
-            Ok(s) => s,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
-                m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                    config: orig_config,
-                    weights: target.weights,
-                    scratch: target.scratch,
-                    kv_cache: target.kv_cache,
-                    dn_state: target.dn_state,
-                    mtp_head,
-                    pipeline: orig_pipeline,
-                }));
-                return;
-            }
-        };
-    // Compressed-serial (cvs) head needs its compressed-logits scratch allocated
-    // up front (mtp_only_demo does this; the daemon previously only set up the
-    // full-vocab path, so a cvs sidecar panicked inside spec_step). Full-vocab
-    // heads (cvs == None) skip this entirely.
-    if let Some(cvs) = cvs_opt {
-        if let Err(e) = state.mtp_scratch.ensure_compressed_logits(gpu, cvs) {
-            emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                mtp_head,
-                pipeline: orig_pipeline,
-            }));
-            return;
-        }
-        if let Err(e) = state.ensure_compressed_lm_logits(gpu, cvs) {
-            emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                mtp_head,
-                pipeline: orig_pipeline,
-            }));
-            return;
-        }
-    }
-    if temp > 1e-6 {
-        // Sampled MTP. temp/top_p/top_k AND the sampling min_p are honored (folded
-        // into the GPU nucleus tau). The draft-chain p_min now ALSO composes with
-        // sampling via DraftMode::SampledPMin (sampled draft + early chain-cutoff
-        // on the head's raw top prob — lossless, the tau lever for sampled MTP), so
-        // we feed the resolved p_min through instead of clearing it. p_min<=0
-        // (HIPFIRE_MTP_P_MIN=0) → plain DraftMode::Sampled (no chain pruning).
-        state.set_p_min(p_min);
-        // set_sampling asserts top_p in (0,1]; a request top_p of 0.0 means
-        // "disabled", so clamp it to 1.0 (the no-nucleus sentinel).
-        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
-        state.set_sampling(
-            mtp_spec::MtpSamplingConfig {
-                temp,
-                top_k: top_k.map(|k| k as usize).unwrap_or(0),
-                top_p: top_p_eff,
-                min_p,
-            },
-            42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
-        );
-    } else {
-        state.set_p_min(p_min); // greedy MTP confidence cutoff
-    }
-
-    let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new
-
-    let t0 = Instant::now();
-
-    // ── Prefill: trunk batched + MTP private-KV fill (trunk-spine) ──────
-    let head = mtp_head.as_ref().unwrap();
-    let prefill_res = mtp_spec::prefill_trunk_and_mtp_cache(
-        gpu,
-        &mut target,
-        head,
-        &mut state,
-        &prompt_tokens,
-        0,
-    );
-    if let Err(e) = prefill_res {
-        emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
-        state.free_gpu(gpu);
-        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-            mtp_head,
-            pipeline: orig_pipeline,
-        }));
-        return;
-    }
-    let _ = gpu.hip.device_synchronize();
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // Seed token = trunk argmax at the last prefill position. prefill left
-    // target.scratch.logits holding the post-prompt logits.
-    let seed_logits = match gpu.download_f32(&target.scratch.logits) {
-        Ok(v) => v,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                mtp_head,
-                pipeline: orig_pipeline,
-            }));
-            return;
-        }
-    };
-    let seed_token = seed_logits
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
-        })
-        .0;
-
-    // ── Decode loop ─────────────────────────────────────────────────────
-    let t_prefill = Instant::now();
-    let mut emitted: Vec<u32> = vec![seed_token];
-    let mut streamed_tokens: Vec<u32> = Vec::new();
-    let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
-    let mut last_committed = seed_token;
-    let mut cur_pos = prompt_tokens.len();
-    let mut generated = 0usize;
-    let mut cycles = 0usize;
-    let mut accepted_total = 0usize;
-    let mut think_count: usize = 0;
-    let mut prev_in_think = false;
-
-    // Emit the seed token first (TTFT = prefill).
-    streamed_tokens.push(seed_token);
-    emit_committed_event(
-        stdout,
-        id,
-        seed_token,
-        streamed_tokens.len() - 1,
-        t0.elapsed().as_millis() as u64,
-    );
-    {
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[bytes_fed_to_filter..];
-        bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-            if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default()
-                );
-                let _ = stdout.flush();
-            }
-        }
-    }
-    generated += 1;
-
-    let seed_is_eos = seed_token == eos_token
-        || im_end_token == Some(seed_token)
-        || tokenizer.is_terminator(seed_token);
-
-    let mut step_error: Option<String> = None;
-    while !seed_is_eos && generated < max_tokens {
-        if check_abort(id) {
-            break;
-        }
-        if cur_pos + max_n + 1 >= max_seq_total {
-            break;
-        }
-
-        let result = match mtp_spec::spec_step_mtp_compressed_serial(
-            gpu,
-            &mut target,
-            head,
-            &mut state,
-            cur_pos,
-            last_committed,
-            eos_token,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                step_error = Some(format!("{e:?}"));
-                break;
-            }
-        };
-        cycles += 1;
-        accepted_total += result.accept_count;
-
-        let mut hit_eos = false;
-        let mut think_cap_hit = false;
-        for &tok in &result.committed {
-            if generated >= max_tokens {
-                break;
-            }
-            emitted.push(tok);
-            streamed_tokens.push(tok);
-            emit_committed_event(
-                stdout,
-                id,
-                tok,
-                streamed_tokens.len() - 1,
-                t0.elapsed().as_millis() as u64,
-            );
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"token","id":"{}","text":{}}}"#,
-                        id,
-                        serde_json::to_string(&text).unwrap_or_default()
-                    );
-                    let _ = stdout.flush();
-                }
-            }
-            generated += 1;
-            if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) {
-                hit_eos = true;
-                break;
-            }
-            if !stop.is_empty() {
-                let decoded_suffix = tokenizer.decode(&streamed_tokens);
-                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
-                    hit_eos = true;
-                    break;
-                }
-            }
-            if max_think_tokens > 0 {
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(
-                    raw_str,
-                    matches!(
-                        assistant_prefix,
-                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                    ),
-                );
-                if in_think && !prev_in_think {
-                    think_count = 0;
-                }
-                if in_think {
-                    think_count += 1;
-                }
-                prev_in_think = in_think;
-                if in_think && think_count >= max_think_tokens {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"token","id":"{}","text":"</think>\n"}}"#,
-                        id
-                    );
-                    let _ = stdout.flush();
-                    think_cap_hit = true;
-                    break;
-                }
-            }
-        }
-        last_committed = match result.committed.last() {
-            Some(&t) => t,
-            None => break, // defensive: spec_step always commits ≥ 1
-        };
-        cur_pos += result.advance;
-        if result.hit_eos || hit_eos || think_cap_hit {
-            break;
-        }
-    }
-
-    let t_end = Instant::now();
-
-    // ── Free the per-request MtpSpecState + put the bundle back ─────────
-    // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV cache
-    // + the trunk DN snapshot, so the NEXT request starts with no residue.
-    state.free_gpu(gpu);
-    // The trunk's mid-decode DN/KV is advanced past the (un-baked) prompt; the
-    // next request cold-resets at the top of this fn (and the DFlash/AR paths
-    // reset on their own !cache_hit branch), so we leave it as-is here. Bake an
-    // empty conversation tracker (v1 is single-turn / no LCP reuse).
-    m.session.seq_pos = 0;
-    m.session.conversation_tokens.clear();
-    m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-        config: orig_config,
-        weights: target.weights,
-        scratch: target.scratch,
-        kv_cache: target.kv_cache,
-        dn_state: target.dn_state,
-        mtp_head,
-        pipeline: orig_pipeline,
-    }));
-
-    if let Some(e) = step_error {
-        emit_error_with_id(stdout, id, format!("mtp spec_step: {e}"));
-        return;
-    }
-
-    // ── Done envelope ──────────────────────────────────────────────────
-    let total_s = t_end.duration_since(t0).as_secs_f64();
-    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prompt_tokens.len() as f64 / prefill_s
-    } else {
-        0.0
-    };
-    // τ = tokens committed per cycle (excludes the seed). > 1.0 = MTP speedup.
-    let tau = if cycles > 0 {
-        (emitted.len().saturating_sub(1)) as f64 / cycles as f64
-    } else {
-        0.0
-    };
-    let _ = accepted_total;
-    let hit_length_cap = generated >= max_tokens;
-    let finish_reason = if hit_length_cap { "length" } else { "stop" };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{},"mtp":true,"tau":{:.2},"cycles":{},"cached_tokens":0,"finish_reason":"{}"}}"#,
-        id,
-        generated,
-        tok_s,
-        prompt_tokens.len(),
-        prefill_ms,
-        prefill_tok_s,
-        decode_tok_s,
-        prefill_ms,
-        tau,
-        cycles,
-        finish_reason,
-    );
-    let _ = stdout.flush();
-}
-
-/// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
-/// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
-/// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
-/// detection, repeat penalty, attractor block on unclosed tool/think
-/// openers, max_think_tokens force-close, budget-alert nudge, ChatML \n
-/// trailer. Forward calls fan out to per-device tensors via
-/// `gpus.devices[dev]` and `scratch_set.per_device[dev]`; the final
-/// sample lives on `gpus.output_device`. DFlash, CASK, PFlash, VL and
-/// arch_id < 5 are refused upstream at load.
-#[allow(clippy::too_many_arguments)]
 fn generate_multi(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -7430,7 +6931,8 @@ fn generate_multi(
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.session.seq_pos
+    if m.session
+        .seq_pos
         .saturating_add(prompt_est)
         .saturating_add(max_tokens)
         > m.meta.max_seq
@@ -7448,11 +6950,11 @@ fn generate_multi(
         // because a `&tokenizer` borrow of `m` is live here; covers both the
         // pp>1 per-LA-device path and the single-GPU path.
         if m.parallel.is_pipelined() {
-            if let (Some(ModelState::Qwen35(b)),
-                    ModelParallel::Pp(PipelineImpl::ArchResident(ref mut gpus))) = (
-                m.state.as_ref(),
-                &mut m.parallel,
-            ) {
+            if let (
+                Some(ModelState::Qwen35(b)),
+                ModelParallel::Pp(PipelineImpl::ArchResident(ref mut gpus)),
+            ) = (m.state.as_ref(), &mut m.parallel)
+            {
                 // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
                 if let Some(pl) = b.pipeline.as_ref() {
                     let la = &pl.dn_la_to_device;
@@ -7648,7 +7150,11 @@ fn generate_multi(
                 eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
                     tokenizer,
-                    system: if m.session.seq_pos == 0 { system_prompt } else { None },
+                    system: if m.session.seq_pos == 0 {
+                        system_prompt
+                    } else {
+                        None
+                    },
                     user: "",
                     assistant_prefix,
                     raw: false,
@@ -7659,7 +7165,11 @@ fn generate_multi(
     } else {
         hipfire_runtime::prompt_frame::ChatFrame {
             tokenizer,
-            system: if m.session.seq_pos == 0 { system_prompt } else { None },
+            system: if m.session.seq_pos == 0 {
+                system_prompt
+            } else {
+                None
+            },
             user: "",
             assistant_prefix,
             raw: false,
@@ -7684,11 +7194,11 @@ fn generate_multi(
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
         if m.parallel.is_pipelined() {
-            if let (Some(ModelState::Qwen35(b)),
-                    ModelParallel::Pp(PipelineImpl::ArchResident(ref mut gpus))) = (
-                m.state.as_ref(),
-                &mut m.parallel,
-            ) {
+            if let (
+                Some(ModelState::Qwen35(b)),
+                ModelParallel::Pp(PipelineImpl::ArchResident(ref mut gpus)),
+            ) = (m.state.as_ref(), &mut m.parallel)
+            {
                 // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
                 if let Some(pl) = b.pipeline.as_ref() {
                     let la = &pl.dn_la_to_device;
@@ -7731,7 +7241,8 @@ fn generate_multi(
     }
 
     let trailer = nl.len();
-    if m.session.seq_pos
+    if m.session
+        .seq_pos
         .saturating_add(new_tokens.len())
         .saturating_add(max_tokens)
         .saturating_add(trailer)
@@ -7779,13 +7290,17 @@ fn generate_multi(
     };
     let config = &b.config;
     let weights = &b.weights;
-    let pl = b.pipeline.as_ref().expect("pp>1 qwen35 must carry pipeline scratch");
+    let pl = b
+        .pipeline
+        .as_ref()
+        .expect("pp>1 qwen35 must carry pipeline scratch");
     let scratch_set = &pl.scratch_set;
     let dn_la_to_device = &pl.dn_la_to_device;
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
-    let ModelParallel::Pp(PipelineImpl::ArchResident(gpus)) = &mut m.parallel
-        else { unreachable!("qwen35 pp>1 forward without ArchResident mesh") };
+    let ModelParallel::Pp(PipelineImpl::ArchResident(gpus)) = &mut m.parallel else {
+        unreachable!("qwen35 pp>1 forward without ArchResident mesh")
+    };
 
     macro_rules! reset_pp_uncommitted_state {
         () => {{
@@ -8299,7 +7814,8 @@ fn generate_multi(
             let budget_left = max_tokens.saturating_sub(generated);
             let nudge_len = nudge_tokens.len().min(budget_left);
             let need_kv = m
-                .session.seq_pos
+                .session
+                .seq_pos
                 .saturating_add(nudge_len)
                 .saturating_add(
                     max_tokens
@@ -8611,9 +8127,14 @@ fn ar_generate(
             let space = window.saturating_sub(seq_pos).max(1);
             let chunk_len = remaining.len().min(space);
             let (chunk, rest) = remaining.split_at(chunk_len);
-            hook_or_fail!(dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos), "prefill forward");
+            hook_or_fail!(
+                dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos),
+                "prefill forward"
+            );
             seq_pos += chunk_len;
-            if let Some(new_phys) = hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction") {
+            if let Some(new_phys) =
+                hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
+            {
                 seq_pos = new_phys;
             }
             remaining = rest;
@@ -8630,7 +8151,10 @@ fn ar_generate(
             }
             let end = (start + chunk_max).min(new_tokens.len());
             let chunk = &new_tokens[start..end];
-            hook_or_fail!(dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos), "prefill forward");
+            hook_or_fail!(
+                dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos),
+                "prefill forward"
+            );
             seq_pos += chunk.len();
             dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
             if ckpt_resume_enabled() {
@@ -8660,7 +8184,9 @@ fn ar_generate(
     }
     // Post-prefill adaptive-KV downshift.
     dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
-    dispatch.conversation_tokens_mut().extend_from_slice(&new_tokens);
+    dispatch
+        .conversation_tokens_mut()
+        .extend_from_slice(&new_tokens);
 
     // Boundary marker for the prompt-cache / asst_turn_cache slice: the model's
     // verbatim emitted tokens start here in the conversation buffer.
@@ -8729,7 +8255,13 @@ fn ar_generate(
     // ngram_scope is empty at tok0 (no generated tokens yet).
     let ngram_scope0: &[u32] = &[];
     let mut blocked0: Vec<u32> = Vec::new();
-    sampler::collect_unclosed_attractor_blocks(ngram_scope0, &attractor_pairs, 20, 2, &mut blocked0);
+    sampler::collect_unclosed_attractor_blocks(
+        ngram_scope0,
+        &attractor_pairs,
+        20,
+        2,
+        &mut blocked0,
+    );
     let cfg0 = SamplerConfig {
         temperature: temp,
         top_p,
@@ -8752,7 +8284,14 @@ fn ar_generate(
             None
         };
         hook_or_fail!(
-            dispatch.sample(ctx.reborrow(), &cfg0, vocab_size, ngram_scope0, mask, &mut rng_state),
+            dispatch.sample(
+                ctx.reborrow(),
+                &cfg0,
+                vocab_size,
+                ngram_scope0,
+                mask,
+                &mut rng_state
+            ),
             "sample"
         )
     };
@@ -8782,8 +8321,8 @@ fn ar_generate(
     // Budget-alert stays DRIVER-side (cfg `budget_alert_at_tok=0`); its nudge tokens
     // emit through `parser.emit_only`. The parser owns the EosFilter; the driver owns
     // `streamed_tokens` + `bytes_fed_to_filter` and hands the running-vector byte delta.
-    let mut parser = dispatch.stream_parser(
-        hipfire_runtime::stream_parser::DefaultStreamParserConfig {
+    let mut parser =
+        dispatch.stream_parser(hipfire_runtime::stream_parser::DefaultStreamParserConfig {
             eos_filter: dispatch.eos_filter_config(),
             stop_seqs: stop.to_vec(),
             max_tokens,
@@ -8797,8 +8336,7 @@ fn ar_generate(
                 assistant_prefix,
                 hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
             ),
-        },
-    );
+        });
 
     // Tool calls emitted BY THE PARSER (ds4 DSML / cohere2moe markers) — captured
     // in the ToolCalls arm below so finish_reason + the asst-cache fingerprint can
@@ -8841,7 +8379,11 @@ fn ar_generate(
                     let _ = stdout.flush();
                 }
                 hipfire_runtime::stream_parser::StreamAction::ToolCalls(v) => {
-                    let _ = writeln!(stdout, r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#, id, v);
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#,
+                        id, v
+                    );
                     let _ = stdout.flush();
                     // Capture for finish_reason + fingerprint (review I2). The wire
                     // event already went out above — this only feeds the metadata,
@@ -8949,7 +8491,9 @@ fn ar_generate(
         if ckpt_resume_enabled() {
             dispatch.take_prefill_checkpoint(ctx.reborrow(), seq_pos);
         }
-        if let Some(new_phys) = hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction") {
+        if let Some(new_phys) =
+            hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
+        {
             seq_pos = new_phys;
         }
         dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
@@ -9043,7 +8587,14 @@ fn ar_generate(
                             None
                         };
                     hook_or_fail!(
-                        dispatch.sample(ctx.reborrow(), &cfg, vocab_size, ngram_scope, mask, &mut rng_state),
+                        dispatch.sample(
+                            ctx.reborrow(),
+                            &cfg,
+                            vocab_size,
+                            ngram_scope,
+                            mask,
+                            &mut rng_state
+                        ),
                         "sample"
                     )
                 };
@@ -9090,9 +8641,14 @@ fn ar_generate(
                     for act in parser.emit_only(tok, &new_bytes2) {
                         exec_stream_action!(act);
                     }
-                    hook_or_fail!(dispatch.decode_step_forward(ctx.reborrow(), tok, seq_pos), "decode forward");
+                    hook_or_fail!(
+                        dispatch.decode_step_forward(ctx.reborrow(), tok, seq_pos),
+                        "decode forward"
+                    );
                     seq_pos += 1;
-                    if let Some(new_phys) = hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction") {
+                    if let Some(new_phys) =
+                        hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
+                    {
                         seq_pos = new_phys;
                     }
                     generated += 1;
@@ -9168,7 +8724,14 @@ fn ar_generate(
                 None
             };
             hook_or_fail!(
-                dispatch.sample(ctx.reborrow(), &cfg, vocab_size, ngram_scope, mask, &mut rng_state),
+                dispatch.sample(
+                    ctx.reborrow(),
+                    &cfg,
+                    vocab_size,
+                    ngram_scope,
+                    mask,
+                    &mut rng_state
+                ),
                 "sample"
             )
         };
@@ -9201,9 +8764,14 @@ fn ar_generate(
         .unwrap_or(0);
     if im_end_token == Some(last_conv) && !nl.is_empty() {
         for &t in nl {
-            hook_or_fail!(dispatch.decode_step_forward(ctx.reborrow(), t, seq_pos), "decode forward");
+            hook_or_fail!(
+                dispatch.decode_step_forward(ctx.reborrow(), t, seq_pos),
+                "decode forward"
+            );
             seq_pos += 1;
-            if let Some(new_phys) = hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction") {
+            if let Some(new_phys) =
+                hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
+            {
                 seq_pos = new_phys;
             }
             dispatch.conversation_tokens_mut().push(t);
@@ -9378,8 +8946,19 @@ fn generate(
         ModelParallelKind::Tp | ModelParallelKind::PpDense => {
             // Dense TP / dense-PP AR decode on the unified ar_generate driver.
             dense_serve_via_ar_generate(
-                m, stdout, id, system_prompt, prompt, assistant_prefix,
-                messages_history, temp, top_p, top_k, min_p, max_tokens, stop,
+                m,
+                stdout,
+                id,
+                system_prompt,
+                prompt,
+                assistant_prefix,
+                messages_history,
+                temp,
+                top_p,
+                top_k,
+                min_p,
+                max_tokens,
+                stop,
             );
             return;
         }
@@ -9533,8 +9112,10 @@ fn generate(
                       // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
                       // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
                       // was hardcoded greedy-only (temp>0 → AR).
-        let spec_temp_ok =
-            temp <= 1e-6 || m.speculator.as_ref().map_or(false, |s| !s.requires_greedy());
+        let spec_temp_ok = temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .map_or(false, |s| !s.requires_greedy());
         let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(
@@ -9820,82 +9401,6 @@ fn generate(
             hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
         );
 
-    // ── Qwen3.5/3.6 native-MTP serve path (opt-in) ─────────────────────
-    //
-    // Routed BEFORE the DFlash fast path so an operator who opts in gets MTP
-    // (durable on prose, ≥1.15× AR every genre; proven 27B-3.6 K=3 p_min=0.4
-    // compressed-serial). Gated tightly so the DEFAULT path (DFlash/AR) is
-    // unchanged: requires the env opt-in `HIPFIRE_QWEN_MTP=1`, a loaded MTP
-    // head (`m.qwen35().mtp_head`), greedy (temp≈0; MTP serve v1 is greedy/
-    // argmax-match), a qwen3.5/3.6 trunk (arch 5/6), single-GPU, and no
-    // budgeted-thinking (which needs the AR </think> splice). Anything not
-    // satisfying ALL of these falls through to the existing DFlash/AR routing.
-    //
-    // SAMPLED (temp>0) MTP is now distribution-preserving and reachable here,
-    // but gated behind an opt-in env flag until the temp>0 coherence battery
-    // validates it. The arch layer's F5 DFlash-convention fix (mtp_spec.rs:
-    // independent per-side nuclei + sample_residual) makes the temp>0 branch
-    // lossless: draft + target each truncate to their own top_p nucleus, the
-    // accept ratio is computed against the truncated distributions, and the
-    // bonus is drawn from the renormalized residual (no longer the lossy
-    // un-truncated / sample_top_p(trunk) posture). Gating:
-    //   * greedy (temp <= 1e-6) → ALWAYS routes to MTP (default, unchanged), or
-    //   * sampled (temp > 0) → routes to MTP only when `HIPFIRE_MTP_SAMPLED=1`.
-    //     temp + top_p + top_k + min_p are all plumbed through and honored on the
-    //     sampled MTP path (top_k+top_p lossless on both nuclei; min_p applied via
-    //     the mtp_spec cutoff), so no sampling knob forces a fall-through here.
-    // With HIPFIRE_MTP_SAMPLED unset, a temp>0 MTP-opted-in request still falls
-    // through to DFlash (lossless sampled-spec) or AR exactly as before.
-    let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
-    let mtp_sampled_on = std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1");
-    // Sampled MTP honors temp + top_p + top_k: the residual-accept sampler
-    // applies the SAME top_k+top_p nucleus to BOTH the draft and target sides
-    // (see mtp_sampled_accept / the draft truncation), so it stays lossless ==
-    // AR-at-(top_k,top_p). min_p is ALSO plumbed through (min_p.unwrap_or(0.0)
-    // below → generate_qwen35_mtp → the mtp_spec min_p cutoff) and honored, not
-    // carved out. top_k + min_p flow through to generate_qwen35_mtp below and on
-    // into the nuclei — this is what lets a model whose card recommends top_k
-    // (qwen3.6 A3B ships top_k=20) keep its recipe AND get the MTP speedup,
-    // instead of silently dropping top_k/min_p or losing MTP.
-    if qwen_mtp_opt_in
-        && m.qwen35().map(|b| b.mtp_head.is_some()).unwrap_or(false)
-        && (temp <= 1e-6 || mtp_sampled_on)
-        && (m.meta.arch_id == 5 || m.meta.arch_id == 6)
-        && !budgeted_thinking_needs_ar
-    {
-        generate_qwen35_mtp(
-            m,
-            gpu,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            max_tokens,
-            max_think_tokens,
-            assistant_prefix,
-            tools,
-            messages_history,
-            stop,
-            temp,  // request-resolved temp (0.0 greedy / >0 lossless residual-accept sampling)
-            top_p, // nucleus cutoff: honored on the sampled MTP path
-            top_k, // top-k cutoff: honored on the sampled MTP path (both nuclei)
-            min_p.unwrap_or(0.0), // min_p floor: honored on the sampled MTP nuclei
-        );
-        // Silence unused-variable warnings for AR-only / DFlash-only knobs the
-        // MTP serve path does not consume.
-        let _ = (
-            repeat_penalty,
-            repeat_window,
-            presence_penalty,
-            frequency_penalty,
-            budget_alert_at_tok,
-            budget_alert_text,
-            pflash_state,
-            pflash_cfg,
-            think_mode,
-        );
-        return;
-    }
     // Prompt-cache routing (2026-05-30, native-reuse update). `generate_dflash`
     // now implements LCP prompt-cache reuse natively: on a pure conversation
     // extension it reuses the target KV + DeltaNet prefix and extends the
@@ -9968,7 +9473,10 @@ fn generate(
     // qualify for spec silently runs AR (correct, but slower). Name the reason.
     if temp > 1e-6
         && m.speculator.is_some()
-        && (m.meta.arch_id == 5 || m.meta.arch_id == 6 || m.meta.arch_id == 0 || m.meta.arch_id == 1)
+        && (m.meta.arch_id == 5
+            || m.meta.arch_id == 6
+            || m.meta.arch_id == 0
+            || m.meta.arch_id == 1)
         && !qwen_dflash_route
         && !llama_dflash_route
         && !budgeted_thinking_needs_ar
@@ -10085,7 +9593,8 @@ fn generate(
         );
     }
     if m.eviction.is_none()
-        && m.session.seq_pos
+        && m.session
+            .seq_pos
             .saturating_add(prompt_est)
             .saturating_add(max_tokens)
             > m.meta.max_seq
@@ -10428,7 +9937,11 @@ fn generate(
     } else {
         hipfire_runtime::prompt_frame::ChatFrame {
             tokenizer,
-            system: if m.session.seq_pos == 0 { system_prompt } else { None },
+            system: if m.session.seq_pos == 0 {
+                system_prompt
+            } else {
+                None
+            },
             user: "", // unused: we pass tokens directly via build_with_user_tokens
             assistant_prefix,
             raw: false,
@@ -10764,7 +10277,8 @@ fn generate(
                 && evict_safe
                 && matches!(m.state.as_ref(), Some(ModelState::Qwen35(_)))
             {
-                m.session.prefill_checkpoints
+                m.session
+                    .prefill_checkpoints
                     .iter()
                     .rposition(|(p, _)| *p <= lcp && *p < rendered.len())
             } else {
@@ -10915,7 +10429,8 @@ fn generate(
             .unwrap_or(0),
     );
     if m.eviction.is_none() {
-        if m.session.seq_pos
+        if m.session
+            .seq_pos
             .saturating_add(new_tokens.len())
             .saturating_add(max_tokens)
             .saturating_add(trailer)
@@ -11074,7 +10589,6 @@ fn generate(
 /// Env knobs (read fresh per generate call so they can be toggled
 /// without daemon restart):
 ///   HIPFIRE_DEEPSEEK4_SPEC_DECODE=1     opt-in MTP speculative decode
-///   HIPFIRE_DEEPSEEK4_SPEC_K=N          drafts per spec-decode window (default 3)
 ///   HIPFIRE_DEEPSEEK4_TOP_K=N           top-k filter (default 0 = off; HF rec)
 ///   HIPFIRE_DEEPSEEK4_SEED=N            PRNG seed (default: time-based)
 ///
@@ -11365,14 +10879,11 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 /// route the spec path through the unified `generate_spec`; the AR path (and the
 /// no-speculator fallback) stay in `generate_deepseek4`.
 fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
-    std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or_else(|| match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
-            Some("on") => true,
-            Some("off") => false,
-            _ => m.meta.mtp_mode == "on" || (m.meta.mtp_mode == "auto" && m.mtp_weights_present()),
-        })
+    mtp_metadata_requested(&m.meta.mtp_mode, m.mtp_weights_present())
+}
+
+fn mtp_metadata_requested(mtp_mode: &str, weights_present: bool) -> bool {
+    mtp_mode == "on" || (mtp_mode == "auto" && weights_present)
 }
 
 /// deepseek4 MTP spec-decode through the unified `generate_spec` (Phase 4 T4c-2).
@@ -11437,16 +10948,7 @@ fn generate_deepseek4_spec(
         return;
     }
 
-    // spec_k: env chain → 2 (the deepseek4-specific default; see generate_deepseek4).
-    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| {
-            std::env::var("HIPFIRE_MTP_K")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(2);
+    let spec_k = m.meta.mtp_k;
 
     // Prefix-cache plan (ds4 policy: forced-cold on partial, ring-safety length
     // guard, step-back exact). Pure decision; the GPU teardown is applied below.
@@ -11876,7 +11378,9 @@ fn generate_deepseek4(
         m.session.conversation_tokens.extend_from_slice(&prompt_ids);
     } else {
         m.session.conversation_tokens.truncate(lcp);
-        m.session.conversation_tokens.extend_from_slice(suffix_tokens);
+        m.session
+            .conversation_tokens
+            .extend_from_slice(suffix_tokens);
     }
     let cached_tokens: usize = lcp;
 
@@ -12157,7 +11661,8 @@ fn generate_deepseek4(
             && generated_count > 0
             && m.session.conversation_tokens.len() > decode_start_tokens_idx
         {
-            let cached_seq: Vec<u32> = m.session.conversation_tokens[decode_start_tokens_idx..].to_vec();
+            let cached_seq: Vec<u32> =
+                m.session.conversation_tokens[decode_start_tokens_idx..].to_vec();
             let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
             if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
@@ -12446,7 +11951,10 @@ fn generate_lfm2moe(
     // The stop-id set (is_eos) + eos_filter_config (in Lfm2MoeDispatch) subsume the
     // legacy id + decoded-frag stop guards; the eos-class literals are stripped from
     // display. No think-cap, no grammar, no LCP (cold-reset arch).
-    let mut __disp = Lfm2MoeDispatch { m: &mut *m, stop_ids };
+    let mut __disp = Lfm2MoeDispatch {
+        m: &mut *m,
+        stop_ids,
+    };
     ar_generate(
         &mut __disp,
         ForwardCtx::Single(gpu),
@@ -12465,16 +11973,16 @@ fn generate_lfm2moe(
         "",  // budget_alert_text
         0,   // max_think_tokens
         hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        &[],       // stop
-        None,      // tools (grammar off)
+        &[],        // stop
+        None,       // tools (grammar off)
         prompt_ids, // new_tokens: full render (cold-reset each turn, no LCP)
-        &[],       // im_end
-        &[],       // nl
-        None,      // im_end_token
-        None,      // tool_call_pair
-        None,      // think_pair
+        &[],        // im_end
+        &[],        // nl
+        None,       // im_end_token
+        None,       // tool_call_pair
+        None,       // think_pair
         __prefill_len,
-        0, // cached_tokens_count (cold reset)
+        0,    // cached_tokens_count (cold reset)
         None, // pflash_summary
         None, // pflash_bypass_reason
         None, // pflash_alpha
@@ -12908,7 +12416,9 @@ impl Cohere2MoeStreamParser {
             think_count: 0,
             think_budget,
             think_force_closed: false,
-            empty_turn_guard: std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD").ok().as_deref()
+            empty_turn_guard: std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
+                .ok()
+                .as_deref()
                 != Some("0"),
             emitted_visible: false,
             eos_suppressions: 0,
@@ -12973,7 +12483,11 @@ impl hipfire_runtime::stream_parser::StreamParser for Cohere2MoeStreamParser {
         self.forced.push_back(tok);
     }
 
-    fn feed(&mut self, tok: u32, bytes: &[u8]) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
+    fn feed(
+        &mut self,
+        tok: u32,
+        bytes: &[u8],
+    ) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
         use hipfire_runtime::stream_parser::StreamAction;
         let mut acts = Vec::new();
 
@@ -13007,7 +12521,11 @@ impl hipfire_runtime::stream_parser::StreamParser for Cohere2MoeStreamParser {
             self.sec = C2mSec::Pre;
         } else if tok == self.mk_act1 {
             let mut calls = cohere2moe::spec_emit::parse_cohere_action(&self.action_buf);
-            cohere2moe::spec_emit::snap_call_names(&mut calls, &self.known_tools, &self.tool_params);
+            cohere2moe::spec_emit::snap_call_names(
+                &mut calls,
+                &self.known_tools,
+                &self.tool_params,
+            );
             if !calls.is_empty() {
                 acts.push(StreamAction::ToolCalls(serde_json::json!(calls)));
                 self.emitted_visible = true;
@@ -13217,7 +12735,6 @@ fn generate_cohere2moe(
         let _ = stdout.flush();
         return;
     }
-
 
     // Capacity guard. No eviction on arch_id=12 — reset the KV cursor when the
     // FULL rendered conversation + generation would overflow. `prompt_ids` is
@@ -13632,7 +13149,8 @@ fn generate_vl(
     let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
 
     if m.eviction.is_none()
-        && m.session.seq_pos
+        && m.session
+            .seq_pos
             .saturating_add(prompt_est)
             .saturating_add(max_tokens)
             > m.meta.max_seq
@@ -13715,7 +13233,11 @@ fn generate_vl(
 
     let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
         tokenizer,
-        system: if m.session.seq_pos == 0 { system_prompt } else { None },
+        system: if m.session.seq_pos == 0 {
+            system_prompt
+        } else {
+            None
+        },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
         raw: false,
@@ -13728,7 +13250,8 @@ fn generate_vl(
     let trailer = nl.len();
     let absolute_pos_vl = m.session.seq_pos.saturating_add(kv.compact_offset);
     let over_budget = if m.eviction.is_none() {
-        m.session.seq_pos
+        m.session
+            .seq_pos
             .saturating_add(prompt_tokens.len())
             .saturating_add(max_tokens)
             .saturating_add(trailer)
@@ -13791,12 +13314,30 @@ fn generate_vl(
     for &token in prompt_tokens.iter() {
         if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
-            qwen35::forward_scratch_embed(gpu, weights, config, emb, m.session.seq_pos, kv, dn, scratch)
-                .expect("forward_scratch_embed failed");
+            qwen35::forward_scratch_embed(
+                gpu,
+                weights,
+                config,
+                emb,
+                m.session.seq_pos,
+                kv,
+                dn,
+                scratch,
+            )
+            .expect("forward_scratch_embed failed");
             visual_idx += 1;
         } else {
-            qwen35::forward_scratch(gpu, weights, config, token, m.session.seq_pos, kv, dn, scratch)
-                .expect("forward_scratch failed");
+            qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                token,
+                m.session.seq_pos,
+                kv,
+                dn,
+                scratch,
+            )
+            .expect("forward_scratch failed");
         }
         m.session.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
@@ -13810,7 +13351,9 @@ fn generate_vl(
         }
     }
 
-    m.session.conversation_tokens.extend_from_slice(&prompt_tokens);
+    m.session
+        .conversation_tokens
+        .extend_from_slice(&prompt_tokens);
 
     // hunt3 M-D: repeat-penalty / n-gram-block history must be scoped to the
     // GENERATED tokens only (mirrors the text path's `ngram_scope_start` set to
@@ -13831,7 +13374,14 @@ fn generate_vl(
     // GPU memcpy + redownload — saves a full vocab-sized DMA per token.
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     if let Some((open, close)) = think_pair {
-        block_attractor_unclosed_cpu(&mut logits, &m.session.conversation_tokens, open, close, 20, 2);
+        block_attractor_unclosed_cpu(
+            &mut logits,
+            &m.session.conversation_tokens,
+            open,
+            close,
+            20,
+            2,
+        );
     }
     let vl_cfg_first = SamplerConfig {
         temperature: temp,
@@ -13928,8 +13478,17 @@ fn generate_vl(
             break;
         }
 
-        qwen35::forward_scratch(gpu, weights, config, next_token, m.session.seq_pos, kv, dn, scratch)
-            .unwrap();
+        qwen35::forward_scratch(
+            gpu,
+            weights,
+            config,
+            next_token,
+            m.session.seq_pos,
+            kv,
+            dn,
+            scratch,
+        )
+        .unwrap();
         m.session.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
             if let Some(hipfire_runtime::triattn::EvictionResult {
@@ -13945,7 +13504,14 @@ fn generate_vl(
         let vl_ngram_scope = &m.session.conversation_tokens[vl_ngram_scope_start..];
         llama::apply_ngram_block(&mut logits, vl_ngram_scope);
         if let Some((open, close)) = think_pair {
-            block_attractor_unclosed_cpu(&mut logits, &m.session.conversation_tokens, open, close, 20, 2);
+            block_attractor_unclosed_cpu(
+                &mut logits,
+                &m.session.conversation_tokens,
+                open,
+                close,
+                20,
+                2,
+            );
         }
 
         next_token = sampler::sample_cpu(&mut logits, vl_ngram_scope, &vl_cfg);
@@ -13972,7 +13538,14 @@ fn generate_vl(
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {
                         qwen35::forward_scratch(
-                            gpu, weights, config, t, m.session.seq_pos, kv, dn, scratch,
+                            gpu,
+                            weights,
+                            config,
+                            t,
+                            m.session.seq_pos,
+                            kv,
+                            dn,
+                            scratch,
                         )
                         .unwrap();
                         m.session.seq_pos += 1;
@@ -14051,7 +13624,8 @@ fn generate_vl(
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
     if im_end_token == Some(*m.session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
-            qwen35::forward_scratch(gpu, weights, config, t, m.session.seq_pos, kv, dn, scratch).unwrap();
+            qwen35::forward_scratch(gpu, weights, config, t, m.session.seq_pos, kv, dn, scratch)
+                .unwrap();
             m.session.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult {
@@ -14869,13 +14443,19 @@ mod c2m_stream_parser_tests {
         assert_eq!(p.feed(10, b""), Vec::new()); // START_THINKING → Think, suppressed
         assert_eq!(
             p.feed(99, b"hi"),
-            vec![StreamAction::Emit { text: "hi".into(), reasoning: true }]
+            vec![StreamAction::Emit {
+                text: "hi".into(),
+                reasoning: true
+            }]
         );
         assert_eq!(p.feed(11, b""), Vec::new()); // END_THINKING → Pre, suppressed
         assert_eq!(p.feed(12, b""), Vec::new()); // START_TEXT → Text, suppressed
         assert_eq!(
             p.feed(98, b"yo"),
-            vec![StreamAction::Emit { text: "yo".into(), reasoning: false }]
+            vec![StreamAction::Emit {
+                text: "yo".into(),
+                reasoning: false
+            }]
         );
     }
 
@@ -14925,10 +14505,11 @@ mod ds4_stream_parser_tests {
 
     #[test]
     fn maps_tool_calls_to_name_arguments_array() {
-        let acts = Deepseek4StreamParser::map_events(vec![StreamEvent::ToolCalls(vec![ToolCall {
-            name: "get_weather".into(),
-            arguments: serde_json::json!({ "city": "Tokyo" }),
-        }])]);
+        let acts =
+            Deepseek4StreamParser::map_events(vec![StreamEvent::ToolCalls(vec![ToolCall {
+                name: "get_weather".into(),
+                arguments: serde_json::json!({ "city": "Tokyo" }),
+            }])]);
         assert_eq!(acts.len(), 1);
         match &acts[0] {
             StreamAction::ToolCalls(v) => {
@@ -14945,15 +14526,19 @@ mod ds4_stream_parser_tests {
     #[test]
     fn on_eos_is_stop_not_commit() {
         // ep_serve_ds4 breaks on the sampled eos without forwarding/emitting it.
-        let mut p =
-            Deepseek4StreamParser::new(hipfire_runtime::prompt_frame::ThinkMode::NonThink, Vec::new());
+        let mut p = Deepseek4StreamParser::new(
+            hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            Vec::new(),
+        );
         assert_eq!(p.on_eos(), EosDecision::Stop);
     }
 
     #[test]
     fn finish_consumes_inner_and_is_idempotent() {
-        let mut p =
-            Deepseek4StreamParser::new(hipfire_runtime::prompt_frame::ThinkMode::NonThink, Vec::new());
+        let mut p = Deepseek4StreamParser::new(
+            hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            Vec::new(),
+        );
         let _ = p.finish(); // takes the inner dsml parser
         assert_eq!(p.finish(), Vec::new()); // second finish: inner is None → empty
     }
@@ -14973,5 +14558,213 @@ mod ds4_stream_parser_tests {
             a2.iter().any(|x| matches!(x, StreamAction::Stop)),
             "stop sequence at the decoded suffix must append a Stop action"
         );
+    }
+}
+
+#[cfg(test)]
+mod mtp_k_tests {
+    use super::{mtp_metadata_requested, resolve_mtp_k, resolve_mtp_mode};
+    use serde_json::Value;
+    use std::sync::{Mutex, OnceLock};
+
+    fn resolve(param: Option<Value>) -> Result<usize, String> {
+        resolve_mtp_k(param.as_ref(), false)
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct MtpKEnvRestore {
+        generic: Option<std::ffi::OsString>,
+        deepseek: Option<std::ffi::OsString>,
+        mode: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for MtpKEnvRestore {
+        fn drop(&mut self) {
+            match self.generic.take() {
+                Some(value) => std::env::set_var("HIPFIRE_MTP_K", value),
+                None => std::env::remove_var("HIPFIRE_MTP_K"),
+            }
+            match self.deepseek.take() {
+                Some(value) => std::env::set_var("HIPFIRE_DEEPSEEK4_SPEC_K", value),
+                None => std::env::remove_var("HIPFIRE_DEEPSEEK4_SPEC_K"),
+            }
+            match self.mode.take() {
+                Some(value) => std::env::set_var("HIPFIRE_MTP_MODE", value),
+                None => std::env::remove_var("HIPFIRE_MTP_MODE"),
+            }
+        }
+    }
+
+    fn with_mtp_env<T>(
+        generic: Option<&str>,
+        deepseek: Option<&str>,
+        mode: Option<&str>,
+        test: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = env_lock().lock().unwrap();
+        let _restore = MtpKEnvRestore {
+            generic: std::env::var_os("HIPFIRE_MTP_K"),
+            deepseek: std::env::var_os("HIPFIRE_DEEPSEEK4_SPEC_K"),
+            mode: std::env::var_os("HIPFIRE_MTP_MODE"),
+        };
+        match generic {
+            Some(value) => std::env::set_var("HIPFIRE_MTP_K", value),
+            None => std::env::remove_var("HIPFIRE_MTP_K"),
+        }
+        match deepseek {
+            Some(value) => std::env::set_var("HIPFIRE_DEEPSEEK4_SPEC_K", value),
+            None => std::env::remove_var("HIPFIRE_DEEPSEEK4_SPEC_K"),
+        }
+        match mode {
+            Some(value) => std::env::set_var("HIPFIRE_MTP_MODE", value),
+            None => std::env::remove_var("HIPFIRE_MTP_MODE"),
+        }
+        test()
+    }
+
+    fn with_mtp_k_env<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        with_mtp_env(value, None, None, test)
+    }
+
+    #[test]
+    fn environment_overrides_load_parameter() {
+        with_mtp_k_env(Some("7"), || {
+            assert_eq!(resolve(Some(serde_json::json!(4))), Ok(7))
+        });
+    }
+
+    #[test]
+    fn deepseek_environment_overrides_generic_only_for_deepseek() {
+        with_mtp_env(Some("4"), Some("6"), None, || {
+            assert_eq!(resolve_mtp_k(Some(&serde_json::json!(3)), true), Ok(6));
+            assert_eq!(resolve_mtp_k(Some(&serde_json::json!(3)), false), Ok(4));
+        });
+    }
+
+    #[test]
+    fn load_parameter_is_used_without_environment() {
+        with_mtp_k_env(None, || {
+            assert_eq!(resolve(Some(serde_json::json!(4))), Ok(4))
+        });
+    }
+
+    #[test]
+    fn defaults_to_three_without_parameter_or_environment() {
+        with_mtp_k_env(None, || assert_eq!(resolve(None), Ok(3)));
+    }
+
+    #[test]
+    fn invalid_environment_rejects_even_with_valid_load_parameter() {
+        with_mtp_k_env(Some("nope"), || {
+            let error = resolve(Some(serde_json::json!(4))).unwrap_err();
+            assert!(error.contains("HIPFIRE_MTP_K"));
+        });
+    }
+
+    #[test]
+    fn environment_rejects_noncanonical_leading_zero() {
+        with_mtp_k_env(Some("01"), || {
+            assert!(resolve(Some(serde_json::json!(4))).is_err())
+        });
+    }
+
+    #[test]
+    fn out_of_range_environment_is_rejected() {
+        with_mtp_k_env(Some("11"), || {
+            assert!(resolve(Some(serde_json::json!(4))).is_err())
+        });
+    }
+
+    #[test]
+    fn accepts_full_daemon_range() {
+        for k in 1..=8 {
+            let env_value = k.to_string();
+            with_mtp_k_env(Some(&env_value), || assert_eq!(resolve(None), Ok(k)));
+        }
+    }
+
+    #[test]
+    fn non_integer_json_parameter_is_rejected() {
+        with_mtp_k_env(None, || {
+            assert!(resolve(Some(serde_json::json!("four"))).is_err())
+        });
+    }
+
+    #[test]
+    fn out_of_range_json_parameter_is_rejected() {
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(9),
+            serde_json::json!(10),
+            serde_json::json!(11),
+        ] {
+            with_mtp_k_env(None, || assert!(resolve(Some(value)).is_err()));
+        }
+    }
+
+    #[test]
+    fn non_integer_json_values_are_rejected() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!([3]),
+            serde_json::json!({ "mtp_k": 3 }),
+            serde_json::json!(3.5),
+            serde_json::json!("3"),
+        ] {
+            with_mtp_k_env(None, || assert!(resolve(Some(value)).is_err()));
+        }
+    }
+
+    #[test]
+    fn invalid_mtp_mode_parameter_is_rejected() {
+        with_mtp_env(None, None, None, || {
+            for value in [
+                serde_json::json!(null),
+                serde_json::json!(true),
+                serde_json::json!("enabled"),
+            ] {
+                assert!(resolve_mtp_mode(Some(&value)).is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn mtp_mode_defaults_to_auto_and_accepts_only_documented_values() {
+        with_mtp_env(None, None, None, || {
+            assert_eq!(resolve_mtp_mode(None), Ok(None));
+            assert_eq!(resolve_mtp_mode(Some(&serde_json::json!("auto"))), Ok(None));
+            assert_eq!(
+                resolve_mtp_mode(Some(&serde_json::json!("on"))),
+                Ok(Some(true))
+            );
+            assert_eq!(
+                resolve_mtp_mode(Some(&serde_json::json!("off"))),
+                Ok(Some(false))
+            );
+        });
+    }
+
+    #[test]
+    fn direct_mode_environment_overrides_load_parameter() {
+        with_mtp_env(None, None, Some("off"), || {
+            assert_eq!(
+                resolve_mtp_mode(Some(&serde_json::json!("on"))),
+                Ok(Some(false))
+            );
+        });
+    }
+
+    #[test]
+    fn metadata_only_mode_controls_deepseek_speculation() {
+        assert!(!mtp_metadata_requested("off", true));
+        assert!(!mtp_metadata_requested("auto", false));
+        assert!(mtp_metadata_requested("auto", true));
+        assert!(mtp_metadata_requested("on", false));
     }
 }

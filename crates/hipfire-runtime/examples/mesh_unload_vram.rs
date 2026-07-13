@@ -35,8 +35,18 @@ fn free_mb(gpu: &rdna_compute::Gpu) -> f64 {
 
 fn load(axis: &str, model: &str, mesh: &DeviceMesh) -> Result<hipfire_loader::LoadedModel, String> {
     match axis {
-        "pp" => hipfire_loader::load_model_pp(model, MAX_SEQ, mesh),
-        _ => hipfire_loader::load_model_tp(model, MAX_SEQ, mesh),
+        "pp" => hipfire_loader::load_model_pp(
+            model,
+            MAX_SEQ,
+            mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ),
+        _ => hipfire_loader::load_model_tp(
+            model,
+            MAX_SEQ,
+            mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ),
     }
 }
 

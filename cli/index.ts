@@ -34,6 +34,7 @@ import {
   formatErrorMessage,
   formatProgressLine,
 } from "./cli_format";
+import { draftMaxForMechanism, mtpDraftMaxForSpeculation, resolveMtpK, validateMtpDraftMaxFlag } from "./mtp_k";
 
 // ─── Top-level safety net (registered FIRST) ────────────
 // Last-resort handlers so a stray rejected promise / synchronous throw —
@@ -504,7 +505,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_profile": return typeof value === "boolean";
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     case "mtp_mode": return ["off", "on", "auto"].includes(value);
-    case "mtp_k": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
+    case "mtp_k": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 8;
     case "speculation": return ["off", "auto", "ngram", "dflash", "mtp", "dspark"].includes(value);
     case "dspark_conf_threshold": return value === null || (typeof value === "number" && value >= 0 && value <= 1);
     case "ngram_mode": return ["off", "on", "auto"].includes(value);
@@ -1037,18 +1038,25 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   params.dflash_adaptive_b = resolved.dflash_adaptive_b;
 
   // ── MTP + n-gram speculation params (unified selector lowering) ─────────
-  // `--draft-max` lowers into HIPFIRE_DRAFT_MAX and routes to the ACTIVE
-  // mechanism's window (mtp_k when mtp runs, ngram_k when n-gram runs).
+  // `--draft-max` lowers only into an explicitly selected mechanism's window.
+  // DeepSeek auto is the exception: it can select its native MTP draft window.
+  const modelIdentity = tag ?? path;
+  const mtpDraftMax = mtpDraftMaxForSpeculation(process.env.HIPFIRE_DRAFT_MAX, speculation, modelIdentity);
+  const ngramDraftMax = draftMaxForMechanism(process.env.HIPFIRE_DRAFT_MAX, speculation, modelIdentity, "ngram");
+  const dflashDraftMax = draftMaxForMechanism(process.env.HIPFIRE_DRAFT_MAX, speculation, modelIdentity, "dflash");
   const draftMaxEnv = process.env.HIPFIRE_DRAFT_MAX
     ? parseInt(process.env.HIPFIRE_DRAFT_MAX, 10)
     : undefined;
-  // MTP: emit the effective mode (the selector may have forced it off). Window
-  // = --draft-max override else resolved mtp_k. This is the SOLE mtp_mode/mtp_k
-  // emission — it supersedes the old unconditional `params.mtp_* = resolved.*`
-  // that used to sit before the return (removed: it ran last and clobbered the
-  // selector, leaving MTP un-gated when speculation forced another mechanism).
+  // MTP: explicit env > --draft-max > per-model > global > default. The
+  // resolved config already contains the final three levels of that ladder.
+  const effectiveMtpK = resolveMtpK(
+    process.env.HIPFIRE_MTP_K,
+    mtpDraftMax,
+    resolved.mtp_k,
+    effMtpMode !== "off",
+  );
   params.mtp_mode = effMtpMode;
-  params.mtp_k = (draftMaxEnv && effMtpMode !== "off") ? draftMaxEnv : resolved.mtp_k;
+  params.mtp_k = effectiveMtpK;
   // DSpark (deepseek4): the selector → load-gate. The loader maps on→force,
   // off→skip load+build, auto→load-if-sidecar. Threshold rides as a load param
   // (env HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD still wins in the speculator).
@@ -1062,14 +1070,14 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // n-gram: byte-identical-to-AR model-free drafter. ngram_draft is the
   // per-load enable the loader reads (env HIPFIRE_NGRAM_DRAFT still wins there).
   params.ngram_draft = ngramOn;
-  params.ngram_k = (draftMaxEnv && ngramOn) ? draftMaxEnv : resolved.ngram_k;
+  params.ngram_k = (ngramDraftMax && ngramOn) ? draftMaxEnv : resolved.ngram_k;
   params.ngram_min_count = resolved.ngram_min_count;
 
   // DFlash ddtree tree shape (the dflash mechanism's draft window). Mirrors
   // mtp_k/ngram_k: --draft-max overrides the budget when dflash runs, else the
   // resolved config. budget=0 → chain-mode DFlash (no tree); >0 → SWOR ddtree.
   if (effDflashMode !== "off") {
-    params.ddtree_budget = draftMaxEnv ? draftMaxEnv : resolved.ddtree_budget;
+    params.ddtree_budget = dflashDraftMax ? draftMaxEnv : resolved.ddtree_budget;
     params.ddtree_topk = resolved.ddtree_topk;
   }
 
@@ -1196,9 +1204,6 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       `Continuing with PFlash disabled.`
     );
   }
-
-  params.mtp_mode = resolved.mtp_mode;
-  params.mtp_k = resolved.mtp_k;
 
   // (Former DFlash+Q8 max_seq cap removed.) The captured-flash LDS cliff that
   // 0-token'd Q8 KV at physical_cap>15000 is fixed in the engine: the captured
@@ -1478,8 +1483,6 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   if (!process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS && cfg.max_total_think_tokens > 0) {
     process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS = String(cfg.max_total_think_tokens);
   }
-  process.env.HIPFIRE_MTP_MODE = cfg.mtp_mode;
-  process.env.HIPFIRE_MTP_K = String(cfg.mtp_k);
   // Chat-template overrides. Shell env wins over config (don't clobber an
   // explicitly-exported HIPFIRE_CHAT_TEMPLATE_FILE / HIPFIRE_DEFAULT_CHATML).
   // chat_template: project the path only when set; empty config = leave the
@@ -7799,10 +7802,14 @@ switch (cmd) {
         console.error(`[hipfire] --model-draft is ignored under speculation=${effSpec} (draft models only feed DFlash).`);
       }
     }
-    if (draftMaxVal !== null && process.env.HIPFIRE_DRAFT_MAX === undefined) process.env.HIPFIRE_DRAFT_MAX = String(Math.floor(Number(draftMaxVal)));
     const image = imageVal ?? undefined;
     const system = systemVal ?? undefined;
     const runCfg = resolveModelConfig(model);
+    const runSpeculation = (process.env.HIPFIRE_SPECULATION || runCfg.speculation || "auto").toLowerCase();
+    if (draftMaxVal !== null && process.env.HIPFIRE_DRAFT_MAX === undefined) {
+      validateMtpDraftMaxFlag(draftMaxVal, runSpeculation, model);
+      process.env.HIPFIRE_DRAFT_MAX = draftMaxVal;
+    }
     const temp = Number(tempVal ?? runCfg.temperature);
     const topP = Number(topPVal ?? runCfg.top_p);
     const repeatPenalty = Number(repeatPenaltyVal ?? runCfg.repeat_penalty);

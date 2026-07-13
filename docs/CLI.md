@@ -37,7 +37,7 @@ for the persistent config keys.
 |---|---|
 | `--spec <m>` | Mechanism selector: `off` / `auto` / `ngram` / `dflash` / `mtp` / `dspark`. |
 | `-md, --model-draft <path>` | DFlash draft model path. Implies `--spec dflash` unless `--spec` is also given. |
-| `--draft-max, --draft <N>` | Draft window of the active mechanism (n-gram K / MTP k). |
+| `--draft-max, --draft <N>` | Draft window for an explicitly selected mechanism. Under `--spec auto`, only DeepSeek maps it to strict MTP K (`1..8`); Qwen/DFlash/n-gram auto routes keep their own configured windows. |
 | `--dspark-conf-threshold <f>` | DSpark confidence-truncation cutoff `0..1` (qwen3 + deepseek4). Unset = per-arch default (qwen3 `0.1`, deepseek4 `0.3`). |
 
 `dspark` uses the model's `<stem>-dspark.<ext>` draft-module sidecar (a small dense
@@ -49,6 +49,9 @@ hipfire run qwen3.5:9b --spec ngram "Repeat verbatim: ..."   # model-free, byte-
 hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq "..."  # draft-model DFlash
 hipfire run qwen3-8b --spec dspark "Write an LRU cache"       # DSpark draft-module sidecar
 ```
+
+Native MTP is currently served only for DeepSeek. Qwen `--spec mtp` / `mtp_mode=on`
+rejects pending SPEC-003; Qwen `auto` and `off` use autoregressive decoding.
 
 ## Configuration
 

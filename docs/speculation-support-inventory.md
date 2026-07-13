@@ -18,8 +18,9 @@ exists upstream. Compiled from a per-architecture audit (one agent per arch crat
 - **n-gram drafter** — model-free, arch-generic (`crates/hipfire-runtime/src/spec_ngram.rs`),
   opt-in `HIPFIRE_NGRAM_DRAFT=1`. Any arch can opt in by implementing the
   `SpecTarget` verify seam (`crates/hipfire-runtime/src/spec.rs`).
-- **MTP** — learned multi-token-prediction head shipped *with* the model weights
-  (DeepSeek-V3/V4, Qwen3.5/3.6 style).
+- **MTP** — learned multi-token-prediction head shipped *with* the model weights.
+  Hipfire currently serves the DeepSeek-V3/V4 form; Qwen3.5/3.6 native MTP
+  artifacts remain disabled pending SPEC-003.
 - **DFlash** — hipfire's block-diffusion drafter (published technique, arXiv
   2602.06036 / Z Lab). Qwen35-specific bespoke path
   (`crates/hipfire-arch-qwen35/src/dflash_spec.rs`); also available for any
@@ -35,8 +36,8 @@ exists upstream. Compiled from a per-architecture audit (one agent per arch crat
 
 | Arch crate | arch_id | Model family | In-repo spec support | Native drafter? | Daemon-wired? |
 |---|---|---|---|---|---|
-| qwen35 | 5/6 | Qwen3.5/3.6 (DeltaNet hybrid) | DFlash + MTP + n-gram + SpecTarget verify | ✅ DFlash (default greedy) + MTP head | ✅ DFlash & n-gram default-wired; MTP gated `HIPFIRE_QWEN35_MTP=1` |
-| deepseek4 | 9 | DeepSeek-V4 (MLA+MoE) | MTP + SpecTarget verify | ✅ MTP head (ships in weights) | ✅ auto at temp=0 if MTP weights present (spec_k=2, greedy-only) |
+| qwen35 | 5/6 | Qwen3.5/3.6 (DeltaNet hybrid) | DFlash + n-gram + SpecTarget verify; native MTP deferred | ✅ DFlash (default greedy); native MTP head is not served | ✅ DFlash & n-gram default-wired; native MTP disabled pending SPEC-003 |
+| deepseek4 | 9 | DeepSeek-V4 (MLA+MoE) | MTP + SpecTarget verify | ✅ MTP head (ships in weights) | ✅ auto at temp=0 if MTP weights present (load-resolved `mtp_k`, default 3, range 1–8; greedy-only) |
 | llama | 0/1 | Llama/Mistral/Qwen3 dense | DFlash (block-diffusion, z-lab-style draft) + n-gram + SpecTarget verify | ✅ DFlash via external arch_id=20 HFQ draft (see below) | ✅ DFlash auto if `params.draft` is set to an arch_id=20 HFQ; n-gram opt-in `HIPFIRE_NGRAM_DRAFT=1` |
 | qwen2 | 7 | Qwen2/2.5, VibeThinker | n-gram + SpecTarget verify (block-parallel) | ❌ (model-free n-gram only) | ✅ n-gram opt-in |
 | qwen35-vl | 5 | Qwen3.5/3.6-VL | none (VL path is AR, CPU-sampled) | ❌ | ❌ (text backbone *is* qwen35 — reusable) |
@@ -45,7 +46,7 @@ exists upstream. Compiled from a per-architecture audit (one agent per arch crat
 | cohere2moe | 12 | Cohere2-MoE / North-Mini-Code | n-gram + SpecTarget verify (sliding-window seq) | ❌ (model-free n-gram only) | ✅ n-gram opt-in (+ `Cohere2MoeEmit`) |
 | dots-ocr | 8 | rednote dots.ocr (Qwen2-1.5B decoder) | n-gram + SpecTarget verify (VL decode-phase) | ❌ (model-free n-gram only) | ✅ n-gram opt-in (image-conditioned prefill unchanged) |
 
-**Has real speculation today:** qwen35 (DFlash + MTP), deepseek4 (MTP),
+**Has real speculation today:** qwen35 (DFlash + n-gram), deepseek4 (MTP),
 llama/qwen3 (DFlash via generic chain speculator + n-gram), qwen2 (n-gram).
 Everything else is plain autoregressive.
 
@@ -54,8 +55,10 @@ Everything else is plain autoregressive.
 ### qwen35 (arch 5/6, DeltaNet) — richest
 - **DFlash** diffusion drafter: `dflash_spec.rs` (`DflashSpeculator`/`DflashState`),
   default production path for greedy generation, daemon-wired via `generate_dflash`→`generate_spec`.
-- **MTP** head: `mtp_head.rs`/`mtp_speculator.rs` (`Qwen35MtpDrafter`), daemon-wired
-  but gated `HIPFIRE_QWEN35_MTP=1` + requires `.mq4-mtp` bundle.
+- **Native MTP** head: implementation artifacts remain in `mtp_head.rs`/
+  `mtp_speculator.rs`, but serving is disabled pending SPEC-003. Qwen
+  `mtp_mode=on` rejects before native-head preflight, open, or GPU upload;
+  `auto` and `off` remain AR-only and do not inspect a head.
 - **n-gram**: opt-in `HIPFIRE_NGRAM_DRAFT=1`.
 - **SpecTarget verify**: `spec_impl.rs` (`ModelSlot`), with DeltaNet snapshot/rollback.
 - **Gap:** DFlash+MTP *composite* (`mtp_compose.rs`) validated in demos only, not
@@ -64,7 +67,9 @@ Everything else is plain autoregressive.
 ### deepseek4 (arch 9, MLA+MoE)
 - **MTP** drafter: `mtp_speculator.rs` (`Deepseek4MtpDrafter`), daemon-wired via
   `generate_deepseek4_spec`→`generate_spec`. Auto-activates at `temp=0` when MTP
-  weights present (`mtp_mode=auto`). spec_k default 2 (`HIPFIRE_DEEPSEEK4_SPEC_K`→`HIPFIRE_MTP_K`→2).
+  weights present (`mtp_mode=auto`). The daemon resolves MTP K once at load: valid
+  `HIPFIRE_DEEPSEEK4_SPEC_K` → `HIPFIRE_MTP_K` → load parameter → default 3
+  (all 1–8); generation reads the resulting metadata.
 - **Greedy-only** (`requires_greedy()=true`); **no n-gram fallback** (`spec_impl.rs`
   n-gram primitives intentionally return `Err`).
 - Upstream: DeepSeek-V3/V4 ship 1 MTP module in public weights (`num_nextn_predict_layers=1`).

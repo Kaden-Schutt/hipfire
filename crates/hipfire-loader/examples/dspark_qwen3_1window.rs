@@ -38,6 +38,8 @@ fn main() -> Result<(), String> {
     let max_seq = 512usize;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
+        mtp_mode: None,
+        mtp_k: None,
         dspark: None, // auto: load sidecar if present
         ..Default::default()
     };

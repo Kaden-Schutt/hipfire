@@ -39,10 +39,18 @@ fn main() {
     // Two full cycles: the reload proves the first unload freed cleanly. Pre-fix,
     // the FIRST unload already panicked at `pp_gpus.expect`.
     for cycle in 0..2 {
-        let m = hipfire_loader::load_model_pp(model_path, MAX_SEQ, &mesh)
-            .unwrap_or_else(|e| panic!("cycle {cycle}: load_model_pp failed: {e}"));
+        let m = hipfire_loader::load_model_pp(
+            model_path,
+            MAX_SEQ,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        )
+        .unwrap_or_else(|e| panic!("cycle {cycle}: load_model_pp failed: {e}"));
         assert!(
-            matches!(m.parallel.kind(), hipfire_loader::ModelParallelKind::PpDense),
+            matches!(
+                m.parallel.kind(),
+                hipfire_loader::ModelParallelKind::PpDense
+            ),
             "cycle {cycle}: dense PP model is not ModelParallel::Pp(Dense)"
         );
         // Pre-fix: panics here at unload_model falling into the qwen35-PP arm.

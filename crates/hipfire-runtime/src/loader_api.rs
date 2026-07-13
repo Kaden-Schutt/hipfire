@@ -71,6 +71,10 @@ pub struct LoadCtx<'a> {
     /// VRAM-delta gate OFF); `None` → uniform (`init_uniform`, gate ON). Only
     /// ever set on the qwen35 PP path.
     pub pp_bands: Option<&'a [usize]>,
+    /// Load-resolved MTP mode for immutable model metadata.
+    pub mtp_mode: &'static str,
+    /// Load-resolved MTP K for model construction and speculative decoding.
+    pub mtp_k: usize,
     pub spec: SpecLoadCfg,
     pub gpu: &'a mut Gpu,
 }
@@ -84,10 +88,15 @@ pub struct LoadCtx<'a> {
 ///
 /// The master `speculation` selector lives entirely CLI-side: it is lowered into
 /// the per-mechanism signals (`dflash_mode`/`draft`, `mtp_mode`, and this), so
-/// `build_speculator`'s first-match cascade (dflash > mtp > n-gram) naturally
+/// `build_speculator`'s first-match cascade (dflash > n-gram) naturally
 /// yields the chosen mechanism without the loader needing a selector of its own.
 #[derive(Clone, Copy, Default)]
 pub struct SpecLoadCfg {
+    /// Load-resolved MTP mode. `None` = auto, `Some(true)` = on,
+    /// `Some(false)` = off.
+    pub mtp_mode: Option<bool>,
+    /// Load-resolved MTP K. `None` = loader default.
+    pub mtp_k: Option<usize>,
     /// Enable the model-free n-gram drafter for this load. `None` = unspecified.
     pub ngram_draft: Option<bool>,
     /// n-gram draft window K (`HIPFIRE_NGRAM_DRAFT_K`). `None` = loader default.

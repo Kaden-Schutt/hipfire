@@ -390,6 +390,8 @@ impl LoadedModel {
         physical_cap: usize,
         model_path: String,
         chat_template: Option<String>,
+        mtp_mode: &str,
+        mtp_k: usize,
     ) -> Self {
         LoadedModel {
             parallel: ModelParallel::Single,
@@ -398,7 +400,10 @@ impl LoadedModel {
             tokenizer: Some(tokenizer),
             eviction: None,
             session: SessionState::default(),
-            persist: PersistState { asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None },
+            persist: PersistState {
+                asst_turn_cache: AsstTurnCache::new_from_env(),
+                decoded_vocab: None,
+            },
             speculator: None,
             meta: ModelMeta {
                 arch_id,
@@ -407,8 +412,8 @@ impl LoadedModel {
                 max_seq,
                 physical_cap,
                 eos_tok: 0,
-                mtp_mode: "auto".to_string(),
-                mtp_k: 3,
+                mtp_mode: mtp_mode.to_string(),
+                mtp_k,
                 rec_temperature: None,
                 rec_top_p: None,
                 rec_top_k: None,
@@ -513,17 +518,12 @@ impl LoadedModel {
         }
     }
 
-    /// Whether the loaded model carries MTP/spec weights that `mtp_mode=auto`
-    /// should treat as spec-eligible. Derived (not cached): DeepSeek V4's bundled
-    /// `mtp_layer` or a DSpark sidecar, OR a Qwen3.5/3.6 native MTP head. Both
-    /// are load-time-fixed, so computing on read is exact and drift-free.
+    /// Whether the loaded DeepSeek model carries MTP/spec weights that
+    /// `mtp_mode=auto` should treat as spec-eligible.
     pub fn mtp_weights_present(&self) -> bool {
-        let ds4 = self
-            .deepseek4()
+        self.deepseek4()
             .map(|b| b.weights.mtp_layer.is_some() || b.weights.dspark.is_some())
-            .unwrap_or(false);
-        let qwen35 = self.qwen35().map(|b| b.mtp_head.is_some()).unwrap_or(false);
-        ds4 || qwen35
+            .unwrap_or(false)
     }
 
     /// Disjoint-field borrow of the request-scoped sub-structs. Native
@@ -545,6 +545,8 @@ impl LoadedModel {
         physical_cap: usize,
         model_path: String,
         chat_template: Option<String>,
+        mtp_mode: &str,
+        mtp_k: usize,
         gpus: Gpus,
     ) -> Self {
         LoadedModel {
@@ -556,6 +558,8 @@ impl LoadedModel {
                 physical_cap,
                 model_path,
                 chat_template,
+                mtp_mode,
+                mtp_k,
             )
         }
     }
@@ -902,54 +906,8 @@ fn finish_qwen35_load(
     } else {
         None
     };
-    // ── qwen35 MTP head (opt-in, bundled .mq4-mtp only) ────────────
-    // Loaded ONLY when HIPFIRE_QWEN35_MTP=1, the trunk is a bundled `.mq4-mtp`
-    // file, no DFlash draft was requested (DFlash wins), eviction is None (the
-    // MTP head KV is not FlashCASK-compacted), and arch is qwen35 (5/6). Gated
-    // here — not in build_speculator — because this is the only site with a
-    // `&mut Gpu` to free on decline, and the head allocates GPU buffers.
-    let mtp = if dflash.is_none()
-        && dspark_speculator.is_none()
-        && eviction.is_none()
-        && matches!(arch_id, 5 | 6)
-        && std::env::var("HIPFIRE_QWEN35_MTP").ok().as_deref() == Some("1")
-        && ctx.path.ends_with(".mq4-mtp")
-    {
-        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
-            std::path::Path::new(ctx.path),
-            ctx.gpu,
-            ctx.max_seq,
-        ) {
-            Ok(Some(head)) => {
-                eprintln!(
-                    "  MTP head loaded from bundle: n_embd={} vocab={} (compressed_lm_head_draft={})",
-                    head.config.n_embd,
-                    head.config.vocab_size,
-                    head.weights.lm_head_draft.is_some(),
-                );
-                Some(head)
-            }
-            Ok(None) => {
-                eprintln!(
-                    "  HIPFIRE_QWEN35_MTP=1 but {} has no bundled MTP trailer — AR/n-gram only",
-                    ctx.path
-                );
-                None
-            }
-            Err(e) => {
-                eprintln!(
-                    "  MTP head load failed ({}): {e} — AR/n-gram only",
-                    ctx.path
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
-    // else a bundled MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in)
-    // the model-free n-gram drafter. `eviction` is borrowed (not moved) here, so
+    // Pick the arch-generic speculator: a loaded DFlash draft, else the opt-in
+    // model-free n-gram drafter. `eviction` is borrowed (not moved) here, so
     // it is still available for the struct literal below; `config`/`dn_state` are
     // borrowed only for the n-gram arm's scratch construction (snapshot copied to
     // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
@@ -958,74 +916,12 @@ fn finish_qwen35_load(
         crate::spec_build::build_speculator(
             arch_id,
             dflash,
-            mtp,
             eviction.is_none(),
             physical_cap,
             ctx.spec,
         )
     });
 
-    // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
-    //
-    // Load the arch_id=21 MTP head when it is present either bundled in the
-    // trunk file (a `.mq4-mtp` trailer, magic HFBNDMTP) or as a sibling `.mtp`
-    // sidecar (`<trunk>.mtp` next to the model path). The head is OPTIONAL:
-    // `Ok(None)` / a missing sidecar just leaves MTP serving unavailable and
-    // the model serves via the unchanged DFlash/AR path. Failures here are
-    // non-fatal — log and continue with `qwen35_mtp_head = None`.
-    //
-    // max_seq mirrors the trunk's KV capacity (the MTP head's KV is a single
-    // F32 layer, so even a 100K window is only a few hundred MB at dim=5120).
-    let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = {
-        use hipfire_arch_qwen35::mtp_head;
-        let trunk_path = Path::new(ctx.path);
-        // 1. Bundled trailer inside the trunk file?
-        let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
-                None
-            }
-        };
-        match bundled {
-            Some(h) => {
-                eprintln!(
-                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={} K-default=3",
-                    h.config.n_embd, h.config.vocab_size
-                );
-                Some(h)
-            }
-            None => {
-                // 2. Sidecar `<trunk>.mtp` next to the model path?
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
-                    match mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
-                        Ok(h) => {
-                            eprintln!(
-                                "  MTP head loaded (sidecar {}): n_embd={} vocab={} K-default=3",
-                                sidecar.display(),
-                                h.config.n_embd,
-                                h.config.vocab_size
-                            );
-                            Some(h)
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
-                                sidecar.display()
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-        }
-    };
-
-    let mut bundle = bundle;
-    bundle.mtp_head = qwen35_mtp_head;
     let state = Some(ModelState::Qwen35(bundle));
     let model = LoadedModel {
         state,
@@ -1041,12 +937,40 @@ fn finish_qwen35_load(
             physical_cap,
             ctx.path.to_string(),
             chat_template,
+            ctx.mtp_mode,
+            ctx.mtp_k,
         )
     };
     Ok(model)
 }
 
 // ─── Main public API ──────────────────────────────────────────────────
+
+fn normalize_mtp_k(arch_id: u32, mtp_k: Option<usize>) -> Result<usize, String> {
+    let _ = arch_id;
+    let value = mtp_k.unwrap_or(3);
+    if (1..=8).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("MTP K must be in 1..=8, got {value}"))
+    }
+}
+
+pub(crate) fn reject_qwen_native_mtp(mtp_mode: &str) -> Result<(), String> {
+    if mtp_mode == "on" {
+        Err("Qwen native MTP is disabled pending SPEC-003".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn mtp_mode_from_spec(spec: SpecLoadCfg) -> &'static str {
+    match spec.mtp_mode {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    }
+}
 
 /// Load a model from an HFQ file (or safetensors directory). This is the
 /// single arch-dispatch point via the carrier registry.
@@ -1065,6 +989,10 @@ pub fn load_model(
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     let src = ModelSource::from_path(path)?;
+    let source_arch_id = match &src {
+        ModelSource::Hfq(hfq) => hfq.arch_id,
+        ModelSource::Dir(source) => source.arch_id(),
+    };
 
     // Author-recommended sampling defaults (temp/top_p/top_k from the .hfq's baked
     // `generation_config`). Extract HERE, from the already-open source, BEFORE the
@@ -1151,6 +1079,7 @@ pub fn load_model(
         }
     }
 
+    let mtp_mode = mtp_mode_from_spec(spec);
     let mut ctx = LoadCtx {
         path,
         max_seq,
@@ -1161,6 +1090,8 @@ pub fn load_model(
         cask,
         pp: mesh.size_of(DimKind::Pp),
         pp_bands,
+        mtp_mode,
+        mtp_k: normalize_mtp_k(source_arch_id, spec.mtp_k)?,
         spec,
         gpu,
     };
@@ -1198,6 +1129,8 @@ fn load_cohere2moe(
     gpu: &mut Gpu,
     max_seq: usize,
     path: &str,
+    mtp_mode: &str,
+    mtp_k: usize,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     let config = <cohere2moe::Cohere2Moe as Architecture>::config_from_hfq(&hfq)?;
@@ -1233,6 +1166,8 @@ fn load_cohere2moe(
             max_seq,
             path.to_string(),
             chat_template,
+            mtp_mode,
+            mtp_k,
         )
     })
 }
@@ -1448,11 +1383,18 @@ impl Drop for MinimaxEpStaging {
 /// (`HIPFIRE_EP_FAIL_RANK`) fires AFTER a rank's constructor returns `Ok`, so it
 /// tests the completed-rank cleanup path (which IS fixed), not this inner window.
 /// The proper fix is an unwind-safe allocation-tracking loader refactor. Deferred.
-pub fn load_model_ep(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<LoadedModel, String> {
+pub fn load_model_ep(
+    path: &str,
+    max_seq: usize,
+    mesh: &DeviceMesh,
+    spec: SpecLoadCfg,
+) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let mtp_mode = mtp_mode_from_spec(spec);
+    let mtp_k = normalize_mtp_k(hfq.arch_id, spec.mtp_k)?;
     match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, mesh),
-        10 => load_model_ep_minimax(path, max_seq, mesh),
+        9 => load_model_ep_ds4(path, max_seq, mesh, mtp_mode, mtp_k),
+        10 => load_model_ep_minimax(path, max_seq, mesh, mtp_mode, mtp_k),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
         )),
@@ -1470,11 +1412,18 @@ pub fn load_model_ep(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
 /// `LlamaWeights` from a `WeightStore`, per-rank scratch/KV, a `Gpus`-threaded
 /// decode loop, and `tp_decode_parity` — is **PB-TP5** and not yet done, so this
 /// returns a clear error rather than silently falling back to single-GPU.
-pub fn load_model_tp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<LoadedModel, String> {
+pub fn load_model_tp(
+    path: &str,
+    max_seq: usize,
+    mesh: &DeviceMesh,
+    spec: SpecLoadCfg,
+) -> Result<LoadedModel, String> {
     // Host-side metadata BEFORE GPU allocation (chat template + recommended
     // sampling), matching the ds4/minimax EP loaders.
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let arch_id = hfq.arch_id;
+    let mtp_mode = mtp_mode_from_spec(spec);
+    let mtp_k = normalize_mtp_k(arch_id, spec.mtp_k)?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let chat_template = resolve_chat_template(&hfq, path);
@@ -1493,8 +1442,8 @@ pub fn load_model_tp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
             max_seq,
             physical_cap: max_seq,
             eos_tok,
-            mtp_mode: "auto".to_string(),
-            mtp_k: 3,
+            mtp_mode: mtp_mode.to_string(),
+            mtp_k,
             rec_temperature: rec.and_then(|r| r.temperature),
             rec_top_p: rec.and_then(|r| r.top_p),
             rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
@@ -1508,6 +1457,8 @@ pub fn load_model_tp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
             max_seq,
             path.to_string(),
             chat_template,
+            mtp_mode,
+            mtp_k,
         )
     })
 }
@@ -1518,9 +1469,16 @@ pub fn load_model_tp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
 /// path (`load_qwen35_pp`); this is the arch-generic driver-owned loop for
 /// llama-family models. Served via the daemon's `generate_pp` (the shared
 /// `generate_dense` loop).
-pub fn load_model_pp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<LoadedModel, String> {
+pub fn load_model_pp(
+    path: &str,
+    max_seq: usize,
+    mesh: &DeviceMesh,
+    spec: SpecLoadCfg,
+) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let arch_id = hfq.arch_id;
+    let mtp_mode = mtp_mode_from_spec(spec);
+    let mtp_k = normalize_mtp_k(arch_id, spec.mtp_k)?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let chat_template = resolve_chat_template(&hfq, path);
@@ -1539,8 +1497,8 @@ pub fn load_model_pp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
             max_seq,
             physical_cap: max_seq,
             eos_tok,
-            mtp_mode: "auto".to_string(),
-            mtp_k: 3,
+            mtp_mode: mtp_mode.to_string(),
+            mtp_k,
             rec_temperature: rec.and_then(|r| r.temperature),
             rec_top_p: rec.and_then(|r| r.top_p),
             rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
@@ -1554,11 +1512,19 @@ pub fn load_model_pp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
             max_seq,
             path.to_string(),
             chat_template,
+            mtp_mode,
+            mtp_k,
         )
     })
 }
 
-fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<LoadedModel, String> {
+fn load_model_ep_ds4(
+    path: &str,
+    max_seq: usize,
+    mesh: &DeviceMesh,
+    mtp_mode: &str,
+    mtp_k: usize,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
@@ -1675,8 +1641,8 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
             max_seq,
             physical_cap: max_seq,
             eos_tok,
-            mtp_mode: "auto".to_string(),
-            mtp_k: 3,
+            mtp_mode: mtp_mode.to_string(),
+            mtp_k,
             rec_temperature: rec.and_then(|r| r.temperature),
             rec_top_p: rec.and_then(|r| r.top_p),
             rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
@@ -1690,6 +1656,8 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
             max_seq,
             path.to_string(),
             chat_template,
+            mtp_mode,
+            mtp_k,
         )
     })
 }
@@ -1698,6 +1666,8 @@ fn load_model_ep_minimax(
     path: &str,
     max_seq: usize,
     mesh: &DeviceMesh,
+    mtp_mode: &str,
+    mtp_k: usize,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
@@ -1820,8 +1790,8 @@ fn load_model_ep_minimax(
             max_seq,
             physical_cap: max_seq,
             eos_tok,
-            mtp_mode: "auto".to_string(),
-            mtp_k: 3,
+            mtp_mode: mtp_mode.to_string(),
+            mtp_k,
             rec_temperature: rec.and_then(|r| r.temperature),
             rec_top_p: rec.and_then(|r| r.top_p),
             rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
@@ -1835,6 +1805,8 @@ fn load_model_ep_minimax(
             max_seq,
             path.to_string(),
             chat_template,
+            mtp_mode,
+            mtp_k,
         )
     })
 }
@@ -2043,7 +2015,88 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
 
 #[cfg(test)]
 mod registry_tests {
-    use super::REGISTRY;
+    use super::{LoadedModel, REGISTRY};
+
+    fn test_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
+        hipfire_runtime::tokenizer::Tokenizer::from_hf_json(
+            r#"{"model":{"vocab":{"a":0},"merges":[]}}"#,
+        )
+        .expect("test tokenizer")
+    }
+
+    #[test]
+    fn skeleton_stores_supplied_mtp_k() {
+        let model = LoadedModel::skeleton(
+            5,
+            test_tokenizer(),
+            128,
+            128,
+            "model.mq4".to_string(),
+            None,
+            "auto",
+            6,
+        );
+
+        assert_eq!(model.meta.mtp_k, 6);
+    }
+
+    #[test]
+    fn skeleton_stores_supplied_mtp_mode() {
+        let model = LoadedModel::skeleton(
+            5,
+            test_tokenizer(),
+            128,
+            128,
+            "model.mq4".to_string(),
+            None,
+            "on",
+            6,
+        );
+
+        assert_eq!(model.meta.mtp_mode, "on");
+    }
+
+    #[test]
+    fn skeleton_stores_default_mtp_k() {
+        let model = LoadedModel::skeleton(
+            5,
+            test_tokenizer(),
+            128,
+            128,
+            "model.mq4".to_string(),
+            None,
+            "auto",
+            3,
+        );
+
+        assert_eq!(model.meta.mtp_k, 3);
+    }
+
+    #[test]
+    fn normalize_mtp_k_bounds_mtp_arches() {
+        let cases = [(1, 1), (8, 8)];
+        for arch_id in [5, 6, 9] {
+            for (input, expected) in cases {
+                assert_eq!(
+                    super::normalize_mtp_k(arch_id, Some(input)),
+                    Ok(expected),
+                    "arch_id={arch_id}, input={input}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_mtp_k_rejects_out_of_range_values() {
+        for arch_id in [5, 6, 9] {
+            for input in [0, 9, 10] {
+                assert!(
+                    super::normalize_mtp_k(arch_id, Some(input)).is_err(),
+                    "arch_id={arch_id}, input={input}"
+                );
+            }
+        }
+    }
 
     /// Every known arch_id must be claimed by AT MOST one carrier, for both
     /// source namespaces (HFQ header ids and `derive_arch_id` dir ids). This
@@ -2120,5 +2173,15 @@ mod registry_tests {
                 .count();
             assert_eq!(n, 0, "arch_id={id} (unassigned) should match no carrier");
         }
+    }
+
+    #[test]
+    fn qwen_mtp_on_is_rejected_before_native_head_loading() {
+        let error = super::reject_qwen_native_mtp("on")
+            .expect_err("Qwen native MTP must remain disabled pending SPEC-003");
+
+        assert!(error.contains("SPEC-003"), "{error}");
+        assert!(super::reject_qwen_native_mtp("auto").is_ok());
+        assert!(super::reject_qwen_native_mtp("off").is_ok());
     }
 }

@@ -44,6 +44,8 @@ fn main() {
         cask: &cask,
         pp: 1,
         pp_bands: None,
+        mtp_mode: "auto",
+        mtp_k: 3,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
     };

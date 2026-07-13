@@ -258,18 +258,21 @@ PFlash long-context prefill compression. `prefill_compression=auto` enables. Mos
 - `HIPFIRE_PREFILL_MAX_BATCH` — max prefill batch size when batched mode is on.
 - `HIPFIRE_PREFILL_REUSE_PBS=1` — reuse the pre-batched scratch across prefill calls.
 
-### `SPECULATION-SELECTOR` (5)
+### `SPECULATION-SELECTOR` (8)
 
 Top-of-ladder env overrides for the unified `speculation` config (see
-[CONFIG.md](CONFIG.md#speculative-decode)). The CLI's `--spec` / `-md` /
-`--draft-max` flags lower into these; an exported env var wins over both flag
-and config. The CLI then resolves them per-model into the load message.
+[CONFIG.md](CONFIG.md#speculative-decode)). The CLI's `--spec` / `-md` flags
+lower into these; an exported env var wins over both flag and config. The CLI
+then resolves them per-model into the load message.
 
 - `HIPFIRE_SPECULATION` — mechanism selector: `off`/`auto`/`ngram`/`dflash`/`mtp`. Maps to `cfg.speculation`.
 - `HIPFIRE_NGRAM_DRAFT=1` — force the model-free n-gram drafter (also the load-param `ngram_draft`). Maps to `cfg.ngram_mode`. **Read by the loader directly and always wins** (keeps a directly-driven daemon working).
 - `HIPFIRE_NGRAM_DRAFT_K` — n-gram draft window K. Maps to `cfg.ngram_k`.
 - `HIPFIRE_NGRAM_MIN_COUNT` — n-gram min match count. Maps to `cfg.ngram_min_count`.
-- `HIPFIRE_DRAFT_MAX` — `--draft-max`: window of the active mechanism (routed to `ngram_k` or `mtp_k`).
+- `HIPFIRE_DRAFT_MAX` — `--draft-max`: forwarded to an explicitly selected mechanism's window. Under `speculation=auto`, only DeepSeek routes it to strict MTP K; non-DeepSeek DFlash/n-gram auto routes keep their configured windows.
+- `HIPFIRE_MTP_K` — direct daemon MTP K override (`1..8`). It takes precedence over the load-message value, including a CLI `--draft-max` value.
+- `HIPFIRE_DEEPSEEK4_SPEC_K` — legacy DeepSeek-only direct daemon MTP K override (`1..8`); ignored by other architectures.
+- `HIPFIRE_MTP_MODE` — direct daemon MTP mode override: `off`, `auto`, or `on`. Qwen `on` rejects pending SPEC-003; Qwen `auto` and `off` use AR.
 
 ### `DFLASH-USER` (3)
 
