@@ -110,6 +110,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]);
     }
+    if kernel.starts_with("conv1d_silu_split_qknorm_") {
+        return Some(vec![
+            write(0),
+            write(8),
+            write(16),
+            read(24),
+            read(32),
+            write(40),
+        ]);
+    }
     match kernel {
         "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "fused_qkvza_hfq4g256" => Some(vec![
@@ -199,6 +209,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     if kernel.starts_with("gated_delta_net_q8_compact2_") {
         return Some(96);
+    }
+    if kernel.starts_with("conv1d_silu_split_qknorm_") {
+        return Some(80);
     }
     if kernel == "moe_router_softmax_topk_k8_wave64" {
         return Some(32);
@@ -1642,6 +1655,11 @@ mod tests {
             Some(96)
         );
         assert!(pointer_effects("gated_delta_net_q8_compact2_b2").is_some());
+        assert_eq!(
+            expected_kernarg_bytes("conv1d_silu_split_qknorm_b256"),
+            Some(80)
+        );
+        assert!(pointer_effects("conv1d_silu_split_qknorm_b256").is_some());
         assert_eq!(
             Pm4WaitPolicy::from_value("resource"),
             Some(Pm4WaitPolicy::Resource)

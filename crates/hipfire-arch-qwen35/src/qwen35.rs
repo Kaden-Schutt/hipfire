@@ -13732,24 +13732,41 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     a_log,
                     self.n_v_heads,
                 )?;
-                gpu.conv1d_silu_split_f32(
-                    &s.dn_q_raw,
-                    &s.dn_k_raw,
-                    &s.dn_v,
-                    &s.dn_qkv,
-                    conv_weight,
-                    &self.dn_state.conv_states[self.delta_layer_idx],
-                    self.k_dim,
-                    self.v_dim,
-                )?;
-                gpu.fused_qk_l2_norm_scale_f32(
-                    &s.dn_q_raw,
-                    &s.dn_k_raw,
-                    config.linear_num_key_heads,
-                    self.hd,
-                    1.0 / (self.hd as f32).sqrt(),
-                    config.norm_eps,
-                )?;
+                if conv_qknorm_enabled(gpu, config, self.dn_state.quant) {
+                    gpu.conv1d_silu_split_qknorm(
+                        &s.dn_q_raw,
+                        &s.dn_k_raw,
+                        &s.dn_v,
+                        &s.dn_qkv,
+                        conv_weight,
+                        &self.dn_state.conv_states[self.delta_layer_idx],
+                        self.k_dim,
+                        self.v_dim,
+                        config.linear_num_key_heads,
+                        self.hd,
+                        1.0 / (self.hd as f32).sqrt(),
+                        config.norm_eps,
+                    )?;
+                } else {
+                    gpu.conv1d_silu_split_f32(
+                        &s.dn_q_raw,
+                        &s.dn_k_raw,
+                        &s.dn_v,
+                        &s.dn_qkv,
+                        conv_weight,
+                        &self.dn_state.conv_states[self.delta_layer_idx],
+                        self.k_dim,
+                        self.v_dim,
+                    )?;
+                    gpu.fused_qk_l2_norm_scale_f32(
+                        &s.dn_q_raw,
+                        &s.dn_k_raw,
+                        config.linear_num_key_heads,
+                        self.hd,
+                        1.0 / (self.hd as f32).sqrt(),
+                        config.norm_eps,
+                    )?;
+                }
                 if gdn_compact2_enabled(gpu, config, self.n_v_heads, self.dn_state.quant) {
                     // The compact Q8 recurrence maps state head h to Q/K head
                     // h/2 directly. Leave the normalized tensors compact and
@@ -13958,6 +13975,13 @@ fn gdn_compact2_enabled(
         && quant == StateQuant::Q8
         && config.linear_num_key_heads * 2 == n_v_heads
         && std::env::var("HIPFIRE_GDN_COMPACT2").ok().as_deref() != Some("0")
+}
+
+fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
+    gpu.arch_caps.is_gfx1201()
+        && quant == StateQuant::Q8
+        && config.linear_key_head_dim == 128
+        && std::env::var("HIPFIRE_CONV_QKNORM").ok().as_deref() != Some("0")
 }
 
 /// Lowered (#397 Ship 6) single-GPU decode layer loop. Behaviorally equivalent

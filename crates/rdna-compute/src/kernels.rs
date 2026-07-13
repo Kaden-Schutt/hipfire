@@ -3292,6 +3292,27 @@ pub const CONV1D_SILU_SRC: &str = include_str!("../../../kernels/src/conv1d_silu
 #[cfg(feature = "deltanet")]
 pub const CONV1D_SILU_SPLIT_SRC: &str = include_str!("../../../kernels/src/conv1d_silu_split.hip");
 
+pub const CONV1D_SILU_SPLIT_QKNORM_B32_SRC: &str = concat!(
+    "#define HIPFIRE_CQN_BLOCK 32\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b32\n",
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
+);
+pub const CONV1D_SILU_SPLIT_QKNORM_B64_SRC: &str = concat!(
+    "#define HIPFIRE_CQN_BLOCK 64\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b64\n",
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
+);
+pub const CONV1D_SILU_SPLIT_QKNORM_B128_SRC: &str = concat!(
+    "#define HIPFIRE_CQN_BLOCK 128\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b128\n",
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
+);
+pub const CONV1D_SILU_SPLIT_QKNORM_B256_SRC: &str = concat!(
+    "#define HIPFIRE_CQN_BLOCK 256\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b256\n",
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
+);
+pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
+    "#define HIPFIRE_CQN_BLOCK 512\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b512\n",
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
+);
+
 /// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
 /// ancestor chain via parent_indices[] for the 3-tap causal window, falling
 /// back to pre-block conv_state when the chain exits the block. Leaves
