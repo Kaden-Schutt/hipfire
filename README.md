@@ -4,9 +4,9 @@ LLM inference for AMD RDNA GPUs. Rust + HIP. Single binary. No Python
 in the hot path. Ollama-style UX.
 
 ```bash
-hipfire pull lfm2.5:1.2b   # 1.25 GB — small dense model, fast first token
-hipfire serve -d           # background daemon, OpenAI-compatible API on 0.0.0.0:11435
-hipfire chat lfm2.5:1.2b   # interactive chat (auto-starts serve if it isn't running)
+hipfire pull qwen3.5:4b          # 2.59 GB — fast, capable default for getting started
+hipfire serve qwen3.5:4b -d      # pre-warm it; OpenAI-compatible API on 0.0.0.0:11435
+hipfire chat qwen3.5:4b          # interactive chat (reuses the background server)
 ```
 
 One-shot prompts and bigger models work the same way:
@@ -71,10 +71,12 @@ ships pre-compiled kernel blobs when possible and JIT-compiles the
 rest through HIP. No Python, no PyTorch, no ROCm userspace stack at
 runtime.
 
-## Headline numbers — 7900 XTX (gfx1100)
+## Performance snapshots
 
-Decode tok/s, default config (measured at asym3 KV — perf-equivalent
-to today's `fwht3` per-arch default; FlashAttention auto):
+### Historical — 7900 XTX (gfx1100)
+
+Historical decode snapshot measured with the then-default asym3 KV
+configuration (FlashAttention auto):
 
 | Model | hipfire decode | hipfire prefill (peak) | vs ollama Q4_K_M |
 |---|---:|---:|---:|
@@ -83,11 +85,13 @@ to today's `fwht3` per-arch default; FlashAttention auto):
 | Qwen 3.5 9B | **132** | 1663 | **1.71×** decode |
 | Qwen 3.5 27B | **47** | 478 | — |
 
-DFlash speculative decode lifts code prompts further: **218 tok/s peak
-on 27B HumanEval/53** (4.45× over AR), **372 tok/s peak on 9B**.
-DFlash speedup is genre-conditional — see
+Historical DFlash measurements using the legacy asym3 / max=120 method
+reached **218 tok/s peak on 27B HumanEval/53** (4.45× over AR) and
+**372 tok/s peak on 9B**. These numbers are retained for historical
+context; they are not current performance baselines. Current DFlash
+claims use q8 / max=256 with prompt and binary hashes recorded. See
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full per-genre table
-and the cross-arch matrix (RDNA1 / RDNA2 / APU / MI300X).
+and methodology notice.
 
 ### RDNA4 (gfx1201, Radeon AI PRO R9700)
 

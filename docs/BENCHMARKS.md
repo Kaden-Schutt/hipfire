@@ -6,11 +6,11 @@ medians across 5 runs unless noted. See
 [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md) for
 the protocol and the noise band you should expect when reproducing.
 
-> **KV-mode note:** these numbers were measured pre-fwht3-default (the
-> per-arch default is now `fwht3`/`fwht2`, not `asym3`). They remain
-> valid for `asym3` KV. `fwht3` shares `asym3`'s byte layout and is
-> perf-equivalent (it differs only in K-rotation basis), so the decode /
-> BW figures carry over; the asym3 rows are not re-benched here.
+> **Historical configuration note:** these numbers were measured with
+> the then-default `asym3` KV mode. A clean current configuration resolves
+> `kv_cache=auto` through the model registry and otherwise falls back to
+> `q8`. Treat the tables below as historical snapshots unless a section
+> explicitly says it follows the current q8 methodology.
 
 ## Autoregressive decode (no spec) — 7900 XTX (gfx1100)
 
@@ -28,14 +28,21 @@ projections.
 
 ## DFlash speculative decode by genre — 7900 XTX
 
+> **Historical methodology (superseded):** the table in this section used
+> `asym3` KV and `max_tokens=120`. It is retained only as a record of the
+> earlier measurements and must not be used as the current DFlash baseline.
+> Current DFlash performance claims require `q8`, `max_tokens=256`, at
+> least three fresh-process runs, prompt and binary hashes, a
+> `./scripts/coherence-gate-dflash.sh` pass, and a decoded-output eyeball
+> check. The table will be replaced after it is rerun under that protocol.
+
 DFlash speedup is **genre-conditional**. Code prompts whose target
 distribution matches the draft win big; long-form prose where the
 target's high-entropy continuations diverge from draft predictions can
 be a net loss.
 
-5-run medians, asym3 KV, `--no-chatml`, `max_tokens=120`,
-`prompt_normalize=true` (measured pre-fwht3-default; numbers remain
-valid for asym3 KV):
+5-run medians under the historical configuration: asym3 KV,
+`--no-chatml`, `max_tokens=120`, `prompt_normalize=true`:
 
 | Model | genre | AR tok/s | DFlash tok/s | speedup | τ |
 |---|---|---:|---:|---:|---:|
@@ -59,10 +66,9 @@ on.
 
 ## vs ollama (Q4_K_M GGUF) — 7900 XTX
 
-Same machine, same models. hipfire MQ4 (asym3 KV, FlashAttention;
-measured pre-fwht3-default, numbers remain valid for asym3 KV) vs
-ollama default Q4_K_M through llama.cpp's ROCm backend. Matched
-~140-token and ~530-token prompts and matched 128-token generation
+Historical same-machine snapshot: hipfire MQ4 with asym3 KV and
+FlashAttention versus ollama Q4_K_M through llama.cpp's ROCm backend.
+Matched ~140-token and ~530-token prompts and matched 128-token generation
 lengths. Ollama numbers extracted from its own `prompt_eval_duration` /
 `eval_duration` reporting via `/api/generate` with `num_predict=128`.
 
@@ -83,7 +89,7 @@ Harness: [`cli/bench_vs_ollama.ts`](../cli/bench_vs_ollama.ts).
 
 ## Other arches
 
-Decode tok/s, default config:
+Historical decode tok/s under the then-default configuration:
 
 | Arch | Examples | 0.8B | 4B | 9B | 27B |
 |---|---|---:|---:|---:|---:|
@@ -94,9 +100,10 @@ Decode tok/s, default config:
 | MI300X (gfx942) | datacenter | 850 | 480 | 320 | 130 |
 
 MI300X is wave64 + MFMA — different kernel family. RDNA4 (gfx1200 /
-gfx1201) ships a dispatch fallback to dot2 today; per-arch WMMA
-kernels are in progress (issue #54). gfx906 (Vega 20) uses the
-nwarps=4 dp4a MMQ kernel for prefill at batch≥16
+gfx1201) now has gfx12-specific WMMA paths across fused GEMM, attention,
+and MoE kernels; operations without a gfx12 sibling still fall back
+through the typed dispatch tables. gfx906 (Vega 20) uses the nwarps=4
+dp4a MMQ kernel for prefill at batch≥16
 (`docs/plans/gfx906-mmq-prd.md`). Decode at batch=1 uses two
 gfx906-specific optimizations from the 2026-05-05 perf
 investigation
