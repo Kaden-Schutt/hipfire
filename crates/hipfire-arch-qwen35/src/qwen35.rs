@@ -13,8 +13,8 @@ use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, execute_steps_mesh, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
-use hipfire_hardware::DeviceMesh;
 use hipfire_dispatch::types::RotationPlan;
+use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
@@ -9641,8 +9641,13 @@ fn forward_prefill_chunk(
                     block_cols,
                     output: &pbs.fa_attn_out_batch,
                 };
-                execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[Step::Attend { plan, io }])
-                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+                execute_steps_mesh(
+                    &DeviceMesh::single(),
+                    gpu,
+                    &ctx,
+                    &[Step::Attend { plan, io }],
+                )
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
 
                 // 8. Fused sigmoid(gate) * attn_out, element-wise over the
                 // full [N × q_dim] tensor.
@@ -11173,8 +11178,13 @@ fn forward_prefill_chunk(
                     block_cols,
                     output: &pbs.fa_attn_out_batch,
                 };
-                execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[Step::Attend { plan, io }])
-                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+                execute_steps_mesh(
+                    &DeviceMesh::single(),
+                    gpu,
+                    &ctx,
+                    &[Step::Attend { plan, io }],
+                )
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 // wo + residual. Mirrors the dense FA wo dispatch at
                 // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
@@ -12596,7 +12606,8 @@ fn qkvza_via_execute_steps(
                 out: dn_alpha,
             },
         ];
-        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps)
+            .map_err(|e| HipError::new(0, &e.to_string()))
     } else {
         // FWHT-rotated (MQ family) or non-rotated (HFQ, Q8, etc.) dtypes.
         // RmsnormAutomatic handles FWHT when rotation != None;
@@ -12669,7 +12680,8 @@ fn qkvza_via_execute_steps(
                 out: dn_alpha,
             },
         ];
-        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps)
+            .map_err(|e| HipError::new(0, &e.to_string()))
     }
 }
 
@@ -12749,7 +12761,8 @@ fn qkv_via_execute_steps(
                 out: fa_v,
             },
         ];
-        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps)
+            .map_err(|e| HipError::new(0, &e.to_string()))
     } else {
         let wrq = WeightRef {
             buf: &wq.buf,
@@ -12805,7 +12818,8 @@ fn qkv_via_execute_steps(
                 out: fa_v,
             },
         ];
-        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps)
+            .map_err(|e| HipError::new(0, &e.to_string()))
     }
 }
 
@@ -12867,7 +12881,8 @@ fn gate_up_via_execute_steps(
                 out: up_out,
             },
         ];
-        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps)
+            .map_err(|e| HipError::new(0, &e.to_string()))
     } else {
         let wrg = WeightRef {
             buf: &w_gate.buf,
@@ -12909,7 +12924,8 @@ fn gate_up_via_execute_steps(
                 out: up_out,
             },
         ];
-        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &steps)
+            .map_err(|e| HipError::new(0, &e.to_string()))
     }
 }
 
@@ -13209,8 +13225,13 @@ fn kv_cache_attention_dispatch(
         block_cols: 0,
         output: &s.fa_attn_out,
     };
-    execute_steps_mesh(&DeviceMesh::single(), gpu, ctx, &[Step::Attend { plan, io }])
-        .map_err(|e| HipError::new(0, &e.to_string()))
+    execute_steps_mesh(
+        &DeviceMesh::single(),
+        gpu,
+        ctx,
+        &[Step::Attend { plan, io }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
 /// Multi-GPU layer-loop dispatcher (Stage 5 of multi-GPU pp migration #58).

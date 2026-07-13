@@ -1313,7 +1313,6 @@ impl GdnTape {
         }
         Ok(())
     }
-
 }
 
 impl DeltaNetTape {
@@ -3264,23 +3263,13 @@ pub fn spec_step_dflash(
                 let pat_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
                 let seed_u32 = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
                 gpu.batched_categorical_sample_f32(
-                    &probs_dev,
-                    &tau_dev,
-                    &z_dev,
-                    &tok_dev,
-                    &pat_dev,
-                    vocab,
-                    batch,
-                    seed_u32,
+                    &probs_dev, &tau_dev, &z_dev, &tok_dev, &pat_dev, vocab, batch, seed_u32,
                 )?;
                 // Download only tokens + probs: batch×8 bytes total.
                 let mut raw_tok = vec![0i32; batch];
                 {
                     let bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            raw_tok.as_mut_ptr() as *mut u8,
-                            batch * 4,
-                        )
+                        std::slice::from_raw_parts_mut(raw_tok.as_mut_ptr() as *mut u8, batch * 4)
                     };
                     gpu.hip.memcpy_dtoh(bytes, &tok_dev.buf)?;
                 }
@@ -3562,7 +3551,7 @@ pub fn spec_step_dflash(
             let z_d_dev = c8_draft_z_dev.as_ref().unwrap();
 
             let out_dev = gpu.alloc_tensor(&[4], rdna_compute::DType::F32)?; // 4×i32 via f32 slot
-            // kernel's b parameter = number of draft comparison positions = b-1
+                                                                             // kernel's b parameter = number of draft comparison positions = b-1
             let draft_b = b - 1;
             let rng_seed = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
             gpu.chain_accept_spec_f32(
@@ -3584,9 +3573,8 @@ pub fn spec_step_dflash(
             // Download 16 bytes: {accept_len, bonus_token, rejected_at, new_rng}
             let mut out_raw = [0i32; 4];
             {
-                let bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(out_raw.as_mut_ptr() as *mut u8, 16)
-                };
+                let bytes: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(out_raw.as_mut_ptr() as *mut u8, 16) };
                 gpu.hip.memcpy_dtoh(bytes, &out_dev.buf)?;
             }
             accept_len = out_raw[0] as usize;
@@ -3695,8 +3683,7 @@ pub fn spec_step_dflash(
                         }
                     }
                     let u2 = xorshift_next_unit(rng_state);
-                    rejected_bonus =
-                        Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
+                    rejected_bonus = Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
                     break;
                 }
             }
@@ -3800,11 +3787,21 @@ pub fn spec_step_dflash(
     }
 
     // Free C8 device tensors now that accept is resolved.
-    if let Some(t) = c8_draft_probs_dev { let _ = gpu.free_tensor(t); }
-    if let Some(t) = c8_draft_tau_dev { let _ = gpu.free_tensor(t); }
-    if let Some(t) = c8_draft_z_dev { let _ = gpu.free_tensor(t); }
-    if let Some(t) = c8_draft_tokens_dev { let _ = gpu.free_tensor(t); }
-    if let Some(t) = c8_draft_p_at_token_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_probs_dev {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = c8_draft_tau_dev {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = c8_draft_z_dev {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = c8_draft_tokens_dev {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = c8_draft_p_at_token_dev {
+        let _ = gpu.free_tensor(t);
+    }
 
     // ── 7b. Seed-prediction oracle (Task #93 Phase B) ───────────────────
     // Three position-based proxies for the next cycle's `seed_token`
@@ -4418,7 +4415,12 @@ fn run_dflash_draft_for_topk_gpu(
             let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
             let positions_k: Vec<i32> = (ctx_start as i32..(position + b) as i32).collect();
             let th_offset = ctx_start * ne * h;
-            (positions_q, positions_k, Some(&host_slice[th_offset..]), effective_ctx_len)
+            (
+                positions_q,
+                positions_k,
+                Some(&host_slice[th_offset..]),
+                effective_ctx_len,
+            )
         } else {
             // GPU-resident path: scratch.target_hidden already contains all rows
             // via D2D scatter (Stage 1); thlog tracks uploaded_rows + abs_positions.

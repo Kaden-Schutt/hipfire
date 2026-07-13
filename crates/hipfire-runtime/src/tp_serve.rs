@@ -837,8 +837,19 @@ impl TpModel {
             let g = &mut self.gpus.devices[self.group[r]];
             let _ = g.bind_thread();
             for t in [
-                rank.x, rank.tmp, rank.x_rot, rank.q, rank.k, rank.v, rank.attn,
-                rank.o, rank.gate, rank.up, rank.hidden, rank.fo, rank.partials,
+                rank.x,
+                rank.tmp,
+                rank.x_rot,
+                rank.q,
+                rank.k,
+                rank.v,
+                rank.attn,
+                rank.o,
+                rank.gate,
+                rank.up,
+                rank.hidden,
+                rank.fo,
+                rank.partials,
             ] {
                 let _ = g.free_tensor(t);
             }

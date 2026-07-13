@@ -121,13 +121,9 @@ impl PpModel {
         // global layer index; each stage only touches its band's (locally
         // resident) entries.
         let layout = crate::model_load::Layout::from_gpus(&gpus, n_layers);
-        let weights = crate::hfq::load_weights_hfq_distributed(
-            &hfq,
-            &config,
-            &mut gpus.devices,
-            &layout,
-        )
-        .map_err(|e| format!("load_weights: {e:?}"))?;
+        let weights =
+            crate::hfq::load_weights_hfq_distributed(&hfq, &config, &mut gpus.devices, &layout)
+                .map_err(|e| format!("load_weights: {e:?}"))?;
 
         // Per-stage decode scratch (small residual buffers, one set per stage
         // device).

@@ -15,9 +15,9 @@
 //!
 //! Real order: `Tp > PpDense > Ep > PpQwen35 > Single`.
 
+use crate::EpState;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::{pp_serve::PpModel, tp_serve::TpModel};
-use crate::EpState;
 
 /// Which parallelism axis is active for a loaded model.
 ///
@@ -48,8 +48,8 @@ pub enum ModelParallel {
 
 /// PP is one axis, two implementations.
 pub enum PipelineImpl {
-    Dense(PpModel),      // generic dense-llama PP driver (self-contained)
-    ArchResident(Gpus),  // model in ModelState; only the mesh here (qwen35 today)
+    Dense(PpModel),     // generic dense-llama PP driver (self-contained)
+    ArchResident(Gpus), // model in ModelState; only the mesh here (qwen35 today)
 }
 
 pub(crate) fn kind_is_pipelined(k: ModelParallelKind) -> bool {

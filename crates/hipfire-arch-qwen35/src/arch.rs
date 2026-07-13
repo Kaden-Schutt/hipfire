@@ -34,7 +34,7 @@
 
 use crate::qwen35::{
     config_from_hfq as qwen35_config_from_hfq, load_weights as qwen35_load_weights, DeltaNetState,
-    HfqSource, Layout, LayerType, Qwen35Config, Qwen35Weights,
+    HfqSource, LayerType, Layout, Qwen35Config, Qwen35Weights,
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
