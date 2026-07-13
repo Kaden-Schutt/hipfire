@@ -1626,6 +1626,15 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
+                        let redline_default = hipfire_runtime::config::gfx12_mq4r_redline_default(
+                            &gpu.arch, path, m.arch_id, pp, tp,
+                        );
+                        if gpu.replay.configure_model_default(redline_default) && redline_default {
+                            eprintln!(
+                                "[redline] enabling fail-closed gfx12 MQ4R default (transport={})",
+                                gpu.replay.transport_name()
+                            );
+                        }
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {

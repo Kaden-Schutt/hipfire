@@ -2,12 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Default-off integration gate for Redline record/replay.
+//! Fail-closed integration gate for Redline record/replay.
 //!
 //! This module records the central HIP launch surface during warmup and owns
 //! the fail-closed selection state. It deliberately does not reinterpret
 //! `void**` arguments: a model adapter must supply explicit resource accesses
 //! and a kernarg ABI to `redline-dispatch` before installing a prepared plan.
+//! Replay remains default-off except for the product-certified, single-GPU
+//! gfx12 Qwen A3B `.mq4r` route selected by the daemon after model load.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -613,6 +615,12 @@ impl ReplayBackendRequest {
     }
 }
 
+fn manual_capture_requested() -> bool {
+    std::env::var("HIPFIRE_REPLAY_MANUAL_CAPTURE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayState {
     Hip,
@@ -781,9 +789,7 @@ pub struct ReplayController {
 impl ReplayController {
     pub fn from_env() -> Self {
         let request = ReplayBackendRequest::from_env();
-        let manual = std::env::var("HIPFIRE_REPLAY_MANUAL_CAPTURE")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
-            .unwrap_or(false);
+        let manual = manual_capture_requested();
         let mut controller = if manual {
             Self::new_armed(request)
         } else {
@@ -830,6 +836,73 @@ impl ReplayController {
             controller.state = ReplayState::Armed;
         }
         controller
+    }
+
+    /// Apply the daemon's model-scoped replay default after a successful load.
+    ///
+    /// An explicit backend selection always wins. Otherwise every successful
+    /// model load resets the process-local controller so prepared queues,
+    /// command buffers, and fallback state cannot bleed across model swaps.
+    /// The certified gfx12 MQ4R route defaults to retained PM4; all other
+    /// models return to ordinary HIP. An explicit transport still overrides
+    /// the PM4 transport choice for diagnostics.
+    pub fn configure_model_default(&mut self, enable_gfx12_mq4r: bool) -> bool {
+        let manual = manual_capture_requested();
+        if std::env::var_os("HIPFIRE_REPLAY_BACKEND").is_some() || manual {
+            self.reset_for_model(
+                ReplayBackendRequest::from_env(),
+                ReplayTransport::from_env(),
+                !manual,
+            );
+            return false;
+        }
+
+        let transport =
+            if enable_gfx12_mq4r && std::env::var_os("HIPFIRE_REPLAY_TRANSPORT").is_none() {
+                ReplayTransport::Pm4Ib
+            } else {
+                ReplayTransport::from_env()
+            };
+        self.apply_model_default(enable_gfx12_mq4r, transport);
+        true
+    }
+
+    fn apply_model_default(&mut self, enable_gfx12_mq4r: bool, transport: ReplayTransport) {
+        let request = if enable_gfx12_mq4r {
+            ReplayBackendRequest::Auto
+        } else {
+            ReplayBackendRequest::Hip
+        };
+        self.reset_for_model(request, transport, true);
+    }
+
+    fn reset_for_model(
+        &mut self,
+        request: ReplayBackendRequest,
+        transport: ReplayTransport,
+        auto_lifecycle: bool,
+    ) {
+        self.request = request;
+        self.transport = transport;
+        self.state = if request == ReplayBackendRequest::Hip {
+            ReplayState::Hip
+        } else {
+            ReplayState::Armed
+        };
+        self.recorded.clear();
+        self.certified_speedups.clear();
+        self.fallback_reason = None;
+        self.prepared = None;
+        self.prepared_pm4 = None;
+        self.auto_lifecycle = auto_lifecycle;
+        self.forward_eligible = true;
+    }
+
+    pub fn transport_name(&self) -> &'static str {
+        match self.transport {
+            ReplayTransport::AqlPackets => "aql",
+            ReplayTransport::Pm4Ib => "pm4",
+        }
     }
 
     pub fn request(&self) -> ReplayBackendRequest {
@@ -1815,6 +1888,31 @@ mod tests {
         controller.record_hip_launch("k", None, [1; 3], [32, 1, 1], 0, &[]);
         assert!(controller.recorded_launches().is_empty());
         assert!(!controller.should_route_aql());
+    }
+
+    #[test]
+    fn model_default_resets_stale_state_and_is_scoped() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.record_hip_launch("old", None, [1; 3], [32, 1, 1], 0, &[]);
+        let mut failed = passing(1.20);
+        failed.guards_intact = false;
+        controller.observe_shadow(failed);
+        assert_eq!(controller.state(), ReplayState::Fallback);
+
+        controller.apply_model_default(true, ReplayTransport::Pm4Ib);
+        assert_eq!(controller.request(), ReplayBackendRequest::Auto);
+        assert_eq!(controller.state(), ReplayState::Armed);
+        assert_eq!(controller.transport_name(), "pm4");
+        assert!(controller.recorded_launches().is_empty());
+        assert_eq!(controller.fallback_reason(), None);
+        controller.begin_auto_capture_if_armed().unwrap();
+        assert_eq!(controller.state(), ReplayState::RecordingWarmup);
+
+        controller.apply_model_default(false, ReplayTransport::AqlPackets);
+        assert_eq!(controller.request(), ReplayBackendRequest::Hip);
+        assert_eq!(controller.state(), ReplayState::Hip);
+        assert_eq!(controller.transport_name(), "aql");
+        assert!(!controller.is_enabled());
     }
 
     #[test]

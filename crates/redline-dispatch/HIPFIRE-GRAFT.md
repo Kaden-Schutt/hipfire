@@ -4,13 +4,16 @@ This crate is copied from the standalone Redline repository at commit
 `50f59ca` after local gfx1201 and remote R9700 certification. The low-level
 public ROCr ABI provenance is retained in `../redline-rocr/PROVENANCE.md`.
 
-The graft is intentionally default-off. `HIPFIRE_REPLAY_BACKEND` remains
-`hip` unless explicitly set to `shadow` or `auto`; neither mode may replace a
-HIP launch until warmup shadow validation proves shared-artifact identity,
-byte-exact output, intact guards, automatic clocks, GPU timing, and two
-independent speedup samples above the configured threshold. Any ABI,
-capability, parity, timeout, queue-fault, or cache-poison failure falls back to
-HIP for the process.
+The graft is default-off except for the product-certified single-GPU Qwen A3B
+`.mq4r` route on gfx12, which defaults to `auto` with the retained PM4
+transport. Explicit `HIPFIRE_REPLAY_BACKEND` and `HIPFIRE_REPLAY_TRANSPORT`
+settings take precedence. No replay mode may replace a HIP launch until warmup
+shadow validation proves shared-artifact identity, byte-exact output, intact
+guards, automatic clocks, GPU timing, and two independent speedup samples above
+the configured threshold. Any ABI, capability, parity, timeout, queue-fault,
+or cache-poison failure falls back to HIP for the process. A successful model
+swap resets the process-local controller; non-MQ4R and non-gfx12 models return
+to ordinary HIP rather than inheriting a prior retained tape.
 
 The source repository's certified results are:
 

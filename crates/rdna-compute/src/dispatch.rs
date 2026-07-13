@@ -402,7 +402,7 @@ pub struct Gpu {
     pub active_stream: Option<hip_bridge::Stream>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
-    /// Default-off Redline warmup recorder and fail-closed backend gate.
+    /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
 
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
