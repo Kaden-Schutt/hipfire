@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
-    BatchFencePolicy, Executable, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuSelector, HeaderPolicy,
-    KernargBuffer, KernargPool, Kernel, LaunchGeometry, RecordedDispatch, Runtime,
-    SingleQueueBatchGraph, SingleQueuePm4Ib, load_symbols,
+    load_symbols, BatchFencePolicy, Executable, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuSelector,
+    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, RecordedDispatch, Runtime,
+    SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +97,19 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     if kernel == "moe_router_softmax_topk_k8_wave64" {
         return Some(vec![read(0), write(8), write(16)]);
     }
+    if kernel.starts_with("gated_delta_net_q8_compact2_") {
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(80),
+        ]);
+    }
     match kernel {
         "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "fused_qkvza_hfq4g256" => Some(vec![
@@ -138,9 +151,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
         | "gemv_hfq4g256_multirow_r4"
-        | "gemv_hfq4g256_multirow_r8" => {
-            Some(vec![read(0), read(8), write(16)])
-        }
+        | "gemv_hfq4g256_multirow_r8" => Some(vec![read(0), read(8), write(16)]),
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
@@ -186,6 +197,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel.starts_with("gated_delta_net_q8_compact2_") {
+        return Some(96);
+    }
     if kernel == "moe_router_softmax_topk_k8_wave64" {
         return Some(32);
     }
@@ -263,11 +277,13 @@ fn recorded_resource_accesses(
         accesses
             .into_iter()
             .map(
-                |((allocation_base, access_base), (allocation_bytes, mode))| RecordedResourceAccess {
-                    allocation_base,
-                    allocation_bytes,
-                    access_base,
-                    mode,
+                |((allocation_base, access_base), (allocation_bytes, mode))| {
+                    RecordedResourceAccess {
+                        allocation_base,
+                        allocation_bytes,
+                        access_base,
+                        mode,
+                    }
                 },
             )
             .collect(),
@@ -516,6 +532,11 @@ impl Pm4MidAcquirePolicy {
 }
 
 fn required_mid_acquire(previous: &str, current: &str) -> bool {
+    if previous.starts_with("gated_delta_net_q8_compact2_")
+        || current.starts_with("gated_delta_net_q8_compact2_")
+    {
+        return true;
+    }
     matches!(
         previous,
         "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
@@ -526,6 +547,11 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
 }
 
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
+    if previous.starts_with("gated_delta_net_q8_compact2_")
+        || current.starts_with("gated_delta_net_q8_compact2_")
+    {
+        return true;
+    }
     (Some(previous) != excluded
         && matches!(
             previous,
@@ -953,7 +979,9 @@ impl ReplayController {
                 .map_err(|error| format!("{symbol}: {error}"))?
                 .with_dynamic_group_bytes(launch.shared_mem)
                 .map_err(|error| format!("{symbol}: {error}"))?;
-            if launch.kernel == "gated_delta_net_q8_fast" {
+            if launch.kernel == "gated_delta_net_q8_fast"
+                || launch.kernel.starts_with("gated_delta_net_q8_compact2_")
+            {
                 if metadata.kernarg_segment_size < 80 {
                     return Err(format!(
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
@@ -1102,7 +1130,9 @@ impl ReplayController {
             device
                 .validate_geometry(geometry)
                 .map_err(|error| format!("{symbol}: {error}"))?;
-            if launch.kernel == "gated_delta_net_q8_fast" {
+            if launch.kernel == "gated_delta_net_q8_fast"
+                || launch.kernel.starts_with("gated_delta_net_q8_compact2_")
+            {
                 if metadata.kernarg_segment_size < 80 {
                     return Err(format!(
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
@@ -1578,34 +1608,26 @@ mod tests {
             Pm4MidAcquirePolicy::from_value("required-only"),
             Some(Pm4MidAcquirePolicy::RequiredOnly)
         );
-        assert!(
-            Pm4MidAcquirePolicy::Conservative
-                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
-        );
-        assert!(
-            !Pm4MidAcquirePolicy::EntryOnly
-                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
-        );
+        assert!(Pm4MidAcquirePolicy::Conservative
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(!Pm4MidAcquirePolicy::EntryOnly
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
         assert!(!Pm4MidAcquirePolicy::Conservative.acquire_between("rmsnorm_f32", "gemv_hfq4g256"));
-        assert!(
-            !Pm4MidAcquirePolicy::WithoutRope
-                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
-        );
-        assert!(
-            Pm4MidAcquirePolicy::WithoutRope
-                .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32")
-        );
+        assert!(!Pm4MidAcquirePolicy::WithoutRope
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(Pm4MidAcquirePolicy::WithoutRope
+            .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32"));
         assert!(
             !Pm4MidAcquirePolicy::WithoutMqRotate.acquire_between("mq_rotate_x", "gemv_hfq4g256")
         );
-        assert!(
-            Pm4MidAcquirePolicy::RequiredOnly
-                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
-        );
-        assert!(
-            !Pm4MidAcquirePolicy::RequiredOnly
-                .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256")
-        );
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(!Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+            "fused_qk_l2_norm_scale_f32",
+            "gated_delta_net_q8_compact2_b2"
+        ));
         assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
     }
 
@@ -1615,6 +1637,11 @@ mod tests {
             Pm4WaitPolicy::from_value("resource-audit"),
             Some(Pm4WaitPolicy::ResourceAudit)
         );
+        assert_eq!(
+            expected_kernarg_bytes("gated_delta_net_q8_compact2_b2"),
+            Some(96)
+        );
+        assert!(pointer_effects("gated_delta_net_q8_compact2_b2").is_some());
         assert_eq!(
             Pm4WaitPolicy::from_value("resource"),
             Some(Pm4WaitPolicy::Resource)

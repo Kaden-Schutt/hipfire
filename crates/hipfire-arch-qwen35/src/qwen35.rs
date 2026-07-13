@@ -13750,7 +13750,11 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     1.0 / (self.hd as f32).sqrt(),
                     config.norm_eps,
                 )?;
-                if config.linear_num_key_heads < self.n_v_heads {
+                if gdn_compact2_enabled(gpu, config, self.n_v_heads, self.dn_state.quant) {
+                    // The compact Q8 recurrence maps state head h to Q/K head
+                    // h/2 directly. Leave the normalized tensors compact and
+                    // remove this materialization dispatch from the replay tape.
+                } else if config.linear_num_key_heads < self.n_v_heads {
                     let ratio = self.n_v_heads / config.linear_num_key_heads;
                     gpu.repeat_interleave_qk_f32(
                         &s.dn_q_raw,
@@ -13857,20 +13861,39 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 self.n_v_heads,
                 config.linear_value_head_dim,
             ),
-            StateQuant::Q8 => gpu.gated_delta_net_q8(
-                &s.dn_q,
-                &s.dn_k,
-                &s.dn_v,
-                &s.dn_alpha,
-                &s.dn_beta,
-                &dn.s_matrices[i],
-                &dn.s_scales[i],
-                &s.dn_attn_out,
-                1,
-                self.n_v_heads,
-                config.linear_value_head_dim,
-                dn.ef_residual(i),
-            ),
+            StateQuant::Q8 => {
+                if gdn_compact2_enabled(gpu, config, self.n_v_heads, dn.quant) {
+                    gpu.gated_delta_net_q8_compact2(
+                        &s.dn_q_raw,
+                        &s.dn_k_raw,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn.s_matrices[i],
+                        &dn.s_scales[i],
+                        &s.dn_attn_out,
+                        1,
+                        self.n_v_heads,
+                        config.linear_value_head_dim,
+                        dn.ef_residual(i),
+                    )
+                } else {
+                    gpu.gated_delta_net_q8(
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn.s_matrices[i],
+                        &dn.s_scales[i],
+                        &s.dn_attn_out,
+                        1,
+                        self.n_v_heads,
+                        config.linear_value_head_dim,
+                        dn.ef_residual(i),
+                    )
+                }
+            }
             StateQuant::Q4 => gpu.gated_delta_net_q4(
                 &s.dn_q,
                 &s.dn_k,
@@ -13919,6 +13942,22 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
 fn forward_lowered_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+}
+
+/// gfx1201 decode path that keeps DeltaNet Q/K at their native head count and
+/// lets each pair of value/state heads reuse one Q/K head. The architecture,
+/// Q8-state, and 2:1-head gates keep every other configuration isolated; the
+/// environment variable is a fail-closed escape hatch for product rollback.
+fn gdn_compact2_enabled(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    n_v_heads: usize,
+    quant: StateQuant,
+) -> bool {
+    gpu.arch_caps.is_gfx1201()
+        && quant == StateQuant::Q8
+        && config.linear_num_key_heads * 2 == n_v_heads
+        && std::env::var("HIPFIRE_GDN_COMPACT2").ok().as_deref() != Some("0")
 }
 
 /// Lowered (#397 Ship 6) single-GPU decode layer loop. Behaviorally equivalent

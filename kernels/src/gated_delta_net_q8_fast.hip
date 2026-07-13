@@ -23,8 +23,20 @@
 #define HD 128
 #define TILE_ROWS 4
 
-extern "C" __launch_bounds__(32, 8)
-__global__ void gated_delta_net_q8_fast(
+#ifndef HIPFIRE_GDN_QK_HEAD_DIV
+#define HIPFIRE_GDN_QK_HEAD_DIV 1
+#endif
+
+#ifndef HIPFIRE_GDN_MIN_BLOCKS
+#define HIPFIRE_GDN_MIN_BLOCKS 8
+#endif
+
+#ifndef HIPFIRE_GDN_KERNEL
+#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast
+#endif
+
+extern "C" __launch_bounds__(32, HIPFIRE_GDN_MIN_BLOCKS)
+__global__ void HIPFIRE_GDN_KERNEL(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
@@ -44,6 +56,9 @@ __global__ void gated_delta_net_q8_fast(
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
     const int stride = n_heads * HD;
+    const int qk_heads = n_heads / HIPFIRE_GDN_QK_HEAD_DIV;
+    const int qk_stride = qk_heads * HD;
+    const int qk_head = h / HIPFIRE_GDN_QK_HEAD_DIV;
     const int row_start = tile * TILE_ROWS;
 
     // Packed layout: S_f4[r * 32 + tid] = {S[r][tid], S[r][tid+32],
@@ -62,8 +77,8 @@ __global__ void gated_delta_net_q8_fast(
     }
 
     for (int t = 0; t < n_tokens; t++) {
-        const float* q_t = q + t * stride + h * HD;
-        const float* k_t = k + t * stride + h * HD;
+        const float* q_t = q + t * qk_stride + qk_head * HD;
+        const float* k_t = k + t * qk_stride + qk_head * HD;
         const float* v_t = v + t * stride + h * HD;
         float alpha = expf(gate[t * n_heads + h]);
         float beta_v = beta[t * n_heads + h];

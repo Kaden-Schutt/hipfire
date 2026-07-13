@@ -2283,6 +2283,121 @@ impl Gpu {
         result
     }
 
+    /// Decode-only Q8 GDN path for a 2:1 value-head:QK-head layout.
+    ///
+    /// `q` and `k` remain compact (`n_heads / 2` heads). The kernel maps state
+    /// head `h` to Q/K head `h / 2`, avoiding a separate repeat-interleave
+    /// materialization. The launch ABI intentionally matches the regular fast
+    /// kernel so replay's dynamic stochastic-rounding frame patch is shared.
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_q8_compact2(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kernel_name, kernel_src) =
+            match std::env::var("HIPFIRE_GDN_COMPACT2_SHAPE").ok().as_deref() {
+                Some("b2") => (
+                    "gated_delta_net_q8_compact2_b2",
+                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
+                ),
+                Some("b4") => (
+                    "gated_delta_net_q8_compact2_b4",
+                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B4_SRC,
+                ),
+                Some("b8") => (
+                    "gated_delta_net_q8_compact2_b8",
+                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B8_SRC,
+                ),
+                Some("b12") => (
+                    "gated_delta_net_q8_compact2_b12",
+                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B12_SRC,
+                ),
+                Some("b16") => (
+                    "gated_delta_net_q8_compact2_b16",
+                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B16_SRC,
+                ),
+                _ => (
+                    "gated_delta_net_q8_compact2_b2",
+                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
+                ),
+            };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let sp = s_q8.buf.as_ptr();
+        let scp = s_scales.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let fr = reserve_gdn_requant_frames(1) as i32;
+        let efp: *mut c_void = ef_residual
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let n_tiles = (128 / 4) as u32;
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &fr as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(scp);
+                b.push_ptr(op);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(fr);
+                b.push_ptr(efp);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched sequential `gated_delta_net_q8` for prefill.
     ///
     /// Launches the single-token kernel N times with offset pointers into

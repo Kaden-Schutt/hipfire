@@ -1155,12 +1155,11 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 // v5: cache-aggressive — launch_bounds(32,16), 2x unroll, packed loads, factored math
 pub const GEMV_HFQ4G256_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
-pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
-    );
+pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str =
@@ -1246,12 +1245,11 @@ pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
 /// topk_indices buffer and the per-expert weight base from an
 /// expert-pointers table. hipGraph-capture-safe replacement for the
 /// kernarg-pointer variant.
-pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
 
 /// NUM_ROWS register row-tile of the indexed MoE gate_up GEMV (opt-in,
 /// HIPFIRE_MOE_GATE_UP_FUSED=1). Each block owns NUM_ROWS output rows/expert,
@@ -1327,12 +1325,11 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 /// a shared residual row. Pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
 /// Observed lift: 387 → ~900 GiB/s on R9700/gfx1201 (no K_TOP-way atomic
 /// contention per output cell).
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
 
 /// Fused atomic-free MoE down: GEMV + K_TOP weighted-accumulate + residual
 /// add in a single kernel. Replaces the two-launch
@@ -1345,7 +1342,6 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// opt-in via `HIPFIRE_MOE_DOWN_FUSED=1`.
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_FUSED_ACC_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_fused_acc.hip");
-
 
 /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
@@ -2290,12 +2286,11 @@ pub const GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC: &str =
 // from one source file. See kernel header for VGPR budget details.
 pub const GEMV_HFQ4G256_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.gfx1100.hip");
-pub const GEMV_HFQ4G256_MULTIROW_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
-    );
+pub const GEMV_HFQ4G256_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
 
@@ -2303,12 +2298,11 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
 // wqkv + wz + w_beta + w_alpha in a single launch. Same 4x-unroll inner
 // loop as gemv_hfq4g256.hip; grid = sum of the four projections' output
 // row counts. Works on every RDNA generation — see the kernel header.
-pub const FUSED_QKVZA_HFQ4G256_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
-    );
+pub const FUSED_QKVZA_HFQ4G256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
 
 // CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
@@ -2323,12 +2317,11 @@ pub const FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str =
 // 3-way fused HFQ4-G256 projection for Qwen3.5 FullAttention preamble:
 // wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
 // variant; grid = q_m + k_m + v_m. Cross-arch.
-pub const FUSED_QKV_HFQ4G256_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
-    );
+pub const FUSED_QKV_HFQ4G256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+);
 
 // CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
 // block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
@@ -3208,6 +3201,30 @@ pub const GATED_DELTA_NET_Q8_SRC: &str =
 /// requant outside the loop. Supports EF residual. Lower VGPR pressure.
 pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
+
+/// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
+/// 32 value/state heads). Each pair of state heads reads one normalized Q/K
+/// head directly, eliminating the materializing repeat-interleave launch.
+pub const GATED_DELTA_NET_Q8_COMPACT2_B2_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 2\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_b2\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+pub const GATED_DELTA_NET_Q8_COMPACT2_B4_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 4\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_b4\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+pub const GATED_DELTA_NET_Q8_COMPACT2_B8_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 8\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_b8\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+pub const GATED_DELTA_NET_Q8_COMPACT2_B12_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 12\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_b12\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+pub const GATED_DELTA_NET_Q8_COMPACT2_B16_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 16\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_b16\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
 
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
