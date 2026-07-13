@@ -96,14 +96,14 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### COR-001 Wire `mtp_k` Metadata
 
-- **Status:** in progress
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Make the configured/load-message `mtp_k` value the deliberate source used by generation, or remove the unsupported knob rather than silently ignoring it.
 - **Acceptance criteria:** `ModelMeta` receives the configured value exactly once; native/spec generation reads that value with documented environment precedence; no stale flat field or self-assignment remains; CLI metadata exposes the setting; tests cover default, configured, and environment-override behavior.
 - **Validation:** Run targeted Rust metadata/generation tests, `cli/config_meta.test.ts`, and searches proving generation no longer bypasses `meta.mtp_k`.
 - **Hardware:** None
-- **Completion blockers:** Run `nix develop --command ./scripts/coherence-gate-deepseek4-mtp.sh` against the available DeepSeek V4 target/add-on fixture; archive its report and confirm the K=2 and K=3 runs consume the load-resolved metadata rather than a generation-time environment read.
-- **Evidence:** In progress: `bun test cli/mtp_k_config.test.ts` (10 passed), `bun test cli/config_meta.test.ts` (1 passed), `nix develop --command bash -lc 'cargo test -p hipfire-loader --lib --locked && cargo test -p hipfire-runtime --example daemon mtp_k_tests --locked'` (13 loader and 15 daemon tests passed), and `nix develop --command ./scripts/coherence-gate-dflash.sh` passed with no hard errors (`/tmp/coherence-dflash-20260713-105546.md`).
+- **Completion blockers:** None.
+- **Evidence:** `bun test cli/mtp_k_config.test.ts` (10 passed); `bun test cli/config_meta.test.ts` (1 passed); `nix develop --command bash -lc 'cargo test -p hipfire-loader --lib --locked && cargo test -p hipfire-runtime --example daemon mtp_k_tests --locked'` (13 loader and 15 daemon tests passed); `nix develop --command cargo test --workspace --locked` (passed); `nix develop --command ./scripts/coherence-gate-dflash.sh` (no hard errors; `/tmp/coherence-dflash-20260713-105546.md`); and `nix develop --command bash scripts/coherence-gate-deepseek4-mtp.sh --full` (all six DeepSeek MTP cases passed at K=2 and K=3; `/tmp/coherence-deepseek4-mtp-20260713-113736.md`). Generation reads `ModelMeta::mtp_k`; direct environment values are resolved only during model load.
 
 ### COR-002 Make Reset Total
 
