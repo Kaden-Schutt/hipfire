@@ -71,6 +71,13 @@ pub(crate) fn compile_and_load_kernel(
     }
     let obj_path = compiler.compile(module_name, source)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
+    // Alias the launched function name to this arch's compiled artifact so the
+    // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
+    // arch-selected module name differs (e.g. gemv_hfq4g256_residual launched vs
+    // module gemv_hfq4g256_residual_rdna3 on RDNA3). Additive; no-op when equal.
+    if func_name != module_name {
+        compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
+    }
     if !modules.contains_key(module_name) {
         let module = module_load_or_recompile(hip, compiler, module_name, source, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);

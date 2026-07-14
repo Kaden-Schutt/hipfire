@@ -215,6 +215,18 @@ impl KernelCompiler {
         &self.compiled
     }
 
+    /// Register `func_name` as an additional key pointing at an already-compiled
+    /// artifact. `compiled_kernels()` is keyed by MODULE name, but the retained-PM4
+    /// capture resolves a launched FUNCTION name; for arch-variant kernels (e.g.
+    /// `gemv_hfq4g256_residual`, whose module is `gemv_hfq4g256_residual_rdna3` on
+    /// RDNA3) the two differ, so without this alias the capture cannot find the
+    /// owning `.hsaco` and the retained replay route fails closed. Additive and
+    /// idempotent: never overwrites an existing key, so module-name lookups and
+    /// the default-arch (module == func) case are unchanged.
+    pub fn register_func_artifact(&mut self, func_name: &str, path: PathBuf) {
+        self.compiled.entry(func_name.to_string()).or_insert(path);
+    }
+
     fn cache_hash(&self, source: &str) -> String {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
