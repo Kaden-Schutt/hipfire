@@ -153,7 +153,7 @@ them toward completion.
 - **Acceptance criteria:** The ownership decision is documented with lifecycle rationale; the field is moved or explicitly retained accordingly; reset, reuse, and speculative commit semantics follow that decision; tests prevent cross-request eviction bleed and accidental loss of intentionally persistent state.
 - **Validation:** Run ownership/reset unit tests plus multi-turn and speculative eviction scenarios; inspect `LoadedModel` so no duplicate eviction authority remains.
 - **Hardware:** None for ownership tests; a supported AMD GPU for end-to-end eviction behavior.
-- **Evidence:** Decision: `LoadedModel.eviction` owns the calibrated policy and
+- **Evidence:** Implementation: `62050f7c`. Decision: `LoadedModel.eviction` owns the calibrated policy and
   reusable GPU scratch until unload; `KvCache::compact_offset`, physical cursor,
   target recurrent state, and the DFlash mirror are request state. Qwen35
   DFlash construction, sidecar loading, snapshots, and eviction scratch now
