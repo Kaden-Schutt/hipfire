@@ -614,6 +614,27 @@ impl Speculator for GenericDflashSpeculator {
         self.finish_chain(&block_hidden, &drafts, accepted, bonus, position, ne, h)
     }
 
+    fn advance_forced(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        position: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<SpecAdvance, String> {
+        // Forced continuations become normal draft context for the following
+        // window, so capture their target-hidden rows rather than advancing only
+        // the target KV/recurrent state.
+        target.spec_advance(
+            gpu,
+            tokens,
+            position,
+            false,
+            abort,
+            Some(&mut self.target_hidden_host),
+        )
+    }
+
     fn reset(&mut self, _gpu: &mut Gpu) {
         // Drafter-local reset: clear the cumulative host shadow + the draft's
         // upload/projection tracking. The target's KV/recurrent reset is the

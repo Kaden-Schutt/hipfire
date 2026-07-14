@@ -21,7 +21,7 @@ use crate::speculative::{
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
-    EvictRetain, PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator,
+    EvictRetain, PrefillOutcome, SpecAdvance, SpecGrammar, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -868,6 +868,71 @@ impl Speculator for DflashSpeculator {
         };
 
         result.map(lower_qwen35).map_err(|e| e.to_string())
+    }
+
+    fn advance_forced(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        position: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<SpecAdvance, String> {
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        if tokens.is_empty() {
+            return Ok(SpecAdvance::Ready { last_argmax: 0 });
+        }
+
+        // The target-hidden buffer is the DFlash draft's authoritative context.
+        // A target-only advance here would leave the next draft's cached rows and
+        // projection cursor behind the target KV/recurrent state.
+        if seed_target_hidden_suffix_abortable(
+            gpu,
+            slot,
+            &mut self.df.hidden_rb,
+            tokens,
+            position,
+            abort,
+            None,
+            self.ck_interval,
+            self.ck_cap,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            return Ok(SpecAdvance::Aborted);
+        }
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            &self.df.hidden_rb,
+            &self.df.draft_scratch.target_hidden,
+            position,
+            tokens.len(),
+            tokens.len(),
+        )
+        .map_err(|e| e.to_string())?;
+        self.df.draft_scratch.thlog.append_committed(
+            position,
+            tokens.len(),
+            slot.kv_cache.compact_offset as i32,
+        );
+        let logits = gpu
+            .download_f32(&slot.scratch.logits)
+            .map_err(|e| e.to_string())?;
+        let last_argmax = logits
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
+            })
+            .0;
+        Ok(SpecAdvance::Ready { last_argmax })
     }
 
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {

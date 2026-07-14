@@ -77,7 +77,7 @@ jobs:
           # and sub-agent spawning (Agent). Net: read the diff + post a comment,
           # nothing else. Runs only on trusted in-repo branches (fork PRs skip).
           claude_args: |
-            --max-turns 20
+            --max-turns 60
             --disallowedTools Edit,Write,MultiEdit,NotebookEdit,Bash,WebSearch,WebFetch,Agent
           prompt: |
             You are the first-pass PR reviewer for hipfire, an RDNA-native LLM
@@ -87,8 +87,23 @@ jobs:
             correct, coherent, or faster; instead flag what the GPU gates
             (test_kernels / coherence-gate / speed-gate) must confirm.
 
-            Read CLAUDE.md and CONTRIBUTING.md first (source of truth). Then
-            review the diff, prioritizing the failure modes that have ACTUALLY
+            TOOLING & TURN BUDGET (read this first — an earlier run died here):
+            - You have NO shell and NO git: Bash, Edit/Write, web, and sub-agents
+              are all disabled. Do NOT try to run `git diff`/`git log` — the call
+              fails and wastes a turn. The PR's changed files and full diff are
+              ALREADY provided to you in the context above; review from that.
+            - Use Read/Grep/Glob ONLY to pull a specific changed file or confirm a
+              `file:line` — not to reconstruct the diff and not to read whole large
+              docs. Do NOT read CLAUDE.md/CONTRIBUTING.md end-to-end; the rules you
+              need are the numbered checklist below. Grep them for one specific
+              detail only if a finding hinges on it.
+            - You have up to 60 turns but should finish in ~15. Post your review as
+              your FINAL action. If you ever approach the turn limit, IMMEDIATELY
+              post the findings you have — a partial review is useful; ending with
+              no comment (the previous failure mode) is not. Never finish without
+              having called update_claude_comment.
+
+            Review the diff, prioritizing the failure modes that have ACTUALLY
             bitten this repo — ordered by how often they recur in its git
             history. Comment only when something is off:
 

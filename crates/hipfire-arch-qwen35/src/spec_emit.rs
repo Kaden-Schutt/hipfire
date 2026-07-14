@@ -40,9 +40,23 @@ pub struct Qwen35Emit<'a> {
     open_think_prefix: bool,
     think_count: usize,
     prev_in_think: bool,
+    /// Think-budget force-close continuation drained by `take_forced` so the
+    /// target advances over `</think>` and continues into visible output.
+    forced: Vec<u32>,
+    /// Number of queued continuation tokens still being fed back through
+    /// `observe`. They must update grammar/filter state but must not re-trigger
+    /// the think budget before the close has drained.
+    forced_remaining: usize,
+    /// Prevent an endlessly re-opened reasoning span from being force-closed
+    /// repeatedly. A second cap hit hard-stops through `ThinkCap`.
+    think_force_closed: bool,
     /// `generated` counter at the point of the most recent `observe` — only used
     /// for the attractor-detect log message (byte-for-byte stderr parity).
     generated_hint: usize,
+}
+
+fn think_continuation_text() -> String {
+    std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
 }
 
 impl<'a> Qwen35Emit<'a> {
@@ -97,6 +111,9 @@ impl<'a> Qwen35Emit<'a> {
             open_think_prefix: matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink),
             think_count: 0,
             prev_in_think: false,
+            forced: Vec::new(),
+            forced_remaining: 0,
+            think_force_closed: false,
             generated_hint: 0,
         })
     }
@@ -175,6 +192,10 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
         // Emit the token (committed + filtered).
         let mut events = self.push_and_filter(token);
+        let draining_forced = self.forced_remaining > 0;
+        if draining_forced {
+            self.forced_remaining -= 1;
+        }
 
         // EOS check (token id). Mirrors 4608-4612.
         if token == self.eos_token
@@ -208,6 +229,13 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let in_think = currently_in_think(raw_str, self.open_think_prefix);
             if in_think && !self.prev_in_think {
+                if self.think_force_closed && !draining_forced {
+                    events.push(ClientEvent::Token("</think>\n".to_string()));
+                    return EmitOutcome {
+                        events,
+                        stop: Some(StopReason::ThinkCap),
+                    };
+                }
                 self.think_count = 0;
             }
             if in_think {
@@ -216,9 +244,16 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             self.prev_in_think = in_think;
 
             if in_think && self.think_count >= self.max_think_tokens {
-                // Force-close: stream `</think>\n` and stop. The inline path
-                // wrote this literal token frame directly (not through the
-                // filter, not into streamed_tokens) — preserve that exactly.
+                if draining_forced {
+                    return EmitOutcome { events, stop: None };
+                }
+                if !self.think_force_closed {
+                    self.forced = self.tokenizer.encode(&think_continuation_text());
+                    self.forced_remaining = self.forced.len();
+                    self.think_force_closed = true;
+                    return EmitOutcome { events, stop: None };
+                }
+                // A pathological re-open after the injected close hard-stops.
                 events.push(ClientEvent::Token("</think>\n".to_string()));
                 return EmitOutcome {
                     events,
@@ -270,5 +305,81 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
     /// attractor-detect log message reports the same number it did inline.
     fn set_generated_hint(&mut self, generated: usize) {
         self.generated_hint = generated;
+    }
+
+    fn take_forced(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.forced)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokenizer() -> Tokenizer {
+        Tokenizer::from_hf_json(
+            r#"{
+                "model": {
+                    "vocab": {
+                        "<think>": 0,
+                        "a": 1,
+                        "b": 2,
+                        "<": 3,
+                        "/": 4,
+                        "t": 5,
+                        "h": 6,
+                        "i": 7,
+                        "n": 8,
+                        "k": 9,
+                        ">": 10,
+                        "\\n": 11,
+                        "<|endoftext|>": 12
+                    },
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 12, "content": "<|endoftext|>", "special": true}
+                ]
+            }"#,
+        )
+        .expect("test tokenizer")
+    }
+
+    #[test]
+    fn first_think_cap_drains_close_then_reopened_think_stops() {
+        let tokenizer = tokenizer();
+        let ctx = SpecEmitCtx {
+            tokenizer: &tokenizer,
+            eos: 12,
+            im_end: None,
+            tools: None,
+            stop: Vec::new(),
+            max_think: 2,
+            max_tokens: 64,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        };
+        let mut emit = Qwen35Emit::from_ctx(ctx);
+
+        emit.begin(0);
+        assert!(emit.observe(1).stop.is_none());
+        assert!(emit.observe(2).stop.is_none());
+        let forced = emit.take_forced();
+        assert_eq!(forced, tokenizer.encode(&think_continuation_text()));
+        assert!(!forced.is_empty());
+
+        let before_drain = emit.streamed_tokens().len();
+        for &token in &forced {
+            let outcome = emit.observe(token);
+            assert!(outcome.stop.is_none());
+            assert!(matches!(
+                outcome.events.first(),
+                Some(ClientEvent::Committed { id, .. }) if *id == token
+            ));
+        }
+        assert_eq!(emit.streamed_tokens().len(), before_drain + forced.len());
+
+        assert_eq!(emit.observe(0).stop, Some(StopReason::ThinkCap));
     }
 }
