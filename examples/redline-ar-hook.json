@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "run": {
+    "model": "qwen3.6-35b-a3b-mq4p",
+    "architecture": "gfx1201",
+    "route": "decode",
+    "baseline": "origin/redline"
+  },
+  "model_path": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4p",
+  "baseline_daemon": ".redline-work/ar/baseline/daemon",
+  "candidate_daemon": ".redline-work/ar/candidate/daemon",
+  "bod_path": "autoresearch/state/bod_gfx1201.json",
+  "environment": {
+    "HIPFIRE_DFLASH_DRAFT": "",
+    "HIPFIRE_KV_MODE": "q8"
+  },
+  "device_ordinal": 0,
+  "kv_mode": "q8",
+  "max_seq": 32768,
+  "decode_context": 128,
+  "decode_iterations": 128,
+  "warmups": 10,
+  "samples": 5,
+  "min_lift_pct": 0.25,
+  "work_dir": ".redline-work/ar/hipfire-hook",
+  "serve_harness": {
+    "script": "scripts/serve_harness.py",
+    "registry": "cli/registry.json",
+    "python": "python3",
+    "sampling": "registry",
+    "max_tokens": 2048,
+    "mode": "session",
+    "session": "/home/kaden/mv/session_coding.json",
+    "port": 11540,
+    "timeout_seconds": 1800,
+    "seed": 305419896
+  }
+}

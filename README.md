@@ -193,6 +193,7 @@ the prefill MMQ redesign log is at
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
 | [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |
+| [methodology/redline-rust-autoresearch.md](docs/methodology/redline-rust-autoresearch.md) | Rust Redline Loop 0–3 hooks and four-card mining |
 
 ## License
 
