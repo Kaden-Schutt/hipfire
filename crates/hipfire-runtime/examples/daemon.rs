@@ -5952,10 +5952,12 @@ struct SpecRun {
     generated: usize,
     spec_cycles: usize,
     spec_accepted: usize,
-    /// Full committed stream (from the emitter) for the wrapper's cache store.
-    /// Empty for emitters that don't track it (deepseek4 — its spec path stores
-    /// no asst-turn cache).
+    /// Full client-visible stream from the emitter, used to decode user-visible
+    /// assistant text and its cache fingerprint.
     streamed_tokens: Vec<u32>,
+    /// Full internal committed stream for assistant-turn cache replay. This may
+    /// contain cache-advanced forced tokens intentionally hidden after a stop.
+    cache_replay_tokens: Vec<u32>,
     /// Newly-prefilled token count (the suffix actually fed through the model).
     prefill_tokens_len: usize,
     /// The terminal flush summary (tool-call count drives the wrapper's
@@ -5973,8 +5975,76 @@ enum SpecRunOutcome {
     Aborted { generated: usize },
 }
 
+#[cfg(test)]
 fn forced_advance_completed(outcome: &SpecAdvance) -> bool {
     matches!(outcome, SpecAdvance::Ready { .. })
+}
+
+#[derive(Debug)]
+enum ForcedAdvance<E> {
+    Aborted,
+    Failed(E),
+}
+
+/// Advance an emitter continuation as one cache transaction before rendering it.
+/// Returning the target's post-continuation argmax gives the caller the next
+/// unconsumed speculative seed after every forced token reaches cache state.
+fn advance_forced_tokens<E>(
+    tokens: &[u32],
+    remaining: usize,
+    advance: impl FnOnce(&[u32]) -> Result<SpecAdvance, E>,
+) -> Result<Option<u32>, ForcedAdvance<E>> {
+    if tokens.is_empty() || tokens.len() > remaining {
+        return Ok(None);
+    }
+    match advance(tokens).map_err(ForcedAdvance::Failed)? {
+        SpecAdvance::Ready { last_argmax } => Ok(Some(last_argmax)),
+        SpecAdvance::Aborted => Err(ForcedAdvance::Aborted),
+    }
+}
+
+/// Observe the target's unconsumed post-continuation prediction before the
+/// next speculative window advances it. `observe` reports whether it produced
+/// a client-visible event, which is the daemon's generated-token accounting.
+fn observe_forced_seed(
+    seed: u32,
+    generated: &mut usize,
+    max_tokens: usize,
+    observe: impl FnOnce(u32) -> bool,
+) -> bool {
+    if *generated >= max_tokens {
+        return false;
+    }
+    if observe(seed) {
+        *generated += 1;
+    }
+    true
+}
+
+/// Preserve the full target/DFlash-advanced continuation in session and
+/// speculative repeat context without making hidden tokens client-visible.
+fn record_forced_batch(history: &mut Vec<u32>, tokens: &[u32]) {
+    history.extend_from_slice(tokens);
+}
+
+/// Copy the committed internal sequence for Qwen's verbatim assistant-turn
+/// cache, which must match the cached KV even when client replay stopped early.
+fn assistant_turn_cache_stream(committed_tokens: &[u32]) -> Vec<u32> {
+    committed_tokens.to_vec()
+}
+
+/// Render a committed forced continuation only through its first terminal token.
+/// The target and draft caches have already advanced over the full batch.
+fn replay_forced_tokens(
+    tokens: &[u32],
+    mut observe: impl FnMut(u32) -> Option<StopReason>,
+) -> Option<StopReason> {
+    for &token in tokens {
+        if let Some(stop) = observe(token) {
+            return Some(stop);
+        }
+    }
+    None
 }
 
 fn publish_eviction_position(
@@ -6300,7 +6370,7 @@ fn generate_dflash(
     // (mirrors qwen35 cache writer).
     let nl_token = tokenizer.encode("\n");
     let nl_set: std::collections::HashSet<u32> = nl_token.iter().copied().collect();
-    let mut cached_seq: Vec<u32> = run.streamed_tokens.clone();
+    let mut cached_seq: Vec<u32> = run.cache_replay_tokens.clone();
     while let Some(&last) = cached_seq.last() {
         if nl_set.contains(&last) {
             cached_seq.pop();
@@ -6784,39 +6854,90 @@ fn generate_spec(
             seed_token = step.next_seed;
 
             // Forced-token injection (cohere2moe generation guards; no-op for every
-            // other emitter — `take_forced` defaulted empty). The target already
-            // batch-advanced over the whole committed tail, so `position` is now its
-            // true cursor: advance it over each forced token, re-feed the token
-            // through the emitter (a marker transitions its state machine + emits a
-            // Committed event), set the next draft seed to it, and continue WITHOUT
-            // honoring the suppressed terminator. Bounded by the emitter's own
-            // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
+            // other emitter — `take_forced` defaulted empty). The speculative window
+            // is fully committed above, so advance the entire continuation as one
+            // target/drafter cache transaction before exposing any of it to the client.
             if !forced_after.is_empty() {
-                for ft in std::mem::take(&mut forced_after) {
-                    match slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
-                    {
-                        Ok(outcome) if forced_advance_completed(&outcome) => {}
-                        Ok(_) => break 'spec SpecRunOutcome::Aborted { generated },
-                        Err(e) => {
-                            break 'spec SpecRunOutcome::Failed(format!(
-                                "forced-token advance: {e}"
-                            ));
+                let forced = std::mem::take(&mut forced_after);
+                match advance_forced_tokens(
+                    &forced,
+                    max_tokens.saturating_sub(generated),
+                    |tokens| spec.advance_forced(gpu, slot, tokens, position, &|| check_abort(id)),
+                ) {
+                    Ok(Some(seed)) => {
+                        position += forced.len();
+                        record_forced_batch(&mut emitted, &forced);
+                        let forced_stop = replay_forced_tokens(&forced, |token| {
+                            emit.set_generated_hint(generated);
+                            let outcome = emit.observe(token);
+                            if !outcome.events.is_empty() {
+                                render_client_events(
+                                    stdout,
+                                    id,
+                                    &outcome.events,
+                                    t0.elapsed().as_millis() as u64,
+                                );
+                                generated += 1;
+                            }
+                            outcome.stop
+                        });
+                        match forced_stop {
+                            Some(StopReason::GrammarViolation) => {
+                                break 'spec SpecRunOutcome::Failed(
+                                    "speculative grammar violation during forced continuation"
+                                        .into(),
+                                );
+                            }
+                            Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
+                                hit_eos = true
+                            }
+                            Some(StopReason::ThinkCap) => think_cap_hit = true,
+                            None => {
+                                let mut seed_stop = None;
+                                let seed_generated_hint = generated;
+                                if observe_forced_seed(seed, &mut generated, max_tokens, |token| {
+                                    emit.set_generated_hint(seed_generated_hint);
+                                    let outcome = emit.observe(token);
+                                    seed_stop = outcome.stop;
+                                    if outcome.events.is_empty() {
+                                        false
+                                    } else {
+                                        emitted.push(token);
+                                        render_client_events(
+                                            stdout,
+                                            id,
+                                            &outcome.events,
+                                            t0.elapsed().as_millis() as u64,
+                                        );
+                                        true
+                                    }
+                                }) {
+                                    match seed_stop {
+                                        Some(StopReason::GrammarViolation) => {
+                                            break 'spec SpecRunOutcome::Failed(
+                                                "speculative grammar violation after forced continuation".into(),
+                                            );
+                                        }
+                                        Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
+                                            hit_eos = true
+                                        }
+                                        Some(StopReason::ThinkCap) => think_cap_hit = true,
+                                        None => {}
+                                    }
+                                    seed_token = seed;
+                                }
+                            }
                         }
                     }
-                    position += 1;
-                    emit.set_generated_hint(generated);
-                    let fo = emit.observe(ft);
-                    if !fo.events.is_empty() {
-                        emitted.push(ft);
-                        render_client_events(
-                            stdout,
-                            id,
-                            &fo.events,
-                            t0.elapsed().as_millis() as u64,
-                        );
-                        generated += 1;
+                    // Never partially inject a structural continuation. The current
+                    // capped thinking turn ends before the close if it cannot fit.
+                    Ok(None) => think_cap_hit = true,
+                    Err(ForcedAdvance::Aborted) => {
+                        break 'spec SpecRunOutcome::Aborted { generated };
                     }
-                    seed_token = ft;
+                    Err(ForcedAdvance::Failed(e)) => {
+                        break 'spec SpecRunOutcome::Failed(format!("forced-token advance: {e}"));
+                    }
                 }
             }
             // Per-cycle eviction (FlashCASK). Fires whenever current physical
@@ -6875,6 +6996,7 @@ fn generate_spec(
             spec_cycles,
             spec_accepted,
             streamed_tokens,
+            cache_replay_tokens: assistant_turn_cache_stream(&emitted),
             prefill_tokens_len: prefill_tokens.len(),
             finish,
             prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
@@ -6927,7 +7049,11 @@ fn generate_spec(
 
 #[cfg(test)]
 mod spec_recovery_tests {
-    use super::{forced_advance_completed, publish_eviction_position, qwen35_recurrent_groups};
+    use super::{
+        advance_forced_tokens, assistant_turn_cache_stream, forced_advance_completed,
+        observe_forced_seed, publish_eviction_position, qwen35_recurrent_groups,
+        record_forced_batch, replay_forced_tokens,
+    };
     use hipfire_runtime::spec::SpecAdvance;
 
     #[test]
@@ -6941,6 +7067,87 @@ mod spec_recovery_tests {
     #[test]
     fn aborted_forced_advance_is_not_successful() {
         assert!(!forced_advance_completed(&SpecAdvance::Aborted));
+    }
+
+    #[test]
+    fn forced_tokens_advance_once_and_reseed_with_the_unconsumed_argmax() {
+        let forced = [41, 42, 43];
+        let mut calls = Vec::new();
+
+        let seed = advance_forced_tokens(&forced, forced.len(), |tokens| {
+            calls.push(tokens.to_vec());
+            Ok::<_, ()>(SpecAdvance::Ready { last_argmax: 99 })
+        })
+        .unwrap();
+
+        assert_eq!(calls, vec![forced]);
+        assert_eq!(seed, Some(99));
+    }
+
+    #[test]
+    fn over_budget_forced_continuation_is_not_advanced() {
+        let forced = [41, 42, 43];
+        let mut calls = 0;
+
+        let seed = advance_forced_tokens(&forced, 2, |_| {
+            calls += 1;
+            Ok::<_, ()>(SpecAdvance::Ready { last_argmax: 0 })
+        })
+        .unwrap();
+
+        assert_eq!(calls, 0);
+        assert_eq!(seed, None);
+    }
+
+    #[test]
+    fn post_forced_argmax_is_observed_counted_once_and_respects_max_tokens() {
+        let mut observed = Vec::new();
+        let mut emitted = Vec::new();
+        let mut generated = 3;
+
+        assert!(observe_forced_seed(99, &mut generated, 4, |token| {
+            observed.push(token);
+            emitted.push(token);
+            true
+        }));
+        assert_eq!(observed, vec![99]);
+        assert_eq!(emitted, vec![99]);
+        assert_eq!(generated, 4);
+
+        assert!(!observe_forced_seed(100, &mut generated, 4, |token| {
+            observed.push(token);
+            emitted.push(token);
+            true
+        }));
+        assert_eq!(observed, vec![99]);
+        assert_eq!(emitted, vec![99]);
+        assert_eq!(generated, 4);
+    }
+
+    #[test]
+    fn forced_replay_stops_at_stop_sequence_before_suffix_or_seed() {
+        let forced = [41, 42, 43];
+        let seed = 99;
+        let mut observed = Vec::new();
+
+        let stop = replay_forced_tokens(&forced, |token| {
+            observed.push(token);
+            (token == 42).then_some(hipfire_runtime::spec::StopReason::StopSequence)
+        });
+        if stop.is_none() {
+            observed.push(seed);
+        }
+
+        assert_eq!(stop, Some(hipfire_runtime::spec::StopReason::StopSequence));
+        assert_eq!(observed, vec![41, 42]);
+
+        let mut session_tokens = vec![1, 10];
+        record_forced_batch(&mut session_tokens, &forced);
+        assert_eq!(session_tokens, vec![1, 10, 41, 42, 43]);
+        assert_eq!(
+            assistant_turn_cache_stream(&session_tokens[1..]),
+            vec![10, 41, 42, 43]
+        );
     }
 
     #[test]
@@ -9350,16 +9557,9 @@ fn generate(
     // rejection invariant) — a temp>0 request carrying a non-default top_p gets
     // temp-only sampling and a one-time warn below.
     //
-    // Exception: thinking-on + max_think_tokens currently needs the AR path.
-    // DFlash's budget cap can close/strip the think span but does not yet
-    // continue into visible answer text after the forced close. AR already
-    // splices </think> through KV and continues generation, so route budgeted
-    // thinking requests there until DFlash continuation is implemented.
-    let budgeted_thinking_needs_ar = max_think_tokens > 0
-        && !matches!(
-            assistant_prefix,
-            hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
-        );
+    // Budgeted thinking remains on the selected decode path. AR splices the
+    // continuation directly, DFlash uses SpecEmit::take_forced, and native MTP
+    // applies the same close at a committed-block boundary.
 
     // Prompt-cache routing (2026-05-30, native-reuse update). `generate_dflash`
     // now implements LCP prompt-cache reuse natively: on a pure conversation
@@ -9439,7 +9639,6 @@ fn generate(
             || m.meta.arch_id == 1)
         && !qwen_dflash_route
         && !llama_dflash_route
-        && !budgeted_thinking_needs_ar
         && !force_ar_chat
     {
         let reason = if temp_spec_env_off {
@@ -9457,11 +9656,7 @@ fn generate(
             "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
         );
     }
-    if m.speculator.is_some()
-        && !budgeted_thinking_needs_ar
-        && !force_ar_chat
-        && (qwen_dflash_route || llama_dflash_route)
-    {
+    if m.speculator.is_some() && !force_ar_chat && (qwen_dflash_route || llama_dflash_route) {
         // One-time visibility: temp + top_p + top_k ARE now honored on the
         // DFlash spec sampled path (identical (top_k,top_p) nucleus truncation on
         // draft + target → lossless == AR-at-(top_k,top_p)). Only min_p remains

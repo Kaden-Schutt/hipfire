@@ -1,0 +1,25 @@
+# Copyright (c) Kaden Schutt
+# autoresearch/config/loop_gfx1201.toml — the gfx1201 (R9700) shared-kernel loop.
+# One file per arch. Nothing here is hardcoded elsewhere; the loop reads it all.
+arch          = "gfx1201"
+baseline_ref  = "loop/gfx1201"          # the kernel source of truth this loop advances
+model         = "qwen3.6-35b-a3b.mq4r"  # measurement SKU (mq4r for the shared-kernel loop)
+kv_mode       = "q8"
+max_tokens    = 128
+prompt_md5    = "d97ec9d3f761ec68093631be27d32441"
+cand_wall     = 3.0                     # min BOD wall% to be a candidate
+k_exhaust     = 5                       # 5 tests/kernel: consecutive DEAD/INCONCLUSIVE ⇒ EXHAUSTED (a WIN resets)
+agent_harness = "codex"
+
+# Roofline-MLP campaign (2026-07-10): single Sol@medium worker, seeded with the
+# roofline map in prompt_gfx1201.md (headroom targets: gate_up VGPR, sigmoid_scaled
+# occ, down/residual pipelining). Sol = unbiased lever-finder.
+[[workers]]
+card   = 0
+dev    = 0
+model  = "gpt-5.6-sol"
+effort = "medium"
+
+[bounds]                                # watcher leashes
+call_budget = 400
+wall_ttl_s  = 43200

@@ -627,6 +627,21 @@ pub trait Speculator {
         temp: f32,
     ) -> Result<SpecStep, String>;
 
+    /// Advance an emitter-injected continuation after a completed speculative
+    /// window. The default keeps target state correct for model-free drafters;
+    /// hidden-conditioned drafters override it to advance their target-hidden
+    /// cache and projection cursor in lockstep with the target.
+    fn advance_forced(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        position: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<SpecAdvance, String> {
+        target.spec_advance(gpu, tokens, position, false, abort, None)
+    }
+
     /// Compact drafter-local cached state after a target KV eviction the daemon
     /// already applied. Default no-op for drafters with no target-hidden cache.
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {

@@ -1243,6 +1243,12 @@ pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip");
 
+/// NUM_ROWS register row-tile of the indexed MoE gate_up GEMV (opt-in,
+/// HIPFIRE_MOE_GATE_UP_FUSED=1). Each block owns NUM_ROWS output rows/expert,
+/// reusing x across them; grid.x = ceil(M/NUM_ROWS). Token-id exact vs the base.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_rowtile.hip");
+
 /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV. Same
 /// device-side expert-pointer table + topk_indices contract as the
 /// HFQ4G256 sibling; closes the residual hipGraph-capture gap for
@@ -1313,6 +1319,19 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 /// contention per output cell).
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
+
+/// Fused atomic-free MoE down: GEMV + K_TOP weighted-accumulate + residual
+/// add in a single kernel. Replaces the two-launch
+/// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` (writes an
+/// [N × K_TOP × M] expanded buffer) FOLLOWED BY `moe_down_combine_k8_batched`
+/// (weighted-sums the K_TOP slots into x_residual). Each block owns one
+/// (token, row), loops all K_TOP experts internally, and does a single
+/// race-free `x_residual[token][row] += Σ_k weight[k]·down_k(row)` — no
+/// expanded intermediate materialized, no atomicAdd. Wave32-only (RDNA);
+/// opt-in via `HIPFIRE_MOE_DOWN_FUSED=1`.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_FUSED_ACC_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_fused_acc.hip");
+
 
 /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs

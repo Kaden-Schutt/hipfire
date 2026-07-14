@@ -12,7 +12,15 @@ cargo test -p rdna-compute --lib
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 
 echo "== Python CPU tests =="
-python3 -m pytest tests scripts/test_astrea.py
+if python3 -c 'import pytest, numpy' 2>/dev/null; then
+    python3 -m pytest tests scripts/test_astrea.py autoresearch/ar/tests
+elif command -v uv >/dev/null 2>&1; then
+    uv run --with pytest --with numpy python -m pytest \
+        tests scripts/test_astrea.py autoresearch/ar/tests
+else
+    echo "no-gpu-ci: pytest/numpy missing and uv unavailable" >&2
+    exit 1
+fi
 
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py

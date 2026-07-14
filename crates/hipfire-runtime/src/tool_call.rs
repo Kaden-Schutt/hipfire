@@ -215,6 +215,37 @@ fn parse_one_hermes(raw: &str, already_repaired: bool) -> Option<ParsedToolCall>
             }
         }
     }
+
+    // Form 4: relaxed recovery for a structurally-malformed JSON body —
+    // most commonly the OUTER tool-call object `}` dropped before
+    // `</tool_call>` (`{"name":"read","arguments":{"path":"x"}`, the Pi
+    // "dropped closing bracket" failure) or a lost leading brace from
+    // special-token leakage. Reuse the runtime's shared fallback extractors
+    // so this parser recovers exactly what the daemon serve path's
+    // `emit_text::extract_tool_calls_from_text` recovers — no divergence.
+    if let Some(name) = crate::emit_text::extract_tool_call_name_fallback(raw) {
+        if let Some(arguments) = crate::emit_text::extract_tool_call_arguments_fallback(raw) {
+            // Recovered a complete, strict-valid args object.
+            return Some(ParsedToolCall {
+                name,
+                arguments,
+                repaired: true,
+            });
+        } else if crate::emit_text::tool_call_args_object_complete(raw) {
+            // Args object is brace-balanced but not strict JSON (trailing
+            // comma / unquoted key) — a formatting glitch, not a truncation.
+            // Preserve the call by name with empty args (legacy behavior).
+            return Some(ParsedToolCall {
+                name,
+                arguments: serde_json::Value::Object(Default::default()),
+                repaired: true,
+            });
+        }
+        // else: no balanced args object — the call was cut off mid-value.
+        // Drop it (return None) rather than fabricating empty args, matching
+        // `extract_tool_calls_from_text`, so a truncated call surfaces as
+        // content + finish_reason for the client to retry.
+    }
     None
 }
 
@@ -528,6 +559,28 @@ mod tests {
             &r.tool_calls[0].arguments,
             serde_json::json!({"path":"/tmp/x","contents":"hi"})
         ));
+    }
+
+    #[test]
+    fn hermes_missing_outer_brace_recovered() {
+        // The Pi "dropped closing bracket" shape: the inner args object is
+        // complete and balanced, but the OUTER tool-call object's `}` is
+        // missing before `</tool_call>`. Must recover the call (marked
+        // repaired) rather than silently dropping it — keeping this parser in
+        // lockstep with `emit_text::extract_tool_calls_from_text`.
+        let p = HermesJsonParser::new();
+        let text = "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"/home/x/flake.nix\"}\n</tool_call>";
+        let r = p.parse(text);
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].name, "read");
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({"path":"/home/x/flake.nix"})
+        ));
+        assert!(
+            r.tool_calls[0].repaired,
+            "recovered-from-malformed call must be marked repaired"
+        );
     }
 
     #[test]
