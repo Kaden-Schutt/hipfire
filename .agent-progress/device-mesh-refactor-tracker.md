@@ -30,7 +30,27 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ## Current Status
 
-**Foundation implemented; refactor incomplete.** The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, and god-struct foundation are substantial and tested. Physical topology evidence and the integration gaps tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+**Foundation implemented; refactor incomplete.** `COR-004` is complete; no task is currently marked `in progress`. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, and god-struct foundation are substantial and tested. Physical topology evidence and the integration gaps tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+
+## Execution Priority
+
+This is the implementation queue. The dependency graph below remains the
+authoritative constraint; a task is marked `in progress` only when work begins.
+
+1. `COR-002` — implement the total reset contract now that `COR-004` resolved the
+   ownership boundary.
+2. `COR-003` — finalize pending parser output exactly once at every terminal
+   path.
+3. `STEP-001` — adopt Step/manifest for DeltaNet with single-device parity.
+4. `PAR-001` — publish and enforce the model-family PP/TP/EP support matrix.
+5. `COMP-001` — decide and enforce the TP x EP scope boundary.
+6. `COR-005` — make generic LLaMA/Qwen3 spec-target loading transactional.
+7. `COR-006` — align eviction physical-cap metadata with KV allocation.
+
+After those ownership, execution, and support decisions, schedule their
+dependent work by the dependency graph. Hardware tasks remain blocked until
+the required distinct-GPU topology is available; emulation does not advance
+them toward completion.
 
 ## Completed Foundation Evidence
 
@@ -127,12 +147,66 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ### COR-004 Decide Eviction Ownership
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Decide and enforce whether eviction is resettable request state in `SessionState` or persistent/model-owned state.
 - **Acceptance criteria:** The ownership decision is documented with lifecycle rationale; the field is moved or explicitly retained accordingly; reset, reuse, and speculative commit semantics follow that decision; tests prevent cross-request eviction bleed and accidental loss of intentionally persistent state.
 - **Validation:** Run ownership/reset unit tests plus multi-turn and speculative eviction scenarios; inspect `LoadedModel` so no duplicate eviction authority remains.
 - **Hardware:** None for ownership tests; a supported AMD GPU for end-to-end eviction behavior.
+- **Evidence:** Decision: `LoadedModel.eviction` owns the calibrated policy and
+  reusable GPU scratch until unload; `KvCache::compact_offset`, physical cursor,
+  target recurrent state, and the DFlash mirror are request state. Qwen35
+  DFlash construction, sidecar loading, snapshots, and eviction scratch now
+  roll back unpublished GPU allocations; failed speculative transitions drop
+  their target guard and rejoin `model_reset_context`. Validation: `nix develop
+  --command cargo test -p hipfire-runtime --lib --locked` (346 passed, 1
+  ignored); `nix develop --command cargo test -p hipfire-loader --lib --locked`
+  (14 passed, 2 ignored); `nix develop --command cargo test -p hipfire-runtime
+  --example daemon --locked` (37 passed); Qwen35 lib tests (141 passed, 5
+  ignored); release daemon build with `deltanet`; default and sidecar-enabled
+  `serve-multiturn-gate.sh` passes (`/tmp/serve-multiturn-20260714-081913.md`,
+  `/tmp/serve-multiturn-20260714-081935.md`); deterministic lifecycle pass
+  (`/tmp/nix-shell.vsoRuA/qwen35-eviction-lifecycle.GBTT1t`, A=104 > 40,
+  reset B token-identical to clean B). Fixtures SHA-256: target
+  `70dcd063a493af20a519e3afd0f341910b97bfd1af76aba45fe4742aed14fd15`, draft
+  `bd8c4f07ae80fe1385bf2606af9a7ba0daa18ca8daec50916f2a489054c44e70`, sidecar
+  `d6cb8026841830cfeb82d2709453aa753f65b5596bfb9cc9c085c808fda6ad22`.
+
+### COR-005 Transactional LLaMA Spec-Target Loading
+
+- **Status:** ready
+- **Dependencies:** None
+- **Goal:** Make generic LLaMA/Qwen3 speculative-target loading and DFlash
+  construction transactional so every fallible load path returns a normal error
+  without orphaning target, draft, scratch, or verification GPU allocations.
+- **Acceptance criteria:** Generic carrier loading retains ownership of a
+  partially loaded LLaMA target until its generic DFlash scratch and target
+  verification resources are fully published; all failure paths free every
+  earlier allocation exactly once; success and unload preserve the existing
+  explicit teardown contract; no global `Drop` for GPU buffers is introduced.
+- **Validation:** Add deterministic fault injection for generic target load and
+  generic DFlash scratch/verify allocation. For each injected failure, drain
+  the pool and require exact VRAM baseline recovery; run generic DFlash
+  success/unload and repeated load/generate/unload cycles on a supported GPU.
+- **Hardware:** A supported AMD GPU with a generic LLaMA/Qwen3 target and
+  compatible DFlash draft fixture.
+- **Evidence:** Pending
+
+### COR-006 Align Eviction Physical-Cap Allocation
+
+- **Status:** ready
+- **Dependencies:** None
+- **Goal:** Make the physical capacity derived for TriAttention/CASK size the
+  actual Qwen35 KV allocation rather than only eviction metadata and scratch.
+- **Acceptance criteria:** With a sidecar, the Qwen35 KV cache allocation uses
+  the resolved physical capacity; loading rejects impossible budget/beta/cap
+  combinations before allocation; configured long context retains the intended
+  bounded VRAM behavior; non-eviction loading remains byte-identical.
+- **Validation:** Add loader and GPU allocation-inventory tests for plain
+  TriAttention and CASK; record KV allocation bytes, physical cap, budget, and
+  beta; run repeated long-context eviction and unload/reload cycles.
+- **Hardware:** A supported AMD GPU with a Qwen35 target and TriAttention
+  sidecar.
 - **Evidence:** Pending
 
 ### GEN-001 Complete Qwen35 Arch-Resident PP
@@ -288,7 +362,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 ### DOC-002 Final Validation And Merge Gate
 
 - **Status:** blocked
-- **Dependencies:** HW-001, HW-002, HW-003, HW-004, HW-005, COR-001, COR-002, COR-003, COR-004, GEN-001, GEN-002, SPEC-001, SPEC-002, SPEC-003, VL-001, VL-002, STEP-001, STEP-002, STEP-003, STEP-004, PAR-001, PAR-002, COMP-001, DOC-001
+- **Dependencies:** HW-001, HW-002, HW-003, HW-004, HW-005, COR-001, COR-002, COR-003, COR-004, COR-005, COR-006, GEN-001, GEN-002, SPEC-001, SPEC-002, SPEC-003, VL-001, VL-002, STEP-001, STEP-002, STEP-003, STEP-004, PAR-001, PAR-002, COMP-001, DOC-001
 - **Goal:** Establish that the completed refactor is correct, production-honest, documented, and ready to merge.
 - **Acceptance criteria:** Every listed dependency and every conditional follow-up created by COMP-001 is `complete` with evidence; every row in the Final Validation Matrix passes against its named fixture/oracle; HW-001 through HW-005 meet the 64 MiB/no-monotonic-growth thresholds; no stale active checklist conflicts with this tracker; PR #527 mirrors all IDs, required CI checks pass, and no blocking review finding remains.
 - **Validation:** Execute and archive every row in the Final Validation Matrix, rerun tracker schema and documentation-link checks, inspect the final branch diff and PR checks/reviews, and attach the physical PP/TP/EP reports with artifact/prompt digests and per-cycle VRAM.
@@ -318,7 +392,7 @@ DOC-002 cannot complete from a generic “tests pass” statement. Its evidence 
 ## Dependency Order
 
 1. HW-003 and HW-005 can start immediately when suitable machines are available; HW-001 and HW-002 wait for STEP-002 so physical RCCL validation exercises the final Step/manifest EP path; HW-004 waits for GEN-001.
-2. COR-001, COR-003, COR-004, PAR-001, STEP-001, and DOC-001 are independent starting points.
+2. COR-001, COR-003, COR-004, COR-005, COR-006, PAR-001, STEP-001, and DOC-001 are independent starting points.
 3. COR-004 feeds COR-002; COR-001 through COR-003 feed SPEC-001; SPEC-001 feeds SPEC-002; VL-001 depends only on COR-002 and COR-003. SPEC-003 is deferred until final closure and blocks DOC-002 only.
 4. STEP-001 feeds STEP-003; PAR-001 feeds STEP-002; STEP-001, STEP-002, STEP-003, and PAR-001 feed STEP-004.
 5. COR-002 plus STEP-001/STEP-003 feed GEN-001; GEN-001 feeds physical Qwen35 validation HW-004.
@@ -328,7 +402,7 @@ DOC-002 cannot complete from a generic “tests pass” statement. Its evidence 
 ## Parallel Streams
 
 - **Physical validation:** HW-003 and HW-005 can run independently; HW-001 and HW-002 follow STEP-002; HW-004 follows GEN-001.
-- **Correctness ownership:** COR-001, COR-003, and COR-004 initially; COR-002 follows the eviction decision.
+- **Correctness ownership:** COR-001, COR-003, COR-004, COR-005, and COR-006 initially; COR-002 follows the eviction decision.
 - **Generation/spec:** GEN-002 can proceed alongside SPEC-001; SPEC-002 follows metadata and shared orchestration. SPEC-003 is deferred to final closure.
 - **Multimodal:** VL-001 follows only COR-002/COR-003 and can proceed independently of SPEC-001; VL-002 waits for SPEC-001 because it adopts the existing n-gram strategy through shared speculative orchestration.
 - **Execution/placement:** STEP-001 and PAR-001 can start together; STEP-002 and STEP-003 then proceed largely independently before STEP-004.

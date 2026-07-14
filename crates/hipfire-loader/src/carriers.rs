@@ -387,10 +387,14 @@ impl Carrier for Qwen35Carrier {
                 let config = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source)
                     .map_err(|e| format!("failed to parse Qwen3.5 config from config.json: {e}"))?;
                 if ctx.draft_path.is_some() {
-                    eprintln!("  warning: DFlash (speculative decoding) is not supported for safetensors Dir sources; draft_path ignored");
+                    eprintln!(
+                        "  warning: DFlash (speculative decoding) is not supported for safetensors Dir sources; draft_path ignored"
+                    );
                 }
                 if ctx.cask.sidecar.is_some() {
-                    eprintln!("  warning: CASK eviction is not supported for safetensors Dir sources; eviction sidecar ignored");
+                    eprintln!(
+                        "  warning: CASK eviction is not supported for safetensors Dir sources; eviction sidecar ignored"
+                    );
                 }
                 let mut paro_source =
                     hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
@@ -442,7 +446,11 @@ impl Carrier for Qwen35Carrier {
                     eprintln!(
                         "  warning: model dim={} (<2048); FP32 DeltaNet state is recommended for small models (current: {})",
                         config.dim,
-                        if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 { "Q4" } else { "Q8" }
+                        if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 {
+                            "Q4"
+                        } else {
+                            "Q8"
+                        }
                     );
                 }
                 let dn_state = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(

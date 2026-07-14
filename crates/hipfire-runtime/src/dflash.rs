@@ -46,6 +46,85 @@ use std::collections::{HashMap, HashSet};
 /// first-call `fc` rotation (one-shot per prompt, negligible vs prefill).
 const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
+/// Test-only fault boundaries for DFlash constructors. This feature is never
+/// enabled in production builds, so no environment variable can alter serving.
+#[cfg(feature = "dflash-fault-inject")]
+#[derive(Clone, Copy)]
+pub enum DflashAllocationSite {
+    Weights,
+    Scratch,
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+impl DflashAllocationSite {
+    fn code(self) -> usize {
+        match self {
+            Self::Weights => 1,
+            Self::Scratch => 2,
+        }
+    }
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+#[derive(Clone, Copy)]
+pub struct DflashAllocationFault {
+    pub site: DflashAllocationSite,
+    pub allocation: usize,
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+mod dflash_fault_inject {
+    use super::{DflashAllocationFault, DflashAllocationSite};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    static SITE: AtomicUsize = AtomicUsize::new(0);
+    static TARGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SITE.store(0, Ordering::SeqCst);
+            TARGET.store(usize::MAX, Ordering::SeqCst);
+            COUNT.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn with_fault<T>(fault: DflashAllocationFault, f: impl FnOnce() -> T) -> T {
+        let _lock = LOCK.lock().expect("DFlash allocation fault lock poisoned");
+        SITE.store(fault.site.code(), Ordering::SeqCst);
+        TARGET.store(fault.allocation, Ordering::SeqCst);
+        COUNT.store(0, Ordering::SeqCst);
+        let _reset = Reset;
+        f()
+    }
+
+    pub(super) fn after_allocation(site: DflashAllocationSite) -> hip_bridge::HipResult<()> {
+        if SITE.load(Ordering::SeqCst) == site.code()
+            && COUNT.fetch_add(1, Ordering::SeqCst) == TARGET.load(Ordering::SeqCst)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "test fault after DFlash allocation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+pub fn with_dflash_allocation_fault<T>(fault: DflashAllocationFault, f: impl FnOnce() -> T) -> T {
+    dflash_fault_inject::with_fault(fault, f)
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+fn dflash_allocation_boundary(site: DflashAllocationSite) -> HipResult<()> {
+    dflash_fault_inject::after_allocation(site)
+}
+
 // ─── Config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -133,6 +212,80 @@ impl DflashConfig {
 
 // ─── Weights ───────────────────────────────────────────────────────────────
 
+enum DflashWeightResource {
+    Tensor(GpuTensor),
+    Weight(WeightTensor),
+}
+
+impl DflashWeightResource {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Self::Tensor(tensor) => {
+                let _ = gpu.free_tensor(tensor);
+            }
+            Self::Weight(weight) => weight.free_all(gpu),
+        }
+    }
+}
+
+/// Local owner for DflashWeights while its constructor is still fallible.
+/// `GpuTensor` has no Drop, so error paths explicitly drain this ledger.
+struct DflashWeightStaging {
+    resources: Vec<DflashWeightResource>,
+}
+
+impl DflashWeightStaging {
+    fn tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
+        self.resources.push(DflashWeightResource::Tensor(tensor));
+        #[cfg(feature = "dflash-fault-inject")]
+        dflash_allocation_boundary(DflashAllocationSite::Weights)?;
+        Ok(())
+    }
+
+    fn weight(&mut self, weight: WeightTensor) -> HipResult<()> {
+        self.resources.push(DflashWeightResource::Weight(weight));
+        #[cfg(feature = "dflash-fault-inject")]
+        dflash_allocation_boundary(DflashAllocationSite::Weights)?;
+        Ok(())
+    }
+
+    fn has_mq(&self) -> bool {
+        self.resources.iter().any(|resource| {
+            let DflashWeightResource::Weight(weight) = resource else {
+                return false;
+            };
+            matches!(
+                weight.gpu_dtype,
+                DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256
+            )
+        })
+    }
+
+    fn free_gpu(mut self, gpu: &mut Gpu) {
+        for resource in self.resources.drain(..) {
+            resource.free_gpu(gpu);
+        }
+    }
+
+    fn into_iter(self) -> std::vec::IntoIter<DflashWeightResource> {
+        self.resources.into_iter()
+    }
+}
+
+fn staged_weight(resources: &mut std::vec::IntoIter<DflashWeightResource>) -> WeightTensor {
+    match resources.next().expect("staged DFlash weight") {
+        DflashWeightResource::Weight(weight) => weight,
+        DflashWeightResource::Tensor(_) => panic!("DFlash weight staging order"),
+    }
+}
+
+fn staged_tensor(resources: &mut std::vec::IntoIter<DflashWeightResource>) -> GpuTensor {
+    match resources.next().expect("staged DFlash tensor") {
+        DflashWeightResource::Tensor(tensor) => tensor,
+        DflashWeightResource::Weight(_) => panic!("DFlash tensor staging order"),
+    }
+}
+
 pub struct DflashLayerWeights {
     pub attn_norm: GpuTensor, // [hidden] — F32, RMSNorm weight
     pub wq: WeightTensor,     // [q_dim, hidden]
@@ -156,6 +309,224 @@ pub struct DflashWeights {
     /// True when at least one matrix weight is MQ4G256 — drives whether
     /// the draft_forward path needs to allocate FWHT rotation scratches.
     pub has_mq: bool,
+}
+
+fn validate_dflash_f32_tensor(hfq: &HfqFile, name: &str, shape: &[usize]) -> Result<(), String> {
+    let (info, data) = hfq
+        .tensor_data(name)
+        .ok_or_else(|| format!("dflash tensor missing: {name}"))?;
+    let expected_shape: Vec<u32> = shape
+        .iter()
+        .map(|&dimension| {
+            u32::try_from(dimension)
+                .map_err(|_| format!("dflash {name} shape dimension {dimension} overflows u32"))
+        })
+        .collect::<Result<_, _>>()?;
+    if info.shape != expected_shape {
+        return Err(format!(
+            "dflash {name} shape mismatch: have {:?}, expected {expected_shape:?}",
+            info.shape
+        ));
+    }
+    let elements = shape.iter().try_fold(1usize, |total, &dimension| {
+        total
+            .checked_mul(dimension)
+            .ok_or_else(|| format!("dflash {name} element count overflows usize"))
+    })?;
+    let bytes_per_element = match info.quant_type {
+        1 => 2,
+        2 => 4,
+        quant_type => {
+            return Err(format!(
+                "dflash: unsupported quant_type {quant_type} for {name}"
+            ));
+        }
+    };
+    let expected_bytes = elements
+        .checked_mul(bytes_per_element)
+        .ok_or_else(|| format!("dflash {name} byte count overflows usize"))?;
+    if data.len() != expected_bytes {
+        return Err(format!(
+            "dflash {name} byte-size mismatch: have {}, expected {expected_bytes}",
+            data.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dflash_mq_payload(
+    name: &str,
+    quant_type: u8,
+    m: usize,
+    k: usize,
+    data: &[u8],
+) -> Result<(), String> {
+    let (format, bytes_per_group) = match quant_type {
+        17 => ("MQ3-G256", 104usize),
+        13 => ("MQ4-G256", 136usize),
+        15 => ("MQ6-G256", 200usize),
+        _ => return Ok(()),
+    };
+    if m == 0 {
+        return Err(format!(
+            "dflash {name} {format} row dimension must be positive"
+        ));
+    }
+    if k == 0 || k % 256 != 0 {
+        return Err(format!(
+            "dflash {name} {format} K dimension {k} must be divisible by 256"
+        ));
+    }
+    let groups_per_row = k / 256;
+    let expected_bytes = m
+        .checked_mul(groups_per_row)
+        .and_then(|groups| groups.checked_mul(bytes_per_group))
+        .ok_or_else(|| format!("dflash {name} {format} payload byte count overflows usize"))?;
+    if data.len() != expected_bytes {
+        return Err(format!(
+            "dflash {name} {format} payload byte-size mismatch: have {}, expected {expected_bytes} ({m} rows x {groups_per_row} groups/row x {bytes_per_group} bytes/group)",
+            data.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dflash_weight(hfq: &HfqFile, name: &str, m: usize, k: usize) -> Result<(), String> {
+    let (info, data) = hfq
+        .tensor_data(name)
+        .ok_or_else(|| format!("dflash tensor missing: {name}"))?;
+    let expected_shape = [
+        u32::try_from(m).map_err(|_| format!("dflash {name} row count {m} overflows u32"))?,
+        u32::try_from(k).map_err(|_| format!("dflash {name} column count {k} overflows u32"))?,
+    ];
+    if info.shape != expected_shape {
+        return Err(format!(
+            "dflash {name} shape mismatch: have {:?}, expected {expected_shape:?}",
+            info.shape
+        ));
+    }
+    let elements = m
+        .checked_mul(k)
+        .ok_or_else(|| format!("dflash {name} element count overflows usize"))?;
+    let expected_bytes = match info.quant_type {
+        1 => elements
+            .checked_mul(2)
+            .ok_or_else(|| format!("dflash {name} F16 byte count overflows usize"))?,
+        2 => elements
+            .checked_mul(4)
+            .ok_or_else(|| format!("dflash {name} F32 byte count overflows usize"))?,
+        13 | 15 | 17 => return validate_dflash_mq_payload(name, info.quant_type, m, k, data),
+        quant_type => {
+            return Err(format!(
+                "dflash: unsupported matrix quant_type {quant_type} for {name}"
+            ));
+        }
+    };
+    if data.len() != expected_bytes {
+        return Err(format!(
+            "dflash {name} byte-size mismatch: have {}, expected {expected_bytes}",
+            data.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate every draft tensor before any GPU upload. The upload helpers retain
+/// their panic diagnostics for malformed inputs, but this makes those paths
+/// unreachable for HFQ metadata/shape/quantization errors after staging begins.
+fn validate_dflash_weight_inputs(hfq: &HfqFile, cfg: &DflashConfig) -> Result<(), String> {
+    if cfg.n_layers == 0
+        || cfg.hidden == 0
+        || cfg.intermediate == 0
+        || cfg.n_heads == 0
+        || cfg.n_kv_heads == 0
+        || cfg.head_dim == 0
+        || cfg.num_extract() == 0
+    {
+        return Err("dflash configuration has a zero required dimension".into());
+    }
+    let q_dim = cfg
+        .n_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| "dflash query dimension overflows usize".to_string())?;
+    let kv_dim = cfg
+        .n_kv_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| "dflash key/value dimension overflows usize".to_string())?;
+    let fc_input = cfg
+        .num_extract()
+        .checked_mul(cfg.hidden)
+        .ok_or_else(|| "dflash fc input dimension overflows usize".to_string())?;
+
+    validate_dflash_weight(hfq, "fc.weight", cfg.hidden, fc_input)?;
+    validate_dflash_f32_tensor(hfq, "hidden_norm.weight", &[cfg.hidden])?;
+    validate_dflash_f32_tensor(hfq, "norm.weight", &[cfg.hidden])?;
+    for i in 0..cfg.n_layers {
+        let prefix = format!("layers.{i}");
+        validate_dflash_f32_tensor(
+            hfq,
+            &format!("{prefix}.input_layernorm.weight"),
+            &[cfg.hidden],
+        )?;
+        validate_dflash_weight(
+            hfq,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            q_dim,
+            cfg.hidden,
+        )?;
+        validate_dflash_weight(
+            hfq,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            kv_dim,
+            cfg.hidden,
+        )?;
+        validate_dflash_weight(
+            hfq,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            kv_dim,
+            cfg.hidden,
+        )?;
+        validate_dflash_weight(
+            hfq,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            cfg.hidden,
+            q_dim,
+        )?;
+        validate_dflash_f32_tensor(
+            hfq,
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            &[cfg.head_dim],
+        )?;
+        validate_dflash_f32_tensor(
+            hfq,
+            &format!("{prefix}.self_attn.k_norm.weight"),
+            &[cfg.head_dim],
+        )?;
+        validate_dflash_f32_tensor(
+            hfq,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &[cfg.hidden],
+        )?;
+        validate_dflash_weight(
+            hfq,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            cfg.intermediate,
+            cfg.hidden,
+        )?;
+        validate_dflash_weight(
+            hfq,
+            &format!("{prefix}.mlp.up_proj.weight"),
+            cfg.intermediate,
+            cfg.hidden,
+        )?;
+        validate_dflash_weight(
+            hfq,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            cfg.hidden,
+            cfg.intermediate,
+        )?;
+    }
+    Ok(())
 }
 
 /// Load a F32-only tensor (norms, embedding-shaped scalars). Always F32 on GPU.
@@ -198,10 +569,8 @@ fn hfq_tensor_f32(
 ///   15 (MQ6-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
 ///   17 (MQ3-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
 ///
-/// `shape = [m, k]` so m=output_dim and k=input_dim. The HFQ index stores
-/// the unaligned byte length; for MQ formats we skip shape verification (the
-/// quantized bytes are not a function of m*k alone — group padding can add
-/// up to 255 trailing bytes per row group).
+/// `shape = [m, k]` so m=output_dim and k=input_dim. MQ formats are G256
+/// row-grouped, so each row requires `K % 256 == 0` and an exact payload.
 fn hfq_weight(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -276,6 +645,8 @@ fn hfq_weight(
         13 => {
             // MQ4-G256: 136 bytes per 256 weights. The buffer is opaque to
             // the engine; the gemm_hfq4g256 kernel reads it directly.
+            validate_dflash_mq_payload(name, info.quant_type, m, k, data)
+                .map_err(|error| hip_bridge::HipError::new(0, &error))?;
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -290,6 +661,8 @@ fn hfq_weight(
         15 => {
             // MQ6-G256: 200 bytes per 256 weights. Same opaque-buffer pattern
             // as MQ4/MQ3; dispatch rotates activations and calls HFQ6 GEMM.
+            validate_dflash_mq_payload(name, info.quant_type, m, k, data)
+                .map_err(|error| hip_bridge::HipError::new(0, &error))?;
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -305,6 +678,8 @@ fn hfq_weight(
             // MQ3-G256: 104 bytes per 256 weights. Same opaque-buffer pattern
             // as MQ4. Dispatch path (`gemm_dispatch`) routes through
             // `rotate_x_mq_batched` + `gemm_hfq3g256_batched_lmhead`.
+            validate_dflash_mq_payload(name, info.quant_type, m, k, data)
+                .map_err(|error| hip_bridge::HipError::new(0, &error))?;
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -324,127 +699,180 @@ fn hfq_weight(
     // MQ2, MQ3-Lloyd, MFP4) is a single helper edit. Sidecar absent →
     // `awq_scale` stays None, dispatch path matches the pre-fix behavior.
     if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
+        // `wt` has already uploaded its main buffer, but it is not in the
+        // caller's staging owner until this function returns. Preserve an
+        // unexpected sidecar-loader panic after freeing that local resource;
+        // the outer DflashWeights transaction then drains earlier weights.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_awq_scale(hfq, gpu, name, k)
+        })) {
+            Ok(awq_scale) => wt.awq_scale = awq_scale,
+            Err(payload) => {
+                wt.free_all(gpu);
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
     Ok(wt)
 }
 
 impl DflashWeights {
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
-        let fc = hfq_weight(
-            hfq,
-            gpu,
-            "fc.weight",
-            cfg.hidden,
-            cfg.num_extract() * cfg.hidden,
-        )?;
-        let hidden_norm = hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden])?;
-        let norm = hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?;
+        validate_dflash_weight_inputs(hfq, cfg)
+            .map_err(|error| hip_bridge::HipError::new(0, &error))?;
+        let resource_capacity = cfg
+            .n_layers
+            .checked_mul(11)
+            .and_then(|layers| layers.checked_add(3))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "dflash weight count overflows usize"))?;
+        let mut staged = DflashWeightStaging {
+            resources: Vec::with_capacity(resource_capacity),
+        };
+        let allocation =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> HipResult<()> {
+                staged.weight(hfq_weight(
+                    hfq,
+                    gpu,
+                    "fc.weight",
+                    cfg.hidden,
+                    cfg.num_extract() * cfg.hidden,
+                )?)?;
+                staged.tensor(hfq_tensor_f32(
+                    hfq,
+                    gpu,
+                    "hidden_norm.weight",
+                    vec![cfg.hidden],
+                )?)?;
+                staged.tensor(hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?)?;
 
+                for i in 0..cfg.n_layers {
+                    let p = format!("layers.{i}");
+                    staged.tensor(hfq_tensor_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.input_layernorm.weight"),
+                        vec![cfg.hidden],
+                    )?)?;
+                    staged.weight(hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_proj.weight"),
+                        cfg.q_dim(),
+                        cfg.hidden,
+                    )?)?;
+                    staged.weight(hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_proj.weight"),
+                        cfg.kv_dim(),
+                        cfg.hidden,
+                    )?)?;
+                    staged.weight(hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.v_proj.weight"),
+                        cfg.kv_dim(),
+                        cfg.hidden,
+                    )?)?;
+                    staged.weight(hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.o_proj.weight"),
+                        cfg.hidden,
+                        cfg.q_dim(),
+                    )?)?;
+                    staged.tensor(hfq_tensor_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                        vec![cfg.head_dim],
+                    )?)?;
+                    staged.tensor(hfq_tensor_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                        vec![cfg.head_dim],
+                    )?)?;
+                    staged.tensor(hfq_tensor_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        vec![cfg.hidden],
+                    )?)?;
+                    staged.weight(hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.gate_proj.weight"),
+                        cfg.intermediate,
+                        cfg.hidden,
+                    )?)?;
+                    staged.weight(hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.up_proj.weight"),
+                        cfg.intermediate,
+                        cfg.hidden,
+                    )?)?;
+                    staged.weight(hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.down_proj.weight"),
+                        cfg.hidden,
+                        cfg.intermediate,
+                    )?)?;
+                }
+                Ok(())
+            }));
+        match allocation {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                staged.free_gpu(gpu);
+                return Err(error);
+            }
+            Err(payload) => {
+                staged.free_gpu(gpu);
+                std::panic::resume_unwind(payload);
+            }
+        }
+
+        let has_mq = staged.has_mq();
+        let mut resources = staged.into_iter();
+        let fc = staged_weight(&mut resources);
+        let hidden_norm = staged_tensor(&mut resources);
+        let norm = staged_tensor(&mut resources);
         let mut layers = Vec::with_capacity(cfg.n_layers);
-        for i in 0..cfg.n_layers {
-            let p = format!("layers.{i}");
-            let layer = DflashLayerWeights {
-                attn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.input_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                wq: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    cfg.q_dim(),
-                    cfg.hidden,
-                )?,
-                wk: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    cfg.kv_dim(),
-                    cfg.hidden,
-                )?,
-                wv: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.v_proj.weight"),
-                    cfg.kv_dim(),
-                    cfg.hidden,
-                )?,
-                wo: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.o_proj.weight"),
-                    cfg.hidden,
-                    cfg.q_dim(),
-                )?,
-                q_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                k_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                ffn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                w_gate: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.gate_proj.weight"),
-                    cfg.intermediate,
-                    cfg.hidden,
-                )?,
-                w_up: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.up_proj.weight"),
-                    cfg.intermediate,
-                    cfg.hidden,
-                )?,
-                w_down: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.down_proj.weight"),
-                    cfg.hidden,
-                    cfg.intermediate,
-                )?,
-            };
-            layers.push(layer);
-        }
-
-        let has_mq = std::iter::once(&fc)
-            .chain(layers.iter().flat_map(|l| {
-                [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down].into_iter()
-            }))
-            .any(|w| {
-                matches!(
-                    w.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256
-                )
+        for _ in 0..cfg.n_layers {
+            layers.push(DflashLayerWeights {
+                attn_norm: staged_tensor(&mut resources),
+                wq: staged_weight(&mut resources),
+                wk: staged_weight(&mut resources),
+                wv: staged_weight(&mut resources),
+                wo: staged_weight(&mut resources),
+                q_norm: staged_tensor(&mut resources),
+                k_norm: staged_tensor(&mut resources),
+                ffn_norm: staged_tensor(&mut resources),
+                w_gate: staged_weight(&mut resources),
+                w_up: staged_weight(&mut resources),
+                w_down: staged_weight(&mut resources),
             });
-        if has_mq {
-            // MQ dispatch needs the engine's FWHT sign tables uploaded
-            // (matches `gemv_mq4g256_with_rotate`'s setup).
-            gpu.ensure_mq_signs()?;
         }
-
-        Ok(DflashWeights {
+        let weights = DflashWeights {
             fc,
             hidden_norm,
             norm,
             layers,
             has_mq,
-        })
+        };
+        if has_mq {
+            // MQ dispatch needs the engine's FWHT sign tables uploaded
+            // (matches `gemv_mq4g256_with_rotate`'s setup).
+            if let Err(error) = gpu.ensure_mq_signs() {
+                weights.free_gpu(gpu);
+                return Err(error);
+            }
+        }
+
+        Ok(weights)
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -664,6 +1092,31 @@ pub struct DflashScratch {
     pub draft_ffn_warmed_up: Vec<HashSet<usize>>,
 }
 
+/// Constructor-local scratch owner. It keeps every tensor in allocation order
+/// until DflashScratch can be built atomically, and explicitly frees on error.
+struct DflashTensorStaging {
+    tensors: Vec<GpuTensor>,
+}
+
+impl DflashTensorStaging {
+    fn allocate(&mut self, gpu: &mut Gpu, shape: &[usize], dtype: DType) -> HipResult<()> {
+        self.tensors.push(gpu.alloc_tensor(shape, dtype)?);
+        #[cfg(feature = "dflash-fault-inject")]
+        dflash_allocation_boundary(DflashAllocationSite::Scratch)?;
+        Ok(())
+    }
+
+    fn free_gpu(mut self, gpu: &mut Gpu) {
+        for tensor in self.tensors.drain(..) {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+
+    fn into_iter(self) -> std::vec::IntoIter<GpuTensor> {
+        self.tensors.into_iter()
+    }
+}
+
 impl DflashScratch {
     pub fn new(
         gpu: &mut Gpu,
@@ -693,43 +1146,77 @@ impl DflashScratch {
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
 
+        let mut staged = DflashTensorStaging {
+            tensors: Vec::with_capacity(with_mq as usize + cfg.n_layers * 2 + 20),
+        };
+        let allocation =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> HipResult<()> {
+                if with_mq {
+                    // Sized for a CHUNK of the worst-case MQ rotation, not the
+                    // whole first-call prefix, so large contexts do not pin a
+                    // context-sized activation buffer.
+                    let widest =
+                        MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
+                    staged.allocate(gpu, &[widest], DType::F32)?;
+                }
+
+                // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K,
+                // pre-RoPE). They remain interleaved to preserve allocation order.
+                for _ in 0..cfg.n_layers {
+                    staged.allocate(gpu, &[l * kvd], DType::F32)?;
+                    staged.allocate(gpu, &[l * kvd], DType::F32)?;
+                }
+                for &len in &[
+                    b * h,
+                    b * h,
+                    b * qd,
+                    b * kvd,
+                    b * kvd,
+                    b * inter,
+                    b * inter,
+                    b * inter,
+                    b * qd,
+                    b * h,
+                    b * h,
+                    b * h,
+                    l * ne * h,
+                    l * h,
+                    l * kvd,
+                    l * kvd,
+                    tot * kvd,
+                    tot * kvd,
+                    b,
+                    tot,
+                ] {
+                    staged.allocate(gpu, &[len], DType::F32)?;
+                }
+                Ok(())
+            }));
+        match allocation {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                staged.free_gpu(gpu);
+                return Err(error);
+            }
+            Err(payload) => {
+                staged.free_gpu(gpu);
+                std::panic::resume_unwind(payload);
+            }
+        }
+
+        let mut tensors = staged.into_iter();
         let mq_x_rot = if with_mq {
-            // Sized for a CHUNK of the worst-case MQ rotation, not the whole
-            // first-call prefix. The rotations called through `gemm_dispatch`
-            // are:
-            //   - first-call `fc` (target_hidden):  batch up to `l`, w.k = ne*h
-            //   - per-cycle wq/wk/wv/gate/up:       batch = b,         w.k = h
-            //   - per-cycle wo:                     batch = b,         w.k = q_dim
-            //   - per-cycle w_down:                 batch = b,         w.k = intermediate
-            //   - first-call wk/wv on prefix:       batch up to `l`,   w.k = h
-            //
-            // Steady-state cycles only need `b × max(inter, qd, ne*h)`. The
-            // first-call rotations against the full prefix used to pin the
-            // buffer to `l × ne × h` (1.7 GB at ctx=17K on 27B). That sizing
-            // forced VRAM bloat that scales with max_seq.
-            //
-            // Fix: cap the scratch at `MQ_X_ROT_CHUNK_ROWS × max(inter, qd, ne*h)`
-            // floats and chunk any call where `batch × w.k > scratch.size()`
-            // inside `gemm_dispatch`. The first-call rotations are split into
-            // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
-            // 1K prefix tokens (negligible vs seconds-scale prefill).
-            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
-            Some(gpu.alloc_tensor(&[widest], DType::F32)?)
+            Some(tensors.next().expect("staged DFlash MQ rotation scratch"))
         } else {
             None
         };
-
-        // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
-        // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
-        // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
-        // = 128 MB. Trivial vs 24 GB VRAM.
         let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
         let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_graphs = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_warmed_up = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
-            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
-            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            k_ctx_cached.push(tensors.next().expect("staged DFlash K cache"));
+            v_ctx_cached.push(tensors.next().expect("staged DFlash V cache"));
             draft_ffn_graphs.push(HashMap::new());
             draft_ffn_warmed_up.push(HashSet::new());
         }
@@ -737,31 +1224,28 @@ impl DflashScratch {
         Ok(DflashScratch {
             max_block_size: b,
             max_ctx_len: l,
-
-            x: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            x_norm: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            q: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            k_noise: gpu.alloc_tensor(&[b * kvd], DType::F32)?,
-            v_noise: gpu.alloc_tensor(&[b * kvd], DType::F32)?,
-            gate: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            gate_up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
-            attn_out: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            attn_proj: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            residual_attn: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            residual_ffn: gpu.alloc_tensor(&[b * h], DType::F32)?,
-
-            target_hidden: gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
-            target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
-            k_ctx: gpu.alloc_tensor(&[l * kvd], DType::F32)?,
-            v_ctx: gpu.alloc_tensor(&[l * kvd], DType::F32)?,
-
-            k_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
-            v_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
-
-            positions_q: gpu.alloc_tensor(&[b], DType::F32)?,
-            positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
-
+            x: tensors.next().expect("staged DFlash x"),
+            x_norm: tensors.next().expect("staged DFlash x norm"),
+            q: tensors.next().expect("staged DFlash q"),
+            k_noise: tensors.next().expect("staged DFlash k noise"),
+            v_noise: tensors.next().expect("staged DFlash v noise"),
+            gate: tensors.next().expect("staged DFlash gate"),
+            up: tensors.next().expect("staged DFlash up"),
+            gate_up: tensors.next().expect("staged DFlash gate/up"),
+            attn_out: tensors.next().expect("staged DFlash attention output"),
+            attn_proj: tensors.next().expect("staged DFlash attention projection"),
+            residual_attn: tensors.next().expect("staged DFlash attention residual"),
+            residual_ffn: tensors.next().expect("staged DFlash FFN residual"),
+            target_hidden: tensors.next().expect("staged DFlash target hidden"),
+            target_hidden_proj: tensors
+                .next()
+                .expect("staged DFlash target hidden projection"),
+            k_ctx: tensors.next().expect("staged DFlash K context"),
+            v_ctx: tensors.next().expect("staged DFlash V context"),
+            k_cat: tensors.next().expect("staged DFlash concatenated K"),
+            v_cat: tensors.next().expect("staged DFlash concatenated V"),
+            positions_q: tensors.next().expect("staged DFlash Q positions"),
+            positions_k: tensors.next().expect("staged DFlash K positions"),
             mq_x_rot,
             thlog: TargetHiddenLog::new(),
             k_ctx_cached,
@@ -1640,4 +2124,204 @@ pub fn draft_forward_opts(
     scratch.thlog.mark_proj_cached(l);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[cfg(feature = "dflash-fault-inject")]
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_hfq(path: &std::path::Path, tensors: &[(&str, &[u32], &[u8])]) {
+        let metadata = b"{}";
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let mut index = Vec::new();
+        index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+        for (name, shape, data) in tensors {
+            index.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            index.extend_from_slice(name.as_bytes());
+            index.push(2); // F32
+            index.push(shape.len() as u8);
+            for &dimension in *shape {
+                index.extend_from_slice(&dimension.to_le_bytes());
+            }
+            index.extend_from_slice(&0u32.to_le_bytes());
+            index.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        }
+        let data_offset = (index_offset + index.len() as u64 + 4095) & !4095;
+
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"HFQM").unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&20u32.to_le_bytes()).unwrap();
+        file.write_all(&(tensors.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        file.write_all(&data_offset.to_le_bytes()).unwrap();
+        file.write_all(metadata).unwrap();
+        file.write_all(&index).unwrap();
+        file.write_all(&vec![
+            0;
+            (data_offset - index_offset - index.len() as u64)
+                as usize
+        ])
+        .unwrap();
+        for (_, _, data) in tensors {
+            file.write_all(data).unwrap();
+        }
+    }
+
+    fn write_single_hfq_weight(path: &std::path::Path, quant_type: u8, shape: &[u32], data: &[u8]) {
+        let metadata = b"{}";
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let name = "weight";
+        let mut index = Vec::new();
+        index.extend_from_slice(&1u32.to_le_bytes());
+        index.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        index.extend_from_slice(name.as_bytes());
+        index.push(quant_type);
+        index.push(shape.len() as u8);
+        for &dimension in shape {
+            index.extend_from_slice(&dimension.to_le_bytes());
+        }
+        index.extend_from_slice(&0u32.to_le_bytes());
+        index.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        let data_offset = (index_offset + index.len() as u64 + 4095) & !4095;
+
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"HFQM").unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&20u32.to_le_bytes()).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        file.write_all(&data_offset.to_le_bytes()).unwrap();
+        file.write_all(metadata).unwrap();
+        file.write_all(&index).unwrap();
+        file.write_all(&vec![
+            0;
+            (data_offset - index_offset - index.len() as u64)
+                as usize
+        ])
+        .unwrap();
+        file.write_all(data).unwrap();
+    }
+
+    fn tiny_dflash_config() -> DflashConfig {
+        DflashConfig {
+            n_layers: 1,
+            hidden: 2,
+            intermediate: 2,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 2,
+            vocab_size: 2,
+            norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            block_size: 1,
+            mask_token_id: 0,
+            target_layer_ids: vec![0],
+            num_target_layers: 1,
+        }
+    }
+
+    fn write_late_malformed_draft(path: &std::path::Path) {
+        let f32x2 = [0u8; 8];
+        let f32x4 = [0u8; 16];
+        write_hfq(
+            path,
+            &[
+                ("fc.weight", &[2, 2], &f32x4),
+                ("hidden_norm.weight", &[2], &f32x2),
+                ("norm.weight", &[2], &f32x2),
+                ("layers.0.input_layernorm.weight", &[2], &f32x2),
+                ("layers.0.self_attn.q_proj.weight", &[2, 2], &f32x4),
+                ("layers.0.self_attn.k_proj.weight", &[2, 2], &f32x4),
+                ("layers.0.self_attn.v_proj.weight", &[2, 2], &f32x4),
+                ("layers.0.self_attn.o_proj.weight", &[2, 2], &f32x4),
+                ("layers.0.self_attn.q_norm.weight", &[2], &f32x2),
+                ("layers.0.self_attn.k_norm.weight", &[2], &f32x2),
+                ("layers.0.post_attention_layernorm.weight", &[2], &f32x2),
+                ("layers.0.mlp.gate_proj.weight", &[2, 2], &f32x4),
+                ("layers.0.mlp.up_proj.weight", &[2, 2], &f32x4),
+                // Same element count but malformed logical shape. This is last
+                // so the old upload-as-you-go loader would already own resources.
+                ("layers.0.mlp.down_proj.weight", &[1, 4], &f32x4),
+            ],
+        );
+    }
+
+    #[test]
+    fn dflash_weight_preflight_rejects_late_shape_mismatch_before_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed-draft.hfq");
+        write_late_malformed_draft(&path);
+
+        let hfq = HfqFile::open(&path).unwrap();
+        let error = validate_dflash_weight_inputs(&hfq, &tiny_dflash_config()).unwrap_err();
+        assert!(error.contains("layers.0.mlp.down_proj.weight"), "{error}");
+        assert!(error.contains("shape"), "{error}");
+    }
+
+    #[test]
+    fn dflash_mq_payload_layout_accepts_exact_per_row_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        for (quant_type, bytes_per_group) in [(17u8, 104usize), (13, 136), (15, 200)] {
+            let path = directory.path().join(format!("mq-{quant_type}.hfq"));
+            // m=2 rows, one 256-weight group per row.
+            write_single_hfq_weight(&path, quant_type, &[2, 256], &vec![0; 2 * bytes_per_group]);
+            let hfq = HfqFile::open(&path).unwrap();
+            validate_dflash_weight(&hfq, "weight", 2, 256).unwrap();
+        }
+    }
+
+    #[test]
+    fn dflash_mq_payload_layout_rejects_invalid_bytes_and_group_dimension() {
+        let directory = tempfile::tempdir().unwrap();
+        let cases = [
+            // MQ3 truncated: 2 x 104 bytes are required.
+            (17u8, 2u32, 256u32, 207usize, "byte-size"),
+            // MQ4 oversized: 2 x 136 bytes are required.
+            (13u8, 2u32, 256u32, 273usize, "byte-size"),
+            // MQ6 has an input dimension that cannot form G256 row groups.
+            (15u8, 2u32, 128u32, 200usize, "K dimension"),
+        ];
+        for (quant_type, m, k, bytes, expected) in cases {
+            let path = directory
+                .path()
+                .join(format!("invalid-mq-{quant_type}-{k}.hfq"));
+            write_single_hfq_weight(&path, quant_type, &[m, k], &vec![0; bytes]);
+            let hfq = HfqFile::open(&path).unwrap();
+            let error = validate_dflash_weight(&hfq, "weight", m as usize, k as usize)
+                .expect_err("invalid MQ layout must fail preflight");
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn malformed_late_draft_weight_leaves_exact_vram_baseline() {
+        let _gpu_test_lock = GPU_TEST_LOCK.lock().expect("DFlash GPU test lock poisoned");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed-draft.hfq");
+        write_late_malformed_draft(&path);
+        let hfq = HfqFile::open(&path).unwrap();
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        gpu.drain_pool();
+        let before = gpu.hip.get_vram_info().expect("measure baseline").0;
+
+        assert!(DflashWeights::load(&mut gpu, &hfq, &tiny_dflash_config()).is_err());
+
+        gpu.drain_pool();
+        let after = gpu
+            .hip
+            .get_vram_info()
+            .expect("measure after malformed draft")
+            .0;
+        assert_eq!(after, before, "malformed draft changed free VRAM");
+    }
 }

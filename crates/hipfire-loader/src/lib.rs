@@ -153,6 +153,10 @@ impl Eviction {
     }
 }
 
+fn effective_cask_m_folding(cask_m_folding: bool, draft_path: Option<&str>) -> bool {
+    cask_m_folding && draft_path.is_none()
+}
+
 // `DdtreeState`, `DflashState`, `load_dflash_state`, and the `DflashSpeculator`
 // impl now live in `hipfire_arch_qwen35::dflash_spec` — all qwen35 + runtime
 // types, so the loader only constructs and routes them, never owns the DFlash
@@ -364,6 +368,10 @@ pub struct LoadedModel {
     pub vision: Option<Qwen35Vl>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
+    /// Model-owned eviction policy. Its calibrated sidecar data and reusable GPU
+    /// scratch survive request resets and are released only by `unload_model`.
+    /// Request-owned cursors, KV compaction state, target state, and the DFlash
+    /// mirror are reset separately by the daemon's fresh-context path.
     pub eviction: Option<Eviction>,
     pub session: SessionState,
     pub persist: PersistState,
@@ -600,7 +608,10 @@ fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
         if !env_path.is_empty() {
             match std::fs::read_to_string(&env_path) {
                 Ok(s) => {
-                    eprintln!("[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={}", env_path);
+                    eprintln!(
+                        "[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={}",
+                        env_path
+                    );
                     return Some(s);
                 }
                 Err(e) => eprintln!(
@@ -691,6 +702,22 @@ pub(crate) fn parse_state_quant(
 /// Build a `LoadedModel` from a carrier `Bundle`, shared fields, and
 /// eviction/DFlash state. This is the common body for qwen35 dispatch
 /// where eviction and DFlash need per-arch type info.
+fn free_unpublished_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut Gpu) {
+    // `finish_qwen35_load` is only called on the pp=1 carrier path, so the
+    // pipeline payload cannot be present here (it needs its owning `Gpus`).
+    debug_assert!(
+        bundle.pipeline.is_none(),
+        "single-GPU Qwen35 finish received pipeline-owned state"
+    );
+    if let Some(head) = bundle.mtp_head {
+        head.free_gpu(gpu);
+    }
+    bundle.kv_cache.free_gpu(gpu);
+    bundle.scratch.free_gpu(gpu);
+    bundle.weights.free_gpu(gpu);
+    bundle.dn_state.free_gpu(gpu);
+}
+
 fn finish_qwen35_load(
     bundle: Qwen35Bundle,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -702,139 +729,169 @@ fn finish_qwen35_load(
     vision_weights: Option<qwen35_vl::VisionWeights>,
 ) -> Result<LoadedModel, String> {
     use hipfire_arch_qwen35::qwen35::LayerType;
-    // Extract references for eviction/DFlash setup (borrow, don't move)
-    let config = &bundle.config;
-    let dn_state = &bundle.dn_state;
-    // ── Eviction ───────────────────────────────────────────────────
-    let eviction = if let Some(ref sidecar_path) = ctx.cask.sidecar {
-        let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
-            use std::io::ErrorKind;
-            let p = Path::new(sidecar_path);
-            let why = match e.kind() {
-                ErrorKind::NotFound if p.symlink_metadata().is_ok() =>
-                    format!("dangling symlink (target absent): {sidecar_path}"),
-                ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
-                ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
-                ErrorKind::UnexpectedEof => format!("truncated/corrupt sidecar: {sidecar_path}"),
-                _ => format!("read error ({e}): {sidecar_path}"),
-            };
-            format!("cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
-        })?;
-        let fa_layer_ids: Vec<usize> = config
-            .layer_types
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| {
-                if *t == LayerType::FullAttention {
-                    Some(i)
-                } else {
-                    None
+    let mut bundle = Some(bundle);
+    let mut eviction = None;
+    let mut vision_weights = vision_weights;
+    let result = (|| -> Result<LoadedModel, String> {
+        // Extract references for eviction/DFlash setup (borrow, don't move).
+        let bundle_ref = bundle.as_ref().expect("Qwen35 bundle is still staged");
+        let config = &bundle_ref.config;
+        let dn_state = &bundle_ref.dn_state;
+        // ── Eviction ───────────────────────────────────────────────────
+        let cask_m_folding = effective_cask_m_folding(ctx.cask.cask_m_folding, ctx.draft_path);
+        if ctx.cask.cask_m_folding && !cask_m_folding {
+            eprintln!(
+                "[hipfire-daemon] cask:true + draft: both set — downgrading to plain TriAttention drop-eviction (CASK m-fold + DFlash is a known-broken combo; see feedback_cask_mfold_dflash_broken.md)",
+            );
+        }
+        let configured_eviction = if let Some(ref sidecar_path) = ctx.cask.sidecar {
+            let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
+                use std::io::ErrorKind;
+                let p = Path::new(sidecar_path);
+                let why = match e.kind() {
+                    ErrorKind::NotFound if p.symlink_metadata().is_ok() =>
+                        format!("dangling symlink (target absent): {sidecar_path}"),
+                    ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
+                    ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
+                    ErrorKind::UnexpectedEof => format!("truncated/corrupt sidecar: {sidecar_path}"),
+                    _ => format!("read error ({e}): {sidecar_path}"),
+                };
+                format!("cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
+            })?;
+            let fa_layer_ids: Vec<usize> = config
+                .layer_types
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    if *t == LayerType::FullAttention {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if fa_layer_ids.is_empty() {
+                eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
+                None
+            } else {
+                // Validate before moving a GPU-backed base into CaskCtx::new;
+                // an invalid CASK request must return Err, not panic after
+                // `EvictionCtx` has acquired reusable scratch.
+                if cask_m_folding && !(0.0..=1.0).contains(&ctx.cask.core_frac) {
+                    return Err(format!(
+                        "invalid CASK core_frac {} (expected 0.0..=1.0)",
+                        ctx.cask.core_frac
+                    ));
                 }
-            })
-            .collect();
-        if fa_layer_ids.is_empty() {
-            eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
-            None
-        } else {
-            let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-            let base = EvictionCtx::new(
-                ctx.gpu,
-                &centers,
-                fa_layer_ids,
-                ctx.cask.budget,
-                ctx.cask.beta,
-                config.n_heads,
-                config.n_kv_heads,
-                config.head_dim,
-                n_rot,
-                config.rope_theta,
-                physical_cap,
-            )
-            .map_err(|e| format!("build EvictionCtx: {e}"))?;
-            if ctx.cask.cask_m_folding {
-                eprintln!(
-                    "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
-                    ctx.cask.core_frac,
-                    ctx.cask.fold_m,
+                if cask_m_folding && ctx.cask.fold_m < 2 {
+                    return Err(format!(
+                        "invalid CASK fold_m {} (expected >= 2)",
+                        ctx.cask.fold_m
+                    ));
+                }
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                let base = EvictionCtx::new(
+                    ctx.gpu,
+                    &centers,
+                    fa_layer_ids,
                     ctx.cask.budget,
                     ctx.cask.beta,
-                    physical_cap
-                );
-                Some(Eviction::Cask(CaskCtx::new(
-                    base,
-                    ctx.cask.core_frac,
-                    ctx.cask.fold_m,
-                )))
-            } else {
-                eprintln!(
-                    "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
-                    ctx.cask.budget, ctx.cask.beta, physical_cap
-                );
-                Some(Eviction::Plain(base))
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                    physical_cap,
+                )
+                .map_err(|e| format!("build EvictionCtx: {e}"))?;
+                if cask_m_folding {
+                    eprintln!(
+                        "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
+                        ctx.cask.core_frac,
+                        ctx.cask.fold_m,
+                        ctx.cask.budget,
+                        ctx.cask.beta,
+                        physical_cap
+                    );
+                    Some(Eviction::Cask(CaskCtx::new(
+                        base,
+                        ctx.cask.core_frac,
+                        ctx.cask.fold_m,
+                    )))
+                } else {
+                    eprintln!(
+                        "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
+                        ctx.cask.budget, ctx.cask.beta, physical_cap
+                    );
+                    Some(Eviction::Plain(base))
+                }
             }
-        }
-    } else {
-        None
-    };
-
-    // ── DSpark sidecar (wins over DFlash/MTP/n-gram) ───────────────
-    // The drafter is a dense-qwen3 body (llama crate); it drives the qwen35
-    // ModelSlot target via the SpecTarget DSpark capture hooks. Discovered as
-    // `<stem>-dspark.<ext>` next to the trunk, independent of ctx.draft_path.
-    let dspark_speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if ctx.spec.dspark
-        != Some(false)
-    {
-        let base = std::path::Path::new(ctx.path);
-        let sidecar_path = match (base.parent(), base.file_stem(), base.extension()) {
-            (Some(parent), Some(stem), Some(ext)) => Some(parent.join(format!(
-                "{}-dspark.{}",
-                stem.to_string_lossy(),
-                ext.to_string_lossy()
-            ))),
-            _ => None,
+        } else {
+            None
         };
-        match sidecar_path.filter(|p| p.exists()) {
-            Some(p) => {
-                eprintln!("  qwen35: opening DSpark sidecar HFQ {p:?}");
-                match hipfire_runtime::hfq::HfqFile::open(&p) {
-                    Ok(mut sidecar) => {
-                        sidecar.drop_mmap();
-                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu)
-                        {
-                            Ok(Some((dspark_weights, assets))) => {
-                                let block = dspark_weights.cfg.block_size;
-                                // Reduced-vocab drafters (ORNITH) ship a compressed
-                                // lm_head; run_heads reads vocab from lm_head.shape[0].
-                                let vocab = if dspark_weights.cfg.draft_vocab_size > 0 {
-                                    dspark_weights.cfg.draft_vocab_size
-                                } else {
-                                    assets.config.vocab_size
-                                };
-                                let stage_norm = assets.weights.output_norm.shallow_clone();
-                                // upload_raw sets dtype=Raw; the data is F16.
-                                let mut lm_head = assets.weights.output.buf.shallow_clone();
-                                lm_head.dtype = rdna_compute::DType::F16;
-                                lm_head.shape = vec![vocab];
-                                let conf_threshold =
-                                    std::env::var("HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD")
-                                        .ok()
-                                        .and_then(|s| s.parse().ok())
-                                        .or(ctx.spec.dspark_conf_threshold)
-                                        .unwrap_or(0.1f32);
-                                eprintln!(
-                                    "  qwen35 DSpark enabled (block={}, target_layers={:?}, draft_vocab={}, conf={:.2})",
-                                    block,
-                                    dspark_weights.cfg.target_layer_ids,
-                                    vocab,
-                                    conf_threshold
-                                );
-                                match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
-                                    assets,
-                                    &dspark_weights.cfg,
-                                    ctx.gpu,
-                                ) {
-                                    Ok(body) => {
-                                        Some(hipfire_runtime::dspark_core::build_dspark_speculator(
+        eviction = configured_eviction;
+
+        // ── DSpark sidecar (wins over DFlash/MTP/n-gram) ───────────────
+        // The drafter is a dense-qwen3 body (llama crate); it drives the qwen35
+        // ModelSlot target via the SpecTarget DSpark capture hooks. Discovered as
+        // `<stem>-dspark.<ext>` next to the trunk, independent of ctx.draft_path.
+        let dspark_speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if ctx
+            .spec
+            .dspark
+            != Some(false)
+        {
+            let base = std::path::Path::new(ctx.path);
+            let sidecar_path = match (base.parent(), base.file_stem(), base.extension()) {
+                (Some(parent), Some(stem), Some(ext)) => Some(parent.join(format!(
+                    "{}-dspark.{}",
+                    stem.to_string_lossy(),
+                    ext.to_string_lossy()
+                ))),
+                _ => None,
+            };
+            match sidecar_path.filter(|p| p.exists()) {
+                Some(p) => {
+                    eprintln!("  qwen35: opening DSpark sidecar HFQ {p:?}");
+                    match hipfire_runtime::hfq::HfqFile::open(&p) {
+                        Ok(mut sidecar) => {
+                            sidecar.drop_mmap();
+                            match hipfire_arch_llama::dspark_body::load_qwen3_dspark(
+                                &sidecar, ctx.gpu,
+                            ) {
+                                Ok(Some((dspark_weights, assets))) => {
+                                    let block = dspark_weights.cfg.block_size;
+                                    // Reduced-vocab drafters (ORNITH) ship a compressed
+                                    // lm_head; run_heads reads vocab from lm_head.shape[0].
+                                    let vocab = if dspark_weights.cfg.draft_vocab_size > 0 {
+                                        dspark_weights.cfg.draft_vocab_size
+                                    } else {
+                                        assets.config.vocab_size
+                                    };
+                                    let stage_norm = assets.weights.output_norm.shallow_clone();
+                                    // upload_raw sets dtype=Raw; the data is F16.
+                                    let mut lm_head = assets.weights.output.buf.shallow_clone();
+                                    lm_head.dtype = rdna_compute::DType::F16;
+                                    lm_head.shape = vec![vocab];
+                                    let conf_threshold =
+                                        std::env::var("HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD")
+                                            .ok()
+                                            .and_then(|s| s.parse().ok())
+                                            .or(ctx.spec.dspark_conf_threshold)
+                                            .unwrap_or(0.1f32);
+                                    eprintln!(
+                                        "  qwen35 DSpark enabled (block={}, target_layers={:?}, draft_vocab={}, conf={:.2})",
+                                        block,
+                                        dspark_weights.cfg.target_layer_ids,
+                                        vocab,
+                                        conf_threshold
+                                    );
+                                    match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+                                        assets,
+                                        &dspark_weights.cfg,
+                                        ctx.gpu,
+                                    ) {
+                                        Ok(body) => {
+                                            Some(hipfire_runtime::dspark_core::build_dspark_speculator(
                                             body,
                                             dspark_weights,
                                             stage_norm,
@@ -844,104 +901,127 @@ fn finish_qwen35_load(
                                             conf_threshold,
                                             true, // sampled verify (temp>0) supported
                                         ))
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "  qwen35: DSpark body build failed: {e} — AR/other"
-                                        );
-                                        None
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "  qwen35: DSpark body build failed: {e} — AR/other"
+                                            );
+                                            None
+                                        }
                                     }
                                 }
-                            }
-                            Ok(None) => {
-                                eprintln!("  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping");
-                                None
-                            }
-                            Err(e) => {
-                                eprintln!("  qwen35: WARNING DSpark sidecar load failed: {e}");
-                                None
+                                Ok(None) => {
+                                    eprintln!(
+                                        "  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping"
+                                    );
+                                    None
+                                }
+                                Err(e) => {
+                                    eprintln!("  qwen35: WARNING DSpark sidecar load failed: {e}");
+                                    None
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("  qwen35: WARNING cannot open DSpark sidecar {p:?}: {e}");
-                        None
+                        Err(e) => {
+                            eprintln!("  qwen35: WARNING cannot open DSpark sidecar {p:?}: {e}");
+                            None
+                        }
                     }
                 }
+                None => None,
             }
-            None => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
-    // ── DFlash (skipped when a DSpark sidecar won) ─────────────────
-    let dflash = if dspark_speculator.is_some() {
-        None
-    } else if let Some(dp) = ctx.draft_path {
-        match hipfire_arch_qwen35::dflash_spec::load_dflash_state(
-            dp,
-            physical_cap,
-            config,
-            dn_state,
-            ctx.gpu,
-            ctx.spec.ddtree_budget,
-            ctx.spec.ddtree_topk,
-        ) {
-            Ok(s) => {
-                eprintln!(
-                    "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
-                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size
-                );
-                Some(s)
+        // ── DFlash (skipped when a DSpark sidecar won) ─────────────────
+        let dflash = if dspark_speculator.is_some() {
+            None
+        } else if let Some(dp) = ctx.draft_path {
+            match hipfire_arch_qwen35::dflash_spec::load_dflash_state(
+                dp,
+                physical_cap,
+                config,
+                dn_state,
+                ctx.gpu,
+                ctx.spec.ddtree_budget,
+                ctx.spec.ddtree_topk,
+            ) {
+                Ok(s) => {
+                    eprintln!(
+                        "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
+                        dp,
+                        s.draft_config.n_layers,
+                        s.draft_config.hidden,
+                        s.draft_config.block_size
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  DFlash draft load failed ({}): {} — falling back to AR only",
+                        dp, e
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "  DFlash draft load failed ({}): {} — falling back to AR only",
-                    dp, e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // Pick the arch-generic speculator: a loaded DFlash draft, else the opt-in
-    // model-free n-gram drafter. `eviction` is borrowed (not moved) here, so
-    // it is still available for the struct literal below; `config`/`dn_state` are
-    // borrowed only for the n-gram arm's scratch construction (snapshot copied to
-    // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
-    // DSpark wins over DFlash/MTP/n-gram when its sidecar loaded.
-    let speculator = dspark_speculator.or_else(|| {
-        crate::spec_build::build_speculator(
-            arch_id,
-            dflash,
-            eviction.is_none(),
-            physical_cap,
-            ctx.spec,
-        )
-    });
+        } else {
+            None
+        };
+        // Pick the arch-generic speculator: a loaded DFlash draft, else the opt-in
+        // model-free n-gram drafter. `eviction` is borrowed (not moved) here, so
+        // it is still available for the struct literal below; `config`/`dn_state` are
+        // borrowed only for the n-gram arm's scratch construction (snapshot copied to
+        // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
+        // DSpark wins over DFlash/MTP/n-gram when its sidecar loaded.
+        let speculator = dspark_speculator.or_else(|| {
+            crate::spec_build::build_speculator(
+                arch_id,
+                dflash,
+                eviction.is_none(),
+                physical_cap,
+                ctx.spec,
+            )
+        });
 
-    let state = Some(ModelState::Qwen35(bundle));
-    let model = LoadedModel {
-        state,
-        eviction,
-        speculator,
-        vision: vision_config
-            .zip(vision_weights)
-            .map(|(config, weights)| Qwen35Vl { config, weights }),
-        ..LoadedModel::skeleton(
-            arch_id,
-            tokenizer,
-            ctx.max_seq,
-            physical_cap,
-            ctx.path.to_string(),
-            chat_template,
-            ctx.mtp_mode,
-            ctx.mtp_k,
-        )
-    };
-    Ok(model)
+        Ok(LoadedModel {
+            state: Some(ModelState::Qwen35(
+                bundle.take().expect("Qwen35 bundle is still staged"),
+            )),
+            eviction: eviction.take(),
+            speculator,
+            vision: vision_config
+                .zip(vision_weights.take())
+                .map(|(config, weights)| Qwen35Vl { config, weights }),
+            ..LoadedModel::skeleton(
+                arch_id,
+                tokenizer,
+                ctx.max_seq,
+                physical_cap,
+                ctx.path.to_string(),
+                chat_template,
+                ctx.mtp_mode,
+                ctx.mtp_k,
+            )
+        })
+    })();
+
+    match result {
+        Ok(model) => Ok(model),
+        Err(error) => {
+            if let Some(eviction) = eviction.take() {
+                eviction.free_gpu(ctx.gpu);
+            }
+            if let Some(weights) = vision_weights.take() {
+                weights.free_gpu(ctx.gpu);
+            }
+            if let Some(bundle) = bundle.take() {
+                free_unpublished_qwen35_bundle(bundle, ctx.gpu);
+            }
+            ctx.gpu.drain_pool();
+            Err(error)
+        }
+    }
 }
 
 // ─── Main public API ──────────────────────────────────────────────────
@@ -2017,6 +2097,13 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
 mod registry_tests {
     use super::{LoadedModel, REGISTRY};
 
+    #[test]
+    fn cask_m_folding_is_disabled_for_drafts() {
+        assert!(super::effective_cask_m_folding(true, None));
+        assert!(!super::effective_cask_m_folding(true, Some("draft.hfq")));
+        assert!(!super::effective_cask_m_folding(false, Some("draft.hfq")));
+    }
+
     fn test_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
         hipfire_runtime::tokenizer::Tokenizer::from_hf_json(
             r#"{"model":{"vocab":{"a":0},"merges":[]}}"#,
@@ -2183,5 +2270,162 @@ mod registry_tests {
         assert!(error.contains("SPEC-003"), "{error}");
         assert!(super::reject_qwen_native_mtp("auto").is_ok());
         assert!(super::reject_qwen_native_mtp("off").is_ok());
+    }
+
+    /// Exercises the published loader owner, rather than `Speculator::free` in
+    /// isolation: `unload_model` must release DFlash, its DDTree snapshots, the
+    /// Qwen35 target, and the pool before the next model lifetime begins.
+    #[test]
+    #[ignore = "requires an AMD GPU plus qwen3.6-27b.mq4 and qwen36-27b-dflash-mq4.hfq"]
+    fn unload_model_reclaims_published_qwen35_dflash_state() {
+        use std::path::Path;
+
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_DFLASH_FREE_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        let draft_path = std::env::var("HIPFIRE_DFLASH_FREE_DRAFT")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen36-27b-dflash-mq4.hfq"));
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}; set HIPFIRE_DFLASH_FREE_TARGET"
+        );
+        assert!(
+            Path::new(&draft_path).is_file(),
+            "draft fixture not found: {draft_path}; set HIPFIRE_DFLASH_FREE_DRAFT"
+        );
+
+        fn free_vram(gpu: &rdna_compute::Gpu, context: &str) -> Result<usize, String> {
+            gpu.hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .map_err(|e| format!("measure {context}: {e}"))
+        }
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let cask = super::CaskConfig::default();
+        let mesh = super::DeviceMesh::single();
+        let load = |gpu: &mut rdna_compute::Gpu| {
+            super::load_model(
+                &target_path,
+                64,
+                Some(&draft_path),
+                Some("q8"),
+                None,
+                None,
+                &cask,
+                &mesh,
+                None,
+                super::SpecLoadCfg {
+                    ddtree_budget: Some(1),
+                    ddtree_topk: Some(1),
+                    ..Default::default()
+                },
+                gpu,
+            )
+        };
+
+        // Warm the fixed loader/kernel allocations once; the second lifetime is
+        // the leak check, so only model-owned resources affect its baseline.
+        let warmup = load(&mut gpu).expect("warmup load_model with DFlash");
+        super::unload_model(warmup, &mut gpu);
+        let baseline = free_vram(&gpu, "after warmup unload").expect("baseline VRAM");
+
+        let model = load(&mut gpu).expect("measured load_model with DFlash");
+        let result = (|| -> Result<(), String> {
+            if model.speculator.is_none() {
+                return Err(
+                    "draft was supplied but DFlash was not published in LoadedModel".into(),
+                );
+            }
+            let loaded = free_vram(&gpu, "after DFlash model load")?;
+            if loaded >= baseline {
+                return Err(format!(
+                    "published DFlash model did not allocate observable VRAM: baseline={baseline}, loaded={loaded}"
+                ));
+            }
+            Ok(())
+        })();
+
+        // This is deliberately outside `result`: every assertion/error after a
+        // successful publication reaches the production `unload_model` path.
+        super::unload_model(model, &mut gpu);
+        let after = free_vram(&gpu, "after measured unload").expect("post-unload VRAM");
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+        assert_eq!(
+            after, baseline,
+            "unload_model leaked published Qwen35 DFlash state: baseline={baseline}, after={after}"
+        );
+    }
+
+    /// `finish_qwen35_load` receives a fully GPU-backed bundle before opening a
+    /// requested TriAttention sidecar. A sidecar read failure must free that
+    /// unpublished bundle rather than leaving its weights/KV/scratch resident.
+    #[test]
+    #[ignore = "requires an AMD GPU and qwen3.6-27b.mq4"]
+    fn rejected_qwen35_sidecar_load_reclaims_unpublished_bundle() {
+        use std::path::Path;
+
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_QWEN35_SIDECAR_FAILURE_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}; set HIPFIRE_QWEN35_SIDECAR_FAILURE_TARGET"
+        );
+
+        fn free_vram(gpu: &rdna_compute::Gpu, context: &str) -> Result<usize, String> {
+            gpu.hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .map_err(|e| format!("measure {context}: {e}"))
+        }
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let load = |cask: &super::CaskConfig, gpu: &mut rdna_compute::Gpu| {
+            super::load_model(
+                &target_path,
+                64,
+                None,
+                Some("q8"),
+                None,
+                None,
+                cask,
+                &mesh,
+                None,
+                super::SpecLoadCfg::default(),
+                gpu,
+            )
+        };
+
+        let no_eviction = super::CaskConfig::default();
+        let warmup = load(&no_eviction, &mut gpu).expect("warmup Qwen35 load");
+        super::unload_model(warmup, &mut gpu);
+        let baseline = free_vram(&gpu, "after warmup unload").expect("baseline VRAM");
+
+        let rejected = super::CaskConfig {
+            sidecar: Some(format!("{target_path}.missing-triattn-sidecar")),
+            cask_m_folding: false,
+            budget: 32,
+            beta: 8,
+            core_frac: 0.5,
+            fold_m: 2,
+        };
+        let error = match load(&rejected, &mut gpu) {
+            Ok(model) => {
+                super::unload_model(model, &mut gpu);
+                panic!("missing sidecar must reject the load");
+            }
+            Err(error) => error,
+        };
+        assert!(error.contains("cask sidecar load failed"), "{error}");
+        gpu.drain_pool();
+        let after = free_vram(&gpu, "after rejected sidecar load").expect("post-error VRAM");
+        assert_eq!(
+            after, baseline,
+            "sidecar read failure leaked unpublished Qwen35 bundle: baseline={baseline}, after={after}"
+        );
     }
 }

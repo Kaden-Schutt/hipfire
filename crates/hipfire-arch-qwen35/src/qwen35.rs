@@ -5375,6 +5375,15 @@ impl PrefillBatchScratch {
                             shape: t.shape.clone(),
                             dtype: t.dtype,
                         });
+                        #[cfg(test)]
+                        if let Err(e) = crate::dflash_spec::dflash_test_after_allocation(
+                            crate::dflash_spec::DflashAllocationSite::PrefillBatchScratch,
+                        ) {
+                            for prev in ledger.drain(..) {
+                                let _ = gpu.free_tensor(prev);
+                            }
+                            return Err(e);
+                        }
                         t
                     }
                     Err(e) => {

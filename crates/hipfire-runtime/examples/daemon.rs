@@ -45,11 +45,12 @@ use std::time::Instant;
 
 use hipfire_hardware::DimKind;
 use hipfire_loader::{
-    AsstTurnCache, EpArch, EpState, LoadedModel, ModelParallel, ModelParallelKind, ModelState,
-    PipelineImpl,
+    AsstTurnCache, EpArch, EpState, Eviction, LoadedModel, ModelParallel, ModelParallelKind,
+    ModelState, PipelineImpl,
 };
 use hipfire_runtime::spec::{
-    ClientEvent, EvictRetain, FinishSummary, PrefillOutcome, SpecEmit, StopReason,
+    ClientEvent, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit, SpecTarget,
+    Speculator, StopReason,
 };
 
 /// An explicitly invalid operator environment is a load error even when the
@@ -104,7 +105,7 @@ fn resolve_mtp_mode(load_param: Option<&serde_json::Value>) -> Result<Option<boo
                 _ => Err(format!(
                     "HIPFIRE_MTP_MODE must be one of off, on, auto, got {value:?}"
                 )),
-            }
+            };
         }
         Err(std::env::VarError::NotPresent) => {}
         Err(error) => return Err(format!("HIPFIRE_MTP_MODE is invalid: {error}")),
@@ -1019,18 +1020,7 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
             unreachable!("single-GPU dispatch received Mesh ctx")
         };
         let m = &mut *self.m;
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            for s in &b.dn_state.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &b.dn_state.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &b.dn_state.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            b.kv_cache.compact_offset = 0;
-        }
+        reset_qwen35_recurrent(m, gpu);
         // Co-resident Llama KV reset (arm does the same defensive no-op).
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
             b.kv.compact_offset = 0;
@@ -3063,7 +3053,9 @@ fn main() {
             }
         }
         if errors > 0 {
-            eprintln!("Kernel precompilation finished with {errors} failure(s) — the missing kernels will JIT on first use.");
+            eprintln!(
+                "Kernel precompilation finished with {errors} failure(s) — the missing kernels will JIT on first use."
+            );
         } else {
             eprintln!("Kernel precompilation done.");
         }
@@ -3476,24 +3468,9 @@ fn main() {
                     .and_then(|p| p.get("cask_fold_m"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(2) as usize;
-                // Known-broken combo guard: CASK m-folding + DFlash spec decode
-                // degenerates into single-token loops after the first eviction
-                // (the m-folded synthetic K/V rows are off the draft's trained
-                // hidden-state distribution). Until that's fixed at the library
-                // level, downgrade m-folding to plain TriAttention drop-eviction
-                // when a draft is attached. User's context window + eviction
-                // cadence still work; just the fold step is skipped.
-                let cask_m_folding_effective = if cask_enabled && draft_path.is_some() {
-                    eprintln!(
-                        "[hipfire-daemon] cask:true + draft: both set — downgrading to plain TriAttention drop-eviction (CASK m-fold + DFlash is a known-broken combo; see feedback_cask_mfold_dflash_broken.md)",
-                    );
-                    false
-                } else {
-                    cask_enabled
-                };
                 let cask = CaskConfig {
                     sidecar: cask_sidecar,
-                    cask_m_folding: cask_m_folding_effective,
+                    cask_m_folding: cask_enabled,
                     budget: cask_budget,
                     beta: cask_beta,
                     core_frac: cask_core_frac,
@@ -3964,9 +3941,15 @@ fn main() {
                                         pf_max_kv,
                                     ) {
                                         Ok(()) => {
-                                            eprintln!("[pflash] LOADED drafter={} dev={} mode={} compat={} keep={} thr={}",
-                                                pf_drafter_path, pflash_drafter_device, pflash_mode_str,
-                                                pf_state.tokenizer_compat, pflash_keep_ratio, pflash_threshold);
+                                            eprintln!(
+                                                "[pflash] LOADED drafter={} dev={} mode={} compat={} keep={} thr={}",
+                                                pf_drafter_path,
+                                                pflash_drafter_device,
+                                                pflash_mode_str,
+                                                pf_state.tokenizer_compat,
+                                                pflash_keep_ratio,
+                                                pflash_threshold
+                                            );
                                             let _ = writeln!(
                                                 stdout,
                                                 r#"{{"type":"pflash","mode":"{}","drafter":"{}","drafter_device":{},"tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
@@ -4007,8 +3990,14 @@ fn main() {
                         let total_mb = vram_total / (1024 * 1024);
                         // serde-escape: raw HipError debug contains { } and "
                         // which corrupt the JSONL protocol if interpolated raw.
-                        write_error(&mut stdout, "", &format!(
-                            "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)", gpu.arch));
+                        write_error(
+                            &mut stdout,
+                            "",
+                            &format!(
+                                "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
+                                gpu.arch
+                            ),
+                        );
                     }
                 }
                 let _ = stdout.flush();
@@ -4384,7 +4373,10 @@ fn main() {
                     // None — but clear them anyway for defense-in-depth
                     // in case a future arch adds VL support.
                     if m.session.seq_pos > 0 {
-                        eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.session.seq_pos);
+                        eprintln!(
+                            "[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation",
+                            m.session.seq_pos
+                        );
                         m.session.seq_pos = 0;
                         m.session.conversation_tokens.clear();
                         free_checkpoints(&mut m.session.prefill_checkpoints, &mut gpu);
@@ -4604,7 +4596,10 @@ fn main() {
                 // Reset conversation state without unloading the model.
                 if let Some(ref mut m) = model {
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                        eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.session.conversation_tokens.len());
+                        eprintln!(
+                            "[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})",
+                            m.session.conversation_tokens.len()
+                        );
                     }
                     model_reset_context(m, &mut gpu);
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
@@ -5686,7 +5681,12 @@ fn plan_prompt_cache(
             {
                 eprintln!(
                     "[qwen-cache resume dflash] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
-                    ckpt, lcp, prior_len, rendered.len(), rendered.len() - ckpt, rendered.len(),
+                    ckpt,
+                    lcp,
+                    prior_len,
+                    rendered.len(),
+                    rendered.len() - ckpt,
+                    rendered.len(),
                 );
                 return PromptCachePlan {
                     new_tokens: rendered[ckpt..].to_vec(),
@@ -5709,51 +5709,69 @@ fn plan_prompt_cache(
     }
 }
 
-/// Zero qwen3.5 (arch 5/6) recurrent DeltaNet + KV state IN PLACE for a fresh
-/// turn. The state lives in the bundle (ModelState::Qwen35), NOT the always-None
-/// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
-/// no double-free). Mirrors the per-LA-device memset for pp>1. No-op off qwen35.
-fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
-    if m.parallel.is_pipelined() {
-        if let (Some(ModelState::Qwen35(b)), ModelParallel::Pp(PipelineImpl::ArchResident(gpus))) =
-            (m.state.as_ref(), &mut m.parallel)
-        {
-            // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
-            if let Some(pl) = b.pipeline.as_ref() {
-                let la = &pl.dn_la_to_device;
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+fn qwen35_recurrent_groups<'a, T>(
+    s_matrices: &'a [T],
+    s_scales: &'a [T],
+    conv_states: &'a [T],
+    s_ef_residual: &'a [T],
+) -> [&'a [T]; 4] {
+    [s_matrices, s_scales, conv_states, s_ef_residual]
+}
+
+fn reset_qwen35_pipeline_recurrent(
+    dn: &hipfire_arch_qwen35::qwen35::DeltaNetState,
+    dn_la_to_device: &[u8],
+    gpus: &mut hipfire_hardware::Gpus,
+) {
+    for buffers in qwen35_recurrent_groups(
+        &dn.s_matrices,
+        &dn.s_scales,
+        &dn.conv_states,
+        &dn.s_ef_residual,
+    ) {
+        for (i, s) in buffers.iter().enumerate() {
+            let g = &mut gpus.devices[dn_la_to_device[i] as usize];
+            let _ = g.bind_thread();
+            match g.active_stream.as_ref() {
+                Some(stream) => {
+                    let _ = g.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
                 }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
+                None => {
                     let _ = g.hip.memset(&s.buf, 0, s.buf.size());
                 }
             }
         }
-    } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.s_scales {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.conv_states {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
     }
-    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+}
+
+fn reset_qwen35_recurrent_parts(
+    state: &mut Option<ModelState>,
+    parallel: &mut ModelParallel,
+    gpu: &mut rdna_compute::Gpu,
+) {
+    if parallel.is_pipelined() {
+        if let (Some(ModelState::Qwen35(b)), ModelParallel::Pp(PipelineImpl::ArchResident(gpus))) =
+            (state.as_ref(), parallel)
+        {
+            if let Some(pl) = b.pipeline.as_ref() {
+                reset_qwen35_pipeline_recurrent(&b.dn_state, &pl.dn_la_to_device, gpus);
+            }
+        }
+    } else if let Some(ModelState::Qwen35(b)) = state.as_mut() {
+        b.dn_state.reset(gpu);
+    }
+    if let Some(ModelState::Qwen35(b)) = state.as_mut() {
         b.kv_cache.compact_offset = 0;
     }
+}
+
+/// Zero qwen3.5 (arch 5/6) recurrent DeltaNet + KV state IN PLACE for a fresh
+/// turn. The state lives in the bundle (ModelState::Qwen35), NOT the always-None
+/// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
+/// no double-free). Pipeline buffers remain on their owning devices; the
+/// single-device path delegates to DeltaNetState's canonical reset.
+fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
 }
 
 /// Full conversation-state reset: clears CPU cursor + token history, frees GPU
@@ -5764,6 +5782,10 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
 /// per-arch arms are no-ops when that arch is not loaded, so calling this
 /// function on any LoadedModel is always safe.
 fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    // Lifecycle boundary: `m.eviction` owns calibrated sidecar data and reusable
+    // GPU scratch until unload. The request owns the physical cursor, compact
+    // offset, target recurrent/KV state, and DFlash's target-hidden mirror, so a
+    // fresh context resets those without rebuilding the eviction policy.
     m.session.reset(gpu);
     if let Some(s) = m.speculator.as_mut() {
         s.reset(gpu);
@@ -5942,6 +5964,58 @@ struct SpecRun {
     prefill_s: f64,
     total_s: f64,
     decode_s: f64,
+}
+
+enum SpecRunOutcome {
+    Ready(SpecRun),
+    ImmediateError(String),
+    Failed(String),
+    Aborted { generated: usize },
+}
+
+fn forced_advance_completed(outcome: &SpecAdvance) -> bool {
+    matches!(outcome, SpecAdvance::Ready { .. })
+}
+
+fn publish_eviction_position(
+    new_physical: usize,
+    draft_mirror: Result<(), String>,
+) -> Result<usize, String> {
+    draft_mirror.map(|()| new_physical)
+}
+
+fn maybe_evict_spec(
+    gpu: &mut rdna_compute::Gpu,
+    eviction: Option<&Eviction>,
+    target: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+    position: usize,
+) -> Result<Option<usize>, String> {
+    let Some(eviction) = eviction else {
+        return Ok(None);
+    };
+    let result = {
+        let kv = target
+            .kv_cache_mut()
+            .ok_or_else(|| "eviction configured for non-KvCache spec target".to_string())?;
+        eviction
+            .maybe_evict(gpu, kv, position)
+            .map_err(|e| format!("target eviction: {e:?}"))?
+    };
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    if result.retain_mask.is_empty() {
+        return Ok(Some(result.new_physical));
+    }
+    let retain = EvictRetain {
+        retain_mask: result.retain_mask,
+        pre_phys: position,
+    };
+    let draft_mirror = spec
+        .on_evict(gpu, &retain)
+        .map_err(|e| format!("draft eviction mirror: {e}"));
+    publish_eviction_position(result.new_physical, draft_mirror).map(Some)
 }
 
 fn generate_dflash(
@@ -6246,7 +6320,10 @@ fn generate_dflash(
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                fp, cached_seq.len(), emit_text.len(), emit_tool_calls.len(),
+                fp,
+                cached_seq.len(),
+                emit_text.len(),
+                emit_tool_calls.len(),
                 emit_text.chars().take(60).collect::<String>(),
             );
         }
@@ -6385,71 +6462,11 @@ fn generate_spec(
             return None;
         }
     };
-    // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
-    // (`m.meta.model_path` is a disjoint field → no borrow conflict with the
-    // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
-    // HfqFile (restored on Drop); the pure-attention arms borrow in place. The
-    // boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way.
-    let mut guard = match carrier.spec_target_guard(&mut m.state, &m.meta.model_path) {
-        Ok(g) => g,
-        Err(e) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
-                id, e
-            );
-            let _ = stdout.flush();
-            return None;
-        }
-    };
-    let spec = m.speculator.as_mut().unwrap();
-
-    // Divergent-render RESUME: restore the drafter-local + target recurrent
-    // state to the latest checkpoint ≤ ckpt and drop the now-stale tail of the
-    // checkpoint ring (`rewind_to` does both), then rewind the daemon's seq_pos
-    // / conversation_tokens. The turn then proceeds exactly like a HIT with
-    // start_pos == ckpt (the cache plan already set cache_hit=true).
-    if let Some(ckpt) = resume_from {
-        let slot = match guard.slot() {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","id":"{}","message":"{}"}}"#,
-                    id, e
-                );
-                let _ = stdout.flush();
-                return None;
-            }
-        };
-        let _ = spec.rewind_to(gpu, slot, ckpt);
-        m.session.seq_pos = ckpt;
-        m.session.conversation_tokens.truncate(ckpt);
-    }
-
-    if !cache_hit {
-        // Fresh target state — full prefill from position 0. The DeltaNet
-        // recurrent state is zeroed by the prefill seed itself
-        // (`seed_target_hidden_from_prompt_abortable` calls `target.reset_state`,
-        // which also zeroes s_ef_residual — more complete than the memset loop
-        // the old inline path ran here), so only the daemon-side position
-        // bookkeeping remains.
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
-    } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-        eprintln!(
-            "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
-            prefill_start,
-            prefill_tokens.len()
-        );
-    }
-
-    let t0 = Instant::now();
     // Capacity checks. With eviction enabled the advertised context window is
     // effectively unbounded (eviction fires between spec cycles), but the
     // *prompt* must still fit in one physical_cap span because the prompt seed
-    // writes it per-token without chunking. Error returns just `return` — the
-    // slot guard restores the bundle into m.state on the way out.
+    // writes it per-token without chunking. These run before acquiring the slot:
+    // they cannot mutate target state and must not reset a clean model.
     let eff_prompt_cap = if m.eviction.is_some() {
         m.meta.physical_cap
     } else {
@@ -6487,15 +6504,13 @@ fn generate_spec(
         return None;
     }
 
-    // Prefill: the speculator seeds the target's hidden state (advancing its KV
-    // + recurrent state), primes the drafter's cached target-hidden, snapshots
-    // the divergent-render checkpoint ring, and returns the target's first
-    // token. On a cache hit only the suffix is seeded; on a miss the seed
-    // self-resets target state and the full prompt is seeded. Client cancel is
-    // surfaced as `PrefillOutcome::Aborted`.
-    let id_for_abort = id.to_string();
-    let slot = match guard.slot() {
-        Ok(s) => s,
+    // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
+    // (`m.meta.model_path` is a disjoint field → no borrow conflict with the
+    // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
+    // HfqFile (restored on Drop); the pure-attention arms borrow in place. The
+    // boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way.
+    let mut guard = match carrier.spec_target_guard(&mut m.state, &m.meta.model_path) {
+        Ok(g) => g,
         Err(e) => {
             let _ = writeln!(
                 stdout,
@@ -6506,173 +6521,394 @@ fn generate_spec(
             return None;
         }
     };
-    let prefill_outcome = spec.prefill(
-        gpu,
-        slot,
-        &prompt_tokens,
-        &prefill_tokens,
-        prefill_start,
-        cache_hit,
-        resume_from,
-        &|| check_abort(&id_for_abort),
-    );
-    let first_token = match prefill_outcome {
-        Ok(PrefillOutcome::Ready { first_token }) => first_token,
-        Ok(PrefillOutcome::Aborted) => {
-            // Full state reset on abort: zero the target recurrent state + KV
-            // eviction offset (reset_recurrent, which also clears s_ef_residual)
-            // and free the speculator's checkpoint ring, then emit aborted+done
-            // for the CLI's drain loop. The slot guard restores the bundle on
-            // the way out.
-            slot.reset_recurrent(gpu);
-            spec.reset(gpu);
+    let outcome = 'spec: {
+        let slot = match guard.slot() {
+            Ok(s) => s,
+            Err(e) => break 'spec SpecRunOutcome::ImmediateError(e),
+        };
+
+        // Build the emitter before speculative state can mutate. A construction
+        // failure therefore leaves the target clean and does not need recovery.
+        let emit_ctx = hipfire_runtime::spec::SpecEmitCtx {
+            tokenizer,
+            eos: slot.eos_token(),
+            im_end: emit_req.im_end,
+            tools: emit_req.tools.as_deref(),
+            stop: emit_req.stop,
+            max_think: emit_req.max_think,
+            max_tokens,
+            assistant_prefix: emit_req.assistant_prefix,
+            think_mode: emit_req.think_mode,
+            decoded_vocab: emit_req.decoded_vocab,
+        };
+        let mut emit: Box<dyn SpecEmit> = match carrier.make_spec_emitter(emit_ctx) {
+            Ok(e) => e,
+            Err(e) => break 'spec SpecRunOutcome::ImmediateError(e),
+        };
+        let spec = m
+            .speculator
+            .as_mut()
+            .expect("checked before slot acquisition");
+
+        // Divergent-render RESUME: restore the drafter-local + target recurrent
+        // state to the latest checkpoint ≤ ckpt and drop the now-stale tail of the
+        // checkpoint ring (`rewind_to` does both), then rewind the daemon's seq_pos
+        // / conversation_tokens. The turn then proceeds exactly like a HIT with
+        // start_pos == ckpt (the cache plan already set cache_hit=true).
+        if let Some(ckpt) = resume_from {
+            if let Err(e) = spec.rewind_to(gpu, slot, ckpt) {
+                break 'spec SpecRunOutcome::Failed(format!("spec rewind: {e}"));
+            }
+            m.session.seq_pos = ckpt;
+            m.session.conversation_tokens.truncate(ckpt);
+        }
+
+        if !cache_hit {
+            // Fresh target state — full prefill from position 0. The DeltaNet
+            // recurrent state is zeroed by the prefill seed itself
+            // (`seed_target_hidden_from_prompt_abortable` calls `target.reset_state`,
+            // which also zeroes s_ef_residual — more complete than the memset loop
+            // the old inline path ran here), so only the daemon-side position
+            // bookkeeping remains.
             m.session.seq_pos = 0;
             m.session.conversation_tokens.clear();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-                id
+        } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
+                prefill_start,
+                prefill_tokens.len()
             );
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return None;
         }
-        Err(e) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#,
-                id, e
-            );
-            let _ = stdout.flush();
-            return None;
-        }
-    };
 
-    let t_prefill = Instant::now();
+        let t0 = Instant::now();
+        // Prefill: the speculator seeds the target's hidden state (advancing its KV
+        // + recurrent state), primes the drafter's cached target-hidden, snapshots
+        // the divergent-render checkpoint ring, and returns the target's first
+        // token. On a cache hit only the suffix is seeded; on a miss the seed
+        // self-resets target state and the full prompt is seeded. Client cancel is
+        // surfaced as `PrefillOutcome::Aborted`.
+        let id_for_abort = id.to_string();
+        let first_token = match spec.prefill(
+            gpu,
+            slot,
+            &prompt_tokens,
+            &prefill_tokens,
+            prefill_start,
+            cache_hit,
+            resume_from,
+            &|| check_abort(&id_for_abort),
+        ) {
+            Ok(PrefillOutcome::Ready { first_token }) => first_token,
+            Ok(PrefillOutcome::Aborted) => break 'spec SpecRunOutcome::Aborted { generated: 0 },
+            Err(e) => break 'spec SpecRunOutcome::Failed(format!("prefill: {e}")),
+        };
 
-    // Per-token emission (EosFilter byte stream + grammar + think force-close +
-    // stop-sequence match) lives behind the arch-generic `SpecEmit` seam. The
-    // emitter is built HERE (not by the caller) because it needs `slot.eos_token()`
-    // (only available after the slot guard) AND borrows the tokenizer (derived
-    // from `m`). The wrapper supplies the model-independent recipe as an owned
-    // `SpecEmitRequest`; the arch's carrier turns it into the concrete
-    // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
-    let emit_ctx = hipfire_runtime::spec::SpecEmitCtx {
-        tokenizer,
-        eos: slot.eos_token(),
-        im_end: emit_req.im_end,
-        tools: emit_req.tools.as_deref(),
-        stop: emit_req.stop,
-        max_think: emit_req.max_think,
-        max_tokens,
-        assistant_prefix: emit_req.assistant_prefix,
-        think_mode: emit_req.think_mode,
-        decoded_vocab: emit_req.decoded_vocab,
-    };
-    let mut emit: Box<dyn SpecEmit> = match carrier.make_spec_emitter(emit_ctx) {
-        Ok(e) => e,
-        Err(e) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
-                id, e
-            );
-            let _ = stdout.flush();
-            return None;
-        }
-    };
+        let t_prefill = Instant::now();
 
-    // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
-    // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
-    // it stays in the loop and excludes any grammar-rejected token.
-    let mut emitted: Vec<u32> = vec![first_token];
-    let mut position = prompt_tokens.len();
-    let mut seed_token = first_token;
-    // τ accounting, inlined from the unified `SpecStep` (the old `SpecStats`
-    // type took the arch-specific `SpecStepResult`, which the daemon no longer
-    // sees): τ = accepted drafts / cycle.
-    let mut spec_cycles = 0usize;
-    let mut spec_accepted = 0usize;
-    let mut generated = 0usize;
+        // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
+        // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
+        // it stays in the loop and excludes any grammar-rejected token.
+        let mut emitted: Vec<u32> = vec![first_token];
+        let mut position = prompt_tokens.len();
+        let mut seed_token = first_token;
+        // τ accounting, inlined from the unified `SpecStep` (the old `SpecStats`
+        // type took the arch-specific `SpecStepResult`, which the daemon no longer
+        // sees): τ = accepted drafts / cycle.
+        let mut spec_cycles = 0usize;
+        let mut spec_accepted = 0usize;
+        let mut generated = 0usize;
 
-    // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
-    // If the prompt already filled past budget+beta, compact once before
-    // entering the spec loop so the first spec step writes at physical slot
-    // `budget`. compact_offset is maintained on slot.kv_cache; subsequent
-    // forwards inside the speculator read it for RoPE phase automatically. The
-    // drafter-local hidden cache is compacted to match via `on_evict`.
-    if let Some(ref ev) = m.eviction {
-        // Eviction is only ever configured for KvCache-backed arches
-        // (qwen35/llama); a `Qwen2State`-backed target never reaches here.
-        let kv = slot
-            .kv_cache_mut()
-            .expect("eviction configured ⇒ KvCache-backed spec target");
-        if let Some(res) = ev.maybe_evict(gpu, kv, position).unwrap() {
-            let pre_phys = position;
-            let compact_offset = slot.kv_cache_mut().unwrap().compact_offset;
+        // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
+        // If the prompt already filled past budget+beta, compact once before
+        // entering the spec loop so the first spec step writes at physical slot
+        // `budget`. compact_offset is maintained on slot.kv_cache; subsequent
+        // forwards inside the speculator read it for RoPE phase automatically. The
+        // drafter-local hidden cache is compacted to match via `on_evict`.
+        if let Some(new_physical) =
+            match maybe_evict_spec(gpu, m.eviction.as_ref(), slot, spec.as_mut(), position) {
+                Ok(position) => position,
+                Err(e) => {
+                    break 'spec SpecRunOutcome::Failed(format!("post-prefill eviction: {e}"));
+                }
+            }
+        {
+            let compact_offset = match slot.kv_cache_mut() {
+                Some(kv) => kv.compact_offset,
+                None => {
+                    break 'spec SpecRunOutcome::Failed(
+                        "post-prefill eviction: missing KvCache after compaction".into(),
+                    );
+                }
+            };
             eprintln!(
                 "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                pre_phys, res.new_physical, compact_offset,
+                position, new_physical, compact_offset,
             );
-            position = res.new_physical;
-            if !res.retain_mask.is_empty() {
-                let _ = spec.on_evict(
-                    gpu,
-                    &EvictRetain {
-                        retain_mask: res.retain_mask,
-                        pre_phys,
-                    },
-                );
+            position = new_physical;
+        }
+
+        // Emit the first token immediately so TTFT is the prefill time. `begin`
+        // pushes + filters it, seeds the grammar matcher, and reports whether the
+        // first token is itself a terminator (→ skip the spec loop entirely, so
+        // spec_step_dflash never drafts a whole block seeded on a terminal token).
+        let first_begin = emit.begin(first_token);
+        render_client_events(
+            stdout,
+            id,
+            &first_begin.events,
+            t0.elapsed().as_millis() as u64,
+        );
+        // Count the first token only when the emitter emitted it (see the same guard
+        // in the accept loop). qwen35 always emits a `Committed`; the ds4 emitter
+        // returns no events for an EOS-first prefill argmax, yielding an empty turn.
+        if !first_begin.events.is_empty() {
+            generated += 1;
+        }
+        let first_token_is_eos = first_begin.stop.is_some();
+
+        // (The DFlash RNG cell and the chain-vs-tree resolution that used to live
+        // here are now resolved once at build time and
+        // owned inside the speculator — see `build_dflash_speculator`.)
+
+        // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
+        // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
+        // first sampled token was already a terminator (see the guard above).
+        while !first_token_is_eos && generated < max_tokens {
+            // Decode-side abort (dflash path). See the matching block in
+            // `generate()` for rationale. Without this, a Pi cancel
+            // mid-decode leaves the spec-decode loop running for max_tokens
+            // worth of wasted work.
+            if check_abort(id) {
+                // The target and drafter have advanced past un-baked history. Leave
+                // the guard scope so the canonical model reset can recover both.
+                break 'spec SpecRunOutcome::Aborted { generated };
+            }
+            if position.saturating_add(block_size) >= ctx_capacity {
+                break;
+            }
+
+            // One acceptance window. The speculator owns chain-vs-tree dispatch
+            // internally; the daemon just hands it the borrowed target and
+            // the prior committed tokens (drafter repeat / n-gram context). The
+            // in-step grammar mask comes from the emitter: qwen35 returns `None`
+            // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
+            // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
+            // borrow ends when `step` returns, before the per-token `emit.observe`.
+            let step = match spec.step(
+                gpu,
+                slot,
+                position,
+                seed_token,
+                &emitted,
+                emit.grammar(),
+                temp,
+            ) {
+                Ok(s) => s,
+                Err(e) => break 'spec SpecRunOutcome::Failed(format!("spec_step: {e}")),
+            };
+            spec_cycles += 1;
+            spec_accepted += step.accepted;
+            // `emit` is already the committed tail with the seed re-echo stripped.
+            let committed_tail: Vec<u32> = step.emit.to_vec();
+
+            let mut hit_eos = false;
+            let mut think_cap_hit = false;
+            let mut forced_after: Vec<u32> = Vec::new();
+            for &tok in &committed_tail {
+                if generated >= max_tokens {
+                    break;
+                }
+                // `emit.observe` runs the per-token emission policy: grammar
+                // pre-check (reject → grammar violation, NO emit, post-loop forces a
+                // full KV/DN reset to clear the polluted slots spec_step wrote), then
+                // committed/token frames, EOS, user stop-sequence, and think
+                // force-close. Loop state (emitted/generated/position) stays here.
+                emit.set_generated_hint(generated);
+                let outcome = emit.observe(tok);
+                if outcome.stop == Some(StopReason::GrammarViolation) {
+                    // Rejected before emit — not added to the repeat context, not
+                    // streamed, not counted. Treat as EOS for this turn.
+                    render_client_events(
+                        stdout,
+                        id,
+                        &outcome.events,
+                        t0.elapsed().as_millis() as u64,
+                    );
+                    hit_eos = true;
+                    break;
+                }
+                // Count/bake/render a committed token only when the emitter actually
+                // emitted it (non-empty events). qwen35 always emits a `Committed`
+                // event (even on EOS / held bytes), so this is a no-op there; the
+                // deepseek4 emitter returns NO events for an accepted EOS, so that
+                // terminator is neither counted into `generated` nor baked into
+                // `conversation_tokens` — byte-matching the bespoke ds4 loop (which
+                // broke on accepted-EOS before push/increment).
+                if !outcome.events.is_empty() {
+                    emitted.push(tok);
+                    render_client_events(
+                        stdout,
+                        id,
+                        &outcome.events,
+                        t0.elapsed().as_millis() as u64,
+                    );
+                    generated += 1;
+                }
+                // Generation-intervention hook: the emitter may request tokens to
+                // FORCE after this one, suppressing the step's terminator (cohere2moe
+                // empty-turn guard / think-budget force-close). Default empty for
+                // every other emitter ⇒ this branch never taken, loop byte-identical.
+                // Processed after the post-loop `position += emit.len()` so forced
+                // tokens advance from the target's true (batch-advanced) cursor.
+                let forced = emit.take_forced();
+                if !forced.is_empty() {
+                    forced_after = forced;
+                    break;
+                }
+                match outcome.stop {
+                    Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
+                        hit_eos = true;
+                        break;
+                    }
+                    Some(StopReason::ThinkCap) => {
+                        think_cap_hit = true;
+                        break;
+                    }
+                    Some(StopReason::GrammarViolation) => unreachable!("handled above"),
+                    None => {}
+                }
+            }
+            // Advance by the emitted-tail length (= accepted + 1), NOT by `accepted`
+            // — the loop contract pinned by spec.rs's `emit_len_drives_advance`.
+            position += step.emit.len();
+            seed_token = step.next_seed;
+
+            // Forced-token injection (cohere2moe generation guards; no-op for every
+            // other emitter — `take_forced` defaulted empty). The target already
+            // batch-advanced over the whole committed tail, so `position` is now its
+            // true cursor: advance it over each forced token, re-feed the token
+            // through the emitter (a marker transitions its state machine + emits a
+            // Committed event), set the next draft seed to it, and continue WITHOUT
+            // honoring the suppressed terminator. Bounded by the emitter's own
+            // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
+            if !forced_after.is_empty() {
+                for ft in std::mem::take(&mut forced_after) {
+                    match slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
+                    {
+                        Ok(outcome) if forced_advance_completed(&outcome) => {}
+                        Ok(_) => break 'spec SpecRunOutcome::Aborted { generated },
+                        Err(e) => {
+                            break 'spec SpecRunOutcome::Failed(format!(
+                                "forced-token advance: {e}"
+                            ));
+                        }
+                    }
+                    position += 1;
+                    emit.set_generated_hint(generated);
+                    let fo = emit.observe(ft);
+                    if !fo.events.is_empty() {
+                        emitted.push(ft);
+                        render_client_events(
+                            stdout,
+                            id,
+                            &fo.events,
+                            t0.elapsed().as_millis() as u64,
+                        );
+                        generated += 1;
+                    }
+                    seed_token = ft;
+                }
+            }
+            // Per-cycle eviction (FlashCASK). Fires whenever current physical
+            // has grown to budget+β since the last compaction. No-op when
+            // physical < budget+β, so non-firing cycles pay only the check cost.
+            if let Some(new_physical) =
+                match maybe_evict_spec(gpu, m.eviction.as_ref(), slot, spec.as_mut(), position) {
+                    Ok(position) => position,
+                    Err(e) => break 'spec SpecRunOutcome::Failed(format!("eviction: {e}")),
+                }
+            {
+                position = new_physical;
+            }
+            if hit_eos || think_cap_hit {
+                break;
             }
         }
-    }
 
-    // Emit the first token immediately so TTFT is the prefill time. `begin`
-    // pushes + filters it, seeds the grammar matcher, and reports whether the
-    // first token is itself a terminator (→ skip the spec loop entirely, so
-    // spec_step_dflash never drafts a whole block seeded on a terminal token).
-    let first_begin = emit.begin(first_token);
-    render_client_events(
-        stdout,
-        id,
-        &first_begin.events,
-        t0.elapsed().as_millis() as u64,
-    );
-    // Count the first token only when the emitter emitted it (see the same guard
-    // in the accept loop). qwen35 always emits a `Committed`; the ds4 emitter
-    // returns no events for an EOS-first prefill argmax, yielding an empty turn.
-    if !first_begin.events.is_empty() {
-        generated += 1;
-    }
-    let first_token_is_eos = first_begin.stop.is_some();
+        // Snapshot the emitter's state needed by the post-loop bookkeeping before
+        // the terminal `finish` consumes it: the full streamed-token stream (for the
+        // asst-turn cache) and whether a committed token tripped the grammar matcher.
+        let streamed_tokens = emit.streamed_tokens().to_vec();
+        let grammar_violated = emit.grammar_violated();
 
-    // (The DFlash RNG cell and the chain-vs-tree resolution that used to live
-    // here are now resolved once at build time and
-    // owned inside the speculator — see `build_dflash_speculator`.)
+        m.session.seq_pos = position;
+        // Bake the FULL conversation (prefill + decode) into conversation_tokens
+        // so subsequent turns can compute LCP against it. Previously this stored
+        // only the decoded portion (`emitted`), making the next non-dflash turn
+        // full-reset because no system/user prefix was present.
+        m.session.conversation_tokens = {
+            let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
+            v.extend_from_slice(&prompt_tokens);
+            v.extend_from_slice(&emitted);
+            v
+        };
 
-    // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
-    // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
-    // first sampled token was already a terminator (see the guard above).
-    while !first_token_is_eos && generated < max_tokens {
-        // Decode-side abort (dflash path). See the matching block in
-        // `generate()` for rationale. Without this, a Pi cancel
-        // mid-decode leaves the spec-decode loop running for max_tokens
-        // worth of wasted work.
-        if check_abort(id) {
-            // Mid-decode cancel: the KV/DeltaNet are advanced past the
-            // (un-baked) conversation_tokens, so the next turn must cold-start.
-            // Zero the target recurrent state + KV eviction offset and free the
-            // speculator's checkpoint ring; the slot guard restores the bundle
-            // into m.state on return. Without this, stale mid-decode recurrent
-            // state corrupts the next generation (drift → premature EOS).
-            slot.reset_recurrent(gpu);
-            spec.reset(gpu);
-            m.session.seq_pos = 0;
-            m.session.conversation_tokens.clear();
+        if grammar_violated {
+            eprintln!(
+                "[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn"
+            );
+            break 'spec SpecRunOutcome::Failed("speculative grammar violation".into());
+        }
+
+        // Terminal `finish` flush — parses tool calls from the decoded text and
+        // renders the `tool_calls` ClientEvent. The arch-specific epilogue (the
+        // asst-turn cache store + the `done` envelope) is the WRAPPER's job: it
+        // differs per arch (qwen35: `dflash`/`tau`/`cycles` + ChatML token-replay
+        // cache; ds4: `spec_k`/`spec_windows`/`spec_accept_pct`), so this core
+        // returns a `SpecRun` summary instead of writing them itself.
+        let finish = emit.finish();
+        render_client_events(stdout, id, &finish.events, 0);
+
+        let t_end = Instant::now();
+        SpecRunOutcome::Ready(SpecRun {
+            generated,
+            spec_cycles,
+            spec_accepted,
+            streamed_tokens,
+            prefill_tokens_len: prefill_tokens.len(),
+            finish,
+            prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
+            total_s: t_end.duration_since(t0).as_secs_f64(),
+            decode_s: t_end.duration_since(t_prefill).as_secs_f64(),
+        })
+    };
+
+    // The slot guard must restore its target bundle before the canonical reset
+    // touches model state. No failure path below retains target/speculator borrows.
+    drop(guard);
+    match outcome {
+        SpecRunOutcome::Ready(run) => Some(run),
+        SpecRunOutcome::ImmediateError(error) => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
+                id, error
+            );
+            let _ = stdout.flush();
+            None
+        }
+        SpecRunOutcome::Failed(error) => {
+            model_reset_context(m, gpu);
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
+                id, error
+            );
+            let _ = stdout.flush();
+            None
+        }
+        SpecRunOutcome::Aborted { generated } => {
+            model_reset_context(m, gpu);
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -6684,223 +6920,39 @@ fn generate_spec(
                 id, generated
             );
             let _ = stdout.flush();
-            return None;
-        }
-        if position.saturating_add(block_size) >= ctx_capacity {
-            break;
-        }
-
-        // One acceptance window. The speculator owns chain-vs-tree dispatch
-        // internally; the daemon just hands it the borrowed target and
-        // the prior committed tokens (drafter repeat / n-gram context). The
-        // in-step grammar mask comes from the emitter: qwen35 returns `None`
-        // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
-        // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
-        // borrow ends when `step` returns, before the per-token `emit.observe`.
-        let step = match spec.step(
-            gpu,
-            slot,
-            position,
-            seed_token,
-            &emitted,
-            emit.grammar(),
-            temp,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","id":"{}","message":"spec_step: {}"}}"#,
-                    id, e
-                );
-                let _ = stdout.flush();
-                break;
-            }
-        };
-        spec_cycles += 1;
-        spec_accepted += step.accepted;
-        // `emit` is already the committed tail with the seed re-echo stripped.
-        let committed_tail: Vec<u32> = step.emit.to_vec();
-
-        let mut hit_eos = false;
-        let mut think_cap_hit = false;
-        let mut forced_after: Vec<u32> = Vec::new();
-        for &tok in &committed_tail {
-            if generated >= max_tokens {
-                break;
-            }
-            // `emit.observe` runs the per-token emission policy: grammar
-            // pre-check (reject → grammar violation, NO emit, post-loop forces a
-            // full KV/DN reset to clear the polluted slots spec_step wrote), then
-            // committed/token frames, EOS, user stop-sequence, and think
-            // force-close. Loop state (emitted/generated/position) stays here.
-            emit.set_generated_hint(generated);
-            let outcome = emit.observe(tok);
-            if outcome.stop == Some(StopReason::GrammarViolation) {
-                // Rejected before emit — not added to the repeat context, not
-                // streamed, not counted. Treat as EOS for this turn.
-                render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
-                hit_eos = true;
-                break;
-            }
-            // Count/bake/render a committed token only when the emitter actually
-            // emitted it (non-empty events). qwen35 always emits a `Committed`
-            // event (even on EOS / held bytes), so this is a no-op there; the
-            // deepseek4 emitter returns NO events for an accepted EOS, so that
-            // terminator is neither counted into `generated` nor baked into
-            // `conversation_tokens` — byte-matching the bespoke ds4 loop (which
-            // broke on accepted-EOS before push/increment).
-            if !outcome.events.is_empty() {
-                emitted.push(tok);
-                render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
-                generated += 1;
-            }
-            // Generation-intervention hook: the emitter may request tokens to
-            // FORCE after this one, suppressing the step's terminator (cohere2moe
-            // empty-turn guard / think-budget force-close). Default empty for
-            // every other emitter ⇒ this branch never taken, loop byte-identical.
-            // Processed after the post-loop `position += emit.len()` so forced
-            // tokens advance from the target's true (batch-advanced) cursor.
-            let forced = emit.take_forced();
-            if !forced.is_empty() {
-                forced_after = forced;
-                break;
-            }
-            match outcome.stop {
-                Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
-                    hit_eos = true;
-                    break;
-                }
-                Some(StopReason::ThinkCap) => {
-                    think_cap_hit = true;
-                    break;
-                }
-                Some(StopReason::GrammarViolation) => unreachable!("handled above"),
-                None => {}
-            }
-        }
-        // Advance by the emitted-tail length (= accepted + 1), NOT by `accepted`
-        // — the loop contract pinned by spec.rs's `emit_len_drives_advance`.
-        position += step.emit.len();
-        seed_token = step.next_seed;
-
-        // Forced-token injection (cohere2moe generation guards; no-op for every
-        // other emitter — `take_forced` defaulted empty). The target already
-        // batch-advanced over the whole committed tail, so `position` is now its
-        // true cursor: advance it over each forced token, re-feed the token
-        // through the emitter (a marker transitions its state machine + emits a
-        // Committed event), set the next draft seed to it, and continue WITHOUT
-        // honoring the suppressed terminator. Bounded by the emitter's own
-        // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
-        if !forced_after.is_empty() {
-            for ft in std::mem::take(&mut forced_after) {
-                if let Err(e) =
-                    slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
-                {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"error","id":"{}","message":"forced-token advance: {}"}}"#,
-                        id, e
-                    );
-                    let _ = stdout.flush();
-                    hit_eos = true;
-                    break;
-                }
-                position += 1;
-                emit.set_generated_hint(generated);
-                let fo = emit.observe(ft);
-                if !fo.events.is_empty() {
-                    emitted.push(ft);
-                    render_client_events(stdout, id, &fo.events, t0.elapsed().as_millis() as u64);
-                    generated += 1;
-                }
-                seed_token = ft;
-            }
-        }
-        // Per-cycle eviction (FlashCASK). Fires whenever current physical
-        // has grown to budget+β since the last compaction. No-op when
-        // physical < budget+β, so non-firing cycles pay only the check cost.
-        if let Some(ref ev) = m.eviction {
-            // Eviction ⇒ KvCache-backed target (qwen35/llama); never qwen2.
-            let kv = slot
-                .kv_cache_mut()
-                .expect("eviction configured ⇒ KvCache-backed spec target");
-            if let Some(res) = ev.maybe_evict(gpu, kv, position).unwrap() {
-                let pre_phys = position;
-                position = res.new_physical;
-                if !res.retain_mask.is_empty() {
-                    let _ = spec.on_evict(
-                        gpu,
-                        &EvictRetain {
-                            retain_mask: res.retain_mask,
-                            pre_phys,
-                        },
-                    );
-                }
-            }
-        }
-        if hit_eos || think_cap_hit {
-            break;
+            None
         }
     }
+}
 
-    // Snapshot the emitter's state needed by the post-loop bookkeeping before
-    // the terminal `finish` consumes it: the full streamed-token stream (for the
-    // asst-turn cache) and whether a committed token tripped the grammar matcher.
-    let streamed_tokens = emit.streamed_tokens().to_vec();
-    let grammar_violated = emit.grammar_violated();
+#[cfg(test)]
+mod spec_recovery_tests {
+    use super::{forced_advance_completed, publish_eviction_position, qwen35_recurrent_groups};
+    use hipfire_runtime::spec::SpecAdvance;
 
-    m.session.seq_pos = position;
-    // Bake the FULL conversation (prefill + decode) into conversation_tokens
-    // so subsequent turns can compute LCP against it. Previously this stored
-    // only the decoded portion (`emitted`), making the next non-dflash turn
-    // full-reset because no system/user prefix was present.
-    m.session.conversation_tokens = {
-        let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
-        v.extend_from_slice(&prompt_tokens);
-        v.extend_from_slice(&emitted);
-        v
-    };
+    #[test]
+    fn does_not_publish_new_position_when_draft_mirror_fails() {
+        let result: Result<usize, String> =
+            publish_eviction_position(128, Err("draft mirror failed".into()));
 
-    // Grammar-violation cleanup: the speculator wrote KV + DN state for the
-    // rejected token(s) before the post-acceptance grammar check saw them.
-    // Those slots are now poisoned — force a full reset (target recurrent state
-    // + KV eviction offset via reset_recurrent, plus the drafter's checkpoint
-    // ring via spec.reset) so the next request starts clean. The user pays the
-    // prefill cost on the retry but never sees the bad tokens; see Pi turn-12.
-    if grammar_violated {
-        eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
-        slot.reset_recurrent(gpu);
-        spec.reset(gpu);
-        m.session.conversation_tokens.clear();
-        m.session.seq_pos = 0;
+        assert_eq!(result, Err("draft mirror failed".into()));
     }
 
-    // Restore the target bundle into m.state via the slot guard's Drop, before
-    // the wrapper's end-of-turn cache bookkeeping (which no longer needs the slot).
-    drop(guard);
+    #[test]
+    fn aborted_forced_advance_is_not_successful() {
+        assert!(!forced_advance_completed(&SpecAdvance::Aborted));
+    }
 
-    // Terminal `finish` flush — parses tool calls from the decoded text and
-    // renders the `tool_calls` ClientEvent. The arch-specific epilogue (the
-    // asst-turn cache store + the `done` envelope) is the WRAPPER's job: it
-    // differs per arch (qwen35: `dflash`/`tau`/`cycles` + ChatML token-replay
-    // cache; ds4: `spec_k`/`spec_windows`/`spec_accept_pct`), so this core
-    // returns a `SpecRun` summary instead of writing them itself.
-    let finish = emit.finish();
-    render_client_events(stdout, id, &finish.events, 0);
+    #[test]
+    fn pipeline_reset_includes_q8_error_feedback_buffers() {
+        let groups = qwen35_recurrent_groups(&[1], &[2], &[3], &[4]);
 
-    let t_end = Instant::now();
-    Some(SpecRun {
-        generated,
-        spec_cycles,
-        spec_accepted,
-        streamed_tokens,
-        prefill_tokens_len: prefill_tokens.len(),
-        finish,
-        prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
-        total_s: t_end.duration_since(t0).as_secs_f64(),
-        decode_s: t_end.duration_since(t_prefill).as_secs_f64(),
-    })
+        assert_eq!(
+            groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
+            [1, 1, 1, 1]
+        );
+        assert_eq!(groups[3], &[4]);
+    }
 }
 
 fn generate_multi(
@@ -6945,52 +6997,7 @@ fn generate_multi(
         m.session.conversation_tokens.clear();
         free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here; covers both the
-        // pp>1 per-LA-device path and the single-GPU path.
-        if m.parallel.is_pipelined() {
-            if let (
-                Some(ModelState::Qwen35(b)),
-                ModelParallel::Pp(PipelineImpl::ArchResident(ref mut gpus)),
-            ) = (m.state.as_ref(), &mut m.parallel)
-            {
-                // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
-                if let Some(pl) = b.pipeline.as_ref() {
-                    let la = &pl.dn_la_to_device;
-                    let dn = &b.dn_state;
-                    for (i, s) in dn.s_matrices.iter().enumerate() {
-                        let g = &mut gpus.devices[la[i] as usize];
-                        let _ = g.bind_thread();
-                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                    for (i, s) in dn.s_scales.iter().enumerate() {
-                        let g = &mut gpus.devices[la[i] as usize];
-                        let _ = g.bind_thread();
-                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                    for (i, s) in dn.conv_states.iter().enumerate() {
-                        let g = &mut gpus.devices[la[i] as usize];
-                        let _ = g.bind_thread();
-                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                }
-            }
-        } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            b.kv_cache.compact_offset = 0;
-        }
+        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
         if let Some(ad) = m.session.kv_adaptive.as_mut() {
             ad.reset();
         }
@@ -7191,50 +7198,7 @@ fn generate_multi(
         m.session.conversation_tokens.clear();
         free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
-        if m.parallel.is_pipelined() {
-            if let (
-                Some(ModelState::Qwen35(b)),
-                ModelParallel::Pp(PipelineImpl::ArchResident(ref mut gpus)),
-            ) = (m.state.as_ref(), &mut m.parallel)
-            {
-                // Silent no-op when pipeline is None preserves the prior 3-way-match skip (byte-identical). The forward path uses .expect() instead — serving must hard-fail a broken pp>1 state, but reset must not panic.
-                if let Some(pl) = b.pipeline.as_ref() {
-                    let la = &pl.dn_la_to_device;
-                    let dn = &b.dn_state;
-                    for (i, s) in dn.s_matrices.iter().enumerate() {
-                        let g = &mut gpus.devices[la[i] as usize];
-                        let _ = g.bind_thread();
-                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                    for (i, s) in dn.s_scales.iter().enumerate() {
-                        let g = &mut gpus.devices[la[i] as usize];
-                        let _ = g.bind_thread();
-                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                    for (i, s) in dn.conv_states.iter().enumerate() {
-                        let g = &mut gpus.devices[la[i] as usize];
-                        let _ = g.bind_thread();
-                        let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                }
-            }
-        } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            b.kv_cache.compact_offset = 0;
-        }
+        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
             b.kv.compact_offset = 0;
         }
@@ -7308,21 +7272,7 @@ fn generate_multi(
             m.session.conversation_tokens.clear();
             free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
             free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
+            reset_qwen35_pipeline_recurrent(dn, dn_la_to_device, gpus);
             kv.compact_offset = 0;
             if let Some(ModelState::Llama(b)) = m.state.as_mut() {
                 b.kv.compact_offset = 0;
@@ -7626,12 +7576,19 @@ fn generate_multi(
                 latch_gen_mark = Some(generated);
             }
             if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
-                eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
+                eprintln!(
+                    "[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS",
+                    id, total_think_tokens, max_total_think
+                );
                 break;
             }
             if let Some(mark) = latch_gen_mark {
                 if generated.saturating_sub(mark) >= post_latch_answer_budget {
-                    eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
+                    eprintln!(
+                        "[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS",
+                        id,
+                        generated.saturating_sub(mark)
+                    );
                     break;
                 }
             }
@@ -7656,7 +7613,10 @@ fn generate_multi(
                         id
                     );
                 } else if force_answer_latched {
-                    eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
+                    eprintln!(
+                        "[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)",
+                        id
+                    );
                 }
                 let close_tokens = tokenizer.encode(&think_continuation());
                 let budget_left = max_tokens.saturating_sub(generated);
@@ -9613,25 +9573,7 @@ fn generate(
         if let Some(s) = m.speculator.as_mut() {
             s.reset(gpu);
         }
-        // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
-        // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
-        // is live here.
-        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            b.kv_cache.compact_offset = 0;
-        }
+        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
             b.kv.compact_offset = 0;
         }
@@ -9998,8 +9940,13 @@ fn generate(
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} jinja={} conv_tok={}",
-            cache_eligible, cache_kill_switch, messages_history.is_some(),
-            m.eviction.is_none(), !pflash_active, jinja_active, m.session.conversation_tokens.len(),
+            cache_eligible,
+            cache_kill_switch,
+            messages_history.is_some(),
+            m.eviction.is_none(),
+            !pflash_active,
+            jinja_active,
+            m.session.conversation_tokens.len(),
         );
     }
     let mut cached_tokens_count: usize = 0;
@@ -10056,7 +10003,12 @@ fn generate(
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
-                            fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
+                            fp,
+                            msg.role,
+                            msg.content.len(),
+                            normalized.len(),
+                            primer.len(),
+                            hit.is_some(),
                         );
                     }
                     hit
@@ -10099,8 +10051,12 @@ fn generate(
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} tool_calls={} hit={}",
-                            fp, msg.role, msg.content.len(), normalized.len(),
-                            msg.tool_calls.len(), hit.is_some(),
+                            fp,
+                            msg.role,
+                            msg.content.len(),
+                            normalized.len(),
+                            msg.tool_calls.len(),
+                            hit.is_some(),
                         );
                     }
                     hit
@@ -10306,7 +10262,12 @@ fn generate(
                     cached_tokens_count = rpos;
                     eprintln!(
                         "[qwen-cache resume] rewound to checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
-                        rpos, lcp, prior_len, rendered.len(), rendered.len() - rpos, rendered.len(),
+                        rpos,
+                        lcp,
+                        prior_len,
+                        rendered.len(),
+                        rendered.len() - rpos,
+                        rendered.len(),
                     );
                     Some(rendered[rpos..].to_vec())
                 } else {
@@ -10319,29 +10280,11 @@ fn generate(
                 Some(tail) => tail,
                 None => {
                     // No usable checkpoint — full cold reset. DeltaNet recurrent
-                    // state is non-reversible; treat as a miss. Inlined (not
-                    // `full_reset_cold`) because a `&tokenizer` borrow of `m` is
-                    // live here; these are disjoint field accesses. qwen35 state
-                    // lives in the bundle (ModelState::Qwen35), not the always-None
-                    // m.dn_state/m.kv_cache.
+                    // state is non-reversible; treat as a miss.
                     m.session.seq_pos = 0;
                     m.session.conversation_tokens.clear();
                     free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-                    if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-                        let dn = &b.dn_state;
-                        for s in &dn.s_matrices {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_scales {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.conv_states {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                    }
-                    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-                        b.kv_cache.compact_offset = 0;
-                    }
+                    reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
                     if let Some(ModelState::Llama(b)) = m.state.as_mut() {
                         b.kv.compact_offset = 0;
                     }
@@ -10385,24 +10328,7 @@ fn generate(
         if let Some(s) = m.speculator.as_mut() {
             s.reset(gpu);
         }
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here.
-        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            b.kv_cache.compact_offset = 0;
-        }
+        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
             b.kv.compact_offset = 0;
         }
@@ -10791,7 +10717,9 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     {
                         eprintln!(
                             "[asst-cache lookup] fp={:#018x} content.len={}/stripped.len={} tool_calls={} hit={}",
-                            fp, msg.content.len(), normalized.len(),
+                            fp,
+                            msg.content.len(),
+                            normalized.len(),
                             msg.tool_calls.len(),
                             asst_turn_cache.contains_key(&fp),
                         );
@@ -11838,7 +11766,9 @@ fn generate_lfm2moe(
             match render_result {
                 Ok(rendered) => tokenizer.encode(&rendered),
                 Err(e) => {
-                    eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
+                    eprintln!(
+                        "[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain"
+                    );
                     hipfire_runtime::prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -12108,7 +12038,9 @@ fn generate_minimax(
                     tokenizer.encode(&rendered)
                 }
                 Err(e) => {
-                    eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
+                    eprintln!(
+                        "[daemon] jinja render failed in minimax path ({e}) — falling back to Plain"
+                    );
                     hipfire_runtime::prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -12195,47 +12127,50 @@ fn generate_minimax(
     // tail is never attended. The reused prefix GROWS with the conversation
     // (all older turns, reasoning already stripped, stay matched), so
     // steady-state per-turn prefill is just {last visible answer} + {new user}.
-    let prefill_ids: Vec<u32> =
-        {
-            let prior_len = m.session.conversation_tokens.len();
-            let max_match = prior_len.min(prompt_ids.len());
-            let mut lcp = 0usize;
-            while lcp < max_match && m.session.conversation_tokens[lcp] == prompt_ids[lcp] {
-                lcp += 1;
-            }
-            // A usable common prefix that leaves at least one fresh token to prefill
-            // (the render always appends a new `]~b]ai\n<think>\n` primer, so
-            // lcp == rendered_len cannot occur on a normal turn). `partial` is the
-            // interleaved-thinking divergence (lcp < prior_len); lcp == prior_len is
-            // the degenerate pure-extension case (rewind is then a no-op).
-            let cache_hit = lcp > 0 && lcp < prompt_ids.len();
-            let partial = lcp < prior_len;
-            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                eprintln!(
+    let prefill_ids: Vec<u32> = {
+        let prior_len = m.session.conversation_tokens.len();
+        let max_match = prior_len.min(prompt_ids.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && m.session.conversation_tokens[lcp] == prompt_ids[lcp] {
+            lcp += 1;
+        }
+        // A usable common prefix that leaves at least one fresh token to prefill
+        // (the render always appends a new `]~b]ai\n<think>\n` primer, so
+        // lcp == rendered_len cannot occur on a normal turn). `partial` is the
+        // interleaved-thinking divergence (lcp < prior_len); lcp == prior_len is
+        // the degenerate pure-extension case (rewind is then a no-op).
+        let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+        let partial = lcp < prior_len;
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
                 "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
+                prior_len,
+                prompt_ids.len(),
+                lcp,
+                cache_hit,
+                cache_hit && partial,
                 m.minimax().unwrap().state.n_tokens,
             );
+        }
+        if cache_hit {
+            // Rewind KV + token history to the common prefix. When lcp ==
+            // prior_len this is a no-op; when lcp < prior_len it discards the
+            // stale reasoning+answer tail. The prefill loop below reads
+            // `state.n_tokens` as its base position, so n_tokens is the only
+            // KV state the rewind must touch (plus the mirror token history).
+            m.minimax_mut().unwrap().state.n_tokens = lcp;
+            m.session.conversation_tokens.truncate(lcp);
+            m.session.seq_pos = lcp;
+            prompt_ids[lcp..].to_vec()
+        } else {
+            if prior_len > 0 {
+                m.minimax_mut().unwrap().state.reset();
+                m.session.seq_pos = 0;
+                m.session.conversation_tokens.clear();
             }
-            if cache_hit {
-                // Rewind KV + token history to the common prefix. When lcp ==
-                // prior_len this is a no-op; when lcp < prior_len it discards the
-                // stale reasoning+answer tail. The prefill loop below reads
-                // `state.n_tokens` as its base position, so n_tokens is the only
-                // KV state the rewind must touch (plus the mirror token history).
-                m.minimax_mut().unwrap().state.n_tokens = lcp;
-                m.session.conversation_tokens.truncate(lcp);
-                m.session.seq_pos = lcp;
-                prompt_ids[lcp..].to_vec()
-            } else {
-                if prior_len > 0 {
-                    m.minimax_mut().unwrap().state.reset();
-                    m.session.seq_pos = 0;
-                    m.session.conversation_tokens.clear();
-                }
-                prompt_ids.clone()
-            }
-        };
+            prompt_ids.clone()
+        }
+    };
 
     // Reused-prefix count for the done event: `prompt_ids` is the full render,
     // `prefill_ids` the post-LCP suffix ar_generate will prefill.
@@ -12687,7 +12622,8 @@ fn generate_cohere2moe(
                         let ids = tokenizer.encode(&rendered);
                         eprintln!(
                             "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
-                            rendered.len(), ids.len(),
+                            rendered.len(),
+                            ids.len(),
                             &rendered[..rendered.len().min(400)],
                             &rendered[rendered.len().saturating_sub(800)..],
                         );
@@ -12716,7 +12652,9 @@ fn generate_cohere2moe(
             } else {
                 "model .hfq carries no chat_template"
             };
-            eprintln!("[daemon] cohere2moe cannot build a valid prompt frame ({why}) — refusing ChatML fallback");
+            eprintln!(
+                "[daemon] cohere2moe cannot build a valid prompt frame ({why}) — refusing ChatML fallback"
+            );
             emit_error_with_id(
                 stdout,
                 id,
@@ -12792,7 +12730,11 @@ fn generate_cohere2moe(
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
+                prior_len,
+                prompt_ids.len(),
+                lcp,
+                cache_hit,
+                cache_hit && partial,
                 m.cohere2moe().unwrap().state.n_tokens,
             );
         }
@@ -13167,25 +13109,7 @@ fn generate_vl(
         if let Some(s) = m.speculator.as_mut() {
             s.reset(gpu);
         }
-        // VL is qwen35-vl (arch 5/8); its recurrent state lives in the bundle
-        // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
-        // is live here.
-        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            b.kv_cache.compact_offset = 0;
-        }
+        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
         if let Some(ad) = m.session.kv_adaptive.as_mut() {
             ad.reset();
         }
@@ -13264,11 +13188,22 @@ fn generate_vl(
             > m.meta.max_seq
     };
     if over_budget {
-        write_error(stdout, id, &format!(
-            "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
-            m.session.seq_pos, prompt_tokens.len(), max_tokens, trailer,
-            if m.eviction.is_none() { m.meta.physical_cap } else { m.meta.max_seq },
-        ));
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
+                m.session.seq_pos,
+                prompt_tokens.len(),
+                max_tokens,
+                trailer,
+                if m.eviction.is_none() {
+                    m.meta.physical_cap
+                } else {
+                    m.meta.max_seq
+                },
+            ),
+        );
         return;
     }
 
@@ -13768,9 +13703,16 @@ fn generate_vl_dots_ocr(
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
     let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
     if prompt_ids.len().saturating_add(max_tokens) > max_seq {
-        write_error(stdout, id, &format!(
-            "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
-            prompt_ids.len(), max_tokens, max_seq));
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
+                prompt_ids.len(),
+                max_tokens,
+                max_seq
+            ),
+        );
         return;
     }
 
@@ -13823,8 +13765,12 @@ fn generate_vl_dots_ocr(
             stdout,
             id,
             &format!(
-            "dots.ocr: merger produced {} values but prompt has {} <|imgpad|> slots × {} dims = {}",
-            merged.len(), n_visual, dim, n_visual * dim),
+                "dots.ocr: merger produced {} values but prompt has {} <|imgpad|> slots × {} dims = {}",
+                merged.len(),
+                n_visual,
+                dim,
+                n_visual * dim
+            ),
         );
         return;
     }

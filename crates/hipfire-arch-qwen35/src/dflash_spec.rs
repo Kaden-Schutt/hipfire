@@ -11,7 +11,7 @@
 //! constructor). All types here are qwen35 + runtime types — no loader types —
 //! so the loader only calls in; it never owns the DFlash mechanics.
 
-use crate::qwen35::{self, DeltaNetState, LayerType, Qwen35Config};
+use crate::qwen35::{self, DeltaNetState, Qwen35Config};
 use crate::speculative::{
     apply_eviction_retain_to_draft, scatter_hidden_block_to_interleaved,
     seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
@@ -25,6 +25,184 @@ use hipfire_runtime::spec::{
 };
 use rdna_compute::Gpu;
 use std::path::Path;
+
+#[derive(Clone, Copy)]
+pub(crate) enum DflashConstructionStage {
+    DraftWeights,
+    DraftScratch,
+    HiddenRing,
+    VerifyScratch,
+    TargetSnapshot,
+    GdnTape,
+    DdtreeSnapshot,
+    DdtreeScratch,
+}
+
+impl DflashConstructionStage {
+    #[cfg(test)]
+    const ALL: [Self; 8] = [
+        Self::DraftWeights,
+        Self::DraftScratch,
+        Self::HiddenRing,
+        Self::VerifyScratch,
+        Self::TargetSnapshot,
+        Self::GdnTape,
+        Self::DdtreeSnapshot,
+        Self::DdtreeScratch,
+    ];
+
+    #[cfg(test)]
+    fn label(self) -> &'static str {
+        match self {
+            Self::DraftWeights => "draft weights",
+            Self::DraftScratch => "draft scratch",
+            Self::HiddenRing => "hidden ring",
+            Self::VerifyScratch => "verify scratch",
+            Self::TargetSnapshot => "target snapshot",
+            Self::GdnTape => "GdnTape",
+            Self::DdtreeSnapshot => "DDTree snapshot",
+            Self::DdtreeScratch => "DDTree scratch",
+        }
+    }
+
+    #[cfg(test)]
+    fn code(self) -> usize {
+        match self {
+            Self::DraftWeights => 1,
+            Self::DraftScratch => 2,
+            Self::HiddenRing => 3,
+            Self::VerifyScratch => 4,
+            Self::TargetSnapshot => 5,
+            Self::GdnTape => 6,
+            Self::DdtreeSnapshot => 7,
+            Self::DdtreeScratch => 8,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum DflashAllocationSite {
+    DeltaNetSnapshot,
+    GdnTape,
+    DdtreeScratch,
+    VerifyScratch,
+    HiddenStateRing,
+    PrefillBatchScratch,
+}
+
+#[cfg(test)]
+impl DflashAllocationSite {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::DeltaNetSnapshot => "DeltaNetSnapshot",
+            Self::GdnTape => "GdnTape",
+            Self::DdtreeScratch => "DdtreeScratch",
+            Self::VerifyScratch => "VerifyScratch",
+            Self::HiddenStateRing => "HiddenStateRingBuffer",
+            Self::PrefillBatchScratch => "PrefillBatchScratch",
+        }
+    }
+
+    fn code(self) -> usize {
+        match self {
+            Self::DeltaNetSnapshot => 1,
+            Self::GdnTape => 2,
+            Self::DdtreeScratch => 3,
+            Self::VerifyScratch => 4,
+            Self::HiddenStateRing => 5,
+            Self::PrefillBatchScratch => 6,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum DflashTestFault {
+    AfterStage(DflashConstructionStage),
+    AfterAllocation {
+        site: DflashAllocationSite,
+        allocation: usize,
+    },
+}
+
+#[cfg(test)]
+mod dflash_test_fault {
+    use super::{DflashAllocationSite, DflashConstructionStage, DflashTestFault};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    static STAGE: AtomicUsize = AtomicUsize::new(0);
+    static ALLOCATION_SITE: AtomicUsize = AtomicUsize::new(0);
+    static ALLOCATION_TARGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STAGE.store(0, Ordering::SeqCst);
+            ALLOCATION_SITE.store(0, Ordering::SeqCst);
+            ALLOCATION_TARGET.store(usize::MAX, Ordering::SeqCst);
+            ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn with_fault<T>(fault: DflashTestFault, f: impl FnOnce() -> T) -> T {
+        let _lock = LOCK.lock().expect("DFlash fault lock poisoned");
+        match fault {
+            DflashTestFault::AfterStage(stage) => STAGE.store(stage.code(), Ordering::SeqCst),
+            DflashTestFault::AfterAllocation { site, allocation } => {
+                ALLOCATION_SITE.store(site.code(), Ordering::SeqCst);
+                ALLOCATION_TARGET.store(allocation, Ordering::SeqCst);
+                ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+            }
+        }
+        let _reset = Reset;
+        f()
+    }
+
+    pub(super) fn after_stage(stage: DflashConstructionStage) -> Result<(), String> {
+        if STAGE.load(Ordering::SeqCst) == stage.code() {
+            return Err(format!("test fault after {}", stage.label()));
+        }
+        Ok(())
+    }
+
+    pub(super) fn after_allocation(site: DflashAllocationSite) -> hip_bridge::HipResult<()> {
+        if ALLOCATION_SITE.load(Ordering::SeqCst) == site.code()
+            && ALLOCATION_COUNT.fetch_add(1, Ordering::SeqCst)
+                == ALLOCATION_TARGET.load(Ordering::SeqCst)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("test fault after {} allocation", site.label()),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_dflash_test_fault<T>(fault: DflashTestFault, f: impl FnOnce() -> T) -> T {
+    dflash_test_fault::with_fault(fault, f)
+}
+
+#[cfg(test)]
+pub(crate) fn dflash_test_after_allocation(
+    site: DflashAllocationSite,
+) -> hip_bridge::HipResult<()> {
+    dflash_test_fault::after_allocation(site)
+}
+
+fn dflash_construction_boundary(stage: DflashConstructionStage) -> Result<(), String> {
+    #[cfg(test)]
+    dflash_test_fault::after_stage(stage)?;
+    #[cfg(not(test))]
+    let _ = stage;
+    Ok(())
+}
 
 // ─── DDTree side state ────────────────────────────────────────────────
 
@@ -53,6 +231,136 @@ pub struct DflashState {
     pub ddtree: Option<DdtreeState>,
 }
 
+impl DflashState {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let DflashState {
+            draft_weights,
+            draft_scratch,
+            hidden_rb,
+            verify_scratch,
+            target_snap,
+            gdn_tape,
+            ddtree,
+            ..
+        } = self;
+        draft_weights.free_gpu(gpu);
+        draft_scratch.free_gpu(gpu);
+        for tensor in hidden_rb
+            .layer_bufs
+            .into_iter()
+            .chain(hidden_rb.staging_bufs)
+        {
+            let _ = gpu.free_tensor(tensor);
+        }
+        verify_scratch.free_gpu(gpu);
+        target_snap.free_gpu(gpu);
+        gdn_tape.free_gpu(gpu);
+        if let Some(DdtreeState {
+            post_seed_snap,
+            scratch,
+            ..
+        }) = ddtree
+        {
+            post_seed_snap.free_gpu(gpu);
+            scratch.free_gpu(gpu);
+        }
+    }
+}
+
+/// Constructor-local owner for DFlash resources that have been allocated but
+/// have not yet become published `DflashState`. It is explicitly drained on
+/// every error path because GPU buffers deliberately have no global `Drop`.
+struct DflashStateStaging {
+    draft_weights: Option<DflashWeights>,
+    draft_scratch: Option<DflashScratch>,
+    hidden_rb: Option<HiddenStateRingBuffer>,
+    verify_scratch: Option<VerifyScratch>,
+    target_snap: Option<DeltaNetSnapshot>,
+    gdn_tape: Option<GdnTape>,
+    ddtree: Option<DdtreeStaging>,
+}
+
+struct DdtreeStaging {
+    post_seed_snap: Option<DeltaNetSnapshot>,
+    scratch: Option<DdtreeScratch>,
+    budget: usize,
+    topk: usize,
+}
+
+impl DflashStateStaging {
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        if let Some(ddtree) = self.ddtree.take() {
+            ddtree.free_gpu(gpu);
+        }
+        if let Some(gdn_tape) = self.gdn_tape.take() {
+            gdn_tape.free_gpu(gpu);
+        }
+        if let Some(target_snap) = self.target_snap.take() {
+            target_snap.free_gpu(gpu);
+        }
+        if let Some(verify_scratch) = self.verify_scratch.take() {
+            verify_scratch.free_gpu(gpu);
+        }
+        if let Some(hidden_rb) = self.hidden_rb.take() {
+            for tensor in hidden_rb
+                .layer_bufs
+                .into_iter()
+                .chain(hidden_rb.staging_bufs)
+            {
+                let _ = gpu.free_tensor(tensor);
+            }
+        }
+        if let Some(draft_scratch) = self.draft_scratch.take() {
+            draft_scratch.free_gpu(gpu);
+        }
+        if let Some(draft_weights) = self.draft_weights.take() {
+            draft_weights.free_gpu(gpu);
+        }
+    }
+
+    fn into_state(
+        mut self,
+        draft_config: DflashConfig,
+        target_hidden_host: Vec<f32>,
+        ctx_capacity: usize,
+        block_size: usize,
+    ) -> DflashState {
+        DflashState {
+            draft_config,
+            draft_weights: self.draft_weights.take().expect("staged draft weights"),
+            draft_scratch: self.draft_scratch.take().expect("staged draft scratch"),
+            hidden_rb: self.hidden_rb.take().expect("staged hidden ring"),
+            verify_scratch: self.verify_scratch.take().expect("staged verify scratch"),
+            target_snap: self.target_snap.take().expect("staged target snapshot"),
+            gdn_tape: self.gdn_tape.take().expect("staged GdnTape"),
+            target_hidden_host,
+            ctx_capacity,
+            block_size,
+            ddtree: self.ddtree.take().map(DdtreeStaging::into_state),
+        }
+    }
+}
+
+impl DdtreeStaging {
+    fn free_gpu(mut self, gpu: &mut Gpu) {
+        if let Some(scratch) = self.scratch.take() {
+            scratch.free_gpu(gpu);
+        }
+        if let Some(post_seed_snap) = self.post_seed_snap.take() {
+            post_seed_snap.free_gpu(gpu);
+        }
+    }
+
+    fn into_state(mut self) -> DdtreeState {
+        DdtreeState {
+            post_seed_snap: self.post_seed_snap.take().expect("staged DDTree snapshot"),
+            scratch: self.scratch.take().expect("staged DDTree scratch"),
+            budget: self.budget,
+            topk: self.topk,
+        }
+    }
+}
+
 // ─── DFlash state load ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -70,8 +378,6 @@ pub fn load_dflash_state(
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
-    let draft_weights =
-        DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
     let block_size = draft_config.block_size;
     // DDTree verify batches up to `budget + 1` slots (seed + budget nodes), which
     // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
@@ -82,20 +388,102 @@ pub fn load_dflash_state(
     // else 0 (chain-only). An explicit `HIPFIRE_DDTREE_BUDGET=0` reads as None
     // (unset) here and falls through to the param, matching the dense semantics.
     let ddtree_budget: usize = gpu.flags.ddtree_budget.or(ddtree_budget_param).unwrap_or(0);
-    let max_n = (block_size + 1).max(ddtree_budget + 1);
+    let ddtree_topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
+
+    // Keep malformed draft metadata and host capacity failures out of the GPU
+    // transaction. Once the first GPU allocation happens, every error below
+    // routes through DflashStateStaging::free_gpu.
+    if ctx_capacity == 0 {
+        return Err("DFlash context capacity must be nonzero".into());
+    }
+    if block_size == 0 {
+        return Err("DFlash draft block_size must be nonzero".into());
+    }
+    if draft_config.hidden != target_config.dim {
+        return Err(format!(
+            "DFlash draft hidden size {} does not match target dimension {}",
+            draft_config.hidden, target_config.dim
+        ));
+    }
+    if draft_config.num_target_layers != target_config.n_layers {
+        return Err(format!(
+            "DFlash draft expects {} target layers, target has {}",
+            draft_config.num_target_layers, target_config.n_layers
+        ));
+    }
+    if draft_config.target_layer_ids.is_empty()
+        || draft_config
+            .target_layer_ids
+            .iter()
+            .any(|&layer| layer >= target_config.n_layers)
+    {
+        return Err("DFlash draft target_layer_ids are empty or out of range".into());
+    }
+    let max_n = block_size
+        .checked_add(1)
+        .ok_or_else(|| "DFlash draft block_size overflows max_n".to_string())?
+        .max(
+            ddtree_budget
+                .checked_add(1)
+                .ok_or_else(|| "DDTree budget overflows max_n".to_string())?,
+        );
+    let target_hidden_len = ctx_capacity
+        .checked_mul(target_config.dim)
+        .ok_or_else(|| "DFlash target hidden host buffer size overflows".to_string())?;
+    let hidden_k = target_config
+        .dim
+        .checked_next_power_of_two()
+        .ok_or_else(|| "DFlash target dimension overflows hidden_k".to_string())?;
+    let mut target_hidden_host = Vec::new();
+    target_hidden_host
+        .try_reserve_exact(target_hidden_len)
+        .map_err(|e| format!("reserve DFlash target hidden host buffer: {e}"))?;
+    target_hidden_host.resize(target_hidden_len, 0.0);
+
+    let mut staged = DflashStateStaging {
+        draft_weights: None,
+        draft_scratch: None,
+        hidden_rb: None,
+        verify_scratch: None,
+        target_snap: None,
+        gdn_tape: None,
+        ddtree: None,
+    };
+    let draft_weights = match DflashWeights::load(gpu, &draft_hfq, &draft_config) {
+        Ok(weights) => weights,
+        Err(error) => return Err(format!("DflashWeights::load: {error}")),
+    };
+    staged.draft_weights = Some(draft_weights);
+    if let Err(error) = dflash_construction_boundary(DflashConstructionStage::DraftWeights) {
+        staged.free_gpu(gpu);
+        return Err(error);
+    }
     // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
     // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
     // refactor regressed this to the `with_mq=false` `::new` constructor →
     // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
-    let draft_scratch = DflashScratch::new_with_mq(
+    let draft_scratch = match DflashScratch::new_with_mq(
         gpu,
         &draft_config,
         block_size,
         ctx_capacity,
-        draft_weights.has_mq,
-    )
-    .map_err(|e| format!("{e}"))?;
-    let _ = draft_hfq;
+        staged
+            .draft_weights
+            .as_ref()
+            .expect("staged draft weights")
+            .has_mq,
+    ) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            staged.free_gpu(gpu);
+            return Err(format!("DflashScratch::new_with_mq: {error}"));
+        }
+    };
+    staged.draft_scratch = Some(draft_scratch);
+    if let Err(error) = dflash_construction_boundary(DflashConstructionStage::DraftScratch) {
+        staged.free_gpu(gpu);
+        return Err(error);
+    }
     // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
     // cycles seed only `max_n` (= block_size+1) rows, but the prompt seed
     // (`seed_target_hidden_from_prompt_abortable`) prefills the prompt in
@@ -105,59 +493,106 @@ pub fn load_dflash_state(
     // copy on any prompt longer than block_size+1 tokens. Size it to the
     // larger of the two so both paths fit.
     let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
-    let hidden_rb = HiddenStateRingBuffer::new(
+    let hidden_rb = match HiddenStateRingBuffer::new(
         gpu,
         target_config.n_layers,
         draft_config.num_extract(),
         target_config.dim,
         ctx_capacity,
         staging_max_batch,
-    )
-    .map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
-    let hidden_k = target_config.dim.next_power_of_two();
-    let verify_scratch = VerifyScratch::with_prefill(
+    ) {
+        Ok(hidden_rb) => hidden_rb,
+        Err(error) => {
+            staged.free_gpu(gpu);
+            return Err(format!("HiddenStateRingBuffer::new: {error}"));
+        }
+    };
+    staged.hidden_rb = Some(hidden_rb);
+    if let Err(error) = dflash_construction_boundary(DflashConstructionStage::HiddenRing) {
+        staged.free_gpu(gpu);
+        return Err(error);
+    }
+    let verify_scratch = match VerifyScratch::with_prefill(
         gpu,
         max_n,
         target_config.dim,
         target_config.vocab_size,
         hidden_k,
         target_config,
-    )
-    .map_err(|e| format!("VerifyScratch::with_prefill: {e}"))?;
-    let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
-        .map_err(|e| format!("DeltaNetSnapshot::new_for: {e}"))?;
-    let gdn_tape = GdnTape::new_for_config(gpu, target_config, max_n)
-        .map_err(|e| format!("GdnTape::new_for_config: {e}"))?;
-    let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
-    // DDTree (budget read once above, used for scratch sizing).
-    let ddtree = if ddtree_budget > 0 {
-        let topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
-        let post_seed_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        let scratch = DdtreeScratch::new(gpu, ddtree_budget)
-            .map_err(|e| format!("DdtreeScratch::new: {e}"))?;
-        Some(DdtreeState {
-            post_seed_snap,
-            scratch,
-            budget: ddtree_budget,
-            topk,
-        })
-    } else {
-        None
+    ) {
+        Ok(verify_scratch) => verify_scratch,
+        Err(error) => {
+            staged.free_gpu(gpu);
+            return Err(format!("VerifyScratch::with_prefill: {error}"));
+        }
     };
-    Ok(DflashState {
-        draft_config,
-        draft_weights,
-        draft_scratch,
-        hidden_rb,
-        verify_scratch,
-        target_snap,
-        gdn_tape,
-        target_hidden_host,
-        ctx_capacity,
-        block_size,
-        ddtree,
-    })
+    staged.verify_scratch = Some(verify_scratch);
+    if let Err(error) = dflash_construction_boundary(DflashConstructionStage::VerifyScratch) {
+        staged.free_gpu(gpu);
+        return Err(error);
+    }
+    let target_snap = match DeltaNetSnapshot::new_for(gpu, target_dn) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            staged.free_gpu(gpu);
+            return Err(format!("DeltaNetSnapshot::new_for: {error}"));
+        }
+    };
+    staged.target_snap = Some(target_snap);
+    if let Err(error) = dflash_construction_boundary(DflashConstructionStage::TargetSnapshot) {
+        staged.free_gpu(gpu);
+        return Err(error);
+    }
+    let gdn_tape = match GdnTape::new_for_config(gpu, target_config, max_n) {
+        Ok(tape) => tape,
+        Err(error) => {
+            staged.free_gpu(gpu);
+            return Err(format!("GdnTape::new_for_config: {error}"));
+        }
+    };
+    staged.gdn_tape = Some(gdn_tape);
+    if let Err(error) = dflash_construction_boundary(DflashConstructionStage::GdnTape) {
+        staged.free_gpu(gpu);
+        return Err(error);
+    }
+    // DDTree (budget read once above, used for scratch sizing).
+    if ddtree_budget > 0 {
+        staged.ddtree = Some(DdtreeStaging {
+            post_seed_snap: None,
+            scratch: None,
+            budget: ddtree_budget,
+            topk: ddtree_topk,
+        });
+        let post_seed_snap = match DeltaNetSnapshot::new_for(gpu, target_dn) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                staged.free_gpu(gpu);
+                return Err(format!("DDTree DeltaNetSnapshot::new_for: {error}"));
+            }
+        };
+        staged
+            .ddtree
+            .as_mut()
+            .expect("staged DDTree state")
+            .post_seed_snap = Some(post_seed_snap);
+        if let Err(error) = dflash_construction_boundary(DflashConstructionStage::DdtreeSnapshot) {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+        let scratch = match DdtreeScratch::new(gpu, ddtree_budget) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                staged.free_gpu(gpu);
+                return Err(format!("DdtreeScratch::new: {error}"));
+            }
+        };
+        staged.ddtree.as_mut().expect("staged DDTree state").scratch = Some(scratch);
+        if let Err(error) = dflash_construction_boundary(DflashConstructionStage::DdtreeScratch) {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+    }
+    Ok(staged.into_state(draft_config, target_hidden_host, ctx_capacity, block_size))
 }
 
 // ─── DflashSpeculator ───────────────────────────────────────────────────
@@ -488,7 +923,10 @@ impl Speculator for DflashSpeculator {
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
         if let Some(idx) = self.checkpoints.iter().rposition(|(p, _)| *p == position) {
-            let _ = self.checkpoints[idx].1.restore_to(&mut slot.dn_state, gpu);
+            self.checkpoints[idx]
+                .1
+                .restore_to(&mut slot.dn_state, gpu)
+                .map_err(|e| format!("DflashSpeculator: checkpoint restore at {position}: {e}"))?;
             for (_, snap) in self.checkpoints.drain(idx + 1..) {
                 snap.free_gpu(gpu);
             }
@@ -525,8 +963,7 @@ impl Speculator for DflashSpeculator {
         let DflashSpeculator {
             df, checkpoints, ..
         } = *self;
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
+        df.free_gpu(gpu);
         for (_, snap) in checkpoints {
             snap.free_gpu(gpu);
         }
@@ -557,4 +994,531 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
         ck_interval,
         ck_cap,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen35::LayerType;
+    use crate::speculative::ModelSlotConfig;
+    use std::sync::{Mutex, MutexGuard};
+
+    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn dflash_gpu_test_lock() -> MutexGuard<'static, ()> {
+        GPU_TEST_LOCK.lock().expect("DFlash GPU test lock poisoned")
+    }
+
+    fn expect_exact_vram_baseline(
+        gpu: &mut Gpu,
+        before: usize,
+        context: &str,
+    ) -> Result<(), String> {
+        gpu.drain_pool();
+        let after = gpu
+            .hip
+            .get_vram_info()
+            .map_err(|e| format!("measure after {context}: {e}"))?
+            .0;
+        if after != before {
+            return Err(format!(
+                "{context} changed free VRAM from {before} to {after} bytes"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Requires real Qwen3.6 target/draft fixtures because DFlash owns GPU-only
+    /// scratch and DeltaNet snapshots. DDTree is enabled to cover both snapshot
+    /// owners, and every target allocation is released before reporting failures.
+    #[test]
+    #[ignore = "requires an AMD GPU plus qwen3.6-27b.mq4 and qwen36-27b-dflash-mq4.hfq"]
+    fn dflash_free_reclaims_target_and_ddtree_snapshots() {
+        let _gpu_test_lock = dflash_gpu_test_lock();
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_DFLASH_FREE_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        let draft_path = std::env::var("HIPFIRE_DFLASH_FREE_DRAFT")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen36-27b-dflash-mq4.hfq"));
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}; set HIPFIRE_DFLASH_FREE_TARGET"
+        );
+        assert!(
+            Path::new(&draft_path).is_file(),
+            "draft fixture not found: {draft_path}; set HIPFIRE_DFLASH_FREE_DRAFT"
+        );
+
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        let slot = ModelSlot::load(
+            &mut gpu,
+            Path::new(&target_path),
+            "dflash-free-test",
+            ModelSlotConfig {
+                max_seq: 64,
+                ..Default::default()
+            },
+        )
+        .expect("load Qwen target slot");
+
+        let result = (|| -> Result<(), String> {
+            if slot.dn_state.s_matrices.is_empty() {
+                return Err("target fixture has no DeltaNet state to snapshot".into());
+            }
+            let before = gpu
+                .hip
+                .get_vram_info()
+                .map_err(|e| format!("measure before DFlash load: {e}"))?
+                .0;
+            let mut state = Some(load_dflash_state(
+                &draft_path,
+                64,
+                &slot.config,
+                &slot.dn_state,
+                &mut gpu,
+                Some(1),
+                Some(1),
+            )?);
+            let result = (|| -> Result<(), String> {
+                if state
+                    .as_ref()
+                    .map(|state| state.ddtree.is_none())
+                    .unwrap_or(true)
+                {
+                    return Err("DDTree post-seed snapshot was not constructed".into());
+                }
+                let loaded = gpu
+                    .hip
+                    .get_vram_info()
+                    .map_err(|e| format!("measure after DFlash load: {e}"))?
+                    .0;
+                if loaded >= before {
+                    return Err("DFlash state did not allocate observable GPU memory".into());
+                }
+                let dflash_state = state
+                    .take()
+                    .ok_or("DFlash state disappeared before speculator publication")?;
+                let spec: Box<dyn Speculator> =
+                    Box::new(DflashSpeculator::new(dflash_state, false, 256, 1));
+                spec.free(&mut gpu);
+                expect_exact_vram_baseline(&mut gpu, before, "DFlash speculator free")?;
+                Ok(())
+            })();
+            // `load_dflash_state` publishes GPU-only resources. If any check above
+            // rejects that state before it becomes a speculator, free it before
+            // propagating the failure to the outer ModelSlot cleanup.
+            if let Some(state) = state.take() {
+                state.free_gpu(&mut gpu);
+            }
+            result
+        })();
+
+        let ModelSlot {
+            weights,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = slot;
+        scratch.free_gpu(&mut gpu);
+        dn_state.free_gpu(&mut gpu);
+        kv_cache.free_gpu(&mut gpu);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    }
+
+    /// Exercises the staged owner at every point a completed DFlash resource
+    /// is waiting to be published. The fault fires after that resource is
+    /// owned, so successful cleanup proves the unpublished state cannot leak.
+    #[test]
+    #[ignore = "requires an AMD GPU plus qwen3.6-27b.mq4 and qwen36-27b-dflash-mq4.hfq"]
+    fn dflash_construction_rolls_back_each_completed_resource() {
+        let _gpu_test_lock = dflash_gpu_test_lock();
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_DFLASH_FREE_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        let draft_path = std::env::var("HIPFIRE_DFLASH_FREE_DRAFT")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen36-27b-dflash-mq4.hfq"));
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}; set HIPFIRE_DFLASH_FREE_TARGET"
+        );
+        assert!(
+            Path::new(&draft_path).is_file(),
+            "draft fixture not found: {draft_path}; set HIPFIRE_DFLASH_FREE_DRAFT"
+        );
+
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        let slot = ModelSlot::load(
+            &mut gpu,
+            Path::new(&target_path),
+            "dflash-construction-rollback-test",
+            ModelSlotConfig {
+                max_seq: 64,
+                ..Default::default()
+            },
+        )
+        .expect("load Qwen target slot");
+
+        let result = (|| -> Result<(), String> {
+            let before = gpu
+                .hip
+                .get_vram_info()
+                .map_err(|e| format!("measure before DFlash load: {e}"))?
+                .0;
+            for &stage in &DflashConstructionStage::ALL {
+                let loaded = with_dflash_test_fault(DflashTestFault::AfterStage(stage), || {
+                    load_dflash_state(
+                        &draft_path,
+                        64,
+                        &slot.config,
+                        &slot.dn_state,
+                        &mut gpu,
+                        Some(1),
+                        Some(1),
+                    )
+                });
+                if let Ok(state) = loaded {
+                    state.free_gpu(&mut gpu);
+                    return Err(format!(
+                        "fault after {} unexpectedly constructed DFlash state",
+                        stage.label()
+                    ));
+                }
+                expect_exact_vram_baseline(
+                    &mut gpu,
+                    before,
+                    &format!("DFlash staging rollback after {}", stage.label()),
+                )?;
+            }
+            Ok(())
+        })();
+
+        let ModelSlot {
+            weights,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = slot;
+        scratch.free_gpu(&mut gpu);
+        dn_state.free_gpu(&mut gpu);
+        kv_cache.free_gpu(&mut gpu);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    }
+
+    /// Directly faults every allocation in the constructors that allocate their
+    /// GPU buffers incrementally. Each constructor must reclaim its local
+    /// partial state before returning the injected allocation error.
+    #[test]
+    #[ignore = "requires an AMD GPU and qwen3.5-0.8b.mq4"]
+    fn dflash_component_constructors_rollback_every_allocation() {
+        let _gpu_test_lock = dflash_gpu_test_lock();
+        let model = std::env::var("HIPFIRE_QWEN35_RESET_STATE_MODEL").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME is required for the default model path");
+            format!("{home}/.hipfire/models/qwen3.5-0.8b.mq4")
+        });
+        assert!(
+            Path::new(&model).is_file(),
+            "model fixture not found: {model}; set HIPFIRE_QWEN35_RESET_STATE_MODEL"
+        );
+
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        let slot = ModelSlot::load(
+            &mut gpu,
+            Path::new(&model),
+            "dflash-component-rollback-test",
+            ModelSlotConfig {
+                max_seq: 16,
+                ..Default::default()
+            },
+        )
+        .expect("load Qwen target slot");
+
+        let result = (|| -> Result<(), String> {
+            let before = gpu
+                .hip
+                .get_vram_info()
+                .map_err(|e| format!("measure before component allocation: {e}"))?
+                .0;
+            let snapshot_allocations = slot.dn_state.s_matrices.len()
+                + slot.dn_state.s_scales.len()
+                + slot.dn_state.conv_states.len()
+                + slot.dn_state.s_ef_residual.len();
+            let gdn_allocations = slot
+                .config
+                .layer_types
+                .iter()
+                .filter(|layer| **layer == LayerType::LinearAttention)
+                .count()
+                * 3
+                + 6;
+            for (site, allocations) in [
+                (DflashAllocationSite::DeltaNetSnapshot, snapshot_allocations),
+                (DflashAllocationSite::GdnTape, gdn_allocations),
+                (DflashAllocationSite::DdtreeScratch, 2),
+                (DflashAllocationSite::VerifyScratch, 4),
+                (DflashAllocationSite::HiddenStateRing, 4),
+            ] {
+                for allocation in 0..allocations {
+                    let loaded = with_dflash_test_fault(
+                        DflashTestFault::AfterAllocation { site, allocation },
+                        || match site {
+                            DflashAllocationSite::DeltaNetSnapshot => {
+                                DeltaNetSnapshot::new_for(&mut gpu, &slot.dn_state)
+                                    .map(|snapshot| ComponentAllocation::Snapshot(snapshot))
+                            }
+                            DflashAllocationSite::GdnTape => {
+                                GdnTape::new_for_config(&mut gpu, &slot.config, 2)
+                                    .map(|tape| ComponentAllocation::GdnTape(tape))
+                            }
+                            DflashAllocationSite::DdtreeScratch => DdtreeScratch::new(&mut gpu, 1)
+                                .map(|scratch| ComponentAllocation::DdtreeScratch(scratch)),
+                            DflashAllocationSite::VerifyScratch => {
+                                VerifyScratch::new(&mut gpu, 2, 32, 64, 32)
+                                    .map(|scratch| ComponentAllocation::VerifyScratch(scratch))
+                            }
+                            DflashAllocationSite::HiddenStateRing => {
+                                HiddenStateRingBuffer::new(&mut gpu, 4, 2, 32, 16, 2)
+                                    .map(|ring| ComponentAllocation::HiddenStateRing(ring))
+                            }
+                            DflashAllocationSite::PrefillBatchScratch => {
+                                unreachable!("PrefillBatchScratch is checked below")
+                            }
+                        },
+                    );
+                    if let Ok(component) = loaded {
+                        component.free_gpu(&mut gpu);
+                        return Err(format!(
+                            "fault after {} allocation {allocation} unexpectedly succeeded",
+                            site.label()
+                        ));
+                    }
+                    expect_exact_vram_baseline(
+                        &mut gpu,
+                        before,
+                        &format!("{} allocation {allocation}", site.label()),
+                    )?;
+                }
+            }
+            let hidden_k =
+                slot.config.dim.checked_next_power_of_two().ok_or_else(|| {
+                    "target dimension overflows nested verify hidden_k".to_string()
+                })?;
+            let mut nested_completed = false;
+            for allocation in 0..=128 {
+                let loaded = with_dflash_test_fault(
+                    DflashTestFault::AfterAllocation {
+                        site: DflashAllocationSite::PrefillBatchScratch,
+                        allocation,
+                    },
+                    || {
+                        VerifyScratch::with_prefill(
+                            &mut gpu,
+                            2,
+                            slot.config.dim,
+                            slot.config.vocab_size,
+                            hidden_k,
+                            &slot.config,
+                        )
+                    },
+                );
+                match loaded {
+                    Err(_) => expect_exact_vram_baseline(
+                        &mut gpu,
+                        before,
+                        &format!("PrefillBatchScratch allocation {allocation}"),
+                    )?,
+                    Ok(scratch) => {
+                        scratch.free_gpu(&mut gpu);
+                        expect_exact_vram_baseline(
+                            &mut gpu,
+                            before,
+                            "PrefillBatchScratch success/free",
+                        )?;
+                        nested_completed = true;
+                        break;
+                    }
+                }
+            }
+            if !nested_completed {
+                return Err("nested PrefillBatchScratch fault loop did not reach success".into());
+            }
+            Ok(())
+        })();
+
+        let ModelSlot {
+            weights,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = slot;
+        scratch.free_gpu(&mut gpu);
+        dn_state.free_gpu(&mut gpu);
+        kv_cache.free_gpu(&mut gpu);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    }
+
+    /// Faults every resource returned by the runtime draft constructors. The
+    /// missing runtime injector makes this test RED until those constructors
+    /// stage their own allocations instead of relying on outer DFlash state.
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    #[ignore = "requires an AMD GPU plus qwen3.6-27b.mq4 and qwen36-27b-dflash-mq4.hfq"]
+    fn draft_runtime_constructors_rollback_every_allocation() {
+        const MAX_RUNTIME_ALLOCATIONS: usize = 256;
+
+        let _gpu_test_lock = dflash_gpu_test_lock();
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_DFLASH_FREE_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        let draft_path = std::env::var("HIPFIRE_DFLASH_FREE_DRAFT")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen36-27b-dflash-mq4.hfq"));
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}; set HIPFIRE_DFLASH_FREE_TARGET"
+        );
+        assert!(
+            Path::new(&draft_path).is_file(),
+            "draft fixture not found: {draft_path}; set HIPFIRE_DFLASH_FREE_DRAFT"
+        );
+
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        let slot = ModelSlot::load(
+            &mut gpu,
+            Path::new(&target_path),
+            "dflash-runtime-rollback-test",
+            ModelSlotConfig {
+                max_seq: 64,
+                ..Default::default()
+            },
+        )
+        .expect("load Qwen target slot");
+
+        let result = (|| -> Result<(), String> {
+            let draft_hfq = HfqFile::open(Path::new(&draft_path)).map_err(|e| format!("{e}"))?;
+            let draft_config = DflashConfig::from_hfq(&draft_hfq)
+                .ok_or_else(|| "parse DFlash fixture config".to_string())?;
+
+            // MQ sign tables belong to Gpu, not DflashWeights. Warm them before
+            // taking the baseline so constructor-local accounting is exact.
+            let warm = DflashWeights::load(&mut gpu, &draft_hfq, &draft_config)
+                .map_err(|e| format!("warm DflashWeights: {e}"))?;
+            let has_mq = warm.has_mq;
+            warm.free_gpu(&mut gpu);
+            gpu.drain_pool();
+            let before = gpu
+                .hip
+                .get_vram_info()
+                .map_err(|e| format!("measure before runtime constructor fault: {e}"))?
+                .0;
+
+            let mut weights_completed = false;
+            for allocation in 0..=MAX_RUNTIME_ALLOCATIONS {
+                let loaded = hipfire_runtime::dflash::with_dflash_allocation_fault(
+                    hipfire_runtime::dflash::DflashAllocationFault {
+                        site: hipfire_runtime::dflash::DflashAllocationSite::Weights,
+                        allocation,
+                    },
+                    || DflashWeights::load(&mut gpu, &draft_hfq, &draft_config),
+                );
+                match loaded {
+                    Err(_) => expect_exact_vram_baseline(
+                        &mut gpu,
+                        before,
+                        &format!("draft weights allocation {allocation}"),
+                    )?,
+                    Ok(weights) => {
+                        weights.free_gpu(&mut gpu);
+                        expect_exact_vram_baseline(&mut gpu, before, "draft weights success/free")?;
+                        weights_completed = true;
+                        break;
+                    }
+                }
+            }
+            if !weights_completed {
+                return Err("draft weights fault loop did not reach constructor success".into());
+            }
+
+            let mut scratch_completed = false;
+            for allocation in 0..=MAX_RUNTIME_ALLOCATIONS {
+                let loaded = hipfire_runtime::dflash::with_dflash_allocation_fault(
+                    hipfire_runtime::dflash::DflashAllocationFault {
+                        site: hipfire_runtime::dflash::DflashAllocationSite::Scratch,
+                        allocation,
+                    },
+                    || DflashScratch::new_with_mq(&mut gpu, &draft_config, 16, 64, has_mq),
+                );
+                match loaded {
+                    Err(_) => expect_exact_vram_baseline(
+                        &mut gpu,
+                        before,
+                        &format!("draft scratch allocation {allocation}"),
+                    )?,
+                    Ok(scratch) => {
+                        scratch.free_gpu(&mut gpu);
+                        expect_exact_vram_baseline(&mut gpu, before, "draft scratch success/free")?;
+                        scratch_completed = true;
+                        break;
+                    }
+                }
+            }
+            if !scratch_completed {
+                return Err("draft scratch fault loop did not reach constructor success".into());
+            }
+            Ok(())
+        })();
+
+        let ModelSlot {
+            weights,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = slot;
+        scratch.free_gpu(&mut gpu);
+        dn_state.free_gpu(&mut gpu);
+        kv_cache.free_gpu(&mut gpu);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    }
+
+    enum ComponentAllocation {
+        Snapshot(DeltaNetSnapshot),
+        GdnTape(GdnTape),
+        DdtreeScratch(DdtreeScratch),
+        VerifyScratch(VerifyScratch),
+        HiddenStateRing(HiddenStateRingBuffer),
+    }
+
+    impl ComponentAllocation {
+        fn free_gpu(self, gpu: &mut Gpu) {
+            match self {
+                Self::Snapshot(snapshot) => snapshot.free_gpu(gpu),
+                Self::GdnTape(tape) => tape.free_gpu(gpu),
+                Self::DdtreeScratch(scratch) => scratch.free_gpu(gpu),
+                Self::VerifyScratch(scratch) => scratch.free_gpu(gpu),
+                Self::HiddenStateRing(ring) => {
+                    for tensor in ring.layer_bufs.into_iter().chain(ring.staging_bufs) {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                }
+            }
+        }
+    }
 }

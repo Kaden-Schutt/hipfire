@@ -736,36 +736,12 @@ impl ModelSlot {
         )
     }
 
-    /// Reset the DeltaNet recurrent state and zero the KV write head.
-    /// Does NOT shrink the KV allocation — callers track `seq_pos` separately.
+    /// Reset all DeltaNet recurrent buffers and clear KV compaction bookkeeping
+    /// for a new sequence. Does NOT clear or shrink the KV allocation; callers
+    /// track `seq_pos` separately.
     pub fn reset_state(&mut self, gpu: &mut Gpu) {
-        // Use stream-ordered memset when an active_stream is set (hot path
-        // inside spec_step_dflash) to avoid null-stream host stalls. ~48
-        // memsets/cycle on 27B when draft rollback triggers a reset.
-        match gpu.active_stream.as_ref() {
-            Some(stream) => {
-                for s in &self.dn_state.s_matrices {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
-                }
-                for s in &self.dn_state.s_scales {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
-                }
-                for s in &self.dn_state.conv_states {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
-                }
-            }
-            None => {
-                for s in &self.dn_state.s_matrices {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &self.dn_state.s_scales {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &self.dn_state.conv_states {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-        }
+        self.dn_state.reset(gpu);
+        self.kv_cache.compact_offset = 0;
     }
 }
 
@@ -879,6 +855,57 @@ pub struct SpecStepResult {
     pub committed: Vec<u32>,
 }
 
+/// Explicit local owner for a constructor assembling several GPU tensors. It
+/// intentionally has no Drop: callers must free it on an error while they have
+/// the `Gpu` that owns the allocations.
+struct TensorStaging {
+    tensors: Vec<GpuTensor>,
+}
+
+impl TensorStaging {
+    fn allocate(
+        &mut self,
+        gpu: &mut Gpu,
+        shape: &[usize],
+        dtype: rdna_compute::DType,
+    ) -> HipResult<()> {
+        self.tensors.push(gpu.alloc_tensor(shape, dtype)?);
+        Ok(())
+    }
+
+    fn free_gpu(mut self, gpu: &mut Gpu) {
+        for tensor in self.tensors.drain(..) {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+
+    fn into_iter(self) -> std::vec::IntoIter<GpuTensor> {
+        self.tensors.into_iter()
+    }
+}
+
+/// The DeviceBuffer equivalent of TensorStaging for DeltaNet snapshots.
+struct DeviceBufferStaging {
+    buffers: Vec<DeviceBuffer>,
+}
+
+impl DeviceBufferStaging {
+    fn allocate(&mut self, gpu: &mut Gpu, bytes: usize) -> HipResult<()> {
+        self.buffers.push(gpu.hip.malloc(bytes)?);
+        Ok(())
+    }
+
+    fn free_gpu(mut self, gpu: &mut Gpu) {
+        for buffer in self.buffers.drain(..) {
+            let _ = gpu.hip.free(buffer);
+        }
+    }
+
+    fn into_iter(self) -> std::vec::IntoIter<DeviceBuffer> {
+        self.buffers.into_iter()
+    }
+}
+
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
@@ -886,27 +913,69 @@ pub struct DeltaNetSnapshot {
     s_matrix_bufs: Vec<DeviceBuffer>,
     s_scale_bufs: Vec<DeviceBuffer>,
     conv_state_bufs: Vec<DeviceBuffer>,
+    s_ef_residual_bufs: Vec<DeviceBuffer>,
 }
 
 impl DeltaNetSnapshot {
     /// Allocate backup buffers matching `state`'s shapes.
     pub fn new_for(gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<Self> {
-        let mut s_matrix_bufs = Vec::with_capacity(state.s_matrices.len());
-        for t in &state.s_matrices {
-            s_matrix_bufs.push(gpu.hip.malloc(t.buf.size())?);
+        let mut staged = DeviceBufferStaging {
+            buffers: Vec::with_capacity(
+                state.s_matrices.len()
+                    + state.s_scales.len()
+                    + state.conv_states.len()
+                    + state.s_ef_residual.len(),
+            ),
+        };
+        let allocation = (|| -> HipResult<()> {
+            for t in &state.s_matrices {
+                staged.allocate(gpu, t.buf.size())?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::DeltaNetSnapshot,
+                )?;
+            }
+            for t in &state.s_scales {
+                staged.allocate(gpu, t.buf.size())?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::DeltaNetSnapshot,
+                )?;
+            }
+            for t in &state.conv_states {
+                staged.allocate(gpu, t.buf.size())?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::DeltaNetSnapshot,
+                )?;
+            }
+            for t in &state.s_ef_residual {
+                staged.allocate(gpu, t.buf.size())?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::DeltaNetSnapshot,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            staged.free_gpu(gpu);
+            return Err(error);
         }
-        let mut s_scale_bufs = Vec::with_capacity(state.s_scales.len());
-        for t in &state.s_scales {
-            s_scale_bufs.push(gpu.hip.malloc(t.buf.size())?);
-        }
-        let mut conv_state_bufs = Vec::with_capacity(state.conv_states.len());
-        for t in &state.conv_states {
-            conv_state_bufs.push(gpu.hip.malloc(t.buf.size())?);
-        }
+        let mut buffers = staged.into_iter();
         Ok(Self {
-            s_matrix_bufs,
-            s_scale_bufs,
-            conv_state_bufs,
+            s_matrix_bufs: (0..state.s_matrices.len())
+                .map(|_| buffers.next().expect("staged S matrix snapshot"))
+                .collect(),
+            s_scale_bufs: (0..state.s_scales.len())
+                .map(|_| buffers.next().expect("staged S scale snapshot"))
+                .collect(),
+            conv_state_bufs: (0..state.conv_states.len())
+                .map(|_| buffers.next().expect("staged conv snapshot"))
+                .collect(),
+            s_ef_residual_bufs: (0..state.s_ef_residual.len())
+                .map(|_| buffers.next().expect("staged error-feedback snapshot"))
+                .collect(),
         })
     }
 
@@ -919,6 +988,13 @@ impl DeltaNetSnapshot {
             gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        for (dst, src) in self
+            .s_ef_residual_bufs
+            .iter()
+            .zip(state.s_ef_residual.iter())
+        {
             gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
         }
         Ok(())
@@ -946,6 +1022,14 @@ impl DeltaNetSnapshot {
             gpu.hip
                 .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
         }
+        for (dst, src) in self
+            .s_ef_residual_bufs
+            .iter()
+            .zip(state.s_ef_residual.iter())
+        {
+            gpu.hip
+                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+        }
         Ok(())
     }
 
@@ -958,6 +1042,13 @@ impl DeltaNetSnapshot {
             gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
         }
         for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+        }
+        for (src, dst) in self
+            .s_ef_residual_bufs
+            .iter()
+            .zip(state.s_ef_residual.iter())
+        {
             gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
         }
         Ok(())
@@ -976,6 +1067,9 @@ impl DeltaNetSnapshot {
             let _ = gpu.hip.free(b);
         }
         for b in self.conv_state_bufs {
+            let _ = gpu.hip.free(b);
+        }
+        for b in self.s_ef_residual_bufs {
             let _ = gpu.hip.free(b);
         }
     }
@@ -1048,15 +1142,52 @@ impl GdnTape {
             .filter(|t| **t == qwen35::LayerType::LinearAttention)
             .count();
 
-        let mut qkv_bufs = Vec::with_capacity(n_la_layers);
-        let mut alpha_bufs = Vec::with_capacity(n_la_layers);
-        let mut beta_bufs = Vec::with_capacity(n_la_layers);
-        for _ in 0..n_la_layers {
-            qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
-            alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-            beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+        let mut staged = TensorStaging {
+            tensors: Vec::with_capacity(n_la_layers * 3 + 6),
+        };
+        let allocation = (|| -> HipResult<()> {
+            for _ in 0..n_la_layers {
+                staged.allocate(gpu, &[max_n * qkv_dim], rdna_compute::DType::F32)?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::GdnTape,
+                )?;
+            }
+            for _ in 0..n_la_layers {
+                staged.allocate(gpu, &[max_n * n_v_heads], rdna_compute::DType::F32)?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::GdnTape,
+                )?;
+            }
+            for _ in 0..n_la_layers {
+                staged.allocate(gpu, &[max_n * n_v_heads], rdna_compute::DType::F32)?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::GdnTape,
+                )?;
+            }
+            for &len in &[
+                max_n * k_dim,
+                max_n * k_dim,
+                max_n * v_dim,
+                max_n * v_dim,
+                max_n * v_dim,
+                max_n * v_dim,
+            ] {
+                staged.allocate(gpu, &[len], rdna_compute::DType::F32)?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::GdnTape,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            staged.free_gpu(gpu);
+            return Err(error);
         }
-
+        let mut tensors = staged.into_iter();
         Ok(Self {
             max_n,
             qkv_dim,
@@ -1066,15 +1197,21 @@ impl GdnTape {
             n_key_heads,
             value_head_dim: config.linear_value_head_dim,
             key_head_dim: config.linear_key_head_dim,
-            qkv_bufs,
-            alpha_bufs,
-            beta_bufs,
-            q_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-            k_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-            v_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            q_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            k_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            qkv_bufs: (0..n_la_layers)
+                .map(|_| tensors.next().expect("staged GdnTape qkv buffer"))
+                .collect(),
+            alpha_bufs: (0..n_la_layers)
+                .map(|_| tensors.next().expect("staged GdnTape alpha buffer"))
+                .collect(),
+            beta_bufs: (0..n_la_layers)
+                .map(|_| tensors.next().expect("staged GdnTape beta buffer"))
+                .collect(),
+            q_raw_scratch: tensors.next().expect("staged GdnTape q scratch"),
+            k_raw_scratch: tensors.next().expect("staged GdnTape k scratch"),
+            v_scratch: tensors.next().expect("staged GdnTape v scratch"),
+            q_scratch: tensors.next().expect("staged GdnTape repeated q scratch"),
+            k_scratch: tensors.next().expect("staged GdnTape repeated k scratch"),
+            attn_scratch: tensors.next().expect("staged GdnTape attention scratch"),
         })
     }
 
@@ -1408,13 +1545,32 @@ impl DdtreeScratch {
     /// Allocate for a worst-case tree of `max_budget` non-root nodes.
     pub fn new(gpu: &mut Gpu, max_budget: usize) -> HipResult<Self> {
         let max_n = 1 + max_budget;
-        let attn_bias = gpu.alloc_tensor(&[max_n * max_n], rdna_compute::DType::F32)?;
-        let parent_indices = gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
+        let mut staged = TensorStaging {
+            tensors: Vec::with_capacity(2),
+        };
+        let allocation = (|| -> HipResult<()> {
+            staged.allocate(gpu, &[max_n * max_n], rdna_compute::DType::F32)?;
+            #[cfg(test)]
+            crate::dflash_spec::dflash_test_after_allocation(
+                crate::dflash_spec::DflashAllocationSite::DdtreeScratch,
+            )?;
+            staged.allocate(gpu, &[max_n * 4], rdna_compute::DType::Raw)?;
+            #[cfg(test)]
+            crate::dflash_spec::dflash_test_after_allocation(
+                crate::dflash_spec::DflashAllocationSite::DdtreeScratch,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+        let mut tensors = staged.into_iter();
 
         Ok(Self {
             max_n,
-            attn_bias,
-            parent_indices,
+            attn_bias: tensors.next().expect("staged DDTree attention bias"),
+            parent_indices: tensors.next().expect("staged DDTree parent indices"),
         })
     }
 
@@ -1469,15 +1625,46 @@ impl VerifyScratch {
         vocab: usize,
         hidden_k: usize,
     ) -> HipResult<Self> {
+        let mut staged = TensorStaging {
+            tensors: Vec::with_capacity(4),
+        };
+        let allocation = (|| -> HipResult<()> {
+            staged.allocate(gpu, &[max_n * dim], rdna_compute::DType::F32)?;
+            #[cfg(test)]
+            crate::dflash_spec::dflash_test_after_allocation(
+                crate::dflash_spec::DflashAllocationSite::VerifyScratch,
+            )?;
+            staged.allocate(gpu, &[max_n * vocab], rdna_compute::DType::F32)?;
+            #[cfg(test)]
+            crate::dflash_spec::dflash_test_after_allocation(
+                crate::dflash_spec::DflashAllocationSite::VerifyScratch,
+            )?;
+            staged.allocate(gpu, &[max_n * hidden_k], rdna_compute::DType::F32)?;
+            #[cfg(test)]
+            crate::dflash_spec::dflash_test_after_allocation(
+                crate::dflash_spec::DflashAllocationSite::VerifyScratch,
+            )?;
+            staged.allocate(gpu, &[max_n], rdna_compute::DType::F32)?;
+            #[cfg(test)]
+            crate::dflash_spec::dflash_test_after_allocation(
+                crate::dflash_spec::DflashAllocationSite::VerifyScratch,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+        let mut tensors = staged.into_iter();
         Ok(Self {
             max_n,
             dim,
             vocab,
             hidden_k,
-            final_hidden: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
-            logits: gpu.alloc_tensor(&[max_n * vocab], rdna_compute::DType::F32)?,
-            rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
-            argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
+            final_hidden: tensors.next().expect("staged verify final hidden"),
+            logits: tensors.next().expect("staged verify logits"),
+            rot: tensors.next().expect("staged verify rotation"),
+            argmax: tensors.next().expect("staged verify argmax"),
             prefill_batch: None,
         })
     }
@@ -1496,7 +1683,13 @@ impl VerifyScratch {
         config: &qwen35::Qwen35Config,
     ) -> HipResult<Self> {
         let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k)?;
-        s.prefill_batch = Some(qwen35::PrefillBatchScratch::new(gpu, config, max_n)?);
+        match qwen35::PrefillBatchScratch::new(gpu, config, max_n) {
+            Ok(prefill_batch) => s.prefill_batch = Some(prefill_batch),
+            Err(error) => {
+                s.free_gpu(gpu);
+                return Err(error);
+            }
+        }
         Ok(s)
     }
 
@@ -1544,13 +1737,34 @@ impl HiddenStateRingBuffer {
         max_batch: usize,
     ) -> HipResult<Self> {
         let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
+        let mut staged = TensorStaging {
+            tensors: Vec::with_capacity(num_extract * 2),
+        };
+        let allocation = (|| -> HipResult<()> {
+            for _ in 0..num_extract {
+                staged.allocate(gpu, &[max_positions * hidden_dim], rdna_compute::DType::F32)?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::HiddenStateRing,
+                )?;
+                staged.allocate(gpu, &[max_batch * hidden_dim], rdna_compute::DType::F32)?;
+                #[cfg(test)]
+                crate::dflash_spec::dflash_test_after_allocation(
+                    crate::dflash_spec::DflashAllocationSite::HiddenStateRing,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+        let mut tensors = staged.into_iter();
         let mut layer_bufs = Vec::with_capacity(num_extract);
         let mut staging_bufs = Vec::with_capacity(num_extract);
         for _ in 0..num_extract {
-            layer_bufs
-                .push(gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32)?);
-            staging_bufs
-                .push(gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32)?);
+            layer_bufs.push(tensors.next().expect("staged hidden ring buffer"));
+            staging_bufs.push(tensors.next().expect("staged hidden staging buffer"));
         }
         Ok(Self {
             layer_bufs,
@@ -5530,8 +5744,9 @@ pub fn spec_step_ddtree_batched(
 /// enable resume-from-checkpoint on a divergent client render (see the daemon's
 /// `generate` divergence branch + `generate_dflash`). Oldest evicted at `cap`
 /// (buffers reused — no realloc churn after warmup). Cheap: one device-to-device
-/// memcpy of the recurrent S/scale/conv buffers; no KV copy (FullAttention KV is
-/// positional and stays resident, so resume only restores the recurrent state).
+/// memcpy of the recurrent S/scale/conv/error-feedback buffers; no KV copy
+/// (FullAttention KV is positional and stays resident, so resume only restores
+/// the recurrent state).
 /// Gating (resume enabled / no eviction) is the caller's responsibility.
 pub fn take_dn_checkpoint(
     cks: &mut Vec<(usize, DeltaNetSnapshot)>,
@@ -5558,6 +5773,7 @@ pub fn take_dn_checkpoint(
         }
     };
     if snap.save_from(dn, gpu).is_err() {
+        snap.free_gpu(gpu);
         return;
     }
     cks.push((pos, snap));
@@ -5818,6 +6034,17 @@ pub fn apply_eviction_retain_to_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdna_compute::{Gpu, GpuTensor};
+    use std::path::Path;
+
+    fn recurrent_groups(state: &DeltaNetState) -> [(&'static str, &[GpuTensor]); 4] {
+        [
+            ("s_matrices", &state.s_matrices),
+            ("s_scales", &state.s_scales),
+            ("conv_states", &state.conv_states),
+            ("s_ef_residual", &state.s_ef_residual),
+        ]
+    }
 
     /// CPU mirror of the GPU `softmax_temp_topp_batched_f32` nucleus phase:
     /// bisect tau over [0, p_max] for the inclusive crossing threshold and
@@ -5959,5 +6186,184 @@ mod tests {
             false,
             Some("0")
         ));
+    }
+
+    /// Requires a local Qwen3.5 model because `ModelSlot` owns GPU-backed KV
+    /// and recurrent-state buffers; no CPU constructor exercises this lifecycle.
+    #[test]
+    #[ignore = "requires an AMD GPU and qwen3.5-0.8b.mq4"]
+    fn reset_state_clears_compact_offset_and_recurrent_buffers() {
+        let model = std::env::var("HIPFIRE_QWEN35_RESET_STATE_MODEL").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME is required for the default model path");
+            format!("{home}/.hipfire/models/qwen3.5-0.8b.mq4")
+        });
+        assert!(
+            Path::new(&model).is_file(),
+            "model fixture not found: {model}; set HIPFIRE_QWEN35_RESET_STATE_MODEL"
+        );
+
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        let mut slot = ModelSlot::load(
+            &mut gpu,
+            Path::new(&model),
+            "reset-state-test",
+            ModelSlotConfig {
+                max_seq: 16,
+                ..Default::default()
+            },
+        )
+        .expect("load Qwen3.5 model slot");
+
+        let result = (|| -> Result<(), String> {
+            if slot.dn_state.s_ef_residual.is_empty() {
+                return Err(
+                    "Q8 error-feedback residuals were not allocated; unset HIPFIRE_DN_STATE_EF=0"
+                        .into(),
+                );
+            }
+            for (kind, buffers) in recurrent_groups(&slot.dn_state) {
+                for (index, buffer) in buffers.iter().enumerate() {
+                    gpu.hip
+                        .memset(&buffer.buf, 0xa5, buffer.buf.size())
+                        .map_err(|e| format!("dirty {kind}[{index}]: {e}"))?;
+                }
+            }
+
+            // Simulate the bookkeeping left by a prior KV compaction. This
+            // test does not run TriAttention's compaction algorithm itself.
+            slot.kv_cache.compact_offset = 19;
+            slot.reset_state(&mut gpu);
+            if slot.kv_cache.compact_offset != 0 {
+                return Err(format!(
+                    "compact_offset survived reset: {}",
+                    slot.kv_cache.compact_offset
+                ));
+            }
+
+            for (kind, buffers) in recurrent_groups(&slot.dn_state) {
+                for (index, buffer) in buffers.iter().enumerate() {
+                    let mut bytes = vec![0u8; buffer.buf.size()];
+                    gpu.hip
+                        .memcpy_dtoh(&mut bytes, &buffer.buf)
+                        .map_err(|e| format!("download {kind}[{index}]: {e}"))?;
+                    if bytes.iter().any(|&byte| byte != 0) {
+                        return Err(format!("{kind}[{index}] survived reset"));
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        let ModelSlot {
+            weights,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = slot;
+        scratch.free_gpu(&mut gpu);
+        dn_state.free_gpu(&mut gpu);
+        kv_cache.free_gpu(&mut gpu);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    }
+
+    /// Requires a local Qwen3.5 model because `DeltaNetSnapshot` backs up GPU
+    /// buffers directly; no CPU fixture can exercise the device copy lifecycle.
+    #[test]
+    #[ignore = "requires an AMD GPU and qwen3.5-0.8b.mq4"]
+    fn snapshot_restore_reproduces_all_recurrent_buffer_groups() {
+        let model = std::env::var("HIPFIRE_QWEN35_RESET_STATE_MODEL").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME is required for the default model path");
+            format!("{home}/.hipfire/models/qwen3.5-0.8b.mq4")
+        });
+        assert!(
+            Path::new(&model).is_file(),
+            "model fixture not found: {model}; set HIPFIRE_QWEN35_RESET_STATE_MODEL"
+        );
+
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        let mut slot = ModelSlot::load(
+            &mut gpu,
+            Path::new(&model),
+            "snapshot-restore-test",
+            ModelSlotConfig {
+                max_seq: 16,
+                ..Default::default()
+            },
+        )
+        .expect("load Qwen3.5 model slot");
+
+        let result = (|| -> Result<(), String> {
+            if slot.dn_state.s_ef_residual.is_empty() {
+                return Err(
+                    "Q8 error-feedback residuals were not allocated; unset HIPFIRE_DN_STATE_EF=0"
+                        .into(),
+                );
+            }
+            let mut snapshot = DeltaNetSnapshot::new_for(&mut gpu, &slot.dn_state)
+                .map_err(|e| format!("allocate snapshot: {e}"))?;
+            let snapshot_result = (|| -> Result<(), String> {
+                for ((kind, buffers), byte) in recurrent_groups(&slot.dn_state)
+                    .into_iter()
+                    .zip([0x11u8, 0x22, 0x33, 0x44])
+                {
+                    for (index, buffer) in buffers.iter().enumerate() {
+                        gpu.hip
+                            .memset(&buffer.buf, byte.into(), buffer.buf.size())
+                            .map_err(|e| format!("seed {kind}[{index}]: {e}"))?;
+                    }
+                }
+                snapshot
+                    .save_from(&slot.dn_state, &mut gpu)
+                    .map_err(|e| format!("save snapshot: {e}"))?;
+                for (_, buffers) in recurrent_groups(&slot.dn_state) {
+                    for (index, buffer) in buffers.iter().enumerate() {
+                        gpu.hip
+                            .memset(&buffer.buf, 0xa5, buffer.buf.size())
+                            .map_err(|e| format!("overwrite recurrent[{index}]: {e}"))?;
+                    }
+                }
+                snapshot
+                    .restore_to(&mut slot.dn_state, &mut gpu)
+                    .map_err(|e| format!("restore snapshot: {e}"))?;
+                for ((kind, buffers), byte) in recurrent_groups(&slot.dn_state)
+                    .into_iter()
+                    .zip([0x11u8, 0x22, 0x33, 0x44])
+                {
+                    for (index, buffer) in buffers.iter().enumerate() {
+                        let mut bytes = vec![0u8; buffer.buf.size()];
+                        gpu.hip
+                            .memcpy_dtoh(&mut bytes, &buffer.buf)
+                            .map_err(|e| format!("download {kind}[{index}]: {e}"))?;
+                        if bytes.iter().any(|&actual| actual != byte) {
+                            return Err(format!("{kind}[{index}] did not restore"));
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            snapshot.free_gpu(&mut gpu);
+            snapshot_result
+        })();
+
+        let ModelSlot {
+            weights,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = slot;
+        scratch.free_gpu(&mut gpu);
+        dn_state.free_gpu(&mut gpu);
+        kv_cache.free_gpu(&mut gpu);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
     }
 }

@@ -57,6 +57,9 @@ arch-dots-ocr = []
 # and the synthetic-error branches OUT, so HIPFIRE_EP_FAIL_RANK has no effect.
 # Build the GPU cleanup test with `--features deltanet,ep-fault-inject`.
 ep-fault-inject = []
+# dflash-fault-inject: enables test-only deterministic DFlash allocation faults.
+# It is intentionally excluded from default/release feature sets.
+dflash-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
