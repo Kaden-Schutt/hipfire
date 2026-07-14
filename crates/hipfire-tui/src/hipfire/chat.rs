@@ -58,13 +58,17 @@ fn stream_chat_inner(
     abort: &Arc<AtomicBool>,
 ) -> Result<()> {
     let url = format!("http://{host}:{port}/v1/chat/completions");
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(600))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(600)))
         // Per-read bound: a stalled socket (half-open TCP, server hang) errors out
         // within this window instead of parking the worker thread for the full
         // total timeout — paired with the optimistic UI abort in request_abort.
-        .timeout_read(Duration::from_secs(120))
-        .build();
+        .timeout_recv_body(Some(Duration::from_secs(120)))
+        // Keep the response body available so HTTP errors include the daemon's
+        // useful message, matching the ureq 2 behavior below.
+        .http_status_as_error(false)
+        .build()
+        .into();
     let mut body = json!({
         "model": model,
         "stream": true,
@@ -77,23 +81,25 @@ fn stream_chat_inner(
     if let Some(p) = top_p {
         body["top_p"] = json!(p);
     }
-    let resp = match agent
+    let mut resp = match agent
         .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            return Err(anyhow!(
-                "HTTP {code}: {}",
-                text.chars().take(240).collect::<String>()
-            ));
-        }
         Err(err) => return Err(anyhow!(err.to_string())),
     };
 
-    let reader = BufReader::new(resp.into_reader());
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(anyhow!(
+            "HTTP {status}: {}",
+            text.chars().take(240).collect::<String>()
+        ));
+    }
+
+    let reader = BufReader::new(resp.into_body().into_reader());
     for line in reader.lines() {
         // Cooperative cancel: checked once per streamed line, so an in-flight
         // generation stops within ~one token of the user pressing Esc. The

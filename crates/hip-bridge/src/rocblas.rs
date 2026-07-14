@@ -118,7 +118,7 @@ impl Rocblas {
         ];
         let lib = candidates
             .iter()
-            .find_map(|name| unsafe { Library::new(name).ok() })
+            .find_map(|name| unsafe { Library::new(*name).ok() })
             .ok_or_else(|| RocblasError {
                 status: 0,
                 context: "dlopen librocblas.so (tried several names) failed".into(),

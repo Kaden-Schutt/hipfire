@@ -105,7 +105,7 @@ impl RcclComms {
             let candidates = ["librccl.so", "librccl.so.1", "librccl.so.1.0"];
             let mut loaded = None;
             for name in &candidates {
-                if let Ok(l) = Library::new(name) {
+                if let Ok(l) = Library::new(*name) {
                     loaded = Some(l);
                     break;
                 }

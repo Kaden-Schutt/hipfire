@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Hazard-checked HIP/public-AQL record and replay runtime"
 
 [dependencies]
-libloading = "0.8.9"
+libloading = "0.9"
 redline-rocr = { path = "../redline-rocr" }
 sha2 = "0.10.9"
 thiserror = "2.0.17"

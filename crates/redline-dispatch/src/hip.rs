@@ -285,7 +285,7 @@ fn open_hip_library() -> Result<Library, HipBackendError> {
     for candidate in CANDIDATES {
         // SAFETY: loading the installed HIP runtime is the purpose of this
         // backend. HipFns retains the successful library handle.
-        match unsafe { Library::new(candidate) } {
+        match unsafe { Library::new(*candidate) } {
             Ok(library) => return Ok(library),
             Err(error) => failures.push(format!("{candidate}: {error}")),
         }

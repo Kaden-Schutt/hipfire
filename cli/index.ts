@@ -3661,7 +3661,7 @@ async function serve(port: number, host: string) {
         // Requested by @shilga in #79.
         const ctk = (body.chat_template_kwargs && typeof body.chat_template_kwargs === "object")
           ? body.chat_template_kwargs : {};
-        const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
+        const enableThinking: boolean | undefined = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : undefined;
         const preserveThinking: boolean = ctk.preserve_thinking === true;
 
         // Include usage

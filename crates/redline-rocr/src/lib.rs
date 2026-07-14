@@ -61,7 +61,7 @@ pub fn load_symbols() -> Result<Arc<Symbols>, LoadError> {
         .find_map(|candidate| {
             // SAFETY: loading the installed ROCr runtime is the purpose of this
             // crate. `Symbols` retains the successful library mapping.
-            match unsafe { Library::new(candidate) } {
+            match unsafe { Library::new(*candidate) } {
                 Ok(library) => Some(Arc::new(library)),
                 Err(error) => {
                     failures.push(format!("{candidate}: {error}"));
