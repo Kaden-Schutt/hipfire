@@ -62,6 +62,8 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
+safetensors = "0.8"
+half = "2.7"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
@@ -99,6 +101,7 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 # work on plain Jinja values — required by the Qwen3 family
 # template which uses these throughout.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+tracing = "0.1"
 
 # Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -123,6 +126,7 @@ hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents

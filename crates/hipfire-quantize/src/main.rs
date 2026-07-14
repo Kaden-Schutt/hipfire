@@ -16,7 +16,9 @@ mod e8_gptq;
 mod gguf_input;
 mod reap_overlay;
 
-use memmap2::Mmap;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -65,137 +67,134 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 
-// ─── Safetensors Parser ─────────────────────────────────────────────────────
+#[derive(Debug, Parser)]
+#[command(
+    name = "hipfire-quantize",
+    version,
+    about = "Quantize Hugging Face safetensors or GGUF weights into Hipfire HFQ"
+)]
+struct QuantizeArgs {
+    /// Hugging Face model directory, model ID, or GGUF file.
+    #[arg(long, value_name = "PATH_OR_MODEL_ID")]
+    input: String,
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct SafetensorsMeta {
-    #[serde(flatten)]
-    tensors: HashMap<String, TensorMeta>,
-}
+    /// Destination HFQ file.
+    #[arg(long, value_name = "PATH")]
+    output: String,
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct TensorMeta {
-    dtype: String,
-    shape: Vec<usize>,
-    data_offsets: [usize; 2],
-}
+    /// Quantization recipe or wire format.
+    #[arg(long, default_value = "q8f16")]
+    format: String,
 
-struct SafetensorsFile {
-    _file: File,
-    mmap: Mmap,
-    header_size: usize,
-    tensors: HashMap<String, TensorMeta>,
-}
+    /// Rayon worker threads (defaults to 80% of available cores).
+    #[arg(long, env = "HIPFIRE_QUANT_THREADS", value_name = "N")]
+    threads: Option<usize>,
 
-impl SafetensorsFile {
-    fn open(path: &Path) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+    /// Override the architecture ID stamped into the HFQ header.
+    #[arg(long, value_name = "ID")]
+    arch_id: Option<u32>,
 
-        // First 8 bytes: u64 LE header size
-        let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-        let header_json = std::str::from_utf8(&mmap[8..8 + header_len]).unwrap();
+    /// Allow an architecture override to move Qwen3 off its pillar IDs.
+    #[arg(long)]
+    force_arch_id: bool,
 
-        // Parse header, filtering out __metadata__ key
-        let raw: serde_json::Value = serde_json::from_str(header_json).unwrap();
-        let mut tensors = HashMap::new();
-        if let serde_json::Value::Object(map) = raw {
-            for (k, v) in map {
-                if k == "__metadata__" {
-                    continue;
-                }
-                let meta: TensorMeta = serde_json::from_value(v).unwrap();
-                tensors.insert(k, meta);
-            }
-        }
+    /// Emit only tensors selected by a REAP plan.
+    #[arg(long, value_name = "PLAN_DIR", conflicts_with = "reap_bake")]
+    reap_overlay: Option<String>,
 
-        Ok(Self {
-            _file: file,
-            mmap,
-            header_size: 8 + header_len,
-            tensors,
-        })
-    }
+    /// Apply a REAP plan while baking a complete model.
+    #[arg(long, value_name = "PLAN_DIR", conflicts_with = "reap_overlay")]
+    reap_bake: Option<String>,
 
-    fn tensor_data(&self, name: &str) -> Option<(&TensorMeta, &[u8])> {
-        let meta = self.tensors.get(name)?;
-        let start = self.header_size + meta.data_offsets[0];
-        let end = self.header_size + meta.data_offsets[1];
-        Some((meta, &self.mmap[start..end]))
-    }
+    /// Output path for a REAP overlay or baked model.
+    #[arg(long, value_name = "PATH")]
+    reap_out: Option<String>,
 
-    /// Advise the kernel to drop page cache for a tensor's data region.
-    /// On UMA systems this is critical: 234 GB of mmap'd safetensors
-    /// pages compete with hipMalloc for the same physical RAM.
-    #[cfg(unix)]
-    fn drop_tensor_pages(&self, name: &str) {
-        if let Some(meta) = self.tensors.get(name) {
-            let start = self.header_size + meta.data_offsets[0];
-            let len = meta.data_offsets[1] - meta.data_offsets[0];
-            use std::os::unix::io::AsRawFd;
-            // POSIX_FADV_DONTNEED = 4
-            unsafe {
-                extern "C" {
-                    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
-                }
-                posix_fadvise(self._file.as_raw_fd(), start as i64, len as i64, 4);
-            }
-        }
-    }
+    /// Architecture family used to interpret a REAP plan.
+    #[arg(long, value_name = "ARCH")]
+    reap_arch: Option<String>,
 
-    #[cfg(not(unix))]
-    fn drop_tensor_pages(&self, _name: &str) {}
+    /// llama.cpp imatrix GGUF used for activation-aware quantization.
+    #[arg(long, value_name = "PATH")]
+    imatrix: Option<PathBuf>,
 
-    fn tensor_names(&self) -> Vec<&str> {
-        self.tensors.keys().map(|s| s.as_str()).collect()
-    }
-}
+    /// Per-tensor Hessian directory used by GPTQ-E8 recipes.
+    #[arg(long, value_name = "DIR")]
+    hessian_dir: Option<PathBuf>,
 
-// ─── FP16/BF16 Conversion ───────────────────────────────────────────────────
+    /// Fraction of hot layers assigned the higher-precision Lloyd tier.
+    #[arg(long, env = "HIPFIRE_TIER_RATIO", default_value_t = 0.30)]
+    tier_ratio: f64,
 
-/// Read `--arch-id <u32>` from `std::env::args` if present. Used by
-/// both the GGUF and safetensors entry paths to override the
-/// auto-detected `arch_id` stamped into the HFQ header.
-///
-/// Why an override exists: the auto-detection maps every Qwen2 input
-/// to `arch_id=1`, which the daemon dispatches through
-/// `hipfire-arch-llama`. That loader doesn't read Q/K/V proj bias,
-/// so a Qwen2 model loaded by default would produce wrong outputs.
-/// Plain Qwen2 should be `arch_id=7` (hipfire-arch-qwen2) and Qwen2-VL
-/// family (dots.ocr) should be `arch_id=8` (hipfire-arch-dots-ocr).
-/// See docs/architecture-ids.md and docs/plans/
-/// dots-ocr-devlog.md §7 (R1).
-fn parse_arch_id_override() -> Option<u32> {
-    let args: Vec<String> = std::env::args().collect();
-    let pos = args.iter().position(|a| a == "--arch-id")?;
-    let raw = args.get(pos + 1).unwrap_or_else(|| {
-        eprintln!("error: --arch-id requires a u32 value");
-        std::process::exit(1);
-    });
-    match raw.parse::<u32>() {
-        Ok(v) => Some(v),
-        Err(e) => {
-            eprintln!("error: --arch-id value '{raw}' is not a valid u32: {e}");
-            std::process::exit(1);
-        }
-    }
-}
+    /// Force router tensors to Q8.
+    #[arg(long)]
+    q8_router: bool,
 
-/// `--force-arch-id` escape hatch for the qwen3*-pillar override guard. When
-/// the auto-detected arch is qwen3* (5/6) and a `--arch-id` override moves it
-/// OFF {5,6}, the quantizer refuses unless this flag is also present.
-fn force_arch_id_flag() -> bool {
-    std::env::args().any(|a| a == "--force-arch-id")
+    /// Disable the default Q8 protection for conv1d tensors.
+    #[arg(long)]
+    no_q8_conv1d: bool,
+
+    /// Disable K-map precision promotion.
+    #[arg(long)]
+    no_kmap: bool,
+
+    /// Alias for --no-kmap for uniform quantization.
+    #[arg(long)]
+    uniform: bool,
+
+    /// Enable AWQ pre-scaling with the default alpha.
+    #[arg(long)]
+    awq: bool,
+
+    /// Enable AWQ pre-scaling with an explicit alpha.
+    #[arg(long, value_name = "ALPHA")]
+    awq_alpha: Option<f32>,
+
+    /// Enable K-map promotion for dense models.
+    #[arg(long)]
+    kmap_dense: bool,
+
+    /// K-map policy: full, alternating/alt, or typed.
+    #[arg(long, default_value = "alternating", value_name = "MODE")]
+    kmap_mode: String,
+
+    /// Permit research-only uniform MQ2 output.
+    #[arg(long)]
+    allow_mq2: bool,
+
+    /// Permit research-only MQ2-Lloyd output.
+    #[arg(long)]
+    allow_mq2_lloyd: bool,
+
+    /// Permit research-only MQ3-Lloyd output.
+    #[arg(long)]
+    allow_mq3_lloyd: bool,
+
+    /// Permit research-only MQ4-Lloyd output.
+    #[arg(long)]
+    allow_mq4_lloyd: bool,
+
+    /// Include vision tensors that are skipped by default.
+    #[arg(long)]
+    include_vision: bool,
+
+    /// Quantization recipe for included vision tensors.
+    #[arg(long, default_value = "", value_name = "FORMAT")]
+    vision_quant: String,
+
+    /// Ingest only tensors whose names start with this prefix.
+    #[arg(long, value_name = "PREFIX")]
+    include_prefix: Option<String>,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected
 /// arch 5 or 6) off the pillar arches, unless `--force-arch-id` is given.
 /// Keeps the froggeric chat-template pillar + qwen35-crate dispatch intact by
 /// construction. No-op for non-qwen models or overrides that stay in {5,6}.
-fn guard_qwen3_arch_override(auto_arch_id: u32, arch_id: u32) {
+fn guard_qwen3_arch_override(auto_arch_id: u32, arch_id: u32, force_arch_id: bool) {
     let auto_is_qwen3 = matches!(auto_arch_id, 5 | 6);
     let override_off_pillar = !matches!(arch_id, 5 | 6);
-    if auto_is_qwen3 && arch_id != auto_arch_id && override_off_pillar && !force_arch_id_flag() {
+    if auto_is_qwen3 && arch_id != auto_arch_id && override_off_pillar && !force_arch_id {
         eprintln!(
             "error: --arch-id {arch_id} moves an auto-detected qwen3* model (arch {auto_arch_id}) \
              OFF the pillar arches {{5,6}}; this would break the froggeric chat-template pillar \
@@ -203,59 +202,6 @@ fn guard_qwen3_arch_override(auto_arch_id: u32, arch_id: u32) {
         );
         std::process::exit(1);
     }
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-    if exp == 0 {
-        if frac == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 {
-            f <<= 1;
-            e -= 1;
-        }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { frac << 13 | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
-}
-
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
-
-fn f32_to_f16(val: f32) -> u16 {
-    let bits = val.to_bits();
-    let sign = (bits >> 31) & 1;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let frac = bits & 0x7FFFFF;
-    if exp == 0xFF {
-        let f16_frac = if frac == 0 { 0 } else { (frac >> 13) | 1 };
-        return ((sign << 15) | (0x1F << 10) | f16_frac) as u16;
-    }
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 31 {
-        return ((sign << 15) | (0x1F << 10)) as u16;
-    }
-    if new_exp <= 0 {
-        if new_exp < -10 {
-            return (sign << 15) as u16;
-        }
-        let f = frac | 0x800000;
-        let shift = (1 - new_exp + 13) as u32;
-        return ((sign << 15) | (f >> shift)) as u16;
-    }
-    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
 }
 
 /// Convert raw tensor bytes to F32 based on dtype string
@@ -5728,6 +5674,8 @@ fn run_gguf_pipeline(
     no_kmap: bool,
     kmap_dense: bool,
     kmap_mode: u8,
+    arch_id_override: Option<u32>,
+    force_arch_id: bool,
 ) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
@@ -5770,8 +5718,8 @@ fn run_gguf_pipeline(
     // instead of the LLaMA-family default 1, which silently drops
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
     // dots-ocr-devlog.md §7 (R1) for the bring-up context.
-    let arch_id: u32 = parse_arch_id_override().unwrap_or(auto_arch_id);
-    guard_qwen3_arch_override(auto_arch_id, arch_id);
+    let arch_id: u32 = arch_id_override.unwrap_or(auto_arch_id);
+    guard_qwen3_arch_override(auto_arch_id, arch_id, force_arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
     } else {
@@ -6257,7 +6205,7 @@ fn run_gguf_pipeline(
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args = QuantizeArgs::parse();
 
     // Bound rayon's pool to 80% of cores (default cap; override with --threads N
     // or HIPFIRE_QUANT_THREADS env). Quantization is CPU-bound and saturates
@@ -6267,39 +6215,15 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(8);
     let default_threads = ((cores * 8) / 10).max(1);
-    let threads = args
-        .iter()
-        .position(|a| a == "--threads")
-        .and_then(|i| args.get(i + 1).and_then(|s| s.parse::<usize>().ok()))
-        .or_else(|| {
-            std::env::var("HIPFIRE_QUANT_THREADS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(default_threads);
+    let threads = args.threads.unwrap_or(default_threads);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global();
     eprintln!("Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})");
 
-    let input_dir = args
-        .iter()
-        .position(|a| a == "--input")
-        .map(|i| &args[i + 1])
-        .unwrap_or_else(|| {
-            eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq>");
-            std::process::exit(1);
-        });
-
-    let output_path = args.iter().position(|a| a == "--output")
-        .map(|i| &args[i + 1])
-        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format q8f16|q4f16]"); std::process::exit(1); });
-
-    let format = args
-        .iter()
-        .position(|a| a == "--format")
-        .map(|i| args[i + 1].as_str())
-        .unwrap_or("q8f16");
+    let input_dir = args.input.as_str();
+    let output_path = args.output.as_str();
+    let format = args.format.as_str();
 
     // ── qwen3-dspark-q8: Qwen3DSparkModel drafter sidecar emission ──────────
     // Produces a `<stem>-dspark.<ext>` HFQ carrying the 5-layer dense drafter
@@ -6317,8 +6241,8 @@ fn main() {
     //   hidden_norm.weight  → main_norm.weight    (RMSNorm after fc)
     //   all others          → kept as-is
     if format == "qwen3-dspark-q8" || format == "qwen35-dspark-q8" {
-        let input_dir = Path::new(input_dir.as_str());
-        let output_path = Path::new(output_path.as_str());
+        let input_dir = Path::new(input_dir);
+        let output_path = Path::new(output_path);
 
         // Read config
         let config_path = input_dir.join("config.json");
@@ -6367,16 +6291,24 @@ fn main() {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(d)
         };
-        let block_size = config.get("block_size").and_then(|v| v.as_u64()).unwrap_or(7) as usize;
+        let block_size = config
+            .get("block_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(7) as usize;
         let target_layer_ids: Vec<u64> = config
             .get("target_layer_ids")
             .or_else(|| config.get("aux_hidden_state_layer_ids"))
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
-        let markov_rank = config.get("markov_rank").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
-        let noise_token_id =
-            config.get("mask_token_id").and_then(|v| v.as_u64()).unwrap_or(151669) as u32;
+        let markov_rank = config
+            .get("markov_rank")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(256) as usize;
+        let noise_token_id = config
+            .get("mask_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(151669) as u32;
         let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
         let confidence_with_markov = config
             .get("confidence_head_with_markov")
@@ -6507,7 +6439,10 @@ fn main() {
                         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
                         .collect()
                 } else if meta.dtype == "BOOL" || meta.dtype == "U8" {
-                    raw_data.iter().map(|&b| if b != 0 { 1.0 } else { 0.0 }).collect()
+                    raw_data
+                        .iter()
+                        .map(|&b| if b != 0 { 1.0 } else { 0.0 })
+                        .collect()
                 } else {
                     to_f32(raw_data, &meta.dtype)
                 };
@@ -6606,28 +6541,16 @@ fn main() {
     // re-quantized into a small `overlay.hfq` (written to `--reap-out`).
     // `--reap-arch` overrides the auto-detected arch family used for
     // tensor-name matching. See reap_overlay.rs / SP4 plan Task 4.
-    let reap_overlay_dir: Option<String> = args
-        .iter()
-        .position(|a| a == "--reap-overlay")
-        .and_then(|i| args.get(i + 1).cloned());
-    let reap_out: Option<String> = args
-        .iter()
-        .position(|a| a == "--reap-out")
-        .and_then(|i| args.get(i + 1).cloned());
-    let reap_arch_flag: Option<String> = args
-        .iter()
-        .position(|a| a == "--reap-arch")
-        .and_then(|i| args.get(i + 1).cloned());
+    let reap_overlay_dir = args.reap_overlay.clone();
+    let reap_out = args.reap_out.clone();
+    let reap_arch_flag = args.reap_arch.clone();
     // SP4b bake mode. `--reap-bake <plan-dir>` runs the NORMAL whole-model
     // quantize to completion BUT with a per-tensor override hook active: any
     // tensor the plan's `quant_overrides` name is re-quantized to its override
     // tier; every other tensor keeps its arch-specific default quant. The whole
     // model is written via the usual `write_hfq` to `--reap-out` (or the normal
     // `--format` output path). Mutually exclusive with `--reap-overlay`.
-    let reap_bake_dir: Option<String> = args
-        .iter()
-        .position(|a| a == "--reap-bake")
-        .and_then(|i| args.get(i + 1).cloned());
+    let reap_bake_dir = args.reap_bake.clone();
     if reap_bake_dir.is_some() && reap_overlay_dir.is_some() {
         eprintln!("reap: --reap-bake and --reap-overlay are mutually exclusive");
         std::process::exit(1);
@@ -6636,13 +6559,10 @@ fn main() {
     // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
     // When provided, MQ2-Lloyd quantization uses per-column importance weights
     // to bias centroid placement. See `quantize_mq2g256_lloyd_weighted`.
-    let imatrix_path: Option<&str> = args
-        .iter()
-        .position(|a| a == "--imatrix")
-        .map(|i| args[i + 1].as_str());
+    let imatrix_path: Option<&Path> = args.imatrix.as_deref();
     let imatrix_gguf: Option<gguf_input::GgufFile> = imatrix_path.map(|p| {
-        eprintln!("Loading imatrix: {p}");
-        gguf_input::GgufFile::open(Path::new(p)).unwrap_or_else(|e| {
+        eprintln!("Loading imatrix: {}", p.display());
+        gguf_input::GgufFile::open(p).unwrap_or_else(|e| {
             eprintln!("imatrix open failed: {e}");
             std::process::exit(2);
         })
@@ -6865,7 +6785,7 @@ fn main() {
     let use_mq4_mq3lloyd_kmap = format == "mq4-mq3lloyd-kmap"
         || format == "mq4-mq3lloyd-routed"
         || format == "mq4-mq3lloyd-exp";
-    let allow_mq3_lloyd_for_mixed = args.iter().any(|a| a == "--allow-mq3-lloyd")
+    let allow_mq3_lloyd_for_mixed = args.allow_mq3_lloyd
         || std::env::var("HIPFIRE_ALLOW_MQ3_LLOYD").ok().as_deref() == Some("1");
     if use_mq4_mq3lloyd_kmap && !allow_mq3_lloyd_for_mixed {
         eprintln!(
@@ -6981,16 +6901,7 @@ fn main() {
              Estimated DeepSeek V4 size: 70% × MQ2 + 20% × MQ3 + 10% × MQ4 ≈ 96 GB."
         );
     }
-    let tier_ratio: f64 = args
-        .iter()
-        .position(|a| a == "--tier-ratio")
-        .and_then(|i| args.get(i + 1).and_then(|s| s.parse().ok()))
-        .or_else(|| {
-            std::env::var("HIPFIRE_TIER_RATIO")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(0.30);
+    let tier_ratio = args.tier_ratio;
     if use_mq4_mqlloyd_tiered {
         if imatrix_path.is_none() {
             eprintln!("error: --format mq4-mqlloyd-tiered requires --imatrix <PATH>");
@@ -7086,11 +6997,7 @@ fn main() {
     // the collect_e8_hessian binary. Missing/degenerate Hessians silently fall
     // back to RTN per-block (never worse than baseline). REQUIRED when --format
     // mfp{2,3,4}e8-gptq is set.
-    let hessian_dir: Option<PathBuf> = args
-        .iter()
-        .position(|a| a == "--hessian-dir")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from);
+    let hessian_dir = args.hessian_dir.clone();
     if use_gptq_e8 && hessian_dir.is_none() {
         eprintln!("warning: --format mfp4e8-gptq without --hessian-dir; every tensor falls back to RTN E8 (== plain mfp4e8). Pass --hessian-dir <dir> to enable GPTQ.");
     }
@@ -7106,13 +7013,13 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let q8_router_flag = args.iter().any(|a| a == "--q8-router");
+    let q8_router_flag = args.q8_router;
     // Conv1d (DeltaNet) defaults to Q8 regardless of --format — the tensor is
     // small (~32K elem) but runs every token and lossy 4-bit FWHT formats
     // measurably hurt the gated-delta path. Override with --no-q8-conv1d to
     // keep conv1d at the same quant as the rest of the model.
-    let q8_conv1d_default = !args.iter().any(|a| a == "--no-q8-conv1d");
-    let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
+    let q8_conv1d_default = !args.no_q8_conv1d;
+    let no_kmap = args.no_kmap || args.uniform;
 
     // ── imatrix loader (consumed by AWQ pre-scaling) ──
     // --imatrix <path>: load an llama-imatrix-produced GGUF (per `examples/
@@ -7125,11 +7032,7 @@ fn main() {
     // linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}
     // (linear-attention layers via SSM-naming). Norms / biases / 1D scalars /
     // conv1d / lookup tables have no imatrix entry.
-    let imatrix_path = args
-        .iter()
-        .position(|a| a == "--imatrix")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from);
+    let imatrix_path = args.imatrix.clone();
     if let Some(path) = &imatrix_path {
         if !path.exists() {
             eprintln!("error: --imatrix path not found: {}", path.display());
@@ -7158,13 +7061,8 @@ fn main() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled = args.iter().any(|a| a == "--awq") || args.iter().any(|a| a == "--awq-alpha");
-    let awq_alpha = args
-        .iter()
-        .position(|a| a == "--awq-alpha")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(0.55);
+    let awq_enabled = args.awq || args.awq_alpha.is_some();
+    let awq_alpha = args.awq_alpha.unwrap_or(0.55);
     if awq_enabled {
         if IMATRIX.get().is_none() {
             eprintln!("error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)");
@@ -7185,32 +7083,30 @@ fn main() {
     // short context, win at long context — see benchmarks/results/
     // ppl_kmap_20260508.md). Maintainer directive 2026-05-08: "intends to
     // help ONLY (never on dense)" by default.
-    let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
+    let kmap_dense = args.kmap_dense;
     // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
     // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
     // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
-    let kmap_mode: u8 = args
-        .iter()
-        .position(|a| a == "--kmap-mode")
-        .and_then(|i| args.get(i + 1))
-        .map(|v| match v.as_str() {
-            "full" | "0" => 0,
-            "alternating" | "alt" | "1" => 1,
-            "typed" | "2" => 2,
-            _ => {
-                eprintln!("warning: unknown --kmap-mode '{v}', using alternating");
-                1
-            }
-        })
-        .unwrap_or(1);
+    let kmap_mode: u8 = match args.kmap_mode.as_str() {
+        "full" | "0" => 0,
+        "alternating" | "alt" | "1" => 1,
+        "typed" | "2" => 2,
+        _ => {
+            eprintln!(
+                "warning: unknown --kmap-mode '{}', using alternating",
+                args.kmap_mode
+            );
+            1
+        }
+    };
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
     // model size validated locally (0.8B / 4B / 9B Qwen 3.5 → multilingual
     // mojibake on all 4 coherence-gate prompts). Refuse by default until
     // Path D Lloyd-Max non-uniform codebooks land (PRD §5.2).
-    let allow_mq2 = args.iter().any(|a| a == "--allow-mq2")
-        || std::env::var("HIPFIRE_ALLOW_MQ2").ok().as_deref() == Some("1");
+    let allow_mq2 =
+        args.allow_mq2 || std::env::var("HIPFIRE_ALLOW_MQ2").ok().as_deref() == Some("1");
     if use_mq2g256 && !allow_mq2 {
         eprintln!(
             "error: --format mq2 is reserved — empirical quality verdict is collapse on every model\n\
@@ -7229,7 +7125,7 @@ fn main() {
     // lloyd_max_findings_20260501.md) but still text-collapse — 9B ppl=2,163
     // vs 9B MQ4 ppl=10. Research-only: same opt-in gate so users don't
     // accidentally ship a 2-bpw model that won't produce coherent output.
-    let allow_mq3_lloyd = args.iter().any(|a| a == "--allow-mq3-lloyd")
+    let allow_mq3_lloyd = args.allow_mq3_lloyd
         || std::env::var("HIPFIRE_ALLOW_MQ3_LLOYD").ok().as_deref() == Some("1");
     if use_mq3g256_lloyd && !allow_mq3_lloyd {
         eprintln!(
@@ -7244,7 +7140,7 @@ fn main() {
         );
         std::process::exit(1);
     }
-    let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
+    let allow_mq2_lloyd = args.allow_mq2_lloyd
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
     if (use_mq2g256_lloyd
         || use_mq4_mq2lloydexp
@@ -7279,7 +7175,7 @@ fn main() {
     // 9B projection is ppl 8.0–9.3 (vs uniform MQ4 ppl 10.34, MQ6 ppl 9.36).
     // Quality not yet validated — same opt-in gate as MQ3-Lloyd until ppl
     // numbers land.
-    let allow_mq4_lloyd = args.iter().any(|a| a == "--allow-mq4-lloyd")
+    let allow_mq4_lloyd = args.allow_mq4_lloyd
         || std::env::var("HIPFIRE_ALLOW_MQ4_LLOYD").ok().as_deref() == Some("1");
     if use_mq4g256_lloyd && !allow_mq4_lloyd {
         eprintln!(
@@ -7318,7 +7214,7 @@ fn main() {
     // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
     // with no quality benefit.
     {
-        let raw_input = Path::new(input_dir.as_str());
+        let raw_input = Path::new(input_dir);
         if is_gguf_input(raw_input) {
             let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
@@ -7329,9 +7225,16 @@ fn main() {
                 GgufFormat::Hfq4
             });
             let out = Path::new(output_path);
-            if let Err(e) =
-                run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense, kmap_mode)
-            {
+            if let Err(e) = run_gguf_pipeline(
+                raw_input,
+                out,
+                gguf_format,
+                no_kmap,
+                kmap_dense,
+                kmap_mode,
+                args.arch_id,
+                args.force_arch_id,
+            ) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -7404,8 +7307,8 @@ fn main() {
     // instead of the LLaMA-family default 1, which silently drops
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
     // dots-ocr-devlog.md §7 (R1) for the bring-up context.
-    let arch_id = parse_arch_id_override().unwrap_or(auto_arch_id);
-    guard_qwen3_arch_override(auto_arch_id, arch_id);
+    let arch_id = args.arch_id.unwrap_or(auto_arch_id);
+    guard_qwen3_arch_override(auto_arch_id, arch_id, args.force_arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
     } else {
@@ -7893,21 +7796,16 @@ fn main() {
     let mut max_quant_error = 0.0f32;
     let mut _n_quant_groups = 0u64;
 
-    let include_vision = std::env::args().any(|a| a == "--include-vision");
-    let vision_quant = std::env::args()
-        .position(|a| a == "--vision-quant")
-        .and_then(|i| std::env::args().nth(i + 1))
-        .unwrap_or_default();
+    let include_vision = args.include_vision;
+    let vision_quant = args.vision_quant.as_str();
     // --include-prefix <prefix>: when set, ONLY tensors whose name starts
     // with this prefix are ingested; everything else is silently skipped.
     // Used to produce side-car HFQs (e.g. `--include-prefix mtp.` builds an
     // MTP-only addon that pairs with an existing base HFQ via the loader's
     // `.mtp-addon.hfq` discovery). When unset (default), all tensors pass
     // this gate and the usual mtp/vision skip rules below apply.
-    let include_prefix = std::env::args()
-        .position(|a| a == "--include-prefix")
-        .and_then(|i| std::env::args().nth(i + 1));
-    if let Some(ref p) = include_prefix {
+    let include_prefix = args.include_prefix.as_deref();
+    if let Some(p) = include_prefix {
         eprintln!(
             "  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested"
         );
@@ -7923,7 +7821,7 @@ fn main() {
         all_tensors.iter().map(|(n, fi)| (*n, *fi)).collect();
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
-        if let Some(ref p) = include_prefix {
+        if let Some(p) = include_prefix {
             if !name.starts_with(p) {
                 let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
                 let n: usize = meta.shape.iter().product();
@@ -8161,8 +8059,7 @@ fn main() {
                 n_elements *= 2; // fused tensor carries gate + up params
                 meta = &_fused_meta;
                 raw_data = &_fused_bytes;
-                expert_fuse_rename
-                    .insert(name.to_string(), format!("{stem}.gate_up_proj.weight"));
+                expert_fuse_rename.insert(name.to_string(), format!("{stem}.gate_up_proj.weight"));
                 st_files[up_fi].drop_tensor_pages(&up_name);
                 eprintln!(
                     "  {:>8}: {name} + up_proj → {stem}.gate_up_proj.weight {:?}",

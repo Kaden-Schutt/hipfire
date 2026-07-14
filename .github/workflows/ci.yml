@@ -74,6 +74,24 @@ jobs:
         # GPU runner and are intentionally excluded here.
         run: cargo test --lib --workspace --locked
 
+  supply-chain:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    # A newly published advisory should be visible immediately without making
+    # an unrelated PR unmergeable. License, source, and ban policy is blocking.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+
   fmt:
     name: rustfmt (advisory)
     runs-on: ubuntu-latest

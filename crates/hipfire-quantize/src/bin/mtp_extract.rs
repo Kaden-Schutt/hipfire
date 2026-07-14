@@ -23,118 +23,12 @@
 //!     `shared_embed_with_trunk` + `shared_lm_head_with_trunk` make
 //!     this explicit so consumers can wire them up at load time.
 
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use memmap2::Mmap;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-// ─── Safetensors parser ────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct TensorMeta {
-    dtype: String,
-    shape: Vec<usize>,
-    data_offsets: [usize; 2],
-}
-
-struct SafetensorsFile {
-    _file: File,
-    mmap: Mmap,
-    header_size: usize,
-    tensors: HashMap<String, TensorMeta>,
-}
-
-impl SafetensorsFile {
-    fn open(path: &Path) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-        let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
-            .expect("safetensors header is not valid utf8");
-        let raw: serde_json::Value =
-            serde_json::from_str(header_json).expect("safetensors header JSON parse failed");
-        let mut tensors = HashMap::new();
-        if let serde_json::Value::Object(map) = raw {
-            for (k, v) in map {
-                if k == "__metadata__" {
-                    continue;
-                }
-                let meta: TensorMeta = serde_json::from_value(v)
-                    .unwrap_or_else(|e| panic!("tensor meta for {k}: {e}"));
-                tensors.insert(k, meta);
-            }
-        }
-        Ok(Self {
-            _file: file,
-            mmap,
-            header_size: 8 + header_len,
-            tensors,
-        })
-    }
-
-    fn tensor_data(&self, name: &str) -> Option<(&TensorMeta, &[u8])> {
-        let meta = self.tensors.get(name)?;
-        let start = self.header_size + meta.data_offsets[0];
-        let end = self.header_size + meta.data_offsets[1];
-        Some((meta, &self.mmap[start..end]))
-    }
-}
-
-// ─── FP conversions (lifted from dflash_convert) ──────────────────────────
-
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-    if exp == 0 {
-        if frac == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 {
-            f <<= 1;
-            e -= 1;
-        }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { (frac << 13) | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
-}
-
-fn f32_to_f16(val: f32) -> u16 {
-    let bits = val.to_bits();
-    let sign = (bits >> 31) & 1;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let frac = bits & 0x7FFFFF;
-    if exp == 0xFF {
-        let f16_frac = if frac == 0 { 0 } else { (frac >> 13) | 1 };
-        return ((sign << 15) | (0x1F << 10) | f16_frac) as u16;
-    }
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 31 {
-        return ((sign << 15) | (0x1F << 10)) as u16;
-    }
-    if new_exp <= 0 {
-        if new_exp < -10 {
-            return (sign << 15) as u16;
-        }
-        let f = frac | 0x800000;
-        let shift = (1 - new_exp + 13) as u32;
-        return ((sign << 15) | (f >> shift)) as u16;
-    }
-    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
-}
 
 fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     match dtype {

@@ -981,7 +981,48 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
     eprintln!("  Run `hipfire diag` for a full environment report.");
 }
 
+/// Install opt-in structured diagnostics on stderr. Stdout is reserved for the
+/// daemon's JSON-lines IPC protocol and must never receive tracing output.
+///
+/// `HIPFIRE_LOG` accepts an EnvFilter directive such as `info` or
+/// `hipfire_runtime=debug`; `RUST_LOG` is the fallback. Set
+/// `HIPFIRE_LOG_FORMAT=json` for machine-readable log events. With neither
+/// filter set, tracing remains off and the existing operator-facing stderr
+/// messages are unchanged.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_env("HIPFIRE_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new("off"));
+    let json = std::env::var("HIPFIRE_LOG_FORMAT")
+        .map(|value| value.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    let result = if json {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .json()
+            .try_init()
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .try_init()
+    };
+
+    if let Err(error) = result {
+        eprintln!("warning: failed to initialize structured logging: {error}");
+    }
+}
+
 fn main() {
+    init_tracing();
+    tracing::info!(pid = std::process::id(), "daemon starting");
+
     let args: Vec<String> = std::env::args().collect();
 
     // --precompile: compile all kernels for this GPU, write hash files, exit.
@@ -1090,6 +1131,11 @@ fn main() {
                 Ok(msg) => {
                     if msg.get("type").and_then(|v| v.as_str()) == Some("abort") {
                         if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                            tracing::info!(
+                                request_id = id,
+                                command = "abort",
+                                "daemon control command received"
+                            );
                             eprintln!("[daemon-abort] received abort for id={}", id);
                             *abort_for_id().lock().unwrap() = Some(id.to_string());
                         }
@@ -1097,6 +1143,11 @@ fn main() {
                     }
                     if msg.get("type").and_then(|v| v.as_str()) == Some("force_answer") {
                         if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                            tracing::info!(
+                                request_id = id,
+                                command = "force_answer",
+                                "daemon control command received"
+                            );
                             eprintln!("[daemon-force-answer] received force_answer for id={}", id);
                             *force_answer_for_id().lock().unwrap() = Some(id.to_string());
                         }
@@ -1120,6 +1171,7 @@ fn main() {
         let msg = match daemon_msg {
             DaemonMsg::Regular(m) => m,
             DaemonMsg::ParseError(e) => {
+                tracing::warn!(error = %e, "daemon received invalid JSON");
                 let _ = writeln!(
                     stdout,
                     r#"{{"type":"error","message":"invalid JSON: {}"}}"#,
@@ -1131,6 +1183,14 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let request_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let command_span = tracing::info_span!(
+            "daemon_command",
+            command = msg_type,
+            request_id = request_id
+        );
+        let _command_guard = command_span.enter();
+        tracing::debug!("daemon command received");
 
         match msg_type {
             "load" => {
@@ -3776,6 +3836,7 @@ fn main() {
             }
 
             _ => {
+                tracing::warn!(command = msg_type, "daemon received unknown command");
                 let _ = writeln!(
                     stdout,
                     r#"{{"type":"error","message":"unknown type: {}"}}"#,
@@ -4004,6 +4065,15 @@ fn ep_emit_done(
     } else {
         0.0
     };
+    tracing::info!(
+        request_id = id,
+        generated_tokens = generated,
+        prompt_tokens = prompt_n,
+        prefill_ms,
+        decode_ms,
+        decode_tok_s,
+        "expert-parallel generation completed"
+    );
     eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
     let _ = writeln!(
         stdout,
@@ -8402,10 +8472,7 @@ fn generate(
             "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
         );
     }
-    if m.speculator.is_some()
-        && !force_ar_chat
-        && (qwen_dflash_route || llama_dflash_route)
-    {
+    if m.speculator.is_some() && !force_ar_chat && (qwen_dflash_route || llama_dflash_route) {
         // One-time visibility: temp + top_p + top_k ARE now honored on the
         // DFlash spec sampled path (identical (top_k,top_p) nucleus truncation on
         // draft + target → lossless == AR-at-(top_k,top_p)). Only min_p remains

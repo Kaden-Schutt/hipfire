@@ -162,31 +162,7 @@ pub fn dequantize_q8_0(data: &[u8], n: usize) -> Vec<f32> {
 }
 
 pub fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-
-    if exp == 0 {
-        if frac == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        // Denormalized
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 {
-            f <<= 1;
-            e -= 1;
-        }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { frac << 13 | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    let exp32 = exp + 127 - 15;
-    f32::from_bits((sign << 31) | (exp32 << 23) | (frac << 13))
+    half::f16::from_bits(bits).to_f32()
 }
 
 pub fn f32_to_f16(val: f32) -> u16 {
