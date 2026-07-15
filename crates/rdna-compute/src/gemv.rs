@@ -6288,6 +6288,11 @@ impl Gpu {
                 && *GATE_UP_LOW_VGPR.get_or_init(|| {
                     std::env::var("HIPFIRE_MOE_GATE_UP_LOW_VGPR").as_deref() == Ok("1")
                 });
+            static GATE_UP_PAIR_VGPR: OnceLock<bool> = OnceLock::new();
+            let pair_vgpr = self.arch_caps.is_gfx1100()
+                && *GATE_UP_PAIR_VGPR.get_or_init(|| {
+                    std::env::var("HIPFIRE_MOE_GATE_UP_PAIR_VGPR").as_deref() == Ok("1")
+                });
             static GATE_UP_CPOL: OnceLock<String> = OnceLock::new();
             let cpol = if self.arch_caps.is_gfx1100() {
                 GATE_UP_CPOL
@@ -6307,7 +6312,22 @@ impl Gpu {
             let fixed_k2048 = self.arch_caps.is_gfx1100()
                 && self.flags.rdna3_hfq4_moe_gate_up_k2048
                 && k == 2_048;
-            if matches!(cpol, "glc" | "slc" | "dlc") {
+            if pair_vgpr {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_pair_slc",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_PAIR_SLC_GFX1100_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
+                    [32u32, 1, 1],
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
+                )
+            } else if matches!(cpol, "glc" | "slc" | "dlc") {
                 let (module, source, func) = match cpol {
                     "glc" => (
                         "gemv_hfq4g256_moe_gate_up_indexed_cpol_glc",

@@ -20,6 +20,10 @@
 #define HIPFIRE_MOE_GATE_UP_LOW_VGPR 0
 #endif
 
+#ifndef HIPFIRE_MOE_GATE_UP_PAIR_VGPR
+#define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 0
+#endif
+
 #if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
 #define HIPFIRE_MOE_GATE_UP_BLOCK 64
 #define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 8
@@ -176,6 +180,53 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         PROCESS_LOW_VGPR(g + 3, 3);
     }
     #undef PROCESS_LOW_VGPR
+#elif HIPFIRE_MOE_GATE_UP_PAIR_VGPR
+    // gfx1100 middle-occupancy schedule: keep two groups' activation values
+    // live at once. The default four-group schedule emits 96 VGPR and the
+    // one-group schedule gives up too much memory-level parallelism. Pairing
+    // targets the intervening occupancy band while preserving each group's
+    // accumulator and arithmetic order exactly.
+    #define PROCESS_PAIR(group_index, chain0, chain1) do { \
+        const int group = (group_index); \
+        const int base = group * 256 + tid * 8; \
+        const float4 x0a = *reinterpret_cast<const float4*>(x + base); \
+        const float4 x0b = *reinterpret_cast<const float4*>(x + base + 4); \
+        const float4 x1a = *reinterpret_cast<const float4*>(x + base + 256); \
+        const float4 x1b = *reinterpret_cast<const float4*>(x + base + 260); \
+        const char* gg0 = gate_ptr + group * 136; \
+        const char* gg1 = gg0 + 136; \
+        const unsigned int gate_base = gate_row_offset + (unsigned int)group * 136u; \
+        float gsc0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg0, 0, gate_base)); \
+        float gzp0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg0 + 4, 4, gate_base)); \
+        float gsc1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg1, 136, gate_base)); \
+        float gzp1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg1 + 4, 140, gate_base)); \
+        unsigned int gpk0 = LOAD_PACKED_U32(gg0 + 8 + boff, 8, gate_base); \
+        unsigned int gpk1 = LOAD_PACKED_U32(gg1 + 8 + boff, 144, gate_base); \
+        DOG_X8(gsc0, gzp0, gpk0, gacc##chain0, \
+               x0a.x, x0a.y, x0a.z, x0a.w, x0b.x, x0b.y, x0b.z, x0b.w); \
+        DOG_X8(gsc1, gzp1, gpk1, gacc##chain1, \
+               x1a.x, x1a.y, x1a.z, x1a.w, x1b.x, x1b.y, x1b.z, x1b.w); \
+        const char* uu0 = up_ptr + group * 136; \
+        const char* uu1 = uu0 + 136; \
+        const unsigned int up_base = up_row_offset + (unsigned int)group * 136u; \
+        float usc0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu0, 0, up_base)); \
+        float uzp0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu0 + 4, 4, up_base)); \
+        float usc1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu1, 136, up_base)); \
+        float uzp1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu1 + 4, 140, up_base)); \
+        unsigned int upk0 = LOAD_PACKED_U32(uu0 + 8 + boff, 8, up_base); \
+        unsigned int upk1 = LOAD_PACKED_U32(uu1 + 8 + boff, 144, up_base); \
+        DOG_X8(usc0, uzp0, upk0, uacc##chain0, \
+               x0a.x, x0a.y, x0a.z, x0a.w, x0b.x, x0b.y, x0b.z, x0b.w); \
+        DOG_X8(usc1, uzp1, upk1, uacc##chain1, \
+               x1a.x, x1a.y, x1a.z, x1a.w, x1b.x, x1b.y, x1b.z, x1b.w); \
+    } while (0)
+
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        PROCESS_PAIR(g, 0, 1);
+        PROCESS_PAIR(g + 2, 2, 3);
+    }
+    #undef PROCESS_PAIR
 #else
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;

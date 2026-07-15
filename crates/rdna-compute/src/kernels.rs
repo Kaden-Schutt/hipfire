@@ -1402,6 +1402,18 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_LOW_VGPR_GFX1100_SRC: &str = concat!
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// gfx1100 two-group schedule with the product-certified SLC weight policy.
+/// This sits between the 96-VGPR four-group default and the rejected
+/// one-group low-VGPR arm, retaining two independent memory streams.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_PAIR_SLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// Radiowave gfx1100 cache-policy probes. LLVM's raw-buffer auxiliary bits are
 /// GLC=1, SLC=2, and DLC=4 on gfx10/gfx11. Keep them as distinct artifacts so
 /// a model-level exact shadow can select policy without runtime ambiguity.
