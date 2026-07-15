@@ -13972,8 +13972,9 @@ fn forward_lowered_enabled() -> bool {
 /// Decode path that keeps DeltaNet Q/K at their native head count and
 /// lets each pair of value/state heads reuse one Q/K head. The architecture,
 /// Q8-state, and 2:1-head gates keep every other configuration isolated; the
-/// environment variable is a fail-closed escape hatch for gfx1201. gfx1100 is
-/// explicit opt-in because its isolated win did not compose with conv+QK fusion.
+/// environment variable is a fail-closed escape hatch. The compact B2 schedule
+/// is the certified default on gfx1100 and gfx1201; other architectures remain
+/// isolated from the experiment.
 fn gdn_compact2_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
@@ -13981,8 +13982,8 @@ fn gdn_compact2_enabled(
     quant: StateQuant,
 ) -> bool {
     let mode = std::env::var("HIPFIRE_GDN_COMPACT2").ok();
-    let arch_enabled = (gpu.arch_caps.is_gfx1201() && mode.as_deref() != Some("0"))
-        || (gpu.arch_caps.arch() == "gfx1100" && mode.as_deref() == Some("1"));
+    let arch_enabled = (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100")
+        && mode.as_deref() != Some("0");
     arch_enabled && quant == StateQuant::Q8 && config.linear_num_key_heads * 2 == n_v_heads
 }
 
