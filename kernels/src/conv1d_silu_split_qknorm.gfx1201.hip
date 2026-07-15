@@ -32,18 +32,45 @@ __global__ void HIPFIRE_CQN_KERNEL(
     const float* __restrict__ input,
     const float* __restrict__ weight,
     float* __restrict__ state,
+#if defined(HIPFIRE_CQN_SCALAR_PREP)
+    float* __restrict__ beta,
+    float* __restrict__ alpha,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ a_log,
+#endif
     int k_dim,
     int v_dim,
     int n_heads,
     int head_dim,
     float q_scale,
     float eps
+#if defined(HIPFIRE_CQN_SCALAR_PREP)
+    , int n_v_heads
+#endif
 ) {
     __shared__ float q_s[HEADS_PER_WG * HD];
     __shared__ float k_s[HEADS_PER_WG * HD];
 
     const int tid = threadIdx.x;
     const int qk_blocks = (n_heads + HEADS_PER_WG - 1) / HEADS_PER_WG;
+
+#if defined(HIPFIRE_CQN_SCALAR_PREP)
+    // The scalar preparation is independent of the conv/QK-normalization
+    // work. Give it one extra workgroup in this already-required launch; the
+    // launch boundary then orders both products before the GDN consumer.
+    const int v_blocks = (v_dim + HIPFIRE_CQN_BLOCK - 1) / HIPFIRE_CQN_BLOCK;
+    if ((int)blockIdx.x == qk_blocks + v_blocks) {
+        if (tid < n_v_heads) {
+            beta[tid] = 1.0f / (1.0f + expf(-beta[tid]));
+            const float biased = alpha[tid] + dt_bias[tid];
+            const float sp = (biased > 20.0f)
+                ? biased
+                : ((biased < -20.0f) ? expf(biased) : logf(1.0f + expf(biased)));
+            alpha[tid] = sp * (-expf(a_log[tid]));
+        }
+        return;
+    }
+#endif
 
     if ((int)blockIdx.x < qk_blocks) {
 #if HIPFIRE_CQN_BLOCK >= 256

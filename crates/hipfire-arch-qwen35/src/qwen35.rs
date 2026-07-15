@@ -13794,7 +13794,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     ),
                     _ => return Err(HipError::new(0, "ATTEND_DN_PREP on non-DeltaNet layer")),
                 };
-                if !qkvza_scalar_prep_enabled(
+                let qkvza_scalar_prep = qkvza_scalar_prep_enabled(
                     gpu,
                     config,
                     self.n_v_heads,
@@ -13803,7 +13803,15 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     wz,
                     w_beta,
                     w_alpha,
-                ) {
+                );
+                let conv_scalar_prep = !qkvza_scalar_prep
+                    && conv_scalar_prep_enabled(
+                        gpu,
+                        config,
+                        self.n_v_heads,
+                        self.dn_state.quant,
+                    );
+                if !qkvza_scalar_prep && !conv_scalar_prep {
                     gpu.fused_sigmoid_alpha_gate_f32(
                         &s.dn_beta,
                         &s.dn_alpha,
@@ -13813,20 +13821,42 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     )?;
                 }
                 if conv_qknorm_enabled(gpu, config, self.dn_state.quant) {
-                    gpu.conv1d_silu_split_qknorm(
-                        &s.dn_q_raw,
-                        &s.dn_k_raw,
-                        &s.dn_v,
-                        &s.dn_qkv,
-                        conv_weight,
-                        &self.dn_state.conv_states[self.delta_layer_idx],
-                        self.k_dim,
-                        self.v_dim,
-                        config.linear_num_key_heads,
-                        self.hd,
-                        1.0 / (self.hd as f32).sqrt(),
-                        config.norm_eps,
-                    )?;
+                    if conv_scalar_prep {
+                        gpu.conv1d_silu_split_qknorm_scalar_prep_gfx1100(
+                            &s.dn_q_raw,
+                            &s.dn_k_raw,
+                            &s.dn_v,
+                            &s.dn_qkv,
+                            conv_weight,
+                            &self.dn_state.conv_states[self.delta_layer_idx],
+                            &s.dn_beta,
+                            &s.dn_alpha,
+                            dt_bias,
+                            a_log,
+                            self.k_dim,
+                            self.v_dim,
+                            config.linear_num_key_heads,
+                            self.hd,
+                            1.0 / (self.hd as f32).sqrt(),
+                            config.norm_eps,
+                            self.n_v_heads,
+                        )?;
+                    } else {
+                        gpu.conv1d_silu_split_qknorm(
+                            &s.dn_q_raw,
+                            &s.dn_k_raw,
+                            &s.dn_v,
+                            &s.dn_qkv,
+                            conv_weight,
+                            &self.dn_state.conv_states[self.delta_layer_idx],
+                            self.k_dim,
+                            self.v_dim,
+                            config.linear_num_key_heads,
+                            self.hd,
+                            1.0 / (self.hd as f32).sqrt(),
+                            config.norm_eps,
+                        )?;
+                    }
                 } else {
                     gpu.conv1d_silu_split_f32(
                         &s.dn_q_raw,
@@ -14091,6 +14121,30 @@ fn qkvza_scalar_prep_enabled(
         && w_beta.gpu_dtype == dtype
         && w_alpha.gpu_dtype == dtype
         && matches!(dtype, DType::MQ4G256 | DType::HFQ4G256)
+}
+
+/// Radiowave experiment: schedule the independent beta/alpha transforms as
+/// one extra workgroup of the following conv/QK-normalization dispatch. This
+/// keeps the hot QKVZA projection unchanged while deleting the same boundary.
+fn conv_scalar_prep_enabled(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    n_v_heads: usize,
+    quant: StateQuant,
+) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_CONV_SCALAR_PREP")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    let shape = std::env::var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
+    enabled
+        && gpu.arch_caps.is_gfx1100()
+        && n_v_heads <= 256
+        && shape.as_deref().is_none_or(|v| v == "b256")
+        && conv_qknorm_enabled(gpu, config, quant)
 }
 
 fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {

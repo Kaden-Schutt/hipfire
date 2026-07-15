@@ -3455,6 +3455,118 @@ impl Gpu {
         result
     }
 
+    /// gfx1100 decode experiment: use one extra workgroup in the existing
+    /// conv/QK-normalization launch to prepare the independent DeltaNet beta
+    /// and alpha scalars. This removes the standalone scalar launch without
+    /// enlarging the hot QKVZA projection kernel.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_silu_split_qknorm_scalar_prep_gfx1100(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_heads: usize,
+        head_dim: usize,
+        q_scale: f32,
+        eps: f32,
+        n_v_heads: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() || head_dim != 128 || n_v_heads > 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "conv scalar-prep fusion requires gfx1100, head_dim=128, n_v_heads<=256",
+            ));
+        }
+
+        const KERNEL: &str = "conv1d_silu_split_qknorm_b256_scalar_prep";
+        const BLOCK: u32 = 256;
+        self.ensure_kernel(
+            KERNEL,
+            kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC,
+            KERNEL,
+        )?;
+
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let dp = dt_bias.buf.as_ptr();
+        let lp = a_log.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let nvh = n_v_heads as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &nvh as *const _ as *mut c_void,
+        ];
+        let heads_per_wg = BLOCK / 256;
+        let qk_blocks = (n_heads as u32 + heads_per_wg - 1) / heads_per_wg;
+        let v_blocks = (v_dim as u32 + BLOCK - 1) / BLOCK;
+        let grid = qk_blocks + v_blocks + 1;
+        let bytes = crate::profile::conv1d_silu_bytes(2 * k_dim + v_dim)
+            + n_v_heads * 4 * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
+        let result = self.launch_maybe_blob(KERNEL, [grid, 1, 1], [BLOCK, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp);
+            b.push_ptr(kp);
+            b.push_ptr(vp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_ptr(sp);
+            b.push_ptr(bp);
+            b.push_ptr(ap);
+            b.push_ptr(dp);
+            b.push_ptr(lp);
+            b.push_i32(kd);
+            b.push_i32(vd);
+            b.push_i32(nh);
+            b.push_i32(hd);
+            b.push_f32(qs);
+            b.push_f32(ep);
+            b.push_i32(nvh);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched conv1d + silu + Q/K/V split. Processes `n_tokens` tokens in
     /// order through the conv, advancing the ring-buffer state N times
     /// (identical state trajectory to calling the single-token variant N

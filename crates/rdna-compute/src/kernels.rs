@@ -3585,6 +3585,12 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B256_SRC: &str = concat!(
     "#define HIPFIRE_CQN_BLOCK 256\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b256\n",
     include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
 );
+pub const CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC: &str = concat!(
+    "#define HIPFIRE_CQN_BLOCK 256\n",
+    "#define HIPFIRE_CQN_SCALAR_PREP 1\n",
+    "#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b256_scalar_prep\n",
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
+);
 pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
     "#define HIPFIRE_CQN_BLOCK 512\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b512\n",
     include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
