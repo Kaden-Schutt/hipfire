@@ -630,6 +630,7 @@ fn pm4_phase_plan(
     recorded: &[RecordedHipLaunch],
     min_parallel_width: usize,
     min_parallel_workgroups: u64,
+    max_parallel_phases: usize,
 ) -> Vec<Pm4PhasePlan> {
     let min_parallel_width = min_parallel_width.max(2);
     let mut antichains = Vec::<Vec<usize>>::new();
@@ -647,6 +648,7 @@ fn pm4_phase_plan(
     }
 
     let mut phases = Vec::<Pm4PhasePlan>::new();
+    let mut parallel_phases = 0_usize;
     for indices in antichains {
         let workgroups = indices.iter().fold(0_u64, |total, index| {
             let launch = &recorded[*index];
@@ -657,7 +659,11 @@ fn pm4_phase_plan(
             total.saturating_add(launch_workgroups)
         });
         let parallel = indices.len() >= min_parallel_width
-            && workgroups >= min_parallel_workgroups;
+            && workgroups >= min_parallel_workgroups
+            && parallel_phases < max_parallel_phases;
+        if parallel {
+            parallel_phases += 1;
+        }
         if !parallel && phases.last().is_some_and(|phase| !phase.parallel) {
             phases.last_mut().unwrap().indices.extend(indices);
         } else {
@@ -686,6 +692,17 @@ fn pm4_min_parallel_workgroups_from_env() -> u64 {
             "WARNING: HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WORKGROUPS={value:?}: expected nonnegative integer; using 0"
         );
         0
+    })
+}
+
+fn pm4_max_parallel_phases_from_env() -> usize {
+    let value = std::env::var("HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES")
+        .unwrap_or_else(|_| usize::MAX.to_string());
+    value.parse::<usize>().unwrap_or_else(|_| {
+        eprintln!(
+            "WARNING: HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES={value:?}: expected nonnegative integer; using unlimited"
+        );
+        usize::MAX
     })
 }
 
@@ -1810,11 +1827,13 @@ impl ReplayController {
         } else {
             let min_parallel_width = pm4_min_parallel_width_from_env();
             let min_parallel_workgroups = pm4_min_parallel_workgroups_from_env();
+            let max_parallel_phases = pm4_max_parallel_phases_from_env();
             let native_phase_sync = pm4_native_phase_sync_from_env();
             let plans = pm4_phase_plan(
                 &self.recorded[..prefix],
                 min_parallel_width,
                 min_parallel_workgroups,
+                max_parallel_phases,
             );
             let parallel_phases = plans.iter().filter(|phase| phase.parallel).count();
             let max_width = plans
@@ -1928,7 +1947,7 @@ impl ReplayController {
             )?;
             debug_assert_eq!(graph.queue_count(), max_queue_count);
             eprintln!(
-                "[redline] PM4 phase plan architecture={} queues={} phases={} parallel_phases={} parallel_launches={} max_width={} min_parallel_width={} min_parallel_workgroups={} sync={}",
+                "[redline] PM4 phase plan architecture={} queues={} phases={} parallel_phases={} parallel_launches={} max_width={} min_parallel_width={} min_parallel_workgroups={} max_parallel_phases={} sync={}",
                 device.name(),
                 graph.queue_count(),
                 graph.phase_count(),
@@ -1937,6 +1956,7 @@ impl ReplayController {
                 max_width,
                 min_parallel_width,
                 min_parallel_workgroups,
+                max_parallel_phases,
                 if native_phase_sync { "native" } else { "aql" },
             );
             (PreparedPm4Graph::Phased(graph), command_dwords)
@@ -2628,7 +2648,7 @@ mod tests {
         ];
 
         assert_eq!(
-            pm4_phase_plan(&recorded, 2, 0),
+            pm4_phase_plan(&recorded, 2, 0, usize::MAX),
             vec![
                 Pm4PhasePlan {
                     indices: vec![0, 1],
@@ -2636,6 +2656,23 @@ mod tests {
                 },
                 Pm4PhasePlan {
                     indices: vec![2, 3, 4],
+                    parallel: false,
+                },
+            ]
+        );
+
+        let mut two_parallel_phases = recorded[..2].to_vec();
+        two_parallel_phases.push(launch("read_a", 0x1000, RecordedAccessMode::Read));
+        two_parallel_phases.push(launch("read_b", 0x2000, RecordedAccessMode::Read));
+        assert_eq!(
+            pm4_phase_plan(&two_parallel_phases, 2, 0, 1),
+            vec![
+                Pm4PhasePlan {
+                    indices: vec![0, 1],
+                    parallel: true,
+                },
+                Pm4PhasePlan {
+                    indices: vec![2, 3],
                     parallel: false,
                 },
             ]
@@ -2660,7 +2697,12 @@ mod tests {
             }]),
         };
         assert_eq!(
-            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 0),
+            pm4_phase_plan(
+                &[read("read_a"), read("read_a_again")],
+                2,
+                0,
+                usize::MAX,
+            ),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: true,
@@ -2680,6 +2722,7 @@ mod tests {
                 ],
                 2,
                 0,
+                usize::MAX,
             ),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
@@ -2687,14 +2730,24 @@ mod tests {
             }]
         );
         assert_eq!(
-            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 3, 0),
+            pm4_phase_plan(
+                &[read("read_a"), read("read_a_again")],
+                3,
+                0,
+                usize::MAX,
+            ),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
             }]
         );
         assert_eq!(
-            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 3),
+            pm4_phase_plan(
+                &[read("read_a"), read("read_a_again")],
+                2,
+                3,
+                usize::MAX,
+            ),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
