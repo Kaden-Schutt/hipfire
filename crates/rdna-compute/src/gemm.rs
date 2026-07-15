@@ -2366,7 +2366,8 @@ impl Gpu {
             return self.fused_qkv_hfq4g256_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k);
         }
 
-        let cdna_wave64 = self.arch_caps.is_wave64_native();
+        let cdna_wave64 = self.arch_caps.is_wave64_native()
+            || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let (func_name, block, grid_x) = if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
@@ -2499,7 +2500,8 @@ impl Gpu {
         // 2 rows per block, halves grid count vs wave32 kernel which wastes half
         // the wave slot. This kernel uses no MFMA, just FMA + shfl_down within
         // wave64, so it is safe for Vega 20 as well as CDNA.
-        let cdna_wave64 = self.arch_caps.is_wave64_native();
+        let cdna_wave64 = self.arch_caps.is_wave64_native()
+            || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let (func_name, block, grid_x) = if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via

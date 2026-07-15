@@ -2096,8 +2096,12 @@ impl Gpu {
                 // wavefront pressure in half on the hottest kernels. Wave32
                 // block=[32,1,1] kernels otherwise waste the upper 32 lanes
                 // of every wave slot on these wave64-native arches.
-                if self.arch_caps.is_wave64_native() {
-                    // Single-token (draft / single-layer paths).
+                if self.arch_caps.is_wave64_native()
+                    || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
+                {
+                    // Single-token QKV paths. RDNA3 may opt into Radiowave's
+                    // explicit wave64 packing experiment; native-wave64
+                    // targets retain their established selection.
                     specs.push((
                         "fused_qkvza_hfq4g256_wave64",
                         kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
@@ -2106,6 +2110,9 @@ impl Gpu {
                         "fused_qkv_hfq4g256_wave64",
                         kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string(),
                     ));
+                }
+                if self.arch_caps.is_wave64_native() {
+                    // Remaining single-token and batched native-wave64 paths.
                     specs.push((
                         "fused_gate_up_hfq4g256_wave64",
                         kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string(),
@@ -2188,8 +2195,12 @@ impl Gpu {
                     kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string(),
                 ));
                 // gfx906/gfx908/gfx94x wave64 variants — see hfq4 branch for rationale.
-                if self.arch_caps.is_wave64_native() {
-                    // Single-token (draft / single-layer paths).
+                if self.arch_caps.is_wave64_native()
+                    || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
+                {
+                    // Single-token QKV paths. RDNA3 may opt into Radiowave's
+                    // explicit wave64 packing experiment; native-wave64
+                    // targets retain their established selection.
                     specs.push((
                         "fused_qkvza_hfq4g256_wave64",
                         kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
@@ -2198,6 +2209,9 @@ impl Gpu {
                         "fused_qkv_hfq4g256_wave64",
                         kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string(),
                     ));
+                }
+                if self.arch_caps.is_wave64_native() {
+                    // Remaining single-token and batched native-wave64 paths.
                     specs.push((
                         "fused_gate_up_hfq4g256_wave64",
                         kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string(),

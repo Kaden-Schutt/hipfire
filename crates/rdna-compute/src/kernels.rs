@@ -1153,15 +1153,23 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 // v3: wide-unroll    — launch_bounds(32,12), 4x unroll, ~85 VGPRs
 // v4: dp4a-packed    — launch_bounds(32,16), dp4a intrinsics, factored scale/zero
 // v5: cache-aggressive — launch_bounds(32,16), 2x unroll, packed loads, factored math
-pub const GEMV_HFQ4G256_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
+pub const GEMV_HFQ4G256_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
-pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str =
@@ -2307,8 +2315,10 @@ pub const FUSED_QKVZA_HFQ4G256_SRC: &str = concat!(
 // CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
 // to (total_m+1)/2. Byte-exact vs the wave32 base kernel.
-pub const FUSED_QKVZA_HFQ4G256_WAVE64_SRC: &str =
-    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64.hip");
+pub const FUSED_QKVZA_HFQ4G256_WAVE64_SRC: &str = concat!(
+    "// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n",
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64.hip")
+);
 // gfx906 dp4a-port — see fused_gate_up_hfq4g256_wave64_dp4a.hip for the
 // math derivation and lane-mapping invariants.
 pub const FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str =
@@ -2325,8 +2335,10 @@ pub const FUSED_QKV_HFQ4G256_SRC: &str = concat!(
 
 // CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
 // block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
-pub const FUSED_QKV_HFQ4G256_WAVE64_SRC: &str =
-    include_str!("../../../kernels/src/fused_qkv_hfq4g256_wave64.hip");
+pub const FUSED_QKV_HFQ4G256_WAVE64_SRC: &str = concat!(
+    "// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n",
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256_wave64.hip")
+);
 // gfx906 dp4a-port — see fused_gate_up_hfq4g256_wave64_dp4a.hip for the
 // math derivation and lane-mapping invariants.
 pub const FUSED_QKV_HFQ4G256_WAVE64_DP4A_SRC: &str =

@@ -37,6 +37,10 @@ pub struct FeatureFlags {
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
+    /// Radiowave experiment: pack two independent HFQ4 QKV rows into one
+    /// explicitly compiled wave64 on RDNA3. Default off until model-level
+    /// correctness and throughput gates promote it.
+    pub rdna3_hfq4_qkv_wave64: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -180,6 +184,27 @@ impl FeatureFlags {
         };
 
         let mut hipcc_extra_flags = std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
+        let mut append_hipcc_flag = |flag: &str| {
+            if !hipcc_extra_flags.is_empty() {
+                hipcc_extra_flags.push(' ');
+            }
+            hipcc_extra_flags.push_str(flag);
+        };
+        if arch == "gfx1100" {
+            match std::env::var("HIPFIRE_GFX11_WEIGHT_LOAD_POLICY")
+                .ok()
+                .as_deref()
+            {
+                None | Some("") | Some("buffer") => {}
+                Some("global") => append_hipcc_flag("-DHIPFIRE_GFX11_WEIGHT_GLOBAL_LOADS=1"),
+                Some("flat-buffer") => {
+                    append_hipcc_flag("-DHIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN=1")
+                }
+                Some(other) => {
+                    eprintln!("unknown HIPFIRE_GFX11_WEIGHT_LOAD_POLICY={other:?}; using buffer")
+                }
+            }
+        }
         if arch == "gfx1201" {
             let policy_flag = match std::env::var("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY")
                 .ok()
@@ -196,10 +221,7 @@ impl FeatureFlags {
                 }
             };
             if let Some(flag) = policy_flag {
-                if !hipcc_extra_flags.is_empty() {
-                    hipcc_extra_flags.push(' ');
-                }
-                hipcc_extra_flags.push_str(flag);
+                append_hipcc_flag(flag);
             }
         }
 
@@ -229,6 +251,8 @@ impl FeatureFlags {
             fp8_wmma: std::env::var("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: std::env::var("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
+            rdna3_hfq4_qkv_wave64: std::env::var("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref()
+                == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -448,6 +472,7 @@ impl FeatureFlags {
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
+            rdna3_hfq4_qkv_wave64: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,

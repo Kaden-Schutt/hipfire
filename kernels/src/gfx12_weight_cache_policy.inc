@@ -10,12 +10,18 @@
 // Earlier RDNA generations use cache-policy zero for ordinary temporal reuse.
 //
 // This preamble is concatenated ahead of selected HFQ4 kernel sources by
-// kernels.rs. gfx1201 defaults to buffer RT after matched model-level gates.
-// Other targets remain byte-identical unless Radiowave explicitly selects
-// HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN. HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS keeps
-// the historical global-load control spelling for existing experiments.
+// kernels.rs. gfx1201 defaults to buffer RT after matched model-level gates;
+// gfx1100 now defaults to temporal buffer addressing after its own exact
+// model-level A/B. Other targets remain byte-identical unless Radiowave
+// explicitly selects HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN. Flat gfx1100 GEMV
+// stays global unless HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN is set.
+// HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS keeps the historical gfx12 control.
 #if defined(HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE) && \
-    (defined(__gfx1201__) || defined(HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN)) && \
+    (defined(__gfx1201__) || defined(__gfx1100__) || \
+     defined(HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN)) && \
+    (!defined(HIPFIRE_WEIGHT_CACHE_FLAT_GEMV) || \
+     defined(HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN)) && \
+    !defined(HIPFIRE_GFX11_WEIGHT_GLOBAL_LOADS) && \
     !defined(HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS)
 #ifndef HIPFIRE_WEIGHT_CPOL_AUX
 #if defined(__gfx1201__)
