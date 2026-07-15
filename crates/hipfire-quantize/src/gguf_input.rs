@@ -33,6 +33,7 @@ pub enum GgmlType {
     Q6K = 14,
     Q8K = 15,
     BF16 = 30,
+    Q2_0 = 42,
 }
 
 impl GgmlType {
@@ -53,6 +54,7 @@ impl GgmlType {
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
             30 => Some(Self::BF16),
+            42 => Some(Self::Q2_0),
             _ => None,
         }
     }
@@ -62,6 +64,7 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::Q2_0 => 128,
         }
     }
 
@@ -81,6 +84,7 @@ impl GgmlType {
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 290,
+            Self::Q2_0 => 34,
         }
     }
 
@@ -204,7 +208,12 @@ impl GgufFile {
                 )
             })?;
             let offset = cursor.read_u64::<LittleEndian>()? as usize;
-            tensors.push(TensorInfo { name, shape, dtype, offset });
+            tensors.push(TensorInfo {
+                name,
+                shape,
+                dtype,
+                offset,
+            });
         }
 
         let alignment = metadata
@@ -500,10 +509,18 @@ fn dequant_q6_k(data: &[u8], n: usize) -> Vec<f32> {
                 let idx1 = y_off + l + 32;
                 let idx2 = y_off + l + 64;
                 let idx3 = y_off + l + 96;
-                if idx0 < n { out[idx0] = d * sc[is] as i8 as f32 * q1 as f32; }
-                if idx1 < n { out[idx1] = d * sc[is + 2] as i8 as f32 * q2 as f32; }
-                if idx2 < n { out[idx2] = d * sc[is + 4] as i8 as f32 * q3 as f32; }
-                if idx3 < n { out[idx3] = d * sc[is + 6] as i8 as f32 * q4 as f32; }
+                if idx0 < n {
+                    out[idx0] = d * sc[is] as i8 as f32 * q1 as f32;
+                }
+                if idx1 < n {
+                    out[idx1] = d * sc[is + 2] as i8 as f32 * q2 as f32;
+                }
+                if idx2 < n {
+                    out[idx2] = d * sc[is + 4] as i8 as f32 * q3 as f32;
+                }
+                if idx3 < n {
+                    out[idx3] = d * sc[is + 6] as i8 as f32 * q4 as f32;
+                }
             }
             ql = &ql[64..];
             qh = &qh[32..];
@@ -547,5 +564,17 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
             "GGUF tensor type {:?} not implemented (tensor: {})",
             other, info.name
         ),
+    }
+}
+
+#[cfg(test)]
+mod q2_0_tests {
+    use super::*;
+    #[test]
+    fn q2_0_type_params() {
+        let t = GgmlType::from_u32(42).expect("ggml_type 42 = Q2_0");
+        assert_eq!(t, GgmlType::Q2_0);
+        assert_eq!(t.block_size(), 128);
+        assert_eq!(t.block_bytes(), 34); // 2 (FP16 d) + 32 (2-bit x 128)
     }
 }
