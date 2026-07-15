@@ -58,6 +58,9 @@ pub struct FeatureFlags {
     /// Compile the shared-expert sigmoid-scaled down kernel with gfx1100
     /// temporal buffer-resource weight loads instead of global addressing.
     pub rdna3_hfq4_sigmoid_buffer: bool,
+    /// Schedule four shared-expert down rows per wave on gfx1100, reusing
+    /// each activation load across four independent weight streams.
+    pub rdna3_hfq4_sigmoid_rows4: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -287,6 +290,11 @@ impl FeatureFlags {
             )
             .as_deref()
                 == Ok("1"),
+            rdna3_hfq4_sigmoid_rows4: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4",
+            )
+            .as_deref()
+                == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -512,6 +520,7 @@ impl FeatureFlags {
             rdna3_hfq4_residual_stage_x32: false,
             rdna3_hfq4_sigmoid_tight_grid: false,
             rdna3_hfq4_sigmoid_buffer: false,
+            rdna3_hfq4_sigmoid_rows4: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,

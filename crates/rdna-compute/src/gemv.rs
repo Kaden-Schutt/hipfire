@@ -4923,9 +4923,21 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module, source) = if self.arch_caps.is_rdna3_dgpu()
-            && self.flags.rdna3_hfq4_sigmoid_buffer
-        {
+        let rdna3_rows4 = self.arch_caps.is_rdna3_dgpu()
+            && self.flags.rdna3_hfq4_sigmoid_rows4;
+        let rdna3_buffer = self.arch_caps.is_rdna3_dgpu()
+            && self.flags.rdna3_hfq4_sigmoid_buffer;
+        let (module, source) = if rdna3_rows4 && rdna3_buffer {
+            (
+                "gemv_hfq4g256_residual_sigmoid_rows4_buffer_gfx1100",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_ROWS4_BUFFER_GFX1100_SRC,
+            )
+        } else if rdna3_rows4 {
+            (
+                "gemv_hfq4g256_residual_sigmoid_rows4_gfx1100",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_ROWS4_GFX1100_SRC,
+            )
+        } else if rdna3_buffer {
             (
                 "gemv_hfq4g256_residual_sigmoid_buffer_gfx1100",
                 kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC,
@@ -4962,7 +4974,9 @@ impl Gpu {
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
             bytes,
         );
-        let grid_m = if self.arch_caps.is_rdna3_dgpu()
+        let grid_m = if rdna3_rows4 {
+            m.div_ceil(4)
+        } else if self.arch_caps.is_rdna3_dgpu()
             && self.flags.rdna3_hfq4_sigmoid_tight_grid
         {
             m.div_ceil(2)

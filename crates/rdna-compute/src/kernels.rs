@@ -1206,6 +1206,16 @@ pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
 );
+pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_ROWS4_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_SIGMOID_ROWS4 1\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
+);
+pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_ROWS4_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    "#define HIPFIRE_RDNA3_SIGMOID_ROWS4 1\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
+);
 
 /// HFQ6/MQ6-G256 batched GEMV with fused sigmoid-scaled residual:
 ///   y_batch[bid,row] += sigmoid(c_batch[bid]) * (A[row] · x_batch[bid]).
