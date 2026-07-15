@@ -601,6 +601,29 @@ fn dequant_tq2_to_f32(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// BQ1G128 binary block → F32, GPU-free pure fn (unit-testable in isolation
+/// from `dequant_f32`, which needs a `Gpu` to upload). Block layout (18
+/// bytes / 128-elem group): `[FP16 d (2B)][16 packed sign-bit bytes,
+/// LSB-first]`; element `e` reads byte `2 + e/8`, bit `e % 8`; `value =
+/// bit ? +d : -d`. Mirrors the proven Task-9 GPU/CPU oracle in
+/// `crates/rdna-compute/examples/test_dequant_bq1g128.rs` and the
+/// `dequant_bq1g128_to_f16.hip` kernel body.
+fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
+    const BLK: usize = 18;
+    let nblocks = n / 128;
+    let mut out = Vec::with_capacity(n);
+    for b in 0..nblocks {
+        let base = b * BLK;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        for j in 0..128 {
+            let byte = data[base + 2 + (j >> 3)];
+            let bit = (byte >> (j & 7)) & 1;
+            out.push(if bit == 1 { d } else { -d });
+        }
+    }
+    out
+}
+
 pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipResult<GpuTensor> {
     let f32_data: Vec<f32> = match quant_type {
         1 => data
@@ -959,6 +982,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
             out
         }
         38 => dequant_tq2_to_f32(data, n),
+        39 => dequant_bq1_to_f32(data, n),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     };
     gpu.upload_f32(&f32_data[..n], &[n])
