@@ -14241,10 +14241,12 @@ fn gdn_compact2_enabled(
     arch_enabled && quant == StateQuant::Q8 && config.linear_num_key_heads * 2 == n_v_heads
 }
 
-/// Radiowave experiment: keep DeltaNet's normalized output on chip and feed
-/// the exact MQ rotation directly from LDS. The fixed gfx1100 A3B shape lets
-/// two independent 128-value heads form one 256-value MQ group without
-/// changing either operation's arithmetic order.
+/// Certified gfx1100 Radiowave schedule: keep DeltaNet's normalized output on
+/// chip and feed the exact MQ rotation directly from LDS. The fixed A3B shape
+/// lets two independent 128-value heads form one 256-value MQ group without
+/// changing either operation's arithmetic order. Enabled by default for the
+/// admitted shape; set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore the two-
+/// dispatch schedule.
 fn gated_norm_mq_rotate_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
@@ -14256,7 +14258,7 @@ fn gated_norm_mq_rotate_enabled(
         std::env::var("HIPFIRE_GATED_NORM_MQ_ROTATE")
             .ok()
             .as_deref()
-            == Some("1")
+            != Some("0")
     });
     enabled
         && gpu.arch_caps.is_gfx1100()
