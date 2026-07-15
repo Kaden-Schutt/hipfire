@@ -4609,7 +4609,15 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
+        let (src, module) =
+            if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_residual_stage_x32 {
+                (
+                    kernels::GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC,
+                    "gemv_hfq4g256_residual_stage_x32_gfx1100",
+                )
+            } else {
+                kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps)
+            };
         self.ensure_kernel(module, src, "gemv_hfq4g256_residual")?;
 
         let a_ptr = a_raw.buf.as_ptr();

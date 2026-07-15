@@ -3343,7 +3343,7 @@ impl Gpu {
         self.conv1d_silu_split_f32_n(q_out, k_out, v_out, input, weight, state, k_dim, v_dim, 1)
     }
 
-    /// gfx1201 decode-only conv+SiLU+Q/K normalization fusion. The five
+    /// gfx1100/gfx1201 decode-only conv+SiLU+Q/K normalization fusion. The five
     /// compile-time block shapes are intentionally separate kernels so the
     /// screen changes cooperative work distribution rather than only metadata.
     #[cfg(feature = "deltanet")]

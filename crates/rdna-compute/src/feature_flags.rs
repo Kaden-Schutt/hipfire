@@ -44,6 +44,13 @@ pub struct FeatureFlags {
     /// Radiowave experiment: split each gfx1100 QKVZA output row across two
     /// lighter wave32s and join their partials through LDS.
     pub rdna3_hfq4_qkvza_2wave: bool,
+    /// Radiowave experiment: port the gfx12 QKVZA float4 activation-hoist
+    /// schedule to gfx1100 while retaining one independent wave per row.
+    pub rdna3_hfq4_qkvza_hoist_x32: bool,
+    /// Stage one residual GEMV row's 32 activation values ahead of the
+    /// independent packed-weight loads. Certified default on exact gfx1100;
+    /// other RDNA3 targets remain explicit opt-in until separately measured.
+    pub rdna3_hfq4_residual_stage_x32: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -258,6 +265,11 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_hfq4_qkvza_2wave: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
                 == Ok("1"),
+            rdna3_hfq4_qkvza_hoist_x32: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
+                .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
+                .unwrap_or(arch == "gfx1100"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -479,6 +491,8 @@ impl FeatureFlags {
             gcn5_wave64_hybrid: None,
             rdna3_hfq4_qkv_wave64: false,
             rdna3_hfq4_qkvza_2wave: false,
+            rdna3_hfq4_qkvza_hoist_x32: false,
+            rdna3_hfq4_residual_stage_x32: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,

@@ -31,8 +31,35 @@ extern "C" __global__ void gemv_hfq4g256_residual(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+    #define DOG_X8(pk, sc, zp, a, xa, xb) \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * (xa).x \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (xa).y \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (xa).z \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (xa).w \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (xb).x \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (xb).y \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (xb).z \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (xb).w
+#endif
+
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
+        const int base = g * 256 + tid * 8;
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+        // RDNA3 oracle: issue the full activation quad before the independent
+        // header/packed-weight stream, then give LLVM a load-free VALU burst.
+        // This preserves one output row per wave (unlike the gfx12 dual-row
+        // kernel) so gfx1100 keeps enough blocks to occupy all 96 CUs.
+        const float4 x0a = *reinterpret_cast<const float4*>(x + base);
+        const float4 x0b = *reinterpret_cast<const float4*>(x + base + 4);
+        const float4 x1a = *reinterpret_cast<const float4*>(x + base + 256);
+        const float4 x1b = *reinterpret_cast<const float4*>(x + base + 260);
+        const float4 x2a = *reinterpret_cast<const float4*>(x + base + 512);
+        const float4 x2b = *reinterpret_cast<const float4*>(x + base + 516);
+        const float4 x3a = *reinterpret_cast<const float4*>(x + base + 768);
+        const float4 x3b = *reinterpret_cast<const float4*>(x + base + 772);
+#endif
         const char* gp0 = row_ptr + g * 136;
         const char* gp1 = gp0 + 136;
         const char* gp2 = gp1 + 136;
@@ -52,8 +79,12 @@ extern "C" __global__ void gemv_hfq4g256_residual(
         unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
         unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
 
-        int base = g * 256 + tid * 8;
-
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+        DOG_X8(pk0, sc0, zp0, acc0, x0a, x0b);
+        DOG_X8(pk1, sc1, zp1, acc1, x1a, x1b);
+        DOG_X8(pk2, sc2, zp2, acc2, x2a, x2b);
+        DOG_X8(pk3, sc3, zp3, acc3, x3a, x3b);
+#else
         #define DOG(pk, sc, zp, b, a) \
             (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
                  + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -69,11 +100,13 @@ extern "C" __global__ void gemv_hfq4g256_residual(
         DOG(pk2, sc2, zp2, base + 512, acc2);
         DOG(pk3, sc3, zp3, base + 768, acc3);
         #undef DOG
+#endif
     }
 
     // Tail groups must accumulate into their own accumulator (acc[g % 4]) —
     // see gemv_hfq4g256.gfx1100.hip for the full bug explanation. Breaks
     // MQ4 4B / 0.8B quality when groups_per_row isn't a multiple of 4.
+#if !HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
     #define TAIL_DOG(pk, sc, zp, b, a) \
         (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -83,35 +116,64 @@ extern "C" __global__ void gemv_hfq4g256_residual(
              + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
              + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
              + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+#endif
 
     if (tail >= 1) {
         const int g = quads << 2;
+        const int base = g * 256 + tid * 8;
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+        const float4 xa = *reinterpret_cast<const float4*>(x + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+#endif
         const char* gp = row_ptr + g * 136;
         float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
         float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
         unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
-        int base = g * 256 + tid * 8;
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+        DOG_X8(pk, sc, zp, acc0, xa, xb);
+#else
         TAIL_DOG(pk, sc, zp, base, acc0);
+#endif
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
+        const int base = g * 256 + tid * 8;
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+        const float4 xa = *reinterpret_cast<const float4*>(x + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+#endif
         const char* gp = row_ptr + g * 136;
         float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
         float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
         unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
-        int base = g * 256 + tid * 8;
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+        DOG_X8(pk, sc, zp, acc1, xa, xb);
+#else
         TAIL_DOG(pk, sc, zp, base, acc1);
+#endif
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
+        const int base = g * 256 + tid * 8;
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+        const float4 xa = *reinterpret_cast<const float4*>(x + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+#endif
         const char* gp = row_ptr + g * 136;
         float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
         float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
         unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
-        int base = g * 256 + tid * 8;
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+        DOG_X8(pk, sc, zp, acc2, xa, xb);
+#else
         TAIL_DOG(pk, sc, zp, base, acc2);
+#endif
     }
+#if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+    #undef DOG_X8
+#else
     #undef TAIL_DOG
+#endif
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)

@@ -2080,10 +2080,17 @@ impl Gpu {
                 // gate+up). Cross-arch — same 4-accumulator inner loop as
                 // gemv_hfq4g256.hip; precompile on every arch that uses
                 // the HFQ4 weight path.
-                specs.push((
-                    "fused_qkvza_hfq4g256",
-                    kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
-                ));
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_hoist_x32 {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_hoist_x32_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC.to_string(),
+                    ));
+                } else {
+                    specs.push((
+                        "fused_qkvza_hfq4g256",
+                        kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
+                    ));
+                }
                 if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave {
                     specs.push((
                         "fused_qkvza_hfq4g256_2wave",
@@ -2180,10 +2187,17 @@ impl Gpu {
                     kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
-                specs.push((
-                    "fused_qkvza_hfq4g256",
-                    kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
-                ));
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_hoist_x32 {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_hoist_x32_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC.to_string(),
+                    ));
+                } else {
+                    specs.push((
+                        "fused_qkvza_hfq4g256",
+                        kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
+                    ));
+                }
                 if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave {
                     specs.push((
                         "fused_qkvza_hfq4g256_2wave",

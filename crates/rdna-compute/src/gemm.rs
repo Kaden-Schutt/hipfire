@@ -2500,7 +2500,14 @@ impl Gpu {
         // 2 rows per block, halves grid count vs wave32 kernel which wastes half
         // the wave slot. This kernel uses no MFMA, just FMA + shfl_down within
         // wave64, so it is safe for Vega 20 as well as CDNA.
-        let rdna3_2wave = self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave;
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        // gfx1100 has 96 CUs: the 1,281-row DeltaNet shape exposes only
+        // 13.3 independent waves/CU, while the 12,352-row shape already has
+        // ample scheduler freedom. Keep the cooperative split restricted to
+        // the genuinely underfilled shape instead of paying its LDS join on
+        // every QKVZA projection.
+        let rdna3_2wave =
+            self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave && total_m <= 2_048;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let (func_name, block, grid_x) = if rdna3_2wave {
@@ -2509,11 +2516,7 @@ impl Gpu {
                 kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC,
                 "fused_qkvza_hfq4g256_2wave",
             )?;
-            (
-                "fused_qkvza_hfq4g256_2wave",
-                [64u32, 1, 1],
-                (qkv_m + z_m + beta_m + alpha_m) as u32,
-            )
+            ("fused_qkvza_hfq4g256_2wave", [64u32, 1, 1], total_m as u32)
         } else if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
@@ -2526,7 +2529,7 @@ impl Gpu {
                     kernels::FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC,
                     "fused_qkvza_hfq4g256_v2_gfx942",
                 )?;
-                let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+                let total = total_m as u32;
                 (
                     "fused_qkvza_hfq4g256_v2_gfx942",
                     [128u32, 1, 1],
@@ -2538,7 +2541,7 @@ impl Gpu {
                     kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
                     "fused_qkvza_hfq4g256_wave64",
                 )?;
-                let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+                let total = total_m as u32;
                 (
                     "fused_qkvza_hfq4g256_wave64",
                     [64u32, 1, 1],
@@ -2546,16 +2549,17 @@ impl Gpu {
                 )
             }
         } else {
-            self.ensure_kernel(
-                "fused_qkvza_hfq4g256",
-                kernels::FUSED_QKVZA_HFQ4G256_SRC,
-                "fused_qkvza_hfq4g256",
-            )?;
-            (
-                "fused_qkvza_hfq4g256",
-                [32u32, 1, 1],
-                (qkv_m + z_m + beta_m + alpha_m) as u32,
-            )
+            let (module, source) =
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_hoist_x32 {
+                    (
+                        "fused_qkvza_hfq4g256_hoist_x32_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC,
+                    )
+                } else {
+                    ("fused_qkvza_hfq4g256", kernels::FUSED_QKVZA_HFQ4G256_SRC)
+                };
+            self.ensure_kernel(module, source, "fused_qkvza_hfq4g256")?;
+            ("fused_qkvza_hfq4g256", [32u32, 1, 1], total_m as u32)
         };
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();

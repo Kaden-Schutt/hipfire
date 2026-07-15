@@ -13961,27 +13961,28 @@ fn forward_lowered_enabled() -> bool {
     *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
-/// gfx1201 decode path that keeps DeltaNet Q/K at their native head count and
+/// Decode path that keeps DeltaNet Q/K at their native head count and
 /// lets each pair of value/state heads reuse one Q/K head. The architecture,
 /// Q8-state, and 2:1-head gates keep every other configuration isolated; the
-/// environment variable is a fail-closed escape hatch for product rollback.
+/// environment variable is a fail-closed escape hatch for gfx1201. gfx1100 is
+/// explicit opt-in because its isolated win did not compose with conv+QK fusion.
 fn gdn_compact2_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
     quant: StateQuant,
 ) -> bool {
-    gpu.arch_caps.is_gfx1201()
-        && quant == StateQuant::Q8
-        && config.linear_num_key_heads * 2 == n_v_heads
-        && std::env::var("HIPFIRE_GDN_COMPACT2").ok().as_deref() != Some("0")
+    let mode = std::env::var("HIPFIRE_GDN_COMPACT2").ok();
+    let arch_enabled = (gpu.arch_caps.is_gfx1201() && mode.as_deref() != Some("0"))
+        || (gpu.arch_caps.arch() == "gfx1100" && mode.as_deref() == Some("1"));
+    arch_enabled && quant == StateQuant::Q8 && config.linear_num_key_heads * 2 == n_v_heads
 }
 
 fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
-    gpu.arch_caps.is_gfx1201()
-        && quant == StateQuant::Q8
-        && config.linear_key_head_dim == 128
-        && std::env::var("HIPFIRE_CONV_QKNORM").ok().as_deref() != Some("0")
+    let mode = std::env::var("HIPFIRE_CONV_QKNORM").ok();
+    let arch_enabled = (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100")
+        && mode.as_deref() != Some("0");
+    arch_enabled && quant == StateQuant::Q8 && config.linear_key_head_dim == 128
 }
 
 /// Lowered (#397 Ship 6) single-GPU decode layer loop. Behaviorally equivalent

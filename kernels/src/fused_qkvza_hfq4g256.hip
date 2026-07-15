@@ -119,15 +119,15 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
 
         int base = g * 256 + tid * 8;
 
-        // R-hoist_x32 (gfx12): vectorize x as float4 pairs BEFORE the DOG FMAs,
+        // R-hoist_x32: vectorize x as float4 pairs BEFORE the DOG FMAs,
         // matching the winning gate_up R20c2_hoist_x32. Bit-exact — a float4 load of
         // contiguous x is the same 8 values as scalar x[base..base+7], just one
         // 128-bit load instead of 8 scalar loads (more in-flight bytes → higher
-        // mem_busy on the L2-resident-but-mem-busy-41% qkvza). gfx12-gated so
-        // gfx11/gfx10 compile BYTE-IDENTICALLY: the float4 hoist raises VGPR ~72→96,
-        // which only helps where there's occupancy room (gfx1201, occ~35%); on the
-        // gfx1100 launch_bounds target it would cut occupancy.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+        // mem_busy on the L2-resident-but-mem-busy-41% qkvza). Default gfx12;
+        // Radiowave can opt gfx1100 into the same schedule after checking emitted
+        // register pressure and model-level throughput. Other gfx11/gfx10 builds
+        // retain the original scalar path byte-for-byte.
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(HIPFIRE_RDNA3_QKVZA_HOIST_X32)
         const float4 xv0a = *reinterpret_cast<const float4*>(x + base);
         const float4 xv0b = *reinterpret_cast<const float4*>(x + base + 4);
         const float4 xv1a = *reinterpret_cast<const float4*>(x + base + 256);

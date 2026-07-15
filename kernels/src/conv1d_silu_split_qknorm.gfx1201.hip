@@ -19,7 +19,7 @@
 #define HEADS_PER_WG 1
 #endif
 
-// Decode-only fusion of conv1d_silu_split_f32 and
+// gfx1100/gfx1201 decode-only fusion of conv1d_silu_split_f32 and
 // fused_qk_l2_norm_scale_f32. Q/K conv results stage in LDS, then the first
 // wave for each head performs the exact existing four-value lane sum, XOR
 // reduction, and two-step Q scale. V channels retain the original independent
