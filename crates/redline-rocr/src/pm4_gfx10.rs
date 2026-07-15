@@ -19,6 +19,7 @@ use crate::{Kernel, LaunchGeometry};
 
 const PACKET3_SET_SH_REG: u32 = 0x76;
 const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
+const PACKET3_WRITE_DATA: u32 = 0x37;
 const PACKET3_COPY_DATA: u32 = 0x40;
 const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
@@ -261,6 +262,23 @@ impl Gfx10Pm4CommandBuffer {
         ]);
     }
 
+    /// Publish a 32-bit value after an explicit compute-idle packet already
+    /// present in this stream. `WRITE_DATA` avoids a second bottom-of-pipe
+    /// event while retaining write confirmation before a peer polls the word.
+    pub fn write_memory_value_after_idle(&mut self, address: u64, value: u32) {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        debug_assert!(self.ends_with_compute_idle());
+        const MEMORY_WRITE_CONFIRMED: u32 = (5 << 8) | (1 << 20);
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_WRITE_DATA, 4, false),
+            MEMORY_WRITE_CONFIRMED,
+            address as u32,
+            (address >> 32) as u32,
+            value,
+        ]);
+    }
+
     /// Stall this queue's command processor until a GPU-visible word equals
     /// `value`. Other queues remain schedulable, which permits a retained
     /// multi-queue graph to synchronize without per-phase AQL signals.
@@ -370,6 +388,11 @@ impl Gfx10Pm4CommandBuffer {
     pub fn wait_compute_idle(&mut self) {
         self.dwords.push(packet3(PACKET3_EVENT_WRITE, 1, false));
         self.dwords.push(0x407); // CS_PARTIAL_FLUSH, event-index 4.
+    }
+
+    pub fn ends_with_compute_idle(&self) -> bool {
+        self.dwords
+            .ends_with(&[packet3(PACKET3_EVENT_WRITE, 1, false), 0x407])
     }
 
     pub fn len_dwords(&self) -> u32 {
@@ -653,6 +676,26 @@ mod tests {
                 4,
             ]
         );
+    }
+
+    #[test]
+    fn confirmed_write_reuses_an_explicit_compute_idle_boundary() {
+        let address = 0x1234_5678_9abc_def0;
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands.wait_compute_idle();
+        assert!(commands.ends_with_compute_idle());
+        commands.write_memory_value_after_idle(address, 9);
+        assert_eq!(
+            &commands.dwords()[2..],
+            &[
+                0xc003_3700,
+                0x0010_0500,
+                0x9abc_def0,
+                0x1234_5678,
+                9,
+            ]
+        );
+        assert!(!commands.ends_with_compute_idle());
     }
 
     #[test]

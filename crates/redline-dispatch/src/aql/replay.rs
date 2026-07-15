@@ -495,6 +495,16 @@ impl PhasedMultiQueuePm4Ib {
         if phases.is_empty() || phases.iter().any(Vec::is_empty) {
             return Err(ReplayError::EmptyGraph);
         }
+        if phases
+            .iter()
+            .flatten()
+            .any(|commands| !commands.ends_with_compute_idle())
+        {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: "native PM4 semaphore publication requires every phase lane to end compute-idle"
+                    .to_owned(),
+            });
+        }
         let queue_count = phases.iter().map(Vec::len).max().unwrap();
         if queue_count < 2 {
             return Err(ReplayError::PolicyShapeMismatch {
@@ -532,13 +542,17 @@ impl PhasedMultiQueuePm4Ib {
             }
             for lane in 1..phase.len() {
                 let (start, _) = semaphore_addresses(lane);
-                streams[0].release_memory_value(start, parallel_epoch);
+                if streams[0].ends_with_compute_idle() {
+                    streams[0].write_memory_value_after_idle(start, parallel_epoch);
+                } else {
+                    streams[0].release_memory_value(start, parallel_epoch);
+                }
             }
             streams[0].append_stream(&phase[0]);
             for lane in 1..phase.len() {
                 let (_, done) = semaphore_addresses(lane);
                 streams[lane].append_stream(&phase[lane]);
-                streams[lane].release_memory_value(done, parallel_epoch);
+                streams[lane].write_memory_value_after_idle(done, parallel_epoch);
             }
             for lane in 1..phase.len() {
                 let (_, done) = semaphore_addresses(lane);
