@@ -608,8 +608,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rotate_with_rms_gfx1100" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
-        "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(76),
-        "fused_qkv_hfq4g256" => Some(80),
+        "fused_qkv_hfq4g256"
+        | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_k2048"
@@ -2644,7 +2644,7 @@ mod tests {
             expected_kernarg_bytes(
                 "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
             ),
-            Some(76)
+            Some(80)
         );
         assert_eq!(
             Pm4WaitPolicy::from_value("resource"),
