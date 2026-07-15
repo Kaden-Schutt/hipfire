@@ -14290,7 +14290,6 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
         || config.n_layers < 2
         || config.n_layers != weights.layers.len()
         || weights.pager.is_some()
-        || std::env::var_os("HIPFIRE_DUMP_HIDDEN").is_some()
         || std::env::var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
         || std::env::var("HIPFIRE_QKVZA_SCALAR_PREP").as_deref() == Ok("1")
     {
@@ -14373,6 +14372,15 @@ fn forward_scratch_layers_lowered(
                 config.num_experts_per_tok,
                 config.norm_eps,
             )?;
+            dump_hidden_localize(
+                gpu,
+                &s.x,
+                1,
+                pos,
+                config.dim,
+                layer_idx - 1,
+                "pertoken",
+            );
         }
         let program = lower_variant(variant_of(layer));
         {
@@ -14401,7 +14409,9 @@ fn forward_scratch_layers_lowered(
         ) {
             delta_layer_idx += 1;
         }
-        dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
+        if !combine_next_rms || layer_idx + 1 == config.n_layers {
+            dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
+        }
     }
 
     // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
