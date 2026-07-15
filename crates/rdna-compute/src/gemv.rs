@@ -5518,7 +5518,7 @@ impl Gpu {
         result
     }
 
-    /// gfx1201 wave64 zero-LDS fused router. The source carries the required
+    /// RDNA wave64 zero-LDS fused router. The source carries the required
     /// whole-translation-unit `-mwavefrontsize64` compiler flag.
     pub fn moe_router_softmax_topk_k8_wave64(
         &mut self,

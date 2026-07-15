@@ -5,7 +5,7 @@
 
 #include <hip/hip_runtime.h>
 
-// gfx1201 wave64 router: one wave owns one token, keeps all 256 router
+// RDNA wave64 router: one wave owns one token, keeps all 256 router
 // probabilities in registers, performs zero-LDS softmax, and selects the top
 // eight with a packed full-precision key.
 #define ROUTER_PER_LANE 4
