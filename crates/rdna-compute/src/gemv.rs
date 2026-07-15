@@ -4815,7 +4815,20 @@ impl Gpu {
             && self.flags.rdna3_hfq4_residual_stage_x32
             && self.flags.rdna3_hfq4_residual_k2048
             && k == 2_048;
-        let (src, module, func_name) = if use_k2048 {
+        use std::sync::OnceLock;
+        static RESIDUAL_CPOL_SLC: OnceLock<bool> = OnceLock::new();
+        let cpol_slc = self.arch_caps.is_gfx1100()
+            && self.flags.rdna3_hfq4_residual_stage_x32
+            && *RESIDUAL_CPOL_SLC.get_or_init(|| {
+                std::env::var("HIPFIRE_RESIDUAL_CPOL").as_deref() == Ok("slc")
+            });
+        let (src, module, func_name) = if cpol_slc {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_CPOL_SLC_GFX1100_SRC,
+                "gemv_hfq4g256_residual_cpol_slc_gfx1100",
+                "gemv_hfq4g256_residual_cpol_slc",
+            )
+        } else if use_k2048 {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_K2048_GFX1100_SRC,
                 "gemv_hfq4g256_residual_k2048",

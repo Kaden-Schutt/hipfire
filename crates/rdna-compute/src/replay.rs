@@ -414,6 +414,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gemv_hfq4g256"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
+        | "gemv_hfq4g256_residual_cpol_slc"
         | "gemv_hfq4g256_residual_k2048"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
@@ -499,6 +500,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
+        | "gemv_hfq4g256_residual_cpol_slc"
         | "gemv_hfq4g256_residual_k2048"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
@@ -2402,6 +2404,7 @@ mod tests {
         "gated_norm_f32",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
+        "gemv_hfq4g256_residual_cpol_slc",
         "gemv_hfq4g256_residual_k2048",
         "gemv_hfq4g256",
         "gemv_hfq4g256_k2048",

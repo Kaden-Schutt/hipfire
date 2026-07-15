@@ -1193,6 +1193,19 @@ pub const GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip")
 );
+/// Radiowave gfx1100 residual probe: preserve the certified activation staging
+/// and reduction order while replacing flat weight loads with SLC raw-buffer
+/// loads. Kept as a distinct replay artifact until model-level certification.
+pub const GEMV_HFQ4G256_RESIDUAL_CPOL_SLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN 1\n",
+    "#define HIPFIRE_RDNA3_RESIDUAL_STAGE_X32 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_cpol_slc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_K2048_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_RESIDUAL_STAGE_X32 1\n",
     "#define HIPFIRE_RDNA3_RESIDUAL_K2048 1\n",
