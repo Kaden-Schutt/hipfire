@@ -6224,10 +6224,30 @@ impl Gpu {
                 && *GATE_UP_RANK_INTERLEAVE.get_or_init(|| {
                     std::env::var("HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE").as_deref() == Ok("1")
                 });
+            static GATE_UP_LOW_VGPR: OnceLock<bool> = OnceLock::new();
+            let low_vgpr = self.arch_caps.is_gfx1100()
+                && *GATE_UP_LOW_VGPR.get_or_init(|| {
+                    std::env::var("HIPFIRE_MOE_GATE_UP_LOW_VGPR").as_deref() == Ok("1")
+                });
             let fixed_k2048 = self.arch_caps.is_gfx1100()
                 && self.flags.rdna3_hfq4_moe_gate_up_k2048
                 && k == 2_048;
-            if rank_interleave {
+            if low_vgpr {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_low_vgpr",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_LOW_VGPR_GFX1100_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
+                    [32u32, 1, 1],
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
+                )
+            } else if rank_interleave {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_rank_interleave",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_RANK_INTERLEAVE_GFX1100_SRC,

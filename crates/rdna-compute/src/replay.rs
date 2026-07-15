@@ -426,6 +426,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
@@ -515,6 +516,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
@@ -997,6 +999,10 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
             )
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
@@ -2385,6 +2391,7 @@ mod tests {
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
@@ -2440,6 +2447,10 @@ mod tests {
         assert!(independent_sibling(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
             "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
+        ));
+        assert!(independent_sibling(
+            "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
         ));
         assert!(!independent_sibling(
             "gemv_hfq4g256_moe_gate_up_k8_indexed",

@@ -1330,6 +1330,17 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_RANK_INTERLEAVE_GFX1100_SRC: &str = 
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// gfx1100 low-register schedule: process one HFQ group at a time while
+/// retaining the base kernel's four accumulator chains and temporal buffer
+/// loads. This shortens activation/header live ranges without changing math.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_LOW_VGPR_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_LOW_VGPR 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// gfx1100 scheduler-packing experiment: two independent wave32 rows per
 /// workgroup. Each wave preserves the base kernel's gate/up accumulator and
 /// shuffle order; there is no cross-wave reduction or extra row accumulator.

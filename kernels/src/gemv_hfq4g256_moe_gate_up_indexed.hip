@@ -16,6 +16,10 @@
 #define HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE 0
 #endif
 
+#ifndef HIPFIRE_MOE_GATE_UP_LOW_VGPR
+#define HIPFIRE_MOE_GATE_UP_LOW_VGPR 0
+#endif
+
 #if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
 #define HIPFIRE_MOE_GATE_UP_BLOCK 64
 #define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 8
@@ -132,6 +136,47 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     #define LOAD_PACKED_U32(ptr, vector_offset, scalar_offset) \
         HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(expert_rsrc, ptr, boff + vector_offset, scalar_offset)
 
+#if HIPFIRE_MOE_GATE_UP_LOW_VGPR
+    // gfx1100 occupancy experiment: retain the four independent accumulator
+    // chains, but keep only one group's eight activation values and two weight
+    // headers live at a time. The default schedule hoists four groups (32 x
+    // values) to maximize load clustering, which is profitable on gfx12 but
+    // leaves this kernel near the gfx1100 VGPR occupancy boundary.
+    #define PROCESS_LOW_VGPR(group_index, chain) do { \
+        const int group = (group_index); \
+        const int base = group * 256 + tid * 8; \
+        const float4 xa = *reinterpret_cast<const float4*>(x + base); \
+        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4); \
+        const char* gg = gate_ptr + group * 136; \
+        const char* uu = up_ptr + group * 136; \
+        const unsigned int group_offset = (unsigned int)group * 136u; \
+        float gsc = __builtin_bit_cast(float, \
+            LOAD_UNIFORM_U32(gg, 0, gate_row_offset + group_offset)); \
+        float gzp = __builtin_bit_cast(float, \
+            LOAD_UNIFORM_U32(gg + 4, 4, gate_row_offset + group_offset)); \
+        unsigned int gpk = LOAD_PACKED_U32( \
+            gg + 8 + boff, 8, gate_row_offset + group_offset); \
+        DOG_X8(gsc, gzp, gpk, gacc##chain, \
+               xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w); \
+        float usc = __builtin_bit_cast(float, \
+            LOAD_UNIFORM_U32(uu, 0, up_row_offset + group_offset)); \
+        float uzp = __builtin_bit_cast(float, \
+            LOAD_UNIFORM_U32(uu + 4, 4, up_row_offset + group_offset)); \
+        unsigned int upk = LOAD_PACKED_U32( \
+            uu + 8 + boff, 8, up_row_offset + group_offset); \
+        DOG_X8(usc, uzp, upk, uacc##chain, \
+               xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w); \
+    } while (0)
+
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        PROCESS_LOW_VGPR(g, 0);
+        PROCESS_LOW_VGPR(g + 1, 1);
+        PROCESS_LOW_VGPR(g + 2, 2);
+        PROCESS_LOW_VGPR(g + 3, 3);
+    }
+    #undef PROCESS_LOW_VGPR
+#else
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
@@ -222,6 +267,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         DOG_X8(usc3, uzp3, upk3, uacc3,
                xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
     }
+#endif
 
     if (tail >= 1) {
         const int g = quads << 2;
