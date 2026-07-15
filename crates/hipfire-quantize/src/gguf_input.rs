@@ -33,6 +33,7 @@ pub enum GgmlType {
     Q6K = 14,
     Q8K = 15,
     BF16 = 30,
+    Q1_0 = 41,
     Q2_0 = 42,
 }
 
@@ -54,6 +55,7 @@ impl GgmlType {
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
             30 => Some(Self::BF16),
+            41 => Some(Self::Q1_0),
             42 => Some(Self::Q2_0),
             _ => None,
         }
@@ -64,7 +66,7 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
-            Self::Q2_0 => 128,
+            Self::Q1_0 | Self::Q2_0 => 128,
         }
     }
 
@@ -84,6 +86,7 @@ impl GgmlType {
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 290,
+            Self::Q1_0 => 18,
             Self::Q2_0 => 34,
         }
     }
@@ -606,5 +609,18 @@ mod q2_0_tests {
         assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]); // (code-1)*d
         assert!(out[4..128].iter().all(|&x| x == -2.0)); // code 0 -> -d
         assert_eq!(out.len(), 128);
+    }
+}
+
+#[cfg(test)]
+mod q1_0_tests {
+    use super::*;
+
+    #[test]
+    fn q1_0_ggml_type_reads() {
+        let t = GgmlType::from_u32(41).expect("ggml_type 41 = Q1_0");
+        assert_eq!(t, GgmlType::Q1_0);
+        assert_eq!(t.block_size(), 128);
+        assert_eq!(t.block_bytes(), 18);
     }
 }
