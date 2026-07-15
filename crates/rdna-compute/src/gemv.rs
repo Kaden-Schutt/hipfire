@@ -5979,15 +5979,35 @@ impl Gpu {
                 ((m as u32) + 1) / 2,
             )
         } else {
+            use std::sync::OnceLock;
+            static GATE_UP_WG2: OnceLock<bool> = OnceLock::new();
+            let wg2 = self.arch_caps.is_gfx1100()
+                && *GATE_UP_WG2.get_or_init(|| {
+                    std::env::var("HIPFIRE_MOE_GATE_UP_WG2").as_deref() == Ok("1")
+                });
+            // Two independent wave32 rows in one workgroup. Unlike the old
+            // row-tile below, this does not duplicate per-wave accumulators or
+            // change a row's reduction order.
             // Opt-in NUM_ROWS=2 register row-tile (HIPFIRE_MOE_GATE_UP_FUSED=1):
             // ceil(M/2) blocks, each owning 2 output rows sharing this expert's x.
             // Token-id exact vs base (per-row math unchanged). Grid divisor here
             // MUST match the kernel's MOE_GATE_UP_NUM_ROWS.
-            use std::sync::OnceLock;
             static GATE_UP_FUSED: OnceLock<bool> = OnceLock::new();
             let fused = *GATE_UP_FUSED
                 .get_or_init(|| std::env::var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1"));
-            if fused {
+            if wg2 {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_wg2",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WG2_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+                )?;
+                let mi = (m as u32) >> 1;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+                    [64u32, 1, 1],
+                    mi.div_ceil(2),
+                )
+            } else if fused {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_rowtile",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC,

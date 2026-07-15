@@ -4,6 +4,22 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_MOE_GATE_UP_WG_WAVES
+#define HIPFIRE_MOE_GATE_UP_WG_WAVES 1
+#endif
+
+#ifndef HIPFIRE_MOE_GATE_UP_KERNEL
+#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed
+#endif
+
+#if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
+#define HIPFIRE_MOE_GATE_UP_BLOCK 64
+#define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 8
+#else
+#define HIPFIRE_MOE_GATE_UP_BLOCK 32
+#define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 16
+#endif
+
 // Index-aware fused MoE gate_up GEMV (Phase 2b/2c) — reads expert IDs from
 // a device-side topk_indices buffer and the per-expert weight base from a
 // device-side expert pointer table. No CPU kernargs depend on the routing
@@ -32,8 +48,8 @@
 // on the cold expert path (L2~64%), then a pure FMA burst dual-issues
 // against already-resident sc/zp/pk. Value-identical.
 
-__launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
+__launch_bounds__(HIPFIRE_MOE_GATE_UP_BLOCK, HIPFIRE_MOE_GATE_UP_MIN_BLOCKS)
+extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp] device pointers
     const int* __restrict__ topk_indices,                // [k_top]
     const float* __restrict__ x,                         // [K]
@@ -42,10 +58,16 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
     int M, int K
 ) {
     const int mi = M >> 1;
+#if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
+    const int wg_wave = threadIdx.x >> 5;
+    const int tid = threadIdx.x & 31;
+    const int row = blockIdx.x * 2 + wg_wave;
+#else
+    const int tid = threadIdx.x;
     const int row = blockIdx.x;
+#endif
     if (row >= mi) return;
     const int krank = blockIdx.y;
-    const int tid = threadIdx.x;
 
     // Read expert_id from device and index into the pointer table.
     const int expert_id = topk_indices[krank];
@@ -256,3 +278,6 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         y_up[krank * mi + row] = uacc;
     }
 }
+
+#undef HIPFIRE_MOE_GATE_UP_BLOCK
+#undef HIPFIRE_MOE_GATE_UP_MIN_BLOCKS
