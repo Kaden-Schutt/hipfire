@@ -6661,9 +6661,26 @@ fn run_gguf_pipeline(
         // the reference keeps them full-precision. Never route them through the
         // terminal HFQ4G128 4-bit fallback (k_dim=conv_kernel is never 256-aligned).
         let is_conv1d = info.name.ends_with("conv1d.weight");
+        // PrismML's GGUF converter (conversion/qwen.py) bakes `+1` into every
+        // RMSNorm weight EXCEPT linear_attn.norm (ssm_norm). hipfire's qwen35
+        // runtime ALSO adds QWEN35_NORM_BIAS=1.0 to exactly that same set
+        // (input_layernorm / post_attention_layernorm / q_norm / k_norm /
+        // output_norm — but NOT ssm_norm, which loads raw). Passing the GGUF
+        // value straight through would double-add → norm weights ~2× → the
+        // whole forward pass runs ~2× hot (verified layer-0 vs llama.cpp).
+        // Undo PrismML's +1 here so the runtime's +1 restores the true weight.
+        let is_qwen35 = arch_str == "qwen35" || arch_str == "qwen35moe";
+        let undo_norm_bias = is_qwen35
+            && info.name.ends_with("norm.weight")
+            && !info.name.ends_with("ssm_norm.weight");
         let (data, quant_type, group_size, label) = if is_norm || !is_2d || is_conv1d {
             // Norms, 1D tensors, and conv1d always F16 (primary gate)
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let mut f32_data = gguf_input::tensor_to_f32(info, raw);
+            if undo_norm_bias {
+                for v in f32_data.iter_mut() {
+                    *v -= 1.0;
+                }
+            }
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
