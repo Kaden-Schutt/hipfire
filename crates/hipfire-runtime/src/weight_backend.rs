@@ -95,19 +95,19 @@ pub enum EmbedPlan {
 /// Pure quant_type → plan. GPU-free, unit-testable.
 ///
 /// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 3 → Raw(Q8_0),
-/// qt 1|2|16|38 → HostF32, else → panic with the supported-format list.
+/// qt 1|2|16|38|39 → HostF32, else → panic with the supported-format list.
 pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
     match quant_type {
         6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
         7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
         3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
-        1 | 2 | 16 | 38 => Ok(EmbedPlan::HostF32),
+        1 | 2 | 16 | 38 | 39 => Ok(EmbedPlan::HostF32),
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "unsupported embedding quant_type {other}; \
                  handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32), \
-                 38 (TQ2G128→F32). \
+                 38 (TQ2G128→F32), 39 (BQ1G128→F32). \
                  Add the format to embed_classify to support it."
             ),
         )),
@@ -399,6 +399,10 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
     RawCodec {
         quant_type: 38,
         dtype: DType::TQ2G128,
+    },
+    RawCodec {
+        quant_type: 39,
+        dtype: DType::BQ1G128,
     },
 ];
 
@@ -1232,7 +1236,7 @@ mod tests {
     }
     #[test]
     fn embed_classify_host_f32() {
-        for qt in [1, 2, 16, 38] {
+        for qt in [1, 2, 16, 38, 39] {
             match embed_classify(qt).unwrap() {
                 EmbedPlan::HostF32 => {}
                 other => panic!("qt={qt}: expected HostF32, got {other:?}"),
@@ -1248,6 +1252,15 @@ mod tests {
         match embed_classify(38).unwrap() {
             EmbedPlan::HostF32 => {}
             other => panic!("qt=38: expected HostF32, got {other:?}"),
+        }
+    }
+    /// Task 5 (SP-B binary Bonsai-27B): quant_type 39 (BQ1G128) → `EmbedPlan::HostF32`,
+    /// mirroring the qt=38 TQ2G128 arm above.
+    #[test]
+    fn embed_classify_bq1g128_is_host_f32() {
+        match embed_classify(39).unwrap() {
+            EmbedPlan::HostF32 => {}
+            other => panic!("qt=39: expected HostF32, got {other:?}"),
         }
     }
     /// Task 15b RED→GREEN gate: `dequant_tq2_to_f32` on a single 34-byte
@@ -1357,6 +1370,7 @@ mod tests {
             (24, DType::MFP4G32),      // wb:475 / hfq:963
             (30, DType::MQ4G256Lloyd), // wb:443 / hfq:978 (renumbered from 21; do not swap)
             (38, DType::TQ2G128),      // Task 7: ternary Bonsai-27B, 34 B/group-128
+            (39, DType::BQ1G128),      // Task 5 (SP-B): binary Bonsai-27B, 18 B/group-128
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));
@@ -1396,5 +1410,12 @@ mod tests {
     fn tq2g128_quant_type_38_maps_to_tq2g128() {
         let codec = raw_codec(38).expect("quant_type 38 registered");
         assert_eq!(codec.dtype, DType::TQ2G128);
+    }
+    /// Task 5 (SP-B binary Bonsai-27B): quant_type 39 (binary Bonsai-27B BQ1G128)
+    /// must resolve to DType::BQ1G128 via the RAW_CODECS loader table.
+    #[test]
+    fn bq1g128_quant_type_39_maps_to_bq1g128() {
+        let c = raw_codec(39).expect("no RAW_CODECS row for qt=39");
+        assert_eq!(c.dtype, DType::BQ1G128);
     }
 }

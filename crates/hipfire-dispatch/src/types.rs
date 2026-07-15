@@ -732,7 +732,13 @@ impl KernelKey {
             // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
             // wave32/wave64 kernel with no ISA-specific intrinsics, same as its
             // HFQ2G128 sibling — identical arch gating.
-            | TQ2G128 => ArchPredicate::Always,
+            | TQ2G128
+            // BQ1G128: binary Bonsai-27B sibling of TQ2G128 (Task 5 of SP-B). No GEMV
+            // kernel is wired yet (Phase 2 HIP kernels, not this task) — for_gemv()'s
+            // catch-all still Errs for (BQ1G128, _) until then — but dtype_arch_predicate
+            // matches exhaustively on DType alone, so this arm must exist to compile.
+            // Mirrors TQ2G128's gating: same generic wave32/wave64 shape expected.
+            | BQ1G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline

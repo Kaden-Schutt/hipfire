@@ -201,6 +201,7 @@ pub enum DType {
     TQ2G128,   // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
     // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
     // CPU-foundation only (variant + byte-size + RawCodec load mapping).
+    BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
     HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
@@ -227,6 +228,7 @@ impl DType {
             | DType::HFQ2G256
             | DType::HFQ2G128
             | DType::TQ2G128
+            | DType::BQ1G128
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G128
