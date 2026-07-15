@@ -110,6 +110,10 @@ impl Pm4Commands {
         }
     }
 
+    fn requires_dependency_acquire(&self) -> bool {
+        matches!(self, Self::Legacy { .. })
+    }
+
     fn wait_compute_idle(&mut self) {
         match self {
             Self::Legacy { commands, .. } => commands.wait_compute_idle(),
@@ -1398,9 +1402,14 @@ impl ReplayController {
                     commands.wait_compute_idle();
                 }
                 resource_frontier.advance(current_launch, resources_independent);
-                if self
-                    .pm4_mid_acquire_policy
-                    .acquire_between(previous, current)
+                // GFX10/11 scalar and vector read caches are not made visible
+                // merely by CS_PARTIAL_FLUSH. Every proven same-agent RMW
+                // boundary therefore gets the legacy GCR acquire. GFX12 keeps
+                // the narrower, product-certified acquire allowlist.
+                if (!independent && commands.requires_dependency_acquire())
+                    || self
+                        .pm4_mid_acquire_policy
+                        .acquire_between(previous, current)
                 {
                     commands.acquire_inter_node(gfx12_gcr_trim);
                 }
