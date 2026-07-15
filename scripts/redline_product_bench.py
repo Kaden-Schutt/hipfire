@@ -18,6 +18,7 @@ import select
 import signal
 import statistics
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -121,12 +122,20 @@ def run_arm(args, backend):
             "context_tokens": args.context,
             "iterations": args.iterations,
         }
+        warmup_started = time.monotonic()
         warmups = [daemon.request(warmup_request) for _ in range(args.warmups)]
+        warmup_seconds = time.monotonic() - warmup_started
+        if warmups:
+            print(
+                f"{backend}: warming caches... took {warmup_seconds:.2f}s",
+                flush=True,
+            )
         rows = [daemon.request(request) for _ in range(args.runs)]
         values = [row["tok_s"] for row in rows]
         return {
             "loaded": loaded,
             "warmups": warmups,
+            "warmup_seconds": warmup_seconds,
             "rows": rows,
             "tok_s": {
                 "min": min(values),

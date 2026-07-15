@@ -697,7 +697,7 @@ impl Gpu {
         // controller. GDDR6 on the 7900 XTX is 24 GB so 256 MB is trivial.
         const SCRATCH_BYTES: usize = 256 * 1024 * 1024;
         let scratch = self.hip.malloc(SCRATCH_BYTES)?;
-        eprintln!("[dpm-warmup] running memset loop for {secs:.1}s to pin GPU at high DPM...");
+        eprint!("warming caches...");
         let t0 = std::time::Instant::now();
         let mut n: u64 = 0;
         while t0.elapsed().as_secs_f32() < secs {
@@ -709,11 +709,7 @@ impl Gpu {
             n = n.wrapping_add(1);
         }
         let elapsed = t0.elapsed().as_secs_f32();
-        eprintln!(
-            "[dpm-warmup] {n} memsets in {elapsed:.2}s ({:.2} ms/iter, {:.1} GiB/s effective)",
-            1000.0 * elapsed / n as f32,
-            (n as f64 * SCRATCH_BYTES as f64) / (1024.0 * 1024.0 * 1024.0) / elapsed as f64
-        );
+        eprintln!(" took {elapsed:.2}s");
         // Free the 256 MB scratch — DeviceBuffer has no Drop, so scope exit
         // would otherwise leak it for the lifetime of the process.
         let _ = self.hip.free(scratch);
