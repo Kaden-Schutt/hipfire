@@ -4811,16 +4811,27 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) =
-            if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_residual_stage_x32 {
-                (
-                    kernels::GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC,
-                    "gemv_hfq4g256_residual_stage_x32_gfx1100",
-                )
-            } else {
-                kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps)
-            };
-        self.ensure_kernel(module, src, "gemv_hfq4g256_residual")?;
+        let use_k2048 = self.arch_caps.is_gfx1100()
+            && self.flags.rdna3_hfq4_residual_stage_x32
+            && self.flags.rdna3_hfq4_residual_k2048
+            && k == 2_048;
+        let (src, module, func_name) = if use_k2048 {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_K2048_GFX1100_SRC,
+                "gemv_hfq4g256_residual_k2048",
+                "gemv_hfq4g256_residual_k2048",
+            )
+        } else if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_residual_stage_x32 {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC,
+                "gemv_hfq4g256_residual_stage_x32_gfx1100",
+                "gemv_hfq4g256_residual",
+            )
+        } else {
+            let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
+            (src, module, "gemv_hfq4g256_residual")
+        };
+        self.ensure_kernel(module, src, func_name)?;
 
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -4959,7 +4970,7 @@ impl Gpu {
             })
         } else {
             self.launch_maybe_blob(
-                "gemv_hfq4g256_residual",
+                func_name,
                 [m as u32, 1, 1],
                 [32, 1, 1],
                 0,

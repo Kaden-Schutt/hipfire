@@ -66,6 +66,9 @@ pub struct FeatureFlags {
     /// independent packed-weight loads. Certified default on exact gfx1100;
     /// other RDNA3 targets remain explicit opt-in until separately measured.
     pub rdna3_hfq4_residual_stage_x32: bool,
+    /// Combine the certified activation staging with a fixed eight-group
+    /// K=2048 loop on gfx1100. Opt-in until exact and tg128 gates promote it.
+    pub rdna3_hfq4_residual_k2048: bool,
     /// Launch only the active half of the two-row shared-expert down grid.
     /// The kernel maps row0 = blockIdx.x * 2; the legacy launcher submits M
     /// workgroups, leaving the upper half to return immediately.
@@ -336,6 +339,9 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
                 .unwrap_or(arch == "gfx1100"),
+            rdna3_hfq4_residual_k2048: std::env::var("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048")
+                .as_deref()
+                == Ok("1"),
             rdna3_hfq4_sigmoid_tight_grid: std::env::var(
                 "HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID",
             )
@@ -596,6 +602,7 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_hoist_x32: false,
             rdna3_hfq4_qkvza_k2048: false,
             rdna3_hfq4_residual_stage_x32: false,
+            rdna3_hfq4_residual_k2048: false,
             rdna3_hfq4_sigmoid_tight_grid: false,
             rdna3_hfq4_sigmoid_buffer: false,
             rdna3_hfq4_sigmoid_rows4: false,

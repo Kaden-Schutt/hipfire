@@ -9,8 +9,12 @@
 // only the final write differs (+= instead of =). Used for wo and w_down in
 // the Qwen3.5 forward path to eliminate the add_inplace_f32 follow-up launch.
 
+#ifndef HIPFIRE_RESIDUAL_KERNEL
+#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual
+#endif
+
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256_residual(
+extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -20,7 +24,12 @@ extern "C" __global__ void gemv_hfq4g256_residual(
     if (row >= M) return;
     const int tid = threadIdx.x;
 
+#if defined(HIPFIRE_RDNA3_RESIDUAL_K2048)
+    // Exact A3B decode contract; host routing enforces K==2048.
+    const int groups_per_row = 8;
+#else
     const int groups_per_row = K / 256;
+#endif
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
