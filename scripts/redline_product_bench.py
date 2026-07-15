@@ -108,12 +108,17 @@ def run_arm(args, backend):
                 },
             }
         )
+        warmup_request = {
+            "type": "bench_decode",
+            "context_tokens": args.context,
+            "iterations": args.warmup_iterations,
+        }
         request = {
             "type": "bench_decode",
             "context_tokens": args.context,
             "iterations": args.iterations,
         }
-        warmups = [daemon.request(request) for _ in range(args.warmups)]
+        warmups = [daemon.request(warmup_request) for _ in range(args.warmups)]
         rows = [daemon.request(request) for _ in range(args.runs)]
         values = [row["tok_s"] for row in rows]
         return {
@@ -139,6 +144,12 @@ def main():
     parser.add_argument("--context", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmups", type=int, default=3)
+    parser.add_argument(
+        "--warmup-iterations",
+        type=int,
+        default=32,
+        help="decode iterations per replay warmup request (default: 32)",
+    )
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--transport", choices=("aql", "pm4"), default="aql")
     parser.add_argument(
@@ -159,6 +170,8 @@ def main():
         "context": args.context,
         "iterations": args.iterations,
         "warmups": args.warmups,
+        "warmup_iterations": args.warmup_iterations,
+        "dpm_warmup_secs": float(os.environ.get("HIPFIRE_DPM_WARMUP_SECS", "0")),
         "runs": args.runs,
         "transport": args.transport,
         "kv_mode": args.kv_mode,
