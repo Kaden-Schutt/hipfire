@@ -376,6 +376,23 @@ fn dequant_q8_0(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+fn dequant_q2_0(data: &[u8], n: usize) -> Vec<f32> {
+    const QK: usize = 128;
+    const BLK: usize = 34;
+    let mut out = Vec::with_capacity(n);
+    let nblocks = n / QK;
+    for b in 0..nblocks {
+        let base = b * BLK;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        let qs = &data[base + 2..base + BLK];
+        for j in 0..QK {
+            let code = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+            out.push((code as i32 - 1) as f32 * d);
+        }
+    }
+    out
+}
+
 fn dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 256;
     let block_bytes = 144;
@@ -557,6 +574,7 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
         }
         GgmlType::Q4_0 => dequant_q4_0(data, n),
         GgmlType::Q8_0 => dequant_q8_0(data, n),
+        GgmlType::Q2_0 => dequant_q2_0(data, n),
         GgmlType::Q4K => dequant_q4_k(data, n),
         GgmlType::Q5K => dequant_q5_k(data, n),
         GgmlType::Q6K => dequant_q6_k(data, n),
@@ -576,5 +594,17 @@ mod q2_0_tests {
         assert_eq!(t, GgmlType::Q2_0);
         assert_eq!(t.block_size(), 128);
         assert_eq!(t.block_bytes(), 34); // 2 (FP16 d) + 32 (2-bit x 128)
+    }
+
+    #[test]
+    fn q2_0_dequant_matches_formula() {
+        let mut block = vec![0u8; 34];
+        block[0] = 0x00;
+        block[1] = 0x40; // FP16 2.0 little-endian
+        block[2] = 0xE4; // codes 0,1,2,3 (LSB-first)
+        let out = dequant_q2_0(&block, 128);
+        assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]); // (code-1)*d
+        assert!(out[4..128].iter().all(|&x| x == -2.0)); // code 0 -> -d
+        assert_eq!(out.len(), 128);
     }
 }
