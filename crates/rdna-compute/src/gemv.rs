@@ -6430,10 +6430,21 @@ impl Gpu {
             // on for gfx1100 after exact shadow and stationary tg128 checks;
             // HIPFIRE_MOE_GATE_UP_TIGHT_GRID=0 restores the legacy geometry.
             static GATE_UP_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
-            let tight_grid = self.arch_caps.is_gfx1100()
-                && *GATE_UP_TIGHT_GRID.get_or_init(|| {
+            let tight_grid = if self.arch_caps.is_gfx1100() {
+                *GATE_UP_TIGHT_GRID.get_or_init(|| {
                     std::env::var("HIPFIRE_MOE_GATE_UP_TIGHT_GRID").as_deref() != Ok("0")
-                });
+                })
+            } else if self.arch_caps.is_gfx1151() {
+                // gfx1151 keeps its own performance-admission gate. The
+                // kernel maps blockIdx.x to one row in each M/2 output, so
+                // M/2 is semantically sufficient on every target; require an
+                // explicit gfx1151 experiment before making it that arch's
+                // default. Do not let the gfx1100 default bleed through a
+                // shared RDNA3 capability predicate.
+                std::env::var("HIPFIRE_GFX1151_MOE_TIGHT_GRID").as_deref() == Ok("1")
+            } else {
+                false
+            };
             // Two independent wave32 rows in one workgroup. Unlike the old
             // row-tile below, this does not duplicate per-wave accumulators or
             // change a row's reduction order.
@@ -7187,11 +7198,19 @@ impl Gpu {
         // Keep this opt-in while it is qualified on gfx1100: the legacy launch
         // used `m` workgroups, leaving three quarters to exit at the row0 guard.
         static DOWN_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
-        let grid_x = if self.arch_caps.is_gfx1100()
-            && *DOWN_TIGHT_GRID.get_or_init(|| {
+        let tight_grid = if self.arch_caps.is_gfx1100() {
+            *DOWN_TIGHT_GRID.get_or_init(|| {
                 std::env::var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() == Ok("1")
             })
-        {
+        } else if self.arch_caps.is_gfx1151() {
+            // This kernel owns four rows per workgroup. Keep gfx1151's
+            // measurement independent from gfx1100 even though the launch
+            // contraction is semantically target-neutral.
+            std::env::var("HIPFIRE_GFX1151_MOE_TIGHT_GRID").as_deref() == Ok("1")
+        } else {
+            false
+        };
+        let grid_x = if tight_grid {
             (m as u32).div_ceil(4)
         } else {
             m as u32
