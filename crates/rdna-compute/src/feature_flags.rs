@@ -57,7 +57,8 @@ pub struct FeatureFlags {
     pub rdna3_hfq4_sigmoid_tight_grid: bool,
     /// Compile the shared-expert sigmoid-scaled down kernel with gfx1100
     /// temporal buffer-resource weight loads instead of global addressing.
-    /// Default-off: order-balanced product measurements were neutral.
+    /// Default-on for gfx1100; set `HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER=0`
+    /// to restore global addressing for comparison.
     pub rdna3_hfq4_sigmoid_buffer: bool,
     /// Schedule four shared-expert down rows per wave on gfx1100, reusing
     /// each activation load across four independent weight streams.
@@ -286,11 +287,8 @@ impl FeatureFlags {
             )
             .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_sigmoid_buffer: std::env::var(
-                "HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER",
-            )
-            .as_deref()
-                == Ok("1"),
+            rdna3_hfq4_sigmoid_buffer: parse_bool("HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER")
+                .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_sigmoid_rows4: std::env::var(
                 "HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4",
             )
