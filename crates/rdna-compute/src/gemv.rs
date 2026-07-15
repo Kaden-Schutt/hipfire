@@ -4827,7 +4827,13 @@ impl Gpu {
         } else {
             None
         };
-        let (src, module, func_name) = if cpol == Some("rt") {
+        let (src, module, func_name) = if cpol == Some("rt-low") {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_CPOL_RT_LOW_GFX1100_SRC,
+                "gemv_hfq4g256_residual_cpol_rt_low_gfx1100",
+                "gemv_hfq4g256_residual_cpol_rt_low",
+            )
+        } else if cpol == Some("rt") {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_CPOL_RT_GFX1100_SRC,
                 "gemv_hfq4g256_residual_cpol_rt_gfx1100",

@@ -33,7 +33,21 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+#if defined(HIPFIRE_RDNA3_RESIDUAL_MATRIX_RSRC)
+    const unsigned int row_offset =
+        (unsigned int)row * (unsigned int)groups_per_row * 136u;
+    const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(A);
+#else
     const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
+#endif
+#endif
+
+#if defined(HIPFIRE_RDNA3_RESIDUAL_MATRIX_RSRC)
+    #define RESIDUAL_WEIGHT_LOAD(ptr, offset) \
+        HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(row_rsrc, ptr, offset, row_offset)
+#else
+    #define RESIDUAL_WEIGHT_LOAD(ptr, offset) \
+        HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, ptr, offset)
 #endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
@@ -74,26 +88,61 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
 
-        float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
-        float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
-        float sc1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 136));
-        float zp1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4, (g + 1) * 136 + 4));
-        float sc2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136));
-        float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
-        float sc3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136));
-        float zp3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4));
-
-        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
-        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
-        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
-        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
-
 #if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
+#if defined(HIPFIRE_RDNA3_RESIDUAL_BUFFER_CONSUME)
+        // Raw-buffer lowering otherwise keeps all four weight triples live
+        // beside 32 activation values and crosses gfx1100's VGPR occupancy
+        // boundary. Consume one group at a time while retaining the exact
+        // independent accumulator and FMA order.
+        #define LOAD_DOG(gp, offset, accumulator, xa, xb) do { \
+            const float sc = __builtin_bit_cast(float, \
+                RESIDUAL_WEIGHT_LOAD(gp, offset)); \
+            const float zp = __builtin_bit_cast(float, \
+                RESIDUAL_WEIGHT_LOAD((gp) + 4, (offset) + 4)); \
+            const unsigned int pk = RESIDUAL_WEIGHT_LOAD( \
+                (gp) + 8 + boff, (offset) + 8 + boff); \
+            DOG_X8(pk, sc, zp, accumulator, xa, xb); \
+        } while (0)
+        LOAD_DOG(gp0, (g + 0) * 136, acc0, x0a, x0b);
+        LOAD_DOG(gp1, (g + 1) * 136, acc1, x1a, x1b);
+        LOAD_DOG(gp2, (g + 2) * 136, acc2, x2a, x2b);
+        LOAD_DOG(gp3, (g + 3) * 136, acc3, x3a, x3b);
+        #undef LOAD_DOG
+#else
+        float sc0 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp0, (g + 0) * 136));
+        float zp0 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp0 + 4, (g + 0) * 136 + 4));
+        float sc1 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp1, (g + 1) * 136));
+        float zp1 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp1 + 4, (g + 1) * 136 + 4));
+        float sc2 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp2, (g + 2) * 136));
+        float zp2 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp2 + 4, (g + 2) * 136 + 4));
+        float sc3 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp3, (g + 3) * 136));
+        float zp3 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp3 + 4, (g + 3) * 136 + 4));
+
+        unsigned int pk0 = RESIDUAL_WEIGHT_LOAD(gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
+        unsigned int pk1 = RESIDUAL_WEIGHT_LOAD(gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
+        unsigned int pk2 = RESIDUAL_WEIGHT_LOAD(gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
+        unsigned int pk3 = RESIDUAL_WEIGHT_LOAD(gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
+
         DOG_X8(pk0, sc0, zp0, acc0, x0a, x0b);
         DOG_X8(pk1, sc1, zp1, acc1, x1a, x1b);
         DOG_X8(pk2, sc2, zp2, acc2, x2a, x2b);
         DOG_X8(pk3, sc3, zp3, acc3, x3a, x3b);
+#endif
 #else
+        float sc0 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp0, (g + 0) * 136));
+        float zp0 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp0 + 4, (g + 0) * 136 + 4));
+        float sc1 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp1, (g + 1) * 136));
+        float zp1 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp1 + 4, (g + 1) * 136 + 4));
+        float sc2 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp2, (g + 2) * 136));
+        float zp2 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp2 + 4, (g + 2) * 136 + 4));
+        float sc3 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp3, (g + 3) * 136));
+        float zp3 = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp3 + 4, (g + 3) * 136 + 4));
+
+        unsigned int pk0 = RESIDUAL_WEIGHT_LOAD(gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
+        unsigned int pk1 = RESIDUAL_WEIGHT_LOAD(gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
+        unsigned int pk2 = RESIDUAL_WEIGHT_LOAD(gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
+        unsigned int pk3 = RESIDUAL_WEIGHT_LOAD(gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
+
         #define DOG(pk, sc, zp, b, a) \
             (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
                  + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -135,9 +184,9 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
 #endif
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
-        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
+        float sc = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp, g * 136));
+        float zp = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp + 4, g * 136 + 4));
+        unsigned int pk = RESIDUAL_WEIGHT_LOAD(gp + 8 + boff, g * 136 + 8 + boff);
 #if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
         DOG_X8(pk, sc, zp, acc0, xa, xb);
 #else
@@ -152,9 +201,9 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
 #endif
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
-        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
+        float sc = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp, g * 136));
+        float zp = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp + 4, g * 136 + 4));
+        unsigned int pk = RESIDUAL_WEIGHT_LOAD(gp + 8 + boff, g * 136 + 8 + boff);
 #if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
         DOG_X8(pk, sc, zp, acc1, xa, xb);
 #else
@@ -169,9 +218,9 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
 #endif
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
-        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
+        float sc = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp, g * 136));
+        float zp = __builtin_bit_cast(float, RESIDUAL_WEIGHT_LOAD(gp + 4, g * 136 + 4));
+        unsigned int pk = RESIDUAL_WEIGHT_LOAD(gp + 8 + boff, g * 136 + 8 + boff);
 #if HIPFIRE_RDNA3_RESIDUAL_STAGE_X32
         DOG_X8(pk, sc, zp, acc2, xa, xb);
 #else
@@ -183,6 +232,7 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
 #else
     #undef TAIL_DOG
 #endif
+    #undef RESIDUAL_WEIGHT_LOAD
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
