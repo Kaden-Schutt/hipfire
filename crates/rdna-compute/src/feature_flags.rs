@@ -92,6 +92,10 @@ pub struct FeatureFlags {
     pub gfx942_gemv_v2: Option<bool>,
     pub gfx942_gemv_v3: bool,
     pub gfx942_rmsnorm_split: bool,
+    /// Reserve only the reduction scratch still used by the current fused
+    /// RMSNorm+MQ kernel. The historical K-float LDS cache was removed when
+    /// the prefetch schedule landed, but its launch reservation remained.
+    pub rmsnorm_mq_tight_lds: bool,
     pub gfx942_mfma_prefill: Option<String>,
     pub moe_grouped_i8: Option<bool>,
     pub moe_grouped_i8_k8: bool,
@@ -344,6 +348,8 @@ impl FeatureFlags {
             gfx942_gemv_v3: std::env::var("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
                 && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
+            rmsnorm_mq_tight_lds: std::env::var("HIPFIRE_RMSNORM_MQ_TIGHT_LDS").as_deref()
+                == Ok("1"),
             gfx942_mfma_prefill: std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
             moe_grouped_i8: match std::env::var("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
                 Some("1") => Some(true),
@@ -551,6 +557,7 @@ impl FeatureFlags {
             gfx942_gemv_v2: None,
             gfx942_gemv_v3: false,
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),
+            rmsnorm_mq_tight_lds: false,
             gfx942_mfma_prefill: None,
             moe_grouped_i8: None,
             moe_grouped_i8_k8: false,

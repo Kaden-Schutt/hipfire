@@ -2042,8 +2042,14 @@ impl Gpu {
         ];
 
         let block_size = 256u32;
-        // Dynamic LDS: K floats for x_shared + 256 floats for reduce buffer.
-        let shared_mem = ((k + 256) * 4) as u32;
+        // The current kernel uses only reduce[256]. Keep the historical
+        // K-float x_shared reservation as the A/B control; x_shared itself
+        // disappeared when the first-group prefetch schedule landed.
+        let shared_mem = if self.flags.rmsnorm_mq_tight_lds {
+            (256 * 4) as u32
+        } else {
+            ((k + 256) * 4) as u32
+        };
 
         // Bandwidth: read x (K*4) + weight (K*4) + signs (2*256*4) + write x_rot (K*4)
         let bytes = k * 4 * 3 + 2 * 256 * 4;
