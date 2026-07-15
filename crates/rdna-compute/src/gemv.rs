@@ -5985,6 +5985,14 @@ impl Gpu {
                 && *GATE_UP_WG2.get_or_init(|| {
                     std::env::var("HIPFIRE_MOE_GATE_UP_WG2").as_deref() == Ok("1")
                 });
+            // The unchanged base kernel maps blockIdx.x to one logical row in
+            // each M/2 gate and up output. The legacy M-sized grid therefore
+            // leaves its upper half to exit at the row >= M/2 guard.
+            static GATE_UP_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
+            let tight_grid = self.arch_caps.is_gfx1100()
+                && *GATE_UP_TIGHT_GRID.get_or_init(|| {
+                    std::env::var("HIPFIRE_MOE_GATE_UP_TIGHT_GRID").as_deref() == Ok("1")
+                });
             // Two independent wave32 rows in one workgroup. Unlike the old
             // row-tile below, this does not duplicate per-wave accumulators or
             // change a row's reduction order.
@@ -6027,7 +6035,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed",
                     [32u32, 1, 1],
-                    m as u32,
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             }
         };
