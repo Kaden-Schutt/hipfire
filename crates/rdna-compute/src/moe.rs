@@ -25,11 +25,25 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "moe_down_combine_k8_batched",
-            kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
-            "moe_down_combine_k8_batched",
-        )?;
+        let use_vec4 = self.arch_caps.is_rdna3_dgpu()
+            && self.flags.moe_down_combine_vec4
+            && k_top == 8
+            && m.is_multiple_of(4);
+        let func_name = if use_vec4 {
+            self.ensure_kernel(
+                "moe_down_combine_k8_batched_vec4",
+                kernels::MOE_DOWN_COMBINE_K8_BATCHED_VEC4_SRC,
+                "moe_down_combine_k8_batched_vec4",
+            )?;
+            "moe_down_combine_k8_batched_vec4"
+        } else {
+            self.ensure_kernel(
+                "moe_down_combine_k8_batched",
+                kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
+                "moe_down_combine_k8_batched",
+            )?;
+            "moe_down_combine_k8_batched"
+        };
         let eop = expert_outputs.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
         let xrp = x_residual.buf.as_ptr();
@@ -51,9 +65,10 @@ impl Gpu {
             bytes,
         );
         let block_m: u32 = 256;
-        let grid_x = (m as u32 + block_m - 1) / block_m;
+        let columns_per_thread = if use_vec4 { 4 } else { 1 };
+        let grid_x = (m as u32).div_ceil(block_m * columns_per_thread);
         let result = self.launch_maybe_blob(
-            "moe_down_combine_k8_batched",
+            func_name,
             [grid_x, batch_size as u32, 1],
             [block_m, 1, 1],
             0,

@@ -401,7 +401,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
-        "moe_down_combine_k8_batched" => Some(vec![read(0), read(8), write(16)]),
+        "moe_down_combine_k8_batched" | "moe_down_combine_k8_batched_vec4" => {
+            Some(vec![read(0), read(8), write(16)])
+        }
         "fused_qkv_hfq4g256" => Some(vec![
             read(0),
             read(8),
@@ -456,6 +458,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "deinterleave_f32"
         | "kv_cache_write_q8_0"
         | "moe_down_combine_k8_batched"
+        | "moe_down_combine_k8_batched_vec4"
         | "moe_topk_renorm_k8"
         | "rmsnorm_f32"
         | "sigmoid_mul_f32" => Some(32),
@@ -2238,6 +2241,7 @@ mod tests {
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
         "moe_down_combine_k8_batched",
+        "moe_down_combine_k8_batched_vec4",
         "fused_qkv_hfq4g256",
         "deinterleave_f32",
         "rmsnorm_f32",

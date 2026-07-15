@@ -1508,6 +1508,11 @@ pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const MOE_DOWN_COMBINE_K8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_k8_batched.hip");
 
+/// Four adjacent output columns per thread with four independent accumulator
+/// chains. Preserves the scalar K=8 reduction order per output.
+pub const MOE_DOWN_COMBINE_K8_BATCHED_VEC4_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_k8_batched_vec4.hip");
+
 /// SGLang-style MoE scatter pipeline — Phase 1: per-expert histogram
 /// over flattened topk_indices. Single workgroup, LDS atomics.
 pub const MOE_SCATTER_HISTOGRAM_K8_SRC: &str =
