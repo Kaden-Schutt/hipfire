@@ -5782,7 +5782,7 @@ fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_j
     // qwen3.5 hybrid-attention (DeltaNet linear-attention + FullAttention)
     // config. Gated on arch_str since these GGUF keys/JSON fields are
     // qwen3.5/qwen3.5moe-specific (see onboarding-map-research.md §B).
-    if arch_str == "qwen35" || arch_str == "qwen35moe" {
+    if is_qwen35_arch(arch_str) {
         let conv_kernel = read_u(&format!("{prefix}.ssm.conv_kernel"));
         let state_size = read_u(&format!("{prefix}.ssm.state_size"));
         let group_count = read_u(&format!("{prefix}.ssm.group_count"));
@@ -5950,6 +5950,28 @@ fn qwen35_layer_types(n_layers: u64, interval: u64) -> Vec<&'static str> {
 /// (qwen35.rs:8662-8683) so it expects GROUPED order → invert tiled→grouped.
 /// hipfire's fused_sigmoid_alpha_gate applies -exp(A_log) itself, so
 /// A_log must hold the raw log parameter: A_log_raw = ln(-gguf_ssm_a).
+/// True for any spelling of the Qwen3.5/3.6 hybrid-attention arch that requires
+/// the PrismML onboarding transforms (V-head un-tiling, A_log `ln(-x)`, norm
+/// de-bias). The GGUF/config auto-detectors and reap_overlay each accept a
+/// disjoint set of spellings for the SAME arch (arch_id 5 dense / 6 MoE); the
+/// transform gates must recognize the full union or a `qwen3_5` GGUF would
+/// auto-detect as Qwen3.5 yet silently skip every transform → corrupt `.hfq`.
+/// Plain `qwen3`/`qwen2` (arch_id 1) are deliberately excluded — they are NOT
+/// hybrid-attn and must not get these transforms.
+fn is_qwen35_arch(arch: &str) -> bool {
+    matches!(
+        arch,
+        "qwen35"
+            | "qwen35moe"
+            | "qwen3_5"
+            | "qwen3_5_text"
+            | "qwen3_5_moe"
+            | "qwen3_5_moe_text"
+            | "qwen3.5"
+            | "qwen3moe"
+    )
+}
+
 fn qwen35_value_transform(
     gguf_name: &str,
     raw: &[u8],
@@ -5957,6 +5979,7 @@ fn qwen35_value_transform(
     nk: usize, // linear_num_key_heads   (16)
     nv: usize, // linear_num_value_heads (48)
     hv: usize, // linear_value_head_dim  (128)
+    dtype: gguf_input::GgmlType,
 ) -> Option<Vec<u8>> {
     // rel = name with the "blk.N." prefix removed
     let rel = gguf_name
@@ -5965,6 +5988,10 @@ fn qwen35_value_transform(
         .map(|(_n, r)| r)?;
 
     let reorder = nk != nv;
+    debug_assert!(
+        nv % nk == 0,
+        "qwen35 reorder expects nv({nv}) divisible by nk({nk})"
+    );
     let r = nv / nk; // v-heads per k-head (3)
     let inv = |g: usize| -> usize { (g % r) * nk + (g / r) }; // tiled→grouped
     const BLK: usize = 34; // Q2_0 bytes per 128-element block
@@ -6014,6 +6041,30 @@ fn qwen35_value_transform(
         out
     };
 
+    // conv1d is stored F32 (channels are 4-byte floats), so its permute is
+    // dtype-independent — handle it before the Q2_0-only block-permute gate.
+    if rel == "ssm_conv1d.weight" {
+        // F32 (4,10240): V channels [nk*hv*2 ..), each channel = ne0 f32
+        let chan = ne0 * 4; // 16 bytes
+        let base = (nk * hv * 2) * chan; // 4096 * 16
+        return Some(permute(base, hv * chan));
+    }
+
+    // The remaining reorder arms slice `raw` as fixed-size quant blocks whose
+    // byte layout is only valid for Q2_0 (BLK=34 bytes / 128-element block).
+    // Fed any other dtype (Q8_0/Q4_K/F16/…) the offsets stay in bounds but
+    // scramble the bytes silently, so decline the transform and let the raw
+    // bytes pass through unchanged. A future 1-bit format (Q1_0, 18-byte block)
+    // would add its own `dtype` arm here.
+    match dtype {
+        gguf_input::GgmlType::Q2_0 => {}
+        _ => return None,
+    }
+    debug_assert!(
+        ne0 % 128 == 0,
+        "qwen35 reorder expects 128-aligned ne0, got {ne0}"
+    );
+
     match rel {
         // Q2_0 (ne0,ne1)=(5120,10240): V rows [nk*hv*2 ..), row=(ne0/128)*34
         "attn_qkv.weight" => {
@@ -6045,12 +6096,6 @@ fn qwen35_value_transform(
                 }
             }
             Some(out)
-        }
-        // F32 (4,10240): V channels [nk*hv*2 ..), each channel = ne0 f32
-        "ssm_conv1d.weight" => {
-            let chan = ne0 * 4; // 16 bytes
-            let base = (nk * hv * 2) * chan; // 4096 * 16
-            Some(permute(base, hv * chan))
         }
         _ => None,
     }
@@ -6216,7 +6261,16 @@ mod qwen35_onboarding_tests {
             .flat_map(|v| v.to_le_bytes())
             .collect();
         // nk==nv → no reorder, only ln
-        let out = qwen35_value_transform("blk.0.ssm_a", &raw, &[2], 2, 2, 128).unwrap();
+        let out = qwen35_value_transform(
+            "blk.0.ssm_a",
+            &raw,
+            &[2],
+            2,
+            2,
+            128,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .unwrap();
         let got: Vec<f32> = out
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -6235,8 +6289,16 @@ mod qwen35_onboarding_tests {
                 raw[g * row + b] = (g as u8) + 1;
             }
         }
-        let out = qwen35_value_transform("blk.0.ssm_alpha.weight", &raw, &[ne0, nv], nk, nv, 128)
-            .unwrap();
+        let out = qwen35_value_transform(
+            "blk.0.ssm_alpha.weight",
+            &raw,
+            &[ne0, nv],
+            nk,
+            nv,
+            128,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .unwrap();
         let r = nv / nk;
         let inv = |g: usize| (g % r) * nk + (g / r);
         for g in 0..nv {
@@ -6262,8 +6324,16 @@ mod qwen35_onboarding_tests {
                 raw[rr * row + b] = rr as u8;
             }
         }
-        let out =
-            qwen35_value_transform("blk.5.attn_qkv.weight", &raw, &[ne0, ne1], nk, nv, hv).unwrap();
+        let out = qwen35_value_transform(
+            "blk.5.attn_qkv.weight",
+            &raw,
+            &[ne0, ne1],
+            nk,
+            nv,
+            hv,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .unwrap();
         // Q/K region untouched
         for rr in 0..v_start {
             assert_eq!(out[rr * row], rr as u8, "Q/K row {rr} must be untouched");
@@ -6293,8 +6363,16 @@ mod qwen35_onboarding_tests {
                 raw[rr * row_bytes + blk_i * blk] = (rr * nv + blk_i) as u8;
             }
         }
-        let out =
-            qwen35_value_transform("blk.0.ssm_out.weight", &raw, &[ne0, ne1], nk, nv, 128).unwrap();
+        let out = qwen35_value_transform(
+            "blk.0.ssm_out.weight",
+            &raw,
+            &[ne0, ne1],
+            nk,
+            nv,
+            128,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .unwrap();
         let r = nv / nk;
         let inv = |g: usize| (g % r) * nk + (g / r);
         for rr in 0..ne1 {
@@ -6302,6 +6380,71 @@ mod qwen35_onboarding_tests {
                 assert_eq!(out[rr * row_bytes + g * blk], (rr * nv + inv(g)) as u8);
             }
         }
+    }
+
+    // Fix 2: the block-permute arms slice raw bytes as 34-byte Q2_0 blocks.
+    // For any non-Q2_0 dtype they would scramble data silently, so the transform
+    // must decline (return None) and let the raw bytes pass through unchanged.
+    #[test]
+    fn qwen35_block_permute_only_for_q2_0() {
+        let (nk, nv) = (2usize, 6usize);
+        let ne0 = 128usize; // 1 block → row = 34 bytes for Q2_0
+        let row = 34usize;
+        let mut raw = vec![0u8; nv * row];
+        for g in 0..nv {
+            for b in 0..row {
+                raw[g * row + b] = (g as u8) + 1;
+            }
+        }
+        // Q2_0 still permutes (behaviour preserved).
+        let q2 = qwen35_value_transform(
+            "blk.0.ssm_alpha.weight",
+            &raw,
+            &[ne0, nv],
+            nk,
+            nv,
+            128,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .expect("Q2_0 must still permute");
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for g in 0..nv {
+            assert_eq!(q2[g * row], (inv(g) as u8) + 1, "Q2_0 head {g} permuted");
+        }
+        // A non-Q2_0 dtype must NOT be byte-permuted: decline the transform.
+        let f16 = qwen35_value_transform(
+            "blk.0.ssm_alpha.weight",
+            &raw,
+            &[ne0, nv],
+            nk,
+            nv,
+            128,
+            gguf_input::GgmlType::F16,
+        );
+        assert!(
+            f16.is_none(),
+            "non-Q2_0 block-permute must be declined (raw bytes pass through), got {f16:?}"
+        );
+    }
+
+    // Fix 1: the transform gate must recognize every spelling of the qwen3.5/3.6
+    // hybrid-attn arch that the auto-detectors / reap_overlay accept, but not
+    // plain non-hybrid qwen3.
+    #[test]
+    fn qwen35_arch_spelling_union() {
+        assert!(is_qwen35_arch("qwen3_5"));
+        assert!(is_qwen35_arch("qwen35"));
+        assert!(is_qwen35_arch("qwen35moe"));
+        assert!(is_qwen35_arch("qwen3_5_text"));
+        assert!(is_qwen35_arch("qwen3_5_moe"));
+        assert!(is_qwen35_arch("qwen3_5_moe_text"));
+        assert!(is_qwen35_arch("qwen3.5"));
+        assert!(is_qwen35_arch("qwen3moe"));
+        // plain non-hybrid qwen3 must NOT be treated as qwen3.5
+        assert!(!is_qwen35_arch("qwen3"));
+        assert!(!is_qwen35_arch("qwen2"));
+        assert!(!is_qwen35_arch("llama"));
     }
 }
 
@@ -6610,7 +6753,7 @@ fn run_gguf_pipeline(
 
     // qwen35 linear-attn head geometry, for the V-head un-tiling + A_log transform.
     let (qw_nk, qw_nv, qw_hv): (Option<usize>, Option<usize>, Option<usize>) =
-        if arch_str == "qwen35" || arch_str == "qwen35moe" {
+        if is_qwen35_arch(&arch_str) {
             let g = |k: &str| gguf.metadata.get(k).and_then(meta_value_as_u64);
             let nk = g(&format!("{arch_str}.ssm.group_count")); // 16
             let nv = g(&format!("{arch_str}.ssm.time_step_rank")); // 48
@@ -6630,7 +6773,7 @@ fn run_gguf_pipeline(
         let raw = gguf.tensor_data(info);
         let qw_transformed: Option<Vec<u8>> = match (qw_nk, qw_nv, qw_hv) {
             (Some(nk), Some(nv), Some(hv)) => {
-                qwen35_value_transform(&info.name, raw, &info.shape, nk, nv, hv)
+                qwen35_value_transform(&info.name, raw, &info.shape, nk, nv, hv, info.dtype)
             }
             _ => None,
         };
@@ -6669,7 +6812,7 @@ fn run_gguf_pipeline(
         // value straight through would double-add → norm weights ~2× → the
         // whole forward pass runs ~2× hot (verified layer-0 vs llama.cpp).
         // Undo PrismML's +1 here so the runtime's +1 restores the true weight.
-        let is_qwen35 = arch_str == "qwen35" || arch_str == "qwen35moe";
+        let is_qwen35 = is_qwen35_arch(&arch_str);
         let undo_norm_bias = is_qwen35
             && info.name.ends_with("norm.weight")
             && !info.name.ends_with("ssm_norm.weight");
