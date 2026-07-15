@@ -4159,6 +4159,151 @@ fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+/// Quantize F32 weights to TQ2G128: PrismML `Q2_0`-compatible scale-only
+/// ternary quant. Block: `[FP16 d][32B packed 2-bit codes]` = 34 bytes per
+/// 128 weights (2.125 bpw). Scale is `d = max(|w|)` over the group (NOT
+/// mean — that's Q1_0's rule). Per element: `code = clamp(round(w * id) + 1,
+/// 0, 3)` where `id = d > 0 ? 1/d : 0`; codes pack LSB-first, 4 per byte
+/// (`byte[j/4] |= code << ((j%4)*2)`). Reconstruction: `w = (code-1) * d`.
+/// Mirrors PrismML's `quantize_row_q2_0_ref` byte-for-byte — this is both
+/// the re-quant fallback for non-Q2_0 tensors under `--format ternary` and
+/// the oracle the passthrough path is checked against.
+/// See findings/prismml-q2_0-layout.md for the frozen wire format.
+fn quantize_tq2g128(f32_data: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+
+        let mut amax = 0.0f32;
+        for &w in group {
+            amax = amax.max(w.abs());
+        }
+        let d = amax;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+
+        let actual_len = end - start;
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let idx = 4 * i + j;
+                let w = if idx < actual_len { group[idx] } else { 0.0 };
+                let mut q = (w * id).round() as i32 + 1;
+                if q < 0 {
+                    q = 0;
+                }
+                if q > 3 {
+                    q = 3;
+                }
+                byte_val |= (q as u8) << (j * 2);
+            }
+            output[out_off + 2 + i] = byte_val;
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tq2g128_tests {
+    use super::*;
+
+    /// Byte-exactness of `quantize_tq2g128` against a hand-derived expected
+    /// block. Group of 128: idx0=-2.0, idx1=0.0, idx2=2.0, idx3..127=0.0.
+    /// d = max(|w|) = 2.0, id = 0.5.
+    ///
+    /// Per-element codes (q = clamp(round(w*id)+1, 0, 3)):
+    ///   idx0: round(-2.0*0.5)+1 = round(-1.0)+1 = 0
+    ///   idx1: round( 0.0*0.5)+1 = round( 0.0)+1 = 1
+    ///   idx2: round( 2.0*0.5)+1 = round( 1.0)+1 = 2
+    ///   idx3..127 (all 0.0): round(0.0)+1 = 1
+    ///
+    /// NOTE: the zero-valued tail encodes to code 1 (not code 0) because
+    /// id=0.5 != 0 here (d != 0) — only an all-zero *group* (d==0, id==0)
+    /// would encode zeros as code 0. This matters for the packed bytes:
+    /// byte0 packs elements 0..3 LSB-first (`code << ((j%4)*2)`):
+    ///   byte0 = code0 | code1<<2 | code2<<4 | code3<<6
+    ///         =    0  |   1<<2   |   2<<4   |   1<<6
+    ///         = 0b01_10_01_00 = 0x64
+    /// bytes[1..32] cover elements 4..127, all code=1:
+    ///   byte = 1 | 1<<2 | 1<<4 | 1<<6 = 0b01_01_01_01 = 0x55
+    ///
+    /// FP16(2.0) = 0x4000 (sign=0, exp=16, frac=0), little-endian [0x00,0x40] —
+    /// cross-checked against the existing `dequant_q2_0` CPU-oracle test in
+    /// gguf_input.rs, which uses the identical byte pair for scale 2.0.
+    #[test]
+    fn quantize_tq2g128_byte_exact() {
+        let mut group = vec![0.0f32; 128];
+        group[0] = -2.0;
+        group[1] = 0.0;
+        group[2] = 2.0;
+        // group[3..128] stay 0.0
+
+        let out = quantize_tq2g128(&group);
+        assert_eq!(out.len(), 34, "one 128-group -> one 34-byte block");
+
+        // FP16 scale d=2.0, little-endian.
+        assert_eq!(&out[0..2], &[0x00, 0x40]);
+
+        // qs[0] (elements 0..3): codes 0,1,2,1 -> 0x64.
+        assert_eq!(out[2], 0x64);
+
+        // qs[1..32] (elements 4..127): all code=1 -> 0x55, repeated 31 times.
+        assert_eq!(&out[3..34], &[0x55u8; 31][..]);
+    }
+
+    /// Round-trip losslessness for an already-ternary input: values drawn
+    /// from {-d, 0, +d} with d a power of two (4.0) so the FP16 scale is
+    /// exact and every code round-trips without rounding error. Decodes via
+    /// the crate's public `tensor_to_f32` dispatcher (which routes
+    /// `GgmlType::Q2_0` to the private `dequant_q2_0` CPU oracle added in
+    /// Task 5) — this exercises the *real* decode path rather than a
+    /// second hand-rolled decoder, so it also proves TQ2G128's block
+    /// layout is byte-compatible with GGUF `Q2_0` end-to-end.
+    #[test]
+    fn quantize_tq2g128_round_trips_ternary_input() {
+        let d = 4.0f32;
+        let f32_data: Vec<f32> = (0..128)
+            .map(|i| match i % 3 {
+                0 => -d,
+                1 => 0.0,
+                _ => d,
+            })
+            .collect();
+
+        let packed = quantize_tq2g128(&f32_data);
+        assert_eq!(packed.len(), 34);
+
+        let info = gguf_input::TensorInfo {
+            name: "round_trip".to_string(),
+            shape: vec![128],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let decoded = gguf_input::tensor_to_f32(&info, &packed);
+
+        assert_eq!(decoded, f32_data);
+    }
+
+    /// Multi-block input (2 groups of 128) — checks block offsets/lengths
+    /// are computed correctly, not just the single-block case above.
+    #[test]
+    fn quantize_tq2g128_multi_block_length() {
+        let f32_data = vec![1.0f32; 256];
+        let out = quantize_tq2g128(&f32_data);
+        assert_eq!(out.len(), 2 * 34);
+    }
+}
+
 /// Quantize F32 weights to HFQ6-G256: 6-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights (0.78125 B/w).
 pub(crate) fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
@@ -4345,7 +4490,11 @@ pub(crate) enum QuantType {
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
-                    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    TQ2G128 = 38, // TQ2G128: PrismML Q2_0-compatible scale-only ternary, g128, 34 B/blk
+                  // (2.125 bpw). [FP16 d][32B 2-bit codes], code=(w/d)+1 clamped 0..3,
+                  // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
+                  // See findings/prismml-q2_0-layout.md.
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -4392,6 +4541,9 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mfp4E8Soa => GgufFormat::Mfp4E8Soa,
         GgufFormat::Mfp3E8 => GgufFormat::Mfp3E8,
         GgufFormat::Mfp2E8 => GgufFormat::Mfp2E8,
+        // Ternary has no promote sibling (PrismML Q2_0 has no 6-bit variant);
+        // no-op, matching the FP4-family pattern above.
+        GgufFormat::Ternary => GgufFormat::Ternary,
     }
 }
 
@@ -5665,6 +5817,14 @@ enum GgufFormat {
     Mfp4E8Soa, // mfp4-E8 SoA — same E8 data in structure-of-arrays layout for coalesced GEMV
     Mfp3E8, // mfp3-E8 — mfp4-E8 frame with 3-bit lattice (13 B/blk, 3.25 bpw; drop-in for MQ3-Lloyd cold)
     Mfp2E8, // mfp2-E8 — mfp4-E8 frame with 2-bit lattice (9 B/blk, 2.25 bpw; drop-in for MQ2-Lloyd cold)
+    /// Ternary — PrismML Bonsai family. Source GGUF is already mixed-precision
+    /// (Q2_0 ternary matmuls + Q8_0/F16 embeddings + F32/F16 norms); the
+    /// per-tensor precision PrismML chose is authoritative, so 2D matmul
+    /// tensors already in Q2_0 pass through byte-verbatim to TQ2G128
+    /// (see the dedicated arm in `run_gguf_pipeline`) rather than going
+    /// through the kmap/Q8 rules. `quantize_tq2g128` is only the re-quant
+    /// fallback for the rare non-Q2_0 matmul tensor under this format.
+    Ternary,
 }
 
 impl GgufFormat {
@@ -5688,6 +5848,7 @@ impl GgufFormat {
             "mfp4e8soa" | "mfp4-e8-soa" | "mfp4e8-soa" => Some(Self::Mfp4E8Soa),
             "mfp3e8" | "mfp3-e8" => Some(Self::Mfp3E8),
             "mfp2e8" | "mfp2-e8" => Some(Self::Mfp2E8),
+            "ternary" | "tq2" | "tq2g128" => Some(Self::Ternary),
             _ => None,
         }
     }
@@ -5712,6 +5873,7 @@ impl GgufFormat {
             Self::Mfp4E8Soa => "MFP4G32E8SOA",
             Self::Mfp3E8 => "MFP3G32E8",
             Self::Mfp2E8 => "MFP2G32E8",
+            Self::Ternary => "TQ2G128",
         }
     }
 }
@@ -5908,6 +6070,31 @@ fn run_gguf_pipeline(
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
+        } else if matches!(format, GgufFormat::Ternary) && info.dtype == gguf_input::GgmlType::Q2_0
+        {
+            // TQ2G128 byte-verbatim passthrough wins over the kmap/Q8 rules
+            // when the source is already Q2_0 — PrismML's per-tensor format
+            // choice (incl. embedding/lm_head) is authoritative. Preserves
+            // the ternary calibration that QAT'd into the model. Layout is
+            // identical between the GGUF Q2_0 block and hipfire TQ2G128
+            // (findings/prismml-q2_0-layout.md) so no re-pack is needed.
+            let nblocks = (n_elements + 127) / 128;
+            let expected = nblocks * 34;
+            assert_eq!(
+                raw.len(),
+                expected,
+                "Q2_0 size mismatch for {}: got {} bytes, expected {}",
+                info.name,
+                raw.len(),
+                expected
+            );
+            quant_params += n_elements as u64;
+            (
+                raw.to_vec(),
+                QuantType::TQ2G128,
+                128u32,
+                "TQ2G128 (passthrough)",
+            )
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -6022,6 +6209,13 @@ fn run_gguf_pipeline(
                     let q = quantize_hfq4g256(&f32_data);
                     (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                 }
+                GgufFormat::Ternary => {
+                    // No Promote6 sibling for ternary (see default_promote_target);
+                    // this arm only exists for match-exhaustiveness — Bonsai has
+                    // no kmap-promoted tensors (kmap is dense-gated off by default).
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant, promote6)")
+                }
             }
         } else if let (QuantLevel::Override(override_fmt), true) = (kmap_level, k_dim % 256 == 0) {
             // K-map says override (lm_head when --lm-head-format set).
@@ -6110,6 +6304,12 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                 }
+                GgufFormat::Ternary => {
+                    // K-map override target (lm_head) not expected under
+                    // --format ternary; arm only for match-exhaustiveness.
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant, override)")
+                }
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -6123,6 +6323,13 @@ fn run_gguf_pipeline(
                 GgufFormat::Hfq6 => {
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                }
+                GgufFormat::Ternary => {
+                    // Safety net for non-Q2_0 matmul tensors under --format
+                    // ternary (real Bonsai matmuls are all Q2_0 and are
+                    // caught by the passthrough arm earlier in this chain).
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant)")
                 }
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
@@ -6367,16 +6574,24 @@ fn main() {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(d)
         };
-        let block_size = config.get("block_size").and_then(|v| v.as_u64()).unwrap_or(7) as usize;
+        let block_size = config
+            .get("block_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(7) as usize;
         let target_layer_ids: Vec<u64> = config
             .get("target_layer_ids")
             .or_else(|| config.get("aux_hidden_state_layer_ids"))
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
-        let markov_rank = config.get("markov_rank").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
-        let noise_token_id =
-            config.get("mask_token_id").and_then(|v| v.as_u64()).unwrap_or(151669) as u32;
+        let markov_rank = config
+            .get("markov_rank")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(256) as usize;
+        let noise_token_id = config
+            .get("mask_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(151669) as u32;
         let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
         let confidence_with_markov = config
             .get("confidence_head_with_markov")
@@ -6507,7 +6722,10 @@ fn main() {
                         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
                         .collect()
                 } else if meta.dtype == "BOOL" || meta.dtype == "U8" {
-                    raw_data.iter().map(|&b| if b != 0 { 1.0 } else { 0.0 }).collect()
+                    raw_data
+                        .iter()
+                        .map(|&b| if b != 0 { 1.0 } else { 0.0 })
+                        .collect()
                 } else {
                     to_f32(raw_data, &meta.dtype)
                 };
@@ -8161,8 +8379,7 @@ fn main() {
                 n_elements *= 2; // fused tensor carries gate + up params
                 meta = &_fused_meta;
                 raw_data = &_fused_bytes;
-                expert_fuse_rename
-                    .insert(name.to_string(), format!("{stem}.gate_up_proj.weight"));
+                expert_fuse_rename.insert(name.to_string(), format!("{stem}.gate_up_proj.weight"));
                 st_files[up_fi].drop_tensor_pages(&up_name);
                 eprintln!(
                     "  {:>8}: {name} + up_proj → {stem}.gate_up_proj.weight {:?}",
@@ -10089,6 +10306,15 @@ fn main() {
                                 };
                                 let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
                                 (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                            }
+                            GgufFormat::Ternary => {
+                                // safetensors pipeline has no Bonsai/GGUF Q2_0
+                                // passthrough source; arm only for
+                                // match-exhaustiveness (not a real dispatch
+                                // target — lm_head override under ternary is
+                                // unused on this branch).
+                                let q = quantize_tq2g128(&f32_data);
+                                (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant)")
                             }
                         }
                     } else {
