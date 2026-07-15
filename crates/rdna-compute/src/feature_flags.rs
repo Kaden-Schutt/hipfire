@@ -57,6 +57,9 @@ pub struct FeatureFlags {
     /// Radiowave experiment: port the gfx12 QKVZA float4 activation-hoist
     /// schedule to gfx1100 while retaining one independent wave per row.
     pub rdna3_hfq4_qkvza_hoist_x32: bool,
+    /// Compile the exact A3B decode shape with eight HFQ4 groups fixed at
+    /// compile time, deleting the general QKVZA loop and tail machinery.
+    pub rdna3_hfq4_qkvza_k2048: bool,
     /// Stage one residual GEMV row's 32 activation values ahead of the
     /// independent packed-weight loads. Certified default on exact gfx1100;
     /// other RDNA3 targets remain explicit opt-in until separately measured.
@@ -324,6 +327,9 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_hoist_x32: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
                 .as_deref()
                 == Ok("1"),
+            rdna3_hfq4_qkvza_k2048: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
+                .as_deref()
+                == Ok("1"),
             rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
                 .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_sigmoid_tight_grid: std::env::var(
@@ -579,6 +585,7 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_ldsx8: false,
             rdna3_hfq4_qkvza_reduce_chain: false,
             rdna3_hfq4_qkvza_hoist_x32: false,
+            rdna3_hfq4_qkvza_k2048: false,
             rdna3_hfq4_residual_stage_x32: false,
             rdna3_hfq4_sigmoid_tight_grid: false,
             rdna3_hfq4_sigmoid_buffer: false,

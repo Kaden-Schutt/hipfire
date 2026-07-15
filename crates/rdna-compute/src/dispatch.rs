@@ -2159,6 +2159,12 @@ impl Gpu {
                         kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC.to_string(),
                     ));
                 }
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_k2048_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC.to_string(),
+                    ));
+                }
                 specs.push((
                     "fused_qkv_hfq4g256",
                     kernels::FUSED_QKV_HFQ4G256_SRC.to_string(),
@@ -2264,6 +2270,12 @@ impl Gpu {
                     specs.push((
                         "fused_qkvza_hfq4g256_2wave",
                         kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC.to_string(),
+                    ));
+                }
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_k2048_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC.to_string(),
                     ));
                 }
                 specs.push((

@@ -2388,6 +2388,17 @@ pub const FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+// Exact gfx1100 A3B decode specialization. The runtime signature remains
+// unchanged for replay compatibility; host routing enforces K=2048 while the
+// source-level constant lets LLVM delete the general loop and tail machinery.
+pub const FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 pub const FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),

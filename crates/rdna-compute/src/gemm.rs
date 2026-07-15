@@ -2516,6 +2516,9 @@ impl Gpu {
             && k == 2_048;
         let rdna3_reduce_chain =
             self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_reduce_chain;
+        let rdna3_k2048 = self.arch_caps.is_gfx1100()
+            && self.flags.rdna3_hfq4_qkvza_k2048
+            && k == 2_048;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let (func_name, block, grid_x) = if rdna3_ldsx8 {
@@ -2555,6 +2558,17 @@ impl Gpu {
             )?;
             (
                 "fused_qkvza_hfq4g256_reduce_chain",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if rdna3_k2048 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_k2048",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048",
                 [32u32, 1, 1],
                 total_m as u32,
             )

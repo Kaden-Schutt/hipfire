@@ -113,7 +113,15 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         A = A_alpha; y = y_alpha; row = gid - (qkv_m + z_m + beta_m);
     }
 
+#if defined(HIPFIRE_RDNA3_QKVZA_K2048)
+    // Qwen3.5/3.6 A3B decode always reaches this path with K=2048. Exposing
+    // that contract to LLVM removes the runtime divide, quad-loop trip count,
+    // and all three dead tail bodies while retaining the exact base-kernel
+    // load and FMA order. The host dispatch enforces K==2048.
+    const int groups_per_row = 8;
+#else
     const int groups_per_row = K / 256;
+#endif
 #if defined(HIPFIRE_RDNA3_QKVZA_REDUCE_CHAIN)
     const long long row_stride = (long long)groups_per_row * 136;
     const char* row_ptr = A + (long long)row * row_stride;
