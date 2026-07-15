@@ -424,6 +424,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
@@ -510,6 +511,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gated_norm_f32"
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "kv_cache_write_asym_k_fwht3"
@@ -987,6 +989,10 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
                 "gemv_hfq4g256_moe_gate_up_k8_indexed",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
             )
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
@@ -2369,6 +2375,7 @@ mod tests {
         "fused_silu_mul_mq_rotate",
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine",

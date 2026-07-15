@@ -6207,6 +6207,9 @@ impl Gpu {
             static GATE_UP_FUSED: OnceLock<bool> = OnceLock::new();
             let fused = *GATE_UP_FUSED
                 .get_or_init(|| std::env::var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1"));
+            let fixed_k2048 = self.arch_caps.is_gfx1100()
+                && self.flags.rdna3_hfq4_moe_gate_up_k2048
+                && k == 2_048;
             if wg2 {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_wg2",
@@ -6229,6 +6232,21 @@ impl Gpu {
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_rowtile",
                     [32u32, 1, 1],
                     ((m as u32) + 1) / 2,
+                )
+            } else if fixed_k2048 {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1100_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+                    [32u32, 1, 1],
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else {
                 self.ensure_kernel(

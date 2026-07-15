@@ -81,6 +81,9 @@ pub struct FeatureFlags {
     /// Compile the exact Qwen3.5-35B LM-head shape (M=248320, K=2048) with
     /// its eight HFQ4 groups fixed at compile time. gfx1100 experiment only.
     pub rdna3_hfq4_lm_head_k2048: bool,
+    /// Compile the gfx1100 A3B MoE gate/up GEMV with its eight K groups fixed
+    /// at compile time. Opt-in until exact shadow and tg128 gates promote it.
+    pub rdna3_hfq4_moe_gate_up_k2048: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -350,6 +353,11 @@ impl FeatureFlags {
             )
             .as_deref()
                 == Ok("1"),
+            rdna3_hfq4_moe_gate_up_k2048: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048",
+            )
+            .as_deref()
+                == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -592,6 +600,7 @@ impl FeatureFlags {
             rdna3_hfq4_sigmoid_buffer: false,
             rdna3_hfq4_sigmoid_rows4: false,
             rdna3_hfq4_lm_head_k2048: false,
+            rdna3_hfq4_moe_gate_up_k2048: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,

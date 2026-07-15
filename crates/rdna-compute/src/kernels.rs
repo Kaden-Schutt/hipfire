@@ -1299,6 +1299,16 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// Exact gfx1100 A3B decode specialization: K=2048 fixes the group count at
+/// eight while preserving the base gate/up load, FMA, and reduction order.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// gfx1100 scheduler-packing experiment: two independent wave32 rows per
 /// workgroup. Each wave preserves the base kernel's gate/up accumulator and
 /// shuffle order; there is no cross-wave reduction or extra row accumulator.
