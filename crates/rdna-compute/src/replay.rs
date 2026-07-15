@@ -103,8 +103,9 @@ impl Pm4Commands {
         }
     }
 
-    fn acquire_inter_node(&mut self, gfx12_gcr_trim: bool) {
+    fn acquire_inter_node(&mut self, gfx12_gcr_trim: bool, vmem_only: bool) {
         match self {
+            Self::Legacy { commands, .. } if vmem_only => commands.acquire_inter_node_vmem(),
             Self::Legacy { commands, .. } => commands.acquire_inter_node_same_agent(),
             Self::Gfx12(commands) if gfx12_gcr_trim => commands.acquire_inter_node_gfx12(),
             Self::Gfx12(commands) => commands.acquire_system(),
@@ -168,6 +169,29 @@ impl Pm4Commands {
         }
         .map_err(|error| error.to_string())
     }
+}
+
+/// Candidate-only cache classification produced by Radiowave inspection of
+/// the exact gfx1100 code objects in the 833-launch MQ4R tape. This list is
+/// deliberately gated by `HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE`: the legacy
+/// Hipfire JIT path does not yet emit hash-bound Radiowave manifests, so the
+/// safe default remains scalar-or-unknown until that binding is added.
+fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
+    matches!(
+        kernel,
+        "conv1d_silu_split_f32"
+            | "deinterleave_f32"
+            | "fused_qk_l2_norm_scale_f32"
+            | "fused_rmsnorm_mq_rotate"
+            | "fused_sigmoid_alpha_gate_f32"
+            | "fused_silu_mul_mq_rotate"
+            | "gated_norm_f32"
+            | "moe_topk_renorm_k8"
+            | "mq_rotate_x"
+            | "repeat_interleave_qk_f32"
+            | "rmsnorm_f32"
+            | "sigmoid_mul_f32"
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1371,6 +1395,9 @@ impl ReplayController {
         let gfx12_gcr_trim = std::env::var("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
+        let gfx11_vmem_acquire = std::env::var("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
+            .unwrap_or(false);
         commands.acquire_system(gfx12_gcr_trim);
         let mut wait_audit = Pm4WaitAudit::default();
         let mut resource_frontier = ResourceFrontier::default();
@@ -1412,7 +1439,10 @@ impl ReplayController {
                         .pm4_mid_acquire_policy
                         .acquire_between(previous, current)
                 {
-                    commands.acquire_inter_node(gfx12_gcr_trim);
+                    commands.acquire_inter_node(
+                        gfx12_gcr_trim,
+                        gfx11_vmem_acquire && radiowave_vmem_only_consumer(current),
+                    );
                 }
             } else {
                 resource_frontier.advance(&self.recorded[index], false);
@@ -1794,6 +1824,16 @@ mod tests {
             gpu_timed: true,
             speedup_over_hip: speedup,
         }
+    }
+
+    #[test]
+    fn radiowave_vmem_cache_classification_fails_closed() {
+        assert!(radiowave_vmem_only_consumer("fused_rmsnorm_mq_rotate"));
+        assert!(radiowave_vmem_only_consumer("mq_rotate_x"));
+        assert!(!radiowave_vmem_only_consumer(
+            "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        ));
+        assert!(!radiowave_vmem_only_consumer("unknown_kernel"));
     }
 
     #[test]

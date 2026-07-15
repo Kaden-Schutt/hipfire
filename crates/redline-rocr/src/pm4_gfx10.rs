@@ -163,6 +163,12 @@ impl Gfx10Pm4CommandBuffer {
     /// Same-agent boundary for a Radiowave-certified VMEM-only consumer.
     pub fn dependency_rmw_vmem(&mut self) {
         self.wait_compute_idle();
+        self.acquire_inter_node_vmem();
+    }
+
+    /// Invalidate only vector/global read caches for a consumer whose loaded
+    /// code object is Radiowave-certified to have no mutable scalar reads.
+    pub fn acquire_inter_node_vmem(&mut self) {
         self.emit_acquire_radv(0x00300);
     }
 
@@ -558,5 +564,15 @@ mod tests {
             .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
             .unwrap();
         assert_eq!(commands.len_dwords() - first, 5);
+    }
+
+    #[test]
+    fn radiowave_cache_classes_keep_distinct_legacy_gcr_bits() {
+        let mut scalar = Gfx10Pm4CommandBuffer::new();
+        scalar.acquire_inter_node_same_agent();
+        let mut vmem = Gfx10Pm4CommandBuffer::new();
+        vmem.acquire_inter_node_vmem();
+        assert_eq!(scalar.dwords().last(), Some(&0x00380));
+        assert_eq!(vmem.dwords().last(), Some(&0x00300));
     }
 }
