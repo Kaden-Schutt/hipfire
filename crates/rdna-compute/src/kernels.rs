@@ -2468,6 +2468,18 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+/// Radiowave gfx1100 QKVZA probe: retain the certified fixed-K arithmetic and
+/// apply the SLC raw-buffer policy that won on the analogous MoE gate-up weight
+/// stream. Kept as a distinct replay-visible artifact until model certification.
+pub const FUSED_QKVZA_HFQ4G256_K2048_CPOL_SLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_cpol_slc\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 pub const FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),

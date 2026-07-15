@@ -373,6 +373,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_k2048"
+        | "fused_qkvza_hfq4g256_k2048_cpol_slc"
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain" => Some(vec![
@@ -538,6 +539,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_k2048"
+        | "fused_qkvza_hfq4g256_k2048_cpol_slc"
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
@@ -2386,6 +2388,7 @@ mod tests {
         "rotate_with_rms_gfx1100",
         "fused_qkvza_hfq4g256",
         "fused_qkvza_hfq4g256_k2048",
+        "fused_qkvza_hfq4g256_k2048_cpol_slc",
         "fused_qkvza_hfq4g256_wavepack4",
         "fused_qkvza_hfq4g256_ldsx8",
         "fused_qkvza_hfq4g256_reduce_chain",
