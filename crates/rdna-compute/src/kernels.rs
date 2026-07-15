@@ -2404,6 +2404,13 @@ pub fn gemv_hfq3g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'stat
 /// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
 pub const GEMV_HFQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g128.hip");
 
+/// TQ2-G128: PrismML Q2_0-layout ternary dequant-to-f16 correctness oracle.
+/// [FP16 d (2B)][2-bit × 128 (32B)] = 34 bytes per 128-weight group.
+/// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
+/// code -> (code - 1) * d, i.e. {0,1,2,3} -> {-d, 0, +d, +2d}.
+pub const DEQUANT_TQ2G128_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequant_tq2g128_to_f16.hip");
+
 /// HFQ4-G256 wide GEMV: 2 rows per block (64 threads = 2 warps).
 /// Each warp processes one row independently. Halves grid size.
 pub const GEMV_HFQ4G256_WIDE_SRC: &str =
