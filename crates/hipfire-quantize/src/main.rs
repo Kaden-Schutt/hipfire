@@ -5150,15 +5150,39 @@ fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
     }
     // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
     if let Some(rest) = gguf_name.strip_prefix("blk.") {
-        // rest = "{N}.<slot>.weight"
+        // rest = "{N}.<slot>.weight"  (or, for a couple of qwen3.5/DeltaNet
+        // SSM tensors, "{N}.<slot>" / "{N}.<slot>.bias" — no ".weight" at
+        // all; handled below BEFORE the ".weight"-suffix strip, since that
+        // strip would otherwise reject them via `?` and silently drop them
+        // from the conversion).
         let dot = rest.find('.')?;
         let layer_idx = &rest[..dot];
-        let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
+        let slot_full = &rest[dot + 1..]; // "<slot>.weight" | "<slot>" | "<slot>.bias"
+
+        // qwen3.5 DeltaNet (linear-attention) SSM tensors with no/unusual
+        // suffix. `ssm_a` carries the raw `A_log` decay parameter as a bare
+        // 1D tensor (no ".weight"); `ssm_dt.bias` is the dt-projection bias
+        // (".bias", not ".weight"). Both map to hipfire's `linear_attn.*`
+        // raw-f32 slots, which are looked up WITHOUT a ".weight" suffix
+        // (see `hfq_plain_name` / `layer_driver.rs`'s `raw_f32("linear_attn.A_log", ...)`
+        // / `raw_f32("linear_attn.dt_bias", ...)`).
+        if slot_full == "ssm_a" {
+            return Some(format!("model.layers.{layer_idx}.linear_attn.A_log"));
+        }
+        if slot_full == "ssm_dt.bias" {
+            return Some(format!("model.layers.{layer_idx}.linear_attn.dt_bias"));
+        }
+
+        // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
         let slot = slot_full.strip_suffix(".weight")?;
         let translated = match slot {
             "attn_norm" => "input_layernorm".to_string(),
             "ffn_norm" => "post_attention_layernorm".to_string(),
+            // qwen3.5 hybrid arch: FullAttention layers name their
+            // post-attention norm "post_attention_norm" (NOT "ffn_norm" —
+            // QWEN35's GGUF tensor list omits FFN_NORM entirely), but it
+            // maps to the same hipfire slot as "ffn_norm" does elsewhere.
+            "post_attention_norm" => "post_attention_layernorm".to_string(),
             "attn_q" => "self_attn.q_proj".to_string(),
             "attn_k" => "self_attn.k_proj".to_string(),
             "attn_v" => "self_attn.v_proj".to_string(),
@@ -5168,6 +5192,18 @@ fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
             "ffn_gate" => "mlp.gate_proj".to_string(),
             "ffn_up" => "mlp.up_proj".to_string(),
             "ffn_down" => "mlp.down_proj".to_string(),
+            // qwen3.5 hybrid arch: LinearAttention (DeltaNet) layer tensors.
+            // These slot names (attn_qkv/attn_gate/ssm_*) are qwen3.5/
+            // qwen3next-specific and don't collide with any other arch's
+            // naming, so it's safe to extend this arch-agnostic function
+            // in place.
+            "attn_qkv" => "linear_attn.in_proj_qkv".to_string(),
+            "attn_gate" => "linear_attn.in_proj_z".to_string(),
+            "ssm_alpha" => "linear_attn.in_proj_a".to_string(),
+            "ssm_beta" => "linear_attn.in_proj_b".to_string(),
+            "ssm_out" => "linear_attn.out_proj".to_string(),
+            "ssm_conv1d" => "linear_attn.conv1d".to_string(),
+            "ssm_norm" => "linear_attn.norm".to_string(),
             other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
         };
         return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
@@ -5742,7 +5778,291 @@ fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_j
     }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
+
+    // qwen3.5 hybrid-attention (DeltaNet linear-attention + FullAttention)
+    // config. Gated on arch_str since these GGUF keys/JSON fields are
+    // qwen3.5/qwen3.5moe-specific (see onboarding-map-research.md §B).
+    if arch_str == "qwen35" || arch_str == "qwen35moe" {
+        let conv_kernel = read_u(&format!("{prefix}.ssm.conv_kernel"));
+        let state_size = read_u(&format!("{prefix}.ssm.state_size"));
+        let group_count = read_u(&format!("{prefix}.ssm.group_count"));
+        let time_step_rank = read_u(&format!("{prefix}.ssm.time_step_rank"));
+        let inner_size = read_u(&format!("{prefix}.ssm.inner_size"));
+        let full_attention_interval =
+            read_u(&format!("{prefix}.full_attention_interval")).unwrap_or(4);
+        let rope_dim_count = read_u(&format!("{prefix}.rope.dimension_count"));
+
+        if let Some(v) = group_count {
+            cfg.insert(
+                "linear_num_key_heads".to_string(),
+                serde_json::Value::from(v),
+            );
+        }
+        if let Some(v) = time_step_rank {
+            cfg.insert(
+                "linear_num_value_heads".to_string(),
+                serde_json::Value::from(v),
+            );
+        }
+        if let Some(v) = state_size {
+            cfg.insert(
+                "linear_key_head_dim".to_string(),
+                serde_json::Value::from(v),
+            );
+        }
+        // `linear_value_head_dim` has no direct GGUF key; derive it from
+        // ssm.inner_size / ssm.time_step_rank — the only GGUF-recoverable
+        // source (the C++ loader just reuses state_size for both key AND
+        // value head-dim, which happens to agree for this checkpoint, but
+        // this derivation is the more defensive/general choice — see
+        // onboarding-map-research.md D3b).
+        if let (Some(inner), Some(rank)) = (inner_size, time_step_rank) {
+            if rank > 0 {
+                cfg.insert(
+                    "linear_value_head_dim".to_string(),
+                    serde_json::Value::from(inner / rank),
+                );
+            }
+        }
+        if let Some(v) = conv_kernel {
+            cfg.insert(
+                "linear_conv_kernel_dim".to_string(),
+                serde_json::Value::from(v),
+            );
+        }
+        // partial_rotary_factor = rope.dimension_count / head_dim (fraction
+        // of head_dim actually rotated by RoPE).
+        if let (Some(rope_dim), Some(hd)) = (rope_dim_count, head_dim) {
+            if hd > 0 {
+                cfg.insert(
+                    "partial_rotary_factor".to_string(),
+                    serde_json::Value::from(rope_dim as f64 / hd as f64),
+                );
+            }
+        }
+        // layer_types: derive the hybrid-attention layer pattern from
+        // `full_attention_interval` — layer i is FullAttention iff
+        // (i+1) % interval == 0, everything else is LinearAttention
+        // (confirmed against qwen35.cpp's `is_recr_impl` formula). This is
+        // the root-cause fix: without this key, `from_config_value`'s
+        // fallback stamps every layer FullAttention, and layer 0 (actually
+        // LinearAttention) then looks for a nonexistent `self_attn.q_proj`.
+        if let Some(n) = n_layers {
+            let interval = full_attention_interval.max(1);
+            let layer_types: Vec<serde_json::Value> = qwen35_layer_types(n, interval)
+                .into_iter()
+                .map(serde_json::Value::from)
+                .collect();
+            cfg.insert(
+                "layer_types".to_string(),
+                serde_json::Value::Array(layer_types),
+            );
+        }
+        // `rope_theta` must be nested under `rope_parameters` for qwen35 —
+        // `RawQwen35Config` only reads `rope_parameters.rope_theta`, never a
+        // flat top-level `rope_theta` (the flat insert above is a harmless
+        // no-op for this arch; left in place since other archs DO read it
+        // flat — see onboarding-map-research.md D4).
+        let mut rope_params = serde_json::Map::new();
+        if let Some(v) = rope_theta {
+            rope_params.insert("rope_theta".to_string(), serde_json::Value::from(v));
+        }
+        rope_params.insert(
+            "mrope_interleaved".to_string(),
+            serde_json::Value::from(true),
+        );
+        let mrope_section: Vec<serde_json::Value> = gguf
+            .metadata
+            .get(&format!("{prefix}.rope.dimension_sections"))
+            .and_then(|v| match v {
+                gguf_input::MetaValue::Array(arr) => Some(arr),
+                _ => None,
+            })
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(meta_value_as_u64)
+                    .take(3)
+                    .map(serde_json::Value::from)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<serde_json::Value>| !v.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    serde_json::Value::from(11u64),
+                    serde_json::Value::from(11u64),
+                    serde_json::Value::from(10u64),
+                ]
+            });
+        rope_params.insert(
+            "mrope_section".to_string(),
+            serde_json::Value::Array(mrope_section),
+        );
+        cfg.insert(
+            "rope_parameters".to_string(),
+            serde_json::Value::Object(rope_params),
+        );
+    }
+
     serde_json::Value::Object(cfg)
+}
+
+/// Coerce any GGUF integer-typed `MetaValue` to `u64`. Used for reading
+/// small integer arrays (e.g. `qwen35.rope.dimension_sections`) that don't
+/// fit the scalar `read_u` closure in `config_json_from_gguf`.
+fn meta_value_as_u64(v: &gguf_input::MetaValue) -> Option<u64> {
+    match v {
+        gguf_input::MetaValue::U8(x) => Some(*x as u64),
+        gguf_input::MetaValue::I8(x) => Some(*x as u64),
+        gguf_input::MetaValue::U16(x) => Some(*x as u64),
+        gguf_input::MetaValue::I16(x) => Some(*x as u64),
+        gguf_input::MetaValue::U32(x) => Some(*x as u64),
+        gguf_input::MetaValue::I32(x) => Some(*x as u64),
+        gguf_input::MetaValue::U64(x) => Some(*x),
+        gguf_input::MetaValue::I64(x) => Some(*x as u64),
+        _ => None,
+    }
+}
+
+/// Pure derivation of the qwen3.5 hybrid-attention `layer_types` array:
+/// layer `i` (0-indexed) is `"full_attention"` iff `(i+1) % interval == 0`,
+/// otherwise `"linear_attention"`. Matches qwen35.cpp's `is_recr_impl`
+/// formula exactly (confirmed in onboarding-map-research.md §B). Pure and
+/// GPU-free so it's unit-testable without a GGUF file.
+fn qwen35_layer_types(n_layers: u64, interval: u64) -> Vec<&'static str> {
+    let interval = interval.max(1);
+    (0..n_layers)
+        .map(|i| {
+            if (i + 1) % interval == 0 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod qwen35_onboarding_tests {
+    use super::*;
+
+    // ── gguf_to_safetensors_name: qwen3.5 linear-attn/SSM slot names ───────
+
+    #[test]
+    fn linear_attn_fused_qkv_and_gate() {
+        assert_eq!(
+            gguf_to_safetensors_name("blk.5.attn_qkv.weight").as_deref(),
+            Some("model.layers.5.linear_attn.in_proj_qkv.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.5.attn_gate.weight").as_deref(),
+            Some("model.layers.5.linear_attn.in_proj_z.weight")
+        );
+    }
+
+    #[test]
+    fn linear_attn_ssm_alpha_beta_out_conv_norm() {
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_alpha.weight").as_deref(),
+            Some("model.layers.0.linear_attn.in_proj_a.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_beta.weight").as_deref(),
+            Some("model.layers.0.linear_attn.in_proj_b.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_out.weight").as_deref(),
+            Some("model.layers.0.linear_attn.out_proj.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_conv1d.weight").as_deref(),
+            Some("model.layers.0.linear_attn.conv1d.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_norm.weight").as_deref(),
+            Some("model.layers.0.linear_attn.norm.weight")
+        );
+    }
+
+    /// `ssm_a` (no `.weight` suffix at all) and `ssm_dt.bias` (`.bias`, not
+    /// `.weight`) previously fell through the `?` on
+    /// `slot_full.strip_suffix(".weight")` and were silently DROPPED from
+    /// the conversion (D3/D3b in onboarding-map-research.md). They must now
+    /// map to hipfire's raw-f32 `linear_attn.A_log` / `linear_attn.dt_bias`
+    /// slots, WITHOUT a `.weight` suffix (matches `hfq_plain_name`, which
+    /// hipfire's `raw_f32` loader queries with).
+    #[test]
+    fn linear_attn_ssm_a_and_dt_bias_no_longer_dropped() {
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.ssm_a").as_deref(),
+            Some("model.layers.3.linear_attn.A_log")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.ssm_dt.bias").as_deref(),
+            Some("model.layers.3.linear_attn.dt_bias")
+        );
+    }
+
+    /// FullAttention layers name their post-attention norm
+    /// `post_attention_norm` (not `ffn_norm`) — must map to the same
+    /// `post_attention_layernorm` slot the `ffn_norm` arm already produces.
+    #[test]
+    fn full_attn_post_attention_norm() {
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.post_attention_norm.weight").as_deref(),
+            Some("model.layers.3.post_attention_layernorm.weight")
+        );
+    }
+
+    /// Existing FullAttention / global-tensor mappings must stay unchanged
+    /// (no regression from the new arms).
+    #[test]
+    fn existing_mappings_unchanged() {
+        assert_eq!(
+            gguf_to_safetensors_name("token_embd.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.attn_q.weight").as_deref(),
+            Some("model.layers.3.self_attn.q_proj.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.attn_norm.weight").as_deref(),
+            Some("model.layers.3.input_layernorm.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.ffn_gate.weight").as_deref(),
+            Some("model.layers.3.mlp.gate_proj.weight")
+        );
+    }
+
+    // ── qwen35_layer_types: hybrid full/linear attention derivation ────────
+
+    #[test]
+    fn layer_types_interval_4_matches_bonsai_27b() {
+        // Bonsai-27B: full_attention_interval=4, 64 layers. Layer i is
+        // FullAttention iff (i+1) % 4 == 0: indices 3, 7, 11, ... are full;
+        // everything else (incl. 0, 1, 2) is linear.
+        let types = qwen35_layer_types(64, 4);
+        assert_eq!(types.len(), 64);
+        assert_eq!(types[0], "linear_attention");
+        assert_eq!(types[1], "linear_attention");
+        assert_eq!(types[2], "linear_attention");
+        assert_eq!(types[3], "full_attention");
+        assert_eq!(types[7], "full_attention");
+        assert_eq!(types[11], "full_attention");
+        assert_eq!(types[63], "full_attention");
+        // Spot-check a non-boundary linear layer past the first full layer.
+        assert_eq!(types[4], "linear_attention");
+        assert_eq!(types[6], "linear_attention");
+    }
+
+    #[test]
+    fn layer_types_interval_zero_does_not_divide_by_zero() {
+        // Defensive: an interval of 0 (malformed metadata) must not panic;
+        // `.max(1)` clamps it so every layer ends up FullAttention.
+        let types = qwen35_layer_types(4, 0);
+        assert_eq!(types, vec!["full_attention"; 4]);
+    }
 }
 
 /// Translate the GGUF metadata HashMap into a JSON object that ends up in
