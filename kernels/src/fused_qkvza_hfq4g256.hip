@@ -114,7 +114,12 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
     }
 
     const int groups_per_row = K / 256;
+#if defined(HIPFIRE_RDNA3_QKVZA_REDUCE_CHAIN)
+    const long long row_stride = (long long)groups_per_row * 136;
+    const char* row_ptr = A + (long long)row * row_stride;
+#else
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
+#endif
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
     const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
@@ -290,8 +295,16 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
 #endif
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
+#if defined(HIPFIRE_RDNA3_QKVZA_REDUCE_CHAIN)
+    acc += __shfl_down(acc, 16);
+    acc += __shfl_down(acc, 8);
+    acc += __shfl_down(acc, 4);
+    acc += __shfl_down(acc, 2);
+    acc += __shfl_down(acc, 1);
+#else
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
+#endif
 
     if (tid == 0) y[row] = acc;
 }

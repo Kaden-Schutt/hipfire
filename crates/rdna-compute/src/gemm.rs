@@ -2514,6 +2514,8 @@ impl Gpu {
         let rdna3_ldsx8 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_qkvza_ldsx8
             && k == 2_048;
+        let rdna3_reduce_chain =
+            self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_reduce_chain;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let (func_name, block, grid_x) = if rdna3_ldsx8 {
@@ -2544,6 +2546,17 @@ impl Gpu {
                 "fused_qkvza_hfq4g256_wavepack4",
                 [128u32, 1, 1],
                 (total_m as u32).div_ceil(4),
+            )
+        } else if rdna3_reduce_chain {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_reduce_chain_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_REDUCE_CHAIN_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_reduce_chain",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_reduce_chain",
+                [32u32, 1, 1],
+                total_m as u32,
             )
         } else if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode

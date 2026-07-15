@@ -50,6 +50,10 @@ pub struct FeatureFlags {
     /// Stage the K=2048 QKVZA activation once per eight exact row waves in a
     /// transposed LDS tile on gfx1100.
     pub rdna3_hfq4_qkvza_ldsx8: bool,
+    /// Radiowave recovery of the exact gfx1100 autoresearch schedule: keep an
+    /// explicit row stride and spell out the five shuffle-reduction stages so
+    /// LLVM cannot re-form the reduction as a loop.
+    pub rdna3_hfq4_qkvza_reduce_chain: bool,
     /// Radiowave experiment: port the gfx12 QKVZA float4 activation-hoist
     /// schedule to gfx1100 while retaining one independent wave per row.
     pub rdna3_hfq4_qkvza_hoist_x32: bool,
@@ -301,6 +305,11 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_ldsx8: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8")
                 .as_deref()
                 == Ok("1"),
+            rdna3_hfq4_qkvza_reduce_chain: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN",
+            )
+            .as_deref()
+                == Ok("1"),
             rdna3_hfq4_qkvza_hoist_x32: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
                 .as_deref()
                 == Ok("1"),
@@ -550,6 +559,7 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_2wave: false,
             rdna3_hfq4_qkvza_wavepack4: false,
             rdna3_hfq4_qkvza_ldsx8: false,
+            rdna3_hfq4_qkvza_reduce_chain: false,
             rdna3_hfq4_qkvza_hoist_x32: false,
             rdna3_hfq4_residual_stage_x32: false,
             rdna3_hfq4_sigmoid_tight_grid: false,

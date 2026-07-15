@@ -2412,6 +2412,14 @@ pub const FUSED_QKVZA_HFQ4G256_LDSX8_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+pub const FUSED_QKVZA_HFQ4G256_REDUCE_CHAIN_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_reduce_chain\n",
+    "#define HIPFIRE_RDNA3_QKVZA_REDUCE_CHAIN 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 // CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
 // to (total_m+1)/2. Byte-exact vs the wave32 base kernel.
