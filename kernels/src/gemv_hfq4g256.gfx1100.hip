@@ -8,8 +8,12 @@
 // launch_bounds(32, 16) — gfx1100 max is 16 waves/SIMD (NOT 20 like gfx1010).
 // 1536 VGPRs / 16 = 96 VGPRs budget at full occupancy.
 
+#ifndef HIPFIRE_HFQ4G256_KERNEL
+#define HIPFIRE_HFQ4G256_KERNEL gemv_hfq4g256
+#endif
+
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256(
+extern "C" __global__ void HIPFIRE_HFQ4G256_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -19,7 +23,14 @@ extern "C" __global__ void gemv_hfq4g256(
     if (row >= M) return;
     const int tid = threadIdx.x;
 
+#if defined(HIPFIRE_HFQ4G256_K2048)
+    // The Qwen3.5-35B LM head is always K=2048. Baking its eight groups into
+    // the code removes the dynamic divide, loop trip count, and all tail
+    // control while retaining the exact four-accumulator FMA order.
+    const int groups_per_row = 8;
+#else
     const int groups_per_row = K / 256;
+#endif
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
@@ -30,6 +41,9 @@ extern "C" __global__ void gemv_hfq4g256(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
+#if defined(HIPFIRE_HFQ4G256_K2048)
+    #pragma unroll
+#endif
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const char* gp0 = row_ptr + g * 136;
@@ -70,6 +84,7 @@ extern "C" __global__ void gemv_hfq4g256(
         #undef DOG
     }
 
+#if !defined(HIPFIRE_HFQ4G256_K2048)
     // Tail handling: groups_per_row may not be a multiple of 4. Each tail
     // group must accumulate into its OWN accumulator (acc[g % 4]) to
     // preserve the 4-way interleaving that the combine step assumes.
@@ -115,6 +130,7 @@ extern "C" __global__ void gemv_hfq4g256(
         TAIL_DOG(pk, sc, zp, base, acc2);
     }
     #undef TAIL_DOG
+#endif
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)

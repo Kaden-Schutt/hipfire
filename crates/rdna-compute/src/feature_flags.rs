@@ -66,6 +66,9 @@ pub struct FeatureFlags {
     /// Schedule four shared-expert down rows per wave on gfx1100, reusing
     /// each activation load across four independent weight streams.
     pub rdna3_hfq4_sigmoid_rows4: bool,
+    /// Compile the exact Qwen3.5-35B LM-head shape (M=248320, K=2048) with
+    /// its eight HFQ4 groups fixed at compile time. gfx1100 experiment only.
+    pub rdna3_hfq4_lm_head_k2048: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -309,6 +312,11 @@ impl FeatureFlags {
             )
             .as_deref()
                 == Ok("1"),
+            rdna3_hfq4_lm_head_k2048: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048",
+            )
+            .as_deref()
+                == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -540,6 +548,7 @@ impl FeatureFlags {
             rdna3_hfq4_sigmoid_tight_grid: false,
             rdna3_hfq4_sigmoid_buffer: false,
             rdna3_hfq4_sigmoid_rows4: false,
+            rdna3_hfq4_lm_head_k2048: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,

@@ -4493,9 +4493,23 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (hfq4g256_src, hfq4g256_module) =
-            kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
-        self.ensure_kernel(hfq4g256_module, hfq4g256_src, "gemv_hfq4g256")?;
+        let use_lm_head_k2048 = self.arch_caps.is_gfx1100()
+            && self.flags.rdna3_hfq4_lm_head_k2048
+            && m == 248_320
+            && k == 2_048;
+        let func_name = if use_lm_head_k2048 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_k2048_gfx1100",
+                kernels::GEMV_HFQ4G256_K2048_GFX1100_SRC,
+                "gemv_hfq4g256_k2048",
+            )?;
+            "gemv_hfq4g256_k2048"
+        } else {
+            let (hfq4g256_src, hfq4g256_module) =
+                kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
+            self.ensure_kernel(hfq4g256_module, hfq4g256_src, "gemv_hfq4g256")?;
+            "gemv_hfq4g256"
+        };
 
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -4588,7 +4602,7 @@ impl Gpu {
             )
         } else {
             self.launch_maybe_blob(
-                "gemv_hfq4g256",
+                func_name,
                 [m as u32, 1, 1],
                 [32, 1, 1],
                 0,

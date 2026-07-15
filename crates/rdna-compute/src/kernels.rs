@@ -1159,6 +1159,14 @@ pub const GEMV_HFQ4G256_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip")
 );
+pub const GEMV_HFQ4G256_K2048_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
+    "#define HIPFIRE_HFQ4G256_KERNEL gemv_hfq4g256_k2048\n",
+    "#define HIPFIRE_HFQ4G256_K2048 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),

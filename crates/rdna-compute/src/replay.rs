@@ -375,7 +375,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
-        "gemv_hfq4g256_residual"
+        "gemv_hfq4g256"
+        | "gemv_hfq4g256_k2048"
+        | "gemv_hfq4g256_residual"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
         | "gemv_hfq4g256_multirow_r4"
@@ -450,6 +452,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     match kernel {
         "softmax_f32" => Some(16),
         "fused_qk_l2_norm_scale_f32"
+        | "gemv_hfq4g256"
+        | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
@@ -2229,6 +2233,8 @@ mod tests {
         "gated_norm_f32",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
+        "gemv_hfq4g256",
+        "gemv_hfq4g256_k2048",
         "gemv_hfq4g256_wide",
         "softmax_f32",
         "moe_topk_renorm_k8",
