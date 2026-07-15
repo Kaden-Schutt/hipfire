@@ -95,18 +95,19 @@ pub enum EmbedPlan {
 /// Pure quant_type → plan. GPU-free, unit-testable.
 ///
 /// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 3 → Raw(Q8_0),
-/// qt 1|2|16 → HostF32, else → panic with the supported-format list.
+/// qt 1|2|16|38 → HostF32, else → panic with the supported-format list.
 pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
     match quant_type {
         6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
         7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
         3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
-        1 | 2 | 16 => Ok(EmbedPlan::HostF32),
+        1 | 2 | 16 | 38 => Ok(EmbedPlan::HostF32),
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "unsupported embedding quant_type {other}; \
-                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32). \
+                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32), \
+                 38 (TQ2G128→F32). \
                  Add the format to embed_classify to support it."
             ),
         )),
@@ -576,6 +577,26 @@ fn fwht256_inplace(group: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
+/// TQ2G128 ternary block → F32, GPU-free pure fn (unit-testable in isolation
+/// from `dequant_f32`, which needs a `Gpu` to upload). Block layout (34
+/// bytes / 128-elem group): `[FP16 d (2B)][qs[32]]`, codes packed 4/byte
+/// LSB-first; `value = (code - 1) * d`. Mirrors the proven Task-5/Task-8v
+/// CPU oracle for `dequant_tq2g128_to_f16`.
+fn dequant_tq2_to_f32(data: &[u8], n: usize) -> Vec<f32> {
+    const BLK: usize = 34;
+    let nblocks = n / 128;
+    let mut out = Vec::with_capacity(n);
+    for b in 0..nblocks {
+        let base = b * BLK;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        for j in 0..128 {
+            let code = (data[base + 2 + j / 4] >> ((j % 4) * 2)) & 0x3;
+            out.push((code as i32 - 1) as f32 * d);
+        }
+    }
+    out
+}
+
 pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipResult<GpuTensor> {
     let f32_data: Vec<f32> = match quant_type {
         1 => data
@@ -933,6 +954,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
             }
             out
         }
+        38 => dequant_tq2_to_f32(data, n),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     };
     gpu.upload_f32(&f32_data[..n], &[n])
@@ -1210,11 +1232,42 @@ mod tests {
     }
     #[test]
     fn embed_classify_host_f32() {
-        for qt in [1, 2, 16] {
+        for qt in [1, 2, 16, 38] {
             match embed_classify(qt).unwrap() {
                 EmbedPlan::HostF32 => {}
                 other => panic!("qt={qt}: expected HostF32, got {other:?}"),
             }
+        }
+    }
+    /// Task 15b: quant_type 38 (TQ2G128) → `EmbedPlan::HostF32`, so
+    /// `token_embd` routes through the existing host-decode-to-F32 embedding
+    /// path instead of tripping the "unsupported embedding quant_type"
+    /// panic seen in Task 16's diagnosis run.
+    #[test]
+    fn embed_classify_tq2g128_is_host_f32() {
+        match embed_classify(38).unwrap() {
+            EmbedPlan::HostF32 => {}
+            other => panic!("qt=38: expected HostF32, got {other:?}"),
+        }
+    }
+    /// Task 15b RED→GREEN gate: `dequant_tq2_to_f32` on a single 34-byte
+    /// Q2_0 block, `d=2.0` (FP16 bytes `[0x00, 0x40]`), `qs[0]=0xE4` (codes
+    /// 0,1,2,3 LSB-first) and the rest of `qs` zeroed (code 0 everywhere).
+    /// `value = (code-1)*d` so: code0→-2.0, code1→0.0, code2→2.0, code3→4.0,
+    /// then 124 more code-0 elements at -2.0. Mirrors the proven Task-5/
+    /// Task-8v oracle for `dequant_tq2g128_to_f16`.
+    #[test]
+    fn dequant_tq2_to_f32_single_block() {
+        let mut data = [0u8; 34];
+        data[0] = 0x00;
+        data[1] = 0x40; // FP16 2.0
+        data[2] = 0xE4; // codes [0,1,2,3] LSB-first (0b11_10_01_00)
+                        // data[3..34] already zero => codes 0 for elements 4..127
+        let out = dequant_tq2_to_f32(&data, 128);
+        assert_eq!(out.len(), 128);
+        assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]);
+        for (i, &v) in out.iter().enumerate().skip(4) {
+            assert_eq!(v, -2.0, "expected tail code-0 => -d at index {i}");
         }
     }
     #[test]
