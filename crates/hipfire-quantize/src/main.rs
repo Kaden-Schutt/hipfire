@@ -5915,15 +5915,22 @@ fn run_gguf_pipeline(
             // froggeric chat-template pillar at serve time. Loud-fail so the
             // operator stamps it explicitly with --arch-id 5 or 6.
             if other.to_lowercase().contains("qwen3") {
+                if let Some(id) = parse_arch_id_override() {
+                    id
+                } else {
+                    eprintln!(
+                        "error: GGUF architecture '{other}' looks like a qwen3* family model but maps to no known arch_id; \
+                         refusing to silently stamp arch_id=0 (would break the froggeric pillar). \
+                         Re-run with an explicit --arch-id 5 (dense) or 6 (MoE)."
+                    );
+                    std::process::exit(1);
+                }
+            } else {
                 eprintln!(
-                    "error: GGUF architecture '{other}' looks like a qwen3* family model but maps to no known arch_id; \
-                     refusing to silently stamp arch_id=0 (would break the froggeric pillar). \
-                     Re-run with an explicit --arch-id 5 (dense) or 6 (MoE)."
+                    "warning: unknown GGUF architecture '{other}', tagging as llama-compatible"
                 );
-                std::process::exit(1);
+                0
             }
-            eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
-            0
         }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
