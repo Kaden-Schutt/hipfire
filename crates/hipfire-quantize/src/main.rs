@@ -4492,9 +4492,10 @@ pub(crate) enum QuantType {
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
     // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
     TQ2G128 = 38, // TQ2G128: PrismML Q2_0-compatible scale-only ternary, g128, 34 B/blk
-                  // (2.125 bpw). [FP16 d][32B 2-bit codes], code=(w/d)+1 clamped 0..3,
-                  // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
-                  // See findings/prismml-q2_0-layout.md.
+    // (2.125 bpw). [FP16 d][32B 2-bit codes], code=(w/d)+1 clamped 0..3,
+    // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
+    // See findings/prismml-q2_0-layout.md.
+    BQ1G128 = 39, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -4544,6 +4545,9 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         // Ternary has no promote sibling (PrismML Q2_0 has no 6-bit variant);
         // no-op, matching the FP4-family pattern above.
         GgufFormat::Ternary => GgufFormat::Ternary,
+        // Binary has no promote sibling either (PrismML Q1_0 has no
+        // higher-bit variant); no-op, matching Ternary above.
+        GgufFormat::Binary => GgufFormat::Binary,
     }
 }
 
@@ -6528,6 +6532,14 @@ enum GgufFormat {
     /// through the kmap/Q8 rules. `quantize_tq2g128` is only the re-quant
     /// fallback for the rare non-Q2_0 matmul tensor under this format.
     Ternary,
+    /// Binary — PrismML Bonsai family, 1-bit variant. Source GGUF is already
+    /// mixed-precision (Q1_0 binary matmuls + Q8_0/F16 embeddings + F32/F16
+    /// norms); the per-tensor precision PrismML chose is authoritative, so 2D
+    /// matmul tensors already in Q1_0 pass through byte-verbatim to BQ1G128
+    /// (see the dedicated arm in `run_gguf_pipeline`) rather than going
+    /// through the kmap/Q8 rules. There is no re-quant fallback for this
+    /// format — binary weights always take the byte-verbatim passthrough.
+    Binary,
 }
 
 impl GgufFormat {
@@ -6552,6 +6564,7 @@ impl GgufFormat {
             "mfp3e8" | "mfp3-e8" => Some(Self::Mfp3E8),
             "mfp2e8" | "mfp2-e8" => Some(Self::Mfp2E8),
             "ternary" | "tq2" | "tq2g128" => Some(Self::Ternary),
+            "binary" | "bq1" | "bq1g128" => Some(Self::Binary),
             _ => None,
         }
     }
@@ -6577,8 +6590,15 @@ impl GgufFormat {
             Self::Mfp3E8 => "MFP3G32E8",
             Self::Mfp2E8 => "MFP2G32E8",
             Self::Ternary => "TQ2G128",
+            Self::Binary => "BQ1G128",
         }
     }
+}
+
+/// Q1_0 on-disk layout == hipfire BQ1G128 layout: copy verbatim.
+fn convert_binary_tensor(src: &[u8], dtype: gguf_input::GgmlType) -> (Vec<u8>, QuantType, u32) {
+    debug_assert_eq!(dtype, gguf_input::GgmlType::Q1_0);
+    (src.to_vec(), QuantType::BQ1G128, 128)
 }
 
 /// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
@@ -6854,6 +6874,25 @@ fn run_gguf_pipeline(
                 128u32,
                 "TQ2G128 (passthrough)",
             )
+        } else if matches!(format, GgufFormat::Binary) && info.dtype == gguf_input::GgmlType::Q1_0 {
+            // BQ1G128 byte-verbatim passthrough — mirrors the TQ2G128/Q2_0 arm
+            // above. PrismML's per-tensor format choice (incl. embedding/lm_head)
+            // is authoritative for the Bonsai binary variant. Layout is
+            // identical between the GGUF Q1_0 block and hipfire BQ1G128.
+            let nblocks = (n_elements + 127) / 128;
+            let expected = nblocks * 18;
+            assert_eq!(
+                raw.len(),
+                expected,
+                "Q1_0 size mismatch for {}: got {} bytes, expected {}",
+                info.name,
+                raw.len(),
+                expected
+            );
+            quant_params += n_elements as u64;
+            let (bytes, quant_type, group_size) =
+                convert_binary_tensor(raw, gguf_input::GgmlType::Q1_0);
+            (bytes, quant_type, group_size, "BQ1G128 (passthrough)")
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -6975,6 +7014,9 @@ fn run_gguf_pipeline(
                     let q = quantize_tq2g128(&f32_data);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant, promote6)")
                 }
+                GgufFormat::Binary => unreachable!(
+                    "binary format uses byte-verbatim Q1_0 passthrough; no requant path"
+                ),
             }
         } else if let (QuantLevel::Override(override_fmt), true) = (kmap_level, k_dim % 256 == 0) {
             // K-map says override (lm_head when --lm-head-format set).
@@ -7069,6 +7111,9 @@ fn run_gguf_pipeline(
                     let q = quantize_tq2g128(&f32_data);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant, override)")
                 }
+                GgufFormat::Binary => unreachable!(
+                    "binary format uses byte-verbatim Q1_0 passthrough; no requant path"
+                ),
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -7090,6 +7135,9 @@ fn run_gguf_pipeline(
                     let q = quantize_tq2g128(&f32_data);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant)")
                 }
+                GgufFormat::Binary => unreachable!(
+                    "binary format uses byte-verbatim Q1_0 passthrough; no requant path"
+                ),
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
@@ -11081,6 +11129,9 @@ fn main() {
                                 let q = quantize_tq2g128(&f32_data);
                                 (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant)")
                             }
+                            GgufFormat::Binary => unreachable!(
+                                "binary format uses byte-verbatim Q1_0 passthrough; no requant path"
+                            ),
                         }
                     } else {
                         // Non-256-aligned override target: Q8 fallback.
@@ -14497,5 +14548,18 @@ mod tests {
             kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
             QuantLevel::Base
         );
+    }
+
+    #[test]
+    fn q1_0_converts_byte_verbatim_to_bq1g128() {
+        // 18-byte Q1_0 block: FP16 d then 16 arbitrary qs bytes.
+        let mut block = vec![0x00u8, 0x3C]; // f16 1.0
+        block.extend((0..16u8).map(|i| i.wrapping_mul(17)));
+        assert_eq!(block.len(), 18);
+        let (out, qt, group) = convert_binary_tensor(&block, gguf_input::GgmlType::Q1_0);
+        assert_eq!(out, block); // byte-verbatim
+        assert_eq!(qt, QuantType::BQ1G128);
+        assert_eq!(group, 128);
+        assert_eq!(QuantType::BQ1G128 as u32, 39);
     }
 }
