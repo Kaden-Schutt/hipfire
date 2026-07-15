@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
-    load_symbols, BatchFencePolicy, Executable, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuSelector,
-    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, RecordedDispatch, Runtime,
-    SingleQueueBatchGraph, SingleQueuePm4Ib,
+    BatchFencePolicy, Executable, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuSelector, HeaderPolicy,
+    KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy,
+    RecordedDispatch, Runtime, SingleQueueBatchGraph, load_symbols,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +351,54 @@ impl ResourceFrontier {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Pm4PhasePlan {
+    indices: Vec<usize>,
+    parallel: bool,
+}
+
+fn launches_are_independent(left: &RecordedHipLaunch, right: &RecordedHipLaunch) -> bool {
+    let (Some(left), Some(right)) = (&left.accesses, &right.accesses) else {
+        return false;
+    };
+    !left
+        .iter()
+        .any(|left| right.iter().any(|right| left.conflicts(*right)))
+}
+
+/// Partition the original HIP stream into ordered phases. Every parallel
+/// phase is a maximal consecutive pairwise-independent antichain. Adjacent
+/// singleton phases are coalesced into one serial tape so ordinary dependency
+/// chains retain the existing one-doorbell replay shape.
+fn pm4_phase_plan(recorded: &[RecordedHipLaunch]) -> Vec<Pm4PhasePlan> {
+    let mut antichains = Vec::<Vec<usize>>::new();
+    for index in 0..recorded.len() {
+        let can_join = antichains.last().is_some_and(|phase| {
+            phase
+                .iter()
+                .all(|prior| launches_are_independent(&recorded[*prior], &recorded[index]))
+        });
+        if can_join {
+            antichains.last_mut().unwrap().push(index);
+        } else {
+            antichains.push(vec![index]);
+        }
+    }
+
+    let mut phases = Vec::<Pm4PhasePlan>::new();
+    for indices in antichains {
+        if indices.len() == 1 && phases.last().is_some_and(|phase| !phase.parallel) {
+            phases.last_mut().unwrap().indices.extend(indices);
+        } else {
+            phases.push(Pm4PhasePlan {
+                parallel: indices.len() > 1,
+                indices,
+            });
+        }
+    }
+    phases
+}
+
 impl ReplayTransport {
     fn from_env() -> Self {
         match std::env::var("HIPFIRE_REPLAY_TRANSPORT")
@@ -362,6 +410,14 @@ impl ReplayTransport {
             _ => Self::AqlPackets,
         }
     }
+}
+
+fn pm4_queue_policy_from_env() -> QueuePolicy {
+    let value = std::env::var("HIPFIRE_REPLAY_PM4_QUEUES").unwrap_or_else(|_| "auto".to_owned());
+    value.parse().unwrap_or_else(|error| {
+        eprintln!("WARNING: HIPFIRE_REPLAY_PM4_QUEUES={value:?}: {error}; retaining auto policy");
+        QueuePolicy::Auto
+    })
 }
 
 /// Experimental cache-acquire policy inside one retained PM4 tape.
@@ -692,7 +748,7 @@ impl PreparedLinearAqlReplay {
 }
 
 pub struct PreparedPm4Replay {
-    graph: SingleQueuePm4Ib,
+    graph: PhasedMultiQueuePm4Ib,
     // Kernels retain their HSA executables and kernargs retain every pointer
     // programmed into the immutable indirect buffer.
     _kernels: Vec<Kernel>,
@@ -717,6 +773,7 @@ impl PreparedPm4Replay {
                 .copy_from_slice(&frame.to_ne_bytes());
         }
         // SAFETY: forwarded from the caller that owns the model allocations.
+        // Phase construction proves cross-lane independence.
         unsafe { self.graph.replay_and_wait() }.map_err(|error| error.to_string())
     }
 
@@ -729,7 +786,18 @@ impl PreparedPm4Replay {
     }
 
     pub fn queue_id(&self) -> u64 {
-        self.graph.queue_id()
+        self.graph
+            .queue_ids()
+            .next()
+            .expect("prepared PM4 replay owns at least one queue")
+    }
+
+    pub fn queue_count(&self) -> usize {
+        self.graph.queue_count()
+    }
+
+    pub fn phase_count(&self) -> usize {
+        self.graph.phase_count()
     }
 }
 
@@ -766,6 +834,7 @@ pub struct ReplayController {
     pm4_mid_acquire_policy: Pm4MidAcquirePolicy,
     pm4_wait_policy: Pm4WaitPolicy,
     pm4_register_policy: Pm4RegisterPolicy,
+    pm4_queue_policy: QueuePolicy,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
     certified_speedups: Vec<f64>,
@@ -811,6 +880,7 @@ impl ReplayController {
             pm4_mid_acquire_policy: Pm4MidAcquirePolicy::from_env(),
             pm4_wait_policy: Pm4WaitPolicy::from_env(),
             pm4_register_policy: Pm4RegisterPolicy::from_env(),
+            pm4_queue_policy: pm4_queue_policy_from_env(),
             state,
             recorded: Vec::new(),
             certified_speedups: Vec::new(),
@@ -842,6 +912,17 @@ impl ReplayController {
 
     pub fn recorded_launches(&self) -> &[RecordedHipLaunch] {
         &self.recorded
+    }
+
+    pub fn pm4_queue_policy(&self) -> QueuePolicy {
+        self.pm4_queue_policy
+    }
+
+    /// Resolved `(queue_count, phase_count)` for the installed PM4 replay.
+    pub fn prepared_pm4_shape(&self) -> Option<(usize, usize)> {
+        self.prepared_pm4
+            .as_ref()
+            .map(|prepared| (prepared.queue_count(), prepared.phase_count()))
     }
 
     pub fn is_recording(&self) -> bool {
@@ -1077,9 +1158,9 @@ impl ReplayController {
         Ok(summary)
     }
 
-    /// Lower a captured prefix to one retained GFX12 PM4 indirect buffer.
-    /// The initial diagnostic form serializes every dispatch boundary. The
-    /// coherence gate can then remove only boundaries proven independent.
+    /// Lower a captured prefix to ordered retained GFX12 PM4 phases over one
+    /// reusable public queue set. Only known, pairwise-independent resource
+    /// effects fan out; unknown or conflicting launches remain serial.
     pub fn prepare_pm4_prefix(
         &mut self,
         device_ordinal: usize,
@@ -1099,6 +1180,12 @@ impl ReplayController {
         let device = runtime
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
+        if !device.name().to_ascii_lowercase().starts_with("gfx12") {
+            return Err(format!(
+                "Hipfire PM4 replay currently lowers gfx12 command buffers and kernargs, not {}",
+                device.name()
+            ));
+        }
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -1158,21 +1245,11 @@ impl ReplayController {
             geometries.push(geometry);
         }
 
-        let mut commands = match self.pm4_register_policy {
-            Pm4RegisterPolicy::Legacy => Gfx12Pm4CommandBuffer::new(),
-            Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
-            Pm4RegisterPolicy::Stateful => Gfx12Pm4CommandBuffer::new_stateful(),
-        };
         let gfx12_gcr_trim = std::env::var("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
-        if gfx12_gcr_trim {
-            commands.acquire_system_gfx12();
-        } else {
-            commands.acquire_system();
-        }
         let mut wait_audit = Pm4WaitAudit::default();
-        let mut resource_frontier = ResourceFrontier::default();
+        let mut audit_frontier = ResourceFrontier::default();
         for index in 0..prefix {
             if index != 0 {
                 let previous_launch = &self.recorded[index - 1];
@@ -1180,10 +1257,10 @@ impl ReplayController {
                 let previous = previous_launch.kernel.as_str();
                 let current = current_launch.kernel.as_str();
                 let allowlist_independent = independent_sibling(previous, current);
-                let resource_covered = resource_frontier.covered(current_launch);
-                let resources_independent = resource_frontier.independent(current_launch);
+                let resource_covered = audit_frontier.covered(current_launch);
+                let resources_independent = audit_frontier.independent(current_launch);
                 let exact_start_independent =
-                    resource_frontier.independent_by_exact_start(current_launch);
+                    audit_frontier.independent_by_exact_start(current_launch);
                 wait_audit.observe(
                     previous_launch,
                     current_launch,
@@ -1192,46 +1269,123 @@ impl ReplayController {
                     exact_start_independent,
                     resource_covered,
                 );
-                let independent = match self.pm4_wait_policy {
-                    Pm4WaitPolicy::Allowlist | Pm4WaitPolicy::ResourceAudit => {
-                        allowlist_independent
-                    }
-                    Pm4WaitPolicy::Resource => resources_independent,
-                };
-                if !independent {
-                    commands.wait_compute_idle();
-                }
-                resource_frontier.advance(current_launch, resources_independent);
-                if self
-                    .pm4_mid_acquire_policy
-                    .acquire_between(previous, current)
-                {
-                    if gfx12_gcr_trim {
-                        commands.acquire_inter_node_gfx12();
-                    } else {
-                        commands.acquire_system();
-                    }
-                }
+                audit_frontier.advance(current_launch, resources_independent);
             } else {
-                resource_frontier.advance(&self.recorded[index], false);
+                audit_frontier.advance(&self.recorded[index], false);
             }
-            commands
-                .dispatch(
-                    &kernels[index],
-                    geometries[index],
-                    self.recorded[index].shared_mem,
-                    kernargs[index].address(),
-                )
-                .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
         }
-        commands.wait_compute_idle();
         if self.pm4_wait_policy != Pm4WaitPolicy::Allowlist {
             wait_audit.report(self.pm4_wait_policy);
         }
-        let command_dwords = commands.len_dwords();
-        let graph = SingleQueuePm4Ib::create(&device, &pool, &commands)
+
+        let new_commands = || match self.pm4_register_policy {
+            Pm4RegisterPolicy::Legacy => Gfx12Pm4CommandBuffer::new(),
+            Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
+            Pm4RegisterPolicy::Stateful => Gfx12Pm4CommandBuffer::new_stateful(),
+        };
+        let begin_phase = |commands: &mut Gfx12Pm4CommandBuffer| {
+            if gfx12_gcr_trim {
+                commands.acquire_system_gfx12();
+            } else {
+                commands.acquire_system();
+            }
+        };
+        let mut phase_commands = Vec::new();
+        let mut command_dwords = 0_u32;
+        let mut max_queue_count = 1_usize;
+        for phase in pm4_phase_plan(&self.recorded[..prefix]) {
+            let lane_count = if phase.parallel {
+                self.pm4_queue_policy
+                    .resolve(device.name(), phase.indices.len())
+            } else {
+                1
+            };
+            if lane_count > 1 {
+                let mut lane_commands = (0..lane_count)
+                    .map(|_| {
+                        let mut commands = new_commands();
+                        begin_phase(&mut commands);
+                        commands
+                    })
+                    .collect::<Vec<_>>();
+                for (position, index) in phase.indices.iter().copied().enumerate() {
+                    lane_commands[position % lane_count]
+                        .dispatch(
+                            &kernels[index],
+                            geometries[index],
+                            self.recorded[index].shared_mem,
+                            kernargs[index].address(),
+                        )
+                        .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
+                }
+                for commands in &mut lane_commands {
+                    commands.wait_compute_idle();
+                    command_dwords = command_dwords
+                        .checked_add(commands.len_dwords())
+                        .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
+                }
+                max_queue_count = max_queue_count.max(lane_commands.len());
+                phase_commands.push(lane_commands);
+                continue;
+            }
+
+            let mut commands = new_commands();
+            begin_phase(&mut commands);
+            let mut resource_frontier = ResourceFrontier::default();
+            for (position, index) in phase.indices.iter().copied().enumerate() {
+                if position != 0 && !phase.parallel {
+                    let previous_index = phase.indices[position - 1];
+                    let previous_launch = &self.recorded[previous_index];
+                    let current_launch = &self.recorded[index];
+                    let previous = previous_launch.kernel.as_str();
+                    let current = current_launch.kernel.as_str();
+                    let allowlist_independent = independent_sibling(previous, current);
+                    let resources_independent = resource_frontier.independent(current_launch);
+                    let independent = match self.pm4_wait_policy {
+                        Pm4WaitPolicy::Allowlist | Pm4WaitPolicy::ResourceAudit => {
+                            allowlist_independent
+                        }
+                        Pm4WaitPolicy::Resource => resources_independent,
+                    };
+                    if !independent {
+                        commands.wait_compute_idle();
+                    }
+                    resource_frontier.advance(current_launch, resources_independent);
+                    if self
+                        .pm4_mid_acquire_policy
+                        .acquire_between(previous, current)
+                    {
+                        if gfx12_gcr_trim {
+                            commands.acquire_inter_node_gfx12();
+                        } else {
+                            commands.acquire_system();
+                        }
+                    }
+                } else {
+                    resource_frontier.advance(&self.recorded[index], false);
+                }
+                commands
+                    .dispatch(
+                        &kernels[index],
+                        geometries[index],
+                        self.recorded[index].shared_mem,
+                        kernargs[index].address(),
+                    )
+                    .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
+            }
+            commands.wait_compute_idle();
+            command_dwords = command_dwords
+                .checked_add(commands.len_dwords())
+                .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
+            phase_commands.push(vec![commands]);
+        }
+        let graph = PhasedMultiQueuePm4Ib::create(&device, &pool, &phase_commands)
             .map_err(|error| error.to_string())?;
-        let queue_id = graph.queue_id();
+        let queue_id = graph
+            .queue_ids()
+            .next()
+            .expect("nonempty captured prefix produces a PM4 queue");
+        debug_assert_eq!(graph.queue_count(), max_queue_count);
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
@@ -1621,22 +1775,34 @@ mod tests {
             Pm4MidAcquirePolicy::from_value("required-only"),
             Some(Pm4MidAcquirePolicy::RequiredOnly)
         );
-        assert!(Pm4MidAcquirePolicy::Conservative
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(!Pm4MidAcquirePolicy::EntryOnly
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(
+            Pm4MidAcquirePolicy::Conservative
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            !Pm4MidAcquirePolicy::EntryOnly
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
         assert!(!Pm4MidAcquirePolicy::Conservative.acquire_between("rmsnorm_f32", "gemv_hfq4g256"));
-        assert!(!Pm4MidAcquirePolicy::WithoutRope
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(Pm4MidAcquirePolicy::WithoutRope
-            .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32"));
+        assert!(
+            !Pm4MidAcquirePolicy::WithoutRope
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            Pm4MidAcquirePolicy::WithoutRope
+                .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32")
+        );
         assert!(
             !Pm4MidAcquirePolicy::WithoutMqRotate.acquire_between("mq_rotate_x", "gemv_hfq4g256")
         );
-        assert!(Pm4MidAcquirePolicy::RequiredOnly
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(!Pm4MidAcquirePolicy::RequiredOnly
-            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));
+        assert!(
+            Pm4MidAcquirePolicy::RequiredOnly
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            !Pm4MidAcquirePolicy::RequiredOnly
+                .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256")
+        );
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "gated_delta_net_q8_compact2_b2"
@@ -1807,6 +1973,93 @@ mod tests {
         assert!(!frontier.independent(&unknown));
         frontier.advance(&unknown, false);
         assert!(!frontier.independent(&write_b));
+    }
+
+    #[test]
+    fn pm4_phase_planner_parallelizes_only_pairwise_independent_launches() {
+        let launch = |kernel: &str, base: u64, mode: RecordedAccessMode| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_mem: 0,
+            kernarg: Vec::new(),
+            accesses: Some(vec![RecordedResourceAccess {
+                allocation_base: base,
+                allocation_bytes: 0x100,
+                access_base: base,
+                mode,
+            }]),
+        };
+        let unknown = RecordedHipLaunch {
+            accesses: None,
+            ..launch("unknown", 0x3000, RecordedAccessMode::Read)
+        };
+        let recorded = vec![
+            launch("write_a", 0x1000, RecordedAccessMode::Write),
+            launch("write_b", 0x2000, RecordedAccessMode::Write),
+            launch("read_a", 0x1000, RecordedAccessMode::Read),
+            launch("write_a_again", 0x1000, RecordedAccessMode::Write),
+            unknown,
+        ];
+
+        assert_eq!(
+            pm4_phase_plan(&recorded),
+            vec![
+                Pm4PhasePlan {
+                    indices: vec![0, 1],
+                    parallel: true,
+                },
+                Pm4PhasePlan {
+                    indices: vec![2, 3, 4],
+                    parallel: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pm4_phase_planner_allows_read_read_and_serializes_unknown_accesses() {
+        let read = |kernel: &str| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_mem: 0,
+            kernarg: Vec::new(),
+            accesses: Some(vec![RecordedResourceAccess {
+                allocation_base: 0x1000,
+                allocation_bytes: 0x100,
+                access_base: 0x1000,
+                mode: RecordedAccessMode::Read,
+            }]),
+        };
+        let reads = vec![read("read_a"), read("read_a_again")];
+        assert_eq!(
+            pm4_phase_plan(&reads),
+            vec![Pm4PhasePlan {
+                indices: vec![0, 1],
+                parallel: true,
+            }]
+        );
+
+        let unknowns = vec![
+            RecordedHipLaunch {
+                accesses: None,
+                ..read("unknown_a")
+            },
+            RecordedHipLaunch {
+                accesses: None,
+                ..read("unknown_b")
+            },
+        ];
+        assert_eq!(
+            pm4_phase_plan(&unknowns),
+            vec![Pm4PhasePlan {
+                indices: vec![0, 1],
+                parallel: false,
+            }]
+        );
     }
 
     #[test]
