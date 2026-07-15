@@ -2284,6 +2284,16 @@ impl Gpu {
                         kernels::FUSED_RMSNORM_MQ_ROTATE_WAVEGRID_GFX1100_SRC.to_string(),
                     ));
                 }
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_split {
+                    specs.push((
+                        "rmsnorm_reduce_gfx1100",
+                        kernels::RMSNORM_REDUCE_GFX1100_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "rotate_with_rms_gfx1100",
+                        kernels::ROTATE_WITH_RMS_GFX1100_SRC.to_string(),
+                    ));
+                }
                 specs.push((
                     "fused_silu_mul_mq_rotate",
                     kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string(),

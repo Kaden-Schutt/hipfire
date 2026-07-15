@@ -2016,6 +2016,9 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_mq_signs()?;
+        if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_split && k == 2048 {
+            return self.fused_rmsnorm_rotate_mq_split_gfx1100(x, weight, x_rot, k, eps);
+        }
         if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_wavegrid && k == 2048 {
             return self.fused_rmsnorm_rotate_mq_wavegrid_gfx1100(
                 x, weight, x_rot, k, eps,
@@ -2079,6 +2082,99 @@ impl Gpu {
             },
         );
         if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// gfx1100 experiment: an exact one-block RMS reduction followed by eight
+    /// independent wave32 FWHT workgroups. This preserves the fused kernel's
+    /// arithmetic assignment without its cross-workgroup rendezvous.
+    fn fused_rmsnorm_rotate_mq_split_gfx1100(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        const REDUCE: &str = "rmsnorm_reduce_gfx1100";
+        const ROTATE: &str = "rotate_with_rms_gfx1100";
+        self.scratch
+            .ensure_mq_rmsnorm_wavegrid_scratch(&self.hip, self.device_id)?;
+        self.ensure_kernel(REDUCE, kernels::RMSNORM_REDUCE_GFX1100_SRC, REDUCE)?;
+        self.ensure_kernel(ROTATE, kernels::ROTATE_WITH_RMS_GFX1100_SRC, ROTATE)?;
+
+        let xp = x.buf.as_ptr();
+        let rms = self
+            .scratch
+            .mq_rmsnorm_wavegrid_scratch
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        let kv = k as i32;
+        let eps_v = eps;
+        let mut reduce_params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &rms as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &eps_v as *const _ as *mut c_void,
+        ];
+        let reduce_timer = crate::profile::begin_timer(&self.hip, "fused", REDUCE, k * 4);
+        self.launch_maybe_blob(
+            REDUCE,
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut reduce_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(rms);
+                b.push_i32(kv);
+                b.push_f32(eps_v);
+                b
+            },
+        )?;
+        if let Some(t) = reduce_timer {
+            t.finish(&self.hip);
+        }
+
+        let wp = weight.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let mut rotate_params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &rms as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let bytes = k * 4 * 3 + 2 * 256 * 4;
+        let rotate_timer = crate::profile::begin_timer(&self.hip, "fused", ROTATE, bytes);
+        let result = self.launch_maybe_blob(
+            ROTATE,
+            [(k / 256) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut rotate_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(rms);
+                b.push_ptr(xrp);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = rotate_timer {
             t.finish(&self.hip);
         }
         self.invalidate_x_caches_for(xrp);
