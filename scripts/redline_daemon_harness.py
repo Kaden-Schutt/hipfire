@@ -135,6 +135,17 @@ def main():
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--prefix", type=int, help="compare only the first N captured launches")
     parser.add_argument(
+        "--profile-prefix-step",
+        type=int,
+        help="profile retained-PM4 cumulative prefixes at this dispatch interval",
+    )
+    parser.add_argument(
+        "--profile-prefix-repeats",
+        type=int,
+        default=3,
+        help="GPU-timed repetitions per cumulative PM4 prefix (default: 3)",
+    )
+    parser.add_argument(
         "--pm4",
         action="store_true",
         help="lower --prefix to one retained PM4 indirect buffer",
@@ -259,6 +270,20 @@ def main():
             f"aql-contracts: kernels={report['aql_contract_probe']['kernels']}",
             flush=True,
         )
+        if args.profile_prefix_step is not None:
+            report["pm4_prefix_profile"] = daemon.request(
+                {
+                    "type": "redline_pm4_prefix_profile",
+                    "context_tokens": args.decode_context,
+                    "step": args.profile_prefix_step,
+                    "repeats": args.profile_prefix_repeats,
+                }
+            )
+            print(
+                f"pm4-prefix-profile: rows={len(report['pm4_prefix_profile']['rows'])} "
+                f"repeats={args.profile_prefix_repeats}",
+                flush=True,
+            )
         if args.prefix is None:
             report["aql_shadow"] = daemon.request(
                 {

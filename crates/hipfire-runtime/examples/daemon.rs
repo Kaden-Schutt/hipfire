@@ -3381,6 +3381,118 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            "redline_pm4_prefix_profile" => {
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(128) as usize;
+                let step = msg
+                    .get("step")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(16) as usize;
+                let repeats = msg
+                    .get("repeats")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(3) as usize;
+                let eligible = model.as_ref().is_some_and(|loaded| {
+                    loaded.pp == 1
+                        && loaded.ep.is_none()
+                        && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+                });
+                if !eligible || step == 0 || repeats == 0 {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "redline_pm4_prefix_profile requires single-GPU Qwen3.5 and positive step/repeats",
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
+                let launch_count = gpu.replay.recorded_launches().len();
+                let mut prefixes = (step..launch_count).step_by(step).collect::<Vec<_>>();
+                prefixes.push(launch_count);
+                let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                let profile_result = (|| -> Result<Vec<serde_json::Value>, String> {
+                    let mut rows = Vec::with_capacity(prefixes.len());
+                    for prefix in prefixes {
+                        let launch = gpu.replay.recorded_launches()[prefix - 1].clone();
+                        let (_, dwords, _) = gpu
+                            .replay
+                            .prepare_pm4_prefix(gpu.device_id as usize, prefix)?;
+                        let mut samples = Vec::with_capacity(repeats);
+                        for _ in 0..repeats {
+                            rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
+                                frame_checkpoint,
+                            );
+                            let loaded = model.as_mut().expect("eligibility checked");
+                            let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                                unreachable!()
+                            };
+                            redline_reset_qwen(&mut gpu, bundle)?;
+                            redline_prime_qwen(&mut gpu, bundle, context)?;
+                            qwen35::prepare_scratch_inputs(
+                                &mut gpu,
+                                &bundle.weights,
+                                &bundle.config,
+                                101,
+                                context,
+                                &bundle.scratch,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            gpu.hip
+                                .device_synchronize()
+                                .map_err(|error| error.to_string())?;
+                            let timing = unsafe { gpu.replay.replay_pm4(context) }?;
+                            samples.push(timing.span_microseconds());
+                        }
+                        let mut ordered = samples.clone();
+                        ordered.sort_by(f64::total_cmp);
+                        let median_gpu_us = ordered[ordered.len() / 2];
+                        rows.push(serde_json::json!({
+                            "prefix": prefix,
+                            "last_kernel": launch.kernel,
+                            "last_grid": launch.grid,
+                            "last_block": launch.block,
+                            "command_dwords": dwords,
+                            "samples_gpu_us": samples,
+                            "median_gpu_us": median_gpu_us,
+                        }));
+                    }
+                    Ok(rows)
+                })();
+                match profile_result {
+                    Ok(rows) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "redline_pm4_prefix_profile",
+                                "context_tokens": context,
+                                "launches": launch_count,
+                                "step": step,
+                                "repeats": repeats,
+                                "rows": rows,
+                            })
+                        );
+                    }
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("retained PM4 prefix profile failed: {reason}"),
+                            })
+                        );
+                    }
+                }
+                let _ = stdout.flush();
+            }
+
             "redline_prefix_shadow" => {
                 let context = msg
                     .get("context_tokens")
