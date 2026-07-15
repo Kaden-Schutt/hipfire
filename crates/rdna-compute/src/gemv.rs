@@ -6586,9 +6586,23 @@ impl Gpu {
             "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
             bytes,
         );
+        // The expanded kernel owns four consecutive output rows per workgroup.
+        // Keep this opt-in while it is qualified on gfx1100: the legacy launch
+        // used `m` workgroups, leaving three quarters to exit at the row0 guard.
+        use std::sync::OnceLock;
+        static DOWN_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
+        let grid_x = if self.arch_caps.is_gfx1100()
+            && *DOWN_TIGHT_GRID.get_or_init(|| {
+                std::env::var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() == Ok("1")
+            })
+        {
+            (m as u32).div_ceil(4)
+        } else {
+            m as u32
+        };
         let result = self.launch_maybe_blob(
             "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-            [m as u32, k_top as u32, batch_size as u32],
+            [grid_x, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
             &mut params,
