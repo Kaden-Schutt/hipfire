@@ -55,6 +55,9 @@ pub struct FeatureFlags {
     /// The kernel maps row0 = blockIdx.x * 2; the legacy launcher submits M
     /// workgroups, leaving the upper half to return immediately.
     pub rdna3_hfq4_sigmoid_tight_grid: bool,
+    /// Compile the shared-expert sigmoid-scaled down kernel with gfx1100
+    /// temporal buffer-resource weight loads instead of global addressing.
+    pub rdna3_hfq4_sigmoid_buffer: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -276,6 +279,11 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_sigmoid_tight_grid: std::env::var(
                 "HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID",
+            )
+            .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_sigmoid_buffer: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER",
             )
             .as_deref()
                 == Ok("1"),
@@ -503,6 +511,7 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_hoist_x32: false,
             rdna3_hfq4_residual_stage_x32: false,
             rdna3_hfq4_sigmoid_tight_grid: false,
+            rdna3_hfq4_sigmoid_buffer: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,

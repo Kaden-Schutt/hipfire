@@ -4923,9 +4923,22 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let (module, source) = if self.arch_caps.is_rdna3_dgpu()
+            && self.flags.rdna3_hfq4_sigmoid_buffer
+        {
+            (
+                "gemv_hfq4g256_residual_sigmoid_buffer_gfx1100",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC,
+            )
+        } else {
+            (
+                "gemv_hfq4g256_residual_scaled",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
+            )
+        };
         self.ensure_kernel(
-            "gemv_hfq4g256_residual_scaled",
-            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
+            module,
+            source,
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
         )?;
         let a_ptr = a_raw.buf.as_ptr();

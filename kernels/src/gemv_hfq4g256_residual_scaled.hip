@@ -4,6 +4,13 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_WEIGHT_LOAD_PTR_U32
+#define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 0
+#define HIPFIRE_WEIGHT_RSRC(base) 0
+#define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, byte_offset) \
+    (*(const unsigned int*)(ptr))
+#endif
+
 // HFQ4-G256 GEMV with fused SCALED residual add: y[row] += scale * (A[row] · x).
 //
 // Two kernel variants — identical math, differ only in how the scale is
@@ -263,6 +270,8 @@ extern "C" __global__ void gemv_hfq4g256_residual_sigmoid_scaled_gpu(
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
     const int boff = tid * 4;
+    const auto row_rsrc0 = HIPFIRE_WEIGHT_RSRC(row_ptr0);
+    const auto row_rsrc1 = HIPFIRE_WEIGHT_RSRC(row_ptr1);
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     float bcc0 = 0.0f, bcc1 = 0.0f, bcc2 = 0.0f, bcc3 = 0.0f;
@@ -279,10 +288,13 @@ extern "C" __global__ void gemv_hfq4g256_residual_sigmoid_scaled_gpu(
         const float x6 = x[(b) + 6]; \
         const float x7 = x[(b) + 7]
 
-    #define DOG_X8(gp, a) do { \
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
-        unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
+    #define DOG_X8(rsrc, gp, group_offset, a) do { \
+        float sc = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_PTR_U32((rsrc), (gp), (group_offset))); \
+        float zp = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_PTR_U32((rsrc), (gp) + 4, (group_offset) + 4)); \
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32( \
+            (rsrc), (gp) + 8 + boff, (group_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
              + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
@@ -299,23 +311,23 @@ extern "C" __global__ void gemv_hfq4g256_residual_sigmoid_scaled_gpu(
 
         {
             LOAD_X8(base0);
-            DOG_X8(row_ptr0 + g * 136, acc0);
-            if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc0);
+            DOG_X8(row_rsrc0, row_ptr0 + g * 136, g * 136, acc0);
+            if (have_row1) DOG_X8(row_rsrc1, row_ptr1 + g * 136, g * 136, bcc0);
         }
         {
             LOAD_X8(base0 + 256);
-            DOG_X8(row_ptr0 + (g + 1) * 136, acc1);
-            if (have_row1) DOG_X8(row_ptr1 + (g + 1) * 136, bcc1);
+            DOG_X8(row_rsrc0, row_ptr0 + (g + 1) * 136, (g + 1) * 136, acc1);
+            if (have_row1) DOG_X8(row_rsrc1, row_ptr1 + (g + 1) * 136, (g + 1) * 136, bcc1);
         }
         {
             LOAD_X8(base0 + 512);
-            DOG_X8(row_ptr0 + (g + 2) * 136, acc2);
-            if (have_row1) DOG_X8(row_ptr1 + (g + 2) * 136, bcc2);
+            DOG_X8(row_rsrc0, row_ptr0 + (g + 2) * 136, (g + 2) * 136, acc2);
+            if (have_row1) DOG_X8(row_rsrc1, row_ptr1 + (g + 2) * 136, (g + 2) * 136, bcc2);
         }
         {
             LOAD_X8(base0 + 768);
-            DOG_X8(row_ptr0 + (g + 3) * 136, acc3);
-            if (have_row1) DOG_X8(row_ptr1 + (g + 3) * 136, bcc3);
+            DOG_X8(row_rsrc0, row_ptr0 + (g + 3) * 136, (g + 3) * 136, acc3);
+            if (have_row1) DOG_X8(row_rsrc1, row_ptr1 + (g + 3) * 136, (g + 3) * 136, bcc3);
         }
     }
 
@@ -323,22 +335,22 @@ extern "C" __global__ void gemv_hfq4g256_residual_sigmoid_scaled_gpu(
         const int g = quads << 2;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8(row_ptr0 + g * 136, acc0);
-        if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc0);
+        DOG_X8(row_rsrc0, row_ptr0 + g * 136, g * 136, acc0);
+        if (have_row1) DOG_X8(row_rsrc1, row_ptr1 + g * 136, g * 136, bcc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8(row_ptr0 + g * 136, acc1);
-        if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc1);
+        DOG_X8(row_rsrc0, row_ptr0 + g * 136, g * 136, acc1);
+        if (have_row1) DOG_X8(row_rsrc1, row_ptr1 + g * 136, g * 136, bcc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8(row_ptr0 + g * 136, acc2);
-        if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc2);
+        DOG_X8(row_rsrc0, row_ptr0 + g * 136, g * 136, acc2);
+        if (have_row1) DOG_X8(row_rsrc1, row_ptr1 + g * 136, g * 136, bcc2);
     }
     #undef DOG_X8
     #undef LOAD_X8
