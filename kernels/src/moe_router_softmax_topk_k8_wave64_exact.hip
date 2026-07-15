@@ -22,6 +22,14 @@
 #define ROUTER_EXACT_PER_LANE 4
 #define ROUTER_EXACT_K 8
 
+__device__ __forceinline__ float router_exact_cross_half_f32(float v) {
+    return __uint_as_float(__builtin_amdgcn_permlane64(__float_as_uint(v)));
+}
+
+__device__ __forceinline__ int router_exact_cross_half_i32(int v) {
+    return (int)__builtin_amdgcn_permlane64((unsigned)v);
+}
+
 __device__ __forceinline__ float router_exact_max_256(
     float v0, float v1, float v2, float v3, int lane)
 {
@@ -30,9 +38,10 @@ __device__ __forceinline__ float router_exact_max_256(
     float v13 = fmaxf(v1, v3);
     float v = fmaxf(v02, v13);
 
-    // Legacy s=32. An indexed wave64 shuffle cannot cross gfx1100's physical
-    // wave32 halves; XOR 32 is the native cross-half exchange.
-    float other = __shfl_xor(v, 32);
+    // Legacy s=32. gfx1100's ds_bpermute-based HIP shuffles are confined to a
+    // physical wave32 half even in wave64 mode; V_PERMLANE64 is the gfx11
+    // instruction which exchanges matching lanes across those halves.
+    float other = router_exact_cross_half_f32(v);
     if (lane < 32) v = fmaxf(v, other);
 
     // Legacy s=16..1 within the low physical half.
@@ -44,7 +53,7 @@ __device__ __forceinline__ float router_exact_max_256(
 
     // Broadcast the low-half lane-0 result to both physical halves.
     float half_leader = __shfl(v, 0, 32);
-    float other_half = __shfl_xor(half_leader, 32);
+    float other_half = router_exact_cross_half_f32(half_leader);
     return lane < 32 ? half_leader : other_half;
 }
 
@@ -58,7 +67,7 @@ __device__ __forceinline__ float router_exact_sum_256(
     float v13 = v1 + v3;
     float v = v02 + v13;
 
-    float other = __shfl_xor(v, 32);
+    float other = router_exact_cross_half_f32(v);
     if (lane < 32) v += other;
 
     #pragma unroll
@@ -68,31 +77,31 @@ __device__ __forceinline__ float router_exact_sum_256(
     }
 
     float half_leader = __shfl(v, 0, 32);
-    float other_half = __shfl_xor(half_leader, 32);
+    float other_half = router_exact_cross_half_f32(half_leader);
     return lane < 32 ? half_leader : other_half;
 }
 
 __device__ __forceinline__ float router_exact_half_leader_f32(float v, int lane) {
     float own_half = __shfl(v, 0, 32);
-    float other_half = __shfl_xor(own_half, 32);
+    float other_half = router_exact_cross_half_f32(own_half);
     return lane < 32 ? own_half : other_half;
 }
 
 __device__ __forceinline__ float router_exact_other_half_leader_f32(float v, int lane) {
     float own_half = __shfl(v, 0, 32);
-    float other_half = __shfl_xor(own_half, 32);
+    float other_half = router_exact_cross_half_f32(own_half);
     return lane < 32 ? other_half : own_half;
 }
 
 __device__ __forceinline__ int router_exact_half_leader_i32(int v, int lane) {
     int own_half = __shfl(v, 0, 32);
-    int other_half = __shfl_xor(own_half, 32);
+    int other_half = router_exact_cross_half_i32(own_half);
     return lane < 32 ? own_half : other_half;
 }
 
 __device__ __forceinline__ int router_exact_other_half_leader_i32(int v, int lane) {
     int own_half = __shfl(v, 0, 32);
-    int other_half = __shfl_xor(own_half, 32);
+    int other_half = router_exact_cross_half_i32(own_half);
     return lane < 32 ? other_half : own_half;
 }
 
