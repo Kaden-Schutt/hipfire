@@ -141,16 +141,13 @@ cheapest-step first:
    sccache, mold, DPM governor), flag state (`HIPFIRE_*` env vars,
    `--kv-mode`, `--no-chatml`, `prompt_normalize`, prompt md5), then
    code-change bisect via `scripts/probe_commits.sh`.
-3. **If real GAIN: coherence MUST be established before ANY claim.**
-   Run `./scripts/coherence-gate.sh` and (if spec-decode touched)
-   `./scripts/coherence-gate-dflash.sh`. A win that ships an
-   attractor / token loop / special-token leak / structural repetition
-   is not a win — it's a regression on the output axis hiding behind a
-   tok/s number. See the multiple "synth-win → prod-falsify" entries
-   in memory (`feedback_v2_sgpr_lut_falsified_2026_05_10`,
-   `project_gfx11_dot2_trickle_down_falsified_2026_05_11`,
-   `project_fp8_wmma_hfp4g32_2026_05_10`) — every one of them passed a
-   synthetic microbench, then failed coherence or fresh-probe perf.
+3. **If real GAIN: validate the actual runtime path before ANY claim.**
+   Use `scripts/redline_daemon_harness.py` for retained-launch capture,
+   contract checks, and multi-position HIP/PM4 output parity. Use
+   `scripts/serve_harness.py` for sampled, chained, or session-level output
+   checks through the user-facing serve path. The retired
+   `scripts/coherence-gate*.sh` family is stale and MUST NOT be used as
+   acceptance evidence.
 
 **Diagnosing memset pressure:** run with `HIPFIRE_MEMSET_DUMP=1` — the
 gpu layer's memset helper is `#[track_caller]` and prints `file:line`
@@ -198,123 +195,30 @@ matches. Index of currently-available skills:
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.
 
-## Coherence Gate (mandatory)
+## Runtime validation (mandatory)
 
-Any change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-or the forward pass MUST pass `./scripts/coherence-gate.sh` before
-committing. A pre-commit hook in `.githooks/pre-commit` runs it automatically
-when relevant files are staged. Spec-decode changes also trigger
-`./scripts/coherence-gate-dflash.sh` (see next section). **Cohere2-MoE /
-North-Mini-Code (arch_id=12)** changes — the flash Q8 tile/reduce kernels, the
-`hipfire-arch-cohere2moe` forward, or the daemon's cohere2moe serve path — run
-the arch-specific `./scripts/coherence-gate-cohere2moe.sh`. It is a greedy
-matrix (capital / sheep-reasoning / one-line code / a >4096-token long-context
-row that exercises the sliding-window flash attention above the 4096 window AND
-the KV-capacity OOB guard) and hard-fails additionally on a Cohere `<|MARKER|>`
-leaking into visible output (decode marker-state-machine failure) or a daemon
-`{"type":"error"}` event. The Qwen `coherence-gate.sh` is ChatML/AWQ-specific
-and does NOT cover North.
+Do not use `scripts/coherence-gate*.sh`. Those fixed, single-request batteries
+are retired: their model matrix and prompt assumptions are stale, and they can
+mislabel both regressions and valid numerical changes.
+
+Choose validation by the path under test:
+
+- Kernel, dispatch, graph, or Redline replay changes: run
+  `scripts/redline_daemon_harness.py`. Require stable capture, valid AQL
+  contracts, and multi-position HIP/PM4 output parity. Record the JSON report.
+- User-facing generation or state-lifecycle changes: run
+  `scripts/serve_harness.py` against the exact model and settings under test.
+  Use `battery` for varied prompts, `chain` for related turns, and `session`
+  for recurrent-state/reset behavior. Record the per-turn JSON and decoded
+  text.
+- Performance claims: combine the applicable harness above with the matched,
+  fresh-process timing protocol in this file. A microbenchmark alone is not
+  acceptance evidence.
 
 First-time setup (once per clone):
 ```
 git config core.hooksPath .githooks
 ```
-
-The coherence battery runs a small fixed matrix of prompts through the
-daemon and writes a markdown report. It hard-fails only on panics, zero
-tokens, or timeouts — soft output changes do NOT block, since legitimate
-numerical-correctness fixes (e.g., norm convention) intentionally change
-output. The committer reads the report and confirms each model is fluent,
-on-topic, and not stuck in a verbatim loop before landing the commit.
-
-This replaces the prior byte-exact `quality-gate.sh` barrier (removed),
-which blocked legitimate forward-pass fixes by treating any token diff as
-a regression.
-
-## Coherence Probe (user-facing behavior debugger)
-
-`coherence_probe` (in `crates/hipfire-runtime/examples/`) is the
-user-facing version of the gate scripts: spawns the daemon, runs a
-prompt, surfaces token attractors / special-token leaks / empty-think
-halts / n-gram density spikes / tool-call malformations. Detector code
-lives in `crates/hipfire-detect/`, a GPU-independent library crate that
-the bash gates can also pipe into via a future thin CLI binary
-(eliminates the inline-Python wart in
-`coherence-gate-dflash.sh:191-243` and `agentic-gate.sh:72-144`).
-
-Quick run:
-```
-cargo build --release --example coherence_probe
-./target/release/examples/coherence_probe --self-check     # no GPU needed
-./target/release/examples/coherence_probe \
-    --model ~/.hipfire/models/qwen3.5-9b.mq4 \
-    --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
-    --max-tokens 200 --temperature 0.0
-```
-
-The probe sets `HIPFIRE_EMIT_TOKEN_IDS=1` on the daemon child it spawns;
-the daemon then emits a parallel `{"type":"committed",...}` event
-stream alongside the existing text events so the probe can run token-id
-detectors (attractor windows, n-gram density, loop_guard mirror)
-without re-tokenizing. The flag is off by default — existing JSONL
-clients see no change. The 3-gram density detector promised below is
-now implemented in `hipfire-detect::ngram` as a soft warn.
-
-## Multi-request serve gate (cross-request state-bleed guard)
-
-`./scripts/serve-multiturn-gate.sh` loads a qwen3.5 (DeltaNet) model **once**
-and sends several distinct prompts in the **same** daemon session (no unload
-between), then runs attractor detection on **every** request. The request-2..N
-checks are the regression guard: the single-request coherence gates
-(`coherence-gate.sh` does load→ONE generate→unload per row) structurally cannot
-catch recurrent state (DeltaNet/KV) bleeding across requests — the #462 class,
-where a state migration moves recurrent state into a bundle but the daemon's
-reset/checkpoint/abort sites keep reading the now-`None` direct fields, silently
-no-op, and bleed into a `</think>` thinking-loop attractor (catastrophic on
-DFlash, mild-but-detectable on AR). Reach for this when touching the daemon's
-reset/checkpoint/prefix-cache/abort state machine, `ModelState` bundles, or any
-recurrent-state lifecycle. AR is the always-on guard; the DFlash arm (the
-catastrophic case) auto-runs when a 27B target+draft are present under
-`MODELS_DIR` (`HIPFIRE_SERVE_GATE_DFLASH=0` to force-skip). Exit 1 = a request
-degraded across the session.
-
-## DFlash Coherence Gate (spec-decode token-attractor guard)
-
-Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
-improvement MUST pass `scripts/coherence-gate-dflash.sh` (shipped 9883e98)
-before commit. The script's inline detector enforces all three tiers below:
-Tier 1 + Tier 2 are hard fails (non-zero exit), Tier 3 is a soft `FLAG`
-status in the report for human eyeball. Thresholds (as of 2026-04-26):
-
-**Tier 1 — First 128 tokens (hard fail, catches single-token attractors):**
-- `unique_token_ratio < 0.15` OR `max_single_token_frequency > 0.50`
-
-**Tier 2 — Last 128 tokens (hard fail, catches block-level attractors):**
-- `unique_token_ratio < 0.30` OR `max_single_token_frequency > 0.50`
-
-**Tier 3 — Full output (soft flag, requires human eyeball):**
-- Consecutive 3gram repetition density > 50% in final half → structural loop signature
-- Full-output unique-token ratio << 0.10 → structural code loop even if early tokens pass
-
-**Why:** Attractors manifest in two forms: (1) single-token loops visible in first 128,
-and (2) block-level structural loops (5+ token sequences repeating) that appear later.
-CASK m-fold + DFlash 2026-04-26 example: τ=8.98 with tight stddev passed first-128 gate
-but emitted 1500-token garbage (47-token vocabulary, 76+ reps of `[1734, 2357, 2733, 283, 869]`).
-Root cause: m-fold hidden-state drift off draft distribution. Per `feedback_attention_precision.md`,
-5% attention error cascades into attractor within ~10 tokens under greedy decode.
-
-Bit DDTree Path A (fake +79% τ / +120% tok/s at 6c84b13) and Path B Variant B1 
-(f9c920a, 2026-04-23) on identical `numbers(numbers(numbers(...` attractor were single-token.
-Linearization-slot RoPE phase delta skew in tree-mode FA — not a bug, structural mismatch 
-between tree-mode and committed-slot phase deltas.
-
-**How to apply:** tight stddev on a spec-decode bench is actively
-SUSPICIOUS, not reassuring. Real acceptance noise is wider. Any new
-spec-decode bench script must include ALL of:
-1. unique-token-ratio check on FIRST 128 (< 0.15 fail) AND LAST 128 (< 0.30 fail)
-2. max-frequency check (> 50% fail) on both windows
-3. decoded text printed for human eyeball (REQUIRED, not optional)
-4. 3gram density check over second half of output (> 50% repetition → block-attractor flag)
 
 ## Prompt-structure τ sensitivity (mandatory bench rule)
 
