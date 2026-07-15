@@ -799,6 +799,77 @@ impl Gpu {
         result
     }
 
+    /// Exact gfx1100 Qwen3.6-35B full-attention preparation. Replaces the
+    /// dependent deinterleave, Q RMS, K RMS, and partial half-split RoPE
+    /// dispatches with one head-local launch. Admission is enforced by the
+    /// architecture layer; this launcher intentionally exposes only the fixed
+    /// 16Q/2K, head_dim=256, n_rot=64 shape.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_fa_prep_gfx1100(
+        &mut self,
+        q_interleaved: &GpuTensor,
+        q: &GpuTensor,
+        gate: &GpuTensor,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        pos_buf: &hip_bridge::DeviceBuffer,
+        eps: f32,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "qwen35_fa_prep_gfx1100";
+        self.ensure_kernel(KERNEL, kernels::QWEN35_FA_PREP_GFX1100_SRC, KERNEL)?;
+
+        let qip = q_interleaved.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let qwp = q_weight.buf.as_ptr();
+        let kwp = k_weight.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let ep = eps;
+        let fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &qip as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &qwp as *const _ as *mut c_void,
+            &kwp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+        ];
+        let bytes = (16 * 256 * 3 + 2 * 256 * 2 + 18 * 256) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [18, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qip);
+                b.push_ptr(qp);
+                b.push_ptr(gp);
+                b.push_ptr(kp);
+                b.push_ptr(qwp);
+                b.push_ptr(kwp);
+                b.push_ptr(pp);
+                b.push_f32(ep);
+                b.push_f32(fb);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Full GPT-J **interleaved** RoPE — rotates pairs (2i, 2i+1) of the first
     /// `n_rot` dims. Matches HF Cohere2's `rotate_half` (`x1=x[..., ::2]`,
     /// `x2=x[..., 1::2]`, `rot=cat(-x2, x1)`), which is explicitly *different

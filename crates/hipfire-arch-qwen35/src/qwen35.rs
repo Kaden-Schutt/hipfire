@@ -13859,30 +13859,34 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     LayerWeights::FullAttnMoe(l) => (&l.q_norm, &l.k_norm),
                     _ => return Err(HipError::new(0, "ATTEND_FULL on non-FullAttn layer")),
                 };
-                gpu.deinterleave_f32(
-                    &s.fa_q_full,
-                    &s.fa_q,
-                    &s.fa_gate,
-                    config.n_heads,
-                    config.head_dim,
-                )?;
-                gpu.rmsnorm_batched(
-                    &s.fa_q,
-                    q_norm,
-                    &s.fa_q,
-                    config.n_heads,
-                    config.head_dim,
-                    config.norm_eps,
-                )?;
-                gpu.rmsnorm_batched(
-                    &s.fa_k,
-                    k_norm,
-                    &s.fa_k,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    config.norm_eps,
-                )?;
-                if hipfire_runtime::triattn::tap_enabled() {
+                let tap_enabled = hipfire_runtime::triattn::tap_enabled();
+                let fused_prep = qwen35_fa_prep_enabled(gpu, config) && !tap_enabled;
+                if !fused_prep {
+                    gpu.deinterleave_f32(
+                        &s.fa_q_full,
+                        &s.fa_q,
+                        &s.fa_gate,
+                        config.n_heads,
+                        config.head_dim,
+                    )?;
+                    gpu.rmsnorm_batched(
+                        &s.fa_q,
+                        q_norm,
+                        &s.fa_q,
+                        config.n_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    )?;
+                    gpu.rmsnorm_batched(
+                        &s.fa_k,
+                        k_norm,
+                        &s.fa_k,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    )?;
+                }
+                if tap_enabled {
                     triattn_tap(gpu, self.layer_idx, s, config)?;
                 }
                 if self.kv_cache.compact_offset > 0 {
@@ -13890,16 +13894,30 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                gpu.rope_partial_interleaved_f32(
-                    &s.fa_q,
-                    &s.fa_k,
-                    &s.pos_buf,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    n_rot,
-                    config.rope_theta,
-                )?;
+                if fused_prep {
+                    gpu.qwen35_fa_prep_gfx1100(
+                        &s.fa_q_full,
+                        &s.fa_q,
+                        &s.fa_gate,
+                        &s.fa_k,
+                        q_norm,
+                        k_norm,
+                        &s.pos_buf,
+                        config.norm_eps,
+                        config.rope_theta,
+                    )?;
+                } else {
+                    gpu.rope_partial_interleaved_f32(
+                        &s.fa_q,
+                        &s.fa_k,
+                        &s.pos_buf,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                    )?;
+                }
                 if self.kv_cache.compact_offset > 0 {
                     let phys = self.pos as i32;
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
@@ -14268,6 +14286,28 @@ fn gated_norm_mq_rotate_enabled(
         && wo.k == n_v_heads * config.linear_value_head_dim
         && wo.gpu_dtype == DType::MQ4G256
         && wo.awq_scale.is_none()
+}
+
+/// Radiowave experiment: collapse full-attention Q/gate deinterleave, Q/K
+/// RMS normalization, and partial half-split RoPE into one head-local launch.
+/// The legacy interleaved-RoPE compatibility mode and diagnostic tap retain
+/// the established multi-dispatch path.
+fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_QWEN35_FA_PREP_FUSE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    enabled
+        && gpu.arch_caps.is_gfx1100()
+        && !gpu.flags.rope_interleaved_legacy
+        && config.n_heads == 16
+        && config.n_kv_heads == 2
+        && config.head_dim == 256
+        && n_rot == 64
 }
 
 /// Radiowave experiment: fold the DeltaNet beta/alpha scalar preparation into

@@ -458,6 +458,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gated_norm_mq_rotate_gfx1100" => {
             Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)])
         }
+        "qwen35_fa_prep_gfx1100" => Some(vec![
+            read(0),
+            write(8),
+            write(16),
+            write(24),
+            read(32),
+            read(40),
+            read(48),
+        ]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
         | "gemv_hfq4g256_k2048"
@@ -608,6 +617,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rope_partial_halfsplit_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
+        | "qwen35_fa_prep_gfx1100"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum" => Some(72),
@@ -2487,6 +2497,7 @@ mod tests {
         "gated_delta_net_q8_fast",
         "gated_norm_f32",
         "gated_norm_mq_rotate_gfx1100",
+        "qwen35_fa_prep_gfx1100",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
