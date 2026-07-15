@@ -9744,6 +9744,7 @@ fn forward_prefill_chunk(
                     tree_bias,
                     block_start,
                     block_cols,
+                    output_gate: None,
                     output: &pbs.fa_attn_out_batch,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -11276,6 +11277,7 @@ fn forward_prefill_chunk(
                     tree_bias,
                     block_start,
                     block_cols,
+                    output_gate: None,
                     output: &pbs.fa_attn_out_batch,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -11694,9 +11696,12 @@ fn run_fa_layer_body(
         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
     }
     let ctx = DispatchCtx::new(gpu);
-    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
+    let fused_epilogue =
+        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
-    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+    if !fused_epilogue {
+        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+    }
     {
         let wr = layer.wo.dispatch_ref();
         execute_steps(
@@ -12255,9 +12260,12 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
+                let fused_epilogue =
+                    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
-                gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                if !fused_epilogue {
+                    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                }
                 {
                     let wr = layer.wo.dispatch_ref();
                     execute_steps(
@@ -12544,9 +12552,12 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
+                let fused_epilogue =
+                    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
-                gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                if !fused_epilogue {
+                    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                }
                 {
                     let wr = layer.wo.dispatch_ref();
                     execute_steps(
@@ -13299,7 +13310,7 @@ fn kv_cache_attention_dispatch(
     config: &Qwen35Config,
     layer_idx: usize,
     pos: usize,
-) -> HipResult<()> {
+) -> HipResult<bool> {
     let plan = KvTierPlan::derive(KvTierInputs {
         pos,
         flash_mode: s.flash_mode as usize,
@@ -13307,6 +13318,9 @@ fn kv_cache_attention_dispatch(
         ..kv_cache.tier_inputs()
     })
     .map_err(|e| HipError::new(0, &e.to_string()))?;
+    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config)
+        && plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteQ8_0
+        && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
@@ -13330,10 +13344,12 @@ fn kv_cache_attention_dispatch(
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
+        output_gate: fused_epilogue.then_some(&s.fa_gate),
         output: &s.fa_attn_out,
     };
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
-        .map_err(|e| HipError::new(0, &e.to_string()))
+        .map_err(|e| HipError::new(0, &e.to_string()))?;
+    Ok(fused_epilogue)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -13922,7 +13938,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     let phys = self.pos as i32;
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
-                kv_cache_attention_dispatch(
+                let fused_epilogue = kv_cache_attention_dispatch(
                     ctx,
                     gpu,
                     self.kv_cache,
@@ -13931,7 +13947,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     self.layer_idx,
                     self.pos,
                 )?;
-                gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                if !fused_epilogue {
+                    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                }
                 Ok(())
             }
             q35_op::ATTEND_DN_PREP => {
@@ -14308,6 +14326,24 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && config.n_kv_heads == 2
         && config.head_dim == 256
         && n_rot == 64
+}
+
+/// Radiowave experiment: pair the Q8 K/V cache writes and apply the Qwen
+/// output gate in the flash-attention reduce epilogue. Admission remains
+/// narrow until replay exactness and stationary product measurements pass.
+fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    enabled
+        && gpu.arch_caps.is_gfx1100()
+        && config.n_heads == 16
+        && config.n_kv_heads == 2
+        && config.head_dim == 256
 }
 
 /// Radiowave experiment: fold the DeltaNet beta/alpha scalar preparation into

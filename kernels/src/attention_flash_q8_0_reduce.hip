@@ -90,3 +90,69 @@ __global__ void attention_flash_q8_0_reduce(
         out[h * head_dim + d] = g * inv_sum;
     }
 }
+
+// Qwen3.5/3.6 decode epilogue sibling. It preserves the reduction order above
+// and performs the existing sigmoid_mul_f32 operation on each final output
+// element before the value leaves the reduce workgroup.
+extern "C" __launch_bounds__(256, 4)
+__global__ void attention_flash_q8_0_reduce_gated_gfx1100(
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    const float* __restrict__ gate,
+    int n_heads,
+    int head_dim,
+    const int* __restrict__ pos_buf,
+    int tile_size,
+    int max_tiles
+) {
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int tid = threadIdx.x;
+    const int stride = 2 + head_dim;
+    const int seq_len = pos_buf[0] + 1;
+    const int n_tiles = min((seq_len + tile_size - 1) / tile_size, max_tiles);
+
+    extern __shared__ float corr_lut[];
+    __shared__ float global_max_shared;
+    __shared__ float global_sum_shared;
+
+    if (tid == 0) {
+        float global_max = -1e30f;
+        for (int tile = 0; tile < n_tiles; tile++) {
+            const float* p = partials + (h * max_tiles + tile) * stride;
+            if (p[1] > 0.0f)
+                global_max = fmaxf(global_max, p[0]);
+        }
+        global_max_shared = global_max;
+    }
+    __syncthreads();
+
+    for (int tile = tid; tile < n_tiles; tile += blockDim.x) {
+        const float* p = partials + (h * max_tiles + tile) * stride;
+        corr_lut[tile] = p[1] > 0.0f ? expf(p[0] - global_max_shared) : 0.0f;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float global_sum = 0.0f;
+        for (int tile = 0; tile < n_tiles; tile++) {
+            const float* p = partials + (h * max_tiles + tile) * stride;
+            global_sum += p[1] * corr_lut[tile];
+        }
+        global_sum_shared = global_sum;
+    }
+    __syncthreads();
+
+    const float inv_sum = global_sum_shared > 0.0f ? 1.0f / global_sum_shared : 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int tile = 0; tile < n_tiles; tile++) {
+            const float* p = partials + (h * max_tiles + tile) * stride;
+            acc += p[2 + d] * corr_lut[tile];
+        }
+        const int index = h * head_dim + d;
+        const float value = acc * inv_sum;
+        const float gate_scale = 1.0f / (1.0f + expf(-gate[index]));
+        out[index] = value * gate_scale;
+    }
+}

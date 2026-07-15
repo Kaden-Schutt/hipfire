@@ -516,6 +516,7 @@ fn attn_mixer_block(
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
+        output_gate: None,
         output: &state.fa_attn_out,
     };
     hipfire_dispatch::pipeline::execute_steps(

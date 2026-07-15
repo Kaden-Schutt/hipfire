@@ -2140,6 +2140,7 @@ impl DenseArch for Qwen2Dense<'_> {
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &st.attn_out,
         };
         Ok(Some((plan, io)))

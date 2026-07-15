@@ -1556,6 +1556,66 @@ impl Gpu {
         result
     }
 
+    /// Exact paired K/V Q8_0 cache write for single-token decode. Uses the
+    /// same 32-lane block quantizer as `kv_cache_write_q8_0` and concatenates
+    /// the independent K and V block grids into one dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_q8_0_pair(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "kv_cache_write_q8_0_pair";
+        self.ensure_kernel(KERNEL, kernels::KV_CACHE_WRITE_Q8_0_SRC, KERNEL)?;
+        let kd = k_dst.buf.as_ptr();
+        let vd = v_dst.buf.as_ptr();
+        let ks = k_src.buf.as_ptr();
+        let vs = v_src.buf.as_ptr();
+        let p = pos_buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &ks as *const _ as *mut c_void,
+            &vs as *const _ as *mut c_void,
+            &p as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        let bytes = crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim) * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "kv_write", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [total_blocks * 2, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kd);
+                b.push_ptr(vd);
+                b.push_ptr(ks);
+                b.push_ptr(vs);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched causal attention with Q8_0 quantized KV cache. Processes N
     /// queries in one launch; each query b has its own causal window read
     /// from positions[b] (i.e. attend to 0..positions[b]+1). Q and out are
@@ -1877,6 +1937,75 @@ impl Gpu {
         partials: &GpuTensor,
         window: i32,
     ) -> HipResult<()> {
+        self.attention_flash_q8_0_windowed_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            window,
+            None,
+        )
+    }
+
+    /// Q8 flash-attention decode with the Qwen output gate folded into the
+    /// reduce epilogue. The tile pass is identical to `attention_flash_q8_0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_gated_gfx1100(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        gate: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_windowed_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            0,
+            Some(gate),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_q8_0_windowed_impl(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window: i32,
+        output_gate: Option<&GpuTensor>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let tile_size = q8_flash_tile_size(&self.arch);
         // Graph-safe: use max_tiles so the grid is position-independent.
@@ -1960,11 +2089,6 @@ impl Gpu {
         }
 
         // ── Reduce kernel (reads seq_len from pos_buf, computes n_tiles) ──
-        self.ensure_kernel(
-            "attention_flash_q8_0_reduce",
-            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-            "attention_flash_q8_0_reduce",
-        )?;
         {
             let p_ptr = partials.buf.as_ptr();
             let o_ptr = out.buf.as_ptr();
@@ -1973,33 +2097,78 @@ impl Gpu {
             let pos_ptr = pos_buf.as_ptr();
             let ts = tile_size as i32;
             let mt = max_tiles as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &p_ptr as *const _ as *mut c_void,
-                &o_ptr as *const _ as *mut c_void,
-                &nh as *const _ as *mut c_void,
-                &hd as *const _ as *mut c_void,
-                &pos_ptr as *const _ as *mut c_void,
-                &ts as *const _ as *mut c_void,
-                &mt as *const _ as *mut c_void,
-            ];
-            self.launch_maybe_blob(
-                "attention_flash_q8_0_reduce",
-                [n_heads as u32, 1, 1],
-                [256, 1, 1],
-                (max_tiles * 4) as u32,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(p_ptr);
-                    b.push_ptr(o_ptr);
-                    b.push_i32(nh);
-                    b.push_i32(hd);
-                    b.push_ptr(pos_ptr);
-                    b.push_i32(ts);
-                    b.push_i32(mt);
-                    b
-                },
-            )?;
+            if let Some(gate) = output_gate {
+                const KERNEL: &str = "attention_flash_q8_0_reduce_gated_gfx1100";
+                self.ensure_kernel(
+                    KERNEL,
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                    KERNEL,
+                )?;
+                let g_ptr = gate.buf.as_ptr();
+                let mut params: Vec<*mut c_void> = vec![
+                    &p_ptr as *const _ as *mut c_void,
+                    &o_ptr as *const _ as *mut c_void,
+                    &g_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &hd as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &ts as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    KERNEL,
+                    [n_heads as u32, 1, 1],
+                    [256, 1, 1],
+                    (max_tiles * 4) as u32,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(o_ptr);
+                        b.push_ptr(g_ptr);
+                        b.push_i32(nh);
+                        b.push_i32(hd);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(ts);
+                        b.push_i32(mt);
+                        b
+                    },
+                )?;
+            } else {
+                const KERNEL: &str = "attention_flash_q8_0_reduce";
+                self.ensure_kernel(
+                    KERNEL,
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                    KERNEL,
+                )?;
+                let mut params: Vec<*mut c_void> = vec![
+                    &p_ptr as *const _ as *mut c_void,
+                    &o_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &hd as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &ts as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    KERNEL,
+                    [n_heads as u32, 1, 1],
+                    [256, 1, 1],
+                    (max_tiles * 4) as u32,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(o_ptr);
+                        b.push_i32(nh);
+                        b.push_i32(hd);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(ts);
+                        b.push_i32(mt);
+                        b
+                    },
+                )?;
+            }
         }
         Ok(())
     }

@@ -467,6 +467,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
+        "kv_cache_write_q8_0_pair" => {
+            Some(vec![write(0), write(8), read(16), read(24), read(32)])
+        }
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
         | "gemv_hfq4g256_k2048"
@@ -546,6 +549,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(48),
         ]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
+        "attention_flash_q8_0_reduce_gated_gfx1100" => {
+            Some(vec![read(0), write(8), read(16), read(32)])
+        }
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
         _ => None,
     }
@@ -592,6 +598,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rmsnorm_reduce_gfx1100"
         | "sigmoid_mul_f32" => Some(32),
         "attention_flash_q8_0_reduce"
+        | "attention_flash_q8_0_reduce_gated_gfx1100"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -612,6 +619,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "kv_cache_write_asym_k_fwht3"
+        | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
         | "rope_partial_halfsplit_f32" => Some(48),
@@ -2535,8 +2543,10 @@ mod tests {
         "rope_partial_halfsplit_f32",
         "kv_cache_write_asym_k_fwht3",
         "kv_cache_write_q8_0",
+        "kv_cache_write_q8_0_pair",
         "attention_flash_fwht3_tile",
         "attention_flash_q8_0_reduce",
+        "attention_flash_q8_0_reduce_gated_gfx1100",
         "sigmoid_mul_f32",
         "gemv_hfq4g256_multirow_r2",
         "gemv_hfq4g256_multirow_r4",
