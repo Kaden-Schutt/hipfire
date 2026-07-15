@@ -395,6 +395,10 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 30,
         dtype: DType::MQ4G256Lloyd,
     },
+    RawCodec {
+        quant_type: 38,
+        dtype: DType::TQ2G128,
+    },
 ];
 
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
@@ -1299,6 +1303,7 @@ mod tests {
             (21, DType::HFP4G32),      // wb:459 / hfq:944
             (24, DType::MFP4G32),      // wb:475 / hfq:963
             (30, DType::MQ4G256Lloyd), // wb:443 / hfq:978 (renumbered from 21; do not swap)
+            (38, DType::TQ2G128),      // Task 7: ternary Bonsai-27B, 34 B/group-128
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));
@@ -1330,5 +1335,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Task 7: quant_type 38 (ternary Bonsai-27B TQ2G128) must resolve to
+    /// DType::TQ2G128 via the RAW_CODECS loader table.
+    #[test]
+    fn tq2g128_quant_type_38_maps_to_tq2g128() {
+        let codec = raw_codec(38).expect("quant_type 38 registered");
+        assert_eq!(codec.dtype, DType::TQ2G128);
     }
 }

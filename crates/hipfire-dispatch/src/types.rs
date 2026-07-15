@@ -741,6 +741,11 @@ impl KernelKey {
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
+            // Phase 4: ternary kernels. No GEMV kernel exists yet for TQ2G128;
+            // this arm is unreachable in practice because `decode_raw_codec`
+            // refuses to build a TQ2G128 WeightTensor (Task 7 is CPU-foundation
+            // only). Placeholder predicate so the match stays exhaustive.
+            TQ2G128 => ArchPredicate::Always,
         }
     }
 

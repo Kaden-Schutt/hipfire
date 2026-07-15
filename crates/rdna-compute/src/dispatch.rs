@@ -198,7 +198,10 @@ pub enum DType {
     MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
-    HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    TQ2G128,   // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
+    // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
+    // CPU-foundation only (variant + byte-size + RawCodec load mapping).
+    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
@@ -223,6 +226,7 @@ impl DType {
             | DType::HFQ3G128
             | DType::HFQ2G256
             | DType::HFQ2G128
+            | DType::TQ2G128
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G128
