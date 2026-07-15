@@ -6229,10 +6229,51 @@ impl Gpu {
                 && *GATE_UP_LOW_VGPR.get_or_init(|| {
                     std::env::var("HIPFIRE_MOE_GATE_UP_LOW_VGPR").as_deref() == Ok("1")
                 });
+            static GATE_UP_CPOL: OnceLock<String> = OnceLock::new();
+            let cpol = if self.arch_caps.is_gfx1100() {
+                GATE_UP_CPOL
+                    .get_or_init(|| {
+                        std::env::var("HIPFIRE_MOE_GATE_UP_CPOL")
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                    })
+                    .as_str()
+            } else {
+                ""
+            };
             let fixed_k2048 = self.arch_caps.is_gfx1100()
                 && self.flags.rdna3_hfq4_moe_gate_up_k2048
                 && k == 2_048;
-            if low_vgpr {
+            if matches!(cpol, "glc" | "slc" | "dlc") {
+                let (module, source, func) = match cpol {
+                    "glc" => (
+                        "gemv_hfq4g256_moe_gate_up_indexed_cpol_glc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_GLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
+                    ),
+                    "slc" => (
+                        "gemv_hfq4g256_moe_gate_up_indexed_cpol_slc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_SLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
+                    ),
+                    "dlc" => (
+                        "gemv_hfq4g256_moe_gate_up_indexed_cpol_dlc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_DLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
+                    ),
+                    _ => unreachable!(),
+                };
+                self.ensure_kernel(module, source, func)?;
+                (
+                    func,
+                    [32u32, 1, 1],
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
+                )
+            } else if low_vgpr {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_low_vgpr",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_LOW_VGPR_GFX1100_SRC,

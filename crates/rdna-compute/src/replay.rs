@@ -425,6 +425,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
@@ -515,6 +518,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gated_norm_f32"
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
@@ -995,6 +1001,18 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
                 "gemv_hfq4g256_moe_gate_up_k8_indexed",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
             )
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
@@ -2390,6 +2408,9 @@ mod tests {
         "fused_silu_mul_mq_rotate",
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
@@ -2452,6 +2473,16 @@ mod tests {
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
             "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
         ));
+        for kernel in [
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
+        ] {
+            assert!(independent_sibling(
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                kernel,
+            ));
+        }
         assert!(!independent_sibling(
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
             "fused_silu_mul_mq_rotate",
