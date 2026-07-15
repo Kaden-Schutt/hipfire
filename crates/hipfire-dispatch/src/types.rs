@@ -199,6 +199,7 @@ pub enum KernelKey {
     GemvHfq3G128,
     GemvHfq2G256,
     GemvHfq2G128,
+    GemvTQ2G128,
     GemvHfq6G256,
     GemvMq4G256,
     GemvMq4G128,
@@ -587,6 +588,7 @@ impl KernelKey {
             (HFQ3G128, Plain) => Ok(Self::GemvHfq3G128),
             (HFQ2G256, Plain) => Ok(Self::GemvHfq2G256),
             (HFQ2G128, Plain) => Ok(Self::GemvHfq2G128),
+            (TQ2G128, Plain) => Ok(Self::GemvTQ2G128),
             (HFQ6G256, Plain) => Ok(Self::GemvHfq6G256),
             (MQ4G256, Plain) => Ok(Self::GemvMq4G256),
             (MQ4G128, Plain) => Ok(Self::GemvMq4G128),
@@ -726,7 +728,11 @@ impl KernelKey {
             | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
             | MFP4G32E8 | MFP4G32E8SOA
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
-            | ParoQ4G128 => ArchPredicate::Always,
+            | ParoQ4G128
+            // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
+            // wave32/wave64 kernel with no ISA-specific intrinsics, same as its
+            // HFQ2G128 sibling — identical arch gating.
+            | TQ2G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline
@@ -741,11 +747,6 @@ impl KernelKey {
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
-            // Phase 4: ternary kernels. No GEMV kernel exists yet for TQ2G128;
-            // this arm is unreachable in practice because `decode_raw_codec`
-            // refuses to build a TQ2G128 WeightTensor (Task 7 is CPU-foundation
-            // only). Placeholder predicate so the match stays exhaustive.
-            TQ2G128 => ArchPredicate::Always,
         }
     }
 
@@ -813,4 +814,16 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP2G32E8
             | ParoQ4G128
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tq2g128_resolves_to_gemv_key() {
+        let k = KernelKey::for_gemv(DType::TQ2G128, GemvVariant::Plain, false)
+            .expect("TQ2G128 should resolve to a GEMV kernel key");
+        assert_eq!(k, KernelKey::GemvTQ2G128);
+    }
 }
