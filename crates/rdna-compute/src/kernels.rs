@@ -1688,6 +1688,11 @@ pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const MOE_DOWN_COMBINE_K8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_k8_batched.hip");
 
+/// Cross-layer gfx1100 experiment: combine one K=8 routed output row and
+/// consume it immediately for the following K=2048 RMSNorm + MQ rotation.
+pub const MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_rmsnorm_mq_rotate_vecsum.gfx1100.hip");
+
 /// Four adjacent output columns per thread with four independent accumulator
 /// chains. Preserves the scalar K=8 reduction order per output.
 pub const MOE_DOWN_COMBINE_K8_BATCHED_VEC4_SRC: &str =

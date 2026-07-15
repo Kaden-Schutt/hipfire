@@ -4077,7 +4077,7 @@ fn moe_ffn_decode(
         down_expanded: &down_expanded,
     };
     let result = moe_ffn_decode_impl(
-        gpu, ffn, x_norm, x_residual, config, &refs, false, None, false,
+        gpu, ffn, x_norm, x_residual, config, &refs, false, None, false, false,
     );
 
     for t in [
@@ -4195,7 +4195,7 @@ pub(crate) fn moe_ffn_decode_with_scratch(
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
     moe_ffn_decode_impl(
-        gpu, ffn, x_norm, x_residual, config, &refs, false, None, false,
+        gpu, ffn, x_norm, x_residual, config, &refs, false, None, false, false,
     )
 }
 
@@ -4214,7 +4214,7 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
     moe_ffn_decode_impl(
-        gpu, ffn, x_norm, x_residual, config, &refs, true, None, false,
+        gpu, ffn, x_norm, x_residual, config, &refs, true, None, false, false,
     )
 }
 
@@ -4318,6 +4318,7 @@ fn moe_ffn_decode_impl(
     // down on rank>0 so the replicated shared expert is summed once.
     ep_routed_out: Option<&GpuTensor>,
     ep_skip_shared: bool,
+    defer_routed_combine: bool,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -4382,6 +4383,7 @@ fn moe_ffn_decode_impl(
         n_exp,
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated,
+        defer_routed_combine,
         layer_idx: ffn.layer_idx,
         x_norm,
         x_residual,
@@ -12460,7 +12462,7 @@ fn forward_scratch_layers(
                 }
 
                 // ── MoE FFN ──
-                moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s)?;
+                moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s, false)?;
                 // DIAG: dump MoE router logits (per-token)
                 if layer_idx == 0 {
                     if let Some(ref rl) = s.moe_router_logits {
@@ -12561,7 +12563,7 @@ fn forward_scratch_layers(
                 }
 
                 // ── MoE FFN ──
-                moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s)?;
+                moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s, false)?;
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -13027,6 +13029,7 @@ fn moe_ffn_dispatch(
     ffn_norm: &GpuTensor,
     config: &Qwen35Config,
     s: &Qwen35Scratch,
+    defer_routed_combine: bool,
 ) -> HipResult<()> {
     let r = if ffn_gate_side_mq4_for_moe(ffn) {
         gpu.fused_rmsnorm_rotate_mq(
@@ -13036,7 +13039,19 @@ fn moe_ffn_dispatch(
             config.dim,
             config.norm_eps,
         )?;
-        moe_ffn_decode_with_scratch_prerotated(gpu, ffn, x, x, config, s)
+        let refs = MoeScratchRef::from_scratch(s);
+        moe_ffn_decode_impl(
+            gpu,
+            ffn,
+            x,
+            x,
+            config,
+            &refs,
+            true,
+            None,
+            false,
+            defer_routed_combine,
+        )
     } else {
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
         moe_ffn_decode_with_scratch(gpu, ffn, &s.tmp, x, config, s)
@@ -13081,6 +13096,7 @@ fn moe_ffn_dispatch_ep(
             true,
             Some(routed_out),
             skip_shared,
+            false,
         )
     } else {
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
@@ -13094,6 +13110,7 @@ fn moe_ffn_dispatch_ep(
             false,
             Some(routed_out),
             skip_shared,
+            false,
         )
     }
 }
@@ -13433,6 +13450,53 @@ fn lower_variant(v: Q35Variant) -> LayerProgram {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn qkv_from_prerotated_mq(
+    gpu: &mut Gpu,
+    wq: &WeightTensor,
+    wk: &WeightTensor,
+    wv: &WeightTensor,
+    x_rot: &GpuTensor,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+) -> HipResult<()> {
+    gpu.fused_qkv_hfq4g256(
+        &wq.buf, &wk.buf, &wv.buf, x_rot, q, k, v, wq.m, wk.m, wv.m, wq.k,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qkvza_from_prerotated_mq(
+    gpu: &mut Gpu,
+    wqkv: &WeightTensor,
+    wz: &WeightTensor,
+    w_beta: &WeightTensor,
+    w_alpha: &WeightTensor,
+    x_rot: &GpuTensor,
+    qkv: &GpuTensor,
+    z: &GpuTensor,
+    beta: &GpuTensor,
+    alpha: &GpuTensor,
+) -> HipResult<()> {
+    gpu.fused_qkvza_hfq4g256(
+        &wqkv.buf,
+        &wz.buf,
+        &w_beta.buf,
+        &w_alpha.buf,
+        x_rot,
+        qkv,
+        z,
+        beta,
+        alpha,
+        wqkv.m,
+        wz.m,
+        w_beta.m,
+        w_alpha.m,
+        wqkv.k,
+    )
+}
+
 /// Per-layer execution context for the lowered decode path. Holds the current
 /// layer's weights + shared scratch/state by reference; rebuilt each layer
 /// iteration so the borrows stay scoped. `kv_cache` is the only `&mut` (DeltaNet
@@ -13450,6 +13514,8 @@ struct Qwen35Bindings<'a> {
     v_dim: usize,
     n_v_heads: usize,
     hd: usize,
+    precomputed_attn_x_rot: bool,
+    defer_routed_combine: bool,
 }
 
 fn op_code(op: &OpBinding) -> u32 {
@@ -13467,66 +13533,108 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         let config = self.config;
         let res: HipResult<()> = match op_code(op) {
             q35_op::PROJ_QKV => match self.layer {
-                LayerWeights::FullAttn(l) => qkv_via_execute_steps(
-                    gpu,
-                    ctx,
-                    &l.wq,
-                    &l.wk,
-                    &l.wv,
-                    &l.attn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.fa_q_full,
-                    &s.fa_k,
-                    &s.fa_v,
-                    config.norm_eps,
-                ),
-                LayerWeights::FullAttnMoe(l) => qkv_via_execute_steps(
-                    gpu,
-                    ctx,
-                    &l.wq,
-                    &l.wk,
-                    &l.wv,
-                    &l.attn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.fa_q_full,
-                    &s.fa_k,
-                    &s.fa_v,
-                    config.norm_eps,
-                ),
+                LayerWeights::FullAttn(l) => {
+                    if self.precomputed_attn_x_rot {
+                        qkv_from_prerotated_mq(
+                            gpu,
+                            &l.wq,
+                            &l.wk,
+                            &l.wv,
+                            &s.x_rot,
+                            &s.fa_q_full,
+                            &s.fa_k,
+                            &s.fa_v,
+                        )
+                    } else {
+                        qkv_via_execute_steps(
+                            gpu,
+                            ctx,
+                            &l.wq,
+                            &l.wk,
+                            &l.wv,
+                            &l.attn_norm,
+                            &s.x,
+                            &s.tmp,
+                            &s.x_rot,
+                            &s.fa_q_full,
+                            &s.fa_k,
+                            &s.fa_v,
+                            config.norm_eps,
+                        )
+                    }
+                }
+                LayerWeights::FullAttnMoe(l) => {
+                    if self.precomputed_attn_x_rot {
+                        qkv_from_prerotated_mq(
+                            gpu,
+                            &l.wq,
+                            &l.wk,
+                            &l.wv,
+                            &s.x_rot,
+                            &s.fa_q_full,
+                            &s.fa_k,
+                            &s.fa_v,
+                        )
+                    } else {
+                        qkv_via_execute_steps(
+                            gpu,
+                            ctx,
+                            &l.wq,
+                            &l.wk,
+                            &l.wv,
+                            &l.attn_norm,
+                            &s.x,
+                            &s.tmp,
+                            &s.x_rot,
+                            &s.fa_q_full,
+                            &s.fa_k,
+                            &s.fa_v,
+                            config.norm_eps,
+                        )
+                    }
+                }
                 _ => return Err(DispatchError::Hip("PROJ_QKV on non-FullAttn layer".into())),
             },
             q35_op::PROJ_QKVZA => {
-                let (wqkv, wz, w_beta, w_alpha, attn_norm, dt_bias, a_log) =
-                    match self.layer {
-                        LayerWeights::DeltaNet(l) => (
-                            &l.wqkv,
-                            &l.wz,
-                            &l.w_beta,
-                            &l.w_alpha,
-                            &l.attn_norm,
-                            &l.dt_bias,
-                            &l.a_log,
-                        ),
-                        LayerWeights::DeltaNetMoe(l) => (
-                            &l.wqkv,
-                            &l.wz,
-                            &l.w_beta,
-                            &l.w_alpha,
-                            &l.attn_norm,
-                            &l.dt_bias,
-                            &l.a_log,
-                        ),
-                        _ => {
-                            return Err(DispatchError::Hip(
-                                "PROJ_QKVZA on non-DeltaNet layer".into(),
-                            ))
-                        }
-                    };
-                if qkvza_scalar_prep_enabled(
+                let (wqkv, wz, w_beta, w_alpha, attn_norm, dt_bias, a_log) = match self.layer {
+                    LayerWeights::DeltaNet(l) => (
+                        &l.wqkv,
+                        &l.wz,
+                        &l.w_beta,
+                        &l.w_alpha,
+                        &l.attn_norm,
+                        &l.dt_bias,
+                        &l.a_log,
+                    ),
+                    LayerWeights::DeltaNetMoe(l) => (
+                        &l.wqkv,
+                        &l.wz,
+                        &l.w_beta,
+                        &l.w_alpha,
+                        &l.attn_norm,
+                        &l.dt_bias,
+                        &l.a_log,
+                    ),
+                    _ => {
+                        return Err(DispatchError::Hip(
+                            "PROJ_QKVZA on non-DeltaNet layer".into(),
+                        ))
+                    }
+                };
+                if self.precomputed_attn_x_rot {
+                    qkvza_from_prerotated_mq(
+                        gpu,
+                        wqkv,
+                        wz,
+                        w_beta,
+                        w_alpha,
+                        &s.x_rot,
+                        &s.dn_qkv,
+                        &s.dn_z,
+                        &s.dn_beta,
+                        &s.dn_alpha,
+                    )
+                } else if qkvza_scalar_prep_enabled(
                     gpu,
                     config,
                     self.n_v_heads,
@@ -13927,8 +14035,16 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        moe_ffn_dispatch(gpu, ffn, &s.x, ffn_norm, config, s)
-            .map_err(|e| DispatchError::Hip(e.to_string()))
+        moe_ffn_dispatch(
+            gpu,
+            ffn,
+            &s.x,
+            ffn_norm,
+            config,
+            s,
+            self.defer_routed_combine,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
     fn run_moe_ep(
@@ -14154,6 +14270,55 @@ fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> b
     arch_enabled && quant == StateQuant::Q8 && config.linear_key_head_dim == 128
 }
 
+/// Radiowave cross-layer experiment: retain each non-final routed-MoE result
+/// in its expanded scratch and let the next layer combine it while producing
+/// that layer's normalized MQ activation. The whole-model admission check is
+/// intentionally strict so every deferred producer has exactly one compatible
+/// consumer and no fallback projection can observe an incomplete residual.
+fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let requested = *REQUESTED.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_COMBINE_NEXT_RMS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if !requested
+        || !gpu.arch_caps.is_gfx1100()
+        || config.dim != 2_048
+        || config.num_experts_per_tok != 8
+        || config.n_layers < 2
+        || config.n_layers != weights.layers.len()
+        || weights.pager.is_some()
+        || std::env::var_os("HIPFIRE_DUMP_HIDDEN").is_some()
+        || std::env::var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
+        || std::env::var("HIPFIRE_QKVZA_SCALAR_PREP").as_deref() == Ok("1")
+    {
+        return false;
+    }
+
+    let mq4 =
+        |w: &WeightTensor| w.gpu_dtype == DType::MQ4G256 && w.k == 2_048 && w.awq_scale.is_none();
+    weights.layers.iter().all(|layer| match layer {
+        LayerWeights::DeltaNetMoe(l) => {
+            l.ffn.expert_dtype_tags.is_some()
+                && ffn_gate_side_mq4_for_moe(&l.ffn)
+                && mq4(&l.wqkv)
+                && mq4(&l.wz)
+                && mq4(&l.w_beta)
+                && mq4(&l.w_alpha)
+        }
+        LayerWeights::FullAttnMoe(l) => {
+            l.ffn.expert_dtype_tags.is_some()
+                && ffn_gate_side_mq4_for_moe(&l.ffn)
+                && mq4(&l.wq)
+                && mq4(&l.wk)
+                && mq4(&l.wv)
+        }
+        LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_) => false,
+    })
+}
+
 /// Lowered (#397 Ship 6) single-GPU decode layer loop. Behaviorally equivalent
 /// to `forward_scratch_layers`'s hand arms (validated byte-identical via the
 /// external committed-token md5 gate). Builds a coarse-super-op `LayerProgram`
@@ -14174,9 +14339,30 @@ fn forward_scratch_layers_lowered(
 
     let ctx = DispatchCtx::new(gpu);
     let mut delta_layer_idx = 0usize;
+    let combine_next_rms = moe_combine_next_rms_enabled(gpu, weights, config);
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
+        let precomputed_attn_x_rot = combine_next_rms && layer_idx > 0;
+        if precomputed_attn_x_rot {
+            let attn_norm = match layer {
+                LayerWeights::DeltaNetMoe(l) => &l.attn_norm,
+                LayerWeights::FullAttnMoe(l) => &l.attn_norm,
+                LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_) => {
+                    unreachable!("moe_combine_next_rms_enabled admits only all-MoE models")
+                }
+            };
+            gpu.moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100(
+                s.moe_down_expanded.as_ref().expect("MoE scratch"),
+                s.moe_topk_weights.as_ref().expect("MoE scratch"),
+                &s.x,
+                attn_norm,
+                &s.x_rot,
+                config.dim,
+                config.num_experts_per_tok,
+                config.norm_eps,
+            )?;
+        }
         let program = lower_variant(variant_of(layer));
         {
             let mut bind = Qwen35Bindings {
@@ -14192,6 +14378,8 @@ fn forward_scratch_layers_lowered(
                 v_dim,
                 n_v_heads,
                 hd,
+                precomputed_attn_x_rot,
+                defer_routed_combine: combine_next_rms && layer_idx + 1 < config.n_layers,
             };
             superop::run_layer_program(gpu, &ctx, &program, &mut bind)
                 .map_err(|e| HipError::new(0, &e.to_string()))?;
@@ -14344,6 +14532,8 @@ pub fn forward_ep(
                 v_dim,
                 n_v_heads,
                 hd,
+                precomputed_attn_x_rot: false,
+                defer_routed_combine: false,
             });
         }
         hipfire_runtime::ep::run_layer_program_ep(

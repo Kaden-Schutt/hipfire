@@ -881,7 +881,7 @@ pub fn run_moe_decode(
                 p.dtypes.routed_down,
                 DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
             ));
-    if !routed_down_self_combines {
+    if !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,

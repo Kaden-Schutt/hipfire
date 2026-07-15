@@ -89,6 +89,79 @@ impl Gpu {
         result
     }
 
+    /// gfx1100 decode experiment: finish one atomic-free routed-MoE row and
+    /// immediately produce the following layer's RMS-normalized MQ rotation.
+    /// This replaces `moe_down_combine_k8_batched` plus
+    /// `fused_rmsnorm_mq_rotate_vecsum` while retaining the exact arithmetic
+    /// order of both kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100(
+        &mut self,
+        expert_outputs: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x_residual: &GpuTensor,
+        norm_weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        m: usize,
+        k_top: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        const KERNEL: &str = "moe_down_combine_rmsnorm_mq_rotate_vecsum";
+        self.ensure_kernel(
+            "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100",
+            kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC,
+            KERNEL,
+        )?;
+
+        let eop = expert_outputs.buf.as_ptr();
+        let twp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let nwp = norm_weight.buf.as_ptr();
+        let s1p = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2p = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xop = x_rot.buf.as_ptr();
+        let mv = m as i32;
+        let ktv = k_top as i32;
+        let epsv = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &twp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &nwp as *const _ as *mut c_void,
+            &s1p as *const _ as *mut c_void,
+            &s2p as *const _ as *mut c_void,
+            &xop as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &ktv as *const _ as *mut c_void,
+            &epsv as *const _ as *mut c_void,
+        ];
+
+        let bytes = (k_top * m + k_top + 2 * m + m + 512 + m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(KERNEL, [1, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(eop);
+            b.push_ptr(twp);
+            b.push_ptr(xrp);
+            b.push_ptr(nwp);
+            b.push_ptr(s1p);
+            b.push_ptr(s2p);
+            b.push_ptr(xop);
+            b.push_i32(mv);
+            b.push_i32(ktv);
+            b.push_f32(epsv);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.scratch.invalidate_x_caches_for(xrp);
+        self.scratch.invalidate_x_caches_for(xop);
+        result
+    }
+
     /// SGLang-style MoE scatter pipeline — Phase 1: per-expert histogram.
     /// Single-CTA LDS-atomic histogram of `topk_indices[total_slots]`.
     /// Output `expert_token_counts[num_experts]` holds RAW counts; Phase 2
