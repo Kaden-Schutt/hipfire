@@ -20,8 +20,14 @@ fn main() {
     for seed in 0..128u32 {
         let logits = make_logits(seed);
         failures += run_case(&mut gpu, &logits, true, seed);
+        if failures != 0 {
+            break;
+        }
         failures += run_case(&mut gpu, &logits, false, seed);
         cases += 2;
+        if failures != 0 {
+            break;
+        }
     }
 
     // Explicit ties exercise the production path's strict first-larger-wins
@@ -30,8 +36,10 @@ fn main() {
     for &i in &[0usize, 31, 32, 63, 64, 127, 128, 255] {
         ties[i] = 7.0;
     }
-    failures += run_case(&mut gpu, &ties, true, u32::MAX);
-    cases += 1;
+    if failures == 0 {
+        failures += run_case(&mut gpu, &ties, true, u32::MAX);
+        cases += 1;
+    }
 
     if failures != 0 {
         eprintln!("FAIL: {failures}/{cases} router cases differed");

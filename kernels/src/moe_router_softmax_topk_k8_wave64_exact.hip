@@ -30,14 +30,22 @@ __device__ __forceinline__ float router_exact_max_256(
     float v13 = fmaxf(v1, v3);
     float v = fmaxf(v02, v13);
 
-    // Legacy s=32..1. Only the low lanes update at each stage, exactly as the
-    // shared-memory tree; lane 0 is broadcast after the final stage.
+    // Legacy s=32. An indexed wave64 shuffle cannot cross gfx1100's physical
+    // wave32 halves; XOR 32 is the native cross-half exchange.
+    float other = __shfl_xor(v, 32);
+    if (lane < 32) v = fmaxf(v, other);
+
+    // Legacy s=16..1 within the low physical half.
     #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-        float other = __shfl_down(v, off, 64);
+    for (int off = 16; off > 0; off >>= 1) {
+        other = __shfl_down(v, off, 32);
         if (lane < off) v = fmaxf(v, other);
     }
-    return __shfl(v, 0, 64);
+
+    // Broadcast the low-half lane-0 result to both physical halves.
+    float half_leader = __shfl(v, 0, 32);
+    float other_half = __shfl_xor(half_leader, 32);
+    return lane < 32 ? half_leader : other_half;
 }
 
 __device__ __forceinline__ float router_exact_sum_256(
@@ -50,12 +58,42 @@ __device__ __forceinline__ float router_exact_sum_256(
     float v13 = v1 + v3;
     float v = v02 + v13;
 
+    float other = __shfl_xor(v, 32);
+    if (lane < 32) v += other;
+
     #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-        float other = __shfl_down(v, off, 64);
+    for (int off = 16; off > 0; off >>= 1) {
+        other = __shfl_down(v, off, 32);
         if (lane < off) v += other;
     }
-    return __shfl(v, 0, 64);
+
+    float half_leader = __shfl(v, 0, 32);
+    float other_half = __shfl_xor(half_leader, 32);
+    return lane < 32 ? half_leader : other_half;
+}
+
+__device__ __forceinline__ float router_exact_half_leader_f32(float v, int lane) {
+    float own_half = __shfl(v, 0, 32);
+    float other_half = __shfl_xor(own_half, 32);
+    return lane < 32 ? own_half : other_half;
+}
+
+__device__ __forceinline__ float router_exact_other_half_leader_f32(float v, int lane) {
+    float own_half = __shfl(v, 0, 32);
+    float other_half = __shfl_xor(own_half, 32);
+    return lane < 32 ? other_half : own_half;
+}
+
+__device__ __forceinline__ int router_exact_half_leader_i32(int v, int lane) {
+    int own_half = __shfl(v, 0, 32);
+    int other_half = __shfl_xor(own_half, 32);
+    return lane < 32 ? own_half : other_half;
+}
+
+__device__ __forceinline__ int router_exact_other_half_leader_i32(int v, int lane) {
+    int own_half = __shfl(v, 0, 32);
+    int other_half = __shfl_xor(own_half, 32);
+    return lane < 32 ? other_half : own_half;
 }
 
 __device__ __forceinline__ void router_exact_wave32_chunk_argmax(
@@ -139,25 +177,39 @@ __global__ void moe_router_softmax_topk_k8_wave64_exact(
         // Reproduce tid 0's strict `>` scan of warp_v[0..7]. Broadcasts make
         // every lane execute the same serial scan, so no extra barrier or LDS
         // publication is needed.
-        float final_v = __shfl(chunk_v0, 0, 64);
-        int final_i = __shfl(chunk_i0, 0, 64);
+        float final_v = router_exact_half_leader_f32(chunk_v0, lane);
+        int final_i = router_exact_half_leader_i32(chunk_i0, lane);
 
-        #define ROUTER_EXACT_CONSIDER(chunk_v, chunk_i, src_lane) do { \
-            const float candidate_v = __shfl((chunk_v), (src_lane), 64); \
-            const int candidate_i = __shfl((chunk_i), (src_lane), 64); \
+        #define ROUTER_EXACT_CONSIDER(candidate_v_expr, candidate_i_expr) do { \
+            const float candidate_v = (candidate_v_expr); \
+            const int candidate_i = (candidate_i_expr); \
             if (candidate_v > final_v) { \
                 final_v = candidate_v; \
                 final_i = candidate_i; \
             } \
         } while (0)
 
-        ROUTER_EXACT_CONSIDER(chunk_v0, chunk_i0, 32);
-        ROUTER_EXACT_CONSIDER(chunk_v1, chunk_i1, 0);
-        ROUTER_EXACT_CONSIDER(chunk_v1, chunk_i1, 32);
-        ROUTER_EXACT_CONSIDER(chunk_v2, chunk_i2, 0);
-        ROUTER_EXACT_CONSIDER(chunk_v2, chunk_i2, 32);
-        ROUTER_EXACT_CONSIDER(chunk_v3, chunk_i3, 0);
-        ROUTER_EXACT_CONSIDER(chunk_v3, chunk_i3, 32);
+        ROUTER_EXACT_CONSIDER(
+            router_exact_other_half_leader_f32(chunk_v0, lane),
+            router_exact_other_half_leader_i32(chunk_i0, lane));
+        ROUTER_EXACT_CONSIDER(
+            router_exact_half_leader_f32(chunk_v1, lane),
+            router_exact_half_leader_i32(chunk_i1, lane));
+        ROUTER_EXACT_CONSIDER(
+            router_exact_other_half_leader_f32(chunk_v1, lane),
+            router_exact_other_half_leader_i32(chunk_i1, lane));
+        ROUTER_EXACT_CONSIDER(
+            router_exact_half_leader_f32(chunk_v2, lane),
+            router_exact_half_leader_i32(chunk_i2, lane));
+        ROUTER_EXACT_CONSIDER(
+            router_exact_other_half_leader_f32(chunk_v2, lane),
+            router_exact_other_half_leader_i32(chunk_i2, lane));
+        ROUTER_EXACT_CONSIDER(
+            router_exact_half_leader_f32(chunk_v3, lane),
+            router_exact_half_leader_i32(chunk_i3, lane));
+        ROUTER_EXACT_CONSIDER(
+            router_exact_other_half_leader_f32(chunk_v3, lane),
+            router_exact_other_half_leader_i32(chunk_i3, lane));
         #undef ROUTER_EXACT_CONSIDER
 
         if (lane == round) {
