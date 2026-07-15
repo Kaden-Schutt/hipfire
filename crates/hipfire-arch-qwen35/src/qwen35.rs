@@ -14270,18 +14270,20 @@ fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> b
     arch_enabled && quant == StateQuant::Q8 && config.linear_key_head_dim == 128
 }
 
-/// Radiowave cross-layer experiment: retain each non-final routed-MoE result
-/// in its expanded scratch and let the next layer combine it while producing
+/// Certified gfx1100 Radiowave schedule: retain each non-final routed-MoE
+/// result in expanded scratch and let the next layer combine it while producing
 /// that layer's normalized MQ activation. The whole-model admission check is
 /// intentionally strict so every deferred producer has exactly one compatible
 /// consumer and no fallback projection can observe an incomplete residual.
+/// Enabled by default for the admitted mq4r shape; set
+/// `HIPFIRE_MOE_COMBINE_NEXT_RMS=0` to restore the two-dispatch schedule.
 fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
     static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let requested = *REQUESTED.get_or_init(|| {
         std::env::var("HIPFIRE_MOE_COMBINE_NEXT_RMS")
             .ok()
             .as_deref()
-            == Some("1")
+            != Some("0")
     });
     if !requested
         || !gpu.arch_caps.is_gfx1100()
