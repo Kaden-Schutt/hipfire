@@ -895,6 +895,68 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
+/// Exact inverse of `cpu_fwht_256`. The forward transform is
+/// `F = D(scale·s2) · H · D(s1)` where `H` is the unnormalized 256-point
+/// Walsh-Hadamard butterfly (self-transpose, `H·H = 256·I`) and `scale = 1/16`.
+/// Hence `F⁻¹ = D(s1) · (1/256)·H · D(s2/scale)`: undo the trailing signs2/scale,
+/// re-run the (self-inverse-up-to-1/256) butterfly, then apply 1/256 and signs1.
+/// Used to recover un-rotated F32 from MQ4/MFP-rotated groups on the CPU.
+fn cpu_ifwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    assert!(x.len() == 256);
+    let scale = 0.0625; // 1/16, matches cpu_fwht_256
+    // Undo the trailing `x[i] *= scale * signs2[i]`.
+    for i in 0..256 {
+        x[i] *= signs2[i] / scale;
+    }
+    // H is symmetric and self-inverse up to the 1/256 factor → identical butterfly.
+    let mut stride = 1;
+    while stride < 256 {
+        let mut i = 0;
+        while i < 256 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    // Undo the leading `x[i] *= signs1[i]` and apply H's 1/256 normalization.
+    let inv_n = 1.0 / 256.0;
+    for i in 0..256 {
+        x[i] *= inv_n * signs1[i];
+    }
+}
+
+#[cfg(test)]
+mod ifwht_tests {
+    use super::*;
+
+    /// `cpu_ifwht_256(cpu_fwht_256(v)) == v` elementwise within 1e-4 for a
+    /// deterministic random-ish 256-vector, using the fixed MQ4 sign pair.
+    #[test]
+    fn ifwht_inverts_fwht() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let orig: Vec<f32> = (0..256)
+            .map(|i| ((i * 7 + 3) % 257) as f32 - 128.0)
+            .collect();
+        let mut v = orig.clone();
+        cpu_fwht_256(&mut v, &signs1, &signs2);
+        cpu_ifwht_256(&mut v, &signs1, &signs2);
+        for i in 0..256 {
+            assert!(
+                (v[i] - orig[i]).abs() < 1e-4,
+                "idx {i}: got {}, want {}",
+                v[i],
+                orig[i]
+            );
+        }
+    }
+}
+
 /// Generate FWHT sign table (matches engine's gen_fwht_signs).
 pub(crate) fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
@@ -951,6 +1013,90 @@ pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
     }
 
     output
+}
+
+/// Inverse of `quantize_mq4g256`: unpack each 256-weight block's 4-bit + affine
+/// codebook into the FWHT-*rotated* group, then apply `cpu_ifwht_256` with the
+/// fixed MQ4 sign pair (`gen_fwht_signs(42,256)` / `gen_fwht_signs(1042,256)`)
+/// to recover the original un-rotated F32 weights. Block layout mirrors the
+/// packer exactly: `[f32 scale][f32 min][128B nibbles]` = 136 bytes / 256
+/// weights, low nibble = even index, high nibble = odd. Returns exactly
+/// `n_elems` values (the final block's padding is truncated).
+pub(crate) fn dequant_mq4g256_to_f32(data: &[u8], n_elems: usize) -> Vec<f32> {
+    let group_size = 256;
+    let block_bytes = 136;
+    let n_blocks = (n_elems + group_size - 1) / group_size;
+    // Fixed MQ4 sign pair — same seeds the packer/runtime use.
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+
+    let mut out = vec![0.0f32; n_blocks * group_size];
+    for b in 0..n_blocks {
+        let in_off = b * block_bytes;
+        let scale = f32::from_le_bytes(data[in_off..in_off + 4].try_into().unwrap());
+        let min_val = f32::from_le_bytes(data[in_off + 4..in_off + 8].try_into().unwrap());
+
+        // Unpack 4-bit codes → rotated group (inverse of the packer's nibble write).
+        let mut group = [0.0f32; 256];
+        for i in 0..128 {
+            let byte = data[in_off + 8 + i];
+            let lo = (byte & 0x0F) as f32;
+            let hi = (byte >> 4) as f32;
+            group[2 * i] = min_val + lo * scale;
+            group[2 * i + 1] = min_val + hi * scale;
+        }
+        // Undo the FWHT rotation baked in at quant time.
+        cpu_ifwht_256(&mut group, &signs1, &signs2);
+        out[b * group_size..(b + 1) * group_size].copy_from_slice(&group);
+    }
+
+    out.truncate(n_elems);
+    out
+}
+
+#[cfg(test)]
+mod dequant_mq4g256_tests {
+    use super::*;
+
+    /// rotate→pack→unpack→unrotate round trip: a known F32 group survives
+    /// `quantize_mq4g256` → `dequant_mq4g256_to_f32` within MQ4 codebook
+    /// tolerance. The forward transform is orthonormal, so per-element error is
+    /// rigorously bounded by `8·scale` (16-level uniform quant of the rotated
+    /// group, `scale = rotated_range/15`), and the relative L2 error is small.
+    #[test]
+    fn mq4g256_round_trip_recovers_group() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let orig: Vec<f32> = (0..256)
+            .map(|i| (((i * 13 + 5) % 251) as f32 - 125.0) * 0.01)
+            .collect();
+
+        let packed = quantize_mq4g256(&orig, &signs1, &signs2);
+        assert_eq!(packed.len(), 136, "one 256-group = 136 bytes");
+
+        let recon = dequant_mq4g256_to_f32(&packed, 256);
+        assert_eq!(recon.len(), 256);
+
+        // Per-element bound from the block's own scale (orthonormal FWHT).
+        let scale = f32::from_le_bytes(packed[0..4].try_into().unwrap());
+        let tol = 8.0 * scale + 1e-4;
+
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..256 {
+            let e = (recon[i] - orig[i]).abs();
+            assert!(
+                e < tol,
+                "idx {i}: got {}, want {} (err {e}, tol {tol})",
+                recon[i],
+                orig[i]
+            );
+            num += (e as f64) * (e as f64);
+            den += (orig[i] as f64) * (orig[i] as f64);
+        }
+        let rel_l2 = (num / den).sqrt();
+        assert!(rel_l2 < 0.2, "relative L2 error {rel_l2} too high for 4-bit");
+    }
 }
 
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
@@ -5137,6 +5283,404 @@ fn is_gguf_input(p: &Path) -> bool {
     p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("gguf")
 }
 
+/// True when `--input` is itself an `.hfq` container (magic `HFQM`), regardless
+/// of extension (the FP source is `qwen3.6-27b.mq4`, an `.hfq`). Routed to
+/// `run_hfq_requant_pipeline` instead of the safetensors/GGUF paths.
+fn is_hfq_input(p: &Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    use std::io::Read;
+    let mut f = match File::open(p) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && &magic == HFQ_MAGIC
+}
+
+/// Map a raw `.hfq` per-tensor quant-type byte back to `QuantType` for verbatim
+/// passthrough of tensors we don't requantize (norms, embeddings, routers, …).
+/// Covers every `QuantType` discriminant so any source `.hfq` round-trips; an
+/// unknown byte is a corrupt/newer file and panics loudly.
+fn quant_type_from_u8(qt: u8) -> QuantType {
+    match qt {
+        0 => QuantType::Q4F16G64,
+        1 => QuantType::F16,
+        2 => QuantType::F32,
+        3 => QuantType::Q8F16,
+        4 => QuantType::Q4K,
+        5 => QuantType::Q8HFQ,
+        6 => QuantType::HFQ4G256,
+        7 => QuantType::HFQ4G128,
+        8 => QuantType::HFQ6G256,
+        9 => QuantType::HFQ2G256,
+        10 => QuantType::HFQ2G128,
+        11 => QuantType::HFQ3G256,
+        12 => QuantType::HFQ3G128,
+        13 => QuantType::MQ4G256,
+        14 => QuantType::MQ8G256,
+        15 => QuantType::MQ6G256,
+        16 => QuantType::BF16,
+        17 => QuantType::MQ3G256,
+        18 => QuantType::MQ2G256,
+        19 => QuantType::MQ2G256Lloyd,
+        20 => QuantType::MQ3G256Lloyd,
+        21 => QuantType::HFP4G32,
+        22 => QuantType::TidI32,
+        24 => QuantType::MFP4G32,
+        28 => QuantType::PARO4G128,
+        29 => QuantType::PARO4G128T,
+        30 => QuantType::MQ4G256Lloyd,
+        31 => QuantType::MQ5G256,
+        32 => QuantType::MFP4G32Lloyd,
+        33 => QuantType::MFP4G32P,
+        34 => QuantType::MFP4G32E8,
+        35 => QuantType::MFP4G32E8SOA,
+        36 => QuantType::MFP3G32E8,
+        37 => QuantType::MFP2G32E8,
+        38 => QuantType::TQ2G128,
+        39 => QuantType::BQ1G128,
+        other => panic!("unknown .hfq quant-type byte {other} — corrupt or newer file"),
+    }
+}
+
+/// Quantize F32 → BQ1G128 (PrismML `Q1_0`-compatible sign-only binary), the
+/// requant path for `--format binary` when the source is F32 rather than
+/// already-Q1_0 bytes (the GGUF pipeline's binary arm is byte-verbatim
+/// passthrough and cannot consume F32). Inverse of `dequant_q1_0`: block is
+/// `[FP16 d][16B sign bits]` = 18 bytes / 128 weights, `d = mean(|w|)` over the
+/// group; bit `j` (LSB-first in byte `j>>3`) is 1 for `w>=0` (+d), 0 for `w<0`.
+fn quantize_bq1g128(f32_data: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let mut sum = 0.0f32;
+        for &w in group {
+            sum += w.abs();
+        }
+        let d = if actual > 0 { sum / actual as f32 } else { 0.0 };
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for j in 0..GROUP {
+            let w = if j < actual { group[j] } else { 0.0 };
+            if w >= 0.0 {
+                output[out_off + 2 + (j >> 3)] |= 1u8 << (j & 7);
+            }
+        }
+    }
+    output
+}
+
+/// `--input <file>.hfq` requant pipeline. Reads an already-coherent `.hfq` (the
+/// mq4 FP source, whose 2D weights are FWHT-rotated MQ4G256), recovers true
+/// un-rotated F32 per tensor (`dequant_mq4g256_to_f32`), re-packs each 2D weight
+/// to the requested `--format` (ternary/binary/mq*), and writes a new `.hfq`
+/// that reuses the source metadata JSON verbatim so config / layer-count /
+/// tokenizer are byte-identical and the existing runtime loads it unchanged.
+///
+/// Non-2D-MQ4 tensors (Q8F16 embeddings, F16 norms, routers, tid tables, …) are
+/// already unrotated and in their runtime-expected precision, so they pass
+/// through byte-verbatim — mirroring how the GGUF ternary/binary pipeline keeps
+/// embeddings at Q8F16 and norms at F16 regardless of `--format`.
+fn run_hfq_requant_pipeline(input_hfq: &Path, output: &Path, format: GgufFormat) {
+    // ── Read the source .hfq (mirrors bin/draft_to_mq4.rs::read_hfq — no
+    //    cross-bin dependency; the parsing logic is copied here). ──
+    let file = File::open(input_hfq).expect("open input .hfq");
+    let mmap = unsafe { Mmap::map(&file).expect("mmap input .hfq") };
+    assert_eq!(&mmap[0..4], HFQ_MAGIC, "input is not an .hfq (bad magic)");
+    let _version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+    let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+    let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+    let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+    let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+
+    // Brace-scan the metadata JSON object (string-aware, escape-aware).
+    let meta_bytes = &mmap[metadata_offset..data_offset];
+    let mut brace = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut json_end = 0usize;
+    for (i, &b) in meta_bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && in_str {
+            escape = true;
+            continue;
+        }
+        if b == b'"' {
+            in_str = !in_str;
+            continue;
+        }
+        if !in_str {
+            if b == b'{' {
+                brace += 1;
+            }
+            if b == b'}' {
+                brace -= 1;
+                if brace == 0 {
+                    json_end = i + 1;
+                    break;
+                }
+            }
+        }
+    }
+    let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+
+    // Tensor index follows the metadata JSON.
+    let mut pos = metadata_offset + json_end;
+    let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
+    assert_eq!(idx_n, n_tensors, "index count != header n_tensors");
+    pos += 4;
+
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+
+    let mut out_tensors: Vec<HfqTensor> = Vec::with_capacity(n_tensors);
+    let mut cumulative = data_offset;
+    let mut requant = 0usize;
+    let mut passthrough = 0usize;
+
+    for _ in 0..n_tensors {
+        let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
+        pos += name_len;
+        let qt = mmap[pos];
+        pos += 1;
+        let n_dims = mmap[pos] as usize;
+        pos += 1;
+        let mut shape = Vec::with_capacity(n_dims);
+        for _ in 0..n_dims {
+            shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        let data = &mmap[cumulative..cumulative + data_size];
+        cumulative += data_size;
+
+        let n_elems: usize = shape.iter().map(|&d| d as usize).product();
+
+        if qt == QuantType::MQ4G256 as u8 && shape.len() == 2 {
+            // Recover un-rotated F32, then re-pack to the requested format using
+            // the SAME per-format packers the GGUF Ternary/Binary/MQ arms use.
+            let f32_data = dequant_mq4g256_to_f32(data, n_elems);
+            let (packed, out_qt, out_group) = match format {
+                GgufFormat::Ternary => {
+                    (quantize_tq2g128(&f32_data), QuantType::TQ2G128, 128u32)
+                }
+                GgufFormat::Binary => {
+                    (quantize_bq1g128(&f32_data), QuantType::BQ1G128, 128u32)
+                }
+                GgufFormat::Mq4 => (
+                    quantize_mq4g256(&f32_data, &signs1, &signs2),
+                    QuantType::MQ4G256,
+                    256u32,
+                ),
+                GgufFormat::Mq6 => (
+                    quantize_mq6g256(&f32_data, &signs1, &signs2),
+                    QuantType::MQ6G256,
+                    256u32,
+                ),
+                GgufFormat::Mq3 => (
+                    quantize_mq3g256(&f32_data, &signs1, &signs2),
+                    QuantType::MQ3G256,
+                    256u32,
+                ),
+                GgufFormat::Mq2 => (
+                    quantize_mq2g256(&f32_data, &signs1, &signs2),
+                    QuantType::MQ2G256,
+                    256u32,
+                ),
+                other => {
+                    eprintln!(
+                        "hfq requant: --format {} unsupported for mq4 2D weights; \
+                         keeping tensor '{name}' as MQ4G256",
+                        other.label()
+                    );
+                    (data.to_vec(), QuantType::MQ4G256, group_size)
+                }
+            };
+            requant += 1;
+            out_tensors.push(HfqTensor {
+                name,
+                quant_type: out_qt,
+                shape,
+                group_size: out_group,
+                data: packed,
+                spilled_len: 0,
+            });
+        } else {
+            // Norms / embeddings / routers / tid tables — already unrotated and
+            // in runtime-expected precision; copy verbatim.
+            passthrough += 1;
+            out_tensors.push(HfqTensor {
+                name,
+                quant_type: quant_type_from_u8(qt),
+                shape,
+                group_size,
+                data: data.to_vec(),
+                spilled_len: 0,
+            });
+        }
+    }
+
+    eprintln!(
+        "hfq requant {} → {}: {} tensors ({} requantized, {} passthrough)",
+        input_hfq.display(),
+        format.label(),
+        out_tensors.len(),
+        requant,
+        passthrough
+    );
+
+    write_hfq(output, arch_id, &metadata_json, &out_tensors, None).expect("write output .hfq");
+    eprintln!("wrote {}", output.display());
+}
+
+#[cfg(test)]
+mod hfq_requant_pipeline_tests {
+    use super::*;
+
+    /// Minimal `.hfq` reader for the test: (arch, meta, Vec<(name, qt, shape,
+    /// group_size, data)>). Mirrors the pipeline's own parse.
+    fn read_hfq_back(path: &Path) -> (u32, String, Vec<(String, u8, Vec<u32>, u32, Vec<u8>)>) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[0..4], HFQ_MAGIC);
+        let arch = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let n_tensors = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let metadata_offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let data_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+
+        let meta_bytes = &bytes[metadata_offset..data_offset];
+        let mut brace = 0i32;
+        let mut json_end = 0usize;
+        for (i, &b) in meta_bytes.iter().enumerate() {
+            if b == b'{' {
+                brace += 1;
+            }
+            if b == b'}' {
+                brace -= 1;
+                if brace == 0 {
+                    json_end = i + 1;
+                    break;
+                }
+            }
+        }
+        let meta = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+
+        let mut pos = metadata_offset + json_end + 4; // skip idx count
+        let mut cumulative = data_offset;
+        let mut out = Vec::new();
+        for _ in 0..n_tensors {
+            let name_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            let name = String::from_utf8_lossy(&bytes[pos..pos + name_len]).to_string();
+            pos += name_len;
+            let qt = bytes[pos];
+            pos += 1;
+            let n_dims = bytes[pos] as usize;
+            pos += 1;
+            let mut shape = Vec::new();
+            for _ in 0..n_dims {
+                shape.push(u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()));
+                pos += 4;
+            }
+            let gs = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let dsz = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            let data = bytes[cumulative..cumulative + dsz].to_vec();
+            cumulative += dsz;
+            out.push((name, qt, shape, gs, data));
+        }
+        (arch, meta, out)
+    }
+
+    /// End-to-end: build a tiny `.hfq` (one 2D MQ4G256 weight + one F16 norm),
+    /// requant to ternary, and confirm the output reuses the metadata verbatim,
+    /// converts the MQ4 weight to TQ2G128 (correct byte length), and passes the
+    /// F16 norm through byte-verbatim.
+    #[test]
+    fn requant_mq4_hfq_to_ternary_end_to_end() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        // 2D weight [m=2, k=256] → 512 elems, 2 groups of 256.
+        let weight_f32: Vec<f32> = (0..512)
+            .map(|i| (((i * 17 + 9) % 241) as f32 - 120.0) * 0.02)
+            .collect();
+        let mq4_data = quantize_mq4g256(&weight_f32, &signs1, &signs2);
+        assert_eq!(mq4_data.len(), 2 * 136);
+
+        // 1D norm [4] as F16.
+        let norm_vals = [0.5f32, -1.0, 2.0, -0.25];
+        let mut norm_data = Vec::new();
+        for &v in &norm_vals {
+            norm_data.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+
+        let in_tensors = vec![
+            HfqTensor {
+                name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![2, 256],
+                group_size: 256,
+                data: mq4_data,
+                spilled_len: 0,
+            },
+            HfqTensor {
+                name: "model.layers.0.input_layernorm.weight".to_string(),
+                quant_type: QuantType::F16,
+                shape: vec![4],
+                group_size: 1,
+                data: norm_data.clone(),
+                spilled_len: 0,
+            },
+        ];
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_requant_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_requant_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary);
+
+        let (arch, out_meta, tensors) = read_hfq_back(&outp);
+        assert_eq!(arch, 7, "arch preserved");
+        assert_eq!(out_meta, meta, "metadata reused verbatim");
+        assert_eq!(tensors.len(), 2);
+
+        // Weight → TQ2G128 (38), group 128, 512 elems / 128 = 4 blocks * 34 B.
+        assert_eq!(tensors[0].1, QuantType::TQ2G128 as u8, "MQ4 → TQ2G128");
+        assert_eq!(tensors[0].3, 128, "ternary group size");
+        assert_eq!(tensors[0].4.len(), 4 * 34, "TQ2G128 byte length");
+        assert_eq!(tensors[0].2, vec![2, 256], "shape preserved");
+
+        // Norm → F16 passthrough, byte-verbatim.
+        assert_eq!(tensors[1].1, QuantType::F16 as u8, "norm stays F16");
+        assert_eq!(tensors[1].4, norm_data, "norm bytes verbatim");
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+}
+
 /// Translate llama.cpp GGUF tensor names to the HuggingFace safetensors
 /// names that `hipfire_runtime::hfq::load_weights_hfq` expects. The mapping is
 /// the canonical llama.cpp ↔ HF convention.
@@ -8393,6 +8937,26 @@ fn main() {
     // Llama-style model produces correct output (the FWHT cancels in
     // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
     // with no quality benefit.
+    // HFQ-input requant branch: if --input is itself an `.hfq` (the mq4 FP
+    // source), recover un-rotated F32 per tensor (inverse-FWHT for MQ4G256) and
+    // re-pack to --format, writing a new `.hfq` that reuses the source metadata
+    // verbatim so it loads on the existing runtime. Checked BEFORE the GGUF
+    // branch (mq4 files carry the `HFQM` magic, not a `.gguf` extension).
+    {
+        let raw_input = Path::new(input_dir.as_str());
+        if is_hfq_input(raw_input) {
+            let hfq_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
+                eprintln!(
+                    "hfq input: --format '{format}' not recognized. Supported requant \
+                     targets: ternary, binary, mq2, mq3, mq4, mq6."
+                );
+                std::process::exit(1);
+            });
+            run_hfq_requant_pipeline(raw_input, Path::new(output_path), hfq_format);
+            return;
+        }
+    }
+
     {
         let raw_input = Path::new(input_dir.as_str());
         if is_gguf_input(raw_input) {
