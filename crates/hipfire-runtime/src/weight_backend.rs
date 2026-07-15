@@ -1307,6 +1307,40 @@ mod tests {
             assert_eq!(v, -2.0, "expected tail code-0 => -d at index {i}");
         }
     }
+    /// SP-B final-review cleanup: `dequant_bq1_to_f32` had no dedicated unit
+    /// test (the bug it once had was missed by every per-task review). Single
+    /// 18-byte Q1_0 block, `d=0.5` (FP16 bytes `[0x00, 0x38]`), all 16 `qs`
+    /// bytes `0xFF` (every sign bit set) => all 128 elements decode to `+d`.
+    /// Then clearing bit 0 of `qs[0]` flips element 0 to `-d` while element 1
+    /// stays `+d`. Mirrors the Task-9 device-parity oracle and the already-
+    /// passing `dequant_q1_0_sign_only` test in `gguf_input.rs`.
+    #[test]
+    fn dequant_bq1_to_f32_single_block() {
+        let mut data = [0u8; 18];
+        data[0] = 0x00;
+        data[1] = 0x38; // FP16 0.5
+        for b in data[2..18].iter_mut() {
+            *b = 0xFF; // all 128 sign bits set => all +d
+        }
+        let out = dequant_bq1_to_f32(&data, 128);
+        assert_eq!(out.len(), 128);
+        for (i, &v) in out.iter().enumerate() {
+            assert!((v - 0.5).abs() < 1e-3, "expected +d at index {i}, got {v}");
+        }
+
+        data[2] &= !1; // clear bit 0 of qs[0] => element 0 flips to -d
+        let out = dequant_bq1_to_f32(&data, 128);
+        assert!(
+            (out[0] - (-0.5)).abs() < 1e-3,
+            "expected -d at index 0, got {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - 0.5).abs() < 1e-3,
+            "expected +d at index 1, got {}",
+            out[1]
+        );
+    }
     #[test]
     fn embed_classify_errors_on_unknown() {
         let err = embed_classify(99).unwrap_err();
