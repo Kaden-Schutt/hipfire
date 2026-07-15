@@ -511,6 +511,13 @@ impl PhasedMultiQueuePm4Ib {
                 detail: "native PM4 phase synchronization requires at least two queues".to_owned(),
             });
         }
+        let parallel_phase_count = phases.iter().filter(|phase| phase.len() > 1).count();
+        if parallel_phase_count == 1 {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: "native PM4 retained epochs require either zero or at least two parallel phases"
+                    .to_owned(),
+            });
+        }
         let semaphore_bytes = (queue_count - 1)
             .checked_mul(8)
             .ok_or_else(|| ReplayError::PolicyShapeMismatch {
