@@ -98,7 +98,10 @@ extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r2(
                + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * pfx##7; \
     } while (0)
 
-    #pragma unroll
+    // Keep the two quads in a compact loop. Fully unrolling this body doubles
+    // the already dual-row instruction footprint and loses to instruction
+    // fetch pressure on gfx1100.
+    #pragma clang loop unroll(disable)
     for (int q = 0; q < 2; q++) {
         const int g = q << 2;
         const int xbase = g * 256 + tid * 8;
