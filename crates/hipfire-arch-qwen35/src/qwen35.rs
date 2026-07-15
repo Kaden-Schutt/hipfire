@@ -14357,8 +14357,9 @@ fn gated_norm_mq_rotate_enabled(
         && wo.awq_scale.is_none()
 }
 
-/// Radiowave experiment: collapse full-attention Q/gate deinterleave, Q/K
-/// RMS normalization, and partial half-split RoPE into one head-local launch.
+/// Collapse full-attention Q/gate deinterleave, Q/K RMS normalization, and
+/// partial half-split RoPE into one head-local launch on the certified gfx1100
+/// shape. Set `HIPFIRE_QWEN35_FA_PREP_FUSE=0` to retain the legacy path.
 /// The legacy interleaved-RoPE compatibility mode and diagnostic tap retain
 /// the established multi-dispatch path.
 fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
@@ -14367,7 +14368,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         std::env::var("HIPFIRE_QWEN35_FA_PREP_FUSE")
             .ok()
             .as_deref()
-            == Some("1")
+            != Some("0")
     });
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     enabled
@@ -14379,16 +14380,16 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && n_rot == 64
 }
 
-/// Radiowave experiment: pair the Q8 K/V cache writes and apply the Qwen
-/// output gate in the flash-attention reduce epilogue. Admission remains
-/// narrow until replay exactness and stationary product measurements pass.
+/// Pair Q8 K/V cache writes and fold the Qwen output gate plus MQ rotation into
+/// the flash-attention reduce epilogue on the certified gfx1100/MQ4 shape. Set
+/// `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
 fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         std::env::var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE")
             .ok()
             .as_deref()
-            == Some("1")
+            != Some("0")
     });
     enabled
         && gpu.arch_caps.is_gfx1100()
