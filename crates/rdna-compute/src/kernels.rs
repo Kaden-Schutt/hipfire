@@ -1459,6 +1459,18 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
 );
 
+/// Radiowave gfx1100 cache-policy probe for the atomic-free MoE down stream.
+/// Keep this replay-visible and opt-in until exact-shadow and product-level
+/// certification establish whether SLC helps this access pattern.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC: &str =
+    concat!(
+        "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+        "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc\n",
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+    );
+
 /// gfx1100 expert-wave-preserving down+combine experiment. Every workgroup
 /// still computes one expert rank; the last arriving rank for each four-row
 /// tile performs the deterministic weighted fold and resets its scratch-tail

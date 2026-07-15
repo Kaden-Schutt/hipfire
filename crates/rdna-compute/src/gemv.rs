@@ -6894,11 +6894,26 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-            kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-        )?;
+        use std::sync::OnceLock;
+        static DOWN_CPOL_SLC: OnceLock<bool> = OnceLock::new();
+        let cpol_slc = self.arch_caps.is_gfx1100()
+            && *DOWN_CPOL_SLC.get_or_init(|| {
+                std::env::var("HIPFIRE_MOE_DOWN_CPOL").as_deref() == Ok("slc")
+            });
+        let (module_name, source, func_name) = if cpol_slc {
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc_gfx1100",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
+            )
+        } else {
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+            )
+        };
+        self.ensure_kernel(module_name, source, func_name)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let rbp = rot_batch.buf.as_ptr();
@@ -6919,13 +6934,12 @@ impl Gpu {
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemv",
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+            func_name,
             bytes,
         );
         // The expanded kernel owns four consecutive output rows per workgroup.
         // Keep this opt-in while it is qualified on gfx1100: the legacy launch
         // used `m` workgroups, leaving three quarters to exit at the row0 guard.
-        use std::sync::OnceLock;
         static DOWN_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
         let grid_x = if self.arch_caps.is_gfx1100()
             && *DOWN_TIGHT_GRID.get_or_init(|| {
@@ -6937,7 +6951,7 @@ impl Gpu {
             m as u32
         };
         let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+            func_name,
             [grid_x, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
