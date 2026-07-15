@@ -23,6 +23,7 @@ const PACKET3_COPY_DATA: u32 = 0x40;
 const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
+const PACKET3_WAIT_REG_MEM: u32 = 0x3c;
 
 // GFX10/GFX11 SET_SH_REG offsets, matching ROCr's legacy compute command
 // builder and Hipfire's independently exercised gfx1010 implementation.
@@ -225,6 +226,56 @@ impl Gfx10Pm4CommandBuffer {
             0,
             0,
             0,
+        ]);
+    }
+
+    /// Append a complete independently-built command stream.
+    ///
+    /// The appended stream materializes its own register state. Clear this
+    /// builder's cache so any later dispatch also rematerializes state rather
+    /// than relying on values that the appended stream may have changed.
+    pub fn append_stream(&mut self, commands: &Self) {
+        self.dwords.extend_from_slice(&commands.dwords);
+        if let Some(register_state) = self.register_state.as_mut() {
+            register_state.clear();
+        }
+    }
+
+    /// Publish a 32-bit value only after all preceding compute work completes.
+    /// This is Mesa's compute-ring `RELEASE_MEM` fence shape: bottom-of-pipe,
+    /// memory destination, immediate 32-bit data, and write confirmation.
+    pub fn release_memory_value(&mut self, address: u64, value: u32) {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        const BOTTOM_OF_PIPE_TS_EVENT: u32 = 40 | (5 << 8);
+        const VALUE_32_AFTER_WRITE_CONFIRM: u32 = (3 << 24) | (1 << 29);
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_RELEASE_MEM, 7, false),
+            BOTTOM_OF_PIPE_TS_EVENT,
+            VALUE_32_AFTER_WRITE_CONFIRM,
+            address as u32,
+            (address >> 32) as u32,
+            value,
+            0,
+            0,
+        ]);
+    }
+
+    /// Stall this queue's command processor until a GPU-visible word equals
+    /// `value`. Other queues remain schedulable, which permits a retained
+    /// multi-queue graph to synchronize without per-phase AQL signals.
+    pub fn wait_memory_value(&mut self, address: u64, value: u32) {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        const MEMORY_SPACE_EQUAL: u32 = (1 << 4) | 3;
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_WAIT_REG_MEM, 6, false),
+            MEMORY_SPACE_EQUAL,
+            address as u32,
+            (address >> 32) as u32,
+            value,
+            u32::MAX,
+            4,
         ]);
     }
 
@@ -574,5 +625,49 @@ mod tests {
         vmem.acquire_inter_node_vmem();
         assert_eq!(scalar.dwords().last(), Some(&0x00380));
         assert_eq!(vmem.dwords().last(), Some(&0x00300));
+    }
+
+    #[test]
+    fn native_queue_semaphore_packets_match_mesa_compute_encodings() {
+        let address = 0x1234_5678_9abc_def0;
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands.release_memory_value(address, 7);
+        commands.wait_memory_value(address + 4, 7);
+        assert_eq!(
+            commands.dwords(),
+            &[
+                0xc006_4900,
+                0x528,
+                0x2300_0000,
+                0x9abc_def0,
+                0x1234_5678,
+                7,
+                0,
+                0,
+                0xc005_3c00,
+                0x13,
+                0x9abc_def4,
+                0x1234_5678,
+                7,
+                u32::MAX,
+                4,
+            ]
+        );
+    }
+
+    #[test]
+    fn appended_stream_invalidates_stateful_register_cache() {
+        let geometry = LaunchGeometry::new([1, 1, 1], [1, 1, 1]).unwrap();
+        let image = image(0x409);
+        let mut commands = Gfx10Pm4CommandBuffer::new_stateful();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+        let first = commands.len_dwords();
+        commands.append_stream(&Gfx10Pm4CommandBuffer::new());
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+        assert_eq!(commands.len_dwords(), first * 2);
     }
 }

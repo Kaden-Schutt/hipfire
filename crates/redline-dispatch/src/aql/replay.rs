@@ -398,9 +398,11 @@ impl Drop for SingleQueuePm4Ib {
 pub struct PhasedMultiQueuePm4Ib {
     queues: QueueSet,
     phase_completions: Vec<Vec<CompletionSignal>>,
+    logical_phase_count: usize,
     indirects: Vec<KernargBuffer>,
     batches: Vec<Vec<PacketImage>>,
     timestamps: Option<Vec<KernargBuffer>>,
+    _native_semaphores: Option<KernargBuffer>,
     timestamp_frequency_hz: Option<u64>,
     usable: bool,
 }
@@ -443,6 +445,27 @@ impl PhasedMultiQueuePm4Ib {
         Self::create_profiled_legacy(device, pool, phases)
     }
 
+    /// Create one retained PM4 IB per queue and synchronize phases inside the
+    /// IBs with GPU memory semaphores. This replaces every per-phase AQL
+    /// completion signal and barrier packet with `RELEASE_MEM`/`WAIT_REG_MEM`,
+    /// leaving only one terminal completion signal per queue.
+    pub fn create_profiled_native_gfx10(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        phases: &[Vec<Gfx10Pm4CommandBuffer>],
+    ) -> Result<Self, ReplayError> {
+        Self::create_profiled_native_legacy(device, pool, phases)
+    }
+
+    /// GFX11 uses the same compute-ring semaphore packet encodings as GFX10.
+    pub fn create_profiled_native_gfx11(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        phases: &[Vec<Gfx10Pm4CommandBuffer>],
+    ) -> Result<Self, ReplayError> {
+        Self::create_profiled_native_legacy(device, pool, phases)
+    }
+
     fn create_profiled_legacy(
         device: &GpuDevice,
         pool: &KernargPool,
@@ -462,6 +485,118 @@ impl PhasedMultiQueuePm4Ib {
             },
             Some(frequency_hz),
         )
+    }
+
+    fn create_profiled_native_legacy(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        phases: &[Vec<Gfx10Pm4CommandBuffer>],
+    ) -> Result<Self, ReplayError> {
+        if phases.is_empty() || phases.iter().any(Vec::is_empty) {
+            return Err(ReplayError::EmptyGraph);
+        }
+        let queue_count = phases.iter().map(Vec::len).max().unwrap();
+        if queue_count < 2 {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: "native PM4 phase synchronization requires at least two queues".to_owned(),
+            });
+        }
+        let semaphore_bytes = (queue_count - 1)
+            .checked_mul(8)
+            .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                detail: format!("native PM4 semaphore count for {queue_count} queues overflowed"),
+            })?;
+        let mut semaphores = pool.allocate_executable_bytes(semaphore_bytes)?;
+        semaphores.as_mut_bytes().fill(0);
+        let semaphore_base = semaphores.address() as usize as u64;
+        let semaphore_addresses = |lane: usize| {
+            let start = semaphore_base + ((lane - 1) * 8) as u64;
+            (start, start + 4)
+        };
+
+        let mut streams = vec![Gfx10Pm4CommandBuffer::new(); queue_count];
+        let mut parallel_epoch = 0_u32;
+        for phase in phases {
+            if phase.len() == 1 {
+                streams[0].append_stream(&phase[0]);
+                continue;
+            }
+            parallel_epoch = parallel_epoch.checked_add(1).ok_or_else(|| {
+                ReplayError::PolicyShapeMismatch {
+                    detail: "native PM4 parallel phase count exceeds u32".to_owned(),
+                }
+            })?;
+            for lane in 1..phase.len() {
+                let (start, _) = semaphore_addresses(lane);
+                streams[lane].wait_memory_value(start, parallel_epoch);
+            }
+            for lane in 1..phase.len() {
+                let (start, _) = semaphore_addresses(lane);
+                streams[0].release_memory_value(start, parallel_epoch);
+            }
+            streams[0].append_stream(&phase[0]);
+            for lane in 1..phase.len() {
+                let (_, done) = semaphore_addresses(lane);
+                streams[lane].append_stream(&phase[lane]);
+                streams[lane].release_memory_value(done, parallel_epoch);
+            }
+            for lane in 1..phase.len() {
+                let (_, done) = semaphore_addresses(lane);
+                streams[0].wait_memory_value(done, parallel_epoch);
+            }
+        }
+        if parallel_epoch == 0 {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: "native PM4 phase synchronization found no parallel phase".to_owned(),
+            });
+        }
+
+        let frequency_hz = device.gpu_timestamp_frequency_hz()?;
+        let mut completions = Vec::with_capacity(queue_count);
+        let mut indirects = Vec::with_capacity(queue_count);
+        let mut batches = Vec::with_capacity(queue_count);
+        let mut timestamps = Vec::with_capacity(queue_count);
+        for commands in streams {
+            let mut timestamp = pool.allocate_executable_bytes(16)?;
+            timestamp.as_mut_bytes().fill(0);
+            let start = timestamp.address() as usize as u64;
+            let timed = commands.with_gpu_timestamps(start, start + 8);
+            let bytes = timed.as_bytes();
+            let dwords = timed.len_dwords();
+            if dwords == 0 {
+                return Err(ReplayError::EmptyGraph);
+            }
+            let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
+            indirect.write_exact(&bytes)?;
+            let completion = CompletionSignal::new(device)?;
+            let packet = PacketImage::pm4_indirect_buffer(
+                indirect.address(),
+                dwords,
+                completion.raw(),
+            )?;
+            timestamps.push(timestamp);
+            indirects.push(indirect);
+            completions.push(completion);
+            batches.push(vec![packet]);
+        }
+
+        let queue_size = retained_queue_size(
+            1,
+            *device.queue_size_range().start(),
+            *device.queue_size_range().end(),
+        )?;
+        let queues = QueueSet::create(device, queue_count, queue_size)?;
+        Ok(Self {
+            queues,
+            phase_completions: vec![completions],
+            logical_phase_count: phases.len(),
+            indirects,
+            batches,
+            timestamps: Some(timestamps),
+            _native_semaphores: Some(semaphores),
+            timestamp_frequency_hz: Some(frequency_hz),
+            usable: true,
+        })
     }
 
     fn create_encoded<C>(
@@ -539,9 +674,11 @@ impl PhasedMultiQueuePm4Ib {
         Ok(Self {
             queues,
             phase_completions,
+            logical_phase_count: phases.len(),
             indirects,
             batches,
             timestamps,
+            _native_semaphores: None,
             timestamp_frequency_hz,
             usable: true,
         })
@@ -556,7 +693,7 @@ impl PhasedMultiQueuePm4Ib {
     }
 
     pub fn phase_count(&self) -> usize {
-        self.phase_completions.len()
+        self.logical_phase_count
     }
 
     pub fn indirect_addresses(&self) -> impl ExactSizeIterator<Item = usize> + '_ {

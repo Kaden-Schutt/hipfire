@@ -75,6 +75,7 @@ fn create_phased_pm4_graph(
     device: &GpuDevice,
     pool: &KernargPool,
     phases: &[Vec<Pm4Commands>],
+    native_sync: bool,
 ) -> Result<PhasedMultiQueuePm4Ib, String> {
     match architecture {
         Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
@@ -94,8 +95,14 @@ fn create_phased_pm4_graph(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             match architecture {
+                Pm4Architecture::Gfx10 if native_sync => {
+                    PhasedMultiQueuePm4Ib::create_profiled_native_gfx10(device, pool, &legacy)
+                }
                 Pm4Architecture::Gfx10 => {
                     PhasedMultiQueuePm4Ib::create_profiled_gfx10(device, pool, &legacy)
+                }
+                Pm4Architecture::Gfx11 if native_sync => {
+                    PhasedMultiQueuePm4Ib::create_profiled_native_gfx11(device, pool, &legacy)
                 }
                 Pm4Architecture::Gfx11 => {
                     PhasedMultiQueuePm4Ib::create_profiled_gfx11(device, pool, &legacy)
@@ -104,6 +111,11 @@ fn create_phased_pm4_graph(
             }
         }
         Pm4Architecture::Gfx12 => {
+            if native_sync {
+                return Err(
+                    "native PM4 phase synchronization is not yet lowered for gfx12".to_owned(),
+                );
+            }
             let gfx12 = phases
                 .iter()
                 .map(|phase| {
@@ -675,6 +687,12 @@ fn pm4_min_parallel_workgroups_from_env() -> u64 {
         );
         0
     })
+}
+
+fn pm4_native_phase_sync_from_env() -> bool {
+    std::env::var("HIPFIRE_REPLAY_PM4_NATIVE_PHASES")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
 }
 
 fn pm4_queue_policy_from_env() -> QueuePolicy {
@@ -1792,6 +1810,7 @@ impl ReplayController {
         } else {
             let min_parallel_width = pm4_min_parallel_width_from_env();
             let min_parallel_workgroups = pm4_min_parallel_workgroups_from_env();
+            let native_phase_sync = pm4_native_phase_sync_from_env();
             let plans = pm4_phase_plan(
                 &self.recorded[..prefix],
                 min_parallel_width,
@@ -1900,10 +1919,16 @@ impl ReplayController {
                 phase_commands.push(vec![commands]);
             }
 
-            let graph = create_phased_pm4_graph(pm4_architecture, &device, &pool, &phase_commands)?;
+            let graph = create_phased_pm4_graph(
+                pm4_architecture,
+                &device,
+                &pool,
+                &phase_commands,
+                native_phase_sync,
+            )?;
             debug_assert_eq!(graph.queue_count(), max_queue_count);
             eprintln!(
-                "[redline] PM4 phase plan architecture={} queues={} phases={} parallel_phases={} parallel_launches={} max_width={} min_parallel_width={} min_parallel_workgroups={}",
+                "[redline] PM4 phase plan architecture={} queues={} phases={} parallel_phases={} parallel_launches={} max_width={} min_parallel_width={} min_parallel_workgroups={} sync={}",
                 device.name(),
                 graph.queue_count(),
                 graph.phase_count(),
@@ -1912,6 +1937,7 @@ impl ReplayController {
                 max_width,
                 min_parallel_width,
                 min_parallel_workgroups,
+                if native_phase_sync { "native" } else { "aql" },
             );
             (PreparedPm4Graph::Phased(graph), command_dwords)
         };
