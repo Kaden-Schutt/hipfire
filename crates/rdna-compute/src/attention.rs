@@ -1572,7 +1572,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         const KERNEL: &str = "kv_cache_write_q8_0_pair";
-        self.ensure_kernel(KERNEL, kernels::KV_CACHE_WRITE_Q8_0_SRC, KERNEL)?;
+        self.ensure_kernel(
+            KERNEL,
+            kernels::KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC,
+            KERNEL,
+        )?;
         let kd = k_dst.buf.as_ptr();
         let vd = v_dst.buf.as_ptr();
         let ks = k_src.buf.as_ptr();
@@ -2102,7 +2106,7 @@ impl Gpu {
                 const KERNEL: &str = "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100";
                 self.ensure_kernel(
                     KERNEL,
-                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC,
                     KERNEL,
                 )?;
                 self.ensure_mq_signs()?;

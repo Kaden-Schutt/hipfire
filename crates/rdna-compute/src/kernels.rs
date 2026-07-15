@@ -3067,6 +3067,11 @@ pub const KV_CACHE_WRITE_Q8_0_BATCHED_SRC: &str =
 pub const KV_CACHE_WRITE_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0.hip");
 
+/// gfx1100-only paired K/V Q8_0 cache writer. Kept in a separate translation
+/// unit so its dormant body cannot perturb portable/gfx12 writer codegen.
+pub const KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_q8_0_pair.gfx1100.hip");
+
 /// Attention with Q8_0 quantized KV cache — same format as GGML Q8_0.
 /// K and V caches stored as [max_seq × n_kv_heads × blocks_per_head × 34].
 pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv.hip");
@@ -3095,6 +3100,13 @@ pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
 /// combines across tiles, normalizes, writes final output.
 pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_reduce.hip");
+
+/// gfx1100-only Qwen attention reduce/gate/MQ epilogue. Kept in a separate
+/// translation unit so its dormant body cannot perturb portable/gfx12 reducer
+/// codegen.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC: &str = include_str!(
+    "../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip"
+);
 
 /// Turbo common header: shared definitions for turbo/givens kernels.
 pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common.h");
@@ -4493,6 +4505,16 @@ mod dispatch_tests {
 
     fn make_caps(arch: &str) -> ArchCaps {
         ArchCaps::new(arch, Arc::new(FeatureFlags::from_env_for_test(arch)))
+    }
+
+    #[test]
+    fn gfx1100_q8_decode_fusions_are_translation_unit_isolated() {
+        assert!(!KV_CACHE_WRITE_Q8_0_SRC.contains("kv_cache_write_q8_0_pair"));
+        assert!(KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC.contains("kv_cache_write_q8_0_pair"));
+        assert!(!ATTENTION_FLASH_Q8_0_REDUCE_SRC
+            .contains("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC
+            .contains("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"));
     }
 
     // ── MQ4G256-Lloyd family ─────────────────────────────────────
