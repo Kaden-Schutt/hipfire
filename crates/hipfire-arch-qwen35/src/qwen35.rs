@@ -14299,9 +14299,18 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
 
     let mq4 =
         |w: &WeightTensor| w.gpu_dtype == DType::MQ4G256 && w.k == 2_048 && w.awq_scale.is_none();
+    let has_expanded_down = |ffn: &MoeFfnWeights| {
+        ffn.expert_dtype_tags.is_some()
+            || ffn.experts.first().is_some_and(|expert| {
+                !matches!(
+                    expert.down.gpu_dtype,
+                    DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+                )
+            })
+    };
     weights.layers.iter().all(|layer| match layer {
         LayerWeights::DeltaNetMoe(l) => {
-            l.ffn.expert_dtype_tags.is_some()
+            has_expanded_down(&l.ffn)
                 && ffn_gate_side_mq4_for_moe(&l.ffn)
                 && mq4(&l.wqkv)
                 && mq4(&l.wz)
@@ -14309,7 +14318,7 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
                 && mq4(&l.w_alpha)
         }
         LayerWeights::FullAttnMoe(l) => {
-            l.ffn.expert_dtype_tags.is_some()
+            has_expanded_down(&l.ffn)
                 && ffn_gate_side_mq4_for_moe(&l.ffn)
                 && mq4(&l.wq)
                 && mq4(&l.wk)
