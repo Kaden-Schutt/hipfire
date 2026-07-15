@@ -12,20 +12,22 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-/// Runtime tile geometry for the scalar Q8 decode attention experiment.
+/// Architecture-aware tile geometry for scalar Q8 decode attention.
 ///
 /// The kernel accepts the tile as a kernarg, so this does not fork codegen.
 /// Restricting the surface to powers of two keeps the partial-buffer layout
-/// and retained-grid contract straightforward while gfx1100 is characterized.
-pub fn q8_flash_tile_size() -> usize {
-    static TILE_SIZE: OnceLock<usize> = OnceLock::new();
-    *TILE_SIZE.get_or_init(|| {
-        std::env::var("HIPFIRE_Q8_FLASH_TILE")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| matches!(value, 32 | 64 | 128 | 256))
-            .unwrap_or(128)
-    })
+/// and retained-grid contract straightforward. The gfx1100 default is the
+/// stationary winner at tg128; other architectures retain their prior value.
+pub fn q8_flash_tile_size(arch: &str) -> usize {
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("HIPFIRE_Q8_FLASH_TILE")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| matches!(value, 32 | 64 | 128 | 256))
+        })
+        .unwrap_or(if arch == "gfx1100" { 32 } else { 128 })
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -1876,7 +1878,7 @@ impl Gpu {
         window: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let tile_size = q8_flash_tile_size();
+        let tile_size = q8_flash_tile_size(&self.arch);
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;

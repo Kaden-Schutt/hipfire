@@ -4752,7 +4752,8 @@ impl Qwen35Scratch {
             // Override with HIPFIRE_FLASH_PARTIALS_BATCH for tuning. Power of
             // two preferred (matches FA dispatcher chunking).
             flash_partials: {
-                let tile_size = rdna_compute::attention::q8_flash_tile_size().min(128);
+                let tile_size =
+                    rdna_compute::attention::q8_flash_tile_size(&gpu.arch).min(128);
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
                 let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
                     .ok()
