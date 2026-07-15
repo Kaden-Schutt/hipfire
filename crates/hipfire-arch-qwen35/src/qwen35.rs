@@ -4727,7 +4727,8 @@ impl Qwen35Scratch {
             repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
             x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
 
-            // Flash attention partials: enough for max_seq with tile_size=128.
+            // Flash attention partials: enough for the smallest tile used by
+            // Q8 decode experiments and the fixed tile_size=128 paths.
             // n_heads * max_tiles * (2 + head_dim) floats per batched query
             // position; total buffer = batch_mult × per-position-bytes.
             //
@@ -4751,7 +4752,7 @@ impl Qwen35Scratch {
             // Override with HIPFIRE_FLASH_PARTIALS_BATCH for tuning. Power of
             // two preferred (matches FA dispatcher chunking).
             flash_partials: {
-                let tile_size = 128usize;
+                let tile_size = rdna_compute::attention::q8_flash_tile_size().min(128);
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
                 let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
                     .ok()

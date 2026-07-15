@@ -10,6 +10,23 @@ use crate::GpuTensor;
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
+use std::sync::OnceLock;
+
+/// Runtime tile geometry for the scalar Q8 decode attention experiment.
+///
+/// The kernel accepts the tile as a kernarg, so this does not fork codegen.
+/// Restricting the surface to powers of two keeps the partial-buffer layout
+/// and retained-grid contract straightforward while gfx1100 is characterized.
+pub fn q8_flash_tile_size() -> usize {
+    static TILE_SIZE: OnceLock<usize> = OnceLock::new();
+    *TILE_SIZE.get_or_init(|| {
+        std::env::var("HIPFIRE_Q8_FLASH_TILE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| matches!(value, 32 | 64 | 128 | 256))
+            .unwrap_or(128)
+    })
+}
 
 const V_MODE_Q8: i32 = 8;
 
@@ -1859,15 +1876,15 @@ impl Gpu {
         window: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const TILE_SIZE: usize = 128;
+        let tile_size = q8_flash_tile_size();
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
-        let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
+        let max_tiles = (max_seq + tile_size - 1) / tile_size;
         // For profiling / non-graph code paths, the actual tile count:
-        let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        let actual_tiles = (seq_len_hint + tile_size - 1) / tile_size;
         // Redline records an immutable launch sequence independently of
         // hipGraph's capture_mode. Its replay updates pos_buf but cannot grow a
-        // recorded grid when seq_len crosses a 128-token tile boundary, so the
+        // recorded grid when seq_len crosses a tile boundary, so the
         // recording pass must capture the same max_tiles superset as hipGraph.
         let launch_tiles = replay_stable_tile_count(
             actual_tiles,
@@ -1894,10 +1911,10 @@ impl Gpu {
             let hd = head_dim as i32;
             let ms = max_seq as i32;
             let sc = scale;
-            let ts = TILE_SIZE as i32;
+            let ts = tile_size as i32;
             let wn = window;
             let grid = [n_heads as u32, launch_tiles as u32, 1];
-            let shared = ((TILE_SIZE + head_dim) * 4) as u32;
+            let shared = ((tile_size + head_dim) * 4) as u32;
             let mut params: Vec<*mut c_void> = vec![
                 &q_ptr as *const _ as *mut c_void,
                 &k_ptr as *const _ as *mut c_void,
@@ -1920,7 +1937,7 @@ impl Gpu {
                 &mut params,
                 1,
                 1,
-                TILE_SIZE as u32,
+                tile_size as u32,
                 || {
                     let mut b = hip_bridge::KernargBlob::new();
                     b.push_ptr(q_ptr);
@@ -1952,7 +1969,7 @@ impl Gpu {
             let nh = n_heads as i32;
             let hd = head_dim as i32;
             let pos_ptr = pos_buf.as_ptr();
-            let ts = TILE_SIZE as i32;
+            let ts = tile_size as i32;
             let mt = max_tiles as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &p_ptr as *const _ as *mut c_void,
