@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Kaden Schutt
-"""Resident HipGraph-vs-Redline product decode benchmark.
+"""Resident HIP-vs-Redline product decode benchmark.
 
 Unlike redline_daemon_harness.py (manual shadow capture), this drives the real
-default-off product lifecycle: HIPFIRE_REPLAY_BACKEND=auto records one ordinary
-AR forward and routes later forwards through the prepared AQL replay. The HIP
-arm leaves the existing AR HipGraph enabled. Models stay resident within each
-arm, clocks are never modified, and every row uses the daemon's full Qwen reset
-and prefill-prime path.
+default-off product lifecycle. The default ``ar`` workload records one ordinary
+AR forward and routes later forwards through retained replay. ``mtp-greedy``
+drives the production daemon MTP generator with a byte-pinned prompt and applies
+the same cache warmup and stationarity contract to its reported decode rate.
+Models stay resident within each arm and clocks are never modified.
 """
 
 import argparse
@@ -26,6 +26,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
+DEFAULT_MTP_PROMPT = REPO / "benchmarks/prompts/redline_mtp_greedy_smoke.txt"
 
 
 def sha256_file(path):
@@ -195,6 +196,9 @@ class Daemon:
         timeout: float,
         kv_mode: str,
         dpm_warmup_secs: float,
+        workload: str,
+        mtp_k: int,
+        mtp_p_min: float,
     ):
         self.timeout = timeout
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,6 +213,15 @@ class Daemon:
             HIPFIRE_GRAPH="1",
             HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
         )
+        if workload == "mtp-greedy":
+            env.update(
+                HIPFIRE_QWEN_MTP="1",
+                HIPFIRE_MTP_K=str(mtp_k),
+                HIPFIRE_MTP_P_MIN=str(mtp_p_min),
+                # Keep HipGraph out of the MTP comparison. The auto arm will
+                # become the retained-PM4 arm as MTP tape support lands.
+                HIPFIRE_MTP_PROPOSAL_GRAPH="0",
+            )
         env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -235,6 +248,39 @@ class Daemon:
             raise RuntimeError(response.get("message", "daemon error"))
         return response
 
+    def generate(self, message):
+        """Consume a streamed generate response and return its final envelope."""
+        if self.proc.poll() is not None:
+            raise RuntimeError(f"daemon exited with {self.proc.returncode}")
+        self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+        deadline = time.monotonic() + self.timeout
+        committed = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"daemon timed out on {message['type']}")
+            ready, _, _ = select.select([self.proc.stdout], [], [], remaining)
+            if not ready:
+                raise TimeoutError(f"daemon timed out on {message['type']}")
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("daemon closed during generate")
+            response = json.loads(line)
+            if response.get("type") == "error":
+                raise RuntimeError(response.get("message", "daemon error"))
+            if response.get("type") == "committed":
+                committed.append(int(response["tok_id"]))
+                continue
+            if response.get("type") != "done":
+                continue
+            digest = hashlib.sha256()
+            for token in committed:
+                digest.update(token.to_bytes(4, "little", signed=False))
+            response["committed_events"] = len(committed)
+            response["token_ids_sha256"] = digest.hexdigest()
+            return response
+
     def close(self):
         if self.proc.poll() is None:
             try:
@@ -250,7 +296,22 @@ class Daemon:
         self.log.close()
 
 
-def run_arm(args, backend):
+def metric_key(args):
+    return "decode_tok_s" if args.workload == "mtp-greedy" else "tok_s"
+
+
+def validate_workload_row(args, row):
+    if args.workload == "mtp-greedy":
+        if row.get("mtp") is not True:
+            raise RuntimeError("greedy MTP smoke fell through to a non-MTP path")
+        if row.get("cycles", 0) <= 0 or row.get("tau", 0.0) <= 0.0:
+            raise RuntimeError(f"greedy MTP smoke returned invalid cycle data: {row}")
+        if row.get("committed_events") != row.get("tokens"):
+            raise RuntimeError(f"greedy MTP stream/final token mismatch: {row}")
+    return row
+
+
+def run_arm(args, backend, prompt):
     daemon = Daemon(
         Path(args.daemon).resolve(),
         backend,
@@ -259,6 +320,9 @@ def run_arm(args, backend):
         args.timeout,
         args.kv_mode,
         args.dpm_warmup_secs,
+        args.workload,
+        args.mtp_k,
+        args.mtp_p_min,
     )
     try:
         loaded = daemon.request(
@@ -269,21 +333,44 @@ def run_arm(args, backend):
                     "max_seq": args.max_seq,
                     "kv_mode": args.kv_mode,
                     "dflash_mode": "off",
+                    "mtp_mode": "on" if args.workload == "mtp-greedy" else "off",
+                    "mtp_k": args.mtp_k,
                 },
             }
         )
-        warmup_request = {
-            "type": "bench_decode",
-            "context_tokens": args.context,
-            "iterations": args.warmup_iterations,
-        }
-        request = {
-            "type": "bench_decode",
-            "context_tokens": args.context,
-            "iterations": args.iterations,
-        }
+        if args.workload == "mtp-greedy":
+            request_serial = 0
+
+            def mtp_request(max_tokens):
+                nonlocal request_serial
+                request_serial += 1
+                return {
+                    "type": "generate",
+                    "id": f"redline-mtp-{backend}-{request_serial}",
+                    "prompt": prompt,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "max_tokens": max_tokens,
+                    "max_think_tokens": 1,
+                    "assistant_prefix": "closed_think",
+                }
+
+            def issue(max_tokens):
+                return validate_workload_row(args, daemon.generate(mtp_request(max_tokens)))
+
+        else:
+
+            def issue(iterations):
+                return daemon.request(
+                    {
+                        "type": "bench_decode",
+                        "context_tokens": args.context,
+                        "iterations": iterations,
+                    }
+                )
+
         warmup_started = time.monotonic()
-        warmups = [daemon.request(warmup_request) for _ in range(args.warmups)]
+        warmups = [issue(args.warmup_iterations) for _ in range(args.warmups)]
         warmup_seconds = time.monotonic() - warmup_started
         if warmups:
             print(
@@ -295,9 +382,9 @@ def run_arm(args, backend):
         settling_rows = []
         settlement = None
         for _ in range(args.settle_max_runs):
-            settling_rows.append(daemon.request(request))
+            settling_rows.append(issue(args.iterations))
             settlement = analyze_stationarity(
-                [row["tok_s"] for row in settling_rows],
+                [row[metric_key(args)] for row in settling_rows],
                 **stationarity_kwargs(args),
             )
             if settlement["stationary"]:
@@ -318,9 +405,15 @@ def run_arm(args, backend):
             flush=True,
         )
 
-        rows = [daemon.request(request) for _ in range(args.runs)]
-        values = [row["tok_s"] for row in rows]
+        rows = [issue(args.iterations) for _ in range(args.runs)]
+        values = [row[metric_key(args)] for row in rows]
         measurement_validation = validate_measurement(values, settlement, args)
+        output_hashes = sorted({row.get("token_ids_sha256") for row in rows} - {None})
+        output_stable = len(output_hashes) <= 1
+        tau_values = [row["tau"] for row in rows if "tau" in row]
+        if args.workload == "mtp-greedy":
+            measurement_validation["output_stable"] = output_stable
+            measurement_validation["valid"] &= output_stable
         print(
             f"{backend}: measured median={statistics.median(values):.3f} tok/s "
             f"valid={measurement_validation['valid']}",
@@ -341,6 +434,17 @@ def run_arm(args, backend):
                 "median": statistics.median(values),
                 "max": max(values),
             },
+            "metric": metric_key(args),
+            "output_hashes": output_hashes,
+            "tau": (
+                {
+                    "min": min(tau_values),
+                    "median": statistics.median(tau_values),
+                    "max": max(tau_values),
+                }
+                if tau_values
+                else None
+            ),
             "measurement_validation": measurement_validation,
         }
     finally:
@@ -351,10 +455,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument(
+        "--workload",
+        choices=("ar", "mtp-greedy"),
+        default="ar",
+        help="stationary decode workload (default: ar)",
+    )
+    parser.add_argument(
         "--daemon", default=str(REPO / "target/release/examples/daemon")
     )
     parser.add_argument("--context", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--prompt-file",
+        default=str(DEFAULT_MTP_PROMPT),
+        help="byte-pinned plain-text prompt used by mtp-greedy",
+    )
+    parser.add_argument("--mtp-k", type=int, default=5)
+    parser.add_argument("--mtp-p-min", type=float, default=0.0)
     parser.add_argument(
         "--warmups",
         type=int,
@@ -441,9 +558,17 @@ def main():
         )
     if args.runs < 5:
         parser.error("--runs must be at least 5 for measurement validation")
+    if not 1 <= args.mtp_k <= 8:
+        parser.error("--mtp-k must be in [1, 8]")
+    if not 0.0 <= args.mtp_p_min <= 1.0:
+        parser.error("--mtp-p-min must be in [0, 1]")
+    if args.workload == "mtp-greedy" and args.kv_mode != "q8":
+        parser.error("mtp-greedy currently requires --kv-mode q8")
 
     model = Path(args.model).expanduser().resolve()
     daemon = Path(args.daemon).expanduser().resolve()
+    prompt_path = Path(args.prompt_file).expanduser().resolve()
+    prompt = prompt_path.read_text() if args.workload == "mtp-greedy" else ""
     report = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "host": socket.gethostname(),
@@ -457,6 +582,7 @@ def main():
             "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
         },
         "automatic_clocks": True,
+        "workload": args.workload,
         "context": args.context,
         "iterations": args.iterations,
         "warmups": args.warmups,
@@ -467,8 +593,16 @@ def main():
         "runs": args.runs,
         "transport": args.transport,
         "kv_mode": args.kv_mode,
-        "hip": run_arm(args, "hip"),
-        "auto": run_arm(args, "auto"),
+        "mtp": {
+            "k": args.mtp_k,
+            "p_min": args.mtp_p_min,
+            "temperature": 0.0,
+            "prompt_file": str(prompt_path) if prompt else None,
+            "prompt_md5": hashlib.md5(prompt.encode()).hexdigest() if prompt else None,
+            "prompt_bytes": len(prompt.encode()) if prompt else None,
+        },
+        "hip": run_arm(args, "hip", prompt),
+        "auto": run_arm(args, "auto", prompt),
     }
     hip = report["hip"]["tok_s"]["median"]
     auto = report["auto"]["tok_s"]["median"]
@@ -476,6 +610,11 @@ def main():
     report["valid"] = report["hip"]["measurement_validation"]["valid"] and report[
         "auto"
     ]["measurement_validation"]["valid"]
+    if args.workload == "mtp-greedy":
+        report["cross_arm_output_equal"] = (
+            report["hip"]["output_hashes"] == report["auto"]["output_hashes"]
+        )
+        report["valid"] &= report["cross_arm_output_equal"]
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + "\n")
