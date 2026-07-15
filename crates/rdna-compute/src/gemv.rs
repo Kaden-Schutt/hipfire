@@ -6234,7 +6234,11 @@ impl Gpu {
                 GATE_UP_CPOL
                     .get_or_init(|| {
                         std::env::var("HIPFIRE_MOE_GATE_UP_CPOL")
-                            .unwrap_or_default()
+                            // SLC is the gfx1100 product-certified policy:
+                            // exact-shadow A-B-A and stationary tg128 A-B-A
+                            // both beat the temporal-buffer control. Use
+                            // `default` to restore cache-policy zero.
+                            .unwrap_or_else(|_| "slc".to_owned())
                             .to_ascii_lowercase()
                     })
                     .as_str()
