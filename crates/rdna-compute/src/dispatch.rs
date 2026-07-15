@@ -833,6 +833,7 @@ impl Gpu {
                 mq_x_rot_fp8_bytes: 0,
                 mq_x_q8: None,
                 mq_x_scales: None,
+                mq_rmsnorm_wavegrid_scratch: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
@@ -2277,6 +2278,12 @@ impl Gpu {
                     "fused_rmsnorm_mq_rotate",
                     kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string(),
                 ));
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_wavegrid {
+                    specs.push((
+                        "fused_rmsnorm_mq_rotate_wavegrid",
+                        kernels::FUSED_RMSNORM_MQ_ROTATE_WAVEGRID_GFX1100_SRC.to_string(),
+                    ));
+                }
                 specs.push((
                     "fused_silu_mul_mq_rotate",
                     kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string(),

@@ -27,6 +27,10 @@ pub struct ScratchState {
     pub mq_x_rot_fp8_bytes: usize,
     pub mq_x_q8: Option<DeviceBuffer>,
     pub mq_x_scales: Option<DeviceBuffer>,
+    /// Persistent cross-workgroup rendezvous for the gfx1100 K=2048 fused
+    /// RMSNorm+MQ wavegrid. Layout is eight f32 partials, one f32 RMS value,
+    /// and three u32 epoch counters, padded to 64 bytes.
+    pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -223,6 +227,21 @@ impl ScratchState {
         self.mq_x_rot = Some(x_rot);
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
+        Ok(())
+    }
+
+    /// Lazily allocate and zero the persistent gfx1100 RMSNorm wavegrid state.
+    pub fn ensure_mq_rmsnorm_wavegrid_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if self.mq_rmsnorm_wavegrid_scratch.is_none() {
+            let scratch = hip.malloc(64)?;
+            hip.memset(&scratch, 0, 64)?;
+            self.mq_rmsnorm_wavegrid_scratch = Some(scratch);
+        }
         Ok(())
     }
 

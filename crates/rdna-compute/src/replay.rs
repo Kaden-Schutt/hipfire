@@ -352,6 +352,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     match kernel {
         "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
+        "fused_rmsnorm_mq_rotate_wavegrid" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+        ]),
         "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
@@ -494,7 +502,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
         | "rope_partial_halfsplit_f32" => Some(48),
-        "conv1d_silu_split_f32" => Some(64),
+        "conv1d_silu_split_f32" | "fused_rmsnorm_mq_rotate_wavegrid" => Some(64),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "fused_qkv_hfq4g256" => Some(80),
         "attention_flash_fwht3_tile"
@@ -2317,6 +2325,7 @@ mod tests {
 
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",
+        "fused_rmsnorm_mq_rotate_wavegrid",
         "fused_qkvza_hfq4g256",
         "fused_qkvza_hfq4g256_wavepack4",
         "fused_qkvza_hfq4g256_ldsx8",
