@@ -4,13 +4,21 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_RDNA3_RMSNORM_SIGN_LDS
+#define HIPFIRE_RDNA3_RMSNORM_SIGN_LDS 0
+#endif
+
+#ifndef HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL
+#define HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL fused_rmsnorm_mq_rotate_vecsum
+#endif
+
 // gfx1100 K=2048 experiment: each of the eight wave32s owns exactly one FWHT
 // group and derives its RMS partial from the same float4 x values already held
 // for rotation. This removes the baseline's eight scalar x loads per thread;
 // the only semantic difference is the sum-of-squares association order.
 
 __launch_bounds__(256, 1)
-extern "C" __global__ void fused_rmsnorm_mq_rotate_vecsum(
+extern "C" __global__ void HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL(
     const float* __restrict__ x,
     const float* __restrict__ weight,
     const float* __restrict__ signs1,
@@ -21,6 +29,13 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_vecsum(
 ) {
     if (K != 2048) return;
     __shared__ float reduce[8];
+#if HIPFIRE_RDNA3_RMSNORM_SIGN_LDS
+    // All eight waves use the same two 256-float sign tables. Stage each
+    // float4 once per workgroup instead of issuing the same global reads from
+    // every wave; the existing reduction barrier makes the stage visible.
+    __shared__ float4 signs1_lds[64];
+    __shared__ float4 signs2_lds[64];
+#endif
 
     const int tid = threadIdx.x;
     const int lane_id = tid & 31;
@@ -28,14 +43,23 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_vecsum(
     const int d0 = lane_id * 8;
     const int base = warp_id * 256 + d0;
 
+#if HIPFIRE_RDNA3_RMSNORM_SIGN_LDS
+    if (tid < 64) {
+        signs1_lds[tid] = reinterpret_cast<const float4*>(signs1)[tid];
+        signs2_lds[tid] = reinterpret_cast<const float4*>(signs2)[tid];
+    }
+#endif
+
     const float4 x0 = *reinterpret_cast<const float4*>(x + base);
     const float4 x1 = *reinterpret_cast<const float4*>(x + base + 4);
     const float4 w0 = *reinterpret_cast<const float4*>(weight + base);
     const float4 w1 = *reinterpret_cast<const float4*>(weight + base + 4);
+#if !HIPFIRE_RDNA3_RMSNORM_SIGN_LDS
     const float4 s10 = *reinterpret_cast<const float4*>(signs1 + d0);
     const float4 s11 = *reinterpret_cast<const float4*>(signs1 + d0 + 4);
     const float4 s20 = *reinterpret_cast<const float4*>(signs2 + d0);
     const float4 s21 = *reinterpret_cast<const float4*>(signs2 + d0 + 4);
+#endif
 
     float warp_sum = x0.x * x0.x;
     warp_sum += x0.y * x0.y;
@@ -62,6 +86,13 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_vecsum(
     }
     __syncthreads();
     const float rms = reduce[0];
+
+#if HIPFIRE_RDNA3_RMSNORM_SIGN_LDS
+    const float4 s10 = signs1_lds[lane_id * 2];
+    const float4 s11 = signs1_lds[lane_id * 2 + 1];
+    const float4 s20 = signs2_lds[lane_id * 2];
+    const float4 s21 = signs2_lds[lane_id * 2 + 1];
+#endif
 
     // Exact rotation multiply order: ((x * weight) * rms) * sign.
     float v0 = x0.x * w0.x * rms * s10.x;
@@ -119,3 +150,5 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_vecsum(
     *reinterpret_cast<float4*>(x_rot + base) = out0;
     *reinterpret_cast<float4*>(x_rot + base + 4) = out1;
 }
+
+#undef HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL

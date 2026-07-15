@@ -128,6 +128,9 @@ pub struct FeatureFlags {
     /// values, eliminating the baseline's second x load. Certified default on
     /// gfx1100; set `HIPFIRE_RDNA3_RMSNORM_VECSUM=0` to restore the baseline.
     pub rdna3_rmsnorm_vecsum: bool,
+    /// Radiowave experiment: stage the two shared MQ sign tables once in LDS
+    /// for the gfx1100 vecsum kernel instead of reloading them in eight waves.
+    pub rdna3_rmsnorm_sign_lds: bool,
     pub gfx942_mfma_prefill: Option<String>,
     pub moe_grouped_i8: Option<bool>,
     pub moe_grouped_i8_k8: bool,
@@ -415,6 +418,9 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_rmsnorm_vecsum: parse_bool("HIPFIRE_RDNA3_RMSNORM_VECSUM")
                 .unwrap_or(arch == "gfx1100"),
+            rdna3_rmsnorm_sign_lds: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS")
+                .as_deref()
+                == Ok("1"),
             gfx942_mfma_prefill: std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
             moe_grouped_i8: match std::env::var("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
                 Some("1") => Some(true),
@@ -634,6 +640,7 @@ impl FeatureFlags {
             rdna3_rmsnorm_wavegrid: false,
             rdna3_rmsnorm_split: false,
             rdna3_rmsnorm_vecsum: false,
+            rdna3_rmsnorm_sign_lds: false,
             gfx942_mfma_prefill: None,
             moe_grouped_i8: None,
             moe_grouped_i8_k8: false,
