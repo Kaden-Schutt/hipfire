@@ -452,6 +452,15 @@ pub fn run_moe_decode(
         // the old non-bit-exact research kernel without exposing it by
         // accident through the former `1` opt-in.
         && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx"));
+    static ROUTER_SHARED_FUSE: OnceLock<bool> = OnceLock::new();
+    let router_shared_fuse = exact_wave64_router
+        && p.batch_size == 1
+        && !p.skip_shared
+        && p.smi == 512
+        && p.shared_down_w.dtype == DType::MQ4G256
+        && p.shared_down_w.awq_scale.is_none()
+        && *ROUTER_SHARED_FUSE
+            .get_or_init(|| std::env::var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1"));
     let wave64_router = (ctx.arch.is_gfx1201()
         && std::env::var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
         || (ctx.arch.is_gfx1100()
@@ -459,7 +468,28 @@ pub fn run_moe_decode(
             // Research-only: faster on gfx1100, but its routing drift can
             // change greedy trajectories and trigger an attractor.
             && gfx1100_router_mode.as_deref() == Some("approx"));
-    if exact_wave64_router {
+    if router_shared_fuse {
+        let shared_x_rot = unsafe {
+            GpuTensor {
+                buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            }
+        };
+        hip!(
+            gpu.moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob,
+                &shared_gate,
+                &shared_up,
+                &shared_x_rot,
+                p.smi,
+            )
+        )?;
+    } else if exact_wave64_router {
         hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
             p.router_logits,
             p.topk_indices,
@@ -510,7 +540,7 @@ pub fn run_moe_decode(
                     &x_rot_alias,
                     p.smi
                 ))?;
-            } else {
+            } else if !router_shared_fuse {
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
             }
             hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(

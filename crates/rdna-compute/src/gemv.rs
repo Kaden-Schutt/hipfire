@@ -5931,6 +5931,88 @@ impl Gpu {
         )
     }
 
+    /// gfx1100 heterogeneous dispatch for the two independent operations
+    /// immediately following the fused gate-side projection: exact router
+    /// selection and shared-expert SwiGLU + MQ rotation. Workgroup 0 runs the
+    /// router while each later wave64 carries two original wave32 FWHT groups.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        shared_gate: &GpuTensor,
+        shared_up: &GpuTensor,
+        shared_x_rot: &GpuTensor,
+        shared_k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        let name = "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate";
+        self.ensure_kernel(
+            "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1100",
+            kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SHARED_SILU_MQ_ROTATE_SRC,
+            name,
+        )?;
+
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = i32::from(norm_topk);
+        let gp = shared_gate.buf.as_ptr();
+        let up = shared_up.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xr = shared_x_rot.buf.as_ptr();
+        let k = shared_k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xr as *const _ as *mut c_void,
+            &k as *const _ as *mut c_void,
+        ];
+        let activation_workgroups = shared_k.div_ceil(512) as u32;
+        let bytes = n_exp * 4 + 8 * (4 + 4) + shared_k * 4 * 3 + 2 * 256 * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [1 + activation_workgroups, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xr);
+                b.push_i32(k);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xr);
+        result
+    }
+
     /// MoE top-K + renorm given pre-softmaxed probs. Companion to the
     /// regular `softmax_f32`. The dispatch site runs `softmax_f32` first,
     /// then this kernel — same softmax math everywhere, no 1-ULP

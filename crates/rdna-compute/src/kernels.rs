@@ -1352,6 +1352,11 @@ pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip");
 pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SRC: &str =
     include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64_exact.hip");
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SHARED_SILU_MQ_ROTATE_SRC: &str = concat!(
+    "#define HIPFIRE_ROUTER_SHARED_SILU_MQ_ROTATE 1\n",
+    "#define HIPFIRE_ROUTER_EXACT_KERNEL moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate\n",
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64_exact.hip")
+);
 
 /// MoE top-K + renorm only, given pre-softmaxed probs. Companion to
 /// the regular softmax_f32 kernel; the dispatch site runs softmax_f32

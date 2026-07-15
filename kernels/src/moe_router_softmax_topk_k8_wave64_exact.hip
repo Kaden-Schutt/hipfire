@@ -22,6 +22,10 @@
 #define ROUTER_EXACT_PER_LANE 4
 #define ROUTER_EXACT_K 8
 
+#ifndef HIPFIRE_ROUTER_EXACT_KERNEL
+#define HIPFIRE_ROUTER_EXACT_KERNEL moe_router_softmax_topk_k8_wave64_exact
+#endif
+
 __device__ __forceinline__ float router_exact_cross_half_f32(float v) {
     return __uint_as_float(__builtin_amdgcn_permlane64(__float_as_uint(v)));
 }
@@ -121,14 +125,116 @@ __device__ __forceinline__ void router_exact_wave32_chunk_argmax(
     }
 }
 
+#ifdef HIPFIRE_ROUTER_SHARED_SILU_MQ_ROTATE
+// Workgroups after block 0 execute the independent shared-expert SwiGLU + MQ
+// rotation.  A physical wave64 carries two original wave32 workgroups, one in
+// each half, so K=512 retains the original two-way group parallelism while the
+// command processor sees one heterogeneous dispatch instead of two kernels.
+__device__ __forceinline__ void router_shared_silu_mq_rotate(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    float* __restrict__ x_rot,
+    int K)
+{
+    const int lane = threadIdx.x;
+    const int tid = lane & 31;
+    const int group = ((int)blockIdx.x - 1) * 2 + (lane >> 5);
+    const int groups_total = K / 256;
+    if (group >= groups_total) return;
+
+    const int d0 = tid * 8;
+    const int base = group * 256 + d0;
+
+    #define ROUTER_SHARED_SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
+    float g0 = gate[base];     float u0 = up[base];
+    float g1 = gate[base + 1]; float u1 = up[base + 1];
+    float g2 = gate[base + 2]; float u2 = up[base + 2];
+    float g3 = gate[base + 3]; float u3 = up[base + 3];
+    float g4 = gate[base + 4]; float u4 = up[base + 4];
+    float g5 = gate[base + 5]; float u5 = up[base + 5];
+    float g6 = gate[base + 6]; float u6 = up[base + 6];
+    float g7 = gate[base + 7]; float u7 = up[base + 7];
+
+    float v0 = ROUTER_SHARED_SILU_MUL(g0, u0) * signs1[d0];
+    float v1 = ROUTER_SHARED_SILU_MUL(g1, u1) * signs1[d0 + 1];
+    float v2 = ROUTER_SHARED_SILU_MUL(g2, u2) * signs1[d0 + 2];
+    float v3 = ROUTER_SHARED_SILU_MUL(g3, u3) * signs1[d0 + 3];
+    float v4 = ROUTER_SHARED_SILU_MUL(g4, u4) * signs1[d0 + 4];
+    float v5 = ROUTER_SHARED_SILU_MUL(g5, u5) * signs1[d0 + 5];
+    float v6 = ROUTER_SHARED_SILU_MUL(g6, u6) * signs1[d0 + 6];
+    float v7 = ROUTER_SHARED_SILU_MUL(g7, u7) * signs1[d0 + 7];
+    #undef ROUTER_SHARED_SILU_MUL
+
+    float t;
+    t = v0; v0 = v0 + v1; v1 = t - v1;
+    t = v2; v2 = v2 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v5; v5 = t - v5;
+    t = v6; v6 = v6 + v7; v7 = t - v7;
+    t = v0; v0 = v0 + v2; v2 = t - v2;
+    t = v1; v1 = v1 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v6; v6 = t - v6;
+    t = v5; v5 = v5 + v7; v7 = t - v7;
+    t = v0; v0 = v0 + v4; v4 = t - v4;
+    t = v1; v1 = v1 + v5; v5 = t - v5;
+    t = v2; v2 = v2 + v6; v6 = t - v6;
+    t = v3; v3 = v3 + v7; v7 = t - v7;
+
+    #define ROUTER_SHARED_HBFLY(v, pat, str) do { \
+        float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (pat))); \
+        if (tid & (str)) { (v) = _p - (v); } else { (v) = (v) + _p; } \
+    } while(0)
+    #define ROUTER_SHARED_HBFLY8(pat, str) \
+        ROUTER_SHARED_HBFLY(v0,pat,str); ROUTER_SHARED_HBFLY(v1,pat,str); \
+        ROUTER_SHARED_HBFLY(v2,pat,str); ROUTER_SHARED_HBFLY(v3,pat,str); \
+        ROUTER_SHARED_HBFLY(v4,pat,str); ROUTER_SHARED_HBFLY(v5,pat,str); \
+        ROUTER_SHARED_HBFLY(v6,pat,str); ROUTER_SHARED_HBFLY(v7,pat,str)
+
+    ROUTER_SHARED_HBFLY8(0x041F, 1);
+    ROUTER_SHARED_HBFLY8(0x081F, 2);
+    ROUTER_SHARED_HBFLY8(0x101F, 4);
+    ROUTER_SHARED_HBFLY8(0x201F, 8);
+    ROUTER_SHARED_HBFLY8(0x401F, 16);
+    #undef ROUTER_SHARED_HBFLY8
+    #undef ROUTER_SHARED_HBFLY
+
+    const float s = 0.0625f;
+    x_rot[base]     = v0 * s * signs2[d0];
+    x_rot[base + 1] = v1 * s * signs2[d0 + 1];
+    x_rot[base + 2] = v2 * s * signs2[d0 + 2];
+    x_rot[base + 3] = v3 * s * signs2[d0 + 3];
+    x_rot[base + 4] = v4 * s * signs2[d0 + 4];
+    x_rot[base + 5] = v5 * s * signs2[d0 + 5];
+    x_rot[base + 6] = v6 * s * signs2[d0 + 6];
+    x_rot[base + 7] = v7 * s * signs2[d0 + 7];
+}
+#endif
+
 extern "C" __launch_bounds__(64, 4)
-__global__ void moe_router_softmax_topk_k8_wave64_exact(
+__global__ void HIPFIRE_ROUTER_EXACT_KERNEL(
     const float* __restrict__ logits,
     int* __restrict__ topk_idx,
     float* __restrict__ topk_w,
     int n_exp,
-    int norm_topk)
+    int norm_topk
+#ifdef HIPFIRE_ROUTER_SHARED_SILU_MQ_ROTATE
+    , const float* __restrict__ shared_gate
+    , const float* __restrict__ shared_up
+    , const float* __restrict__ signs1
+    , const float* __restrict__ signs2
+    , float* __restrict__ shared_x_rot
+    , int shared_k
+#endif
+)
 {
+#ifdef HIPFIRE_ROUTER_SHARED_SILU_MQ_ROTATE
+    if (blockIdx.x != 0) {
+        router_shared_silu_mq_rotate(
+            shared_gate, shared_up, signs1, signs2, shared_x_rot, shared_k);
+        return;
+    }
+#endif
     const int lane = threadIdx.x;
     float prob[ROUTER_EXACT_PER_LANE];
 
