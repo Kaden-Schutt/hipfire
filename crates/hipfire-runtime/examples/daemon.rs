@@ -3228,7 +3228,8 @@ fn main() {
                         )
                         .map_err(|error| error.to_string())?;
                         if pm4 {
-                            unsafe { gpu.replay.replay_pm4() }?;
+                            let timing = unsafe { gpu.replay.replay_pm4() }?;
+                            gpu_us += timing.span_microseconds();
                         } else {
                             let timing = unsafe { gpu.replay.replay_linear_aql() }?;
                             gpu_us += timing.span_microseconds();
@@ -7767,8 +7768,10 @@ fn generate(
                       // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
                       // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
                       // was hardcoded greedy-only (temp>0 → AR).
-        let spec_temp_ok =
-            temp <= 1e-6 || m.speculator.as_ref().map_or(false, |s| !s.requires_greedy());
+        let spec_temp_ok = temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .map_or(false, |s| !s.requires_greedy());
         let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(
@@ -8214,10 +8217,7 @@ fn generate(
             "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
         );
     }
-    if m.speculator.is_some()
-        && !force_ar_chat
-        && (qwen_dflash_route || llama_dflash_route)
-    {
+    if m.speculator.is_some() && !force_ar_chat && (qwen_dflash_route || llama_dflash_route) {
         // One-time visibility: temp + top_p + top_k ARE now honored on the
         // DFlash spec sampled path (identical (top_k,top_p) nucleus truncation on
         // draft + target → lossless == AR-at-(top_k,top_p)). Only min_p remains

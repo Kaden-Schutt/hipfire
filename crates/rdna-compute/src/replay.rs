@@ -18,8 +18,9 @@ use std::sync::Arc;
 use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
-    GpuBatchTiming, GpuDevice, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
-    LaunchGeometry, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
+    KernargPool, Kernel, LaunchGeometry, RecordedDispatch, Runtime, SingleQueueBatchGraph,
+    SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,16 +155,16 @@ impl Pm4Commands {
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx10,
                 commands,
-            } => SingleQueuePm4Ib::create_gfx10(device, pool, commands),
+            } => SingleQueuePm4Ib::create_profiled_gfx10(device, pool, commands),
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx11,
                 commands,
-            } => SingleQueuePm4Ib::create_gfx11(device, pool, commands),
+            } => SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands),
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx12,
                 ..
             } => unreachable!("gfx12 never uses the legacy PM4 command variant"),
-            Self::Gfx12(commands) => SingleQueuePm4Ib::create(device, pool, commands),
+            Self::Gfx12(commands) => SingleQueuePm4Ib::create_profiled(device, pool, commands),
         }
         .map_err(|error| error.to_string())
     }
@@ -849,7 +850,7 @@ impl PreparedPm4Replay {
     ///
     /// Every pointer captured in the immutable explicit kernarg prefixes must
     /// still refer to the same live Hipfire allocation and model instance.
-    pub unsafe fn replay_and_wait(&mut self) -> Result<(), String> {
+    pub unsafe fn replay_and_wait(&mut self) -> Result<GpuMultiQueueTiming, String> {
         for dispatch in &self.dynamic_gdn_frames {
             let frame = crate::norm::reserve_gdn_requant_frames(1);
             let bytes = self.kernargs[*dispatch].as_mut_bytes();
@@ -859,7 +860,7 @@ impl PreparedPm4Replay {
                 .copy_from_slice(&frame.to_ne_bytes());
         }
         // SAFETY: forwarded from the caller that owns the model allocations.
-        unsafe { self.graph.replay_and_wait() }.map_err(|error| error.to_string())
+        unsafe { self.graph.replay_and_wait_profiled() }.map_err(|error| error.to_string())
     }
 
     pub fn dispatch_count(&self) -> usize {
@@ -1461,7 +1462,7 @@ impl ReplayController {
     ///
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
-    pub unsafe fn replay_pm4(&mut self) -> Result<(), String> {
+    pub unsafe fn replay_pm4(&mut self) -> Result<GpuMultiQueueTiming, String> {
         let prepared = self
             .prepared_pm4
             .as_mut()

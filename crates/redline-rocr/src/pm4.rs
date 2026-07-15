@@ -13,6 +13,8 @@ use crate::{Kernel, LaunchGeometry};
 
 const PACKET3_SET_SH_REG: u32 = 0x76;
 const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
+const PACKET3_COPY_DATA: u32 = 0x40;
+const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
 
@@ -104,6 +106,44 @@ impl Gfx12Pm4CommandBuffer {
     /// GL1/metadata bits into the merged RDNA4 hierarchy.
     pub fn acquire_system_gfx12(&mut self) {
         self.emit_acquire_gcr(0x1c1d1);
+    }
+
+    /// Return a copy bracketed by GPU-clock writes. The end timestamp follows
+    /// all earlier compute work; the start uses RADV's top-of-pipe COPY_DATA
+    /// timestamp form.
+    pub fn with_gpu_timestamps(&self, start_address: u64, end_address: u64) -> Self {
+        let mut timed = Self::new();
+        timed.copy_gpu_timestamp(start_address);
+        timed.dwords.extend_from_slice(&self.dwords);
+        timed.release_gpu_timestamp(end_address);
+        timed
+    }
+
+    fn copy_gpu_timestamp(&mut self, address: u64) {
+        const COPY_DATA_TIMESTAMP_TO_MEMORY_64: u32 = 9 | (5 << 8) | (1 << 16) | (1 << 20);
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_COPY_DATA, 5, false),
+            COPY_DATA_TIMESTAMP_TO_MEMORY_64,
+            0,
+            0,
+            address as u32,
+            (address >> 32) as u32,
+        ]);
+    }
+
+    fn release_gpu_timestamp(&mut self, address: u64) {
+        const BOTTOM_OF_PIPE_TS_EVENT: u32 = 40 | (5 << 8);
+        const TIMESTAMP_AFTER_WRITE_CONFIRM: u32 = (3 << 24) | (3 << 29);
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_RELEASE_MEM, 7, false),
+            BOTTOM_OF_PIPE_TS_EVENT,
+            TIMESTAMP_AFTER_WRITE_CONFIRM,
+            address as u32,
+            (address >> 32) as u32,
+            0,
+            0,
+            0,
+        ]);
     }
 
     /// Same-agent inter-node acquire for one retained gfx12 tape. Kernel code

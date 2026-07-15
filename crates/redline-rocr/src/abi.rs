@@ -34,6 +34,7 @@ pub const AGENT_INFO_QUEUE_TYPE: u32 = 15;
 pub const AGENT_INFO_DEVICE: u32 = 17;
 pub const AMD_AGENT_INFO_BDFID: u32 = 0xA006;
 pub const AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
+pub const AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: u32 = 0xA016;
 
 pub const PROFILE_BASE: u32 = 0;
 pub const PROFILE_FULL: u32 = 1;

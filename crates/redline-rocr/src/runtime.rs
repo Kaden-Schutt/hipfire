@@ -512,6 +512,24 @@ impl GpuDevice {
         .timestamp_frequency_hz()
     }
 
+    /// GPU clock frequency used by PM4 timestamp packets. This differs from
+    /// the HSA system-clock frequency used by ROCr dispatch profiling.
+    pub fn gpu_timestamp_frequency_hz(&self) -> Result<u64, RuntimeError> {
+        let mut frequency = 0_u64;
+        query_agent(
+            &self.runtime.symbols,
+            self.gpu_agent(),
+            abi::AMD_AGENT_INFO_TIMESTAMP_FREQUENCY,
+            (&mut frequency as *mut u64).cast(),
+        )?;
+        if frequency == 0 {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "GPU timestamp frequency is zero",
+            ));
+        }
+        Ok(frequency)
+    }
+
     fn gpu_agent(&self) -> abi::Agent {
         self.gpu.handle
     }
