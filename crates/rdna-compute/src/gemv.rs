@@ -2026,7 +2026,13 @@ impl Gpu {
         }
         let vecsum = self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_vecsum && k == 2048;
         let sign_lds = vecsum && self.flags.rdna3_rmsnorm_sign_lds;
-        let (kernel, source) = if sign_lds {
+        let sign_const = vecsum && self.flags.rdna3_rmsnorm_sign_const;
+        let (kernel, source) = if sign_const {
+            (
+                "fused_rmsnorm_mq_rotate_vecsum_sign_const",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_SIGN_CONST_GFX1100_SRC,
+            )
+        } else if sign_lds {
             (
                 "fused_rmsnorm_mq_rotate_vecsum_sign_lds",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_SIGN_LDS_GFX1100_SRC,

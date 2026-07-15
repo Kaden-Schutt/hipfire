@@ -382,6 +382,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     match kernel {
         "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
+        | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_lds" => {
             Some(vec![read(0), read(8), read(16), read(24), write(32)])
         }
@@ -559,6 +560,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
+        | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_lds"
         | "fused_sigmoid_alpha_gate_f32"
         | "fused_silu_mul_mq_rotate"
@@ -2435,6 +2437,7 @@ mod tests {
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",
         "fused_rmsnorm_mq_rotate_vecsum",
+        "fused_rmsnorm_mq_rotate_vecsum_sign_const",
         "fused_rmsnorm_mq_rotate_vecsum_sign_lds",
         "fused_rmsnorm_mq_rotate_wavegrid",
         "rmsnorm_reduce_gfx1100",

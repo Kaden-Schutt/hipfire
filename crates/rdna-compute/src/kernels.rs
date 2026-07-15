@@ -1004,6 +1004,11 @@ pub const FUSED_RMSNORM_MQ_ROTATE_VECSUM_SIGN_LDS_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL fused_rmsnorm_mq_rotate_vecsum_sign_lds\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_vecsum.gfx1100.hip")
 );
+pub const FUSED_RMSNORM_MQ_ROTATE_VECSUM_SIGN_CONST_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_RMSNORM_SIGN_CONST 1\n",
+    "#define HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL fused_rmsnorm_mq_rotate_vecsum_sign_const\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_vecsum.gfx1100.hip")
+);
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
 
