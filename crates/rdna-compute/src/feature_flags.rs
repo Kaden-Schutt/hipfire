@@ -41,6 +41,9 @@ pub struct FeatureFlags {
     /// explicitly compiled wave64 on RDNA3. Default off until model-level
     /// correctness and throughput gates promote it.
     pub rdna3_hfq4_qkv_wave64: bool,
+    /// Radiowave experiment: split each gfx1100 QKVZA output row across two
+    /// lighter wave32s and join their partials through LDS.
+    pub rdna3_hfq4_qkvza_2wave: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -252,6 +255,8 @@ impl FeatureFlags {
             dot2_gemv: std::env::var("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
             rdna3_hfq4_qkv_wave64: std::env::var("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_2wave: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
                 == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
@@ -473,6 +478,7 @@ impl FeatureFlags {
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
             rdna3_hfq4_qkv_wave64: false,
+            rdna3_hfq4_qkvza_2wave: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,
