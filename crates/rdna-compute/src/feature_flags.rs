@@ -113,6 +113,9 @@ pub struct FeatureFlags {
     /// Radiowave experiment: replace the cross-workgroup rendezvous with one
     /// exact reduction dispatch followed by eight independent rotate waves.
     pub rdna3_rmsnorm_split: bool,
+    /// Radiowave experiment: compute the K=2048 RMS sum from each FWHT wave's
+    /// prefetched float4 values, eliminating the baseline's second x load.
+    pub rdna3_rmsnorm_vecsum: bool,
     pub gfx942_mfma_prefill: Option<String>,
     pub moe_grouped_i8: Option<bool>,
     pub moe_grouped_i8_k8: bool,
@@ -388,6 +391,8 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_rmsnorm_split: std::env::var("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref()
                 == Ok("1"),
+            rdna3_rmsnorm_vecsum: std::env::var("HIPFIRE_RDNA3_RMSNORM_VECSUM").as_deref()
+                == Ok("1"),
             gfx942_mfma_prefill: std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
             moe_grouped_i8: match std::env::var("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
                 Some("1") => Some(true),
@@ -603,6 +608,7 @@ impl FeatureFlags {
             rmsnorm_mq_tight_lds: false,
             rdna3_rmsnorm_wavegrid: false,
             rdna3_rmsnorm_split: false,
+            rdna3_rmsnorm_vecsum: false,
             gfx942_mfma_prefill: None,
             moe_grouped_i8: None,
             moe_grouped_i8_k8: false,

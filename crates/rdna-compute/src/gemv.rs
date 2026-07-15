@@ -2024,11 +2024,19 @@ impl Gpu {
                 x, weight, x_rot, k, eps,
             );
         }
-        self.ensure_kernel(
-            "fused_rmsnorm_mq_rotate",
-            kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
-            "fused_rmsnorm_mq_rotate",
-        )?;
+        let vecsum = self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_vecsum && k == 2048;
+        let (kernel, source) = if vecsum {
+            (
+                "fused_rmsnorm_mq_rotate_vecsum",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC,
+            )
+        } else {
+            (
+                "fused_rmsnorm_mq_rotate",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
+            )
+        };
+        self.ensure_kernel(kernel, source, kernel)?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
@@ -2053,7 +2061,9 @@ impl Gpu {
         // The current kernel uses only reduce[256]. Keep the historical
         // K-float x_shared reservation as the A/B control; x_shared itself
         // disappeared when the first-group prefetch schedule landed.
-        let shared_mem = if self.flags.rmsnorm_mq_tight_lds {
+        let shared_mem = if vecsum {
+            0
+        } else if self.flags.rmsnorm_mq_tight_lds {
             (256 * 4) as u32
         } else {
             ((k + 256) * 4) as u32
@@ -2061,10 +2071,9 @@ impl Gpu {
 
         // Bandwidth: read x (K*4) + weight (K*4) + signs (2*256*4) + write x_rot (K*4)
         let bytes = k * 4 * 3 + 2 * 256 * 4;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "fused", "fused_rmsnorm_mq_rotate", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
-            "fused_rmsnorm_mq_rotate",
+            kernel,
             [1, 1, 1],
             [block_size, 1, 1],
             shared_mem,

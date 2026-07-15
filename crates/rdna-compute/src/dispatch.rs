@@ -2294,6 +2294,12 @@ impl Gpu {
                         kernels::ROTATE_WITH_RMS_GFX1100_SRC.to_string(),
                     ));
                 }
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_vecsum {
+                    specs.push((
+                        "fused_rmsnorm_mq_rotate_vecsum",
+                        kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC.to_string(),
+                    ));
+                }
                 specs.push((
                     "fused_silu_mul_mq_rotate",
                     kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string(),

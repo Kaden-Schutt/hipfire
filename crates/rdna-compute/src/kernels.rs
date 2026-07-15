@@ -997,6 +997,8 @@ pub const RMSNORM_REDUCE_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx1100.hip");
 pub const ROTATE_WITH_RMS_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/rotate_with_rms.gfx1100.hip");
+pub const FUSED_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_vecsum.gfx1100.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
 
