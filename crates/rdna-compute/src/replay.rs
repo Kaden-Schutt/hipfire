@@ -340,7 +340,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     match kernel {
         "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
-        "fused_qkvza_hfq4g256" => Some(vec![
+        "fused_qkvza_hfq4g256" | "fused_qkvza_hfq4g256_wavepack4" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -475,9 +475,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "conv1d_silu_split_f32" => Some(64),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "fused_qkv_hfq4g256" => Some(80),
-        "attention_flash_fwht3_tile" | "fused_qkvza_hfq4g256" | "gated_delta_net_q8_fast" => {
-            Some(96)
-        }
+        "attention_flash_fwht3_tile"
+        | "fused_qkvza_hfq4g256"
+        | "fused_qkvza_hfq4g256_wavepack4"
+        | "gated_delta_net_q8_fast" => Some(96),
         _ => None,
     }
 }
@@ -2216,6 +2217,7 @@ mod tests {
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",
         "fused_qkvza_hfq4g256",
+        "fused_qkvza_hfq4g256_wavepack4",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "fused_qk_l2_norm_scale_f32",

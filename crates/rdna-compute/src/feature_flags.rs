@@ -44,6 +44,9 @@ pub struct FeatureFlags {
     /// Radiowave experiment: split each gfx1100 QKVZA output row across two
     /// lighter wave32s and join their partials through LDS.
     pub rdna3_hfq4_qkvza_2wave: bool,
+    /// Radiowave experiment: package four independent gfx1100 QKVZA row
+    /// waves in one workgroup without changing per-row arithmetic.
+    pub rdna3_hfq4_qkvza_wavepack4: bool,
     /// Radiowave experiment: port the gfx12 QKVZA float4 activation-hoist
     /// schedule to gfx1100 while retaining one independent wave per row.
     pub rdna3_hfq4_qkvza_hoist_x32: bool,
@@ -276,6 +279,11 @@ impl FeatureFlags {
             rdna3_hfq4_qkv_wave64: std::env::var("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref()
                 == Ok("1"),
             rdna3_hfq4_qkvza_2wave: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_wavepack4: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4",
+            )
+            .as_deref()
                 == Ok("1"),
             rdna3_hfq4_qkvza_hoist_x32: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
                 .as_deref()
@@ -515,6 +523,7 @@ impl FeatureFlags {
             gcn5_wave64_hybrid: None,
             rdna3_hfq4_qkv_wave64: false,
             rdna3_hfq4_qkvza_2wave: false,
+            rdna3_hfq4_qkvza_wavepack4: false,
             rdna3_hfq4_qkvza_hoist_x32: false,
             rdna3_hfq4_residual_stage_x32: false,
             rdna3_hfq4_sigmoid_tight_grid: false,

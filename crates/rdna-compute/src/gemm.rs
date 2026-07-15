@@ -2508,6 +2508,9 @@ impl Gpu {
         // every QKVZA projection.
         let rdna3_2wave =
             self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave && total_m <= 2_048;
+        let rdna3_wavepack4 = self.arch_caps.is_rdna3_dgpu()
+            && self.flags.rdna3_hfq4_qkvza_wavepack4
+            && total_m <= 2_048;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let (func_name, block, grid_x) = if rdna3_2wave {
@@ -2517,6 +2520,17 @@ impl Gpu {
                 "fused_qkvza_hfq4g256_2wave",
             )?;
             ("fused_qkvza_hfq4g256_2wave", [64u32, 1, 1], total_m as u32)
+        } else if rdna3_wavepack4 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_wavepack4",
+                kernels::FUSED_QKVZA_HFQ4G256_WAVEPACK4_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_wavepack4",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_wavepack4",
+                [128u32, 1, 1],
+                (total_m as u32).div_ceil(4),
+            )
         } else if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via

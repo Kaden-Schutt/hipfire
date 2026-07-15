@@ -2373,6 +2373,19 @@ pub const FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256_2wave.gfx1100.hip")
 );
 
+// Four independent wave32 rows per workgroup. Unlike the 2wave experiment,
+// this preserves one full wave and the base reduction tree for every row;
+// only the workgroup packaging changes.
+pub const FUSED_QKVZA_HFQ4G256_WAVEPACK4_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_QKVZA_WAVES_PER_BLOCK 4\n",
+    "#define HIPFIRE_QKVZA_BLOCK_SIZE 128\n",
+    "#define HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU 4\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_wavepack4\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 // CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
 // to (total_m+1)/2. Byte-exact vs the wave32 base kernel.

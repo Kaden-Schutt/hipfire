@@ -39,8 +39,24 @@
 // Bit-exact with four sequential gemv_hfq4g256 calls — the inner loop
 // is a verbatim copy.
 
-__launch_bounds__(32, 16)
-extern "C" __global__ void fused_qkvza_hfq4g256(
+#ifndef HIPFIRE_QKVZA_WAVES_PER_BLOCK
+#define HIPFIRE_QKVZA_WAVES_PER_BLOCK 1
+#endif
+
+#ifndef HIPFIRE_QKVZA_BLOCK_SIZE
+#define HIPFIRE_QKVZA_BLOCK_SIZE 32
+#endif
+
+#ifndef HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU
+#define HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU 16
+#endif
+
+#ifndef HIPFIRE_QKVZA_KERNEL_NAME
+#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256
+#endif
+
+__launch_bounds__(HIPFIRE_QKVZA_BLOCK_SIZE, HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU)
+extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
     const char*  __restrict__ A_qkv,
     const char*  __restrict__ A_z,
     const char*  __restrict__ A_beta,
@@ -53,7 +69,17 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
     int qkv_m, int z_m, int beta_m, int alpha_m,
     int K
 ) {
+#if HIPFIRE_QKVZA_WAVES_PER_BLOCK > 1
+    // Pack independent row waves into one workgroup. This does not split a
+    // row or introduce a cross-wave reduction: each wave retains the base
+    // kernel's lane mapping, accumulator order, and shuffle tree.
+    const int wave = threadIdx.x >> 5;
+    const int tid = threadIdx.x & 31;
+    const int gid = blockIdx.x * HIPFIRE_QKVZA_WAVES_PER_BLOCK + wave;
+#else
+    const int tid = threadIdx.x;
     const int gid = blockIdx.x;
+#endif
     const int total_m = qkv_m + z_m + beta_m + alpha_m;
     if (gid >= total_m) return;
 
@@ -71,7 +97,6 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
         A = A_alpha; y = y_alpha; row = gid - (qkv_m + z_m + beta_m);
     }
 
-    const int tid = threadIdx.x;
     const int groups_per_row = K / 256;
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
