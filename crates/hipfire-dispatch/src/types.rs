@@ -200,6 +200,7 @@ pub enum KernelKey {
     GemvHfq2G256,
     GemvHfq2G128,
     GemvTQ2G128,
+    GemvBQ1G128,
     GemvHfq6G256,
     GemvMq4G256,
     GemvMq4G128,
@@ -589,6 +590,7 @@ impl KernelKey {
             (HFQ2G256, Plain) => Ok(Self::GemvHfq2G256),
             (HFQ2G128, Plain) => Ok(Self::GemvHfq2G128),
             (TQ2G128, Plain) => Ok(Self::GemvTQ2G128),
+            (BQ1G128, Plain) => Ok(Self::GemvBQ1G128),
             (HFQ6G256, Plain) => Ok(Self::GemvHfq6G256),
             (MQ4G256, Plain) => Ok(Self::GemvMq4G256),
             (MQ4G128, Plain) => Ok(Self::GemvMq4G128),
@@ -831,5 +833,12 @@ mod tests {
         let k = KernelKey::for_gemv(DType::TQ2G128, GemvVariant::Plain, false)
             .expect("TQ2G128 should resolve to a GEMV kernel key");
         assert_eq!(k, KernelKey::GemvTQ2G128);
+    }
+
+    #[test]
+    fn bq1g128_resolves_to_gemv_key() {
+        let k = KernelKey::for_gemv(DType::BQ1G128, GemvVariant::Plain, false)
+            .expect("BQ1G128 should resolve to a GEMV kernel key");
+        assert_eq!(k, KernelKey::GemvBQ1G128);
     }
 }
