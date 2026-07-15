@@ -2563,6 +2563,15 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+/// Radiowave gfx1100 dual-row QKVZA probe. Two adjacent rows share each
+/// K=2048 activation load while preserving independent weight streams and the
+/// shipping four-chain reduction order.
+pub const FUSED_QKVZA_HFQ4G256_K2048_R2_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_r2.gfx1100.hip")
+);
+
 /// gfx1100 decode experiment: keep the certified K=2048 projection schedule
 /// and fold the beta sigmoid plus alpha softplus/decay preparation into the
 /// two scalar projection tails. This removes one launch per DeltaNet layer.

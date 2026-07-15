@@ -2519,6 +2519,11 @@ impl Gpu {
         let rdna3_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_qkvza_k2048
             && k == 2_048;
+        static QKVZA_R2: OnceLock<bool> = OnceLock::new();
+        let rdna3_k2048_r2 = rdna3_k2048
+            && *QKVZA_R2.get_or_init(|| {
+                std::env::var("HIPFIRE_RDNA3_QKVZA_R2").as_deref() == Ok("1")
+            });
         static QKVZA_CPOL_SLC: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_cpol_slc = rdna3_k2048
             && *QKVZA_CPOL_SLC.get_or_init(|| {
@@ -2565,6 +2570,17 @@ impl Gpu {
                 "fused_qkvza_hfq4g256_reduce_chain",
                 [32u32, 1, 1],
                 total_m as u32,
+            )
+        } else if rdna3_k2048_r2 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_r2_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_R2_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_k2048_r2",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_r2",
+                [32u32, 1, 1],
+                (total_m as u32).div_ceil(2),
             )
         } else if rdna3_k2048_cpol_slc {
             self.ensure_kernel(
