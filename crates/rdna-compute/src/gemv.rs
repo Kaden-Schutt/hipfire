@@ -4119,6 +4119,42 @@ impl Gpu {
         }
     }
 
+    /// TQ2-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
+    pub fn gemv_tq2g128(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_tq2g128", kernels::GEMV_TQ2G128_SRC, "gemv_tq2g128")?;
+        let func = &self.functions["gemv_tq2g128"];
+        let mut ap = a_raw.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HFQ6-G256 GEMV with fused residual add: y[row] += A[row] . x.
     /// Same shape as gemv_hfq6g256; only the final write differs (+= vs =).
     /// Used for wo and w_down in HFQ6 / MQ6 forward paths so the
