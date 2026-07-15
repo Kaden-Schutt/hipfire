@@ -58,8 +58,9 @@ pub struct AttnParams<'a> {
     /// Tree window cols (0 for plain causal).
     pub block_cols: usize,
     /// Optional Qwen decode gate. When present on the narrow Q8 single-token
-    /// path, the family pairs the K/V writes and applies the gate in the flash
-    /// reduce epilogue; all other callers leave this `None`.
+    /// path, the family pairs the K/V writes and applies the gate plus MQ
+    /// rotation in the flash-reduce epilogue; all other callers leave this
+    /// `None`.
     pub output_gate: Option<&'a GpuTensor>,
     pub output: &'a GpuTensor,
 }
@@ -739,7 +740,7 @@ fn dispatch_attend(
                 let seq_len = io.pos + 1;
                 let fp = io.flash_partials.unwrap();
                 if let Some(gate) = io.output_gate {
-                    hip!(gpu.attention_flash_q8_0_gated_gfx1100(
+                    hip!(gpu.attention_flash_q8_0_gated_mq_rotate_gfx1100(
                         io.q,
                         io.k_cache,
                         io.v_cache,

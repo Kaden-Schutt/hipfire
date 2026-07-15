@@ -549,8 +549,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(48),
         ]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
-        "attention_flash_q8_0_reduce_gated_gfx1100" => {
-            Some(vec![read(0), write(8), read(16), read(32)])
+        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100" => {
+            Some(vec![read(0), write(8), read(16), read(24), read(32), read(48)])
         }
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
         _ => None,
@@ -598,7 +598,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rmsnorm_reduce_gfx1100"
         | "sigmoid_mul_f32" => Some(32),
         "attention_flash_q8_0_reduce"
-        | "attention_flash_q8_0_reduce_gated_gfx1100"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -626,6 +625,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "qwen35_fa_prep_gfx1100"
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum" => Some(72),
@@ -2546,7 +2546,7 @@ mod tests {
         "kv_cache_write_q8_0_pair",
         "attention_flash_fwht3_tile",
         "attention_flash_q8_0_reduce",
-        "attention_flash_q8_0_reduce_gated_gfx1100",
+        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
         "sigmoid_mul_f32",
         "gemv_hfq4g256_multirow_r2",
         "gemv_hfq4g256_multirow_r4",

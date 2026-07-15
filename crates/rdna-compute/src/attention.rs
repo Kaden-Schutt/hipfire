@@ -1954,10 +1954,11 @@ impl Gpu {
         )
     }
 
-    /// Q8 flash-attention decode with the Qwen output gate folded into the
-    /// reduce epilogue. The tile pass is identical to `attention_flash_q8_0`.
+    /// Q8 flash-attention decode with the Qwen output gate and MQ rotation
+    /// folded into the reduce epilogue. The tile pass is identical to
+    /// `attention_flash_q8_0`.
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_flash_q8_0_gated_gfx1100(
+    pub fn attention_flash_q8_0_gated_mq_rotate_gfx1100(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -2098,17 +2099,22 @@ impl Gpu {
             let ts = tile_size as i32;
             let mt = max_tiles as i32;
             if let Some(gate) = output_gate {
-                const KERNEL: &str = "attention_flash_q8_0_reduce_gated_gfx1100";
+                const KERNEL: &str = "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100";
                 self.ensure_kernel(
                     KERNEL,
                     kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
                     KERNEL,
                 )?;
+                self.ensure_mq_signs()?;
                 let g_ptr = gate.buf.as_ptr();
+                let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+                let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
                 let mut params: Vec<*mut c_void> = vec![
                     &p_ptr as *const _ as *mut c_void,
                     &o_ptr as *const _ as *mut c_void,
                     &g_ptr as *const _ as *mut c_void,
+                    &s1_ptr as *const _ as *mut c_void,
+                    &s2_ptr as *const _ as *mut c_void,
                     &nh as *const _ as *mut c_void,
                     &hd as *const _ as *mut c_void,
                     &pos_ptr as *const _ as *mut c_void,
@@ -2119,13 +2125,15 @@ impl Gpu {
                     KERNEL,
                     [n_heads as u32, 1, 1],
                     [256, 1, 1],
-                    (max_tiles * 4) as u32,
+                    ((max_tiles + head_dim) * 4) as u32,
                     &mut params,
                     || {
                         let mut b = hip_bridge::KernargBlob::new();
                         b.push_ptr(p_ptr);
                         b.push_ptr(o_ptr);
                         b.push_ptr(g_ptr);
+                        b.push_ptr(s1_ptr);
+                        b.push_ptr(s2_ptr);
                         b.push_i32(nh);
                         b.push_i32(hd);
                         b.push_ptr(pos_ptr);

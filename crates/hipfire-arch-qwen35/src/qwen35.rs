@@ -11697,19 +11697,24 @@ fn run_fa_layer_body(
     }
     let ctx = DispatchCtx::new(gpu);
     let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
+        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos)?;
 
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
     }
     {
         let wr = layer.wo.dispatch_ref();
+        let input = if fused_epilogue {
+            GemvInput::Prerotated(&s.fa_attn_out)
+        } else {
+            GemvInput::Raw(&s.fa_attn_out)
+        };
         execute_steps(
             gpu,
             &ctx,
             &[Step::GemvResidual {
                 w: &wr,
-                input: GemvInput::Raw(&s.fa_attn_out),
+                input,
                 residual: &s.x,
                 out: &s.x,
             }],
@@ -12261,19 +12266,33 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue =
-                    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
+                    kv_cache_attention_dispatch(
+                        &ctx,
+                        gpu,
+                        kv_cache,
+                        s,
+                        config,
+                        &layer.wo,
+                        layer_idx,
+                        pos,
+                    )?;
 
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                 }
                 {
                     let wr = layer.wo.dispatch_ref();
+                    let input = if fused_epilogue {
+                        GemvInput::Prerotated(&s.fa_attn_out)
+                    } else {
+                        GemvInput::Raw(&s.fa_attn_out)
+                    };
                     execute_steps(
                         gpu,
                         &ctx,
                         &[Step::GemvResidual {
                             w: &wr,
-                            input: GemvInput::Raw(&s.fa_attn_out),
+                            input,
                             residual: &s.x,
                             out: &s.x,
                         }],
@@ -12553,19 +12572,33 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue =
-                    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
+                    kv_cache_attention_dispatch(
+                        &ctx,
+                        gpu,
+                        kv_cache,
+                        s,
+                        config,
+                        &layer.wo,
+                        layer_idx,
+                        pos,
+                    )?;
 
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                 }
                 {
                     let wr = layer.wo.dispatch_ref();
+                    let input = if fused_epilogue {
+                        GemvInput::Prerotated(&s.fa_attn_out)
+                    } else {
+                        GemvInput::Raw(&s.fa_attn_out)
+                    };
                     execute_steps(
                         gpu,
                         &ctx,
                         &[Step::GemvResidual {
                             w: &wr,
-                            input: GemvInput::Raw(&s.fa_attn_out),
+                            input,
                             residual: &s.x,
                             out: &s.x,
                         }],
@@ -13308,6 +13341,7 @@ fn kv_cache_attention_dispatch(
     kv_cache: &mut llama::KvCache,
     s: &Qwen35Scratch,
     config: &Qwen35Config,
+    wo: &WeightTensor,
     layer_idx: usize,
     pos: usize,
 ) -> HipResult<bool> {
@@ -13318,7 +13352,7 @@ fn kv_cache_attention_dispatch(
         ..kv_cache.tier_inputs()
     })
     .map_err(|e| HipError::new(0, &e.to_string()))?;
-    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config)
+    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo)
         && plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteQ8_0
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
     let io = AttnParams {
@@ -13531,6 +13565,7 @@ struct Qwen35Bindings<'a> {
     n_v_heads: usize,
     hd: usize,
     precomputed_attn_x_rot: bool,
+    fa_output_prerotated: bool,
     defer_routed_combine: bool,
 }
 
@@ -13757,8 +13792,22 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         let res: HipResult<()> = (|| match op_code(op) {
             q35_op::RESID_WO => {
                 let (wo, input) = match self.layer {
-                    LayerWeights::FullAttn(l) => (&l.wo, GemvInput::Raw(&s.fa_attn_out)),
-                    LayerWeights::FullAttnMoe(l) => (&l.wo, GemvInput::Raw(&s.fa_attn_out)),
+                    LayerWeights::FullAttn(l) => {
+                        let input = if self.fa_output_prerotated {
+                            GemvInput::Prerotated(&s.fa_attn_out)
+                        } else {
+                            GemvInput::Raw(&s.fa_attn_out)
+                        };
+                        (&l.wo, input)
+                    }
+                    LayerWeights::FullAttnMoe(l) => {
+                        let input = if self.fa_output_prerotated {
+                            GemvInput::Prerotated(&s.fa_attn_out)
+                        } else {
+                            GemvInput::Raw(&s.fa_attn_out)
+                        };
+                        (&l.wo, input)
+                    }
                     LayerWeights::DeltaNet(l) => {
                         let input = if gated_norm_mq_rotate_enabled(
                             gpu,
@@ -13870,9 +13919,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         let config = self.config;
         let res: HipResult<()> = (|| match op_code(op) {
             q35_op::ATTEND_FULL => {
-                let (q_norm, k_norm) = match self.layer {
-                    LayerWeights::FullAttn(l) => (&l.q_norm, &l.k_norm),
-                    LayerWeights::FullAttnMoe(l) => (&l.q_norm, &l.k_norm),
+                let (q_norm, k_norm, wo) = match self.layer {
+                    LayerWeights::FullAttn(l) => (&l.q_norm, &l.k_norm, &l.wo),
+                    LayerWeights::FullAttnMoe(l) => (&l.q_norm, &l.k_norm, &l.wo),
                     _ => return Err(HipError::new(0, "ATTEND_FULL on non-FullAttn layer")),
                 };
                 let tap_enabled = hipfire_runtime::triattn::tap_enabled();
@@ -13944,12 +13993,14 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     self.kv_cache,
                     s,
                     config,
+                    wo,
                     self.layer_idx,
                     self.pos,
                 )?;
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                 }
+                self.fa_output_prerotated = fused_epilogue;
                 Ok(())
             }
             q35_op::ATTEND_DN_PREP => {
@@ -14331,7 +14382,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
 /// Radiowave experiment: pair the Q8 K/V cache writes and apply the Qwen
 /// output gate in the flash-attention reduce epilogue. Admission remains
 /// narrow until replay exactness and stationary product measurements pass.
-fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         std::env::var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE")
@@ -14344,6 +14395,8 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && config.n_heads == 16
         && config.n_kv_heads == 2
         && config.head_dim == 256
+        && wo.gpu_dtype == DType::MQ4G256
+        && wo.awq_scale.is_none()
 }
 
 /// Radiowave experiment: fold the DeltaNet beta/alpha scalar preparation into
@@ -14541,6 +14594,7 @@ fn forward_scratch_layers_lowered(
                 n_v_heads,
                 hd,
                 precomputed_attn_x_rot: fused_transition && reuse_fused_rotation,
+                fa_output_prerotated: false,
                 defer_routed_combine: combine_next_rms && layer_idx + 1 < config.n_layers,
             };
             superop::run_layer_program(gpu, &ctx, &program, &mut bind)
@@ -14697,6 +14751,7 @@ pub fn forward_ep(
                 n_v_heads,
                 hd,
                 precomputed_attn_x_rot: false,
+                fa_output_prerotated: false,
                 defer_routed_combine: false,
             });
         }
