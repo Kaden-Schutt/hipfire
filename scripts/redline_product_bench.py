@@ -33,6 +33,7 @@ class Daemon:
         log_path: Path,
         timeout: float,
         kv_mode: str,
+        dpm_warmup_secs: float,
     ):
         self.timeout = timeout
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,6 +46,7 @@ class Daemon:
             HIPFIRE_CASK_OFF="1",
             HIPFIRE_AR_GRAPH="1",
             HIPFIRE_GRAPH="1",
+            HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
         )
         env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
         self.proc = subprocess.Popen(
@@ -95,6 +97,7 @@ def run_arm(args, backend):
         Path(args.work_dir) / f"product-{backend}.log",
         args.timeout,
         args.kv_mode,
+        args.dpm_warmup_secs,
     )
     try:
         loaded = daemon.request(
@@ -143,7 +146,12 @@ def main():
     )
     parser.add_argument("--context", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--warmups", type=int, default=3)
+    parser.add_argument(
+        "--warmups",
+        type=int,
+        default=10,
+        help="number of short replay warmup requests (default: 10)",
+    )
     parser.add_argument(
         "--warmup-iterations",
         type=int,
@@ -159,6 +167,12 @@ def main():
         help="KV layout used by both the HipGraph and retained-replay arms",
     )
     parser.add_argument("--max-seq", type=int, default=2048)
+    parser.add_argument(
+        "--dpm-warmup-secs",
+        type=float,
+        default=0.0,
+        help="optional legacy memset warmup per daemon arm (default: 0)",
+    )
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--work-dir", default=str(REPO / ".redline-work"))
     parser.add_argument("--out", required=True)
@@ -171,7 +185,7 @@ def main():
         "iterations": args.iterations,
         "warmups": args.warmups,
         "warmup_iterations": args.warmup_iterations,
-        "dpm_warmup_secs": float(os.environ.get("HIPFIRE_DPM_WARMUP_SECS", "0")),
+        "dpm_warmup_secs": args.dpm_warmup_secs,
         "runs": args.runs,
         "transport": args.transport,
         "kv_mode": args.kv_mode,
