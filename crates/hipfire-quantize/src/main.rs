@@ -5966,7 +5966,7 @@ fn qwen35_value_transform(
 
     let reorder = nk != nv;
     let r = nv / nk; // v-heads per k-head (3)
-    let inv = |g: usize| -> usize { (g % r) * nk + (g / r) };
+    let inv = |g: usize| -> usize { (g % r) * nk + (g / r) }; // tiled→grouped
     const BLK: usize = 34; // Q2_0 bytes per 128-element block
 
     // ---- A_log: value transform (+ permute if GQA) ----
@@ -6657,8 +6657,12 @@ fn run_gguf_pipeline(
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
-        let (data, quant_type, group_size, label) = if is_norm || !is_2d {
-            // Norms and 1D tensors always F16 (primary gate)
+        // Depthwise conv1d kernels (Qwen3.5 GDN) are tiny and precision-critical;
+        // the reference keeps them full-precision. Never route them through the
+        // terminal HFQ4G128 4-bit fallback (k_dim=conv_kernel is never 256-aligned).
+        let is_conv1d = info.name.ends_with("conv1d.weight");
+        let (data, quant_type, group_size, label) = if is_norm || !is_2d || is_conv1d {
+            // Norms, 1D tensors, and conv1d always F16 (primary gate)
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
