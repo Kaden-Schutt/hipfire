@@ -69,6 +69,22 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
     int qkv_m, int z_m, int beta_m, int alpha_m,
     int K
 ) {
+    const int block_tid = threadIdx.x;
+#if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
+    // Eight row waves reuse one K=2048 activation staged as
+    // [group][element-in-lane][lane]. The transposition makes every LDS
+    // consumer read contiguous across its 32 lanes instead of producing an
+    // eight-way bank conflict from the natural lane*8 layout.
+    __shared__ float x_lds[2048];
+    #pragma unroll
+    for (int d = block_tid; d < 2048; d += HIPFIRE_QKVZA_BLOCK_SIZE) {
+        const int group = d >> 8;
+        const int j = (d >> 5) & 7;
+        const int lane = d & 31;
+        x_lds[d] = x[group * 256 + lane * 8 + j];
+    }
+    __syncthreads();
+#endif
 #if HIPFIRE_QKVZA_WAVES_PER_BLOCK > 1
     // Pack independent row waves into one workgroup. This does not split a
     // row or introduce a cross-wave reduction: each wave retains the base
@@ -152,7 +168,22 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         // Radiowave can opt gfx1100 into the same schedule after checking emitted
         // register pressure and model-level throughput. Other gfx11/gfx10 builds
         // retain the original scalar path byte-for-byte.
-#if defined(__gfx1200__) || defined(__gfx1201__) || defined(HIPFIRE_RDNA3_QKVZA_HOIST_X32)
+#if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
+        #define DOG_LDS(pk, sc, zp, group, a) \
+            (a) += (sc * (float)((pk) & 0xFu)         + zp) * x_lds[(group) * 256 + 0 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x_lds[(group) * 256 + 1 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x_lds[(group) * 256 + 2 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x_lds[(group) * 256 + 3 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x_lds[(group) * 256 + 4 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x_lds[(group) * 256 + 5 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x_lds[(group) * 256 + 6 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x_lds[(group) * 256 + 7 * 32 + tid]
+        DOG_LDS(pk0, sc0, zp0, g + 0, acc0);
+        DOG_LDS(pk1, sc1, zp1, g + 1, acc1);
+        DOG_LDS(pk2, sc2, zp2, g + 2, acc2);
+        DOG_LDS(pk3, sc3, zp3, g + 3, acc3);
+        #undef DOG_LDS
+#elif defined(__gfx1200__) || defined(__gfx1201__) || defined(HIPFIRE_RDNA3_QKVZA_HOIST_X32)
         const float4 xv0a = *reinterpret_cast<const float4*>(x + base);
         const float4 xv0b = *reinterpret_cast<const float4*>(x + base + 4);
         const float4 xv1a = *reinterpret_cast<const float4*>(x + base + 256);
@@ -212,7 +243,20 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
+#if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
+        #define TAIL_DOG_LDS(pk, sc, zp, group, a) \
+            (a) += (sc * (float)((pk) & 0xFu)         + zp) * x_lds[(group) * 256 + 0 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x_lds[(group) * 256 + 1 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x_lds[(group) * 256 + 2 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x_lds[(group) * 256 + 3 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x_lds[(group) * 256 + 4 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x_lds[(group) * 256 + 5 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x_lds[(group) * 256 + 6 * 32 + tid] \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x_lds[(group) * 256 + 7 * 32 + tid]
+        TAIL_DOG_LDS(pk, sc, zp, g, acc0);
+#else
         TAIL_DOG(pk, sc, zp, base, acc0);
+#endif
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
@@ -221,7 +265,11 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
+#if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
+        TAIL_DOG_LDS(pk, sc, zp, g, acc1);
+#else
         TAIL_DOG(pk, sc, zp, base, acc1);
+#endif
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
@@ -230,9 +278,16 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
+#if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
+        TAIL_DOG_LDS(pk, sc, zp, g, acc2);
+#else
         TAIL_DOG(pk, sc, zp, base, acc2);
+#endif
     }
     #undef TAIL_DOG
+#if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
+    #undef TAIL_DOG_LDS
+#endif
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)

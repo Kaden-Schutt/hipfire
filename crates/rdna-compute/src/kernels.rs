@@ -2399,6 +2399,19 @@ pub const FUSED_QKVZA_HFQ4G256_WAVEPACK4_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+// Eight exact row waves share one bank-conflict-free LDS activation tile.
+// Exact gfx1100/K=2048 experiment; host routing enforces the fixed-K contract.
+pub const FUSED_QKVZA_HFQ4G256_LDSX8_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_LDSX8 1\n",
+    "#define HIPFIRE_QKVZA_WAVES_PER_BLOCK 8\n",
+    "#define HIPFIRE_QKVZA_BLOCK_SIZE 256\n",
+    "#define HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU 2\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_ldsx8\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 // CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
 // to (total_m+1)/2. Byte-exact vs the wave32 base kernel.

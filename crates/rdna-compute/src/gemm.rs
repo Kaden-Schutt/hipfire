@@ -2511,9 +2511,23 @@ impl Gpu {
         let rdna3_wavepack4 = self.arch_caps.is_rdna3_dgpu()
             && self.flags.rdna3_hfq4_qkvza_wavepack4
             && total_m <= 2_048;
+        let rdna3_ldsx8 = self.arch_caps.is_gfx1100()
+            && self.flags.rdna3_hfq4_qkvza_ldsx8
+            && k == 2_048;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
-        let (func_name, block, grid_x) = if rdna3_2wave {
+        let (func_name, block, grid_x) = if rdna3_ldsx8 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_ldsx8_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_LDSX8_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_ldsx8",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_ldsx8",
+                [256u32, 1, 1],
+                (total_m as u32).div_ceil(8),
+            )
+        } else if rdna3_2wave {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_2wave",
                 kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC,

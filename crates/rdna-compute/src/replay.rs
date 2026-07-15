@@ -340,7 +340,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     match kernel {
         "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
-        "fused_qkvza_hfq4g256" | "fused_qkvza_hfq4g256_wavepack4" => Some(vec![
+        "fused_qkvza_hfq4g256"
+        | "fused_qkvza_hfq4g256_wavepack4"
+        | "fused_qkvza_hfq4g256_ldsx8" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -485,6 +487,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_wavepack4"
+        | "fused_qkvza_hfq4g256_ldsx8"
         | "gated_delta_net_q8_fast" => Some(96),
         _ => None,
     }
@@ -2225,6 +2228,7 @@ mod tests {
         "fused_rmsnorm_mq_rotate",
         "fused_qkvza_hfq4g256",
         "fused_qkvza_hfq4g256_wavepack4",
+        "fused_qkvza_hfq4g256_ldsx8",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "fused_qk_l2_norm_scale_f32",
