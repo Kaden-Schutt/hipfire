@@ -5941,6 +5941,121 @@ fn qwen35_layer_types(n_layers: u64, interval: u64) -> Vec<&'static str> {
         .collect()
 }
 
+/// Invert PrismML's grouped→tiled V-head reorder (D1) and apply the A_log
+/// -exp inverse (D2) for a qwen35 GGUF tensor. Returns Some(transformed_bytes)
+/// when this tensor needs a value transform, else None (caller keeps raw).
+///
+/// Direction is verified against hipfire kernels and MUST NOT be flipped:
+/// GGUF stores V-heads TILED; hipfire repeat-INTERLEAVES K→V
+/// (qwen35.rs:8662-8683) so it expects GROUPED order → invert tiled→grouped.
+/// hipfire's fused_sigmoid_alpha_gate applies -exp(A_log) itself, so
+/// A_log must hold the raw log parameter: A_log_raw = ln(-gguf_ssm_a).
+fn qwen35_value_transform(
+    gguf_name: &str,
+    raw: &[u8],
+    shape: &[usize],
+    nk: usize, // linear_num_key_heads   (16)
+    nv: usize, // linear_num_value_heads (48)
+    hv: usize, // linear_value_head_dim  (128)
+) -> Option<Vec<u8>> {
+    // rel = name with the "blk.N." prefix removed
+    let rel = gguf_name
+        .strip_prefix("blk.")
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(_n, r)| r)?;
+
+    let reorder = nk != nv;
+    let r = nv / nk; // v-heads per k-head (3)
+    let inv = |g: usize| -> usize { (g % r) * nk + (g / r) };
+    const BLK: usize = 34; // Q2_0 bytes per 128-element block
+
+    // ---- A_log: value transform (+ permute if GQA) ----
+    if rel == "ssm_a" {
+        let mut vals: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        for v in vals.iter_mut() {
+            *v = (-*v).ln(); // A = -exp(raw) < 0  ⇒  -A > 0  ⇒  ln(-A) = raw
+        }
+        let out: Vec<f32> = if reorder {
+            (0..nv).map(|g| vals[inv(g)]).collect()
+        } else {
+            vals
+        };
+        return Some(out.iter().flat_map(|v| v.to_le_bytes()).collect());
+    }
+
+    if !reorder {
+        return None;
+    }
+
+    // ---- pure permutations (no value change) ----
+    if rel == "ssm_dt.bias" {
+        let vals: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let out: Vec<f32> = (0..nv).map(|g| vals[inv(g)]).collect();
+        return Some(out.iter().flat_map(|v| v.to_le_bytes()).collect());
+    }
+
+    let ne0 = shape[0];
+
+    // permute `nv` contiguous head-blocks of `chunk` bytes at `base`;
+    // bytes outside [base, base+nv*chunk) are copied verbatim.
+    let permute = |base: usize, chunk: usize| -> Vec<u8> {
+        let mut out = raw.to_vec();
+        for g in 0..nv {
+            let dst = base + g * chunk;
+            let src = base + inv(g) * chunk;
+            out[dst..dst + chunk].copy_from_slice(&raw[src..src + chunk]);
+        }
+        out
+    };
+
+    match rel {
+        // Q2_0 (ne0,ne1)=(5120,10240): V rows [nk*hv*2 ..), row=(ne0/128)*34
+        "attn_qkv.weight" => {
+            let row = (ne0 / 128) * BLK;
+            let base = (nk * hv * 2) * row; // 4096 * row
+            Some(permute(base, hv * row)) // head = hv ne1-rows
+        }
+        // Q2_0 (5120,6144): all rows are V
+        "attn_gate.weight" => {
+            let row = (ne0 / 128) * BLK;
+            Some(permute(0, hv * row))
+        }
+        // Q2_0 (5120,48): head_dim = 1 → one ne1-row per head
+        "ssm_alpha.weight" | "ssm_beta.weight" => {
+            let row = (ne0 / 128) * BLK;
+            Some(permute(0, row))
+        }
+        // Q2_0 (6144,5120): reorder ne0 columns → per-row 48-block permute
+        "ssm_out.weight" => {
+            let ne1 = shape[1];
+            let row_bytes = (ne0 / 128) * BLK; // 48*34 = 1632
+            let mut out = raw.to_vec();
+            for rrow in 0..ne1 {
+                let rb = rrow * row_bytes;
+                for g in 0..nv {
+                    let dst = rb + g * BLK;
+                    let src = rb + inv(g) * BLK;
+                    out[dst..dst + BLK].copy_from_slice(&raw[src..src + BLK]);
+                }
+            }
+            Some(out)
+        }
+        // F32 (4,10240): V channels [nk*hv*2 ..), each channel = ne0 f32
+        "ssm_conv1d.weight" => {
+            let chan = ne0 * 4; // 16 bytes
+            let base = (nk * hv * 2) * chan; // 4096 * 16
+            Some(permute(base, hv * chan))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod qwen35_onboarding_tests {
     use super::*;
@@ -6062,6 +6177,131 @@ mod qwen35_onboarding_tests {
         // `.max(1)` clamps it so every layer ends up FullAttention.
         let types = qwen35_layer_types(4, 0);
         assert_eq!(types, vec!["full_attention"; 4]);
+    }
+
+    // ── qwen35_value_transform: A_log (-exp inverse) + V-head un-tiling ────
+
+    #[test]
+    fn qwen35_inv_perm_inverts_tiling() {
+        let (nk, nv, r) = (16usize, 48usize, 3usize);
+        let a: Vec<usize> = (0..nv).collect(); // grouped source
+        let mut tiled = vec![0usize; nv]; // PrismML forward grouped→tiled
+        for kh in 0..nk {
+            for vpk in 0..r {
+                tiled[vpk * nk + kh] = a[kh * r + vpk];
+            }
+        }
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        let rec: Vec<usize> = (0..nv).map(|g| tiled[inv(g)]).collect();
+        assert_eq!(rec, a, "inv must undo PrismML's grouped→tiled reorder");
+        let mut sorted = (0..nv).map(inv).collect::<Vec<_>>();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            (0..nv).collect::<Vec<_>>(),
+            "inv must be a bijection"
+        );
+    }
+
+    #[test]
+    fn qwen35_alog_roundtrip() {
+        for &x in &[-8.0f32, -3.5, -1.0, 0.0, 0.7] {
+            let gguf = -(x.exp()); // PrismML stored A = -exp(x)
+            let recovered = (-gguf).ln(); // our transform
+            assert!((recovered - x).abs() < 1e-5);
+        }
+        // and check the helper emits it for ssm_a
+        let raw: Vec<u8> = [-(0.5f32.exp()), -(2.0f32.exp())]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        // nk==nv → no reorder, only ln
+        let out = qwen35_value_transform("blk.0.ssm_a", &raw, &[2], 2, 2, 128).unwrap();
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert!((got[0] - 0.5).abs() < 1e-5 && (got[1] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn qwen35_ssm_alpha_full_permute() {
+        let (nk, nv) = (2usize, 6usize);
+        let ne0 = 128usize; // 1 block → row = 34 bytes
+        let row = 34usize;
+        let mut raw = vec![0u8; nv * row];
+        for g in 0..nv {
+            for b in 0..row {
+                raw[g * row + b] = (g as u8) + 1;
+            }
+        }
+        let out = qwen35_value_transform("blk.0.ssm_alpha.weight", &raw, &[ne0, nv], nk, nv, 128)
+            .unwrap();
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for g in 0..nv {
+            assert_eq!(
+                out[g * row],
+                (inv(g) as u8) + 1,
+                "grouped head {g} must come from tiled head {}",
+                inv(g)
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_qkv_v_permuted_qk_untouched() {
+        let (nk, nv, hv) = (2usize, 6usize, 4usize);
+        let ne0 = 128usize;
+        let row = 34usize;
+        let v_start = nk * hv * 2; // 16 rows
+        let ne1 = v_start + nv * hv; // 40 rows
+        let mut raw = vec![0u8; ne1 * row];
+        for rr in 0..ne1 {
+            for b in 0..row {
+                raw[rr * row + b] = rr as u8;
+            }
+        }
+        let out =
+            qwen35_value_transform("blk.5.attn_qkv.weight", &raw, &[ne0, ne1], nk, nv, hv).unwrap();
+        // Q/K region untouched
+        for rr in 0..v_start {
+            assert_eq!(out[rr * row], rr as u8, "Q/K row {rr} must be untouched");
+        }
+        // V head-blocks permuted by inv (each head = hv rows)
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for g in 0..nv {
+            for e in 0..hv {
+                let dst_row = v_start + g * hv + e;
+                let src_row = v_start + inv(g) * hv + e;
+                assert_eq!(out[dst_row * row], src_row as u8, "V head {g} elem {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35_ssm_out_column_block_permute() {
+        let (nk, nv) = (2usize, 6usize);
+        let ne0 = nv * 128;
+        let ne1 = 3usize;
+        let blk = 34usize;
+        let row_bytes = (ne0 / 128) * blk; // 6*34
+        let mut raw = vec![0u8; ne1 * row_bytes];
+        for rr in 0..ne1 {
+            for blk_i in 0..nv {
+                raw[rr * row_bytes + blk_i * blk] = (rr * nv + blk_i) as u8;
+            }
+        }
+        let out =
+            qwen35_value_transform("blk.0.ssm_out.weight", &raw, &[ne0, ne1], nk, nv, 128).unwrap();
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for rr in 0..ne1 {
+            for g in 0..nv {
+                assert_eq!(out[rr * row_bytes + g * blk], (rr * nv + inv(g)) as u8);
+            }
+        }
     }
 }
 
@@ -6368,8 +6608,36 @@ fn run_gguf_pipeline(
     let mut total_bytes_in: u64 = 0;
     let mut total_bytes_out: u64 = 0;
 
+    // qwen35 linear-attn head geometry, for the V-head un-tiling + A_log transform.
+    let (qw_nk, qw_nv, qw_hv): (Option<usize>, Option<usize>, Option<usize>) =
+        if arch_str == "qwen35" || arch_str == "qwen35moe" {
+            let g = |k: &str| gguf.metadata.get(k).and_then(meta_value_as_u64);
+            let nk = g(&format!("{arch_str}.ssm.group_count")); // 16
+            let nv = g(&format!("{arch_str}.ssm.time_step_rank")); // 48
+            let inner = g(&format!("{arch_str}.ssm.inner_size")); // 6144
+            match (nk, nv, inner) {
+                (Some(k), Some(v), Some(i)) if v > 0 => {
+                    (Some(k as usize), Some(v as usize), Some((i / v) as usize))
+                }
+                _ => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
+    let mut qw_xform_count = 0usize;
+
     for info in &gguf.tensors {
         let raw = gguf.tensor_data(info);
+        let qw_transformed: Option<Vec<u8>> = match (qw_nk, qw_nv, qw_hv) {
+            (Some(nk), Some(nv), Some(hv)) => {
+                qwen35_value_transform(&info.name, raw, &info.shape, nk, nv, hv)
+            }
+            _ => None,
+        };
+        if qw_transformed.is_some() {
+            qw_xform_count += 1;
+        }
+        let raw: &[u8] = qw_transformed.as_deref().unwrap_or(raw);
         let n_elements = info.numel();
         total_params += n_elements as u64;
         total_bytes_in += raw.len() as u64;
@@ -6769,6 +7037,12 @@ fn run_gguf_pipeline(
             data,
             spilled_len: 0,
         });
+    }
+
+    if qw_xform_count > 0 {
+        eprintln!(
+            "qwen35 value-transform: applied to {qw_xform_count} tensors (A_log + V-head un-tiling)"
+        );
     }
 
     eprintln!("\n=== GGUF → MQ4 Summary ===");
