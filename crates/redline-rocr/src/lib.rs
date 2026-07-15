@@ -28,6 +28,7 @@ pub mod abi;
 #[doc(hidden)]
 pub mod packet;
 mod pm4;
+mod pm4_gfx10;
 mod runtime;
 
 pub use abi::{MissingSymbol, Symbols};
@@ -36,6 +37,9 @@ pub use packet::{
     PacketError,
 };
 pub use pm4::{Gfx12Pm4CommandBuffer, Pm4BuildError};
+pub use pm4_gfx10::{
+    Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer, Gfx11Pm4CommandBuffer,
+};
 pub use runtime::DEFAULT_WAIT_TIMEOUT;
 pub use runtime::{
     AqlQueue, CompletionSignal, Executable, GpuDevice, GpuSelector, KernargBuffer, KernargPool,

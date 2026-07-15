@@ -11,6 +11,7 @@ pub use generic::{AqlKernelCatalog, GenericAqlError, PreparedAqlPlan};
 pub use redline_rocr::abi;
 pub use redline_rocr::{
     AqlQueue, BARRIER_DEPENDENCY_CAPACITY, CompletionSignal, Executable, FenceScope,
+    Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer, Gfx11Pm4CommandBuffer,
     Gfx12Pm4CommandBuffer, GpuDevice, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool,
     Kernel, KernelMetadata, KernelPm4Metadata, LaunchGeometry, LoadError, MissingSymbol,
     PacketError, PciBusId, PciBusIdParseError, Pm4BuildError, QueueDepthReport, QueueDepthSample,

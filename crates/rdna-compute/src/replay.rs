@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
-    load_symbols, BatchFencePolicy, Executable, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuSelector,
-    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, RecordedDispatch, Runtime,
-    SingleQueueBatchGraph, SingleQueuePm4Ib,
+    load_symbols, BatchFencePolicy, Executable, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
+    GpuBatchTiming, GpuDevice, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
+    LaunchGeometry, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +33,136 @@ pub enum ReplayBackendRequest {
 enum ReplayTransport {
     AqlPackets,
     Pm4Ib,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pm4Architecture {
+    Gfx10,
+    Gfx11,
+    Gfx12,
+}
+
+impl Pm4Architecture {
+    fn from_device(device: &GpuDevice) -> Result<Self, String> {
+        let name = device.name().to_ascii_lowercase();
+        if name.starts_with("gfx10") {
+            Ok(Self::Gfx10)
+        } else if name.starts_with("gfx11") {
+            Ok(Self::Gfx11)
+        } else if name.starts_with("gfx12") {
+            Ok(Self::Gfx12)
+        } else {
+            Err(format!(
+                "retained PM4 has no certified register map for HSA agent {:?}",
+                device.name()
+            ))
+        }
+    }
+}
+
+enum Pm4Commands {
+    Legacy {
+        architecture: Pm4Architecture,
+        commands: Gfx10Pm4CommandBuffer,
+    },
+    Gfx12(Gfx12Pm4CommandBuffer),
+}
+
+impl Pm4Commands {
+    fn new(architecture: Pm4Architecture, policy: Pm4RegisterPolicy) -> Self {
+        match architecture {
+            Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
+                let commands = match policy {
+                    Pm4RegisterPolicy::Legacy => Gfx10Pm4CommandBuffer::new(),
+                    Pm4RegisterPolicy::Static | Pm4RegisterPolicy::Stateful => {
+                        Gfx10Pm4CommandBuffer::new_stateful()
+                    }
+                };
+                Self::Legacy {
+                    architecture,
+                    commands,
+                }
+            }
+            Pm4Architecture::Gfx12 => {
+                let commands = match policy {
+                    Pm4RegisterPolicy::Legacy => Gfx12Pm4CommandBuffer::new(),
+                    Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
+                    Pm4RegisterPolicy::Stateful => Gfx12Pm4CommandBuffer::new_stateful(),
+                };
+                Self::Gfx12(commands)
+            }
+        }
+    }
+
+    fn acquire_system(&mut self, gfx12_gcr_trim: bool) {
+        match self {
+            Self::Legacy { commands, .. } => commands.acquire_system(),
+            Self::Gfx12(commands) if gfx12_gcr_trim => commands.acquire_system_gfx12(),
+            Self::Gfx12(commands) => commands.acquire_system(),
+        }
+    }
+
+    fn acquire_inter_node(&mut self, gfx12_gcr_trim: bool) {
+        match self {
+            Self::Legacy { commands, .. } => commands.acquire_inter_node_same_agent(),
+            Self::Gfx12(commands) if gfx12_gcr_trim => commands.acquire_inter_node_gfx12(),
+            Self::Gfx12(commands) => commands.acquire_system(),
+        }
+    }
+
+    fn wait_compute_idle(&mut self) {
+        match self {
+            Self::Legacy { commands, .. } => commands.wait_compute_idle(),
+            Self::Gfx12(commands) => commands.wait_compute_idle(),
+        }
+    }
+
+    fn dispatch(
+        &mut self,
+        kernel: &Kernel,
+        geometry: LaunchGeometry,
+        dynamic_group_bytes: u32,
+        kernarg_address: *mut std::ffi::c_void,
+    ) -> Result<(), String> {
+        match self {
+            Self::Legacy { commands, .. } => commands
+                .dispatch(kernel, geometry, dynamic_group_bytes, kernarg_address)
+                .map_err(|error| error.to_string()),
+            Self::Gfx12(commands) => commands
+                .dispatch(kernel, geometry, dynamic_group_bytes, kernarg_address)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    fn len_dwords(&self) -> u32 {
+        match self {
+            Self::Legacy { commands, .. } => commands.len_dwords(),
+            Self::Gfx12(commands) => commands.len_dwords(),
+        }
+    }
+
+    fn create_graph(
+        &self,
+        device: &GpuDevice,
+        pool: &KernargPool,
+    ) -> Result<SingleQueuePm4Ib, String> {
+        match self {
+            Self::Legacy {
+                architecture: Pm4Architecture::Gfx10,
+                commands,
+            } => SingleQueuePm4Ib::create_gfx10(device, pool, commands),
+            Self::Legacy {
+                architecture: Pm4Architecture::Gfx11,
+                commands,
+            } => SingleQueuePm4Ib::create_gfx11(device, pool, commands),
+            Self::Legacy {
+                architecture: Pm4Architecture::Gfx12,
+                ..
+            } => unreachable!("gfx12 never uses the legacy PM4 command variant"),
+            Self::Gfx12(commands) => SingleQueuePm4Ib::create(device, pool, commands),
+        }
+        .map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1150,9 +1280,9 @@ impl ReplayController {
         Ok(summary)
     }
 
-    /// Lower a captured prefix to one retained GFX12 PM4 indirect buffer.
-    /// The initial diagnostic form serializes every dispatch boundary. The
-    /// coherence gate can then remove only boundaries proven independent.
+    /// Lower a captured prefix to one retained architecture-native PM4
+    /// indirect buffer. Unsupported HSA agents fail closed before commands are
+    /// constructed; gfx10/11 and gfx12 never share register encodings.
     pub fn prepare_pm4_prefix(
         &mut self,
         device_ordinal: usize,
@@ -1172,6 +1302,7 @@ impl ReplayController {
         let device = runtime
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
+        let pm4_architecture = Pm4Architecture::from_device(&device)?;
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -1231,19 +1362,11 @@ impl ReplayController {
             geometries.push(geometry);
         }
 
-        let mut commands = match self.pm4_register_policy {
-            Pm4RegisterPolicy::Legacy => Gfx12Pm4CommandBuffer::new(),
-            Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
-            Pm4RegisterPolicy::Stateful => Gfx12Pm4CommandBuffer::new_stateful(),
-        };
+        let mut commands = Pm4Commands::new(pm4_architecture, self.pm4_register_policy);
         let gfx12_gcr_trim = std::env::var("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
-        if gfx12_gcr_trim {
-            commands.acquire_system_gfx12();
-        } else {
-            commands.acquire_system();
-        }
+        commands.acquire_system(gfx12_gcr_trim);
         let mut wait_audit = Pm4WaitAudit::default();
         let mut resource_frontier = ResourceFrontier::default();
         for index in 0..prefix {
@@ -1279,11 +1402,7 @@ impl ReplayController {
                     .pm4_mid_acquire_policy
                     .acquire_between(previous, current)
                 {
-                    if gfx12_gcr_trim {
-                        commands.acquire_inter_node_gfx12();
-                    } else {
-                        commands.acquire_system();
-                    }
+                    commands.acquire_inter_node(gfx12_gcr_trim);
                 }
             } else {
                 resource_frontier.advance(&self.recorded[index], false);
@@ -1302,8 +1421,7 @@ impl ReplayController {
             wait_audit.report(self.pm4_wait_policy);
         }
         let command_dwords = commands.len_dwords();
-        let graph = SingleQueuePm4Ib::create(&device, &pool, &commands)
-            .map_err(|error| error.to_string())?;
+        let graph = commands.create_graph(&device, &pool)?;
         let queue_id = graph.queue_id();
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,

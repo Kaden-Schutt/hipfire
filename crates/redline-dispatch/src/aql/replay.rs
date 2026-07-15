@@ -10,8 +10,9 @@ use redline_rocr::packet::{
     PacketError, PacketImage,
 };
 use redline_rocr::{
-    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx12Pm4CommandBuffer, GpuDevice, HeaderPolicy,
-    KernargBuffer, KernargPool, Kernel, QueueDepthReport, QueueSet, RuntimeError,
+    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
+    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, QueueDepthReport, QueueSet,
+    RuntimeError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,18 +62,42 @@ impl SingleQueuePm4Ib {
         pool: &KernargPool,
         commands: &Gfx12Pm4CommandBuffer,
     ) -> Result<Self, ReplayError> {
-        if commands.is_empty() {
+        Self::create_encoded(device, pool, commands.as_bytes(), commands.len_dwords())
+    }
+
+    /// Create a retained GFX10 PM4 IB using the legacy compute-register map.
+    pub fn create_gfx10(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        commands: &Gfx10Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        Self::create_encoded(device, pool, commands.as_bytes(), commands.len_dwords())
+    }
+
+    /// GFX11 shares the GFX10 compute-register map but remains an explicit
+    /// constructor so callers cannot silently submit a legacy IB on GFX12.
+    pub fn create_gfx11(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        commands: &Gfx10Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        Self::create_encoded(device, pool, commands.as_bytes(), commands.len_dwords())
+    }
+
+    fn create_encoded(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        bytes: Vec<u8>,
+        dwords: u32,
+    ) -> Result<Self, ReplayError> {
+        if dwords == 0 {
             return Err(ReplayError::EmptyGraph);
         }
-        let bytes = commands.as_bytes();
         let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
         indirect.write_exact(&bytes)?;
         let completion = CompletionSignal::new(device)?;
-        let packet = PacketImage::pm4_indirect_buffer(
-            indirect.address(),
-            commands.len_dwords(),
-            completion.raw(),
-        )?;
+        let packet =
+            PacketImage::pm4_indirect_buffer(indirect.address(), dwords, completion.raw())?;
         let queue_size = *device.queue_size_range().start();
         let queues = QueueSet::create(device, 1, queue_size)?;
         Ok(Self {
