@@ -5153,7 +5153,21 @@ impl Gpu {
             && self.flags.rdna3_hfq4_sigmoid_rows4;
         let rdna3_buffer = self.arch_caps.is_rdna3_dgpu()
             && self.flags.rdna3_hfq4_sigmoid_buffer;
-        let (module, source) = if rdna3_rows4 && rdna3_buffer {
+        use std::sync::OnceLock;
+        static SIGMOID_K512: OnceLock<bool> = OnceLock::new();
+        let rdna3_k512 = self.arch_caps.is_gfx1100()
+            && rdna3_buffer
+            && !rdna3_rows4
+            && k == 512
+            && *SIGMOID_K512.get_or_init(|| {
+                std::env::var("HIPFIRE_RDNA3_HFQ4_SIGMOID_K512").as_deref() == Ok("1")
+            });
+        let (module, source) = if rdna3_k512 {
+            (
+                "gemv_hfq4g256_residual_sigmoid_k512_buffer_gfx1100",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_BUFFER_GFX1100_SRC,
+            )
+        } else if rdna3_rows4 && rdna3_buffer {
             (
                 "gemv_hfq4g256_residual_sigmoid_rows4_buffer_gfx1100",
                 kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_ROWS4_BUFFER_GFX1100_SRC,

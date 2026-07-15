@@ -391,7 +391,14 @@ extern "C" __global__ void gemv_hfq4g256_residual_sigmoid_scaled_gpu(
     const bool have_row1 = row1 < M;
     const int tid = threadIdx.x;
 
+#if HIPFIRE_RDNA3_SIGMOID_K512
+    // The gfx1100 A3B shared-down decode shape is fixed at K=512. Keeping the
+    // public ABI unchanged lets replay reuse the same kernarg while LLVM can
+    // delete the empty quad loop and dynamic tail predicates.
+    const int groups_per_row = 2;
+#else
     const int groups_per_row = K / 256;
+#endif
     const long long row_stride = (long long)groups_per_row * 136;
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;

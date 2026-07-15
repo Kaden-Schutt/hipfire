@@ -1244,6 +1244,15 @@ pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
 );
+/// Radiowave gfx1100 shared-down specialization. The hot A3B decode shape is
+/// K=512 (two HFQ4 groups), so the compiler can remove the empty quad loop and
+/// all dynamic tail predicates while retaining the public kernarg ABI.
+pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_SIGMOID_K512 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_ROWS4_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_SIGMOID_ROWS4 1\n",
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
