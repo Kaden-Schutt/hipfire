@@ -59,6 +59,8 @@ pub struct FeatureFlags {
     pub rdna3_hfq4_qkvza_hoist_x32: bool,
     /// Compile the exact A3B decode shape with eight HFQ4 groups fixed at
     /// compile time, deleting the general QKVZA loop and tail machinery.
+    /// Certified default on gfx1100; set
+    /// `HIPFIRE_RDNA3_HFQ4_QKVZA_K2048=0` to restore the general kernel.
     pub rdna3_hfq4_qkvza_k2048: bool,
     /// Stage one residual GEMV row's 32 activation values ahead of the
     /// independent packed-weight loads. Certified default on exact gfx1100;
@@ -327,9 +329,8 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_hoist_x32: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
                 .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_k2048: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
-                .as_deref()
-                == Ok("1"),
+            rdna3_hfq4_qkvza_k2048: parse_bool("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
+                .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
                 .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_sigmoid_tight_grid: std::env::var(
