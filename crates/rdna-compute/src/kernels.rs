@@ -1254,6 +1254,8 @@ pub const MOE_SOFTMAX_TOPK_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_softmax_topk_k8.hip");
 pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip");
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64_exact.hip");
 
 /// MoE top-K + renorm only, given pre-softmaxed probs. Companion to
 /// the regular softmax_f32 kernel; the dispatch site runs softmax_f32

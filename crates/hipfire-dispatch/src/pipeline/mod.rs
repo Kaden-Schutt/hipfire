@@ -430,13 +430,25 @@ pub fn run_moe_decode(
             }
         }
     }
+    let gfx1100_router_mode = std::env::var("HIPFIRE_GFX1100_ROUTER_W64").ok();
+    let exact_wave64_router = ctx.arch.is_gfx1100()
+        && p.n_exp == 256
+        && gfx1100_router_mode.as_deref() == Some("exact");
     let wave64_router = (ctx.arch.is_gfx1201()
         && std::env::var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
         || (ctx.arch.is_gfx1100()
             // Research-only: faster on gfx1100, but its 1-ULP routing-weight
             // drift can change greedy trajectories and trigger an attractor.
-            && std::env::var("HIPFIRE_GFX1100_ROUTER_W64").as_deref() == Ok("1"));
-    if wave64_router {
+            && gfx1100_router_mode.as_deref() == Some("1"));
+    if exact_wave64_router {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else if wave64_router {
         hip!(gpu.moe_router_softmax_topk_k8_wave64(
             p.router_logits,
             p.topk_indices,
