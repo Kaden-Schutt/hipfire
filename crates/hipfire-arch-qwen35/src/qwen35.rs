@@ -13499,47 +13499,92 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 ),
                 _ => return Err(DispatchError::Hip("PROJ_QKV on non-FullAttn layer".into())),
             },
-            q35_op::PROJ_QKVZA => match self.layer {
-                LayerWeights::DeltaNet(l) => qkvza_via_execute_steps(
+            q35_op::PROJ_QKVZA => {
+                let (wqkv, wz, w_beta, w_alpha, attn_norm, dt_bias, a_log) =
+                    match self.layer {
+                        LayerWeights::DeltaNet(l) => (
+                            &l.wqkv,
+                            &l.wz,
+                            &l.w_beta,
+                            &l.w_alpha,
+                            &l.attn_norm,
+                            &l.dt_bias,
+                            &l.a_log,
+                        ),
+                        LayerWeights::DeltaNetMoe(l) => (
+                            &l.wqkv,
+                            &l.wz,
+                            &l.w_beta,
+                            &l.w_alpha,
+                            &l.attn_norm,
+                            &l.dt_bias,
+                            &l.a_log,
+                        ),
+                        _ => {
+                            return Err(DispatchError::Hip(
+                                "PROJ_QKVZA on non-DeltaNet layer".into(),
+                            ))
+                        }
+                    };
+                if qkvza_scalar_prep_enabled(
                     gpu,
-                    ctx,
-                    &l.wqkv,
-                    &l.wz,
-                    &l.w_beta,
-                    &l.w_alpha,
-                    &l.attn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.dn_qkv,
-                    &s.dn_z,
-                    &s.dn_beta,
-                    &s.dn_alpha,
-                    config.norm_eps,
-                ),
-                LayerWeights::DeltaNetMoe(l) => qkvza_via_execute_steps(
-                    gpu,
-                    ctx,
-                    &l.wqkv,
-                    &l.wz,
-                    &l.w_beta,
-                    &l.w_alpha,
-                    &l.attn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.dn_qkv,
-                    &s.dn_z,
-                    &s.dn_beta,
-                    &s.dn_alpha,
-                    config.norm_eps,
-                ),
-                _ => {
-                    return Err(DispatchError::Hip(
-                        "PROJ_QKVZA on non-DeltaNet layer".into(),
-                    ))
+                    config,
+                    self.n_v_heads,
+                    self.dn_state.quant,
+                    wqkv,
+                    wz,
+                    w_beta,
+                    w_alpha,
+                ) {
+                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                        gpu,
+                        wqkv,
+                        &s.x,
+                        attn_norm,
+                        &s.tmp,
+                        &s.x_rot,
+                        config.norm_eps,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    let eff_x = x_rot.unwrap_or(&s.tmp);
+                    gpu.fused_qkvza_hfq4g256_scalar_prep_gfx1100(
+                        &wqkv.buf,
+                        &wz.buf,
+                        &w_beta.buf,
+                        &w_alpha.buf,
+                        eff_x,
+                        &s.dn_qkv,
+                        &s.dn_z,
+                        &s.dn_beta,
+                        &s.dn_alpha,
+                        dt_bias,
+                        a_log,
+                        wqkv.m,
+                        wz.m,
+                        w_beta.m,
+                        w_alpha.m,
+                        wqkv.k,
+                    )
+                } else {
+                    qkvza_via_execute_steps(
+                        gpu,
+                        ctx,
+                        wqkv,
+                        wz,
+                        w_beta,
+                        w_alpha,
+                        attn_norm,
+                        &s.x,
+                        &s.tmp,
+                        &s.x_rot,
+                        &s.dn_qkv,
+                        &s.dn_z,
+                        &s.dn_beta,
+                        &s.dn_alpha,
+                        config.norm_eps,
+                    )
                 }
-            },
+            }
             q35_op::PROJ_GATE_UP => match self.layer {
                 LayerWeights::DeltaNet(l) => gate_up_via_execute_steps(
                     gpu,
@@ -13728,18 +13773,45 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 Ok(())
             }
             q35_op::ATTEND_DN_PREP => {
-                let (dt_bias, a_log, conv_weight) = match self.layer {
-                    LayerWeights::DeltaNet(l) => (&l.dt_bias, &l.a_log, &l.conv_weight),
-                    LayerWeights::DeltaNetMoe(l) => (&l.dt_bias, &l.a_log, &l.conv_weight),
+                let (dt_bias, a_log, conv_weight, wqkv, wz, w_beta, w_alpha) = match self.layer {
+                    LayerWeights::DeltaNet(l) => (
+                        &l.dt_bias,
+                        &l.a_log,
+                        &l.conv_weight,
+                        &l.wqkv,
+                        &l.wz,
+                        &l.w_beta,
+                        &l.w_alpha,
+                    ),
+                    LayerWeights::DeltaNetMoe(l) => (
+                        &l.dt_bias,
+                        &l.a_log,
+                        &l.conv_weight,
+                        &l.wqkv,
+                        &l.wz,
+                        &l.w_beta,
+                        &l.w_alpha,
+                    ),
                     _ => return Err(HipError::new(0, "ATTEND_DN_PREP on non-DeltaNet layer")),
                 };
-                gpu.fused_sigmoid_alpha_gate_f32(
-                    &s.dn_beta,
-                    &s.dn_alpha,
-                    dt_bias,
-                    a_log,
+                if !qkvza_scalar_prep_enabled(
+                    gpu,
+                    config,
                     self.n_v_heads,
-                )?;
+                    self.dn_state.quant,
+                    wqkv,
+                    wz,
+                    w_beta,
+                    w_alpha,
+                ) {
+                    gpu.fused_sigmoid_alpha_gate_f32(
+                        &s.dn_beta,
+                        &s.dn_alpha,
+                        dt_bias,
+                        a_log,
+                        self.n_v_heads,
+                    )?;
+                }
                 if conv_qknorm_enabled(gpu, config, self.dn_state.quant) {
                     gpu.conv1d_silu_split_qknorm(
                         &s.dn_q_raw,
@@ -13985,6 +14057,40 @@ fn gdn_compact2_enabled(
     let arch_enabled = (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100")
         && mode.as_deref() != Some("0");
     arch_enabled && quant == StateQuant::Q8 && config.linear_num_key_heads * 2 == n_v_heads
+}
+
+/// Radiowave experiment: fold the DeltaNet beta/alpha scalar preparation into
+/// the fixed-K QKVZA producer. Keep the gate deliberately narrow until exact
+/// replay and stationary product certification justify a default flip.
+#[allow(clippy::too_many_arguments)]
+fn qkvza_scalar_prep_enabled(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    n_v_heads: usize,
+    quant: StateQuant,
+    wqkv: &WeightTensor,
+    wz: &WeightTensor,
+    w_beta: &WeightTensor,
+    w_alpha: &WeightTensor,
+) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_QKVZA_SCALAR_PREP")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    let dtype = wqkv.gpu_dtype;
+    enabled
+        && gpu.arch_caps.is_gfx1100()
+        && gdn_compact2_enabled(gpu, config, n_v_heads, quant)
+        && wqkv.k == 2_048
+        && w_beta.m == n_v_heads
+        && w_alpha.m == n_v_heads
+        && wz.gpu_dtype == dtype
+        && w_beta.gpu_dtype == dtype
+        && w_alpha.gpu_dtype == dtype
+        && matches!(dtype, DType::MQ4G256 | DType::HFQ4G256)
 }
 
 fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {

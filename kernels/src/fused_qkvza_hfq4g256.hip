@@ -66,6 +66,10 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
     float*       __restrict__ y_z,
     float*       __restrict__ y_beta,
     float*       __restrict__ y_alpha,
+#if defined(HIPFIRE_QKVZA_SCALAR_PREP)
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ a_log,
+#endif
     int qkv_m, int z_m, int beta_m, int alpha_m,
     int K
 ) {
@@ -314,5 +318,23 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         acc += __shfl_down(acc, offset);
 #endif
 
-    if (tid == 0) y[row] = acc;
+    if (tid == 0) {
+#if defined(HIPFIRE_QKVZA_SCALAR_PREP)
+        // Fold the immediately-following DeltaNet scalar preparation into
+        // the two tiny projection tails. Each beta/alpha row is transformed
+        // once, preserving the standalone kernel's float operation order.
+        if (gid >= qkv_m + z_m) {
+            if (gid < qkv_m + z_m + beta_m) {
+                acc = 1.0f / (1.0f + expf(-acc));
+            } else {
+                const float biased = acc + dt_bias[row];
+                const float sp = (biased > 20.0f)
+                    ? biased
+                    : ((biased < -20.0f) ? expf(biased) : logf(1.0f + expf(biased)));
+                acc = sp * (-expf(a_log[row]));
+            }
+        }
+#endif
+        y[row] = acc;
+    }
 }

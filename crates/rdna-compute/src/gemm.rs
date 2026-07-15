@@ -2695,6 +2695,114 @@ impl Gpu {
         result
     }
 
+    /// gfx1100/K=2048 QKVZA experiment that also prepares the DeltaNet beta
+    /// and alpha scalars. The projection FMAs and reduction are identical to
+    /// `fused_qkvza_hfq4g256`; only the two tiny output tails absorb the
+    /// elementwise work from `fused_sigmoid_alpha_gate_f32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_hfq4g256_scalar_prep_gfx1100(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() || k != 2_048 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "scalar-prep QKVZA requires gfx1100 and K=2048",
+            ));
+        }
+
+        const KERNEL: &str = "fused_qkvza_hfq4g256_k2048_scalar_prep";
+        self.ensure_kernel(
+            "fused_qkvza_hfq4g256_k2048_scalar_prep_gfx1100",
+            kernels::FUSED_QKVZA_HFQ4G256_K2048_SCALAR_PREP_GFX1100_SRC,
+            KERNEL,
+        )?;
+
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let db = dt_bias.buf.as_ptr();
+        let al = a_log.buf.as_ptr();
+        let q_m_i = qkv_m as i32;
+        let z_m_i = z_m as i32;
+        let b_m_i = beta_m as i32;
+        let a_m_i = alpha_m as i32;
+        let k_i = k as i32;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+            + (beta_m + alpha_m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &db as *const _ as *mut c_void,
+            &al as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &z_m_i as *const _ as *mut c_void,
+            &b_m_i as *const _ as *mut c_void,
+            &a_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let grid = [(qkv_m + z_m + beta_m + alpha_m) as u32, 1, 1];
+        let result = self.launch_maybe_blob(KERNEL, grid, [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(aq);
+            b.push_ptr(az);
+            b.push_ptr(ab);
+            b.push_ptr(aa);
+            b.push_ptr(xp);
+            b.push_ptr(yq);
+            b.push_ptr(yz);
+            b.push_ptr(yb);
+            b.push_ptr(ya);
+            b.push_ptr(db);
+            b.push_ptr(al);
+            b.push_i32(q_m_i);
+            b.push_i32(z_m_i);
+            b.push_i32(b_m_i);
+            b.push_i32(a_m_i);
+            b.push_i32(k_i);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// dp4a-port of fused_qkvza_hfq4g256 for gfx906. Pre-quantizes x to
     /// Q8_1 via the shared MMQ scratch, then runs the dp4a-based GEMV.
     /// Math is identical modulo Q8_1 quant noise. Targets gfx906's

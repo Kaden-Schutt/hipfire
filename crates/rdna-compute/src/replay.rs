@@ -340,6 +340,21 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]);
     }
+    if kernel == "fused_qkvza_hfq4g256_k2048_scalar_prep" {
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+            read(72),
+            read(80),
+        ]);
+    }
     if kernel.starts_with("conv1d_silu_split_qknorm_") {
         return Some(vec![
             write(0),
@@ -488,6 +503,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     if kernel.starts_with("conv1d_silu_split_qknorm_") {
         return Some(80);
+    }
+    if kernel == "fused_qkvza_hfq4g256_k2048_scalar_prep" {
+        return Some(112);
     }
     if kernel == "moe_router_softmax_topk_k8_wave64"
         || kernel == "moe_router_softmax_topk_k8_wave64_exact"
@@ -2393,6 +2411,7 @@ mod tests {
         "fused_qkvza_hfq4g256",
         "fused_qkvza_hfq4g256_k2048",
         "fused_qkvza_hfq4g256_k2048_cpol_slc",
+        "fused_qkvza_hfq4g256_k2048_scalar_prep",
         "fused_qkvza_hfq4g256_wavepack4",
         "fused_qkvza_hfq4g256_ldsx8",
         "fused_qkvza_hfq4g256_reduce_chain",
