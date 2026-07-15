@@ -5998,7 +5998,11 @@ fn qwen35_value_transform(
     );
     let r = nv / nk; // v-heads per k-head (3)
     let inv = |g: usize| -> usize { (g % r) * nk + (g / r) }; // tiled→grouped
-    const BLK: usize = 34; // Q2_0 bytes per 128-element block
+    let blk: usize = match dtype {
+        gguf_input::GgmlType::Q2_0 => 34, // ternary
+        gguf_input::GgmlType::Q1_0 => 18, // binary
+        _ => 0, // non-low-bit dtypes are rejected by the guard below before blk is used
+    };
 
     // ---- A_log: value transform (+ permute if GQA) ----
     if rel == "ssm_a" {
@@ -6055,13 +6059,13 @@ fn qwen35_value_transform(
     }
 
     // The remaining reorder arms slice `raw` as fixed-size quant blocks whose
-    // byte layout is only valid for Q2_0 (BLK=34 bytes / 128-element block).
+    // byte layout is only valid for Q2_0 (34 bytes/128-element block, ternary)
+    // and Q1_0 (18 bytes/128-element block, binary) — see `blk` above.
     // Fed any other dtype (Q8_0/Q4_K/F16/…) the offsets stay in bounds but
     // scramble the bytes silently, so decline the transform and let the raw
-    // bytes pass through unchanged. A future 1-bit format (Q1_0, 18-byte block)
-    // would add its own `dtype` arm here.
+    // bytes pass through unchanged.
     match dtype {
-        gguf_input::GgmlType::Q2_0 => {}
+        gguf_input::GgmlType::Q2_0 | gguf_input::GgmlType::Q1_0 => {}
         _ => return None,
     }
     debug_assert!(
@@ -6072,31 +6076,31 @@ fn qwen35_value_transform(
     match rel {
         // Q2_0 (ne0,ne1)=(5120,10240): V rows [nk*hv*2 ..), row=(ne0/128)*34
         "attn_qkv.weight" => {
-            let row = (ne0 / 128) * BLK;
+            let row = (ne0 / 128) * blk;
             let base = (nk * hv * 2) * row; // 4096 * row
             Some(permute(base, hv * row)) // head = hv ne1-rows
         }
         // Q2_0 (5120,6144): all rows are V
         "attn_gate.weight" => {
-            let row = (ne0 / 128) * BLK;
+            let row = (ne0 / 128) * blk;
             Some(permute(0, hv * row))
         }
         // Q2_0 (5120,48): head_dim = 1 → one ne1-row per head
         "ssm_alpha.weight" | "ssm_beta.weight" => {
-            let row = (ne0 / 128) * BLK;
+            let row = (ne0 / 128) * blk;
             Some(permute(0, row))
         }
         // Q2_0 (6144,5120): reorder ne0 columns → per-row 48-block permute
         "ssm_out.weight" => {
             let ne1 = shape[1];
-            let row_bytes = (ne0 / 128) * BLK; // 48*34 = 1632
+            let row_bytes = (ne0 / 128) * blk; // 48*34 = 1632 (Q2_0) / 48*18 (Q1_0)
             let mut out = raw.to_vec();
             for rrow in 0..ne1 {
                 let rb = rrow * row_bytes;
                 for g in 0..nv {
-                    let dst = rb + g * BLK;
-                    let src = rb + inv(g) * BLK;
-                    out[dst..dst + BLK].copy_from_slice(&raw[src..src + BLK]);
+                    let dst = rb + g * blk;
+                    let src = rb + inv(g) * blk;
+                    out[dst..dst + blk].copy_from_slice(&raw[src..src + blk]);
                 }
             }
             Some(out)
@@ -6343,6 +6347,47 @@ mod qwen35_onboarding_tests {
             assert_eq!(out[rr * row], rr as u8, "Q/K row {rr} must be untouched");
         }
         // V head-blocks permuted by inv (each head = hv rows)
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for g in 0..nv {
+            for e in 0..hv {
+                let dst_row = v_start + g * hv + e;
+                let src_row = v_start + inv(g) * hv + e;
+                assert_eq!(out[dst_row * row], src_row as u8, "V head {g} elem {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35_reorder_q1_0_uses_18b_blocks() {
+        // Same layout/assertions as qwen35_qkv_v_permuted_qk_untouched, but
+        // for the 1-bit Q1_0 format's 18-byte blocks instead of Q2_0's 34.
+        let (nk, nv, hv) = (2usize, 6usize, 4usize);
+        let ne0 = 128usize;
+        let row = 18usize;
+        let v_start = nk * hv * 2; // 16 rows
+        let ne1 = v_start + nv * hv; // 40 rows
+        let mut raw = vec![0u8; ne1 * row];
+        for rr in 0..ne1 {
+            for b in 0..row {
+                raw[rr * row + b] = rr as u8;
+            }
+        }
+        let out = qwen35_value_transform(
+            "blk.5.attn_qkv.weight",
+            &raw,
+            &[ne0, ne1],
+            nk,
+            nv,
+            hv,
+            gguf_input::GgmlType::Q1_0,
+        )
+        .expect("Q1_0 attn_qkv should be reordered");
+        // Q/K region untouched
+        for rr in 0..v_start {
+            assert_eq!(out[rr * row], rr as u8, "Q/K row {rr} must be untouched");
+        }
+        // V head-blocks permuted by inv (each head = hv rows), 18-byte stride
         let r = nv / nk;
         let inv = |g: usize| (g % r) * nk + (g / r);
         for g in 0..nv {
