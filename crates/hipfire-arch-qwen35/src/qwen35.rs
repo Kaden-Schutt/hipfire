@@ -13740,11 +13740,35 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         let s = self.s;
         let res: HipResult<()> = (|| match op_code(op) {
             q35_op::RESID_WO => {
-                let (wo, input): (&WeightTensor, &GpuTensor) = match self.layer {
-                    LayerWeights::FullAttn(l) => (&l.wo, &s.fa_attn_out),
-                    LayerWeights::FullAttnMoe(l) => (&l.wo, &s.fa_attn_out),
-                    LayerWeights::DeltaNet(l) => (&l.wo, &s.dn_normed),
-                    LayerWeights::DeltaNetMoe(l) => (&l.wo, &s.dn_normed),
+                let (wo, input) = match self.layer {
+                    LayerWeights::FullAttn(l) => (&l.wo, GemvInput::Raw(&s.fa_attn_out)),
+                    LayerWeights::FullAttnMoe(l) => (&l.wo, GemvInput::Raw(&s.fa_attn_out)),
+                    LayerWeights::DeltaNet(l) => {
+                        let input = if gated_norm_mq_rotate_enabled(
+                            gpu,
+                            self.config,
+                            self.n_v_heads,
+                            &l.wo,
+                        ) {
+                            GemvInput::Prerotated(&s.x_rot)
+                        } else {
+                            GemvInput::Raw(&s.dn_normed)
+                        };
+                        (&l.wo, input)
+                    }
+                    LayerWeights::DeltaNetMoe(l) => {
+                        let input = if gated_norm_mq_rotate_enabled(
+                            gpu,
+                            self.config,
+                            self.n_v_heads,
+                            &l.wo,
+                        ) {
+                            GemvInput::Prerotated(&s.x_rot)
+                        } else {
+                            GemvInput::Raw(&s.dn_normed)
+                        };
+                        (&l.wo, input)
+                    }
                 };
                 let wr = wo.dispatch_ref();
                 execute_steps(
@@ -13752,7 +13776,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     ctx,
                     &[Step::GemvResidual {
                         w: &wr,
-                        input: GemvInput::Raw(input),
+                        input,
                         residual: &s.x,
                         out: &s.x,
                     }],
@@ -13787,24 +13811,36 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
     ) -> Result<(), DispatchError> {
         let s = self.s;
         let config = self.config;
-        let norm_weight = match self.layer {
-            LayerWeights::DeltaNet(l) => &l.norm_weight,
-            LayerWeights::DeltaNetMoe(l) => &l.norm_weight,
+        let (norm_weight, wo) = match self.layer {
+            LayerWeights::DeltaNet(l) => (&l.norm_weight, &l.wo),
+            LayerWeights::DeltaNetMoe(l) => (&l.norm_weight, &l.wo),
             _ => {
                 return Err(DispatchError::Hip(
                     "NORM_GATED on non-DeltaNet layer".into(),
                 ))
             }
         };
-        gpu.gated_norm_f32(
-            &s.dn_attn_out,
-            &s.dn_z,
-            norm_weight,
-            &s.dn_normed,
-            self.n_v_heads,
-            config.linear_value_head_dim,
-            config.norm_eps,
-        )
+        if gated_norm_mq_rotate_enabled(gpu, config, self.n_v_heads, wo) {
+            gpu.gated_norm_rotate_mq_gfx1100(
+                &s.dn_attn_out,
+                &s.dn_z,
+                norm_weight,
+                &s.x_rot,
+                self.n_v_heads,
+                config.linear_value_head_dim,
+                config.norm_eps,
+            )
+        } else {
+            gpu.gated_norm_f32(
+                &s.dn_attn_out,
+                &s.dn_z,
+                norm_weight,
+                &s.dn_normed,
+                self.n_v_heads,
+                config.linear_value_head_dim,
+                config.norm_eps,
+            )
+        }
         .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
@@ -14203,6 +14239,33 @@ fn gdn_compact2_enabled(
     let arch_enabled = (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100")
         && mode.as_deref() != Some("0");
     arch_enabled && quant == StateQuant::Q8 && config.linear_num_key_heads * 2 == n_v_heads
+}
+
+/// Radiowave experiment: keep DeltaNet's normalized output on chip and feed
+/// the exact MQ rotation directly from LDS. The fixed gfx1100 A3B shape lets
+/// four independent 64-value heads form one 256-value MQ group without
+/// changing either operation's arithmetic order.
+fn gated_norm_mq_rotate_enabled(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    n_v_heads: usize,
+    wo: &WeightTensor,
+) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_GATED_NORM_MQ_ROTATE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    enabled
+        && gpu.arch_caps.is_gfx1100()
+        && config.dim == 2_048
+        && n_v_heads == 32
+        && config.linear_value_head_dim == 64
+        && wo.k == n_v_heads * config.linear_value_head_dim
+        && wo.gpu_dtype == DType::MQ4G256
+        && wo.awq_scale.is_none()
 }
 
 /// Radiowave experiment: fold the DeltaNet beta/alpha scalar preparation into
