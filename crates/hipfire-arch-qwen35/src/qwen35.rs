@@ -5156,7 +5156,7 @@ pub fn forward_scratch(
     if gpu.replay.should_route_pm4() {
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        let replay = unsafe { gpu.replay.replay_pm4() };
+        let replay = unsafe { gpu.replay.replay_pm4(pos) };
         return match replay {
             Ok(_) => Ok(()),
             Err(reason) => {

@@ -45,6 +45,15 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 /// instrumented sweep.
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 
+fn pm4_dynamic_grid_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
 /// at N ≤ 512, 0.82-1.26× only at N ≥ 2048 with high DPM variance —
@@ -1174,6 +1183,61 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        self.launch_maybe_blob_bound(
+            func_name,
+            grid,
+            block,
+            shared_mem,
+            params,
+            None,
+            blob_builder,
+        )
+    }
+
+    /// Record a position-derived PM4 workgroup binding while retaining the
+    /// recorded maximum grid for HIP, hipGraph, AQL, and capture validation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_maybe_blob_position_grid(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut Vec<*mut std::ffi::c_void>,
+        axis: u8,
+        addend: u32,
+        divisor: u32,
+        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
+        let grid_binding = pm4_dynamic_grid_enabled().then_some(
+            crate::replay::ReplayGridBinding::PositionCeilDiv {
+                axis,
+                addend,
+                divisor,
+            },
+        );
+        self.launch_maybe_blob_bound(
+            func_name,
+            grid,
+            block,
+            shared_mem,
+            params,
+            grid_binding,
+            blob_builder,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_maybe_blob_bound(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut Vec<*mut std::ffi::c_void>,
+        grid_binding: Option<crate::replay::ReplayGridBinding>,
+        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
         let record = self.replay.is_recording();
         if record || self.graphs.capture_mode || self.flags.force_blob_path {
             let mut blob = blob_builder();
@@ -1225,7 +1289,7 @@ impl Gpu {
                             .and_then(|name| self.compiler.compiled_kernels().get(name))
                     })
                     .cloned();
-                self.replay.record_hip_launch_typed(
+                self.replay.record_hip_launch_typed_bound(
                     &self.hip,
                     func_name,
                     artifact,
@@ -1233,6 +1297,7 @@ impl Gpu {
                     block,
                     shared_mem,
                     blob.as_bytes(),
+                    grid_binding,
                 );
             }
             let func = &self.functions[func_name];

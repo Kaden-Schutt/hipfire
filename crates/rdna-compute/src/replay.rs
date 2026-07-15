@@ -914,6 +914,9 @@ pub struct RecordedHipLaunch {
     pub grid: [u32; 3],
     pub block: [u32; 3],
     pub shared_mem: u32,
+    /// Optional PM4-only binding that narrows one recorded maximum grid axis
+    /// from the zero-based decode position before each quiescent replay.
+    pub grid_binding: Option<ReplayGridBinding>,
     /// Exact naturally-aligned, tail-padded bytes passed through HIP's
     /// contiguous `extra` launch ABI. The model adapter owns the lifetime
     /// contract for pointer values recovered into allocation-wide effects.
@@ -921,6 +924,43 @@ pub struct RecordedHipLaunch {
     /// Allocation-wide effects recovered from typed kernel signatures and
     /// `hipMemGetAddressRange`. `None` means the launch must remain serialized.
     accesses: Option<Vec<RecordedResourceAccess>>,
+}
+
+/// A dynamic retained-grid contract supplied by the engine at capture time.
+/// The recorded grid remains the hard maximum; replay may only narrow it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayGridBinding {
+    PositionCeilDiv {
+        axis: u8,
+        addend: u32,
+        divisor: u32,
+    },
+}
+
+impl ReplayGridBinding {
+    fn bind(self, position: usize, recorded: [u32; 3]) -> Result<[u32; 3], String> {
+        let Self::PositionCeilDiv {
+            axis,
+            addend,
+            divisor,
+        } = self;
+        let axis = usize::from(axis);
+        if axis >= 3 || divisor == 0 {
+            return Err(format!(
+                "invalid replay grid binding axis={axis} divisor={divisor}"
+            ));
+        }
+        let extent = u64::try_from(position)
+            .map_err(|_| "decode position exceeds u64".to_owned())?
+            .checked_add(u64::from(addend))
+            .ok_or_else(|| "dynamic replay extent overflow".to_owned())?;
+        let units = extent.div_ceil(u64::from(divisor)).max(1);
+        let units = u32::try_from(units)
+            .map_err(|_| format!("dynamic replay grid {units} exceeds u32"))?;
+        let mut bound = recorded;
+        bound[axis] = units.min(recorded[axis]);
+        Ok(bound)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1011,6 +1051,21 @@ impl PreparedPm4Graph {
             Self::Phased(graph) => graph.phase_count(),
         }
     }
+
+    fn patch_dispatch_workgroups(
+        &mut self,
+        dispatch: usize,
+        workgroups: [u32; 3],
+    ) -> Result<(), String> {
+        match self {
+            Self::Single(graph) => graph
+                .patch_dispatch_workgroups(dispatch, workgroups)
+                .map_err(|error| error.to_string()),
+            Self::Phased(_) => Err(
+                "dynamic PM4 geometry requires the certified single-queue replay".to_owned(),
+            ),
+        }
+    }
 }
 
 pub struct PreparedPm4Replay {
@@ -1020,6 +1075,7 @@ pub struct PreparedPm4Replay {
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
+    dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3])>,
     dispatch_count: usize,
     command_dwords: u32,
 }
@@ -1029,7 +1085,10 @@ impl PreparedPm4Replay {
     ///
     /// Every pointer captured in the immutable explicit kernarg prefixes must
     /// still refer to the same live Hipfire allocation and model instance.
-    pub unsafe fn replay_and_wait(&mut self) -> Result<GpuMultiQueueTiming, String> {
+    pub unsafe fn replay_and_wait(
+        &mut self,
+        position: usize,
+    ) -> Result<GpuMultiQueueTiming, String> {
         for dispatch in &self.dynamic_gdn_frames {
             let frame = crate::norm::reserve_gdn_requant_frames(1);
             let bytes = self.kernargs[*dispatch].as_mut_bytes();
@@ -1037,6 +1096,11 @@ impl PreparedPm4Replay {
                 .get_mut(76..80)
                 .ok_or_else(|| "PM4 GDN kernarg is too short for frame patch".to_owned())?
                 .copy_from_slice(&frame.to_ne_bytes());
+        }
+        for (dispatch, binding, recorded) in &self.dynamic_grids {
+            let workgroups = binding.bind(position, *recorded)?;
+            self.graph
+                .patch_dispatch_workgroups(*dispatch, workgroups)?;
         }
         // SAFETY: forwarded from the caller that owns the model allocations.
         unsafe { self.graph.replay_and_wait_profiled() }
@@ -1514,6 +1578,7 @@ impl ReplayController {
         let mut kernargs = Vec::with_capacity(prefix);
         let mut geometries = Vec::with_capacity(prefix);
         let mut dynamic_gdn_frames = Vec::new();
+        let mut dynamic_grids = Vec::new();
 
         for launch in self.recorded.iter().take(prefix) {
             let artifact = launch.artifact.clone().ok_or_else(|| {
@@ -1561,6 +1626,9 @@ impl ReplayController {
                 }
                 dynamic_gdn_frames.push(kernargs.len());
             }
+            if let Some(binding) = launch.grid_binding {
+                dynamic_grids.push((kernargs.len(), binding, launch.grid));
+            }
             kernels.push(kernel);
             kernargs.push(kernarg);
             geometries.push(geometry);
@@ -1602,7 +1670,14 @@ impl ReplayController {
             wait_audit.report(self.pm4_wait_policy);
         }
 
-        let queue_limit = self.pm4_queue_policy.resolve(device.name(), usize::MAX);
+        // Dynamic direct-dispatch patching is intentionally limited to the
+        // certified one-IB path. Multi-queue phases duplicate and reorder
+        // command buffers, so a global capture index is not a safe patch key.
+        let queue_limit = if dynamic_grids.is_empty() {
+            self.pm4_queue_policy.resolve(device.name(), usize::MAX)
+        } else {
+            1
+        };
         let (graph, command_dwords) = if queue_limit == 1 {
             let mut commands = Pm4Commands::new(pm4_architecture, self.pm4_register_policy);
             commands.acquire_system(gfx12_gcr_trim);
@@ -1775,6 +1850,7 @@ impl ReplayController {
             _kernels: kernels,
             kernargs,
             dynamic_gdn_frames,
+            dynamic_grids,
             dispatch_count: prefix,
             command_dwords,
         });
@@ -1799,13 +1875,16 @@ impl ReplayController {
     ///
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
-    pub unsafe fn replay_pm4(&mut self) -> Result<GpuMultiQueueTiming, String> {
+    pub unsafe fn replay_pm4(
+        &mut self,
+        position: usize,
+    ) -> Result<GpuMultiQueueTiming, String> {
         let prepared = self
             .prepared_pm4
             .as_mut()
             .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
         // SAFETY: forwarded from the model owner.
-        unsafe { prepared.replay_and_wait() }
+        unsafe { prepared.replay_and_wait(position) }
     }
 
     /// Start one explicitly delimited prefill or decode capture. This clears
@@ -1862,6 +1941,28 @@ impl ReplayController {
                     hash = hash.wrapping_mul(0x100000001b3);
                 }
             }
+            match launch.grid_binding {
+                None => {
+                    hash ^= 0;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+                Some(ReplayGridBinding::PositionCeilDiv {
+                    axis,
+                    addend,
+                    divisor,
+                }) => {
+                    hash ^= 1;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                    for byte in [axis]
+                        .into_iter()
+                        .chain(addend.to_le_bytes())
+                        .chain(divisor.to_le_bytes())
+                    {
+                        hash ^= u64::from(byte);
+                        hash = hash.wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
         }
         ReplayCaptureSummary {
             launch_count: self.recorded.len(),
@@ -1870,7 +1971,7 @@ impl ReplayController {
         }
     }
 
-    pub(crate) fn record_hip_launch_typed(
+    pub(crate) fn record_hip_launch_typed_bound(
         &mut self,
         hip: &HipRuntime,
         kernel: &str,
@@ -1879,10 +1980,18 @@ impl ReplayController {
         block: [u32; 3],
         shared_mem: u32,
         kernarg: &[u8],
+        grid_binding: Option<ReplayGridBinding>,
     ) {
         let accesses = recorded_resource_accesses(hip, kernel, kernarg);
         self.record_hip_launch_with_accesses(
-            kernel, artifact, grid, block, shared_mem, kernarg, accesses,
+            kernel,
+            artifact,
+            grid,
+            block,
+            shared_mem,
+            kernarg,
+            grid_binding,
+            accesses,
         );
     }
 
@@ -1897,7 +2006,7 @@ impl ReplayController {
         kernarg: &[u8],
     ) {
         self.record_hip_launch_with_accesses(
-            kernel, artifact, grid, block, shared_mem, kernarg, None,
+            kernel, artifact, grid, block, shared_mem, kernarg, None, None,
         );
     }
 
@@ -1909,6 +2018,7 @@ impl ReplayController {
         block: [u32; 3],
         shared_mem: u32,
         kernarg: &[u8],
+        grid_binding: Option<ReplayGridBinding>,
         accesses: Option<Vec<RecordedResourceAccess>>,
     ) {
         if !self.is_recording() {
@@ -1924,6 +2034,7 @@ impl ReplayController {
             grid,
             block,
             shared_mem,
+            grid_binding,
             kernarg: kernarg.to_vec(),
             accesses,
         });
@@ -2305,6 +2416,25 @@ mod tests {
     }
 
     #[test]
+    fn position_grid_binding_narrows_recorded_maximum() {
+        let binding = ReplayGridBinding::PositionCeilDiv {
+            axis: 1,
+            addend: 1,
+            divisor: 128,
+        };
+        assert_eq!(binding.bind(0, [16, 16, 1]).unwrap(), [16, 1, 1]);
+        assert_eq!(binding.bind(128, [16, 16, 1]).unwrap(), [16, 2, 1]);
+        assert_eq!(
+            binding.bind(2047, [16, 16, 1]).unwrap(),
+            [16, 16, 1]
+        );
+        assert_eq!(
+            binding.bind(4095, [16, 16, 1]).unwrap(),
+            [16, 16, 1]
+        );
+    }
+
+    #[test]
     fn resource_frontier_catches_non_adjacent_hazards() {
         let launch = |kernel: &str, access: RecordedResourceAccess| RecordedHipLaunch {
             kernel: kernel.to_owned(),
@@ -2312,6 +2442,7 @@ mod tests {
             grid: [1; 3],
             block: [1; 3],
             shared_mem: 0,
+            grid_binding: None,
             kernarg: Vec::new(),
             accesses: Some(vec![access]),
         };
@@ -2366,6 +2497,7 @@ mod tests {
             grid: [1; 3],
             block: [1; 3],
             shared_mem: 0,
+            grid_binding: None,
             kernarg: Vec::new(),
             accesses: Some(vec![RecordedResourceAccess {
                 allocation_base: base,
@@ -2409,6 +2541,7 @@ mod tests {
             grid: [1; 3],
             block: [1; 3],
             shared_mem: 0,
+            grid_binding: None,
             kernarg: Vec::new(),
             accesses: Some(vec![RecordedResourceAccess {
                 allocation_base: 0x1000,

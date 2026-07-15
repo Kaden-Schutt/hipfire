@@ -77,6 +77,7 @@ pub struct SingleQueuePm4Ib {
     batch: Vec<PacketImage>,
     timestamps: Option<KernargBuffer>,
     timestamp_frequency_hz: Option<u64>,
+    dispatch_workgroup_offsets: Vec<usize>,
     usable: bool,
 }
 
@@ -202,6 +203,7 @@ impl SingleQueuePm4Ib {
         if dwords == 0 {
             return Err(ReplayError::EmptyGraph);
         }
+        let dispatch_workgroup_offsets = pm4_dispatch_workgroup_offsets(bytes)?;
         let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
         indirect.write_exact(bytes)?;
         let completion = CompletionSignal::new(device)?;
@@ -216,6 +218,7 @@ impl SingleQueuePm4Ib {
             batch: vec![packet],
             timestamps,
             timestamp_frequency_hz,
+            dispatch_workgroup_offsets,
             usable: true,
         })
     }
@@ -229,6 +232,43 @@ impl SingleQueuePm4Ib {
 
     pub fn indirect_address(&self) -> usize {
         self.indirect.address() as usize
+    }
+
+    /// Patch one quiescent `DISPATCH_DIRECT` packet's workgroup counts.
+    ///
+    /// Retained PM4 replay is synchronous, so a successful prior replay has
+    /// proved that the indirect buffer is no longer in flight. This permits a
+    /// small dynamic-shape binding to update the next submission without
+    /// rebuilding the command stream or weakening its dependency boundaries.
+    pub fn patch_dispatch_workgroups(
+        &mut self,
+        dispatch: usize,
+        workgroups: [u32; 3],
+    ) -> Result<(), ReplayError> {
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
+        }
+        if workgroups.contains(&0) {
+            return Err(ReplayError::Pm4ZeroWorkgroup {
+                dispatch,
+                workgroups,
+            });
+        }
+        let offset = *self.dispatch_workgroup_offsets.get(dispatch).ok_or(
+            ReplayError::Pm4DispatchOutOfBounds {
+                dispatch,
+                dispatches: self.dispatch_workgroup_offsets.len(),
+            },
+        )?;
+        let bytes = self.indirect.as_mut_bytes();
+        let end = offset + 12;
+        let destination = bytes
+            .get_mut(offset..end)
+            .ok_or(ReplayError::MalformedPm4IndirectBuffer { dword: offset / 4 })?;
+        for (axis, value) in workgroups.into_iter().enumerate() {
+            destination[axis * 4..axis * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        Ok(())
     }
 
     /// Submit and synchronously prove completion with a finite timeout.
@@ -302,6 +342,42 @@ impl SingleQueuePm4Ib {
             }
         }
     }
+}
+
+fn pm4_dispatch_workgroup_offsets(bytes: &[u8]) -> Result<Vec<usize>, ReplayError> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(ReplayError::MalformedPm4IndirectBuffer {
+            dword: bytes.len() / 4,
+        });
+    }
+    let dwords = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let mut offsets = Vec::new();
+    let mut cursor = 0_usize;
+    while cursor < dwords.len() {
+        let header = dwords[cursor];
+        if header >> 30 != 3 {
+            return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+        }
+        let body_dwords = ((header >> 16) & 0x3fff) as usize + 1;
+        let next = cursor
+            .checked_add(1 + body_dwords)
+            .ok_or(ReplayError::MalformedPm4IndirectBuffer { dword: cursor })?;
+        if next > dwords.len() {
+            return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+        }
+        let opcode = (header >> 8) & 0xff;
+        if opcode == 0x15 {
+            if body_dwords != 4 {
+                return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+            }
+            offsets.push((cursor + 1) * 4);
+        }
+        cursor = next;
+    }
+    Ok(offsets)
 }
 
 impl Drop for SingleQueuePm4Ib {
@@ -2681,6 +2757,17 @@ pub enum ReplayError {
         start: u64,
         end: u64,
     },
+    MalformedPm4IndirectBuffer {
+        dword: usize,
+    },
+    Pm4DispatchOutOfBounds {
+        dispatch: usize,
+        dispatches: usize,
+    },
+    Pm4ZeroWorkgroup {
+        dispatch: usize,
+        workgroups: [u32; 3],
+    },
     ProfilingDoesNotCoverBatch,
 }
 
@@ -2782,6 +2869,24 @@ impl fmt::Display for ReplayError {
                 f,
                 "retained PM4 GPU timestamp bracket is invalid: start={start}, end={end}"
             ),
+            Self::MalformedPm4IndirectBuffer { dword } => write!(
+                f,
+                "retained PM4 indirect buffer is malformed at dword {dword}"
+            ),
+            Self::Pm4DispatchOutOfBounds {
+                dispatch,
+                dispatches,
+            } => write!(
+                f,
+                "retained PM4 dispatch {dispatch} is outside the {dispatches}-dispatch indirect buffer"
+            ),
+            Self::Pm4ZeroWorkgroup {
+                dispatch,
+                workgroups,
+            } => write!(
+                f,
+                "retained PM4 dispatch {dispatch} cannot use zero workgroups: {workgroups:?}"
+            ),
             Self::ProfilingDoesNotCoverBatch => write!(
                 f,
                 "last dispatches are barrier-free, so first/last queue timestamps do not cover the batch"
@@ -2795,6 +2900,27 @@ impl std::error::Error for ReplayError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pm4_dispatch_offsets_follow_packet_boundaries() {
+        let words = [
+            0xc001_7602_u32,
+            0x20c,
+            0x1234,
+            0xc003_1502,
+            8,
+            4,
+            1,
+            0x800d,
+            0xc000_4600,
+            0x407,
+        ];
+        let bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(pm4_dispatch_workgroup_offsets(&bytes).unwrap(), vec![16]);
+    }
 
     #[test]
     fn gpu_batch_span_uses_first_and_last_kernel_timestamps() {

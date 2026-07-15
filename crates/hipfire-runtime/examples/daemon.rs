@@ -3228,7 +3228,7 @@ fn main() {
                         )
                         .map_err(|error| error.to_string())?;
                         if pm4 {
-                            let timing = unsafe { gpu.replay.replay_pm4() }?;
+                            let timing = unsafe { gpu.replay.replay_pm4(context + i) }?;
                             gpu_us += timing.span_microseconds();
                         } else {
                             let timing = unsafe { gpu.replay.replay_linear_aql() }?;
@@ -3453,7 +3453,7 @@ fn main() {
                     let initial = redline_qwen_debug_hashes(&gpu, bundle)?;
                     let replay_started = Instant::now();
                     if pm4 {
-                        unsafe { gpu.replay.replay_pm4() }?;
+                        unsafe { gpu.replay.replay_pm4(context) }?;
                     } else {
                         unsafe { gpu.replay.replay_linear_aql() }?;
                     }

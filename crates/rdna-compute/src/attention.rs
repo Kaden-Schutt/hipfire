@@ -1912,12 +1912,15 @@ impl Gpu {
                 &ts as *const _ as *mut c_void,
                 &wn as *const _ as *mut c_void,
             ];
-            self.launch_maybe_blob(
+            self.launch_maybe_blob_position_grid(
                 "attention_flash_q8_0_tile",
                 grid,
                 [32, 1, 1],
                 shared,
                 &mut params,
+                1,
+                1,
+                TILE_SIZE as u32,
                 || {
                     let mut b = hip_bridge::KernargBlob::new();
                     b.push_ptr(q_ptr);
