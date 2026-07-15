@@ -1253,6 +1253,17 @@ pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_BUFFER_GFX1100_SRC: &str = concat!
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
 );
+/// Exact M=2048/K=512 sibling with both activation groups hoisted ahead of
+/// the two row-weight streams. This probes gfx1100 VMEM/VALU overlap without
+/// changing the reduction tree, output mapping, or replay ABI.
+pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_HOIST_X16_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_SIGMOID_K512 1\n",
+    "#define HIPFIRE_RDNA3_SIGMOID_M2048 1\n",
+    "#define HIPFIRE_RDNA3_SIGMOID_HOIST_X16 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_ROWS4_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_SIGMOID_ROWS4 1\n",
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")

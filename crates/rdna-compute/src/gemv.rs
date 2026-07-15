@@ -5155,14 +5155,29 @@ impl Gpu {
             && self.flags.rdna3_hfq4_sigmoid_buffer;
         use std::sync::OnceLock;
         static SIGMOID_K512: OnceLock<bool> = OnceLock::new();
+        static SIGMOID_HOIST_X16: OnceLock<bool> = OnceLock::new();
+        let rdna3_hoist_x16 = self.arch_caps.is_gfx1100()
+            && rdna3_buffer
+            && !rdna3_rows4
+            && m == 2_048
+            && k == 512
+            && *SIGMOID_HOIST_X16.get_or_init(|| {
+                std::env::var("HIPFIRE_RDNA3_HFQ4_SIGMOID_HOIST_X16").as_deref() == Ok("1")
+            });
         let rdna3_k512 = self.arch_caps.is_gfx1100()
             && rdna3_buffer
             && !rdna3_rows4
+            && m == 2_048
             && k == 512
             && *SIGMOID_K512.get_or_init(|| {
                 std::env::var("HIPFIRE_RDNA3_HFQ4_SIGMOID_K512").as_deref() == Ok("1")
             });
-        let (module, source) = if rdna3_k512 {
+        let (module, source) = if rdna3_hoist_x16 {
+            (
+                "gemv_hfq4g256_residual_sigmoid_k512_hoist_x16_buffer_gfx1100",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_HOIST_X16_BUFFER_GFX1100_SRC,
+            )
+        } else if rdna3_k512 {
             (
                 "gemv_hfq4g256_residual_sigmoid_k512_buffer_gfx1100",
                 kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_BUFFER_GFX1100_SRC,
