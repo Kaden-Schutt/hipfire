@@ -54,6 +54,12 @@ extern "C" __global__ void HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL(
     __shared__ float4 signs2_lds[64];
 #endif
 
+    const int tid = threadIdx.x;
+    const int lane_id = tid & 31;
+    const int warp_id = tid >> 5;
+    const int d0 = lane_id * 8;
+    const int base = warp_id * 256 + d0;
+
 #if HIPFIRE_RDNA3_RMSNORM_SIGN_CONST
     const unsigned int sign_shift = (unsigned int)(lane_id & 3) * 8u;
     const unsigned int sign1_bits =
@@ -61,12 +67,6 @@ extern "C" __global__ void HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL(
     const unsigned int sign2_bits =
         hipfire_mq_sign2_words[lane_id >> 2] >> sign_shift;
 #endif
-
-    const int tid = threadIdx.x;
-    const int lane_id = tid & 31;
-    const int warp_id = tid >> 5;
-    const int d0 = lane_id * 8;
-    const int base = warp_id * 256 + d0;
 
 #if HIPFIRE_RDNA3_RMSNORM_SIGN_LDS
     if (tid < 64) {
