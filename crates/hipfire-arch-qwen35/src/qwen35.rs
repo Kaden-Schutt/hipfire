@@ -14349,11 +14349,13 @@ fn forward_scratch_layers_lowered(
     let ctx = DispatchCtx::new(gpu);
     let mut delta_layer_idx = 0usize;
     let combine_next_rms = moe_combine_next_rms_enabled(gpu, weights, config);
+    let reuse_fused_rotation =
+        std::env::var("HIPFIRE_MOE_COMBINE_NEXT_RMS_RENORM").as_deref() != Ok("1");
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
-        let precomputed_attn_x_rot = combine_next_rms && layer_idx > 0;
-        if precomputed_attn_x_rot {
+        let fused_transition = combine_next_rms && layer_idx > 0;
+        if fused_transition {
             let attn_norm = match layer {
                 LayerWeights::DeltaNetMoe(l) => &l.attn_norm,
                 LayerWeights::FullAttnMoe(l) => &l.attn_norm,
@@ -14387,7 +14389,7 @@ fn forward_scratch_layers_lowered(
                 v_dim,
                 n_v_heads,
                 hd,
-                precomputed_attn_x_rot,
+                precomputed_attn_x_rot: fused_transition && reuse_fused_rotation,
                 defer_routed_combine: combine_next_rms && layer_idx + 1 < config.n_layers,
             };
             superop::run_layer_program(gpu, &ctx, &program, &mut bind)
