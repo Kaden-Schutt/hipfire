@@ -4949,9 +4949,16 @@ impl Gpu {
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
             bytes,
         );
+        let grid_m = if self.arch_caps.is_rdna3_dgpu()
+            && self.flags.rdna3_hfq4_sigmoid_tight_grid
+        {
+            m.div_ceil(2)
+        } else {
+            m
+        };
         let result = self.launch_maybe_blob(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
-            [m as u32, 1, 1],
+            [grid_m as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,

@@ -51,6 +51,10 @@ pub struct FeatureFlags {
     /// independent packed-weight loads. Certified default on exact gfx1100;
     /// other RDNA3 targets remain explicit opt-in until separately measured.
     pub rdna3_hfq4_residual_stage_x32: bool,
+    /// Launch only the active half of the two-row shared-expert down grid.
+    /// The kernel maps row0 = blockIdx.x * 2; the legacy launcher submits M
+    /// workgroups, leaving the upper half to return immediately.
+    pub rdna3_hfq4_sigmoid_tight_grid: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -270,6 +274,11 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
                 .unwrap_or(arch == "gfx1100"),
+            rdna3_hfq4_sigmoid_tight_grid: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID",
+            )
+            .as_deref()
+                == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -493,6 +502,7 @@ impl FeatureFlags {
             rdna3_hfq4_qkvza_2wave: false,
             rdna3_hfq4_qkvza_hoist_x32: false,
             rdna3_hfq4_residual_stage_x32: false,
+            rdna3_hfq4_sigmoid_tight_grid: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,
