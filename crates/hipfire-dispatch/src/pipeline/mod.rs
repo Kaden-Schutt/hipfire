@@ -433,13 +433,18 @@ pub fn run_moe_decode(
     let gfx1100_router_mode = std::env::var("HIPFIRE_GFX1100_ROUTER_W64").ok();
     let exact_wave64_router = ctx.arch.is_gfx1100()
         && p.n_exp == 256
-        && gfx1100_router_mode.as_deref() == Some("exact");
+        // The exact fused router is the production gfx1100 path. `0` retains
+        // the two-launch reference path for A/B diagnosis; `approx` retains
+        // the old non-bit-exact research kernel without exposing it by
+        // accident through the former `1` opt-in.
+        && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx"));
     let wave64_router = (ctx.arch.is_gfx1201()
         && std::env::var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
         || (ctx.arch.is_gfx1100()
-            // Research-only: faster on gfx1100, but its 1-ULP routing-weight
-            // drift can change greedy trajectories and trigger an attractor.
-            && gfx1100_router_mode.as_deref() == Some("1"));
+            && p.n_exp == 256
+            // Research-only: faster on gfx1100, but its routing drift can
+            // change greedy trajectories and trigger an attractor.
+            && gfx1100_router_mode.as_deref() == Some("approx"));
     if exact_wave64_router {
         hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
             p.router_logits,
