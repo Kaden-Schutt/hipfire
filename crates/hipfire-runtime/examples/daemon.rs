@@ -3399,22 +3399,34 @@ fn main() {
                         && loaded.ep.is_none()
                         && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
                 });
-                if !eligible || step == 0 || repeats == 0 {
+                let launch_count = gpu.replay.recorded_launches().len();
+                let start = msg
+                    .get("start")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(step as u64) as usize;
+                if !eligible
+                    || launch_count == 0
+                    || step == 0
+                    || repeats == 0
+                    || start == 0
+                    || start > launch_count
+                {
                     let _ = writeln!(
                         stdout,
                         "{}",
                         serde_json::json!({
                             "type": "error",
-                            "message": "redline_pm4_prefix_profile requires single-GPU Qwen3.5 and positive step/repeats",
+                            "message": "redline_pm4_prefix_profile requires captured single-GPU Qwen3.5 and valid start/step/repeats",
                         })
                     );
                     let _ = stdout.flush();
                     continue;
                 }
 
-                let launch_count = gpu.replay.recorded_launches().len();
-                let mut prefixes = (step..launch_count).step_by(step).collect::<Vec<_>>();
-                prefixes.push(launch_count);
+                let mut prefixes = (start..launch_count).step_by(step).collect::<Vec<_>>();
+                if prefixes.last().copied() != Some(launch_count) {
+                    prefixes.push(launch_count);
+                }
                 let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
                 let profile_result = (|| -> Result<Vec<serde_json::Value>, String> {
                     let mut rows = Vec::with_capacity(prefixes.len());
@@ -3473,6 +3485,7 @@ fn main() {
                                 "type": "redline_pm4_prefix_profile",
                                 "context_tokens": context,
                                 "launches": launch_count,
+                                "start": start,
                                 "step": step,
                                 "repeats": repeats,
                                 "rows": rows,

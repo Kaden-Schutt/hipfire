@@ -146,6 +146,11 @@ def main():
         help="GPU-timed repetitions per cumulative PM4 prefix (default: 3)",
     )
     parser.add_argument(
+        "--profile-prefix-start",
+        type=int,
+        help="first cumulative dispatch prefix to profile (default: one step)",
+    )
+    parser.add_argument(
         "--pm4",
         action="store_true",
         help="lower --prefix to one retained PM4 indirect buffer",
@@ -277,6 +282,11 @@ def main():
                     "context_tokens": args.decode_context,
                     "step": args.profile_prefix_step,
                     "repeats": args.profile_prefix_repeats,
+                    **(
+                        {"start": args.profile_prefix_start}
+                        if args.profile_prefix_start is not None
+                        else {}
+                    ),
                 }
             )
             print(
