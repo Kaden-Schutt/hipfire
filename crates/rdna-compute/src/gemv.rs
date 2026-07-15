@@ -6218,10 +6218,28 @@ impl Gpu {
             static GATE_UP_FUSED: OnceLock<bool> = OnceLock::new();
             let fused = *GATE_UP_FUSED
                 .get_or_init(|| std::env::var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1"));
+            static GATE_UP_RANK_INTERLEAVE: OnceLock<bool> = OnceLock::new();
+            let rank_interleave = self.arch_caps.is_gfx1100()
+                && n_ranks == 8
+                && *GATE_UP_RANK_INTERLEAVE.get_or_init(|| {
+                    std::env::var("HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE").as_deref() == Ok("1")
+                });
             let fixed_k2048 = self.arch_caps.is_gfx1100()
                 && self.flags.rdna3_hfq4_moe_gate_up_k2048
                 && k == 2_048;
-            if wg2 {
+            if rank_interleave {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_rank_interleave",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_RANK_INTERLEAVE_GFX1100_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
+                )?;
+                let mi = (m as u32) >> 1;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
+                    [32u32, 1, 1],
+                    mi * 8,
+                )
+            } else if wg2 {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_wg2",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WG2_SRC,
@@ -6301,7 +6319,15 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             func_name,
-            [grid_x, n_ranks as u32, 1],
+            [
+                grid_x,
+                if func_name == "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave" {
+                    1
+                } else {
+                    n_ranks as u32
+                },
+                1,
+            ],
             block,
             0,
             &mut params,

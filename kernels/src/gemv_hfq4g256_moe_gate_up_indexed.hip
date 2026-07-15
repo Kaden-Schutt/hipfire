@@ -12,6 +12,10 @@
 #define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed
 #endif
 
+#ifndef HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE
+#define HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE 0
+#endif
+
 #if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
 #define HIPFIRE_MOE_GATE_UP_BLOCK 64
 #define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 8
@@ -58,7 +62,16 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     int M, int K
 ) {
     const int mi = M >> 1;
-#if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
+#if HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE
+    // gfx1100 K=8 scheduling experiment: make expert rank the fastest-moving
+    // workgroup coordinate. Eight consecutive workgroups consume the same
+    // 8-KiB activation while issuing independent expert-weight streams. The
+    // per-row arithmetic and output address are unchanged.
+    const int tid = threadIdx.x;
+    const int linear = blockIdx.x;
+    const int krank = linear & 7;
+    const int row = linear >> 3;
+#elif HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
     const int wg_wave = threadIdx.x >> 5;
     const int tid = threadIdx.x & 31;
     const int row = blockIdx.x * 2 + wg_wave;
@@ -67,7 +80,9 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const int row = blockIdx.x;
 #endif
     if (row >= mi) return;
+#if !HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE
     const int krank = blockIdx.y;
+#endif
 
     // Read expert_id from device and index into the pointer table.
     const int expert_id = topk_indices[krank];

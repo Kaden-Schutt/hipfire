@@ -1318,6 +1318,18 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// gfx1100 K=8 scheduling experiment: linearize the two-dimensional grid with
+/// expert rank as the fastest-moving coordinate. Arithmetic stays byte-for-byte
+/// identical while adjacent workgroups share the activation working set and
+/// expose eight independent expert-weight streams to the scheduler.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_RANK_INTERLEAVE_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// gfx1100 scheduler-packing experiment: two independent wave32 rows per
 /// workgroup. Each wave preserves the base kernel's gate/up accumulator and
 /// shuffle order; there is no cross-wave reduction or extra row accumulator.
