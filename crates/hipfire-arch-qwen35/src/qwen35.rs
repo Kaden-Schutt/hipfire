@@ -14243,7 +14243,7 @@ fn gdn_compact2_enabled(
 
 /// Radiowave experiment: keep DeltaNet's normalized output on chip and feed
 /// the exact MQ rotation directly from LDS. The fixed gfx1100 A3B shape lets
-/// four independent 64-value heads form one 256-value MQ group without
+/// two independent 128-value heads form one 256-value MQ group without
 /// changing either operation's arithmetic order.
 fn gated_norm_mq_rotate_enabled(
     gpu: &Gpu,
@@ -14262,7 +14262,7 @@ fn gated_norm_mq_rotate_enabled(
         && gpu.arch_caps.is_gfx1100()
         && config.dim == 2_048
         && n_v_heads == 32
-        && config.linear_value_head_dim == 64
+        && config.linear_value_head_dim == 128
         && wo.k == n_v_heads * config.linear_value_head_dim
         && wo.gpu_dtype == DType::MQ4G256
         && wo.awq_scale.is_none()

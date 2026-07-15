@@ -2999,7 +2999,7 @@ impl Gpu {
         self.scratch.invalidate_x_caches_for(dst_ptr)
     }
 
-    /// gfx1100 DeltaNet decode specialization: reproduce four independent
+    /// gfx1100 DeltaNet decode specialization: reproduce two independent
     /// head-wise gated norms per workgroup, then consume their 256 normalized
     /// values directly from LDS for the MQ rotation.
     #[allow(clippy::too_many_arguments)]
@@ -3047,8 +3047,8 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
         let result = self.launch_maybe_blob(
             KERNEL,
-            [(n_heads / 4) as u32, 1, 1],
-            [128, 1, 1],
+            [(n_heads / 2) as u32, 1, 1],
+            [64, 1, 1],
             0,
             &mut params,
             || {

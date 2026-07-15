@@ -4,12 +4,12 @@
 
 #include <hip/hip_runtime.h>
 
-// gfx1100 Qwen3.6 DeltaNet decode specialization. Four wave32s reproduce four
-// independent head_dim=64 gated_norm_f32 workgroups, publish their normalized
+// gfx1100 Qwen3.6 DeltaNet decode specialization. Two wave32s reproduce two
+// independent head_dim=128 gated_norm_f32 workgroups, publish their normalized
 // 256-value group through LDS, then wave 0 performs the exact mq_rotate_x
 // butterfly. This removes the normalized global-memory round trip and one
 // dependent dispatch without changing either operation's arithmetic order.
-extern "C" __launch_bounds__(128, 1)
+extern "C" __launch_bounds__(64, 1)
 __global__ void gated_norm_mq_rotate_gfx1100(
     const float* __restrict__ x,
     const float* __restrict__ z,
@@ -21,7 +21,7 @@ __global__ void gated_norm_mq_rotate_gfx1100(
     int head_dim,
     float eps)
 {
-    if (n_heads != 32 || head_dim != 64) return;
+    if (n_heads != 32 || head_dim != 128) return;
 
     __shared__ float normalized[256];
 
@@ -29,7 +29,7 @@ __global__ void gated_norm_mq_rotate_gfx1100(
     const int wave = tid >> 5;
     const int lane = tid & 31;
     const int group = blockIdx.x;
-    const int head = group * 4 + wave;
+    const int head = group * 2 + wave;
 
     const float* xh = x + head * head_dim;
     const float* zh = z + head * head_dim;
