@@ -2411,6 +2411,13 @@ pub const GEMV_HFQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2
 pub const DEQUANT_TQ2G128_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/dequant_tq2g128_to_f16.hip");
 
+/// TQ2-G128 GEMV: correctness-first FP decode GEMV for PrismML Q2_0 ternary.
+/// Mirrors GEMV_HFQ2G128_SRC's layout/reduction, swapping the affine
+/// [f32 scale][f32 zero][32B codes] (40B) block for the ternary
+/// [FP16 d (2B)][32B codes] (34B) block and the `scale*code+zero` map for
+/// `(code - 1) * d`.
+pub const GEMV_TQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_tq2g128.hip");
+
 /// HFQ4-G256 wide GEMV: 2 rows per block (64 threads = 2 warps).
 /// Each warp processes one row independently. Halves grid size.
 pub const GEMV_HFQ4G256_WIDE_SRC: &str =
