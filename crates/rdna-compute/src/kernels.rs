@@ -2411,6 +2411,13 @@ pub const GEMV_HFQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2
 pub const DEQUANT_TQ2G128_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/dequant_tq2g128_to_f16.hip");
 
+/// BQ1-G128: PrismML Q1_0-layout binary dequant-to-f16 correctness oracle.
+/// [FP16 d (2B)][1-bit × 128 (16B)] = 18 bytes per 128-weight group.
+/// 32 threads × 4 elements = 128 per group. Each thread reads 4 bits (half a byte).
+/// bit -> {0,1} -> {-d, +d}.
+pub const DEQUANT_BQ1G128_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequant_bq1g128_to_f16.hip");
+
 /// TQ2-G128 GEMV: correctness-first FP decode GEMV for PrismML Q2_0 ternary.
 /// Mirrors GEMV_HFQ2G128_SRC's layout/reduction, swapping the affine
 /// [f32 scale][f32 zero][32B codes] (40B) block for the ternary
