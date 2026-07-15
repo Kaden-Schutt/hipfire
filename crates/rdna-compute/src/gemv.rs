@@ -6638,6 +6638,98 @@ impl Gpu {
         result
     }
 
+    /// Expert-wave-preserving down + deterministic combine experiment.
+    ///
+    /// The GEMV body and expanded stores are identical to the production
+    /// kernel. A reusable counter tail appended to `expert_outputs` elects the
+    /// last expert workgroup for each four-row tile; that wave folds the eight
+    /// expanded slots in fixed rank order into `x_residual`. The caller must
+    /// allocate and initially zero `batch_size * ceil(m/4)` f32-sized counter
+    /// slots after the `[batch_size * k_top * m]` payload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_down_k8_indexed_last_combine(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
+            kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_LAST_COMBINE_SRC,
+            "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let twp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &twp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
+            bytes,
+        );
+        use std::sync::OnceLock;
+        static DOWN_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
+        let grid_x = if self.arch_caps.is_gfx1100()
+            && *DOWN_TIGHT_GRID.get_or_init(|| {
+                std::env::var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() == Ok("1")
+            })
+        {
+            (m as u32).div_ceil(4)
+        } else {
+            m as u32
+        };
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
+            [grid_x, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_ptr(twp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Fused atomic-free MoE down: GEMV + K_TOP weighted-accumulate +
     /// residual add in ONE launch. Drop-in replacement for the two-kernel
     /// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` (writes

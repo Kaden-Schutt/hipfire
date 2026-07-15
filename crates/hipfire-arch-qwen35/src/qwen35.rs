@@ -3991,8 +3991,10 @@ struct MoeScratchRef<'a> {
     rot_batch: &'a GpuTensor,
     topk_indices: &'a GpuTensor,
     topk_weights: &'a GpuTensor,
-    // [k_top × dim] f32 — per-(expert-rank) MoE down output buffer for
-    // the atomic-free expand+combine decode path. Mirrors the prefill
+    // [k_top × dim + ceil(dim/4)] f32 — per-(expert-rank) MoE down output
+    // plus a zero-initialised u32 counter tail used only by the optional
+    // expert-wave-preserving last-arriver combine experiment. The production
+    // atomic-free expand+combine path ignores the tail. Mirrors the prefill
     // `pbs.moe_down_expanded_batch` layout with batch=1. Required so
     // the MoE FFN is byte-deterministic under hipGraph replay; see
     // task #100 root-cause notes in `forward_scratch`.
@@ -4056,7 +4058,7 @@ fn moe_ffn_decode(
     let rot_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
     let topk_indices = gpu.alloc_tensor(&[k], DType::F32)?;
     let topk_weights = gpu.alloc_tensor(&[k], DType::F32)?;
-    let down_expanded = gpu.alloc_tensor(&[k * hidden], DType::F32)?;
+    let down_expanded = gpu.zeros(&[k * hidden + hidden.div_ceil(4)], DType::F32)?;
 
     let refs = MoeScratchRef {
         router_logits: &router_logits,
@@ -4659,7 +4661,10 @@ pub struct Qwen35Scratch {
     /// can stay in a graph-capturable stream).
     pub moe_topk_indices: Option<GpuTensor>, // [k] i32 stored as f32 alias
     pub moe_topk_weights: Option<GpuTensor>,  // [k] f32
-    // Atomic-free MoE down expansion buffer for decode — [k × dim] f32.
+    // Atomic-free MoE down expansion buffer for decode — payload [k × dim]
+    // plus ceil(dim/4) f32-sized counter slots for the optional last-arriver
+    // combine. The full allocation is zeroed once; each fused dispatch resets
+    // the counters it consumes.
     // Paired with `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` +
     // `moe_down_combine_k8_batched` (batch_size=1) in `moe_ffn_decode_impl`'s
     // use_gpu_topk path. Replaces the K_TOP-way atomicAdd that introduced
@@ -4846,8 +4851,9 @@ impl Qwen35Scratch {
                 // indexed MoE GEMV kernels read it as int*.
                 s.moe_topk_indices = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 s.moe_topk_weights = Some(gpu.alloc_tensor(&[k], DType::F32)?);
-                // Atomic-free decode MoE down output: [k × dim].
-                s.moe_down_expanded = Some(gpu.alloc_tensor(&[k * hidden], DType::F32)?);
+                // Atomic-free decode MoE down payload plus reusable counter tail.
+                s.moe_down_expanded =
+                    Some(gpu.zeros(&[k * hidden + hidden.div_ceil(4)], DType::F32)?);
                 // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
                 // ensure_mq_signs fires during the first moe_ffn_decode and
                 // blows up hipGraph capture with a hipMalloc-in-capture

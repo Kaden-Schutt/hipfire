@@ -1,5 +1,13 @@
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_MOE_DOWN_LAST_COMBINE
+#define HIPFIRE_MOE_DOWN_LAST_COMBINE 0
+#endif
+
+#ifndef HIPFIRE_MOE_DOWN_KERNEL
+#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded
+#endif
+
 // Atomic-free variant of `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched`.
 //
 // Same per-(token, krank) GEMV compute. Instead of `atomicAdd(scale * acc)`
@@ -35,11 +43,15 @@
 // per DOG, same pairwise slot fold + shfl reduce + masked store.
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int*   __restrict__ topk_indices,              // [N × K_TOP]
     const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
     float*       __restrict__ expert_outputs,            // [N × K_TOP × M]
+#if HIPFIRE_MOE_DOWN_LAST_COMBINE
+    const float* __restrict__ topk_weights,               // [N × K_TOP]
+    float*       __restrict__ x_residual,                 // [N × M], in-place
+#endif
     int M, int K, int K_TOP
 ) {
     const int row0 = blockIdx.x * 4;
@@ -159,4 +171,45 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         if (have_row2) expert_outputs[out_base + row2] = ccc;
         if (have_row3) expert_outputs[out_base + row3] = dcc;
     }
+
+#if HIPFIRE_MOE_DOWN_LAST_COMBINE
+    // Preserve one independently schedulable expert wave per workgroup. Each
+    // row tile publishes its four expanded outputs, then increments a reusable
+    // counter in the scratch tail. Only the last expert wave performs the
+    // fixed k=0..7 weighted fold, replacing the separate combine dispatch.
+    // The scratch tail is [N × ceil(M/4)] u32 immediately after the expanded
+    // [N × K_TOP × M] payload and is zeroed once at scratch allocation.
+    int prior = -1;
+    const int row_tiles = (M + 3) / 4;
+    int* counters = reinterpret_cast<int*>(
+        expert_outputs + (long long)gridDim.z * K_TOP * M);
+    const int counter_index = bid * row_tiles + blockIdx.x;
+    if (tid == 0) {
+        // Publish this block's output stores before advertising arrival.
+        __threadfence();
+        prior = atomicAdd(counters + counter_index, 1);
+    }
+    prior = __shfl(prior, 0);
+    if (prior == K_TOP - 1) {
+        if (tid < 4) {
+            const int row = row0 + tid;
+            if (row < M) {
+                const long long token_base = (long long)bid * K_TOP * M;
+                const int weights_base = bid * K_TOP;
+                float combined = 0.0f;
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    if (k < K_TOP) {
+                        combined += topk_weights[weights_base + k]
+                                  * expert_outputs[token_base + (long long)k * M + row];
+                    }
+                }
+                x_residual[(long long)bid * M + row] += combined;
+            }
+        }
+        __syncwarp();
+        if (tid == 0)
+            atomicExch(counters + counter_index, 0);
+    }
+#endif
 }

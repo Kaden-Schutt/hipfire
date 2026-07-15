@@ -271,6 +271,20 @@ pub fn run_moe_decode(
     // executor and added into x_residual once). `None` → x_residual directly
     // (single-GPU, byte-identical).
     let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_residual);
+    // gfx1100 experiment: retain one independently schedulable workgroup per
+    // expert rank, but let the last rank for each four-row tile perform the
+    // deterministic expanded-output fold. This is deliberately narrower than
+    // the dtype resolver: mixed/Paro/E8/Lloyd paths keep their existing
+    // kernels and combine semantics.
+    static DOWN_LAST_COMBINE: OnceLock<bool> = OnceLock::new();
+    let down_last_combine = ctx.arch.is_gfx1100()
+        && p.batch_size == 1
+        && p.k == 8
+        && p.expert_dtype_tags.is_none()
+        && p.dtypes.routed_down == DType::MQ4G256
+        && *DOWN_LAST_COMBINE.get_or_init(|| {
+            std::env::var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
+        });
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
@@ -819,6 +833,19 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
+        } else if down_last_combine {
+            hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_last_combine(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                p.topk_weights,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
         } else {
             hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
@@ -848,11 +875,12 @@ pub fn run_moe_decode(
     // experts double-count (atomic + combine) or zero out (expanded written,
     // combine skipped) — silent numerical corruption. The merged kernel's
     // expanded write replaces the standalone Lloyd atomic GEMV.
-    let routed_down_self_combines = p.expert_dtype_tags.is_none()
-        && matches!(
-            p.dtypes.routed_down,
-            DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
-        );
+    let routed_down_self_combines = down_last_combine
+        || (p.expert_dtype_tags.is_none()
+            && matches!(
+                p.dtypes.routed_down,
+                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+            ));
     if !routed_down_self_combines {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,

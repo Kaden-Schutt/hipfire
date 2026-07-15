@@ -393,6 +393,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded" => {
             Some(vec![read(0), read(8), read(16), write(24)])
         }
+        "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            read(32),
+            write(40),
+        ]),
         "moe_down_combine_k8_batched" => Some(vec![read(0), read(8), write(16)]),
         "fused_qkv_hfq4g256" => Some(vec![
             read(0),
@@ -465,6 +473,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "repeat_interleave_qk_f32"
         | "rope_partial_halfsplit_f32" => Some(48),
         "conv1d_silu_split_f32" => Some(64),
+        "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "fused_qkv_hfq4g256" => Some(80),
         "attention_flash_fwht3_tile" | "fused_qkvza_hfq4g256" | "gated_delta_net_q8_fast" => {
             Some(96)
@@ -2225,6 +2234,7 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+        "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
         "moe_down_combine_k8_batched",
         "fused_qkv_hfq4g256",
         "deinterleave_f32",

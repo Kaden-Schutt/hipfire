@@ -1374,6 +1374,19 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
 );
 
+/// gfx1100 expert-wave-preserving down+combine experiment. Every workgroup
+/// still computes one expert rank; the last arriving rank for each four-row
+/// tile performs the deterministic weighted fold and resets its scratch-tail
+/// counter, eliminating the separate combine launch without serializing the
+/// eight expert GEMVs inside one workgroup.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_LAST_COMBINE_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_DOWN_LAST_COMBINE 1\n",
+    "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_last_combine\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
+
 /// Fused atomic-free MoE down: GEMV + K_TOP weighted-accumulate + residual
 /// add in a single kernel. Replaces the two-launch
 /// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` (writes an
