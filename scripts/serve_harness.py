@@ -21,8 +21,8 @@ Modes:
             conversation each prompt (no cache); surfaces genre-specific runaway.
   chain   — the genre prompts chained into one growing conversation; exercises the
             prefix cache (cached_tokens) + cross-turn prefill/decode.
-  session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
-            session_coding.json the coherence gate uses.
+  session — an existing N-turn session file (recall + attractor), defaulting to
+            the repo's 8-turn sampled coding/recall battery.
 """
 import argparse, atexit, json, os, re, signal, subprocess, sys, time, urllib.request
 
@@ -330,12 +330,15 @@ def main():
     ap.add_argument("--kv", default="fwht3")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
     ap.add_argument("--thinking", default="med", help="thinking_budget preset key")
-    ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--max-tokens", type=int, default=4096)
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--sampling", default="registry",
                     help="registry | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
-    ap.add_argument("--session", default="/home/kaden/mv/session_coding.json")
+    ap.add_argument(
+        "--session",
+        default=os.path.join(REPO, "benchmarks/prompts/session_coding_8turn.json"),
+    )
     ap.add_argument("--port", type=int, default=11520)
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
