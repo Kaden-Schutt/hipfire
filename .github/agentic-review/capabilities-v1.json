@@ -1,0 +1,42 @@
+{
+  "schema": "hipfire.agentic-review.capabilities",
+  "version": 1,
+  "capabilities": [
+    {
+      "id": "hipfire/rdna3-smoke@1",
+      "parameters": {},
+      "contract_digest": "sha256:2b4f7e2a0e1f7d5e2e8cf3d8c6e6d1d2b0f4e9a1c3b8d6f5a7e2c1d9f0b6a4e3",
+      "allowed_suite_revisions": ["rdna3-smoke-v1"],
+      "required_checks": ["build", "smoke"],
+      "artifacts": ["test-report.json"],
+      "pass_criteria": {
+        "status": "passed",
+        "required_checks": "all"
+      }
+    },
+    {
+      "id": "hipfire/gfx1151-kernel-validation@1",
+      "parameters": {},
+      "contract_digest": "sha256:9d2c4a6f8b1e0d3c5f7a9b2e4d6c8f0a1b3e5d7c9f2a4b6e8d0c2f4a6b8e1d3c5",
+      "allowed_suite_revisions": ["gfx1151-kernel-validation-v1"],
+      "required_checks": ["build", "kernel-validation"],
+      "artifacts": ["kernel-validation.json"],
+      "pass_criteria": {
+        "status": "passed",
+        "required_checks": "all"
+      }
+    },
+    {
+      "id": "hipfire/dflash-coherence@1",
+      "parameters": {},
+      "contract_digest": "sha256:7e1c3a5f9b2d4e6f8a0c2e4b6d8f1a3c5e7b9d0f2a4c6e8b1d3f5a7c9e2b4d6f8",
+      "allowed_suite_revisions": ["dflash-coherence-v1"],
+      "required_checks": ["build", "coherence-gate"],
+      "artifacts": ["coherence-report.md"],
+      "pass_criteria": {
+        "status": "passed",
+        "required_checks": "all"
+      }
+    }
+  ]
+}
