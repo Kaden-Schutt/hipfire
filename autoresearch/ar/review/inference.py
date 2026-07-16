@@ -68,6 +68,18 @@ class BoundedHttpTransport:
             if time.monotonic() > deadline:
                 raise ToollessInferenceError("provider request exceeded deadline")
 
+        def apply_read_deadline(response: Any, remaining: float) -> None:
+            setter = getattr(response, "settimeout", None)
+            if callable(setter):
+                setter(remaining)
+                return
+            socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+            setter = getattr(socket, "settimeout", None)
+            if callable(setter):
+                setter(remaining)
+                return
+            raise ToollessInferenceError("provider response socket timeout is unavailable")
+
         try:
             response = self._opener.open(
                 Request(request.url, data=request.body, headers=dict(request.headers), method=request.method),
@@ -85,6 +97,10 @@ class BoundedHttpTransport:
             body = bytearray()
             while True:
                 check_deadline()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ToollessInferenceError("provider request exceeded deadline")
+                apply_read_deadline(response, remaining)
                 chunk = response.read(min(64 * 1024, request.max_response_bytes - len(body) + 1))
                 check_deadline()
                 if not chunk:
@@ -95,6 +111,8 @@ class BoundedHttpTransport:
             return HttpResponse(int(response.status), headers, bytes(body))
         except ToollessInferenceError:
             raise
+        except TimeoutError as exc:
+            raise ToollessInferenceError("provider request exceeded deadline") from exc
         except HTTPError as exc:
             if 300 <= exc.code < 400:
                 raise ToollessInferenceError("HTTP redirects are forbidden") from exc

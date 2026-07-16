@@ -446,7 +446,7 @@ def test_branch_head_accepts_git_plus_and_rejects_invalid_ref_constructs():
     runner = FakeRunner([result({"ref": "refs/heads/release+stable", "object": {"sha": "c" * 40, "type": "commit"}})])
     assert GitHubClient(runner).get_branch_head(REPO, "release+stable") == "c" * 40
     assert runner.calls[0][0][-1].endswith("/git/ref/heads/release%2Bstable")
-    for branch in ("release..stable", "release@{stable}", "release~stable", "release:stable", "release/.lock", "/release", "release/"):
+    for branch in ("@", "release..stable", "release@{stable}", "release~stable", "release:stable", "release/.lock", "/release", "release/"):
         with pytest.raises(GitHubBoundaryError):
             GitHubClient(FakeRunner([])).get_branch_head(REPO, branch)
 

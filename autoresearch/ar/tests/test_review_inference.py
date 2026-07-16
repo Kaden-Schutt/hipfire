@@ -143,6 +143,10 @@ class _ProviderResponse:
         self.headers = response.headers
         self._body = response.body
         self._read = False
+        self.read_timeout = None
+
+    def settimeout(self, timeout):
+        self.read_timeout = timeout
 
     def read(self, size):
         if self._read:
@@ -344,6 +348,9 @@ def test_owned_transport_deadline_covers_slow_response_reads(monkeypatch):
         status = 200
         headers = {"Content-Length": "1"}
 
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
         def read(self, size):
             time.sleep(0.03)
             return b"x"
@@ -355,6 +362,34 @@ def test_owned_transport_deadline_covers_slow_response_reads(monkeypatch):
     monkeypatch.setattr(inference_module, "build_opener", lambda handler: SlowOpener())
     with pytest.raises(ToollessInferenceError, match="deadline|timed out"):
         BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.005, 8))
+
+
+def test_owned_transport_applies_remaining_deadline_before_near_expiry_read(monkeypatch):
+    class NearExpiryResponse:
+        status = 200
+        headers = {"Content-Length": "1"}
+
+        def __init__(self):
+            self.read_timeout = None
+
+        def settimeout(self, timeout):
+            self.read_timeout = timeout
+
+        def read(self, size):
+            assert self.read_timeout is not None
+            assert self.read_timeout < 0.01
+            raise TimeoutError("socket read timed out")
+
+    response = NearExpiryResponse()
+
+    class NearExpiryOpener:
+        def open(self, request, timeout):
+            time.sleep(0.015)
+            return response
+
+    monkeypatch.setattr(inference_module, "build_opener", lambda handler: NearExpiryOpener())
+    with pytest.raises(ToollessInferenceError, match="deadline|timed out"):
+        BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.02, 8))
 
 
 @pytest.mark.parametrize("environment_name", ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_API_TOKEN", "GH_ENTERPRISE_TOKEN"])

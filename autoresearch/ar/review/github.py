@@ -240,6 +240,7 @@ def _login(value: str) -> str:
 def _branch(value: str) -> str:
     if (
         not isinstance(value, str)
+        or value == "@"
         or re.fullmatch(r"[^/]+(?:/[^/]+)*", value) is None
         or any(ord(char) < 0x20 or ord(char) == 0x7F or char.isspace() for char in value)
         or any(char in "~^:?*[\\" for char in value)
