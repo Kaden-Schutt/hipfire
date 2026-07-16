@@ -2590,6 +2590,8 @@ impl Gpu {
             && total_m > 2_048
             && *GFX1151_QKVZA_X_BUFFER_LARGE.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE").as_deref() == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref()
+                        == Ok("1")
             });
         static GFX1151_QKVZA_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
         let gfx1151_k2048_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
