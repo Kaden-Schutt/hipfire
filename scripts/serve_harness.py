@@ -219,7 +219,7 @@ def send(cfg, messages):
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
     t0 = time.time(); ttft = None; think = []; ans = []; tools = []
-    usage = {}; timings = {}; finish = None
+    usage = {}; timings = {}; finish = None; request_error = None
     req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
@@ -230,6 +230,10 @@ def send(cfg, messages):
         if p == "[DONE]": break
         try: ck = json.loads(p)
         except Exception: continue
+        if ck.get("error"):
+            err = ck["error"]
+            request_error = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            break
         if ck.get("usage"): usage = ck["usage"]
         if ck.get("timings"): timings = ck["timings"]
         ch = (ck.get("choices") or [{}])[0]
@@ -265,6 +269,7 @@ def send(cfg, messages):
         "ttft_s": round(ttft or 0, 3), "wall_s": round(wall, 3),
         "attractor": bad, "empty": (cfg.get("expect_visible", True) and len(visible) == 0),
         "runaway": (finish == "length"),
+        "error": request_error,
         "ans_preview": (visible or "<<no visible content>>")[:90],
         "assistant_content": ans_s if ans_s else (tool_s if tool_s else think_s),
     }
@@ -275,13 +280,15 @@ def turn_line(i, r, recall=""):
     if r["runaway"]: flags.append("RUNAWAY")
     if r["empty"]:   flags.append("EMPTY")
     if r["attractor"]: flags.append("ATTRACTOR")
+    if r.get("error"): flags.append("ERROR")
     fl = (" !" + ",".join(flags)) if flags else ""
     dec = r["decode_tok_s"]
     dec_str = f"{dec}~" if (dec is not None and r.get("decode_estimated")) else f"{dec}"
     return (f"  t{i:<2} finish={str(r['finish']):<6} ctx={r['ctx']:<6} cached={r['cached']:<6} "
             f"gen={r['gen']:<5}(think {r['think_words']}/ans {r['ans_words']}w) "
             f"prefill={r['prefill_ms']}ms decode={dec_str} tau={r['tau']}"
-            f"{recall}{fl} | {r['ans_preview']!r}")
+            f"{recall}{fl} | {r['ans_preview']!r}"
+            + (f" error={r['error']!r}" if r.get("error") else ""))
 
 
 def run(cfg, args):
