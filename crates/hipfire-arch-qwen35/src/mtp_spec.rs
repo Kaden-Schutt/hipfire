@@ -133,6 +133,17 @@ fn mtp_redline_enabled_from_env() -> bool {
         .unwrap_or(false)
 }
 
+fn mtp_redline_capture_only_from_env() -> bool {
+    std::env::var("HIPFIRE_MTP_REDLINE_CAPTURE_ONLY")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[inline]
 fn mtp_gpu_rng_next(seed: u32) -> u32 {
     seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223)
@@ -1363,6 +1374,13 @@ fn try_run_mtp_sampled_proposal_redline(
             .replay
             .finish_capture()
             .map_err(|e| hip_bridge::HipError::new(0, e))?;
+        if mtp_redline_capture_only_from_env() {
+            gpu.replay
+                .reset_external_capture()
+                .map_err(|e| hip_bridge::HipError::new(0, e))?;
+            state.mtp_proposal_replay_seq_cap = 0;
+            return Ok(true);
+        }
         let device_ordinal = usize::try_from(gpu.device_id)
             .map_err(|_| hip_bridge::HipError::new(0, "negative HIP device ordinal"))?;
         if gpu.replay.uses_pm4_transport() {
