@@ -89,6 +89,7 @@ KNOWN_KV_MODES = {
     "turbo3",
     "turbo2",
 }
+KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
 
 # Bounds for the optional curated `recommended_settings` (author-recommended
 # inference settings inherited from the parent model card). MUST stay in sync
@@ -314,6 +315,13 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
             errors.append(
                 f"{tag}: invalid default_kv_mode {kv_default!r} "
                 f"(allowed: {sorted(KNOWN_KV_MODES)})"
+            )
+
+        tool_format = entry.get("default_tool_format")
+        if tool_format is not None and tool_format not in KNOWN_TOOL_FORMATS:
+            errors.append(
+                f"{tag}: invalid default_tool_format {tool_format!r} "
+                f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
             )
 
         # Optional curated recommended_settings (carried verbatim by deepcopy).

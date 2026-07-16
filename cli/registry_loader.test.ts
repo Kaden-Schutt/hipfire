@@ -132,6 +132,20 @@ describe("validateRegistryV1", () => {
     expect(validateRegistryV1(r)).not.toBeNull();
   });
 
+  test("accepts known tool formats and rejects unknown values", () => {
+    const hermes = goodRegistry();
+    hermes.models["qwen3.5:9b"].default_tool_format = "hermes";
+    expect(validateRegistryV1(hermes)).not.toBeNull();
+
+    const qwenXml = goodRegistry();
+    qwenXml.models["qwen3.5:9b"].default_tool_format = "qwen_xml";
+    expect(validateRegistryV1(qwenXml)).not.toBeNull();
+
+    const unknown = goodRegistry();
+    (unknown.models["qwen3.5:9b"] as unknown as Record<string, unknown>).default_tool_format = "json";
+    expect(validateRegistryV1(unknown)).toBeNull();
+  });
+
   test("accepts a valid per-model default_kv_mode and null/missing", () => {
     const r = goodRegistry();
     (r.models["qwen3.5:9b"] as unknown as Record<string, unknown>).default_kv_mode = "q8";
