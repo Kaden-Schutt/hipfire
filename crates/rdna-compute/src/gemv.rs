@@ -6680,6 +6680,13 @@ impl Gpu {
                 && *GFX1151_GATE_UP_ALL_BUFFER.get_or_init(|| {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_ALL_BUFFER").as_deref() == Ok("1")
                 });
+            static GFX1151_GATE_UP_ROUTE_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
+            let gfx1151_route_all_buffer = self.arch_caps.is_gfx1151()
+                && k == 2_048
+                && *GFX1151_GATE_UP_ROUTE_ALL_BUFFER.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_GATE_UP_ROUTE_ALL_BUFFER").as_deref()
+                        == Ok("1")
+                });
             static GFX1151_GATE_UP_PAIR_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
             let gfx1151_pair_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
@@ -6687,7 +6694,18 @@ impl Gpu {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER").as_deref()
                         == Ok("1")
                 });
-            if gfx1151_pair_all_buffer {
+            if gfx1151_route_all_buffer {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_route_all_buffer_gfx1151",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_ROUTE_ALL_BUFFER_GFX1151_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151",
+                    [32u32, 1, 1],
+                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                )
+            } else if gfx1151_pair_all_buffer {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_k2048_pair_all_buffer_gfx1151",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_PAIR_ALL_BUFFER_GFX1151_SRC,

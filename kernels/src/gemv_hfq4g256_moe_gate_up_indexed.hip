@@ -8,6 +8,9 @@
 using hipfire_gate_i32x4 = int __attribute__((ext_vector_type(4)));
 using hipfire_gate_f32x4 = float __attribute__((ext_vector_type(4)));
 #endif
+#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_ROUTE_BUFFER)
+using hipfire_gate_u32x2 = unsigned int __attribute__((ext_vector_type(2)));
+#endif
 
 #ifndef HIPFIRE_MOE_GATE_UP_WG_WAVES
 #define HIPFIRE_MOE_GATE_UP_WG_WAVES 1
@@ -97,10 +100,31 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const int krank = blockIdx.y;
 #endif
 
-    // Read expert_id from device and index into the pointer table.
+    // Read expert_id from device and index into the pointer table. The
+    // gfx1151 route-buffer candidate deliberately keeps both dependent reads
+    // on VMEM, then scalarizes their uniform result without touching the
+    // scalar data cache. This makes the route dependency eligible for the
+    // narrower same-agent Redline acquire.
+#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_ROUTE_BUFFER)
+    const auto topk_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<int*>(topk_indices), 0, 0xffffffffu, 0x31004000u);
+    const unsigned int expert_id_v = __builtin_amdgcn_raw_buffer_load_b32(
+        topk_rsrc, (unsigned int)krank * 4u, 0, 0);
+    const int expert_id = __builtin_amdgcn_readfirstlane(expert_id_v);
+    const auto expert_ptrs_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<unsigned long long*>(expert_ptrs),
+        0, 0xffffffffu, 0x31004000u);
+    const hipfire_gate_u32x2 expert_ptr_v = __builtin_amdgcn_raw_buffer_load_b64(
+        expert_ptrs_rsrc, (unsigned int)expert_id * 8u, 0, 0);
+    const unsigned long long expert_ptr =
+        (unsigned long long)__builtin_amdgcn_readfirstlane(expert_ptr_v.x)
+        | ((unsigned long long)__builtin_amdgcn_readfirstlane(expert_ptr_v.y) << 32);
+    const char* __restrict__ A = reinterpret_cast<const char*>(expert_ptr);
+#else
     const int expert_id = topk_indices[krank];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+#endif
 
 #if defined(HIPFIRE_RDNA3_MOE_GATE_UP_K2048)
     // The gfx1100 A3B decode route is fixed at K=2048. Host dispatch enforces

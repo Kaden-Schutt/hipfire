@@ -1547,6 +1547,22 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_ALL_BUFFER_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// gfx1151 bandwidth candidate: keep weights, activations, the freshly
+/// produced top-k index, and the expert-pointer lookup on temporal VMEM. The
+/// two uniform routing loads are scalarized with readfirstlane, allowing the
+/// replay boundary to invalidate vector caches without flushing scalar data.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_ROUTE_ALL_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_X_BUFFER 1\n",
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_ROUTE_BUFFER 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// gfx1100 K=8 scheduling experiment: linearize the two-dimensional grid with
 /// expert rank as the fastest-moving coordinate. Arithmetic stays byte-for-byte
 /// identical while adjacent workgroups share the activation working set and
