@@ -1018,18 +1018,6 @@ pub struct GdnTape {
     pub attn_scratch: GpuTensor,  // [max_n × v_dim]
 }
 
-fn spec_gdn_async_copy_enabled_from_env() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("HIPFIRE_MTP_GDN_ASYNC_COPY")
-                .ok()
-                .as_deref(),
-            Some("1" | "true" | "on" | "yes")
-        )
-    })
-}
-
 impl GdnTape {
     pub fn new_for_config(
         gpu: &mut Gpu,
@@ -1249,40 +1237,20 @@ impl GdnTape {
                 )?;
             } else {
                 let bytes = n_steps * k_dim * 4;
-                if spec_gdn_async_copy_enabled_from_env() {
-                    // Preserve single-stream ordering while avoiding two
-                    // device-wide hipMemcpy synchronization points per LA
-                    // layer in partial-accept rollback.
-                    gpu.memcpy_dtod_at_auto(
-                        &self.q_scratch.buf,
-                        0,
-                        &self.q_raw_scratch.buf,
-                        0,
-                        bytes,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &self.k_scratch.buf,
-                        0,
-                        &self.k_raw_scratch.buf,
-                        0,
-                        bytes,
-                    )?;
-                } else {
-                    gpu.hip.memcpy_dtod_at(
-                        &self.q_scratch.buf,
-                        0,
-                        &self.q_raw_scratch.buf,
-                        0,
-                        bytes,
-                    )?;
-                    gpu.hip.memcpy_dtod_at(
-                        &self.k_scratch.buf,
-                        0,
-                        &self.k_raw_scratch.buf,
-                        0,
-                        bytes,
-                    )?;
-                }
+                gpu.hip.memcpy_dtod_at(
+                    &self.q_scratch.buf,
+                    0,
+                    &self.q_raw_scratch.buf,
+                    0,
+                    bytes,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &self.k_scratch.buf,
+                    0,
+                    &self.k_raw_scratch.buf,
+                    0,
+                    bytes,
+                )?;
             }
 
             // 4. GDN recurrence — advances S_state.
