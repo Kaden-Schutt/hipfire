@@ -4825,6 +4825,14 @@ impl Gpu {
             && *GFX1151_LM_HEAD_BUFFER.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_LM_HEAD_BUFFER").as_deref() == Ok("1")
             });
+        static GFX1151_LM_HEAD_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_hybrid_buffer = self.arch_caps.is_gfx1151()
+            && rows == 2
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_HYBRID_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER").as_deref() == Ok("1")
+            });
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
@@ -4841,7 +4849,12 @@ impl Gpu {
                 8 => ("gemv_hfq4g256_multirow_r8", 8u32),
                 _ => unreachable!(),
             };
-            let (mr_name, mr_src) = if gfx1151_lm_head_buffer {
+            let (mr_name, mr_src) = if gfx1151_lm_head_hybrid_buffer {
+                (
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_buffer",
+                    kernels::GEMV_HFQ4G256_MULTIROW_HYBRID_BUFFER_GFX1151_SRC,
+                )
+            } else if gfx1151_lm_head_buffer {
                 (
                     "gemv_hfq4g256_multirow_gfx1151_buffer",
                     kernels::GEMV_HFQ4G256_MULTIROW_BUFFER_GFX1151_SRC,

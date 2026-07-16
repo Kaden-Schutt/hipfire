@@ -292,10 +292,21 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
         const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
         const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
 
+#if defined(HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER)
+    // Uniform per-group headers are cheaper on the scalar/global path. Only
+    // the lane-divergent packed dword uses temporal buffer VMEM.
+    #define LOAD_LM_HEADER(gp, weight_offset) (*(const unsigned int*)(gp))
+#else
+    #define LOAD_LM_HEADER(gp, weight_offset) \
+        HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
+#endif
+    #define LOAD_LM_PACKED(gp, weight_offset) \
+        HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
+
     #define DOG_X8(gp, weight_offset, a, pfx) do { \
-        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)); \
-        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)); \
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
+        float sc = __builtin_bit_cast(float, LOAD_LM_HEADER(gp, weight_offset)); \
+        float zp = __builtin_bit_cast(float, LOAD_LM_HEADER((gp) + 4, (weight_offset) + 4)); \
+        unsigned int pk = LOAD_LM_PACKED((gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * pfx##0 \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * pfx##1 \
              + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * pfx##2 \
@@ -335,9 +346,9 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
         const float x4 = xv1.x, x5 = xv1.y, x6 = xv1.z, x7 = xv1.w
 
     #define DOG_X8_TAIL(gp, weight_offset, a) do { \
-        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)); \
-        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)); \
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
+        float sc = __builtin_bit_cast(float, LOAD_LM_HEADER(gp, weight_offset)); \
+        float zp = __builtin_bit_cast(float, LOAD_LM_HEADER((gp) + 4, (weight_offset) + 4)); \
+        unsigned int pk = LOAD_LM_PACKED((gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
              + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
@@ -373,6 +384,8 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
     #undef LOAD_X8
     #undef DOG_X8
     #undef LOAD_X8_INTO
+    #undef LOAD_LM_PACKED
+    #undef LOAD_LM_HEADER
 
     float s0 = (a0 + a1) + (a2 + a3);
     float s1 = (b0 + b1) + (b2 + b3);
