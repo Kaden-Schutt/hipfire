@@ -87,10 +87,6 @@ pub struct FeatureFlags {
     /// Compile the gfx1100 A3B MoE gate/up GEMV with its eight K groups fixed
     /// at compile time. Opt-in until exact shadow and tg128 gates promote it.
     pub rdna3_hfq4_moe_gate_up_k2048: bool,
-    /// Compile the exact dense Qwen3.5-27B gate/up shape with twenty HFQ4
-    /// groups fixed at compile time on gfx1201. Experimental opt-in until the
-    /// retained-PM4 shadow and stationary product gates promote it.
-    pub gfx1201_hfq4_gate_up_k5120: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -374,11 +370,6 @@ impl FeatureFlags {
             )
             .as_deref()
                 == Ok("1"),
-            gfx1201_hfq4_gate_up_k5120: std::env::var(
-                "HIPFIRE_GFX1201_HFQ4_GATE_UP_K5120",
-            )
-            .as_deref()
-                == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -629,7 +620,6 @@ impl FeatureFlags {
             rdna3_hfq4_sigmoid_rows4: false,
             rdna3_hfq4_lm_head_k2048: false,
             rdna3_hfq4_moe_gate_up_k2048: false,
-            gfx1201_hfq4_gate_up_k5120: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,

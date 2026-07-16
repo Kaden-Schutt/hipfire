@@ -370,9 +370,7 @@ const fn write(offset: usize) -> PointerEffect {
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     if matches!(
         kernel,
-        "fused_gate_up_hfq4g256"
-            | "fused_gate_up_hfq4g256_k1024_gfx1201"
-            | "fused_gate_up_hfq4g256_k5120_gfx1201"
+        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -690,9 +688,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     if matches!(
         kernel,
-        "fused_gate_up_hfq4g256"
-            | "fused_gate_up_hfq4g256_k1024_gfx1201"
-            | "fused_gate_up_hfq4g256_k5120_gfx1201"
+        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
     ) {
         return Some(64);
     }
@@ -3541,7 +3537,6 @@ mod tests {
         for kernel in [
             "fused_gate_up_hfq4g256",
             "fused_gate_up_hfq4g256_k1024_gfx1201",
-            "fused_gate_up_hfq4g256_k5120_gfx1201",
         ] {
             assert_eq!(expected_kernarg_bytes(kernel), Some(64));
             assert_eq!(pointer_effects(kernel).map(|effects| effects.len()), Some(5));

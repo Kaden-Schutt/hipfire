@@ -3613,16 +3613,6 @@ pub const FUSED_GATE_UP_HFQ4G256_K1024_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
 );
-/// gfx1201 dense Qwen3.5-27B decode experiment. Fixing K=5120 exposes five
-/// complete four-group quads to LLVM and removes the generic loop/tail tests
-/// without changing the load, FMA, or reduction order.
-pub const FUSED_GATE_UP_HFQ4G256_K5120_GFX1201_SRC: &str = concat!(
-    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_k5120_gfx1201\n",
-    "#define HIPFIRE_FUSED_GATE_UP_K5120 1\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
-);
 /// Fused gate+up for Q8_0 weights. Two Q8 GEMVs in one launch.
 /// Grid=[gate_m + up_m], block=[32]. +5.8 tok/s decode on dots.ocr.
 pub const FUSED_GATE_UP_Q8_0_SRC: &str =
