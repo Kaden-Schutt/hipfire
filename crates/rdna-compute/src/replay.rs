@@ -389,6 +389,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151"
     ) {
@@ -685,6 +686,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151"
     ) {
@@ -2986,6 +2988,7 @@ mod tests {
         let gate_hybrid =
             "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
+        let qkvza_hybrid = "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(gate), Some(48));
         assert_eq!(pointer_effects(gate).map(|effects| effects.len()), Some(5));
         assert_eq!(expected_kernarg_bytes(gate_hybrid), Some(48));
@@ -2995,6 +2998,12 @@ mod tests {
         );
         assert_eq!(expected_kernarg_bytes(qkvza), Some(96));
         assert_eq!(pointer_effects(qkvza).map(|effects| effects.len()), Some(9));
+        assert_eq!(expected_kernarg_bytes(qkvza_hybrid), Some(96));
+        assert_eq!(
+            pointer_effects(qkvza_hybrid).map(|effects| effects.len()),
+            Some(9)
+        );
+        assert!(!radiowave_vmem_only_consumer(qkvza_hybrid));
         for (symbol, kernarg_bytes, pointer_count) in [
             ("gated_norm_mq_rotate_gfx1151", 64, 6),
             ("qwen35_fa_prep_gfx1151", 64, 7),

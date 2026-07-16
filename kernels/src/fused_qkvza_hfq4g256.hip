@@ -8,6 +8,9 @@
 using hipfire_qkvza_i32x4 = int __attribute__((ext_vector_type(4)));
 using hipfire_qkvza_f32x4 = float __attribute__((ext_vector_type(4)));
 #endif
+#if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
+using hipfire_qkvza_u32x2 = unsigned int __attribute__((ext_vector_type(2)));
+#endif
 
 // 4-way fused HFQ4-G256 GEMV for the Qwen3.5 DeltaNet linear-attention
 // layer preamble. One kernel launch performs all four projections from a
@@ -187,10 +190,21 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
                  + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
                  + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
         {
+#if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
+            const hipfire_qkvza_u32x2 h0 =
+                *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp0;
+            const hipfire_qkvza_u32x2 h1 =
+                *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp1;
+            float sc0 = __builtin_bit_cast(float, h0.x);
+            float zp0 = __builtin_bit_cast(float, h0.y);
+            float sc1 = __builtin_bit_cast(float, h1.x);
+            float zp1 = __builtin_bit_cast(float, h1.y);
+#else
             float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
             float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
             float sc1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 136));
             float zp1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4, (g + 1) * 136 + 4));
+#endif
             unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
             unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
             const int base = g * 256 + tid * 8;
@@ -198,10 +212,21 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
             DOG_PAIR(pk1, sc1, zp1, base + 256, acc1);
         }
         {
+#if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
+            const hipfire_qkvza_u32x2 h2 =
+                *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp2;
+            const hipfire_qkvza_u32x2 h3 =
+                *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp3;
+            float sc2 = __builtin_bit_cast(float, h2.x);
+            float zp2 = __builtin_bit_cast(float, h2.y);
+            float sc3 = __builtin_bit_cast(float, h3.x);
+            float zp3 = __builtin_bit_cast(float, h3.y);
+#else
             float sc2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136));
             float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
             float sc3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136));
             float zp3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4));
+#endif
             unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
             unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
             const int base = g * 256 + tid * 8;
@@ -209,6 +234,24 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
             DOG_PAIR(pk3, sc3, zp3, base + 768, acc3);
         }
         #undef DOG_PAIR
+#else
+#if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
+        const hipfire_qkvza_u32x2 h0 =
+            *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp0;
+        const hipfire_qkvza_u32x2 h1 =
+            *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp1;
+        const hipfire_qkvza_u32x2 h2 =
+            *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp2;
+        const hipfire_qkvza_u32x2 h3 =
+            *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp3;
+        float sc0 = __builtin_bit_cast(float, h0.x);
+        float zp0 = __builtin_bit_cast(float, h0.y);
+        float sc1 = __builtin_bit_cast(float, h1.x);
+        float zp1 = __builtin_bit_cast(float, h1.y);
+        float sc2 = __builtin_bit_cast(float, h2.x);
+        float zp2 = __builtin_bit_cast(float, h2.y);
+        float sc3 = __builtin_bit_cast(float, h3.x);
+        float zp3 = __builtin_bit_cast(float, h3.y);
 #else
         float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
         float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
@@ -218,6 +261,7 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
         float sc3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136));
         float zp3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4));
+#endif
 
         unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
         unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);

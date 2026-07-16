@@ -2585,6 +2585,12 @@ impl Gpu {
                 std::env::var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER").as_deref() == Ok("1")
                     || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
             });
+        static GFX1151_QKVZA_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_hybrid_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_HYBRID_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER").as_deref() == Ok("1")
+            });
         static GFX1151_QKVZA_X_BUFFER_LARGE: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_x_buffer_large = self.arch_caps.is_gfx1151()
             && k == 2_048
@@ -2779,6 +2785,17 @@ impl Gpu {
             };
             self.ensure_kernel(module, source, function)?;
             (function, [32u32, 1, 1], total_m as u32)
+        } else if gfx1151_k2048_hybrid_buffer {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_HYBRID_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
         } else if gfx1151_k2048_all_buffer && !gfx1151_k2048_pair_buffer {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151",

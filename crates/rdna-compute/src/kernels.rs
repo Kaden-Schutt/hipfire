@@ -2950,6 +2950,22 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+/// gfx1151 QKVZA hybrid cache path: immutable wave-uniform scale/zero headers
+/// use scalar B64 loads, while packed weights and the shared activation retain
+/// the admitted temporal buffer lowering. This removes redundant per-lane
+/// header VMEM without changing row ownership or the arithmetic tree.
+pub const FUSED_QKVZA_HFQ4G256_K2048_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_X_BUFFER 1\n",
+    "#define HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 /// gfx1151 selective QKVZA lowering for the large projection geometry. Keep
 /// HFQ weights on global loads and issue only the shared K=2048 activation as
 /// aligned temporal B128 buffer loads.
