@@ -116,9 +116,12 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         0, 0xffffffffu, 0x31004000u);
     const hipfire_gate_u32x2 expert_ptr_v = __builtin_amdgcn_raw_buffer_load_b64(
         expert_ptrs_rsrc, (unsigned int)expert_id * 8u, 0, 0);
+    const unsigned int expert_ptr_lo =
+        (unsigned int)__builtin_amdgcn_readfirstlane(expert_ptr_v.x);
+    const unsigned int expert_ptr_hi =
+        (unsigned int)__builtin_amdgcn_readfirstlane(expert_ptr_v.y);
     const unsigned long long expert_ptr =
-        (unsigned long long)__builtin_amdgcn_readfirstlane(expert_ptr_v.x)
-        | ((unsigned long long)__builtin_amdgcn_readfirstlane(expert_ptr_v.y) << 32);
+        (unsigned long long)expert_ptr_lo | ((unsigned long long)expert_ptr_hi << 32);
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_ptr);
 #else
     const int expert_id = topk_indices[krank];
