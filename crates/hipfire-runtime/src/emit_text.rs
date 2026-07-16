@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 
 //! Model-independent parsing of *emitted* assistant text — think-span state and
-//! Hermes/ChatML `<tool_call>` extraction.
+//! Hermes/ChatML and Qwen-native XML `<tool_call>` extraction.
 //!
 //! These helpers used to live in the `daemon` example, where the per-arch
 //! `SpecEmit` impls call them during the decode loop. They are pure
@@ -28,10 +28,11 @@ pub fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
     }
 }
 
-/// Extract Hermes/ChatML `<tool_call>{json}</tool_call>` calls from generated
-/// text. Tolerant of truncation (unclosed `<tool_call>`), ChatML special-token
-/// leakage, and stacked/nested openers (MQ4 #111 attractor shapes). Mirrors the
-/// CLI's `parseToolCalls` / `parseOneToolCall`.
+/// Extract Hermes/ChatML `<tool_call>{json}</tool_call>` and Qwen-native XML
+/// `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>...` calls from
+/// generated text. Tolerant of truncation (unclosed `<tool_call>`), ChatML
+/// special-token leakage, and stacked/nested openers (MQ4 #111 attractor
+/// shapes). Mirrors the CLI's `parseToolCalls` / `parseOneToolCall`.
 pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCall> {
     let mut out: Vec<crate::prompt_frame::ToolCall> = Vec::new();
     let mut search_pos = 0;
@@ -82,7 +83,15 @@ pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCal
                     parsed = Some((name, arguments));
                 }
             }
-            // Form 4 (regex fallback): when JSON parse fails, recover
+            // Form 3: Qwen3.5/3.6 native XML. Check this before the relaxed
+            // JSON scan: a write-file parameter can itself contain JSON keys
+            // named `name`/`arguments`, which must not shadow the outer XML
+            // function name.
+            if parsed.is_none() {
+                parsed = extract_qwen_xml_tool_call(body);
+            }
+            // Form 4 (regex fallback): when JSON and native XML parsing fail,
+            // recover
             // name + arguments via a relaxed key-delimiter pattern.
             // Mirrors cli/index.ts:2287-2295.
             if parsed.is_none() {
@@ -117,6 +126,71 @@ pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCal
         }
     }
     out
+}
+
+/// Parse Qwen3.5/3.6's native tool-call body:
+/// `<function=NAME><parameter=KEY>VALUE</parameter>...</function>`.
+///
+/// The upstream template does not XML-escape parameter values, so this parser
+/// deliberately mirrors the CLI's first-close-tag behavior. Missing parameter
+/// close tags are treated as truncation and reject the call instead of
+/// fabricating partial arguments.
+fn extract_qwen_xml_tool_call(body: &str) -> Option<(String, serde_json::Value)> {
+    let body = body.trim_start();
+    let function_body = body.strip_prefix("<function=")?;
+    let name_end = function_body.find('>')?;
+    let name = function_body[..name_end].trim();
+    if name.is_empty()
+        || !name.chars().enumerate().all(|(i, c)| {
+            c == '_' || c.is_ascii_alphanumeric() || (i > 0 && matches!(c, '.' | '-'))
+        })
+        || name.as_bytes()[0].is_ascii_digit()
+    {
+        return None;
+    }
+
+    let after_name = &function_body[name_end + 1..];
+    let params_body = after_name
+        .find("</function>")
+        .map(|end| &after_name[..end])
+        .unwrap_or(after_name);
+    let mut arguments = serde_json::Map::new();
+    let mut rest = params_body;
+    while let Some(open) = rest.find("<parameter=") {
+        rest = &rest[open + "<parameter=".len()..];
+        let key_end = rest.find('>')?;
+        let key = rest[..key_end].trim();
+        if key.is_empty()
+            || !key.chars().enumerate().all(|(i, c)| {
+                c == '_' || c.is_ascii_alphanumeric() || (i > 0 && matches!(c, '.' | '-'))
+            })
+            || key.as_bytes()[0].is_ascii_digit()
+        {
+            return None;
+        }
+        rest = &rest[key_end + 1..];
+        let value_end = rest.find("</parameter>")?;
+        let value = rest[..value_end].trim();
+        arguments.insert(key.to_string(), coerce_qwen_xml_parameter(value));
+        rest = &rest[value_end + "</parameter>".len()..];
+    }
+
+    Some((name.to_string(), serde_json::Value::Object(arguments)))
+}
+
+/// Match the CLI's native-XML value coercion: JSON primitives, objects, and
+/// arrays retain their types; ordinary text stays a string.
+fn coerce_qwen_xml_parameter(value: &str) -> serde_json::Value {
+    let typed = matches!(value, "true" | "false" | "null")
+        || value.parse::<f64>().is_ok()
+        || (value.starts_with('{') && value.ends_with('}'))
+        || (value.starts_with('[') && value.ends_with(']'));
+    if typed {
+        if let Ok(parsed) = serde_json::from_str(value) {
+            return parsed;
+        }
+    }
+    serde_json::Value::String(value.to_string())
 }
 
 /// Relaxed name extraction: matches `"name": "X"` (or `'name': 'X'`,
@@ -287,4 +361,47 @@ pub fn tool_call_args_object_complete(s: &str) -> bool {
         k += 1;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_tool_calls_from_text;
+
+    #[test]
+    fn parses_qwen_native_xml_tool_call() {
+        let emitted = "<tool_call><function=write_file><parameter=path>/tmp/angle.c</parameter><parameter=content>#include <stdio.h>\nint main(void) { return 3 < 4 ? 0 : 1; }</parameter></function></tool_call>";
+        let calls = extract_tool_calls_from_text(emitted);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["path"], "/tmp/angle.c");
+        assert_eq!(
+            calls[0].arguments["content"],
+            "#include <stdio.h>\nint main(void) { return 3 < 4 ? 0 : 1; }"
+        );
+    }
+
+    #[test]
+    fn coerces_qwen_native_xml_parameter_types() {
+        let emitted = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n</function>\n</tool_call>";
+        let calls = extract_tool_calls_from_text(emitted);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["count"], 42);
+        assert_eq!(calls[0].arguments["enabled"], true);
+        assert_eq!(calls[0].arguments["options"]["mode"], "fast");
+    }
+
+    #[test]
+    fn qwen_xml_function_name_wins_over_json_keys_in_parameter_text() {
+        let emitted = "<tool_call><function=write_file><parameter=content>{\"name\":\"wrong\",\"arguments\":{\"x\":1}}</parameter></function></tool_call>";
+        let calls = extract_tool_calls_from_text(emitted);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["content"]["name"], "wrong");
+    }
+
+    #[test]
+    fn rejects_truncated_qwen_native_xml_parameter() {
+        let emitted = "<tool_call><function=write_file><parameter=path>/tmp/incomplete";
+        assert!(extract_tool_calls_from_text(emitted).is_empty());
+    }
 }

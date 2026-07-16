@@ -1433,6 +1433,41 @@ function resolveNgramBlock(value: "auto" | boolean, modelTag: string | null | un
   return /(:|-)(0\.[68]b|0\.6b|1b|2b|4b)\b/.test(t);
 }
 
+// Whether the Hermes JSON tool-call grammar (daemon's HIPFIRE_QWEN35_GRAMMAR)
+// should be enabled for a model. Only Hermes-format models — the ones that
+// natively emit `<tool_call>{"name":..,"arguments":{..}}</tool_call>` (the
+// carnice family, registry desc "Hermes …") — want it. Plain qwen3.x is
+// Qwen-XML-native (`<function=><parameter=>`); forcing JSON on it makes the
+// model drift back into XML close tags mid-call and drop JSON braces, which
+// corrupts code-writing tool calls. So default OFF and only turn it ON for
+// Hermes-format cards. The caller applies any explicit
+// `HIPFIRE_QWEN35_GRAMMAR` override without caching this decision globally:
+// one serve can load plain Qwen and Carnice in succession, so model-derived
+// policy must be resolved for every active/requested model.
+export function resolveToolGrammar(modelTag: string | null | undefined): boolean {
+  if (!modelTag) return false;
+  const card = REGISTRY[resolveModelTag(modelTag)] as
+    | { desc?: string; default_tool_format?: string | null }
+    | undefined;
+  const fmt = card?.default_tool_format;
+  if (fmt === "hermes") return true;
+  if (fmt === "qwen_xml") return false;
+  // Fallback inference when no explicit card field: Hermes-format models are
+  // described as "Hermes …", and the carnice family is the Hermes tool-use set.
+  if (card?.desc && /hermes/i.test(card.desc)) return true;
+  return /(^|[:/_-])(carnice|hermes)\b/i.test(modelTag);
+}
+
+// Explicit shell override wins; otherwise resolve from the model for this
+// request/load. Keeping this pure prevents a pre-warmed model's tool format
+// from bleeding into a different model loaded later by the same serve.
+export function resolveToolGrammarForModel(
+  modelTag: string | null | undefined,
+  envValue: string | undefined = process.env.HIPFIRE_QWEN35_GRAMMAR,
+): boolean {
+  return envValue === undefined ? resolveToolGrammar(modelTag) : envValue !== "0";
+}
+
 // Set all config-driven env vars in one place so every daemon-spawning
 // codepath picks up the user's current settings consistently.
 // Called before `new Engine().start()`. Optional `modelTag` enables
@@ -1440,6 +1475,10 @@ function resolveNgramBlock(value: "auto" | boolean, modelTag: string | null | un
 // dflash_ngram_block).
 function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg, modelTag);
+  // Do not materialize model-derived tool grammar into process.env here.
+  // The daemon resolves its default from every loaded model path, while the
+  // serve-side tools example calls resolveToolGrammarForModel per request.
+  // Only an explicit inherited shell env is process-global by user intent.
   // Only set HIPFIRE_ATTN_FLASH if the user hasn't already set it in their
   // shell (env overrides config). `auto` is the engine default — skip the
   // env var in that case so the engine's own default applies.
@@ -2615,7 +2654,11 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
 }
 
 async function serve(port: number, host: string) {
-  applyConfigEnv(cfg);
+  // Resolve the model this serve will pre-warm (HIPFIRE_MODEL env or the config
+  // default) BEFORE spawning the daemon, so per-model env — notably the
+  // Hermes-JSON tool grammar — is set correctly on the daemon's inherited env.
+  const serveModel = process.env.HIPFIRE_MODEL || cfg.default_model;
+  applyConfigEnv(cfg, serveModel);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
   // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
   // HIPFIRE_NO_PID_FILE=1 suppresses the write — used by `hipfire chat` when it
@@ -3451,11 +3494,29 @@ async function serve(port: number, host: string) {
         //    tool-call format contracts (observed verbatim in
         //    /tmp/hipfire-prompt-*.txt). Skip for V4F.
         if (tools.length > 0 && currentArch !== "deepseek4") {
+          // qwen3.5/3.6 (arch qwen3_5 / qwen3_5_moe) are Qwen-XML-native
+          // (`<function=NAME><parameter=ARG>`). When the Hermes JSON grammar is
+          // OFF for them (the default for non-Hermes qwen — see resolveToolGrammar),
+          // show the model its NATIVE XML call format instead of the legacy
+          // Hermes JSON example. A JSON example fights the model's training and
+          // induces XML-tag drift / dropped braces mid-call. Resolve against
+          // the requested model on every request so a pre-warmed model cannot
+          // bleed its format into a later live reload. An explicit shell env
+          // remains a process-wide user override. Non-qwen35 arches (cohere,
+          // etc.) are untouched. The <tools> schema block stays JSON either
+          // way — that is the function DEFINITION list, which Qwen's native
+          // template also renders as JSON; only the emitted CALL format differs.
+          const isQwen35 = currentArch === "qwen3_5" || currentArch === "qwen3_5_moe";
+          const grammarOn = resolveToolGrammarForModel(body.model || path);
+          const useXmlToolFormat = isQwen35 && !grammarOn;
+          const exampleCall = useXmlToolFormat
+            ? "<tool_call>\n<function=example_function>\n<parameter=param>\nvalue\n</parameter>\n</function>\n</tool_call>"
+            : '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
           const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
             + tools.map((t: any) => JSON.stringify(t)).join("\n")
             + "\n</tools>\n\n"
             + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
-            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
+            + exampleCall;
           systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
         }
 

@@ -147,3 +147,22 @@ describe("peekFlagValue allowDashValue (HF-CLI-005)", () => {
     expect(mod.peekFlagValue(["-d"], "--temp").kind).toBe("absent");
   });
 });
+
+// ─── Per-model tool grammar: no live-serve bleed ─────────
+describe("resolveToolGrammarForModel", () => {
+  test("plain Qwen defaults to native XML and Carnice to Hermes", () => {
+    expect(mod.resolveToolGrammarForModel("qwen3.6:35b-a3b", undefined)).toBe(false);
+    expect(mod.resolveToolGrammarForModel("carnice:27b", undefined)).toBe(true);
+  });
+
+  test("successive mixed-model resolutions do not retain the prior model", () => {
+    expect(mod.resolveToolGrammarForModel("carnice:9b", undefined)).toBe(true);
+    expect(mod.resolveToolGrammarForModel("qwen3.6:35b-a3b", undefined)).toBe(false);
+    expect(mod.resolveToolGrammarForModel("carnice:27b", undefined)).toBe(true);
+  });
+
+  test("an explicit shell override remains process-wide by intent", () => {
+    expect(mod.resolveToolGrammarForModel("qwen3.6:35b-a3b", "1")).toBe(true);
+    expect(mod.resolveToolGrammarForModel("carnice:27b", "0")).toBe(false);
+  });
+});
