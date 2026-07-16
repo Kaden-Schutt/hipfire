@@ -1164,6 +1164,19 @@ pub const GEMV_HFQ4G1024_SRC: &str = include_str!("../../../kernels/src/gemv_hfq
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights.
 /// Same coalesced width as Q4_K, 14 VGPRs instead of 39.
 pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.hip");
+/// gfx1151 LM-head one-row candidate. Keep wave-uniform HFQ headers on scalar
+/// loads, lower lane-divergent packed weights to temporal VMEM, and specialize
+/// the hot 248320x2048 shape so the compiler removes dynamic tail control.
+pub const GEMV_HFQ4G256_LM_HEAD_R1_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_HFQ4G256_K2048 1\n",
+    "#define HIPFIRE_HFQ4G256_KERNEL gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256.hip")
+);
 
 // ── RDNA2 (gfx1030) HFQ4-G256 variants ──
 // 5 kernel variants exploring the occupancy/unroll/cache tradeoff space.

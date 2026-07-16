@@ -4764,11 +4764,26 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        use std::sync::OnceLock;
+        static GFX1151_LM_HEAD_R1_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_r1_hybrid_buffer = self.arch_caps.is_gfx1151()
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_R1_HYBRID_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_LM_HEAD_R1_HYBRID_BUFFER").as_deref() == Ok("1")
+            });
         let use_lm_head_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_lm_head_k2048
             && m == 248_320
             && k == 2_048;
-        let func_name = if use_lm_head_k2048 {
+        let func_name = if gfx1151_lm_head_r1_hybrid_buffer {
+            self.ensure_kernel(
+                "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151",
+                kernels::GEMV_HFQ4G256_LM_HEAD_R1_HYBRID_BUFFER_GFX1151_SRC,
+                "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151",
+            )?;
+            "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
+        } else if use_lm_head_k2048 {
             self.ensure_kernel(
                 "gemv_hfq4g256_k2048_gfx1100",
                 kernels::GEMV_HFQ4G256_K2048_GFX1100_SRC,
@@ -4815,8 +4830,7 @@ impl Gpu {
         // the per-arch defaults.
         let rdna3 = self.arch_caps.is_rdna3_dgpu();
         let rows = self.arch_caps.gemv_rows_default();
-        let use_multirow = rows > 1;
-        use std::sync::OnceLock;
+        let use_multirow = rows > 1 && !gfx1151_lm_head_r1_hybrid_buffer;
         static GFX1151_LM_HEAD_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_lm_head_buffer = self.arch_caps.is_gfx1151()
             && rows == 2
@@ -4844,7 +4858,8 @@ impl Gpu {
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
-        let use_wide = !use_multirow
+        let use_wide = !gfx1151_lm_head_r1_hybrid_buffer
+            && !use_multirow
             && m >= 64
             && !(self.arch_caps.is_rdna2() || self.arch_caps.is_rdna3_dgpu());
 

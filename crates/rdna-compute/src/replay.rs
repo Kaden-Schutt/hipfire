@@ -528,6 +528,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         }
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
+        | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
         | "gemv_hfq4g256_residual_cpol_rt"
@@ -679,6 +680,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "softmax_f32" => Some(16),
         "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
+        | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
         | "gemv_hfq4g256_residual_cpol_rt"
@@ -2715,6 +2717,12 @@ mod tests {
             "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(down), Some(48));
         assert_eq!(pointer_effects(down).map(|effects| effects.len()), Some(4));
+        let lm_head = "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151";
+        assert_eq!(expected_kernarg_bytes(lm_head), Some(32));
+        assert_eq!(
+            pointer_effects(lm_head).map(|effects| effects.len()),
+            Some(3)
+        );
     }
 
     #[test]
