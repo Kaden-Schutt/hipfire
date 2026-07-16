@@ -3001,6 +3001,16 @@ pub const FUSED_QKVZA_HFQ4G256_GLOBAL_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
+/// Exact dense Qwen3.5-27B dual-row QKVZA candidate. Two adjacent output
+/// rows share every K=5120 activation load while weights remain global.
+pub const FUSED_QKVZA_HFQ4G256_R2_K5120_GLOBAL_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_QKVZA_R2_K5120 1\n",
+    "#define HIPFIRE_QKVZA_R2_KERNEL_NAME fused_qkvza_hfq4g256_r2_k5120_global_gfx1201\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_r2.gfx1100.hip")
+);
 
 /// Exact gfx1151 A3B candidate: preserve the generic one-row schedule while
 /// making K=2048 constant and lowering weights through temporal raw-buffer

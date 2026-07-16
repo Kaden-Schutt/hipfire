@@ -4,13 +4,17 @@
 
 #include <hip/hip_runtime.h>
 
-// gfx1100 Radiowave experiment for the fixed K=2048 DeltaNet QKVZA shape.
+// Radiowave experiment for fixed-shape DeltaNet QKVZA projections.
 // One wave owns two adjacent output rows and reuses the same 32 activation
 // values across both independent weight streams. Each row retains the shipping
 // four-chain dot-product and wave32 reduction order.
 
+#ifndef HIPFIRE_QKVZA_R2_KERNEL_NAME
+#define HIPFIRE_QKVZA_R2_KERNEL_NAME fused_qkvza_hfq4g256_k2048_r2
+#endif
+
 __launch_bounds__(32, 16)
-extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r2(
+extern "C" __global__ void HIPFIRE_QKVZA_R2_KERNEL_NAME(
     const char*  __restrict__ A_qkv,
     const char*  __restrict__ A_z,
     const char*  __restrict__ A_beta,
@@ -58,8 +62,14 @@ extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r2(
         A1 = A_alpha; y1 = y_alpha; row1 = gid1 - qkv_m - z_m - beta_m;
     }
 
-    // Eight 136-byte HFQ4 groups per K=2048 row.
-    constexpr long long row_stride = 8LL * 136;
+#if defined(HIPFIRE_QKVZA_R2_K5120)
+    constexpr int groups_per_row = 20;
+    constexpr int quads = 5;
+#else
+    constexpr int groups_per_row = 8;
+    constexpr int quads = 2;
+#endif
+    constexpr long long row_stride = (long long)groups_per_row * 136;
     const char* row_ptr0 = A0 + (long long)row0 * row_stride;
     const char* row_ptr1 = have_row1
         ? A1 + (long long)row1 * row_stride
@@ -102,7 +112,7 @@ extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r2(
     // the already dual-row instruction footprint and loses to instruction
     // fetch pressure on gfx1100.
     #pragma clang loop unroll(disable)
-    for (int q = 0; q < 2; q++) {
+    for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int xbase = g * 256 + tid * 8;
         LOAD_X8_INTO(xbase, xa);

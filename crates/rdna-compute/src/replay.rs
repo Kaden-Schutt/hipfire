@@ -533,6 +533,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_global_gfx1201"
+        | "fused_qkvza_hfq4g256_r2_k5120_global_gfx1201"
         | "fused_qkvza_hfq4g256_k2048"
         | "fused_qkvza_hfq4g256_k2048_r2"
         | "fused_qkvza_hfq4g256_k2048_cpol_slc"
@@ -839,6 +840,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_global_gfx1201"
+        | "fused_qkvza_hfq4g256_r2_k5120_global_gfx1201"
         | "fused_qkvza_hfq4g256_k2048"
         | "fused_qkvza_hfq4g256_k2048_r2"
         | "fused_qkvza_hfq4g256_k2048_cpol_slc"
@@ -2983,6 +2985,7 @@ mod tests {
         "rotate_with_rms_gfx1100",
         "fused_qkvza_hfq4g256",
         "fused_qkvza_hfq4g256_global_gfx1201",
+        "fused_qkvza_hfq4g256_r2_k5120_global_gfx1201",
         "fused_qkvza_hfq4g256_k2048",
         "fused_qkvza_hfq4g256_k2048_r2",
         "fused_qkvza_hfq4g256_k2048_cpol_slc",
