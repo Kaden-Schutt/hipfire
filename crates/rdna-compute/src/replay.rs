@@ -18,10 +18,10 @@ use std::sync::Arc;
 use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
-    Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
-    GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
-    PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph,
-    SingleQueuePm4Ib,
+    Gfx10Pm4CommandBuffer, Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, GpuBatchTiming,
+    GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
+    LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch, Runtime,
+    SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +142,7 @@ impl Pm4Commands {
         architecture: Pm4Architecture,
         policy: Pm4RegisterPolicy,
         dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
+        dispatch_interleave: Option<Gfx11DispatchInterleave>,
     ) -> Self {
         match architecture {
             Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
@@ -151,7 +152,8 @@ impl Pm4Commands {
                         Gfx10Pm4CommandBuffer::new_stateful()
                     }
                 }
-                .with_dispatch_initiator_policy(dispatch_initiator_policy);
+                .with_dispatch_initiator_policy(dispatch_initiator_policy)
+                .with_dispatch_interleave(dispatch_interleave);
                 Self::Legacy {
                     architecture,
                     commands,
@@ -1086,6 +1088,48 @@ fn gfx10_dispatch_initiator_policy_from_value(
     }
 }
 
+fn gfx1151_dispatch_interleave(
+    architecture: Pm4Architecture,
+    device_name: &str,
+) -> Option<Gfx11DispatchInterleave> {
+    let value =
+        std::env::var("HIPFIRE_GFX1151_PM4_INTERLEAVE").unwrap_or_else(|_| "inherit".to_owned());
+    let interleave = gfx1151_dispatch_interleave_from_value(architecture, device_name, &value)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unknown HIPFIRE_GFX1151_PM4_INTERLEAVE={value:?}; inheriting queue value"
+            );
+            None
+        });
+    if let Some(interleave) = interleave {
+        eprintln!(
+            "[redline] gfx1151 PM4 dispatch interleave={} threads/SE",
+            interleave.threads()
+        );
+    }
+    interleave
+}
+
+fn gfx1151_dispatch_interleave_from_value(
+    architecture: Pm4Architecture,
+    device_name: &str,
+    value: &str,
+) -> Option<Option<Gfx11DispatchInterleave>> {
+    if architecture != Pm4Architecture::Gfx11 || !device_name.eq_ignore_ascii_case("gfx1151") {
+        return Some(None);
+    }
+
+    match value.to_ascii_lowercase().as_str() {
+        "" | "inherit" | "legacy" | "firmware" => Some(None),
+        "0" | "disabled" | "off" => Some(Some(Gfx11DispatchInterleave::Disabled)),
+        "64" => Some(Some(Gfx11DispatchInterleave::Threads64)),
+        "128" => Some(Some(Gfx11DispatchInterleave::Threads128)),
+        "256" => Some(Some(Gfx11DispatchInterleave::Threads256)),
+        "512" => Some(Some(Gfx11DispatchInterleave::Threads512)),
+        _ => None,
+    }
+}
+
 impl Pm4WaitPolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -1996,6 +2040,7 @@ impl ReplayController {
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
         let dispatch_initiator_policy =
             gfx10_dispatch_initiator_policy(pm4_architecture, device.name());
+        let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -2114,6 +2159,7 @@ impl ReplayController {
                 pm4_architecture,
                 self.pm4_register_policy,
                 dispatch_initiator_policy,
+                dispatch_interleave,
             );
             commands.acquire_system(gfx12_gcr_trim);
             let mut resource_frontier = ResourceFrontier::default();
@@ -2201,6 +2247,7 @@ impl ReplayController {
                                 pm4_architecture,
                                 self.pm4_register_policy,
                                 dispatch_initiator_policy,
+                                dispatch_interleave,
                             );
                             commands.acquire_system(gfx12_gcr_trim);
                             commands
@@ -2231,6 +2278,7 @@ impl ReplayController {
                     pm4_architecture,
                     self.pm4_register_policy,
                     dispatch_initiator_policy,
+                    dispatch_interleave,
                 );
                 commands.acquire_system(gfx12_gcr_trim);
                 let mut resource_frontier = ResourceFrontier::default();
@@ -2944,6 +2992,38 @@ mod tests {
                 "gfx1151",
                 "invalid",
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn gfx1151_dispatch_interleave_is_exact_arch_only() {
+        assert_eq!(
+            gfx1151_dispatch_interleave_from_value(Pm4Architecture::Gfx11, "gfx1151", "64"),
+            Some(Some(Gfx11DispatchInterleave::Threads64))
+        );
+        assert_eq!(
+            gfx1151_dispatch_interleave_from_value(Pm4Architecture::Gfx11, "gfx1151", "0"),
+            Some(Some(Gfx11DispatchInterleave::Disabled))
+        );
+        assert_eq!(
+            gfx1151_dispatch_interleave_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "inherit",
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            gfx1151_dispatch_interleave_from_value(Pm4Architecture::Gfx11, "gfx1100", "64"),
+            Some(None)
+        );
+        assert_eq!(
+            gfx1151_dispatch_interleave_from_value(Pm4Architecture::Gfx12, "gfx1201", "64"),
+            Some(None)
+        );
+        assert_eq!(
+            gfx1151_dispatch_interleave_from_value(Pm4Architecture::Gfx11, "gfx1151", "32"),
             None
         );
     }

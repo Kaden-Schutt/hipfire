@@ -34,6 +34,7 @@ const COMPUTE_PGM_RSRC1: u32 = 0x212;
 const COMPUTE_RESOURCE_LIMITS: u32 = 0x215;
 const COMPUTE_TMPRING_SIZE_GFX10: u32 = 0x218;
 const COMPUTE_PGM_RSRC3_GFX10: u32 = 0x228;
+const COMPUTE_DISPATCH_INTERLEAVE: u32 = 0x22f;
 const COMPUTE_USER_DATA_0: u32 = 0x240;
 
 const LDS_SIZE_MASK: u32 = 0x00ff_8000;
@@ -129,6 +130,32 @@ impl Gfx10DispatchInitiatorPolicy {
     }
 }
 
+/// Architected GFX11 `COMPUTE_DISPATCH_INTERLEAVE` values.
+///
+/// The register controls how many threads are sent to one shader engine before
+/// dispatch advances to the next. `Disabled` writes zero; inheriting the queue
+/// value is represented by `None` at the command-buffer API boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Gfx11DispatchInterleave {
+    Disabled,
+    Threads64,
+    Threads128,
+    Threads256,
+    Threads512,
+}
+
+impl Gfx11DispatchInterleave {
+    pub const fn threads(self) -> u32 {
+        match self {
+            Self::Disabled => 0,
+            Self::Threads64 => 64,
+            Self::Threads128 => 128,
+            Self::Threads256 => 256,
+            Self::Threads512 => 512,
+        }
+    }
+}
+
 /// Retained GFX10/GFX11 PM4 words suitable for one vendor-AQL indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Gfx10Pm4CommandBuffer {
@@ -159,6 +186,18 @@ impl Gfx10Pm4CommandBuffer {
     /// Select the initiator bits used by subsequently encoded dispatches.
     pub fn with_dispatch_initiator_policy(mut self, policy: Gfx10DispatchInitiatorPolicy) -> Self {
         self.dispatch_initiator_policy = policy;
+        self
+    }
+
+    /// Program a GFX11 dispatch-interleave queue preamble when requested.
+    /// `None` preserves the queue/firmware value byte-for-byte.
+    pub fn with_dispatch_interleave(
+        mut self,
+        interleave: Option<Gfx11DispatchInterleave>,
+    ) -> Self {
+        if let Some(interleave) = interleave {
+            self.set_sh_regs(COMPUTE_DISPATCH_INTERLEAVE, &[interleave.threads()]);
+        }
         self
     }
 
@@ -652,6 +691,31 @@ mod tests {
             0x8045
         );
         assert_eq!(dispatch_word(Gfx10DispatchInitiatorPolicy::Radv), 0xa045);
+    }
+
+    #[test]
+    fn gfx11_dispatch_interleave_uses_queue_preamble_register() {
+        let inherited = Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(None);
+        assert!(inherited.is_empty());
+
+        for (policy, threads) in [
+            (Gfx11DispatchInterleave::Disabled, 0),
+            (Gfx11DispatchInterleave::Threads64, 64),
+            (Gfx11DispatchInterleave::Threads128, 128),
+            (Gfx11DispatchInterleave::Threads256, 256),
+            (Gfx11DispatchInterleave::Threads512, 512),
+        ] {
+            let commands =
+                Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(Some(policy));
+            assert_eq!(
+                commands.dwords(),
+                &[
+                    packet3(PACKET3_SET_SH_REG, 2, true),
+                    COMPUTE_DISPATCH_INTERLEAVE,
+                    threads,
+                ]
+            );
+        }
     }
 
     #[test]
