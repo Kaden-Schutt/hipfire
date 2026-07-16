@@ -2539,6 +2539,18 @@ impl Gpu {
             && *GFX1151_QKVZA_ALL_BUFFER.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER").as_deref() == Ok("1")
             });
+        static GFX1151_QKVZA_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
+        let gfx1151_k2048_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
+            GFX1151_QKVZA_ALL_BUFFER_CPOL
+                .get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                })
+                .as_str()
+        } else {
+            ""
+        };
         static GFX1151_QKVZA_LDSX8_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_ldsx8_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
@@ -2665,6 +2677,27 @@ impl Gpu {
                 [256u32, 1, 1],
                 (total_m as u32).div_ceil(8),
             )
+        } else if matches!(gfx1151_k2048_all_buffer_cpol, "glc" | "slc" | "dlc") {
+            let (module, source, function) = match gfx1151_k2048_all_buffer_cpol {
+                "glc" => (
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151",
+                    kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GLC_GFX1151_SRC,
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151",
+                ),
+                "slc" => (
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151",
+                    kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC,
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151",
+                ),
+                "dlc" => (
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151",
+                    kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_DLC_GFX1151_SRC,
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151",
+                ),
+                _ => unreachable!(),
+            };
+            self.ensure_kernel(module, source, function)?;
+            (function, [32u32, 1, 1], total_m as u32)
         } else if gfx1151_k2048_all_buffer {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151",

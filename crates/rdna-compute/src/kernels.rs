@@ -2834,6 +2834,43 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+/// Cache-policy sweep for the gfx1151 all-buffer QKVZA lowering. The
+/// activation stream remains temporal; only the much larger weight stream
+/// changes policy so replay-level cache contamination can be measured without
+/// changing arithmetic, geometry, or instruction addressing.
+pub const FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GLC_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_X_BUFFER 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
+pub const FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_X_BUFFER 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
+pub const FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_DLC_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 4\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_X_BUFFER 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 /// gfx1151 temporal-buffer candidate with pairwise load/consume scheduling.
 /// It retains two groups of VMEM overlap while avoiding the four-group
 /// artifact's higher VGPR band.
