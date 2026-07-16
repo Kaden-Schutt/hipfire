@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
 
 import pytest
 
-from autoresearch.ar.review.canonical import canonical_digest
+from autoresearch.ar.review.canonical import canonical_digest, metadata_digest
 from autoresearch.ar.review.config import AuthenticatedConfigSource, ReviewConfiguration
 from autoresearch.ar.review.github import GitHubResponse
 from autoresearch.ar.review.models import Finding, GitHubEnvelope, ReviewProposal, ReviewTarget
@@ -94,6 +95,8 @@ class FakeGitHub:
         self.label_pages: list[list[dict]] | None = None
         self.mutate_head_after: str | None = None
         self.revoke_before_next_review: dict | None = None
+        self.inject_review_on_completion = False
+        self.inject_review_on_labels = False
         self.deleted_comment_ids: set[int] = set()
         self.edited_comment_ids: set[int] = set()
 
@@ -136,6 +139,16 @@ class FakeGitHub:
 
     def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
         self.calls.append(("list_labels", None))
+        if self.inject_review_on_labels and self.reviews:
+            stale = deepcopy(self.reviews[0])
+            stale["id"] = 902
+            stale["node_id"] = "stale-before-label"
+            stale_payload = json.loads(self.payload_from_body(stale["body"]))
+            stale_payload["record_id"] = "stale-before-label"
+            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
+            stale["body"] = json.dumps(stale_payload)
+            self.reviews.append(stale)
+            self.inject_review_on_labels = False
         if self.label_pages is None:
             return GitHubResponse([{"name": label} for label in sorted(self.labels)], {}, 200)
         self.calls.extend(("list_labels", None) for _ in self.label_pages[1:])
@@ -181,6 +194,16 @@ class FakeGitHub:
         }
         self.next_id += 1
         self.comments.append(record)
+        if record_type == "completion" and self.inject_review_on_completion and self.reviews:
+            stale = deepcopy(self.reviews[0])
+            stale["id"] = 901
+            stale["node_id"] = "stale-after-completion"
+            stale_payload = json.loads(self.payload_from_body(stale["body"]))
+            stale_payload["record_id"] = "stale-after-completion"
+            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
+            stale["body"] = json.dumps(stale_payload)
+            self.reviews.append(stale)
+            self.inject_review_on_completion = False
         return GitHubResponse(record, {}, 201)
 
     def create_pull_request_review(self, repository: str, number: int, *, body: str, event: str, commit_id: str) -> GitHubResponse:
@@ -529,8 +552,7 @@ def test_report_is_visible_markdown_with_hidden_metadata_and_escaped_injection()
 
     assert body.startswith("## Agentic review")
     assert "<!-- agentic-review/v1" in body
-    assert "**the checked value**" not in body
-    assert "<instead>" not in body
+    assert "<pre><code>Use **the checked value** &lt;instead&gt;.</code></pre>" in body
 
 
 def test_label_add_failure_is_explicit():
@@ -559,18 +581,14 @@ def test_completion_retry_revalidates_active_changes_review_before_label_removal
 
 def test_visible_report_neutralizes_tilde_backtick_backslash_ordered_list_and_multiline_input():
     client = FakeGitHub()
-    message = "~~strike~~\n1. list\n`code` \\path\n# heading\n- bullet"
+    message = "~~strike~~\n1. list\n`code` \\path\n# heading\n- bullet\n\n    indented\nsetext\n===="
     result = _publisher(client).publish(_proposal("changes-requested", message=message), TARGET)
     assert result.status == "complete", result.reason
     report = next(item for item in client.comments if json.loads(client.payload_from_body(item["body"]))["record_type"] == "report")
     visible = report["body"].split("<!-- agentic-review/v1", 1)[0]
 
-    assert "~~strike~~" not in visible
-    assert "1. list" not in visible
-    assert "`code`" not in visible
-    assert "\\path" not in visible
-    assert "\n# heading" not in visible
-    assert "\n- bullet" not in visible
+    assert "<pre><code>~~strike~~\n1. list\n`code` \\path\n# heading\n- bullet\n\n    indented\nsetext\n====</code></pre>" in visible
+    assert visible.count("<pre><code>") == visible.count("</code></pre>") == 1
 
 
 def test_needs_review_is_verified_across_all_label_pages_before_removal():
@@ -582,3 +600,29 @@ def test_needs_review_is_verified_across_all_label_pages_before_removal():
     assert result.status == "complete", result.reason
     assert client.removed_labels == ["needs-review"]
     assert [call[0] for call in client.calls if call[0] == "list_labels"].count("list_labels") == 2
+
+
+def test_completed_retry_dismisses_stale_workflow_review_before_label_removal():
+    client = FakeGitHub()
+    client.fail.add("remove_label")
+    first = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert first.status == "incomplete"
+    client.fail.remove("remove_label")
+    client.inject_review_on_labels = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "duplicate", result.reason
+    assert ("dismiss", 902) in client.calls
+    assert client.removed_labels == ["needs-review"]
+
+
+def test_completion_history_refresh_dismisses_review_appearing_after_completion_creation():
+    client = FakeGitHub()
+    client.inject_review_on_completion = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "complete", result.reason
+    assert ("dismiss", 901) in client.calls
+    assert client.removed_labels == ["needs-review"]

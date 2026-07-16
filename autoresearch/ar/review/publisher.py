@@ -10,7 +10,6 @@ from datetime import datetime
 import hashlib
 import html
 import json
-import re
 from typing import Any, Callable
 
 from .canonical import canonical_digest, canonical_json, metadata_digest
@@ -88,23 +87,22 @@ def _target_from_payload(payload: Mapping[str, Any]) -> ReviewTarget:
     return result
 
 
-def _escape_markdown(value: str) -> str:
-    escaped = html.escape(value, quote=False)
-    escaped = escaped.replace("\r\n", "\n").replace("\r", "\n")
-    escaped = escaped.replace("\\", "&#92;")
-    escaped = re.sub(r"([\\`*_\[\]#>+\-~\.])", r"\\\1", escaped)
-    return escaped.replace("\n", "  \n")
+def _safe_html_text(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    return html.escape(normalized, quote=True)
 
 
 def render_report(proposal: ReviewProposal) -> str:
     """Render only structured, escaped proposal fields into visible Markdown."""
-    lines = ["## Agentic review", "", f"Verdict: `{_escape_markdown(proposal.verdict)}`"]
+    lines = ["## Agentic review", "", f"Verdict: <code>{_safe_html_text(proposal.verdict)}</code>"]
     if proposal.findings:
         lines.extend(("", "### Findings"))
         for finding in proposal.findings:
-            path = _escape_markdown(finding.path)
-            message = _escape_markdown(finding.message)
-            lines.append(f"- `{path}:{finding.range[0]}-{finding.range[1]}` ({_escape_markdown(finding.severity)}): {message}")
+            path = _safe_html_text(finding.path)
+            message = _safe_html_text(finding.message)
+            severity = _safe_html_text(finding.severity)
+            lines.append(f"- <code>{path}:{finding.range[0]}-{finding.range[1]}</code> ({severity}):")
+            lines.append(f"  <pre><code>{message}</code></pre>")
     else:
         lines.extend(("", "No findings."))
     return "\n".join(lines)
@@ -443,6 +441,25 @@ class ReviewPublisher:
             result.append(record.server_id)
         return result
 
+    def _reconcile_workflow_reviews(
+        self, target: ReviewTarget, attempt_id: str, intent_node: str, keep_node: str,
+    ) -> tuple[_History, GitHubEnvelope]:
+        history = self._history(target)
+        canonical = self._canonical(target, attempt_id, intent_node)
+        for review_id in self._workflow_review_ids(history, target, keep_node):
+            self._mutate(
+                target,
+                lambda review_id=review_id: self._client.dismiss_workflow_review(
+                    target.repository, target.number, review_id,
+                    message="Superseded by a current agentic review",
+                ),
+                attempt_id=attempt_id,
+                intent_node=canonical.node_id,
+            )
+            history = self._history(target)
+            canonical = self._canonical(target, attempt_id, intent_node)
+        return history, canonical
+
     def _label_present(self, target: ReviewTarget) -> bool:
         getter = getattr(self._client, "list_issue_labels", None)
         if not callable(getter):
@@ -453,13 +470,15 @@ class ReviewPublisher:
             raise LabelError("GitHub label state is malformed")
         return any(isinstance(item, Mapping) and item.get("name") == _LABEL for item in data)
 
-    def _remove_label(self, target: ReviewTarget, attempt_id: str, intent_node: str) -> None:
+    def _remove_label(self, target: ReviewTarget, attempt_id: str, intent_node: str, keep_node: str) -> None:
+        self._reconcile_workflow_reviews(target, attempt_id, intent_node, keep_node)
         if self._label_present(target):
+            _, canonical = self._reconcile_workflow_reviews(target, attempt_id, intent_node, keep_node)
             self._mutate(
                 target,
                 lambda: self._client.remove_label(target.repository, target.number, _LABEL),
                 attempt_id=attempt_id,
-                intent_node=intent_node,
+                intent_node=canonical.node_id,
             )
 
     def _recover(self, target: ReviewTarget, attempt_id: str, status: str, reason: str) -> PublishResult:
@@ -510,7 +529,7 @@ class ReviewPublisher:
                 metadata = self._review_metadata(history, target, attempt_id, proposal.verdict)
                 if report is None or metadata is None:
                     raise PublisherError("completion dependencies are missing")
-                self._remove_label(target, attempt_id, canonical.node_id)
+                self._remove_label(target, attempt_id, canonical.node_id, metadata.envelope.node_id)
                 return PublishResult("duplicate", attempt_id, report.envelope, metadata.envelope, completion.envelope,
                                      "canonical attempt is already complete")
 
@@ -540,23 +559,15 @@ class ReviewPublisher:
             canonical = self._canonical(target, attempt_id, intent.node_id)
             completion = self._find_record(history, target, attempt_id, "completion")
             if completion is None:
-                for review_id in self._workflow_review_ids(history, target, metadata.envelope.node_id):
-                    self._mutate(
-                        target,
-                        lambda review_id=review_id: self._client.dismiss_workflow_review(
-                            target.repository, target.number, review_id,
-                            message="Superseded by a current agentic review",
-                        ),
-                        attempt_id=attempt_id, intent_node=canonical.node_id,
-                    )
-                    history = self._history(target)
-                    canonical = self._canonical(target, attempt_id, intent.node_id)
+                history, canonical = self._reconcile_workflow_reviews(
+                    target, attempt_id, intent.node_id, metadata.envelope.node_id,
+                )
                 completion_envelope = self._new_comment(
                     target, self._completion_payload(target, intent, report.envelope, metadata.envelope),
                     attempt_id=attempt_id, intent_node=canonical.node_id,
                 )
                 completion = _HistoryRecord(completion_envelope, False, 0)
-            self._remove_label(target, attempt_id, canonical.node_id)
+            self._remove_label(target, attempt_id, canonical.node_id, metadata.envelope.node_id)
             return PublishResult("complete", attempt_id, report.envelope, metadata.envelope, completion.envelope)
         except _StaleTarget as exc:
             return self._recover(target, attempt_id, "stale", str(exc))
