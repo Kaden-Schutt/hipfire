@@ -1049,6 +1049,74 @@ impl Gpu {
         result
     }
 
+    /// Exact per-row top-K + log-sum-exp for sampled decode with K <= 20.
+    ///
+    /// This is deliberately a separate kernel from
+    /// [`Self::topk_logsumexp_batched_f32`]. Raising that kernel's compile-time
+    /// `MAX_K` would increase its register/LDS footprint for every existing
+    /// K<=8 caller. Sampled MTP needs the production top_k=20 policy, so it
+    /// gets a dedicated variant and downloads only 20 `(token, logp)` pairs
+    /// per row instead of a full vocabulary-sized probability row.
+    pub fn topk20_logsumexp_batched_f32(
+        &mut self,
+        logits: &GpuTensor,   // [B × vocab] f32
+        top_idx: &GpuTensor,  // [B × K] i32 (stored in an f32-typed allocation)
+        top_logp: &GpuTensor, // [B × K] f32
+        vocab: usize,
+        k: usize,
+        b: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k >= 1 && k <= 20,
+            "topk20_logsumexp_batched: K={} must be in [1,20]",
+            k
+        );
+
+        // Keep one source of truth for the selection/reduction algorithm while
+        // compiling this larger-footprint variant under its own module and
+        // entry-point names. minBlocks=1 avoids forcing a register budget that
+        // is impossible to pair with this variant's ~41 KiB dynamic LDS.
+        let source = kernels::TOPK_LOGSUMEXP_BATCHED_SRC
+            .replace("#define MAX_K 8", "#define MAX_K 20")
+            .replace("__launch_bounds__(256, 4)", "__launch_bounds__(256, 1)")
+            .replace(
+                "topk_logsumexp_batched_f32(",
+                "topk20_logsumexp_batched_f32(",
+            );
+        self.ensure_kernel(
+            "topk20_logsumexp_batched",
+            &source,
+            "topk20_logsumexp_batched_f32",
+        )?;
+        let func = &self.functions["topk20_logsumexp_batched_f32"];
+        let mut lp = logits.buf.as_ptr();
+        let mut ti = top_idx.buf.as_ptr();
+        let mut tl = top_logp.buf.as_ptr();
+        let mut vs = vocab as i32;
+        let mut kk = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut ti as *mut _ as *mut c_void,
+            &mut tl as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        const MAX_K: u32 = 20;
+        let nth: u32 = 256;
+        let lds = ((32 + nth * MAX_K * 2) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [b as u32, 1, 1],
+                [nth, 1, 1],
+                lds,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn argmax_token_chain_f32(
         &mut self,
         data: &GpuTensor,

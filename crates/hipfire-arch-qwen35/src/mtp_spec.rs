@@ -452,6 +452,187 @@ fn exact_truncated_distribution(logits: &[f32], cfg: &MtpSamplingConfig) -> Vec<
     dense
 }
 
+const MTP_EXACT_GPU_TOPK_MAX: usize = 20;
+
+/// A sampling distribution whose support is the exact retained top-k set.
+/// Production sampled MTP uses top_k=20, so carrying only the non-zero support
+/// avoids materializing or transferring a dense 16K/248K-vocabulary row.
+#[derive(Clone, Debug)]
+struct SparseDistribution {
+    token_ids: Vec<u32>,
+    probabilities: Vec<f32>,
+}
+
+impl SparseDistribution {
+    fn probability(&self, token_id: u32) -> f32 {
+        self.token_ids
+            .iter()
+            .position(|&candidate| candidate == token_id)
+            .map(|index| self.probabilities[index])
+            .unwrap_or(0.0)
+    }
+
+    fn sample(&self, uniform: f32) -> u32 {
+        debug_assert!(!self.token_ids.is_empty());
+        let mut cumulative = 0.0f32;
+        for (&token_id, &probability) in self.token_ids.iter().zip(&self.probabilities) {
+            cumulative += probability;
+            if uniform < cumulative {
+                return token_id;
+            }
+        }
+        *self.token_ids.last().unwrap()
+    }
+
+    /// Map a compressed draft support to trunk token ids, summing aliases.
+    fn remap(&self, vocab_map: &[u32]) -> Self {
+        let mut token_ids = Vec::with_capacity(self.token_ids.len());
+        let mut probabilities = Vec::with_capacity(self.probabilities.len());
+        for (&draft_id, &probability) in self.token_ids.iter().zip(&self.probabilities) {
+            let token_id = vocab_map[draft_id as usize];
+            if let Some(index) = token_ids.iter().position(|&existing| existing == token_id) {
+                probabilities[index] += probability;
+            } else {
+                token_ids.push(token_id);
+                probabilities.push(probability);
+            }
+        }
+        Self {
+            token_ids,
+            probabilities,
+        }
+    }
+}
+
+/// Reconstruct exact top-k -> temperature -> min-p -> top-p semantics from
+/// the GPU's sorted top-k results. `logp` may be normalized over the entire
+/// vocabulary: subtracting its maximum cancels that common log-Z exactly.
+fn sparse_distribution_from_topk(
+    token_ids: &[i32],
+    logp: &[f32],
+    cfg: &MtpSamplingConfig,
+) -> SparseDistribution {
+    assert!(!token_ids.is_empty());
+    assert_eq!(token_ids.len(), logp.len());
+    assert!(cfg.temp > 0.0);
+
+    let max_logp = logp[0] as f64;
+    let inv_temp = 1.0 / cfg.temp as f64;
+    let mut probabilities: Vec<f64> = logp
+        .iter()
+        .map(|&value| ((value as f64 - max_logp) * inv_temp).exp())
+        .collect();
+    let mut mass: f64 = probabilities.iter().sum();
+    for probability in &mut probabilities {
+        *probability /= mass;
+    }
+
+    let mut retained = probabilities.len();
+    if cfg.min_p > 0.0 {
+        let threshold = cfg.min_p as f64 * probabilities[0];
+        retained = probabilities
+            .iter()
+            .position(|&probability| probability < threshold)
+            .unwrap_or(probabilities.len())
+            .max(1);
+        probabilities.truncate(retained);
+        mass = probabilities.iter().sum();
+        for probability in &mut probabilities {
+            *probability /= mass;
+        }
+    }
+
+    if cfg.top_p < 1.0 {
+        let mut cumulative = 0.0f64;
+        retained = probabilities.len();
+        for (index, &probability) in probabilities.iter().enumerate() {
+            cumulative += probability;
+            if cumulative >= cfg.top_p as f64 {
+                retained = index + 1;
+                break;
+            }
+        }
+        probabilities.truncate(retained);
+        mass = probabilities.iter().sum();
+        for probability in &mut probabilities {
+            *probability /= mass;
+        }
+    }
+
+    SparseDistribution {
+        token_ids: token_ids[..retained]
+            .iter()
+            .map(|&token_id| token_id as u32)
+            .collect(),
+        probabilities: probabilities
+            .into_iter()
+            .map(|probability| probability as f32)
+            .collect(),
+    }
+}
+
+fn exact_sparse_distributions_gpu(
+    gpu: &mut Gpu,
+    logits: &GpuTensor,
+    top_idx: &GpuTensor,
+    top_logp: &GpuTensor,
+    vocab: usize,
+    rows: usize,
+    cfg: &MtpSamplingConfig,
+) -> HipResult<Vec<SparseDistribution>> {
+    assert!(cfg.top_k > 0 && cfg.top_k <= MTP_EXACT_GPU_TOPK_MAX);
+    let k = cfg.top_k.min(vocab);
+    let idx_view = top_idx.sub_offset(0, rows * k);
+    let logp_view = top_logp.sub_offset(0, rows * k);
+    gpu.topk20_logsumexp_batched_f32(logits, &idx_view, &logp_view, vocab, k, rows)?;
+
+    let mut indices = vec![0i32; rows * k];
+    let index_bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(
+            indices.as_mut_ptr() as *mut u8,
+            indices.len() * std::mem::size_of::<i32>(),
+        )
+    };
+    gpu.hip.memcpy_dtoh(index_bytes, &idx_view.buf)?;
+    let log_probabilities = gpu.download_f32(&logp_view)?;
+
+    Ok((0..rows)
+        .map(|row| {
+            sparse_distribution_from_topk(
+                &indices[row * k..(row + 1) * k],
+                &log_probabilities[row * k..(row + 1) * k],
+                cfg,
+            )
+        })
+        .collect())
+}
+
+fn sample_sparse_residual(
+    target: &SparseDistribution,
+    draft: &SparseDistribution,
+    uniform: f32,
+) -> u32 {
+    let mut residual = Vec::with_capacity(target.token_ids.len());
+    let mut mass = 0.0f32;
+    for (&token_id, &target_probability) in target.token_ids.iter().zip(&target.probabilities) {
+        let probability = (target_probability - draft.probability(token_id)).max(0.0);
+        residual.push((token_id, probability));
+        mass += probability;
+    }
+    if mass <= 0.0 {
+        return target.token_ids[0];
+    }
+    let threshold = uniform * mass;
+    let mut cumulative = 0.0f32;
+    for (token_id, probability) in residual {
+        cumulative += probability;
+        if threshold < cumulative {
+            return token_id;
+        }
+    }
+    *target.token_ids.last().unwrap()
+}
+
 /// Compute the temperature-scaled softmax probability of a single token at
 /// index `idx` in a logits row. Used by the residual-acceptance rule to
 /// gather `p_target(c_k)` and `p_draft(c_k)` under the same temperature
@@ -638,6 +819,10 @@ pub struct MtpSpecState {
     pub mtp_sample_draft_indices: GpuTensor,
     pub mtp_sample_draft_prob_at_token: GpuTensor,
     pub mtp_sample_draft_vocab: usize,
+    /// Exact sampled-decode top-20 scratch shared by serial draft rows and the
+    /// batched target verify. Indices are i32 in an f32-typed allocation.
+    pub mtp_sample_sparse_idx: GpuTensor,
+    pub mtp_sample_sparse_logp: GpuTensor,
     /// On-device rng state for `gpu.sample_top_p`. Threaded through both
     /// draft and bonus sampling calls within a cycle and across cycles.
     /// Reseeded by [`Self::set_sampling`].
@@ -770,6 +955,10 @@ impl MtpSpecState {
         let mtp_sample_draft_z = gpu.alloc_tensor(&[max_n], DType::F32)?;
         let mtp_sample_draft_indices = gpu.alloc_tensor(&[max_n], DType::F32)?;
         let mtp_sample_draft_prob_at_token = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_sample_sparse_idx =
+            gpu.alloc_tensor(&[(max_n + 1) * MTP_EXACT_GPU_TOPK_MAX], DType::F32)?;
+        let mtp_sample_sparse_logp =
+            gpu.alloc_tensor(&[(max_n + 1) * MTP_EXACT_GPU_TOPK_MAX], DType::F32)?;
 
         let mtp_vocab_inverse = head.weights.lm_head_draft_vocab_map.as_ref().map(|map| {
             map.iter()
@@ -823,6 +1012,8 @@ impl MtpSpecState {
             mtp_sample_draft_indices,
             mtp_sample_draft_prob_at_token,
             mtp_sample_draft_vocab,
+            mtp_sample_sparse_idx,
+            mtp_sample_sparse_logp,
             gpu_rng_state: 42,
             max_n,
             p_min: default_mtp_p_min(gpu.arch.as_str()),
@@ -1006,6 +1197,8 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_sample_draft_z);
         let _ = gpu.free_tensor(self.mtp_sample_draft_indices);
         let _ = gpu.free_tensor(self.mtp_sample_draft_prob_at_token);
+        let _ = gpu.free_tensor(self.mtp_sample_sparse_idx);
+        let _ = gpu.free_tensor(self.mtp_sample_sparse_logp);
         // DeltaNetSnapshot holds DeviceBuffers which have no Drop impl —
         // use free_gpu to release the GPU allocations rather than bare drop.
         self.trunk_snap.free_gpu(gpu);
@@ -2351,6 +2544,7 @@ fn mtp_sampled_accept(
     draft_taus: &[f32],
     draft_zs: &[f32],
     exact_draft_rows: Option<&[Vec<f32>]>,
+    sparse_draft_rows: Option<&[SparseDistribution]>,
     draft_vocab_map: Option<&[u32]>,
     candidates: &[u32],
     drafts_generated: usize,
@@ -2396,11 +2590,7 @@ fn mtp_sampled_accept(
             } else {
                 draft_rows[k].clone()
             };
-            let bonus = sample_residual(
-                &target_row,
-                &draft_row,
-                state.rng.next_uniform_f32(),
-            );
+            let bonus = sample_residual(&target_row, &draft_row, state.rng.next_uniform_f32());
             committed.push(bonus);
             return Ok(bonus == eos_token_id);
         }
@@ -2409,10 +2599,54 @@ fn mtp_sampled_accept(
             &target_logits[drafts_generated * vocab..(drafts_generated + 1) * vocab],
             &state.sampling,
         );
-        let bonus = crate::speculative::sample_categorical(
-            &bonus_row,
-            state.rng.next_uniform_f32(),
-        );
+        let bonus =
+            crate::speculative::sample_categorical(&bonus_row, state.rng.next_uniform_f32());
+        committed.push(bonus);
+        return Ok(bonus == eos_token_id);
+    }
+
+    if let Some(draft_rows) = sparse_draft_rows {
+        // Exact production path: select only the target's top-20 support on
+        // device, then transfer 160 bytes per row. This is distributionally
+        // identical to the host oracle for the sampled-serve top_k=20 policy,
+        // without copying dense logits or probabilities across PCIe.
+        let n_verify = drafts_generated + 1;
+        let sampling = state.sampling;
+        let target_rows = exact_sparse_distributions_gpu(
+            gpu,
+            logits_view,
+            &state.mtp_sample_sparse_idx,
+            &state.mtp_sample_sparse_logp,
+            vocab,
+            n_verify,
+            &sampling,
+        )?;
+        debug_assert_eq!(draft_rows.len(), drafts_generated);
+
+        for k in 0..drafts_generated {
+            let draft_row = if let Some(vocab_map) = draft_vocab_map {
+                draft_rows[k].remap(vocab_map)
+            } else {
+                draft_rows[k].clone()
+            };
+            let p_d = draft_row.probability(candidates[k]).max(f32::MIN_POSITIVE);
+            let p_t = target_rows[k].probability(candidates[k]);
+            if state.rng.next_uniform_f32() * p_d <= p_t {
+                committed.push(candidates[k]);
+                *accept_count += 1;
+                if candidates[k] == eos_token_id {
+                    return Ok(true);
+                }
+                continue;
+            }
+
+            let bonus =
+                sample_sparse_residual(&target_rows[k], &draft_row, state.rng.next_uniform_f32());
+            committed.push(bonus);
+            return Ok(bonus == eos_token_id);
+        }
+
+        let bonus = target_rows[drafts_generated].sample(state.rng.next_uniform_f32());
         committed.push(bonus);
         return Ok(bonus == eos_token_id);
     }
@@ -2945,8 +3179,21 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         Vec::new()
     };
-    let exact_host_sampling = use_sampling && mtp_exact_host_sample_enabled_from_env();
+    // top_k=1..20 has an exact sparse GPU implementation. Keep the dense host
+    // oracle as an explicit diagnostic and as the correctness fallback for
+    // policies outside that bounded production surface; never silently return
+    // to the approximate histogram nucleus that corrupted sampled output.
+    let exact_host_sampling = use_sampling
+        && (mtp_exact_host_sample_enabled_from_env()
+            || sampling.top_k == 0
+            || sampling.top_k > MTP_EXACT_GPU_TOPK_MAX);
+    let exact_sparse_sampling = use_sampling && !exact_host_sampling;
     let mut exact_draft_rows: Vec<Vec<f32>> = if exact_host_sampling {
+        Vec::with_capacity(max_n)
+    } else {
+        Vec::new()
+    };
+    let mut sparse_draft_rows: Vec<SparseDistribution> = if exact_sparse_sampling {
         Vec::with_capacity(max_n)
     } else {
         Vec::new()
@@ -3216,77 +3463,27 @@ pub fn spec_step_mtp_compressed_serial(
                     draft_probs.push(distribution[draft_idx]);
                     draft_taus.push(0.0);
                     draft_zs.push(1.0);
-                    top_prob = distribution
-                        .iter()
-                        .copied()
-                        .fold(0.0f32, f32::max);
+                    top_prob = distribution.iter().copied().fold(0.0f32, f32::max);
                     exact_draft_rows.push(distribution);
-                } else {
-                    // Keep each draft distribution in its native (full or
-                    // compressed) device row. The categorical draw returns only a
-                    // token id and its effective probability; a dense row crosses
-                    // to host only if this exact draft is later rejected.
-                    debug_assert_eq!(argmax_vocab, state.mtp_sample_draft_vocab);
-                    let probs_gpu = state
-                        .mtp_sample_draft_probs
-                        .sub_offset(k * argmax_vocab, argmax_vocab);
-                    let tau_gpu = state.mtp_sample_draft_tau.sub_offset(k, 1);
-                    let z_gpu = state.mtp_sample_draft_z.sub_offset(k, 1);
-                    gpu.softmax_temp_topp_batched_into_f32(
+                } else if exact_sparse_sampling {
+                    let mut distributions = exact_sparse_distributions_gpu(
+                        gpu,
                         logits_for_argmax,
-                        &probs_gpu,
-                        &tau_gpu,
-                        &z_gpu,
-                        argmax_vocab,
-                        /* rows */ 1,
-                        sampling.temp,
-                        sampling.top_p,
-                        sampling.top_k,
-                        sampling.min_p,
-                    )?;
-                    let sampled_index = state.mtp_sample_draft_indices.sub_offset(k, 1);
-                    let sampled_prob = state.mtp_sample_draft_prob_at_token.sub_offset(k, 1);
-                    let seed = {
-                        let bits = state.rng.next_u64();
-                        ((bits >> 32) as u32 ^ bits as u32) | 1
-                    };
-                    gpu.batched_categorical_sample_f32(
-                        &probs_gpu,
-                        &tau_gpu,
-                        &z_gpu,
-                        &sampled_index,
-                        &sampled_prob,
+                        &state.mtp_sample_sparse_idx,
+                        &state.mtp_sample_sparse_logp,
                         argmax_vocab,
                         1,
-                        seed,
+                        &sampling,
                     )?;
-
-                    let mut sampled_index_host = 0i32;
-                    let sampled_index_bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            &mut sampled_index_host as *mut i32 as *mut u8,
-                            std::mem::size_of::<i32>(),
-                        )
-                    };
-                    gpu.hip
-                        .memcpy_dtoh(sampled_index_bytes, &sampled_index.buf)?;
-                    draft_idx = sampled_index_host as usize;
-                    let sampled_prob_host = gpu.download_f32(&sampled_prob)?[0];
-                    let tau = gpu.download_f32(&tau_gpu)?[0];
-                    let z = gpu.download_f32(&z_gpu)?[0];
-                    draft_probs.push(sampled_prob_host);
-                    draft_taus.push(tau);
-                    draft_zs.push(z);
-
-                    // SampledPMin reads max(raw softmax), never the
-                    // post-truncation probability at the sampled token.
-                    top_prob = if use_sampled_pmin {
-                        let max_out = state.mtp_topk_logp.sub_offset(0, 1);
-                        gpu.max_value_f32(&probs_gpu, &max_out, argmax_vocab)?;
-                        gpu.download_f32(&max_out)?[0]
-                    } else {
-                        0.0
-                    };
+                    let distribution = distributions.pop().unwrap();
+                    draft_idx = distribution.sample(state.rng.next_uniform_f32()) as usize;
+                    draft_probs.push(distribution.probability(draft_idx as u32));
+                    draft_taus.push(0.0);
+                    draft_zs.push(1.0);
+                    top_prob = distribution.probabilities[0];
+                    sparse_draft_rows.push(distribution);
+                } else {
+                    unreachable!("sampled MTP must use exact host or exact sparse sampling");
                 }
                 assert!(
                     draft_idx < argmax_vocab,
@@ -3639,6 +3836,7 @@ pub fn spec_step_mtp_compressed_serial(
             &draft_taus,
             &draft_zs,
             exact_host_sampling.then_some(exact_draft_rows.as_slice()),
+            exact_sparse_sampling.then_some(sparse_draft_rows.as_slice()),
             vocab_map_opt.map(Vec::as_slice),
             &candidates,
             drafts_generated,
@@ -3820,6 +4018,53 @@ mod tests {
         let distribution = exact_truncated_distribution(&[4.0, 3.0, 2.0, 1.0], &cfg);
 
         assert_eq!(distribution, vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn sparse_topk_distribution_matches_dense_host_oracle() {
+        let logits = [4.0f32, 3.2, 1.1, -0.7, 2.4, 0.5];
+        let cfg = MtpSamplingConfig {
+            temp: 0.7,
+            top_k: 4,
+            top_p: 0.90,
+            min_p: 0.04,
+            ..MtpSamplingConfig::default()
+        };
+        let ids = [0, 1, 4, 2];
+        // A common additive log-Z is irrelevant; the GPU returns exactly this
+        // shape, normalized over the full vocabulary.
+        let logp = [1.25, 0.45, -0.35, -1.65];
+        let sparse = sparse_distribution_from_topk(&ids, &logp, &cfg);
+        let dense = exact_truncated_distribution(&logits, &cfg);
+
+        for token_id in 0..logits.len() as u32 {
+            assert!(
+                (sparse.probability(token_id) - dense[token_id as usize]).abs() < 1e-6,
+                "token {token_id}: sparse={} dense={}",
+                sparse.probability(token_id),
+                dense[token_id as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_remap_coalesces_aliases_and_residual_uses_token_ids() {
+        let draft = SparseDistribution {
+            token_ids: vec![0, 1, 2],
+            probabilities: vec![0.25, 0.50, 0.25],
+        }
+        .remap(&[7, 9, 7]);
+        assert_eq!(draft.token_ids, vec![7, 9]);
+        assert!((draft.probability(7) - 0.5).abs() < 1e-6);
+        assert!((draft.probability(9) - 0.5).abs() < 1e-6);
+
+        let target = SparseDistribution {
+            token_ids: vec![7, 11],
+            probabilities: vec![0.4, 0.6],
+        };
+        // Token 7 has no positive residual (0.4 - 0.5); token 11 owns all of
+        // it, even though the sparse rows have different support/order.
+        assert_eq!(sample_sparse_residual(&target, &draft, 0.37), 11);
     }
 
     #[test]
