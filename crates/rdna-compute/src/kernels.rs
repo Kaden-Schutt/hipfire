@@ -2834,6 +2834,18 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+/// gfx1151 selective QKVZA lowering for the large projection geometry. Keep
+/// HFQ weights on global loads and issue only the shared K=2048 activation as
+/// aligned temporal B128 buffer loads.
+pub const FUSED_QKVZA_HFQ4G256_K2048_X_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_X_BUFFER 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 /// Cache-policy sweep for the gfx1151 all-buffer QKVZA lowering. The
 /// activation stream remains temporal; only the much larger weight stream
 /// changes policy so replay-level cache contamination can be measured without
