@@ -1,8 +1,8 @@
 # Redline PM4 fence specialization
 
-Branch: `redline`  
-Base: `fe044f551`  
-Host: `hiptrx`, gfx1201, automatic clocks  
+Branch: `redline`
+Base: `fe044f551`
+Host: `hiptrx`, gfx1201, automatic clocks
 Model: `qwen3.6-35b-a3b.mq4r`, FWHT3 KV
 
 ## Result

@@ -1,8 +1,8 @@
 # Redline PM4 stateful encoding
 
-Branch: `redline`  
-Base: `fd472a1b2`  
-Host: `hiptrx`, gfx1201, automatic clocks  
+Branch: `redline`
+Base: `fd472a1b2`
+Host: `hiptrx`, gfx1201, automatic clocks
 Model: `qwen3.6-35b-a3b.mq4r`
 
 ## Result

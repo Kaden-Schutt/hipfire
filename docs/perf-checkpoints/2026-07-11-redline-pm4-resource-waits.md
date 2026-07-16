@@ -1,7 +1,7 @@
 # Redline PM4 resource-derived waits
 
-Branch: `redline`  
-Host: `hiptrx`, gfx1201, automatic clocks  
+Branch: `redline`
+Host: `hiptrx`, gfx1201, automatic clocks
 Model: `qwen3.6-35b-a3b.mq4r`, FWHT3 KV
 
 ## Result
