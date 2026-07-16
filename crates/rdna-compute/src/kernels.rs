@@ -3039,6 +3039,32 @@ pub const FUSED_QKV_HFQ4G256_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
 );
 
+/// gfx1151 fixed-K FullAttention projection with Radiowave temporal buffer
+/// lowering for weights and aligned activation vectors.
+pub const FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_RDNA3_QKV_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKV_X_BUFFER 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256_k2048_all_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+);
+
+/// Same gfx1151 addressing and activation schedule, with SLC on the large
+/// weight stream to reduce pollution of replay-resident data.
+pub const FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_RDNA3_QKV_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKV_X_BUFFER 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256_k2048_all_buffer_slc_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+);
+
 // CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
 // block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
 pub const FUSED_QKV_HFQ4G256_WAVE64_SRC: &str = concat!(

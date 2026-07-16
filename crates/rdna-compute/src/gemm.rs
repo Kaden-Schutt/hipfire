@@ -2371,10 +2371,38 @@ impl Gpu {
             && *GFX1151_QKVZA_WAVE64.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_QKVZA_WAVE64").as_deref() == Ok("1")
             });
+        static GFX1151_QKV_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
+        let gfx1151_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
+            GFX1151_QKV_ALL_BUFFER_CPOL
+                .get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                })
+                .as_str()
+        } else {
+            ""
+        };
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
             || gfx1151_wave64;
-        let (func_name, block, grid_x) = if cdna_wave64 {
+        let (func_name, block, grid_x) = if matches!(gfx1151_all_buffer_cpol, "temporal" | "slc") {
+            let (module, source, function) = if gfx1151_all_buffer_cpol == "slc" {
+                (
+                    "fused_qkv_hfq4g256_k2048_all_buffer_slc_gfx1151",
+                    kernels::FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC,
+                    "fused_qkv_hfq4g256_k2048_all_buffer_slc_gfx1151",
+                )
+            } else {
+                (
+                    "fused_qkv_hfq4g256_k2048_all_buffer_gfx1151",
+                    kernels::FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC,
+                    "fused_qkv_hfq4g256_k2048_all_buffer_gfx1151",
+                )
+            };
+            self.ensure_kernel(module, source, function)?;
+            (function, [32u32, 1, 1], (q_m + k_m + v_m) as u32)
+        } else if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
             // HIPFIRE_GFX942_GEMV_V2=0.
