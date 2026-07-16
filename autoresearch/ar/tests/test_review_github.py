@@ -88,12 +88,12 @@ def body_payload(record_id="logical"):
     return payload
 
 
-def record(node_id="IC_1", *, updated_at="2026-01-01T00:00:00Z"):
+def record(node_id="IC_1", *, updated_at="2026-01-01T00:00:00Z", author_login="review-bot", author_type="Bot"):
     payload = body_payload()
     return {
         "id": 11,
         "node_id": node_id,
-        "user": {"login": "review-bot", "type": "Bot"},
+        "user": {"login": author_login, "type": author_type},
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": updated_at,
         "body": json.dumps(payload, separators=(",", ":")),
@@ -108,17 +108,8 @@ def permission(login="review-bot", role="pull", principal_type="Bot"):
     return {"user": user(login=login, principal_type=principal_type), "permissions": {}, "role_name": role}
 
 
-def installation(account_type="Bot"):
-    return {
-        "id": 2,
-        "app_id": 1,
-        "account": {"login": "repository-owner", "type": account_type},
-        "permissions": {"metadata": "read", "issues": "write", "pull_requests": "write"},
-    }
-
-
-def installation_repositories():
-    return {"total_count": 1, "repositories": [repository()]}
+def installation_repositories(repositories=None, *, total_count=1):
+    return {"total_count": total_count, "repositories": [repository()] if repositories is None else repositories}
 
 
 def app_manifest(operation="publish", *, login="review-bot", digest=None):
@@ -297,6 +288,13 @@ def test_envelope_factories_are_not_public_record_mapping_apis():
     assert not hasattr(client, "envelope_from_review")
 
 
+def test_envelope_acquisition_uses_server_author_for_later_app_bot_trust():
+    runner = FakeRunner([result(record(author_login="repository-owner", author_type="User"))])
+    envelope = GitHubClient(runner).comment_envelope(REPO, 11)
+    assert envelope.author == "repository-owner"
+    assert envelope.author_type == "User"
+
+
 def test_review_envelope_is_constructed_from_authenticated_review():
     review = dict(record("PRR_1"), id=7, state="APPROVED", commit_id="head-sha")
     runner = FakeRunner([result(review)])
@@ -420,7 +418,7 @@ def preflight_responses(*, scopes="read:user, repo:status", accepted=None, probe
     return responses
 
 
-def app_preflight_responses(*, link=None, account_type="Bot"):
+def app_preflight_responses(*, link=None):
     accepted = "metadata=read, pull_requests=write, issues=write"
     headers = {"X-Accepted-GitHub-Permissions": accepted}
     pull_headers = dict(headers)
@@ -432,7 +430,6 @@ def app_preflight_responses(*, link=None, account_type="Bot"):
         result(pull(), headers=headers),
         result([record()], headers=headers),
         result([review_record()], headers=headers),
-        result(installation(account_type), headers=headers),
         result(installation_repositories(), headers=headers),
     ]
 
@@ -451,6 +448,32 @@ def human_preflight_responses():
         result([review_record()], headers=headers),
         result(permission(login="reviewer", role="push", principal_type="User"), headers=headers),
     ]
+
+
+def test_app_token_repository_enumeration_follows_link_to_target_beyond_first_page():
+    next_page = '<https://api.github.com/installation/repositories?page=2>; rel="next"'
+    first_page = result(
+        installation_repositories([dict(repository(), id=9)], total_count=2),
+        headers={"X-Accepted-GitHub-Permissions": "metadata=read", "Link": next_page},
+    )
+    second_page = result(
+        installation_repositories([repository()], total_count=2),
+        headers={"X-Accepted-GitHub-Permissions": "metadata=read"},
+    )
+    response = GitHubClient(FakeRunner([first_page, second_page])).list_installation_repositories()
+    assert [item["id"] for item in response.data["repositories"]] == [9, 8]
+
+
+def test_app_token_repository_enumeration_fails_when_link_remains_at_page_cap():
+    responses = []
+    for page in range(1, 17):
+        link = f'<https://api.github.com/installation/repositories?page={page + 1}>; rel="next"'
+        responses.append(result(
+            installation_repositories([dict(repository(), id=page)], total_count=16),
+            headers={"X-Accepted-GitHub-Permissions": "metadata=read", "Link": link},
+        ))
+    with pytest.raises(GitHubBoundaryError, match="pagination|page|bound"):
+        GitHubClient(FakeRunner(responses)).list_installation_repositories()
 
 
 def test_preflight_probes_only_read_endpoints_with_bounded_pages_and_explicit_principal():
@@ -567,9 +590,8 @@ def test_publisher_preflight_accepts_matching_app_and_operator_manifest():
         GitHubClient(runner), REPO, mode="publisher", configuration=configuration, operator_manifest=manifest
     )
     assert all("--method" in call[0] and call[0][call[0].index("--method") + 1] == "GET" for call in runner.calls)
-    assert "/installation" in runner.calls[-2][0]
     assert runner.calls[-1][0][-1].startswith("/installation/repositories?")
-    assert all("/repos/owner/repo/installation" not in call[0] for call in runner.calls)
+    assert all("/installation" not in call[0][-1] or call[0][-1].startswith("/installation/repositories?") for call in runner.calls)
 
 
 def test_dismissal_preflight_requires_dismissal_attestation():
@@ -641,7 +663,6 @@ def test_app_publisher_preflight_with_attestation_avoids_user_and_repo_installat
     )
     assert outcome.login == "review-bot"
     assert all(call[0][-1] != "/user" for call in runner.calls)
-    assert "/installation" in runner.calls[-2][0]
     assert runner.calls[-1][0][-1].startswith("/installation/repositories?")
     assert all("/repos/owner/repo/installation" not in call[0] for call in runner.calls)
 
@@ -670,23 +691,6 @@ def test_preflight_sample_accepts_next_link_without_claiming_exhaustive_discover
     next_page = '<https://api.github.com/repos/owner/repo/pulls?page=2>; rel="next"'
     outcome = preflight_read_only(
         GitHubClient(FakeRunner(app_preflight_responses(link=next_page))),
-        REPO,
-        mode="publisher",
-        configuration=configuration,
-        operator_manifest=app_manifest(),
-    )
-    assert outcome.login == "review-bot"
-
-
-def test_app_installation_identity_is_not_restricted_to_bot_accounts():
-    configuration = load_review_configuration(ROOT).with_trusted_publishers(
-        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [
-            {"app_id": 1, "login": "review-bot", "installation_id": 2, "repository_id": 8,
-             "credential_attestation_digest": "sha256:" + "a" * 64}
-        ]}
-    )
-    outcome = preflight_read_only(
-        GitHubClient(FakeRunner(app_preflight_responses(account_type="Organization"))),
         REPO,
         mode="publisher",
         configuration=configuration,

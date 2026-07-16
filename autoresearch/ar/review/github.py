@@ -186,7 +186,6 @@ _ENDPOINTS = (
     ("GET", re.compile(rf"/repos/{_REPO}/issues/comments/[1-9][0-9]*$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews$"), True),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews/[1-9][0-9]*$"), False),
-    ("GET", re.compile(r"/installation$"), False),
     ("GET", re.compile(r"/installation/repositories$"), False),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
     ("DELETE", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels/[^/]+$"), False),
@@ -495,35 +494,50 @@ class GitHubClient:
             raise GitHubBoundaryError("GitHub repository response has malformed identity")
         return response
 
-    def get_installation(self) -> GitHubResponse:
-        response = self._request("GET", "/installation")
-        data = self._require_mapping(response.data, "App installation")
-        self._require(data, ("id", "app_id", "permissions"), "App installation")
-        if (
-            isinstance(data["id"], bool)
-            or not isinstance(data["id"], int)
-            or data["id"] <= 0
-            or isinstance(data["app_id"], bool)
-            or not isinstance(data["app_id"], int)
-            or data["app_id"] <= 0
-            or not isinstance(data["permissions"], Mapping)
-        ):
-            raise GitHubBoundaryError("GitHub App installation identity is malformed")
-        return response
-
     def list_installation_repositories(self) -> GitHubResponse:
-        response = self._request(
-            "GET", "/installation/repositories", query={"per_page": _PAGE_SIZE, "page": 1}
-        )
-        data = self._require_mapping(response.data, "installation repositories")
-        repositories = data.get("repositories")
-        if not isinstance(repositories, list):
-            raise GitHubBoundaryError("GitHub installation repositories response is malformed")
-        for repository in repositories:
-            item = self._require_mapping(repository, "installation repository")
-            if isinstance(item.get("id"), bool) or not isinstance(item.get("id"), int) or item["id"] <= 0:
-                raise GitHubBoundaryError("GitHub installation repository identity is malformed")
-        return response
+        repositories: list[Mapping[str, Any]] = []
+        headers: dict[str, str] = {}
+        total_count: int | None = None
+        for page in range(1, _MAX_PAGINATED_PAGES + 1):
+            response = self._request(
+                "GET", "/installation/repositories", query={"per_page": _PAGE_SIZE, "page": page}
+            )
+            data = self._require_mapping(response.data, "installation repositories")
+            page_total = data.get("total_count")
+            if isinstance(page_total, bool) or not isinstance(page_total, int) or page_total < 0:
+                raise GitHubBoundaryError("GitHub installation repositories total count is malformed")
+            if total_count is None:
+                total_count = page_total
+            elif page_total != total_count:
+                raise GitHubBoundaryError("GitHub installation repositories total count changed")
+            if total_count > _MAX_PAGINATED_ITEMS:
+                raise GitHubBoundaryError("GitHub installation repository pagination exceeds the fixed item bound")
+            page_repositories = data.get("repositories")
+            if not isinstance(page_repositories, list):
+                raise GitHubBoundaryError("GitHub installation repositories response is malformed")
+            if len(repositories) + len(page_repositories) > _MAX_PAGINATED_ITEMS:
+                raise GitHubBoundaryError("GitHub installation repository pagination exceeds the fixed item bound")
+            for repository in page_repositories:
+                item = self._require_mapping(repository, "installation repository")
+                if isinstance(item.get("id"), bool) or not isinstance(item.get("id"), int) or item["id"] <= 0:
+                    raise GitHubBoundaryError("GitHub installation repository identity is malformed")
+                repositories.append(item)
+            if len(repositories) > total_count:
+                raise GitHubBoundaryError("GitHub installation repositories exceed the reported total count")
+            headers.update(response.headers)
+            has_next = _has_next_page(response.headers)
+            required_pages = (total_count + _PAGE_SIZE - 1) // _PAGE_SIZE
+            if required_pages > _MAX_PAGINATED_PAGES:
+                raise GitHubBoundaryError("GitHub installation repository pagination exceeds the fixed page bound")
+            if page == _MAX_PAGINATED_PAGES and has_next:
+                raise GitHubBoundaryError("GitHub installation repository pagination reached its fixed page bound")
+            if not has_next:
+                if len(repositories) < total_count:
+                    raise GitHubBoundaryError("GitHub installation repositories response is incomplete")
+                break
+        else:
+            raise GitHubBoundaryError("GitHub installation repository pagination reached its fixed page bound")
+        return GitHubResponse({"total_count": total_count, "repositories": repositories}, headers, 200)
 
     def list_pull_requests(
         self, repository: str, *, pages: int = 1, require_complete: bool = True
@@ -866,15 +880,12 @@ def _scope_header(response: GitHubResponse) -> tuple[str, ...]:
     return _capability_signal(response)[0]
 
 
-_PERMISSION_RANK = {"read": 1, "write": 2, "admin": 3}
-
-
 def _require_write_permission(permission: str, name: str) -> None:
     if permission not in {"write", "admin"}:
         raise PreflightError(f"{name} requires effective write or admin permission")
 
 
-def _app_identity(
+def _validate_app_token_repository_access(
     client: GitHubClient,
     repository: str,
     repository_id: int,
@@ -883,34 +894,27 @@ def _app_identity(
     operator_manifest: Mapping[str, Any] | None,
     mode: str,
 ) -> tuple[str, str, tuple[str, ...]]:
+    """Validate deployment binding plus repositories visible to an App token.
+
+    An installation token cannot prove the App bot identity here. That
+    identity is checked later from the server-supplied author on the exact
+    comment or review envelope.
+
+    The configured App ID and installation ID are deployment assertions;
+    installation-token API calls are intentionally not used to re-prove them.
+    """
     apps = [app for app in trusted["apps"] if app["repository_id"] == repository_id]
     if len(apps) != 1:
         raise PreflightError("publisher requires exactly one trusted App binding for the repository")
     configured = apps[0]
-    response = client.get_installation()
-    scopes, accepted = _capability_signal(response, required=("metadata",))
-    data = client._require_mapping(response.data, "App installation")
-    if (
-        data["id"] != configured["installation_id"]
-        or data["app_id"] != configured["app_id"]
-    ):
-        raise PreflightError("GitHub App installation does not match the trusted binding")
     repositories_response = client.list_installation_repositories()
-    _capability_signal(repositories_response, required=("metadata",))
+    scopes, _ = _capability_signal(repositories_response, required=("metadata",))
     repositories_data = client._require_mapping(repositories_response.data, "installation repositories")
     if not any(
         isinstance(item, Mapping) and item.get("id") == repository_id
         for item in repositories_data["repositories"]
     ):
         raise PreflightError("GitHub App installation does not include the target repository")
-    permissions = data["permissions"]
-    for name in ("issues", "pull_requests"):
-        value = permissions.get(name) if isinstance(permissions, Mapping) else None
-        if value not in {"write", "admin"}:
-            raise PreflightError(f"GitHub App installation lacks {name} write permission")
-        advertised = accepted.get(name)
-        if advertised is not None and _PERMISSION_RANK[advertised] < _PERMISSION_RANK["write"]:
-            raise PreflightError(f"GitHub App permission header lacks {name} write permission")
     if operator_manifest is not None:
         principal = operator_manifest["principal"]
         if principal["type"] != "Bot" or principal["login"] != configured["login"]:
@@ -1019,7 +1023,7 @@ def preflight_read_only(
                 raise PreflightError("effective permission principal type mismatch")
             _require_write_permission(permission.permission, "publisher")
         if write_mode and user_data is None:
-            user_login, principal_type, scopes = _app_identity(
+            user_login, principal_type, scopes = _validate_app_token_repository_access(
                 client, repository, repository_data["id"], trusted,
                 operator_manifest=operator, mode=mode,
             )
