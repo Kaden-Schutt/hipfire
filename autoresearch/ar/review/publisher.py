@@ -10,16 +10,25 @@ import hashlib
 import html
 import json
 import re
-from typing import Any
+from typing import Any, Callable
 
 from .canonical import canonical_digest, canonical_json, metadata_digest
-from .config import ReviewConfiguration, validate_operator_credential_manifest
+from .config import (
+    ReviewConfiguration,
+    validate_operator_credential_manifest,
+    validate_publisher_operator_credential,
+)
+from .github import decode_protocol_body, encode_protocol_body
 from .models import GitHubEnvelope, ReviewProposal, ReviewTarget
 from .protocol import validate_protocol
 
 
 class PublisherError(RuntimeError):
     """The publisher rejected an input or an authenticated protocol state."""
+
+
+class LabelError(PublisherError):
+    """A required label mutation failed or could not be verified."""
 
 
 @dataclass(frozen=True)
@@ -32,7 +41,26 @@ class PublishResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _HistoryRecord:
+    envelope: GitHubEnvelope
+    is_review: bool
+    server_id: int
+    state: str | None = None
+    commit_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _History:
+    current: tuple[_HistoryRecord, ...]
+    valid: tuple[_HistoryRecord, ...]
+
+
 class _StaleTarget(RuntimeError):
+    pass
+
+
+class _CanonicalChanged(RuntimeError):
     pass
 
 
@@ -40,36 +68,30 @@ _SCHEMA = "agentic-review/v1"
 _LABEL = "needs-review"
 
 
-def _json_body(payload: Mapping[str, Any]) -> str:
-    return canonical_json(payload).decode("utf-8")
-
-
-def _target_from_response(data: Mapping[str, Any], expected: ReviewTarget) -> ReviewTarget:
-    try:
-        head = data["head"]
-        base = data["base"]
-        head_repo = head["repo"]["full_name"]
-        repository = base.get("repo", {}).get("full_name", expected.repository)
-        merge_base = data.get("merge_base_sha", expected.merge_base_sha)
-        target = ReviewTarget(
-            repository,
-            expected.number,
-            head_repo,
-            head["sha"],
-            base["ref"],
-            base["sha"],
-            merge_base,
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise PublisherError("GitHub pull response is not a complete ReviewTarget") from exc
-    if data.get("number") != expected.number:
-        raise PublisherError("GitHub pull response number does not match ReviewTarget")
-    return target
+def _target_from_payload(payload: Mapping[str, Any]) -> ReviewTarget:
+    target = payload.get("target")
+    if isinstance(target, ReviewTarget):
+        result = target
+    elif isinstance(target, Mapping):
+        fields = {"repository", "number", "head_repository", "head_sha", "base_ref", "base_sha", "merge_base_sha"}
+        if set(target) != fields:
+            raise PublisherError("protocol record does not contain a complete ReviewTarget")
+        try:
+            result = ReviewTarget(**target)
+        except (TypeError, ValueError) as exc:
+            raise PublisherError("protocol record contains an invalid ReviewTarget") from exc
+    else:
+        raise PublisherError("protocol record does not contain a ReviewTarget")
+    if payload.get("target_key") != result.target_key():
+        raise PublisherError("protocol record target key is not bound to its target")
+    return result
 
 
 def _escape_markdown(value: str) -> str:
     escaped = html.escape(value, quote=False)
-    return re.sub(r"([\\`*_\[\]#])", r"\\\1", escaped)
+    escaped = escaped.replace("\r\n", "\n").replace("\r", "\n")
+    escaped = re.sub(r"([\\`*_\[\]#>+-])", r"\\\1", escaped)
+    return escaped.replace("\n", "  \n")
 
 
 def render_report(proposal: ReviewProposal) -> str:
@@ -80,7 +102,7 @@ def render_report(proposal: ReviewProposal) -> str:
         for finding in proposal.findings:
             path = _escape_markdown(finding.path)
             message = _escape_markdown(finding.message)
-            lines.append(f"- `{path}:{finding.range[0]}-{finding.range[1]}` ({finding.severity}): {message}")
+            lines.append(f"- `{path}:{finding.range[0]}-{finding.range[1]}` ({_escape_markdown(finding.severity)}): {message}")
     else:
         lines.extend(("", "No findings."))
     return "\n".join(lines)
@@ -104,8 +126,6 @@ class ReviewPublisher:
             validate_operator_credential_manifest(operator_credential)
         except (TypeError, ValueError) as exc:
             raise PublisherError("operator credential is not attested") from exc
-        if "publish" not in operator_credential["allowed_operations"]:
-            raise PublisherError("operator credential does not attest publication")
         self._client = client
         self._configuration = configuration
         self._operator = deepcopy(dict(operator_credential))
@@ -115,275 +135,393 @@ class ReviewPublisher:
         authors = {self._operator["principal"]["login"]}
         apps = self._configuration.trusted_publishers.get("apps", ())
         if isinstance(apps, Sequence) and not isinstance(apps, (str, bytes)):
-            authors.update(app["login"] for app in apps if isinstance(app, Mapping) and isinstance(app.get("login"), str))
+            authors.update(
+                app["login"] for app in apps
+                if isinstance(app, Mapping) and isinstance(app.get("login"), str)
+            )
         return frozenset(authors)
 
     def _pull_target(self, target: ReviewTarget) -> ReviewTarget:
-        response = self._client.get_pull_request(target.repository, target.number)
-        data = response.data if hasattr(response, "data") else response
-        if not isinstance(data, Mapping):
-            raise PublisherError("GitHub pull response is not an object")
-        current = _target_from_response(data, target)
+        getter = getattr(self._client, "get_review_target", None)
+        if not callable(getter):
+            raise PublisherError("GitHub client lacks the typed complete-target operation")
+        current = getter(target.repository, target.number)
+        if not isinstance(current, ReviewTarget):
+            raise PublisherError("GitHub client returned an untyped ReviewTarget")
         return current
 
     def _assert_target(self, target: ReviewTarget) -> None:
         if self._pull_target(target) != target:
             raise _StaleTarget("review target changed")
 
-    def _reapply_label(self, target: ReviewTarget) -> bool:
+    def _reapply_label(self, target: ReviewTarget, attempt_id: str | None = None) -> None:
         try:
-            self._pull_target(target)
+            if attempt_id is not None:
+                try:
+                    self._canonical(target, attempt_id)
+                except (_CanonicalChanged, PublisherError):
+                    # Recovery must still restore the safety label when the
+                    # attempt itself became stale; the election was performed
+                    # and publication is already being aborted.
+                    pass
+            before = self._pull_target(target)
             self._client.add_labels(target.repository, target.number, [_LABEL])
-            self._pull_target(target)
-            return True
-        except Exception:
-            return False
-
-    def _mutate(self, target: ReviewTarget, operation):
-        self._assert_target(target)
-        value = operation()
-        try:
-            self._assert_target(target)
+            after = self._pull_target(target)
+            if after != before:
+                raise _StaleTarget("target changed while reapplying needs-review")
+            if not self._label_present(target):
+                raise LabelError("GitHub did not confirm needs-review after reapply")
         except _StaleTarget:
-            self._reapply_label(target)
             raise
-        return value
+        except Exception as exc:
+            raise LabelError("failed to reapply needs-review") from exc
 
-    @staticmethod
-    def _protocolish(body: Any) -> bool:
-        if not isinstance(body, str):
-            return False
-        try:
-            value = json.loads(body)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return False
-        return isinstance(value, Mapping) and value.get("schema") == _SCHEMA
-
-    def _history(self, target: ReviewTarget) -> list[GitHubEnvelope]:
-        records: list[GitHubEnvelope] = []
-        comments = self._client.list_issue_comments(target.repository, target.number).data
-        reviews = self._client.list_pull_reviews(target.repository, target.number).data
-        for record in [*(comments or []), *(reviews or [])]:
-            if not isinstance(record, Mapping):
+    def _history(self, target: ReviewTarget) -> _History:
+        raw_comments = self._client.list_issue_comments(target.repository, target.number).data
+        raw_reviews = self._client.list_pull_reviews(target.repository, target.number).data
+        records: list[_HistoryRecord] = []
+        for raw, is_review in [
+            *[(item, False) for item in (raw_comments or [])],
+            *[(item, True) for item in (raw_reviews or [])],
+        ]:
+            if not isinstance(raw, Mapping):
                 raise PublisherError("GitHub history contains a malformed record")
-            if not self._protocolish(record.get("body")):
+            body = raw.get("body")
+            if not isinstance(body, str):
                 continue
             try:
-                if "submitted_at" in record:
-                    envelope = self._client.review_envelope(target.repository, target.number, record["id"])
-                else:
-                    envelope = self._client.comment_envelope(target.repository, record["id"])
-            except Exception as exc:
-                raise PublisherError("a protocol record was deleted or edited") from exc
-            records.append(envelope)
+                payload = decode_protocol_body(body)
+            except Exception:
+                if body.lstrip().startswith("{") or "agentic-review/v1" in body:
+                    raise PublisherError("a protocol record was deleted or edited")
+                continue
+            if payload.get("schema") != _SCHEMA:
+                continue
+            try:
+                envelope = (
+                    self._client.review_envelope(target.repository, target.number, raw["id"])
+                    if is_review else self._client.comment_envelope(target.repository, raw["id"])
+                )
+                record = _HistoryRecord(
+                    envelope, is_review, raw["id"],
+                    raw.get("state") if is_review else None,
+                    raw.get("commit_id") if is_review else None,
+                )
+                _target_from_payload(envelope.payload) if envelope.payload.get("record_type") != "revocation" else None
+            except (KeyError, TypeError, ValueError, PublisherError) as exc:
+                raise PublisherError("a protocol record was deleted, edited, or malformed") from exc
+            records.append(record)
+
+        targets: dict[str, ReviewTarget] = {}
+        for record in records:
+            if record.envelope.payload.get("record_type") == "revocation":
+                continue
+            parsed = _target_from_payload(record.envelope.payload)
+            targets[parsed.target_key()] = parsed
+        groups: dict[str, list[_HistoryRecord]] = {}
+        for record in records:
+            payload = record.envelope.payload
+            key = payload.get("target_key")
+            if not isinstance(key, str):
+                raise PublisherError("protocol record target key is missing")
+            if payload.get("record_type") == "revocation" and key not in targets:
+                raise PublisherError("revocation has no complete historical target")
+            groups.setdefault(key, []).append(record)
+
+        valid: list[_HistoryRecord] = []
+        current: list[_HistoryRecord] = []
+        for key, group in groups.items():
+            expected = targets.get(key)
+            if expected is None:
+                continue
+            try:
+                validate_protocol(
+                    [record.envelope for record in group],
+                    expected_target=expected,
+                    trusted_authors=self._trusted_authors,
+                )
+            except ValueError as exc:
+                if expected == target:
+                    if "no valid non-revoked intent" not in str(exc):
+                        raise PublisherError(f"invalid current review history: {exc}") from exc
+                if "no valid non-revoked intent" in str(exc):
+                    valid.extend(group)
+                continue
+            valid.extend(group)
+            if expected == target:
+                current.extend(group)
+        return _History(tuple(current), tuple(valid))
+
+    def _canonical(self, target: ReviewTarget, attempt_id: str, intent_node: str | None = None) -> GitHubEnvelope:
+        history = self._history(target)
         try:
-            validate_protocol(records, expected_target=target, trusted_authors=self._trusted_authors)
+            elected = validate_protocol(
+                [record.envelope for record in history.current],
+                expected_target=target,
+                trusted_authors=self._trusted_authors,
+            )
         except ValueError as exc:
-            # A history containing only unrelated protocol records is still
-            # meaningful; malformed records must not be silently overwritten.
-            if records and "no valid non-revoked intent" not in str(exc):
-                raise PublisherError(f"invalid authenticated review history: {exc}") from exc
-        return records
+            raise _CanonicalChanged("canonical intent is no longer active") from exc
+        if not isinstance(elected, GitHubEnvelope):
+            raise _CanonicalChanged("canonical intent is not an authenticated envelope")
+        if elected.payload.get("attempt_id") != attempt_id or (intent_node and elected.node_id != intent_node):
+            raise _CanonicalChanged("canonical review attempt changed")
+        return elected
+
+    def _mutate(
+        self,
+        target: ReviewTarget,
+        operation: Callable[[], Any],
+        *,
+        attempt_id: str | None = None,
+        intent_node: str | None = None,
+    ) -> Any:
+        if attempt_id is not None:
+            self._canonical(target, attempt_id, intent_node)
+        self._assert_target(target)
+        value = operation()
+        self._assert_target(target)
+        if attempt_id is not None:
+            self._canonical(target, attempt_id, intent_node)
+        return value
 
     def _intent_payload(self, target: ReviewTarget, attempt_id: str) -> dict[str, Any]:
-        payload = {
-            "schema": _SCHEMA,
-            "record_type": "intent",
-            "record_id": f"intent-{attempt_id}",
-            "target": target,
-            "target_key": target.target_key(),
-            "attempt_id": attempt_id,
+        payload: dict[str, Any] = {
+            "schema": _SCHEMA, "record_type": "intent", "record_id": f"intent-{attempt_id}",
+            "target": target, "target_key": target.target_key(), "attempt_id": attempt_id,
             "canonical_digest": "",
         }
-        payload["canonical_digest"] = canonical_digest(
-            {key: value for key, value in payload.items() if key != "canonical_digest"}
-        )
+        payload["canonical_digest"] = canonical_digest({key: value for key, value in payload.items() if key != "canonical_digest"})
         return payload
 
     def _report_payload(self, proposal: ReviewProposal, target: ReviewTarget, intent: GitHubEnvelope) -> dict[str, Any]:
         body = render_report(proposal)
-        payload = {
-            "schema": _SCHEMA,
-            "record_type": "report",
-            "record_id": f"report-{intent.payload['attempt_id']}",
-            "target": target,
-            "target_key": target.target_key(),
-            "attempt_id": intent.payload["attempt_id"],
-            "intent_record_id": intent.payload["record_id"],
-            "canonical_intent_node_id": intent.node_id,
-            "canonical_intent_digest": intent.payload["canonical_digest"],
-            "head_sha": target.head_sha,
-            "report_body": body,
-            "report_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        return {
+            "schema": _SCHEMA, "record_type": "report", "record_id": f"report-{intent.payload['attempt_id']}",
+            "target": target, "target_key": target.target_key(), "attempt_id": intent.payload["attempt_id"],
+            "intent_record_id": intent.payload["record_id"], "canonical_intent_node_id": intent.node_id,
+            "canonical_intent_digest": intent.payload["canonical_digest"], "head_sha": target.head_sha,
+            "report_body": body, "report_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         }
-        return payload
 
     def _metadata_payload(self, target: ReviewTarget, intent: GitHubEnvelope, report: GitHubEnvelope) -> dict[str, Any]:
-        payload = {
-            "schema": _SCHEMA,
-            "record_type": "review-metadata",
-            "record_id": f"metadata-{intent.payload['attempt_id']}",
-            "target": target,
-            "target_key": target.target_key(),
-            "attempt_id": intent.payload["attempt_id"],
-            "intent_record_id": intent.payload["record_id"],
-            "head_sha": target.head_sha,
-            "report_record_id": report.payload["record_id"],
-            "report_node_id": report.node_id,
-            "report_digest": canonical_digest(report.payload),
-            "report_body_sha256": report.payload["report_body_sha256"],
-            "canonical_intent_digest": intent.payload["canonical_digest"],
-            "canonical_intent_node_id": intent.node_id,
+        payload: dict[str, Any] = {
+            "schema": _SCHEMA, "record_type": "review-metadata", "record_id": f"metadata-{intent.payload['attempt_id']}",
+            "target": target, "target_key": target.target_key(), "attempt_id": intent.payload["attempt_id"],
+            "intent_record_id": intent.payload["record_id"], "head_sha": target.head_sha,
+            "report_record_id": report.payload["record_id"], "report_node_id": report.node_id,
+            "report_digest": canonical_digest(report.payload), "report_body_sha256": report.payload["report_body_sha256"],
+            "canonical_intent_digest": intent.payload["canonical_digest"], "canonical_intent_node_id": intent.node_id,
             "metadata_digest": "",
         }
         payload["metadata_digest"] = metadata_digest(payload)
         return payload
 
-    def _completion_payload(
-        self, target: ReviewTarget, intent: GitHubEnvelope, report: GitHubEnvelope, metadata: GitHubEnvelope
-    ) -> dict[str, Any]:
+    def _completion_payload(self, target: ReviewTarget, intent: GitHubEnvelope, report: GitHubEnvelope, metadata: GitHubEnvelope) -> dict[str, Any]:
         return {
-            "schema": _SCHEMA,
-            "record_type": "completion",
-            "record_id": f"completion-{intent.payload['attempt_id']}",
-            "target": target,
-            "target_key": target.target_key(),
-            "attempt_id": intent.payload["attempt_id"],
-            "intent_record_id": intent.payload["record_id"],
-            "head_sha": target.head_sha,
-            "canonical_intent_digest": intent.payload["canonical_digest"],
-            "canonical_intent_node_id": intent.node_id,
-            "report_record_id": report.payload["record_id"],
-            "report_node_id": report.node_id,
-            "report_digest": canonical_digest(report.payload),
-            "metadata_record_id": metadata.payload["record_id"],
+            "schema": _SCHEMA, "record_type": "completion", "record_id": f"completion-{intent.payload['attempt_id']}",
+            "target": target, "target_key": target.target_key(), "attempt_id": intent.payload["attempt_id"],
+            "intent_record_id": intent.payload["record_id"], "head_sha": target.head_sha,
+            "canonical_intent_digest": intent.payload["canonical_digest"], "canonical_intent_node_id": intent.node_id,
+            "report_record_id": report.payload["record_id"], "report_node_id": report.node_id,
+            "report_digest": canonical_digest(report.payload), "metadata_record_id": metadata.payload["record_id"],
             "metadata_digest": metadata.payload["metadata_digest"],
         }
 
-    def _new_comment(self, target: ReviewTarget, payload: Mapping[str, Any]) -> GitHubEnvelope:
+    def _new_comment(
+        self, target: ReviewTarget, payload: Mapping[str, Any], *, attempt_id: str | None = None,
+        intent_node: str | None = None, visible_body: str | None = None,
+    ) -> GitHubEnvelope:
         response = self._mutate(
             target,
-            lambda: self._client.create_issue_comment(target.repository, target.number, _json_body(payload)),
+            lambda: self._client.create_issue_comment(
+                target.repository, target.number, encode_protocol_body(payload, visible_body=visible_body)
+            ),
+            attempt_id=attempt_id,
+            intent_node=intent_node,
         )
         record = response.data if hasattr(response, "data") else response
         if not isinstance(record, Mapping) or not isinstance(record.get("id"), int):
             raise PublisherError("GitHub comment mutation did not return a server record")
         return self._client.comment_envelope(target.repository, record["id"])
 
-    def _workflow_reviews(self, records: Sequence[GitHubEnvelope], target: ReviewTarget, keep_node: str | None) -> list[int]:
-        ids: list[int] = []
-        for envelope in records:
-            if envelope.node_id == keep_node or envelope.payload.get("record_type") != "review-metadata":
+    def _new_review(self, target: ReviewTarget, payload: Mapping[str, Any], attempt_id: str, intent_node: str) -> _HistoryRecord:
+        response = self._mutate(
+            target,
+            lambda: self._client.create_pull_request_review(
+                target.repository, target.number, body=canonical_json(payload).decode("utf-8"),
+                event="REQUEST_CHANGES", commit_id=target.head_sha,
+            ),
+            attempt_id=attempt_id,
+            intent_node=intent_node,
+        )
+        record = response.data if hasattr(response, "data") else response
+        if not isinstance(record, Mapping) or not isinstance(record.get("id"), int):
+            raise PublisherError("GitHub review mutation did not return a server record")
+        server = self._client.get_pull_review(target.repository, target.number, record["id"]).data
+        envelope = self._client.review_envelope(target.repository, target.number, record["id"])
+        if server.get("state") != "REQUEST_CHANGES" or server.get("commit_id") != target.head_sha:
+            raise PublisherError("created review metadata is not an active exact-head REQUEST_CHANGES review")
+        return _HistoryRecord(envelope, True, record["id"], server["state"], server["commit_id"])
+
+    def _find_record(self, history: _History, target: ReviewTarget, attempt_id: str, record_type: str) -> _HistoryRecord | None:
+        return next(
+            (record for record in history.current
+             if record.envelope.payload.get("record_type") == record_type
+             and record.envelope.payload.get("attempt_id") == attempt_id),
+            None,
+        )
+
+    def _review_metadata(self, history: _History, target: ReviewTarget, attempt_id: str, verdict: str) -> _HistoryRecord | None:
+        metadata = self._find_record(history, target, attempt_id, "review-metadata")
+        if metadata is None:
+            return None
+        if verdict == "changes-requested":
+            if not metadata.is_review or metadata.state != "REQUEST_CHANGES" or metadata.commit_id != target.head_sha:
+                raise PublisherError("review metadata is not an active exact-head REQUEST_CHANGES review")
+        elif metadata.is_review:
+            raise PublisherError("clean verdict cannot reuse a pull request review")
+        return metadata
+
+    def _workflow_review_ids(self, history: _History, target: ReviewTarget, keep_node: str) -> list[int]:
+        result: list[int] = []
+        for record in history.valid:
+            payload = record.envelope.payload
+            record_target = _target_from_payload(payload) if payload.get("record_type") != "revocation" else None
+            if (
+                not record.is_review or record.envelope.node_id == keep_node
+                or payload.get("record_type") != "review-metadata"
+                or record.state != "REQUEST_CHANGES" or record_target is None
+                or record.commit_id != record_target.head_sha
+                or record.envelope.author not in self._trusted_authors
+            ):
                 continue
-            if envelope.payload.get("target_key") != target.target_key() or envelope.author not in self._trusted_authors:
-                continue
-            # Only records that came from the review endpoint have a matching
-            # server review ID in the current API listing.
-            for record in self._client.list_pull_reviews(target.repository, target.number).data:
-                if record.get("node_id") == envelope.node_id and isinstance(record.get("id"), int):
-                    ids.append(record["id"])
-        return ids
+            result.append(record.server_id)
+        return result
+
+    def _label_present(self, target: ReviewTarget) -> bool:
+        getter = getattr(self._client, "list_issue_labels", None)
+        if not callable(getter):
+            raise LabelError("GitHub client lacks typed label-state retrieval")
+        response = getter(target.repository, target.number)
+        data = response.data if hasattr(response, "data") else response
+        if not isinstance(data, list):
+            raise LabelError("GitHub label state is malformed")
+        return any(isinstance(item, Mapping) and item.get("name") == _LABEL for item in data)
+
+    def _remove_label(self, target: ReviewTarget, attempt_id: str, intent_node: str) -> None:
+        if self._label_present(target):
+            self._mutate(
+                target,
+                lambda: self._client.remove_label(target.repository, target.number, _LABEL),
+                attempt_id=attempt_id,
+                intent_node=intent_node,
+            )
+
+    def _recover(self, target: ReviewTarget, attempt_id: str, status: str, reason: str) -> PublishResult:
+        try:
+            self._reapply_label(target, attempt_id)
+        except (_StaleTarget, LabelError) as exc:
+            return PublishResult("error", attempt_id, reason=f"{reason}; label recovery failed: {exc}")
+        return PublishResult(status, attempt_id, reason=reason)
 
     def publish(self, proposal: ReviewProposal, target: ReviewTarget) -> PublishResult:
         if not isinstance(proposal, ReviewProposal) or not isinstance(target, ReviewTarget):
             raise PublisherError("publish requires a validated ReviewProposal and complete ReviewTarget")
         if proposal.target != target:
             raise PublisherError("proposal and ReviewTarget do not match")
+        if self._configuration.source is None or self._configuration.source.repository != target.repository:
+            raise PublisherError("authenticated configuration source does not match target repository")
+        try:
+            validate_publisher_operator_credential(self._operator, target.repository)
+        except (TypeError, ValueError) as exc:
+            raise PublisherError(str(exc)) from exc
         attempt_id = "attempt-" + proposal.proposal_digest[7:]
         try:
             self._client.revalidate_config_source(self._configuration.source)
             self._assert_target(target)
-            records = self._history(target)
+            if proposal.verdict == "incomplete":
+                self._reapply_label(target, attempt_id)
+                return PublishResult("incomplete", attempt_id, reason="proposal verdict is incomplete")
+
+            history = self._history(target)
             try:
                 elected = validate_protocol(
-                    records, expected_target=target, trusted_authors=self._trusted_authors
-                ) if records else None
+                    [record.envelope for record in history.current],
+                    expected_target=target, trusted_authors=self._trusted_authors,
+                ) if history.current else None
             except ValueError as exc:
                 if "no valid non-revoked intent" not in str(exc):
-                    raise PublisherError(f"invalid authenticated review history: {exc}") from exc
+                    raise PublisherError(f"invalid current review history: {exc}") from exc
                 elected = None
             canonical = elected if isinstance(elected, GitHubEnvelope) else None
-            if canonical is not None and canonical.payload["attempt_id"] != attempt_id:
+            if canonical is not None and canonical.payload.get("attempt_id") != attempt_id:
                 return PublishResult("duplicate", attempt_id, reason="a different canonical attempt exists")
-            intent = canonical if canonical is not None else self._new_comment(target, self._intent_payload(target, attempt_id))
-            records = self._history(target)
-            elected = validate_protocol(records, expected_target=target, trusted_authors=self._trusted_authors)
-            if not isinstance(elected, GitHubEnvelope):
-                raise PublisherError("canonical intent is not a typed GitHub envelope")
-            canonical = elected
-            if canonical.node_id != intent.node_id:
-                return PublishResult("duplicate", attempt_id, reason="intent is not canonical")
-            existing_completion = next(
-                (item for item in records
-                 if item.payload.get("record_type") == "completion"
-                 and item.payload.get("attempt_id") == attempt_id),
-                None,
-            )
-            if existing_completion is not None:
-                existing_report = next(
-                    (item for item in records
-                     if item.payload.get("record_type") == "report"
-                     and item.payload.get("attempt_id") == attempt_id),
-                    None,
-                )
-                existing_metadata = next(
-                    (item for item in records
-                     if item.payload.get("record_type") == "review-metadata"
-                     and item.payload.get("attempt_id") == attempt_id),
-                    None,
-                )
-                return PublishResult(
-                    "duplicate", attempt_id, existing_report, existing_metadata, existing_completion,
-                    "canonical attempt is already complete",
-                )
-            by_type = {envelope.payload["record_type"]: envelope for envelope in records
-                       if envelope.payload.get("attempt_id") == attempt_id}
-            report = by_type.get("report")
+            intent = canonical or self._new_comment(target, self._intent_payload(target, attempt_id))
+            history = self._history(target)
+            canonical = self._canonical(target, attempt_id, intent.node_id)
+            completion = self._find_record(history, target, attempt_id, "completion")
+            if completion is not None:
+                report = self._find_record(history, target, attempt_id, "report")
+                metadata = self._find_record(history, target, attempt_id, "review-metadata")
+                if report is None or metadata is None:
+                    raise PublisherError("completion dependencies are missing")
+                self._remove_label(target, attempt_id, canonical.node_id)
+                return PublishResult("duplicate", attempt_id, report.envelope, metadata.envelope, completion.envelope,
+                                     "canonical attempt is already complete")
+
+            report = self._find_record(history, target, attempt_id, "report")
             if report is None:
-                report = self._new_comment(target, self._report_payload(proposal, target, intent))
-            records = self._history(target)
-            report = next((item for item in records if item.payload.get("record_type") == "report" and item.payload.get("attempt_id") == attempt_id), report)
-            metadata = next((item for item in records if item.payload.get("record_type") == "review-metadata" and item.payload.get("attempt_id") == attempt_id), None)
+                report_envelope = self._new_comment(
+                    target, self._report_payload(proposal, target, intent),
+                    attempt_id=attempt_id, intent_node=canonical.node_id,
+                    visible_body=render_report(proposal),
+                )
+                report = _HistoryRecord(report_envelope, False, 0)
+            history = self._history(target)
+            report = self._find_record(history, target, attempt_id, "report") or report
+
+            metadata = self._review_metadata(history, target, attempt_id, proposal.verdict)
             if metadata is None:
-                metadata_payload = self._metadata_payload(target, intent, report)
+                metadata_payload = self._metadata_payload(target, intent, report.envelope)
                 if proposal.verdict == "changes-requested":
-                    response = self._mutate(
-                        target,
-                        lambda: self._client.create_pull_request_review(
-                            target.repository,
-                            target.number,
-                            body=_json_body(metadata_payload),
-                            event="REQUEST_CHANGES",
-                            commit_id=target.head_sha,
-                        ),
-                    )
-                    record = response.data if hasattr(response, "data") else response
-                    metadata = self._client.review_envelope(target.repository, target.number, record["id"])
+                    metadata = self._new_review(target, metadata_payload, attempt_id, canonical.node_id)
                 else:
-                    metadata = self._new_comment(target, metadata_payload)
-            records = self._history(target)
-            completion = next((item for item in records if item.payload.get("record_type") == "completion" and item.payload.get("attempt_id") == attempt_id), None)
+                    metadata_envelope = self._new_comment(
+                        target, metadata_payload, attempt_id=attempt_id, intent_node=canonical.node_id,
+                    )
+                    metadata = _HistoryRecord(metadata_envelope, False, 0)
+
+            history = self._history(target)
+            canonical = self._canonical(target, attempt_id, intent.node_id)
+            completion = self._find_record(history, target, attempt_id, "completion")
             if completion is None:
-                workflow_ids = self._workflow_reviews(records, target, metadata.node_id)
-                for review_id in workflow_ids:
+                for review_id in self._workflow_review_ids(history, target, metadata.envelope.node_id):
                     self._mutate(
                         target,
                         lambda review_id=review_id: self._client.dismiss_workflow_review(
-                            target.repository, target.number, review_id, message="Superseded by a current agentic review"
+                            target.repository, target.number, review_id,
+                            message="Superseded by a current agentic review",
                         ),
+                        attempt_id=attempt_id, intent_node=canonical.node_id,
                     )
-                completion = self._new_comment(target, self._completion_payload(target, intent, report, metadata))
-            self._mutate(target, lambda: self._client.remove_label(target.repository, target.number, _LABEL))
-            return PublishResult("complete", attempt_id, report, metadata, completion)
+                    history = self._history(target)
+                    canonical = self._canonical(target, attempt_id, intent.node_id)
+                completion_envelope = self._new_comment(
+                    target, self._completion_payload(target, intent, report.envelope, metadata.envelope),
+                    attempt_id=attempt_id, intent_node=canonical.node_id,
+                )
+                completion = _HistoryRecord(completion_envelope, False, 0)
+            self._remove_label(target, attempt_id, canonical.node_id)
+            return PublishResult("complete", attempt_id, report.envelope, metadata.envelope, completion.envelope)
         except _StaleTarget as exc:
-            self._reapply_label(target)
-            return PublishResult("stale", attempt_id, reason=str(exc))
+            return self._recover(target, attempt_id, "stale", str(exc))
+        except _CanonicalChanged as exc:
+            return self._recover(target, attempt_id, "stale", str(exc))
         except PublisherError as exc:
-            self._reapply_label(target)
-            return PublishResult("error", attempt_id, reason=str(exc))
+            return self._recover(target, attempt_id, "error", str(exc))
         except Exception as exc:
-            self._reapply_label(target)
-            return PublishResult("incomplete", attempt_id, reason=str(exc))
+            return self._recover(target, attempt_id, "incomplete", str(exc))
 
 
 def publish_review(
@@ -394,9 +532,7 @@ def publish_review(
     configuration: ReviewConfiguration,
     operator_credential: Mapping[str, Any],
 ) -> PublishResult:
-    return ReviewPublisher(
-        client, configuration=configuration, operator_credential=operator_credential
-    ).publish(proposal, target)
+    return ReviewPublisher(client, configuration=configuration, operator_credential=operator_credential).publish(proposal, target)
 
 
-__all__ = ["PublishResult", "PublisherError", "ReviewPublisher", "publish_review", "render_report"]
+__all__ = ["LabelError", "PublishResult", "PublisherError", "ReviewPublisher", "publish_review", "render_report"]

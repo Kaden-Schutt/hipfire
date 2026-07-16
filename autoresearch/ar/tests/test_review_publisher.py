@@ -86,11 +86,18 @@ class FakeGitHub:
         self.reviews: list[dict] = []
         self.calls: list[tuple[str, object]] = []
         self.next_id = 1
+        self.clock = 0
         self.fail: set[str] = set()
         self.removed_labels: list[str] = []
+        self.labels = {"needs-review"}
         self.mutate_head_after: str | None = None
+        self.revoke_before_next_review: dict | None = None
         self.deleted_comment_ids: set[int] = set()
         self.edited_comment_ids: set[int] = set()
+
+    def _now(self) -> str:
+        self.clock += 1
+        return f"2026-01-01T00:{self.clock:02d}:00Z"
 
     @staticmethod
     def _pull(target: ReviewTarget) -> dict:
@@ -99,13 +106,20 @@ class FakeGitHub:
             "node_id": "PR_1",
             "number": target.number,
             "head": {"repo": {"full_name": target.head_repository}, "sha": target.head_sha},
-            "base": {"ref": target.base_ref, "sha": target.base_sha},
+            "base": {"repo": {"full_name": target.repository}, "ref": target.base_ref, "sha": target.base_sha},
             "merge_base_sha": target.merge_base_sha,
         }
 
     def get_pull_request(self, repository: str, number: int) -> GitHubResponse:
         self.calls.append(("get_target", self.pull["head"]["sha"]))
         return GitHubResponse(self.pull, {}, 200)
+
+    def get_review_target(self, repository: str, number: int) -> ReviewTarget:
+        data = self.get_pull_request(repository, number).data
+        return ReviewTarget(
+            data["base"]["repo"]["full_name"], data["number"], data["head"]["repo"]["full_name"],
+            data["head"]["sha"], data["base"]["ref"], data["base"]["sha"], data["merge_base_sha"],
+        )
 
     def revalidate_config_source(self, source) -> None:
         self.calls.append(("config", source.commit_sha))
@@ -118,6 +132,18 @@ class FakeGitHub:
         self.calls.append(("list_reviews", None))
         return GitHubResponse(self.reviews, {}, 200)
 
+    def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
+        self.calls.append(("list_labels", None))
+        return GitHubResponse([{"name": label} for label in sorted(self.labels)], {}, 200)
+
+    @staticmethod
+    def payload_from_body(body: str) -> str:
+        if body.lstrip().startswith("{"):
+            return body
+        marker = "<!-- agentic-review/v1"
+        start = body.index(marker) + len(marker)
+        return body[start:].split("-->", 1)[0].strip()
+
     def _envelope(self, record: dict, kind: str) -> GitHubEnvelope:
         if record["id"] in self.deleted_comment_ids:
             raise RuntimeError("record deleted")
@@ -126,7 +152,7 @@ class FakeGitHub:
             updated = "2026-01-01T00:09:00Z"
         published = record["created_at"] if "created_at" in record else record["submitted_at"]
         return GitHubEnvelope(
-            json.loads(record["body"]), record["node_id"], TRUSTED, published, updated, "Bot"
+            json.loads(self.payload_from_body(record["body"])), record["node_id"], TRUSTED, published, updated, "Bot"
         )
 
     def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:
@@ -135,12 +161,15 @@ class FakeGitHub:
     def review_envelope(self, repository: str, number: int, review_id: int) -> GitHubEnvelope:
         return self._envelope(next(item for item in self.reviews if item["id"] == review_id), "review")
 
+    def get_pull_review(self, repository: str, number: int, review_id: int) -> GitHubResponse:
+        return GitHubResponse(next(item for item in self.reviews if item["id"] == review_id), {}, 200)
+
     def create_issue_comment(self, repository: str, number: int, body: str) -> GitHubResponse:
-        record_type = json.loads(body)["record_type"]
+        record_type = json.loads(self.payload_from_body(body))["record_type"]
         self.calls.append(("create_comment", record_type))
         if "comment" in self.fail or record_type in self.fail:
             raise RuntimeError("comment creation failed")
-        now = f"2026-01-01T00:{len(self.comments) + 1:02d}:00Z"
+        now = self._now()
         record = {
             "id": self.next_id, "node_id": f"C_{self.next_id}", "user": {"login": TRUSTED, "type": "Bot"},
             "created_at": now, "updated_at": now, "body": body,
@@ -153,7 +182,13 @@ class FakeGitHub:
         self.calls.append(("create_review", (event, commit_id)))
         if "review" in self.fail:
             raise RuntimeError("review creation failed")
-        now = f"2026-01-01T00:{len(self.comments) + len(self.reviews) + 1:02d}:00Z"
+        if self.revoke_before_next_review is not None:
+            now = "2026-01-01T00:10:00Z"
+            self.comments.append({"id": 900, "node_id": "race-revoke", "user": {"login": TRUSTED, "type": "Bot"},
+                                  "created_at": now, "updated_at": now,
+                                  "body": json.dumps(self.revoke_before_next_review)})
+            self.revoke_before_next_review = None
+        now = self._now()
         record = {
             "id": self.next_id, "node_id": f"R_{self.next_id}", "user": {"login": TRUSTED, "type": "Bot"},
             "submitted_at": now, "body": body, "state": event, "commit_id": commit_id,
@@ -164,6 +199,9 @@ class FakeGitHub:
 
     def add_labels(self, repository: str, number: int, labels) -> GitHubResponse:
         self.calls.append(("add_label", tuple(labels)))
+        if "add_label" in self.fail:
+            raise RuntimeError("label add failed")
+        self.labels.update(labels)
         return GitHubResponse([], {}, 200)
 
     def remove_label(self, repository: str, number: int, label: str) -> GitHubResponse:
@@ -171,6 +209,7 @@ class FakeGitHub:
         if "remove_label" in self.fail:
             raise RuntimeError("label removal failed")
         self.removed_labels.append(label)
+        self.labels.discard(label)
         return GitHubResponse({}, {}, 204)
 
     def dismiss_workflow_review(self, repository: str, number: int, review_id: int, *, message: str) -> GitHubResponse:
@@ -180,6 +219,7 @@ class FakeGitHub:
         for review in self.reviews:
             if review["id"] == review_id:
                 review["state"] = "DISMISSED"
+        self.reviews = [review for review in self.reviews if review["id"] != review_id]
         return GitHubResponse({"id": review_id, "node_id": f"D_{review_id}"}, {}, 200)
 
 
@@ -197,7 +237,7 @@ def test_clean_lifecycle_publishes_report_and_completion_without_approval():
     assert [call[1] for call in client.calls if call[0] == "create_comment"] == [
         "intent", "report", "review-metadata", "completion"
     ]
-    report = next(json.loads(item["body"]) for item in client.comments if json.loads(item["body"])["record_type"] == "report")
+    report = next(json.loads(client.payload_from_body(item["body"])) for item in client.comments if json.loads(client.payload_from_body(item["body"]))["record_type"] == "report")
     assert "**the checked value**" not in report["report_body"]
     assert "<instead>" not in report["report_body"]
 
@@ -282,7 +322,7 @@ def test_revoked_workflow_review_is_dismissed_but_human_review_is_not():
     old = _publisher(client).publish(_proposal("changes-requested"), TARGET)
     assert old.status == "incomplete", old.reason
     client.fail.remove("completion")
-    old_intent = next(item for item in client.comments if json.loads(item["body"])["record_type"] == "intent")
+    old_intent = next(item for item in client.comments if json.loads(client.payload_from_body(item["body"]))["record_type"] == "intent")
     intent_payload = json.loads(old_intent["body"])
     revocation = {
         "schema": "agentic-review/v1", "record_type": "revocation", "record_id": "revoke-old",
@@ -321,8 +361,178 @@ def test_edited_report_is_not_resumed_and_stale_target_keeps_label():
     client = FakeGitHub()
     first = _publisher(client).publish(_proposal(), TARGET)
     assert first.status == "complete"
-    report_id = next(item["id"] for item in client.comments if json.loads(item["body"])["record_type"] == "report")
+    report_id = next(item["id"] for item in client.comments if json.loads(client.payload_from_body(item["body"]))["record_type"] == "report")
     client.edited_comment_ids.add(report_id)
     result = _publisher(client).publish(_proposal(), TARGET)
     assert result.status in {"error", "incomplete", "duplicate"}
     assert ("remove_label", "needs-review") not in client.calls[-5:]
+
+
+def test_incomplete_proposal_never_completes_or_removes_label():
+    client = FakeGitHub()
+    result = _publisher(client).publish(_proposal("incomplete"), TARGET)
+
+    assert result.status == "incomplete"
+    assert not any(call[0] == "create_review" for call in client.calls)
+    assert not client.removed_labels
+    assert ("add_label", ("needs-review",)) in client.calls
+
+
+def test_completed_retry_reconciles_label_after_prior_remove_failure():
+    client = FakeGitHub()
+    client.fail.add("remove_label")
+    first = _publisher(client).publish(_proposal(), TARGET)
+    assert first.status == "incomplete"
+    client.fail.remove("remove_label")
+
+    second = _publisher(client).publish(_proposal(), TARGET)
+
+    assert second.status == "duplicate"
+    assert client.removed_labels == ["needs-review"]
+
+
+@pytest.mark.parametrize("field", ["repository", "head_repository", "head_sha", "base_ref", "base_sha", "merge_base_sha"])
+def test_every_target_field_race_is_stale_and_reapplies_label(field):
+    client = FakeGitHub()
+    original = client.get_pull_request
+    count = 0
+
+    def advancing(repository, number):
+        nonlocal count
+        count += 1
+        response = original(repository, number)
+        if count == 4:
+            values = {
+                "repository": "other/repo" if field == "repository" else TARGET.repository,
+                "head_repository": "fork/repo" if field == "head_repository" else TARGET.head_repository,
+                "head_sha": "new-head" if field == "head_sha" else TARGET.head_sha,
+                "base_ref": "release" if field == "base_ref" else TARGET.base_ref,
+                "base_sha": "new-base" if field == "base_sha" else TARGET.base_sha,
+                "merge_base_sha": "new-merge" if field == "merge_base_sha" else TARGET.merge_base_sha,
+            }
+            client.pull = client._pull(ReviewTarget(number=TARGET.number, **values))
+        return response
+
+    client.get_pull_request = advancing
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status in {"stale", "error"}
+    assert ("add_label", ("needs-review",)) in client.calls
+    assert not client.removed_labels
+
+
+def test_missing_merge_base_fails_closed_before_intent():
+    client = FakeGitHub()
+    client.pull.pop("merge_base_sha")
+
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "error"
+    assert not any(call[0] == "create_comment" for call in client.calls)
+
+
+def test_prior_target_history_does_not_block_current_target():
+    old = ReviewTarget(REPO, 42, REPO, "old-head", "main", "old-base", "old-merge")
+    payload = {
+        "schema": "agentic-review/v1", "record_type": "intent", "record_id": "old-intent",
+        "target": {"repository": old.repository, "number": old.number, "head_repository": old.head_repository,
+                    "head_sha": old.head_sha, "base_ref": old.base_ref, "base_sha": old.base_sha,
+                    "merge_base_sha": old.merge_base_sha}, "target_key": old.target_key(),
+        "attempt_id": "old-attempt", "canonical_digest": "",
+    }
+    payload["canonical_digest"] = canonical_digest({key: value for key, value in payload.items() if key != "canonical_digest"})
+    client = FakeGitHub()
+    client.comments.append({"id": 99, "node_id": "old", "user": {"login": TRUSTED, "type": "Bot"},
+                            "created_at": "2025-12-01T00:00:00Z", "updated_at": "2025-12-01T00:00:00Z",
+                            "body": json.dumps(payload)})
+
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "complete", result.reason
+
+
+def test_canonical_change_before_review_aborts_without_completion():
+    client = FakeGitHub()
+    client.fail.add("completion")
+    old = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert old.status == "incomplete"
+    client.fail.remove("completion")
+    intent = next(json.loads(client.payload_from_body(item["body"])) for item in client.comments if json.loads(client.payload_from_body(item["body"]))["record_type"] == "intent")
+    revocation = {"schema": "agentic-review/v1", "record_type": "revocation", "record_id": "race-revoke",
+                  "target_key": TARGET.target_key(), "attempt_id": intent["attempt_id"],
+                  "canonical_intent_digest": intent["canonical_digest"], "reason": "race"}
+    client.comments.append({"id": 901, "node_id": "race-revoke-1", "user": {"login": TRUSTED, "type": "Bot"},
+                            "created_at": "2026-01-01T00:03:30Z", "updated_at": "2026-01-01T00:03:30Z",
+                            "body": json.dumps(revocation)})
+    client.revoke_before_next_review = {**revocation, "record_id": "race-revoke-2"}
+
+    result = _publisher(client).publish(
+        _proposal("changes-requested", response_digest="sha256:" + "d" * 64), TARGET
+    )
+
+    assert result.status in {"error", "incomplete", "stale"}
+    assert not client.removed_labels
+
+
+@pytest.mark.parametrize("state,commit", [("COMMENTED", TARGET.head_sha), ("DISMISSED", TARGET.head_sha), ("REQUEST_CHANGES", "wrong-head")])
+def test_changes_retry_rejects_invalid_review_metadata(state, commit):
+    client = FakeGitHub()
+    client.fail.add("completion")
+    first = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert first.status == "incomplete"
+    client.fail.remove("completion")
+    client.reviews[0]["state"] = state
+    client.reviews[0]["commit_id"] = commit
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "error"
+    assert [call for call in client.calls if call[0] == "create_review"] == [("create_review", ("REQUEST_CHANGES", TARGET.head_sha))]
+
+
+@pytest.mark.parametrize("change", ["source", "operator_repo", "operator_ops", "operator_permissions"])
+def test_publish_requires_repository_and_operator_binding(change):
+    client = FakeGitHub()
+    configuration = _configuration()
+    operator = dict(OPERATOR)
+    if change == "source":
+        source = configuration.source
+        configuration = replace(configuration, source=AuthenticatedConfigSource._from_authenticated_boundary(
+            __import__("autoresearch.ar.review.config", fromlist=["_SOURCE_PROOF"])._SOURCE_PROOF,
+            "other/repo", source.default_branch, source.commit_sha, source.config_digest, "."))
+        object.__setattr__(configuration, "_loaded_from_protected_paths", True)
+        object.__setattr__(configuration, "_loaded_source_digest", source.config_digest)
+        object.__setattr__(configuration, "_loaded_root_identity", configuration.source.root_identity)
+    elif change == "operator_repo":
+        operator["repository"] = "other/repo"
+    elif change == "operator_ops":
+        operator["allowed_operations"] = ["publish"]
+    else:
+        operator["write_permissions"] = {"issues": "write"}
+
+    with pytest.raises(Exception) if change != "source" else pytest.raises(Exception):
+        ReviewPublisher(client, configuration=configuration, operator_credential=operator).publish(_proposal(), TARGET)
+
+
+def test_report_is_visible_markdown_with_hidden_metadata_and_escaped_injection():
+    client = FakeGitHub()
+    proposal = _proposal("changes-requested")
+    result = _publisher(client).publish(proposal, TARGET)
+    assert result.status == "complete", result.reason
+    report = next(item for item in client.comments if json.loads(client.payload_from_body(item["body"]))["record_type"] == "report")
+    body = report["body"]
+
+    assert body.startswith("## Agentic review")
+    assert "<!-- agentic-review/v1" in body
+    assert "**the checked value**" not in body
+    assert "<instead>" not in body
+
+
+def test_label_add_failure_is_explicit():
+    client = FakeGitHub()
+    client.fail.add("add_label")
+
+    result = _publisher(client).publish(_proposal("incomplete"), TARGET)
+
+    assert result.status == "error"
+    assert "reapply" in (result.reason or "").lower()

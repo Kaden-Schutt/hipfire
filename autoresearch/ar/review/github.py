@@ -18,7 +18,7 @@ import time
 from typing import Any, Protocol
 from urllib.parse import quote
 
-from .canonical import canonical_digest, canonical_loads, metadata_digest
+from .canonical import canonical_digest, canonical_json, canonical_loads, metadata_digest
 from .config import (
     ReviewConfiguration,
     AuthenticatedConfigSource,
@@ -26,7 +26,7 @@ from .config import (
     configuration_source_digest,
     validate_operator_credential_manifest,
 )
-from .models import GitHubEnvelope, IntentPayload, validate_trusted_publishers_policy
+from .models import GitHubEnvelope, IntentPayload, ReviewTarget, validate_trusted_publishers_policy
 
 
 class GitHubBoundaryError(RuntimeError):
@@ -198,8 +198,10 @@ _ENDPOINTS = (
     ("GET", re.compile(rf"/repos/{_REPO}/issues/comments/[1-9][0-9]*$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews$"), True),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews/[1-9][0-9]*$"), False),
+    ("GET", re.compile(rf"/repos/{_REPO}/compare/{_SHA}\.{3}{_SHA}$"), False),
     ("GET", re.compile(r"/installation/repositories$"), False),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
+    ("GET", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
     ("DELETE", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels/[^/]+$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/collaborators/[^/]+/permission$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/commits/{_SHA}$"), False),
@@ -213,6 +215,33 @@ _ENDPOINTS = (
 _LIST_PATHS = {pattern.pattern for _, pattern, paginated in _ENDPOINTS if paginated}
 _PRINCIPAL_TYPES = {"User", "Bot", "Organization"}
 _PERMISSIONS = ("admin", "maintain", "push", "triage", "pull")
+_PROTOCOL_COMMENT_MARKER = "<!-- agentic-review/v1\n"
+
+
+def encode_protocol_body(payload: Mapping[str, Any], *, visible_body: str | None = None) -> str:
+    encoded = canonical_json(payload).decode("utf-8")
+    if visible_body is None:
+        return encoded
+    if not isinstance(visible_body, str) or not visible_body.strip():
+        raise GitHubBoundaryError("visible protocol body must be non-empty")
+    return f"{visible_body.rstrip()}\n\n{_PROTOCOL_COMMENT_MARKER}{encoded}\n-->"
+
+
+def decode_protocol_body(body: str) -> Mapping[str, Any]:
+    if not isinstance(body, str) or not body.strip():
+        raise GitHubBoundaryError("protocol body is empty")
+    raw = body.strip()
+    if raw.startswith("{"):
+        decoded = canonical_loads(raw.encode("utf-8"))
+    else:
+        prefix = raw.rfind(_PROTOCOL_COMMENT_MARKER)
+        if prefix < 0 or not raw.endswith("-->"):
+            raise GitHubBoundaryError("protocol metadata block is missing")
+        encoded = raw[prefix + len(_PROTOCOL_COMMENT_MARKER):-3].strip()
+        decoded = canonical_loads(encoded.encode("utf-8"))
+    if not isinstance(decoded, Mapping):
+        raise GitHubBoundaryError("protocol body is not an object")
+    return decoded
 
 
 def _repository(value: str) -> str:
@@ -638,6 +667,38 @@ class GitHubClient:
         self._validate_pull(data, expected_number=number, expected_repository=repository)
         return response
 
+    def get_merge_base_sha(self, repository: str, base_sha: str, head_sha: str) -> str:
+        repository = _repository(repository)
+        base_sha = _identifier(base_sha, "base SHA")
+        head_sha = _identifier(head_sha, "head SHA")
+        response = self._request("GET", f"/repos/{repository}/compare/{quote(base_sha, safe='')}...{quote(head_sha, safe='')}")
+        data = self._require_mapping(response.data, "commit comparison")
+        base = self._require_mapping(data.get("base_commit"), "comparison base commit")
+        merge_base = self._require_mapping(data.get("merge_base_commit"), "comparison merge base commit")
+        if base.get("sha") != base_sha or not isinstance(merge_base.get("sha"), str) or not merge_base["sha"].strip():
+            raise GitHubBoundaryError("GitHub comparison does not bind the requested base and merge-base")
+        return merge_base["sha"]
+
+    def get_review_target(self, repository: str, number: int) -> ReviewTarget:
+        repository = _repository(repository)
+        number = _positive_integer(number, "pull request number")
+        data = self.get_pull_request(repository, number).data
+        head = self._require_mapping(data.get("head"), "pull request head")
+        base = self._require_mapping(data.get("base"), "pull request base")
+        head_repo = self._require_mapping(head.get("repo"), "head repository")
+        base_repo = self._require_mapping(base.get("repo"), "base repository")
+        head_sha = head.get("sha")
+        base_sha = base.get("sha")
+        if base_repo.get("full_name") != repository or not isinstance(head_repo.get("full_name"), str):
+            raise GitHubBoundaryError("GitHub pull request repositories are incomplete or mismatched")
+        if not isinstance(head_sha, str) or not isinstance(base_sha, str):
+            raise GitHubBoundaryError("GitHub pull request SHAs are incomplete")
+        merge_base_sha = self.get_merge_base_sha(repository, base_sha, head_sha)
+        return ReviewTarget(
+            repository, number, head_repo["full_name"], head_sha,
+            base["ref"], base_sha, merge_base_sha,
+        )
+
     def list_issue_comments(self, repository: str, number: int) -> GitHubResponse:
         return self._list_records(repository, number, "issue comments")
 
@@ -662,6 +723,18 @@ class GitHubClient:
             response, "pull review", record_kind="review",
             extra=("state", "commit_id", "body"), expected_id=review_id, require_timestamp=False,
         )
+        return response
+
+    def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
+        repository = _repository(repository)
+        number = _positive_integer(number, "issue number")
+        response = self._request("GET", f"/repos/{repository}/issues/{number}/labels", query={"per_page": _PAGE_SIZE})
+        if not isinstance(response.data, list):
+            raise GitHubBoundaryError("GitHub labels response is not a list")
+        for item in response.data:
+            label = self._require_mapping(item, "label")
+            if not isinstance(label.get("name"), str) or not label["name"].strip():
+                raise GitHubBoundaryError("GitHub label response is malformed")
         return response
 
     @classmethod
@@ -987,11 +1060,9 @@ class GitHubClient:
         if not isinstance(body, str) or not body.strip():
             raise GitHubBoundaryError(f"GitHub {record_name} body is missing")
         try:
-            payload = canonical_loads(body)
-            if not isinstance(payload, Mapping):
-                raise ValueError("protocol body must be an object")
+            payload = decode_protocol_body(body)
             _validate_protocol_payload(payload)
-        except (TypeError, ValueError, RecursionError) as exc:
+        except (GitHubBoundaryError, TypeError, ValueError, RecursionError) as exc:
             raise GitHubBoundaryError(f"GitHub {record_name} body is not a valid protocol payload") from exc
         publication_time = record["created_at"] if record_kind == "comment" else record["submitted_at"]
         return GitHubEnvelope(

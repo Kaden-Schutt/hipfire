@@ -221,6 +221,21 @@ def validate_operator_credential_manifest(manifest: Mapping[str, Any]) -> None:
         raise ValueError("operator credential attestation digest is invalid") from exc
 
 
+def validate_publisher_operator_credential(manifest: Mapping[str, Any], repository: str) -> None:
+    """Validate the stricter credential contract required by publication."""
+    validate_operator_credential_manifest(manifest)
+    if manifest["repository"] != repository:
+        raise ValueError("operator credential repository does not match target repository")
+    principal = manifest["principal"]
+    if principal["type"] not in {"User", "Bot"} or not principal["login"].strip():
+        raise ValueError("publisher operator principal is unsupported")
+    if not {"publish", "dismiss-workflow-review"}.issubset(manifest["allowed_operations"]):
+        raise ValueError("publisher operator is missing a required operation")
+    for permission in ("issues", "pull_requests"):
+        if manifest["write_permissions"].get(permission) not in _WRITE_PERMISSION_LEVELS:
+            raise ValueError("publisher operator is missing a required write permission")
+
+
 def load_operator_credential_manifest(
     repository_root: str | Path,
     *,
