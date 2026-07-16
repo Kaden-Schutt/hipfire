@@ -45,7 +45,10 @@ use std::time::Instant;
 struct MtpPhaseTraceStats {
     cycles: u64,
     proposal_ms: f64,
-    verify_accept_ms: f64,
+    snapshot_ms: f64,
+    trunk_verify_ms: f64,
+    penalties_ms: f64,
+    accept_ms: f64,
     rollback_ms: f64,
     full_accepts: u64,
 }
@@ -59,7 +62,10 @@ fn mtp_phase_trace_enabled_from_env() -> bool {
 
 fn record_mtp_phase_trace(
     proposal_ms: f64,
-    verify_accept_ms: f64,
+    snapshot_ms: f64,
+    trunk_verify_ms: f64,
+    penalties_ms: f64,
+    accept_ms: f64,
     rollback_ms: f64,
     full_accept: bool,
 ) {
@@ -71,18 +77,30 @@ fn record_mtp_phase_trace(
         .unwrap();
     stats.cycles += 1;
     stats.proposal_ms += proposal_ms;
-    stats.verify_accept_ms += verify_accept_ms;
+    stats.snapshot_ms += snapshot_ms;
+    stats.trunk_verify_ms += trunk_verify_ms;
+    stats.penalties_ms += penalties_ms;
+    stats.accept_ms += accept_ms;
     stats.rollback_ms += rollback_ms;
     stats.full_accepts += u64::from(full_accept);
     if stats.cycles % 64 == 0 {
         let n = stats.cycles as f64;
         eprintln!(
-            "[mtp-phase] cycles={} proposal={:.3}ms verify_accept={:.3}ms rollback={:.3}ms total={:.3}ms full_accept={:.1}%",
+            "[mtp-phase] cycles={} proposal={:.3}ms snapshot={:.3}ms trunk_verify={:.3}ms penalties={:.3}ms accept={:.3}ms rollback={:.3}ms total={:.3}ms full_accept={:.1}%",
             stats.cycles,
             stats.proposal_ms / n,
-            stats.verify_accept_ms / n,
+            stats.snapshot_ms / n,
+            stats.trunk_verify_ms / n,
+            stats.penalties_ms / n,
+            stats.accept_ms / n,
             stats.rollback_ms / n,
-            (stats.proposal_ms + stats.verify_accept_ms + stats.rollback_ms) / n,
+            (stats.proposal_ms
+                + stats.snapshot_ms
+                + stats.trunk_verify_ms
+                + stats.penalties_ms
+                + stats.accept_ms
+                + stats.rollback_ms)
+                / n,
             100.0 * stats.full_accepts as f64 / n,
         );
     }
@@ -4231,7 +4249,7 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         0.0
     };
-    let verify_accept_started = Instant::now();
+    let snapshot_started = Instant::now();
 
     // ── 2. Trunk verify ───────────────────────────────────────────────────
     let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
@@ -4245,6 +4263,13 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         state.trunk_snap.save_from(&target.dn_state, gpu)?;
     }
+    let snapshot_ms = if phase_trace {
+        gpu.hip.device_synchronize()?;
+        snapshot_started.elapsed().as_secs_f64() * 1e3
+    } else {
+        0.0
+    };
+    let trunk_verify_started = Instant::now();
 
     // GDN-tape capture happens only when the verify takes the batched (PBS)
     // path; otherwise the forward silently drops to a tape-less per-token loop
@@ -4417,6 +4442,14 @@ pub fn spec_step_mtp_compressed_serial(
         }
     }
 
+    let trunk_verify_ms = if phase_trace {
+        gpu.hip.device_synchronize()?;
+        trunk_verify_started.elapsed().as_secs_f64() * 1e3
+    } else {
+        0.0
+    };
+    let penalties_started = Instant::now();
+
     if penalties_active {
         let mut row_history = state.sampling_history.clone();
         for row in 0..n_verify {
@@ -4427,6 +4460,13 @@ pub fn spec_step_mtp_compressed_serial(
             }
         }
     }
+    let penalties_ms = if phase_trace {
+        gpu.hip.device_synchronize()?;
+        penalties_started.elapsed().as_secs_f64() * 1e3
+    } else {
+        0.0
+    };
+    let accept_started = Instant::now();
 
     let mut accept_count = 0usize;
     // Assigned exactly once in each arm below (sampled accept returns it; the
@@ -4536,9 +4576,9 @@ pub fn spec_step_mtp_compressed_serial(
     let prev_hidden_row = advance - 1;
     state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
 
-    let verify_accept_ms = if phase_trace {
+    let accept_ms = if phase_trace {
         gpu.hip.device_synchronize()?;
-        verify_accept_started.elapsed().as_secs_f64() * 1e3
+        accept_started.elapsed().as_secs_f64() * 1e3
     } else {
         0.0
     };
@@ -4623,7 +4663,10 @@ pub fn spec_step_mtp_compressed_serial(
         gpu.hip.device_synchronize()?;
         record_mtp_phase_trace(
             proposal_ms,
-            verify_accept_ms,
+            snapshot_ms,
+            trunk_verify_ms,
+            penalties_ms,
+            accept_ms,
             rollback_started.elapsed().as_secs_f64() * 1e3,
             full_accept_no_eos,
         );
