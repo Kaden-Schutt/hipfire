@@ -15,6 +15,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from .canonical import canonical_digest, canonical_json, canonical_loads
 from .capsule import ReviewCapsule
 from .config import ReviewConfiguration
+from .github import GitHubClient
 from .models import Finding, ProviderPolicy, ReviewProposal, validate_provider_policy
 
 
@@ -51,8 +52,8 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 class BoundedHttpTransport:
     """Owned HTTPS transport with no redirects, streaming, or unbounded reads."""
 
-    def __init__(self, opener=None):
-        self._opener = opener or build_opener(_NoRedirectHandler())
+    def __init__(self):
+        self._opener = build_opener(_NoRedirectHandler())
         self._requests = 0
 
     def send(self, request: HttpRequest) -> HttpResponse:
@@ -169,8 +170,13 @@ class ToollessReviewAdapter:
         provider_id: str,
         transport: HttpTransport,
         environment: Mapping[str, str],
+        github_client: GitHubClient | None = None,
     ):
-        if not isinstance(configuration, ReviewConfiguration) or type(transport) is not BoundedHttpTransport:
+        if (
+            not isinstance(configuration, ReviewConfiguration)
+            or type(transport) is not BoundedHttpTransport
+            or not isinstance(github_client, GitHubClient)
+        ):
             raise ToollessInferenceError("protected review configuration and HTTP transport are required")
         self._policy = _provider(configuration, provider_id)
         if not isinstance(environment, Mapping) or any(
@@ -189,6 +195,8 @@ class ToollessReviewAdapter:
         if credential.startswith(_GITHUB_TOKEN_PREFIXES) or _LEGACY_GITHUB_TOKEN.fullmatch(credential):
             raise ToollessInferenceError("configured provider API key is a GitHub credential")
         self._transport = transport
+        self._configuration = configuration
+        self._github_client = github_client
         self._credential = credential
         self._requests = 0
 
@@ -199,8 +207,9 @@ class ToollessReviewAdapter:
         provider_id: str,
         transport: HttpTransport,
         environment: Mapping[str, str],
+        github_client: GitHubClient | None = None,
     ) -> "ToollessReviewAdapter":
-        return cls(configuration, provider_id, transport, environment)
+        return cls(configuration, provider_id, transport, environment, github_client)
 
     def _request_body(self, capsule: ReviewCapsule) -> bytes:
         try:
@@ -367,6 +376,15 @@ class ToollessReviewAdapter:
     def review(self, capsule: ReviewCapsule) -> ReviewProposal:
         if not isinstance(capsule, ReviewCapsule) or not capsule.complete:
             raise ToollessInferenceError("only complete review capsules may be inferred")
+        source = self._configuration.source
+        if source is None or source.repository != capsule.target.repository:
+            raise ToollessInferenceError("configuration repository does not match review target")
+        try:
+            self._github_client.revalidate_config_source(source)
+        except Exception as exc:
+            if isinstance(exc, ToollessInferenceError):
+                raise
+            raise ToollessInferenceError("configuration provenance revalidation failed") from exc
         if self._requests >= self._policy.max_requests:
             raise ToollessInferenceError("provider request limit exceeded")
         body = self._request_body(capsule)

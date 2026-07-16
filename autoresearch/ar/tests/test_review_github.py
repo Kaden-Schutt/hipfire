@@ -431,6 +431,17 @@ def test_commit_tree_is_read_from_github_top_level_tree_field():
         GitHubClient(FakeRunner([nested])).get_commit(REPO, "commit-sha")
 
 
+def test_branch_head_allows_safe_slash_refs_and_rejects_dot_segments():
+    runner = FakeRunner([result({"ref": "refs/heads/release/stable", "object": {"sha": "c" * 40, "type": "commit"}})])
+    assert GitHubClient(runner).get_branch_head(REPO, "release/stable") == "c" * 40
+    assert runner.calls[0][0][-1] == "/repos/owner/repo/git/ref/heads/release/stable"
+
+    runner = FakeRunner([])
+    with pytest.raises(GitHubBoundaryError):
+        GitHubClient(runner).get_branch_head(REPO, "release/../stable")
+    assert runner.calls == []
+
+
 def test_authenticated_config_source_binds_branch_commit_and_policy_blobs(tmp_path):
     paths = (
         ".github/agentic-review/providers.json",

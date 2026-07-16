@@ -158,6 +158,8 @@ class PreflightResult:
 _REPO_SEGMENT = r"(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9_.-]*"
 _REPO = rf"{_REPO_SEGMENT}/{_REPO_SEGMENT}"
 _SHA = r"[A-Za-z0-9][A-Za-z0-9_.:-]*"
+_BRANCH_SEGMENT = r"(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9_.-]*"
+_BRANCH_PATH = rf"{_BRANCH_SEGMENT}(?:/{_BRANCH_SEGMENT})*"
 _LOGIN = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
 _MAX_PAGINATED_PAGES = 16
 _MAX_PAGINATED_ITEMS = 4096
@@ -201,7 +203,7 @@ _ENDPOINTS = (
     ("DELETE", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels/[^/]+$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/collaborators/[^/]+/permission$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/commits/{_SHA}$"), False),
-    ("GET", re.compile(rf"/repos/{_REPO}/git/ref/heads/{_SHA}$"), False),
+    ("GET", re.compile(rf"/repos/{_REPO}/git/ref/heads/{_BRANCH_PATH}$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/trees/{_SHA}$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/blobs/{_SHA}$"), False),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/comments$"), False),
@@ -233,6 +235,12 @@ def _identifier(value: str, name: str, pattern: str = _SHA) -> str:
 
 def _login(value: str) -> str:
     return _identifier(value, "login", _LOGIN)
+
+
+def _branch(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(_BRANCH_PATH, value) is None:
+        raise GitHubBoundaryError("branch identifier is unsafe")
+    return value
 
 
 def _label(value: str) -> str:
@@ -790,14 +798,23 @@ class GitHubClient:
 
     def get_branch_head(self, repository: str, branch: str) -> str:
         repository = _repository(repository)
-        branch = _identifier(branch, "default branch")
-        response = self._request("GET", f"/repos/{repository}/git/ref/heads/{branch}")
+        branch = _branch(branch)
+        response = self._request("GET", f"/repos/{repository}/git/ref/heads/{quote(branch, safe='/')}")
         data = self._require_mapping(response.data, "branch ref")
         obj = self._require_mapping(data.get("object"), "branch ref object")
         sha = obj.get("sha")
         if obj.get("type") != "commit" or not isinstance(sha, str) or not sha.strip():
             raise GitHubBoundaryError("GitHub branch ref is not a commit identity")
         return sha
+
+    def revalidate_config_source(self, source: AuthenticatedConfigSource) -> None:
+        if not isinstance(source, AuthenticatedConfigSource) or not source.authenticated:
+            raise GitHubBoundaryError("configuration source is not authenticated")
+        repository_data = self.get_repository(source.repository).data
+        if repository_data.get("default_branch") != source.default_branch:
+            raise GitHubBoundaryError("configuration default branch changed")
+        if self.get_branch_head(source.repository, source.default_branch) != source.commit_sha:
+            raise GitHubBoundaryError("configuration commit is no longer the live default-branch head")
 
     def authenticated_config_source(
         self, repository: str, *, commit_sha: str, repository_root: str
