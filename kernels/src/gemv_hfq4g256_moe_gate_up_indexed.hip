@@ -35,10 +35,14 @@ using hipfire_gate_u32x2 = unsigned int __attribute__((ext_vector_type(2)));
 
 #if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
 #define HIPFIRE_MOE_GATE_UP_BLOCK 64
+#ifndef HIPFIRE_MOE_GATE_UP_MIN_BLOCKS
 #define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 8
+#endif
 #else
 #define HIPFIRE_MOE_GATE_UP_BLOCK 32
+#ifndef HIPFIRE_MOE_GATE_UP_MIN_BLOCKS
 #define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 16
+#endif
 #endif
 
 // Index-aware fused MoE gate_up GEMV (Phase 2b/2c) — reads expert IDs from
