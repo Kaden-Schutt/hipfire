@@ -370,6 +370,12 @@ const fn write(offset: usize) -> PointerEffect {
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     if matches!(
         kernel,
+        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
+    ) {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+    if matches!(
+        kernel,
         "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151"
             | "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151"
     ) {
@@ -680,6 +686,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if matches!(
+        kernel,
+        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
+    ) {
+        return Some(64);
+    }
     if matches!(
         kernel,
         "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151"
@@ -1450,6 +1462,16 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     {
         return true;
     }
+    // Dense Qwen3.5 feeds the rotated SiLU product straight into the FFN
+    // down projection.  A compute-idle wait orders the dispatches, but gfx12
+    // still needs the vector-cache acquire before the GEMV reads that buffer.
+    // Without it the first divergent launch in the 0.8B tape is this exact
+    // pair (launches 12 -> 13); logits, KV, and recurrent state then drift.
+    if previous == "fused_silu_mul_mq_rotate"
+        && current.starts_with("gemv_hfq4g256_residual")
+    {
+        return true;
+    }
     matches!(
         previous,
         "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
@@ -1723,14 +1745,14 @@ impl PreparedPm4Graph {
         }
     }
 
-    fn patch_dispatch_workgroups(
+    fn patch_dispatch_dimensions(
         &mut self,
         dispatch: usize,
-        workgroups: [u32; 3],
+        dimensions: [u32; 3],
     ) -> Result<(), String> {
         match self {
             Self::Single(graph) => graph
-                .patch_dispatch_workgroups(dispatch, workgroups)
+                .patch_dispatch_dimensions(dispatch, dimensions)
                 .map_err(|error| error.to_string()),
             Self::Phased(_) => Err(
                 "dynamic PM4 geometry requires the certified single-queue replay".to_owned(),
@@ -1746,7 +1768,8 @@ pub struct PreparedPm4Replay {
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
-    dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3])>,
+    dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
+    pm4_architecture: Pm4Architecture,
     dispatch_count: usize,
     command_dwords: u32,
 }
@@ -1768,10 +1791,26 @@ impl PreparedPm4Replay {
                 .ok_or_else(|| "PM4 GDN kernarg is too short for frame patch".to_owned())?
                 .copy_from_slice(&frame.to_ne_bytes());
         }
-        for (dispatch, binding, recorded) in &self.dynamic_grids {
+        for (dispatch, binding, recorded, workgroup) in &self.dynamic_grids {
             let workgroups = binding.bind(position, *recorded)?;
+            let dimensions = if self.pm4_architecture == Pm4Architecture::Gfx12 {
+                let mut workitems = [0_u32; 3];
+                for axis in 0..3 {
+                    workitems[axis] = workgroups[axis]
+                        .checked_mul(workgroup[axis])
+                        .ok_or_else(|| {
+                            format!(
+                                "dynamic PM4 grid overflow axis={axis} workgroups={} workgroup={}",
+                                workgroups[axis], workgroup[axis]
+                            )
+                        })?;
+                }
+                workitems
+            } else {
+                workgroups
+            };
             self.graph
-                .patch_dispatch_workgroups(*dispatch, workgroups)?;
+                .patch_dispatch_dimensions(*dispatch, dimensions)?;
         }
         // SAFETY: forwarded from the caller that owns the model allocations.
         unsafe { self.graph.replay_and_wait_profiled() }
@@ -2306,7 +2345,7 @@ impl ReplayController {
                 dynamic_gdn_frames.push(kernargs.len());
             }
             if let Some(binding) = launch.grid_binding {
-                dynamic_grids.push((kernargs.len(), binding, launch.grid));
+                dynamic_grids.push((kernargs.len(), binding, launch.grid, launch.block));
             }
             kernels.push(kernel);
             kernargs.push(kernarg);
@@ -2575,6 +2614,7 @@ impl ReplayController {
             kernargs,
             dynamic_gdn_frames,
             dynamic_grids,
+            pm4_architecture,
             dispatch_count: prefix,
             command_dwords,
         });
@@ -3238,6 +3278,14 @@ mod tests {
         );
         assert!(Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+            "fused_silu_mul_mq_rotate",
+            "gemv_hfq4g256_residual"
+        ));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+            "fused_silu_mul_mq_rotate",
+            "gemv_hfq4g256_residual_k2048_gfx1201"
+        ));
         assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
@@ -3486,6 +3534,13 @@ mod tests {
             Some(Pm4RegisterPolicy::Static)
         );
         assert_eq!(Pm4RegisterPolicy::from_value("invalid"), None);
+        for kernel in [
+            "fused_gate_up_hfq4g256",
+            "fused_gate_up_hfq4g256_k1024_gfx1201",
+        ] {
+            assert_eq!(expected_kernarg_bytes(kernel), Some(64));
+            assert_eq!(pointer_effects(kernel).map(|effects| effects.len()), Some(5));
+        }
         assert!(pointer_effects("unknown_kernel").is_none());
         assert!(expected_kernarg_bytes("unknown_kernel").is_none());
         for kernel in A3B_REPLAY_KERNELS {

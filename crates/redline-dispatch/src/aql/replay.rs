@@ -240,24 +240,29 @@ impl SingleQueuePm4Ib {
         self.indirect.address() as usize
     }
 
-    /// Patch one quiescent `DISPATCH_DIRECT` packet's workgroup counts.
+    /// Patch one quiescent `DISPATCH_DIRECT` packet's three raw dimensions.
+    ///
+    /// GFX10/GFX11 encode work-group counts while GFX12's
+    /// `USE_THREAD_DIMENSIONS` encoding uses total work-items. The
+    /// architecture-aware caller must convert into the command buffer's native
+    /// unit before using this low-level patch surface.
     ///
     /// Retained PM4 replay is synchronous, so a successful prior replay has
     /// proved that the indirect buffer is no longer in flight. This permits a
     /// small dynamic-shape binding to update the next submission without
     /// rebuilding the command stream or weakening its dependency boundaries.
-    pub fn patch_dispatch_workgroups(
+    pub fn patch_dispatch_dimensions(
         &mut self,
         dispatch: usize,
-        workgroups: [u32; 3],
+        dimensions: [u32; 3],
     ) -> Result<(), ReplayError> {
         if !self.usable {
             return Err(ReplayError::GraphInactive);
         }
-        if workgroups.contains(&0) {
+        if dimensions.contains(&0) {
             return Err(ReplayError::Pm4ZeroWorkgroup {
                 dispatch,
-                workgroups,
+                workgroups: dimensions,
             });
         }
         let offset = *self.dispatch_workgroup_offsets.get(dispatch).ok_or(
@@ -271,7 +276,7 @@ impl SingleQueuePm4Ib {
         let destination = bytes
             .get_mut(offset..end)
             .ok_or(ReplayError::MalformedPm4IndirectBuffer { dword: offset / 4 })?;
-        for (axis, value) in workgroups.into_iter().enumerate() {
+        for (axis, value) in dimensions.into_iter().enumerate() {
             destination[axis * 4..axis * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
         Ok(())
