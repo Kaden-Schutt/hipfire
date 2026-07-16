@@ -98,6 +98,8 @@ class FakeGitHub:
         self.inject_review_on_completion = False
         self.inject_review_on_labels = False
         self.inject_review_on_remove = False
+        self.inject_review_on_dismiss = False
+        self.invalidate_keep_on_labels = False
         self.deleted_comment_ids: set[int] = set()
         self.edited_comment_ids: set[int] = set()
 
@@ -140,6 +142,9 @@ class FakeGitHub:
 
     def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
         self.calls.append(("list_labels", None))
+        if self.invalidate_keep_on_labels and self.reviews:
+            self.reviews[0]["state"] = "DISMISSED"
+            self.invalidate_keep_on_labels = False
         if self.inject_review_on_labels and self.reviews:
             stale = deepcopy(self.reviews[0])
             stale["id"] = 902
@@ -259,6 +264,16 @@ class FakeGitHub:
             if review["id"] == review_id:
                 review["state"] = "DISMISSED"
         self.reviews = [review for review in self.reviews if review["id"] != review_id]
+        if self.inject_review_on_dismiss and self.reviews:
+            stale = deepcopy(self.reviews[0])
+            stale["id"] = 904
+            stale["node_id"] = "stale-during-dismiss"
+            stale_payload = json.loads(self.payload_from_body(stale["body"]))
+            stale_payload["record_id"] = "stale-during-dismiss"
+            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
+            stale["body"] = json.dumps(stale_payload)
+            self.reviews.append(stale)
+            self.inject_review_on_dismiss = False
         return GitHubResponse({"id": review_id, "node_id": f"D_{review_id}"}, {}, 200)
 
 
@@ -658,4 +673,26 @@ def test_review_race_dismissal_failure_reapplies_needs_review():
     result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
 
     assert result.status in {"incomplete", "error"}
+    assert "needs-review" in client.labels
+
+
+def test_reconciliation_stabilizes_across_reviews_appearing_during_dismissal():
+    client = FakeGitHub()
+    client.inject_review_on_labels = True
+    client.inject_review_on_dismiss = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "complete", result.reason
+    assert ("dismiss", 902) in client.calls
+    assert ("dismiss", 904) in client.calls
+
+
+def test_keep_review_invalidation_before_final_label_removal_fails_closed():
+    client = FakeGitHub()
+    client.invalidate_keep_on_labels = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status in {"error", "incomplete"}
     assert "needs-review" in client.labels

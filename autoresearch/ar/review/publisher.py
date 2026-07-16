@@ -66,6 +66,7 @@ class _CanonicalChanged(RuntimeError):
 
 _SCHEMA = "agentic-review/v1"
 _LABEL = "needs-review"
+_MAX_RECONCILIATION_ROUNDS = 4
 
 
 def _target_from_payload(payload: Mapping[str, Any]) -> ReviewTarget:
@@ -443,22 +444,49 @@ class ReviewPublisher:
 
     def _reconcile_workflow_reviews(
         self, target: ReviewTarget, attempt_id: str, intent_node: str, keep_node: str,
+        *, keep_is_review: bool,
     ) -> tuple[_History, GitHubEnvelope]:
         history = self._history(target)
         canonical = self._canonical(target, attempt_id, intent_node)
-        for review_id in self._workflow_review_ids(history, target, keep_node):
-            self._mutate(
-                target,
-                lambda review_id=review_id: self._client.dismiss_workflow_review(
-                    target.repository, target.number, review_id,
-                    message="Superseded by a current agentic review",
-                ),
-                attempt_id=attempt_id,
-                intent_node=canonical.node_id,
-            )
-            history = self._history(target)
-            canonical = self._canonical(target, attempt_id, intent_node)
-        return history, canonical
+        for _ in range(_MAX_RECONCILIATION_ROUNDS):
+            if keep_is_review:
+                self._validate_keep_review(history, target, keep_node)
+            review_ids = self._workflow_review_ids(history, target, keep_node)
+            if review_ids:
+                for review_id in review_ids:
+                    self._mutate(
+                        target,
+                        lambda review_id=review_id: self._client.dismiss_workflow_review(
+                            target.repository, target.number, review_id,
+                            message="Superseded by a current agentic review",
+                        ),
+                        attempt_id=attempt_id,
+                        intent_node=canonical.node_id,
+                    )
+                    history = self._history(target)
+                    canonical = self._canonical(target, attempt_id, intent_node)
+                continue
+            # Require two consecutive no-stale snapshots. The second fetch
+            # closes the window between election and the next mutation.
+            stable_history = self._history(target)
+            stable_canonical = self._canonical(target, attempt_id, intent_node)
+            if keep_is_review:
+                self._validate_keep_review(stable_history, target, keep_node)
+            if not self._workflow_review_ids(stable_history, target, keep_node):
+                return stable_history, stable_canonical
+            history, canonical = stable_history, stable_canonical
+        raise PublisherError("workflow review reconciliation did not stabilize")
+
+    def _validate_keep_review(self, history: _History, target: ReviewTarget, keep_node: str) -> None:
+        keep = next((record for record in history.current if record.envelope.node_id == keep_node), None)
+        if (
+            keep is None
+            or not keep.is_review
+            or keep.envelope.payload.get("record_type") != "review-metadata"
+            or keep.state != "CHANGES_REQUESTED"
+            or keep.commit_id != target.head_sha
+        ):
+            raise PublisherError("canonical keep review is not an active exact-head CHANGES_REQUESTED review")
 
     def _label_present(self, target: ReviewTarget) -> bool:
         getter = getattr(self._client, "list_issue_labels", None)
@@ -470,10 +498,16 @@ class ReviewPublisher:
             raise LabelError("GitHub label state is malformed")
         return any(isinstance(item, Mapping) and item.get("name") == _LABEL for item in data)
 
-    def _remove_label(self, target: ReviewTarget, attempt_id: str, intent_node: str, keep_node: str) -> None:
-        self._reconcile_workflow_reviews(target, attempt_id, intent_node, keep_node)
+    def _remove_label(
+        self, target: ReviewTarget, attempt_id: str, intent_node: str, keep_node: str, *, keep_is_review: bool,
+    ) -> None:
+        self._reconcile_workflow_reviews(
+            target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
+        )
         if self._label_present(target):
-            _, canonical = self._reconcile_workflow_reviews(target, attempt_id, intent_node, keep_node)
+            _, canonical = self._reconcile_workflow_reviews(
+                target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
+            )
             self._mutate(
                 target,
                 lambda: self._client.remove_label(target.repository, target.number, _LABEL),
@@ -482,7 +516,9 @@ class ReviewPublisher:
             )
             try:
                 self._assert_target(target)
-                self._reconcile_workflow_reviews(target, attempt_id, intent_node, keep_node)
+                self._reconcile_workflow_reviews(
+                    target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
+                )
             except Exception:
                 self._reapply_label(target, attempt_id)
                 raise
@@ -535,7 +571,10 @@ class ReviewPublisher:
                 metadata = self._review_metadata(history, target, attempt_id, proposal.verdict)
                 if report is None or metadata is None:
                     raise PublisherError("completion dependencies are missing")
-                self._remove_label(target, attempt_id, canonical.node_id, metadata.envelope.node_id)
+                self._remove_label(
+                    target, attempt_id, canonical.node_id, metadata.envelope.node_id,
+                    keep_is_review=metadata.is_review,
+                )
                 return PublishResult("duplicate", attempt_id, report.envelope, metadata.envelope, completion.envelope,
                                      "canonical attempt is already complete")
 
@@ -567,13 +606,17 @@ class ReviewPublisher:
             if completion is None:
                 history, canonical = self._reconcile_workflow_reviews(
                     target, attempt_id, intent.node_id, metadata.envelope.node_id,
+                    keep_is_review=metadata.is_review,
                 )
                 completion_envelope = self._new_comment(
                     target, self._completion_payload(target, intent, report.envelope, metadata.envelope),
                     attempt_id=attempt_id, intent_node=canonical.node_id,
                 )
                 completion = _HistoryRecord(completion_envelope, False, 0)
-            self._remove_label(target, attempt_id, canonical.node_id, metadata.envelope.node_id)
+            self._remove_label(
+                target, attempt_id, canonical.node_id, metadata.envelope.node_id,
+                keep_is_review=metadata.is_review,
+            )
             return PublishResult("complete", attempt_id, report.envelope, metadata.envelope, completion.envelope)
         except _StaleTarget as exc:
             return self._recover(target, attempt_id, "stale", str(exc))
