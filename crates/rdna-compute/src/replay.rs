@@ -489,7 +489,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_multirow_r4"
         | "gemv_hfq4g256_multirow_r8" => Some(vec![read(0), read(8), write(16)]),
         "softmax_f32" => Some(vec![write(0)]),
-        "moe_topk_renorm_k8" | "moe_topk_renorm_k8_batched" => {
+        "moe_softmax_topk_renorm_k8_batched"
+        | "moe_topk_renorm_k8"
+        | "moe_topk_renorm_k8_batched" => {
             Some(vec![read(0), write(8), write(16)])
         }
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
@@ -616,6 +618,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0"
         | "moe_down_combine_k8_batched"
         | "moe_down_combine_k8_batched_vec4"
+        | "moe_softmax_topk_renorm_k8_batched"
         | "moe_topk_renorm_k8"
         | "moe_topk_renorm_k8_batched"
         | "rmsnorm_f32"
@@ -2859,6 +2862,7 @@ mod tests {
         "gemv_hfq4g256_wide",
         "convert_f32_to_f16",
         "softmax_f32",
+        "moe_softmax_topk_renorm_k8_batched",
         "moe_topk_renorm_k8",
         "moe_topk_renorm_k8_batched",
         "moe_router_softmax_topk_k8_wave64",
