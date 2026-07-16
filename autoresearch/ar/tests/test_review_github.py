@@ -418,6 +418,16 @@ def test_pull_tree_and_blob_responses_are_bound_to_requested_ids():
         GitHubClient(FakeRunner([result(dict(blob(), sha="other-sha"))])).get_blob(REPO, "blob-sha")
 
 
+def test_commit_tree_is_read_from_github_top_level_tree_field():
+    response = result({"sha": "commit-sha", "tree": {"sha": "tree-sha", "url": "https://api.invalid/tree"}})
+    commit = GitHubClient(FakeRunner([response])).get_commit(REPO, "commit-sha")
+    assert commit.data["tree"]["sha"] == "tree-sha"
+
+    nested = result({"sha": "commit-sha", "commit": {"tree": {"sha": "tree-sha"}}})
+    with pytest.raises(GitHubBoundaryError, match="missing|commit"):
+        GitHubClient(FakeRunner([nested])).get_commit(REPO, "commit-sha")
+
+
 def test_create_review_sends_exact_commit_id():
     runner = FakeRunner([result({"id": 17, "node_id": "PRR_17"})])
     GitHubClient(runner).create_pull_request_review(

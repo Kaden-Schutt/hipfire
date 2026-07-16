@@ -279,12 +279,23 @@ class ReviewProposal:
     proposal_digest: str
     verdict: str
     findings: tuple[Finding, ...]
+    adapter_id: str
+    adapter_version: str
+    model: str
+    response_digest: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, ReviewTarget):
             raise ValueError("target must be a ReviewTarget")
         _require_digest("capsule_digest", self.capsule_digest)
         _require_digest("proposal_digest", self.proposal_digest)
+        _require_digest("response_digest", self.response_digest)
+        for name, value in (
+            ("adapter_id", self.adapter_id),
+            ("adapter_version", self.adapter_version),
+            ("model", self.model),
+        ):
+            _require_text(name, value)
         if self.verdict not in _VERDICTS:
             raise ValueError("verdict is not supported")
         if not isinstance(self.findings, tuple) or any(not isinstance(finding, Finding) for finding in self.findings):
@@ -294,8 +305,19 @@ class ReviewProposal:
             raise ValueError("clean proposals cannot contain actionable findings")
         if self.verdict == "changes-requested" and not has_actionable_finding:
             raise ValueError("changes-requested proposals require an actionable finding")
-        if self.verdict == "incomplete":
-            return
+        expected = "sha256:" + canonical_digest({
+            "target": self.target,
+            "target_key": self.target.target_key(),
+            "capsule_digest": self.capsule_digest,
+            "adapter_id": self.adapter_id,
+            "adapter_version": self.adapter_version,
+            "model": self.model,
+            "response_digest": self.response_digest,
+            "verdict": self.verdict,
+            "findings": self.findings,
+        })
+        if self.proposal_digest != expected:
+            raise ValueError("proposal digest is not bound to target, capsule, provider, and response")
 
 
 @dataclass(frozen=True)

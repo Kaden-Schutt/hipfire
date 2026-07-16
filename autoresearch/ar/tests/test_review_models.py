@@ -34,6 +34,25 @@ POLICY_DIR = ROOT / ".github" / "agentic-review"
 TARGET = ReviewTarget("owner/repo", 42, "owner/repo", "head", "main", "base", "merge")
 
 
+def make_proposal(verdict, findings=(), *, capsule_digest="sha256:" + "a" * 64, response_digest="sha256:" + "c" * 64):
+    values = {
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "capsule_digest": capsule_digest,
+        "adapter_id": "openai-compatible",
+        "adapter_version": "1",
+        "model": "review-model-v1",
+        "response_digest": response_digest,
+        "verdict": verdict,
+        "findings": tuple(findings),
+    }
+    digest = "sha256:" + canonical_digest(values)
+    return ReviewProposal(
+        TARGET, capsule_digest, digest, verdict, tuple(findings),
+        "openai-compatible", "1", "review-model-v1", response_digest,
+    )
+
+
 def test_review_target_key_is_stable_and_base_sha_sensitive():
     target = ReviewTarget(
         repository="Kaden-Schutt/hipfire",
@@ -364,7 +383,7 @@ def test_review_contracts_bind_required_identity_and_target_fields():
     )
     assert envelope.node_id == "gh-node"
     finding = Finding("src/main.py", (1, 2), "warning", "nonblocking")
-    proposal = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))
+    proposal = make_proposal("clean", (finding,))
     assert proposal.findings == (finding,)
     request = ValidationRequest(TARGET, "request-1", "capability", "sha256:" + "a" * 64, "sha256:" + "b" * 64)
     assert request.target == TARGET
@@ -429,28 +448,32 @@ def test_clean_proposal_rejects_actionable_finding():
     finding = Finding("src/main.py", (1, 2), "error", "must fix")
 
     with pytest.raises(ValueError, match="clean|actionable"):
-        ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))
+        make_proposal("clean", (finding,))
 
 
 def test_changes_requested_requires_actionable_finding():
     finding = Finding("src/main.py", (1, 2), "warning", "consider this")
 
     with pytest.raises(ValueError, match="actionable"):
-        ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "changes-requested", (finding,))
+        make_proposal("changes-requested", (finding,))
 
 
 def test_changes_requested_accepts_error_finding_and_incomplete_is_explicit():
     finding = Finding("src/main.py", (1, 2), "error", "must fix")
-    proposal = ReviewProposal(
-        TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "changes-requested", (finding,)
-    )
-    incomplete = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "incomplete", ())
+    proposal = make_proposal("changes-requested", (finding,))
+    incomplete = make_proposal("incomplete")
 
     assert proposal.verdict == "changes-requested"
     assert incomplete.verdict == "incomplete"
 
 
+def test_review_proposal_requires_provider_audit_fields():
+    with pytest.raises(TypeError):
+        ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", ())
+
+
 @pytest.mark.parametrize("verdict", ["approved", "reject", "unknown"])
 def test_review_proposal_rejects_arbitrary_verdict(verdict):
     with pytest.raises(ValueError, match="verdict"):
-        ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, verdict, ())
+        ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, verdict, (),
+                       "openai-compatible", "1", "review-model-v1", "sha256:" + "c" * 64)

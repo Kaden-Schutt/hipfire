@@ -772,9 +772,8 @@ class GitHubClient:
         commit_sha = _identifier(commit_sha, "commit SHA")
         response = self._request("GET", f"/repos/{repository}/git/commits/{commit_sha}")
         data = self._require_mapping(response.data, "commit")
-        self._require(data, ("sha", "commit"), "commit")
-        commit = self._require_mapping(data["commit"], "commit details")
-        tree = self._require_mapping(commit.get("tree"), "commit tree")
+        self._require(data, ("sha", "tree"), "commit")
+        tree = self._require_mapping(data["tree"], "commit tree")
         self._require(tree, ("sha",), "commit tree")
         if data["sha"] != commit_sha or not isinstance(tree["sha"], str) or not tree["sha"].strip():
             raise GitHubBoundaryError("GitHub commit or tree identity does not match request")

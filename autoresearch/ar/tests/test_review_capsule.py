@@ -8,7 +8,7 @@ from autoresearch.ar.review.capsule import ReviewCapsuleError, build_review_caps
 from autoresearch.ar.review.models import ReviewTarget
 
 
-TARGET = ReviewTarget("owner/repo", 42, "owner/repo", "head", "main", "base", "merge")
+TARGET = ReviewTarget("owner/repo", 42, "fork/repo", "head", "main", "base", "merge")
 
 
 def response(data):
@@ -20,7 +20,7 @@ def tree(sha, entries, *, truncated=False):
 
 
 def commit(tree_sha):
-    return response({"sha": "merge" if tree_sha == "merge-tree" else "head", "commit": {"tree": {"sha": tree_sha}}})
+    return response({"sha": "merge" if tree_sha == "merge-tree" else "head", "tree": {"sha": tree_sha}})
 
 
 def blob(sha, payload, *, encoding="base64", size=None):
@@ -38,8 +38,10 @@ class FakeGitHub:
         self.blobs = blobs
         self.tree_calls = []
         self.blob_calls = []
+        self.commit_calls = []
 
     def get_commit(self, repository, sha):
+        self.commit_calls.append((repository, sha))
         return commit("merge-tree" if sha == TARGET.merge_base_sha else "head-tree")
 
     def get_tree(self, repository, sha, *, recursive=False):
@@ -71,7 +73,9 @@ def test_capsule_uses_merge_base_tree_not_base_tip_and_retrieves_changed_blobs()
     assert capsule.manifest[1].base_blob_oid == "z0"
     assert capsule.manifest[1].head_blob_oid == "z1"
     assert capsule.files[0].head_source == "a\n"
-    assert client.tree_calls == [("owner/repo", "merge-tree", True), ("owner/repo", "head-tree", True)]
+    assert client.commit_calls == [("owner/repo", "merge"), ("fork/repo", "head")]
+    assert client.tree_calls == [("owner/repo", "merge-tree", True), ("fork/repo", "head-tree", True)]
+    assert client.blob_calls == [("fork/repo", "a1"), ("owner/repo", "z0"), ("fork/repo", "z1")]
 
 
 def test_capsule_order_and_digest_are_stable_across_api_order():
@@ -134,6 +138,47 @@ def test_invalid_base64_and_encoding_are_rejected():
     capsule = build_review_capsule(client, TARGET)
     assert not capsule.complete
     assert any("encoding" in reason or "opaque" in reason for reason in capsule.rejections)
+
+
+def test_symlink_blob_is_retrieved_but_submodule_is_explicitly_incomplete():
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
+            {"path": "link", "mode": "120000", "type": "blob", "sha": "link"},
+            {"path": "vendor", "mode": "160000", "type": "commit", "sha": "submodule"},
+        ])},
+        {"link": blob("link", b"target")},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert client.blob_calls == [("fork/repo", "link")]
+    assert {item.path for item in capsule.manifest} == {"link", "vendor"}
+    assert any("opaque" in reason or "binary" in reason for reason in capsule.rejections)
+
+
+def test_blob_sha_mismatch_is_incomplete():
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
+            {"path": "x.py", "mode": "100644", "type": "blob", "sha": "expected"},
+        ])},
+        {"expected": blob("returned", b"x\n")},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert any("identity mismatch" in reason for reason in capsule.rejections)
+
+
+def test_canonical_byte_limit_returns_rejected_capsule(monkeypatch):
+    monkeypatch.setattr("autoresearch.ar.review.capsule.MAX_CANONICAL_BYTES", 2048)
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
+            {"path": "large.py", "mode": "100644", "type": "blob", "sha": "large"},
+        ])},
+        {"large": blob("large", b"x" * 5000)},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert any("canonical" in reason for reason in capsule.rejections)
+    assert len(capsule.canonical_json()) <= 2048
 
 
 def test_missing_blob_and_manifest_mismatch_never_claim_complete():

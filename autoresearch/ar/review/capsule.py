@@ -7,10 +7,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import base64
 import binascii
-import hashlib
 from typing import Any
 
-from .canonical import canonical_digest, canonical_json
+from .canonical import DEFAULT_MAX_BYTES, canonical_digest, canonical_json
 from .models import ReviewTarget
 
 
@@ -20,6 +19,7 @@ MAX_TREE_ENTRIES = 65536
 MAX_TOTAL_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BLOB_BYTES = 2 * 1024 * 1024
 MAX_TREE_DEPTH = 64
+MAX_CANONICAL_BYTES = DEFAULT_MAX_BYTES
 
 
 class ReviewCapsuleError(ValueError):
@@ -60,7 +60,10 @@ class ReviewCapsule:
     def __post_init__(self) -> None:
         if not isinstance(self.target, ReviewTarget) or self.target_key != self.target.target_key():
             raise ReviewCapsuleError("capsule target binding is invalid")
-        expected = canonical_digest({key: value for key, value in self.to_mapping().items() if key != "digest"})
+        expected = canonical_digest(
+            {key: value for key, value in self.to_mapping().items() if key != "digest"},
+            max_bytes=MAX_CANONICAL_BYTES,
+        )
         if self.digest != "sha256:" + expected:
             raise ReviewCapsuleError("capsule digest does not match canonical content")
         if tuple(item.path for item in self.manifest) != tuple(sorted(item.path for item in self.manifest)):
@@ -93,7 +96,7 @@ class ReviewCapsule:
         }
 
     def canonical_json(self) -> bytes:
-        return canonical_json(self.to_mapping())
+        return canonical_json(self.to_mapping(), max_bytes=MAX_CANONICAL_BYTES)
 
 
 def _data(response: Any) -> Mapping[str, Any]:
@@ -109,18 +112,24 @@ def _text(value: Any, name: str) -> str:
     return value
 
 
-def _trees(client: Any, target: ReviewTarget, commit_sha: str, label: str) -> tuple[str, dict[str, Mapping[str, Any]], list[str]]:
+def _trees(
+    client: Any,
+    target: ReviewTarget,
+    repository: str,
+    commit_sha: str,
+    label: str,
+) -> tuple[str, dict[str, Mapping[str, Any]], list[str]]:
     reasons: list[str] = []
     try:
-        commit = _data(client.get_commit(target.repository, commit_sha))
+        commit = _data(client.get_commit(repository, commit_sha))
         if commit.get("sha") != commit_sha:
             reasons.append(f"{label} commit identity mismatch")
-        commit_details = commit.get("commit")
-        if not isinstance(commit_details, Mapping) or not isinstance(commit_details.get("tree"), Mapping):
+        tree = commit.get("tree")
+        if not isinstance(tree, Mapping):
             reasons.append(f"{label} commit tree is unavailable")
             return "", {}, reasons
-        tree_oid = _text(commit_details["tree"].get("sha"), f"{label} tree OID")
-        raw_tree = _data(client.get_tree(target.repository, tree_oid, recursive=True))
+        tree_oid = _text(tree.get("sha"), f"{label} tree OID")
+        raw_tree = _data(client.get_tree(repository, tree_oid, recursive=True))
         if raw_tree.get("sha") != tree_oid:
             reasons.append(f"{label} tree identity mismatch")
         if not isinstance(raw_tree.get("truncated", False), bool):
@@ -166,10 +175,17 @@ def _trees(client: Any, target: ReviewTarget, commit_sha: str, label: str) -> tu
         return "", {}, reasons
 
 
-def _blob(client: Any, target: ReviewTarget, oid: str, path: str, side: str) -> tuple[str | None, int | None, list[str]]:
+def _blob(
+    client: Any,
+    target: ReviewTarget,
+    repository: str,
+    oid: str,
+    path: str,
+    side: str,
+) -> tuple[str | None, int | None, list[str]]:
     reasons: list[str] = []
     try:
-        data = _data(client.get_blob(target.repository, oid))
+        data = _data(client.get_blob(repository, oid))
         if data.get("sha") != oid:
             reasons.append(f"{side} blob identity mismatch: {path}")
             return None, None, reasons
@@ -208,8 +224,8 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
     """Compare ``merge_base_sha`` to ``head_sha`` and return a bounded capsule."""
     if not isinstance(target, ReviewTarget):
         raise ReviewCapsuleError("target must be a ReviewTarget")
-    base_oid, base_tree, reasons = _trees(client, target, target.merge_base_sha, "base")
-    head_oid, head_tree, head_reasons = _trees(client, target, target.head_sha, "head")
+    base_oid, base_tree, reasons = _trees(client, target, target.repository, target.merge_base_sha, "base")
+    head_oid, head_tree, head_reasons = _trees(client, target, target.head_repository, target.head_sha, "head")
     reasons.extend(head_reasons)
     changed_paths = sorted(
         path for path in set(base_tree) | set(head_tree)
@@ -239,8 +255,8 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
             ))
             files.append(ReviewFile(path, None, None))
             continue
-        if (base and base.get("mode") not in {"100644", "100755"}) or (
-            head and head.get("mode") not in {"100644", "100755"}
+        if (base and base.get("mode") not in {"100644", "100755", "120000"}) or (
+            head and head.get("mode") not in {"100644", "100755", "120000"}
         ):
             reasons.append(f"binary or opaque file mode: {path}")
             manifest.append(ReviewManifestEntry(
@@ -257,10 +273,14 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
         base_source = head_source = None
         base_size = head_size = None
         if base is not None:
-            base_source, base_size, blob_reasons = _blob(client, target, base["sha"], path, "base")
+            base_source, base_size, blob_reasons = _blob(
+                client, target, target.repository, base["sha"], path, "base"
+            )
             reasons.extend(blob_reasons)
         if head is not None:
-            head_source, head_size, blob_reasons = _blob(client, target, head["sha"], path, "head")
+            head_source, head_size, blob_reasons = _blob(
+                client, target, target.head_repository, head["sha"], path, "head"
+            )
             reasons.extend(blob_reasons)
         for size in (base_size, head_size):
             if size is not None:
@@ -297,5 +317,22 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
         "coverage": coverage,
         "rejections": tuple(sorted(set(reasons))),
     }
-    digest = "sha256:" + canonical_digest({"schema": "agentic-review/review-capsule-v1", **values})
+    try:
+        digest = "sha256:" + canonical_digest(
+            {"schema": "agentic-review/review-capsule-v1", **values}, max_bytes=MAX_CANONICAL_BYTES
+        )
+    except ValueError:
+        # A rejected capsule must remain representable and auditable; do not
+        # leak canonical_json's size exception at this trust boundary.
+        values = {
+            **values,
+            "manifest": (),
+            "files": (),
+            "complete": False,
+            "coverage": ("canonical byte cap prevented full capsule coverage",),
+            "rejections": ("canonical capsule byte limit exceeded",),
+        }
+        digest = "sha256:" + canonical_digest(
+            {"schema": "agentic-review/review-capsule-v1", **values}, max_bytes=MAX_CANONICAL_BYTES
+        )
     return ReviewCapsule(digest=digest, **values)
