@@ -44,7 +44,14 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     const bool have_row1 = row1 < M;
     const int tid = threadIdx.x;
 
+#if defined(HIPFIRE_GFX1151_RESIDUAL_K2048)
+    // Exact Qwen3.6 A3B decode contract. Making both quads static lets LLVM
+    // schedule the two independent row chains across the full K extent and
+    // removes the dead generic tail machinery on gfx1151.
+    const int groups_per_row = 8;
+#else
     const int groups_per_row = K / 256;
+#endif
     const long long row_stride = (long long)groups_per_row * 136;
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
@@ -87,6 +94,9 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
 
+#if defined(HIPFIRE_GFX1151_RESIDUAL_K2048)
+    #pragma unroll
+#endif
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;

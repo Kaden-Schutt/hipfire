@@ -4983,6 +4983,13 @@ impl Gpu {
             && *GFX1151_RESIDUAL_ROW1.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_RESIDUAL_ROW1").as_deref() == Ok("1")
             });
+        static GFX1151_RESIDUAL_K2048: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048 = self.arch_caps.is_gfx1151()
+            && m == 2_048
+            && k == 2_048
+            && *GFX1151_RESIDUAL_K2048.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_RESIDUAL_K2048").as_deref() == Ok("1")
+            });
         static RESIDUAL_CPOL: OnceLock<Option<String>> = OnceLock::new();
         let cpol = RESIDUAL_CPOL
             .get_or_init(|| std::env::var("HIPFIRE_RESIDUAL_CPOL").ok())
@@ -4994,7 +5001,13 @@ impl Gpu {
         } else {
             None
         };
-        let (src, module, func_name) = if gfx1151_hybrid_buffer {
+        let (src, module, func_name) = if gfx1151_k2048 {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_K2048_GFX1151_SRC,
+                "gemv_hfq4g256_residual_k2048_gfx1151",
+                "gemv_hfq4g256_residual_k2048_gfx1151",
+            )
+        } else if gfx1151_hybrid_buffer {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_HYBRID_BUFFER_GFX1151_SRC,
                 "gemv_hfq4g256_residual_hybrid_buffer_gfx1151",

@@ -535,6 +535,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_residual_cpol_rt_low"
         | "gemv_hfq4g256_residual_cpol_slc"
         | "gemv_hfq4g256_residual_k2048"
+        | "gemv_hfq4g256_residual_k2048_gfx1151"
         | "gemv_hfq4g256_residual_multirow_r2_gfx1151"
         | "gemv_hfq4g256_residual_wave64"
         | "gemv_hfq4g256_wide"
@@ -688,6 +689,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_residual_cpol_rt_low"
         | "gemv_hfq4g256_residual_cpol_slc"
         | "gemv_hfq4g256_residual_k2048"
+        | "gemv_hfq4g256_residual_k2048_gfx1151"
         | "gemv_hfq4g256_residual_multirow_r2_gfx1151"
         | "gemv_hfq4g256_residual_wave64"
         | "gemv_hfq4g256_wide"
@@ -2719,6 +2721,12 @@ mod tests {
         assert_eq!(expected_kernarg_bytes(residual_r2), Some(32));
         assert_eq!(
             pointer_effects(residual_r2).map(|effects| effects.len()),
+            Some(3)
+        );
+        let residual_k2048 = "gemv_hfq4g256_residual_k2048_gfx1151";
+        assert_eq!(expected_kernarg_bytes(residual_k2048), Some(32));
+        assert_eq!(
+            pointer_effects(residual_k2048).map(|effects| effects.len()),
             Some(3)
         );
         let down =

@@ -1227,6 +1227,16 @@ pub const GEMV_HFQ4G256_RESIDUAL_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
+/// Exact gfx1151 A3B residual specialization. Preserve the admitted dual-row
+/// global-load arithmetic while exposing M=K=2048 to LLVM so both group quads
+/// can be unrolled and VOPD/load scheduling can span the complete dot product.
+pub const GEMV_HFQ4G256_RESIDUAL_K2048_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GFX1151_RESIDUAL_K2048 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_k2048_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
