@@ -1290,7 +1290,6 @@ fn try_run_mtp_sampled_proposal_redline(
         || state.mtp_resident_sample.is_none()
         || state.mtp_kv.kv_mode != crate::mtp_head::MtpKvMode::Q8
         || !state.mtp_proposal_replay.is_enabled()
-        || !state.mtp_proposal_replay.uses_pm4_transport()
     {
         return Ok(false);
     }
@@ -1312,25 +1311,37 @@ fn try_run_mtp_sampled_proposal_redline(
     // explicitly delimited sequence completes.
     std::mem::swap(&mut gpu.replay, &mut state.mtp_proposal_replay);
     let result = (|| -> HipResult<bool> {
-        if gpu.replay.should_route_pm4() {
+        if gpu.replay.should_route_pm4() || gpu.replay.should_route_aql() {
             let mut seed = state.gpu_rng_state;
             let mut seeds = Vec::with_capacity(max_n);
             for _ in 0..max_n {
                 seeds.push(seed);
                 seed = mtp_gpu_rng_next(seed);
             }
-            gpu.replay
-                .patch_pm4_kernel_u32("batched_categorical_sample_f32", 28, &seeds)
-                .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            if gpu.replay.should_route_pm4() {
+                gpu.replay
+                    .patch_pm4_kernel_u32("batched_categorical_sample_f32", 28, &seeds)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            } else {
+                gpu.replay
+                    .patch_aql_kernel_u32("batched_categorical_sample_f32", 28, &seeds)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            }
             // SAFETY: every captured weight, scratch, token, and position
             // allocation belongs to this live MtpSpecState at the same address.
             unsafe {
-                gpu.replay
-                    // Absolute MTP positions flow through mtp_positions. Keep
-                    // any generic position-bound launch geometry at the fixed
-                    // tier cap used during capture, matching hipGraph replay.
-                    .replay_pm4(seq_cap - 1)
-                    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                if gpu.replay.should_route_pm4() {
+                    gpu.replay
+                        // Absolute MTP positions flow through mtp_positions. Keep
+                        // any generic position-bound launch geometry at the fixed
+                        // tier cap used during capture, matching hipGraph replay.
+                        .replay_pm4(seq_cap - 1)
+                        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                } else {
+                    gpu.replay
+                        .replay_linear_aql()
+                        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                }
             }
             state.gpu_rng_state = seed;
             return Ok(true);
@@ -1354,22 +1365,43 @@ fn try_run_mtp_sampled_proposal_redline(
             .map_err(|e| hip_bridge::HipError::new(0, e))?;
         let device_ordinal = usize::try_from(gpu.device_id)
             .map_err(|_| hip_bridge::HipError::new(0, "negative HIP device ordinal"))?;
-        match gpu
-            .replay
-            .prepare_pm4_prefix(device_ordinal, summary.launch_count)
-        {
-            Ok((dispatches, dwords, queue)) => {
-                eprintln!(
-                    "[mtp-redline] retained sampled proposal dispatches={} dwords={} queue={} seq_cap={}",
-                    dispatches, dwords, queue, seq_cap
-                );
-                state.mtp_proposal_replay_seq_cap = seq_cap;
+        if gpu.replay.uses_pm4_transport() {
+            match gpu
+                .replay
+                .prepare_pm4_prefix(device_ordinal, summary.launch_count)
+            {
+                Ok((dispatches, dwords, queue)) => {
+                    eprintln!(
+                        "[mtp-redline] retained sampled proposal dispatches={} dwords={} queue={} seq_cap={}",
+                        dispatches, dwords, queue, seq_cap
+                    );
+                    state.mtp_proposal_replay_seq_cap = seq_cap;
+                }
+                Err(error) => {
+                    gpu.replay.poison(format!(
+                        "sampled MTP proposal PM4 preparation failed: {error}"
+                    ));
+                    eprintln!("[mtp-redline] disabled after PM4 preparation failure: {error}");
+                }
             }
-            Err(error) => {
-                gpu.replay.poison(format!(
-                    "sampled MTP proposal PM4 preparation failed: {error}"
-                ));
-                eprintln!("[mtp-redline] disabled after PM4 preparation failure: {error}");
+        } else {
+            match gpu
+                .replay
+                .prepare_linear_aql_prefix(device_ordinal, summary.launch_count)
+            {
+                Ok((dispatches, packets, queue)) => {
+                    eprintln!(
+                        "[mtp-redline] retained sampled proposal dispatches={} packets={} queue={} seq_cap={}",
+                        dispatches, packets, queue, seq_cap
+                    );
+                    state.mtp_proposal_replay_seq_cap = seq_cap;
+                }
+                Err(error) => {
+                    gpu.replay.poison(format!(
+                        "sampled MTP proposal AQL preparation failed: {error}"
+                    ));
+                    eprintln!("[mtp-redline] disabled after AQL preparation failure: {error}");
+                }
             }
         }
         // Capture executed the body directly, so this cycle is complete even

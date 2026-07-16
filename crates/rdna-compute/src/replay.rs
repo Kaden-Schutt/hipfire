@@ -1250,10 +1250,38 @@ pub struct AqlContractProbe {
 
 pub struct PreparedLinearAqlReplay {
     graph: SingleQueueBatchGraph,
+    kernel_names: Vec<String>,
     dynamic_gdn_frames: Vec<usize>,
 }
 
 impl PreparedLinearAqlReplay {
+    fn patch_kernel_u32(
+        &mut self,
+        kernel: &str,
+        offset: usize,
+        values: &[u32],
+    ) -> Result<(), String> {
+        let dispatches = self
+            .kernel_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| (name == kernel).then_some(index))
+            .collect::<Vec<_>>();
+        if dispatches.len() != values.len() {
+            return Err(format!(
+                "retained kernel {kernel:?} occurs {} times, patch supplied {} values",
+                dispatches.len(),
+                values.len()
+            ));
+        }
+        for (dispatch, value) in dispatches.into_iter().zip(values.iter().copied()) {
+            self.graph
+                .patch_kernarg_u32(dispatch, offset, value)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// # Safety
     ///
     /// Every pointer captured in the immutable explicit kernarg prefixes must
@@ -1891,6 +1919,12 @@ impl ReplayController {
         );
         self.prepared = Some(PreparedLinearAqlReplay {
             graph,
+            kernel_names: self
+                .recorded
+                .iter()
+                .take(prefix)
+                .map(|launch| launch.kernel.clone())
+                .collect(),
             dynamic_gdn_frames,
         });
         self.state = ReplayState::Ready;
@@ -2273,6 +2307,18 @@ impl ReplayController {
         self.prepared_pm4
             .as_mut()
             .ok_or_else(|| "no prepared PM4 replay".to_owned())?
+            .patch_kernel_u32(kernel, offset, values)
+    }
+
+    pub fn patch_aql_kernel_u32(
+        &mut self,
+        kernel: &str,
+        offset: usize,
+        values: &[u32],
+    ) -> Result<(), String> {
+        self.prepared
+            .as_mut()
+            .ok_or_else(|| "no prepared AQL replay".to_owned())?
             .patch_kernel_u32(kernel, offset, values)
     }
 
