@@ -304,11 +304,21 @@ pub struct LoadedModel {
     pub mtp_weights_present: bool,
     // Qwen3.5/3.6 native MTP (NextN) head (arch_id=21). Loaded once at model
     // load when a bundled `.mq4-mtp` trailer OR a separate `.mtp` sidecar is
-    // present alongside the trunk. Persistent for the life of the model;
-    // `generate_qwen35_mtp` allocates a fresh per-request `MtpSpecState`
-    // against it (so the recurrent MTP-KV never bleeds across requests). None
-    // for every other arch and for qwen35 trunks without an MTP head.
+    // present alongside the trunk. Persistent for the life of the model.
+    // None for every other arch and for qwen35 trunks without an MTP head.
     pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    // Persistent MTP decode/cache state paired with `qwen35_mtp_head`. The
+    // daemon resets it on a prompt-cache miss and retains it only while the
+    // trunk + sidecar caches are known to match `conversation_tokens`.
+    pub qwen35_mtp_state: Option<hipfire_arch_qwen35::mtp_spec::MtpSpecState>,
+    // Independent cache identity for the MTP sidecar. Other decode paths may
+    // legitimately advance `conversation_tokens` and the trunk without
+    // touching MTP state; equality is therefore required before MTP reuse.
+    pub qwen35_mtp_conversation_tokens: Vec<u32>,
+    // DeltaNet checkpoints paired with the MTP cache identity. Full-attention
+    // and MTP KV are positional, so a divergent prompt only needs recurrent
+    // state restored before overwriting its suffix in order.
+    pub qwen35_mtp_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     // dots.ocr state
     pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
     pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
@@ -379,6 +389,9 @@ impl LoadedModel {
             mtp_k: 3,
             mtp_weights_present: false,
             qwen35_mtp_head: None,
+            qwen35_mtp_state: None,
+            qwen35_mtp_conversation_tokens: Vec::new(),
+            qwen35_mtp_checkpoints: Vec::new(),
             dots_ocr_config: None,
             dots_ocr_weights: None,
             vision_config: None,
@@ -1735,6 +1748,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
         // empty) is still drained below for defense-in-depth.
         spec.free(gpu);
+    }
+    if let Some(state) = m.qwen35_mtp_state {
+        state.free_gpu(gpu);
+    }
+    for (_, snapshot) in m.qwen35_mtp_checkpoints {
+        snapshot.free_gpu(gpu);
     }
     if let Some(head) = m.qwen35_mtp_head {
         head.free_gpu(gpu);

@@ -4829,6 +4829,172 @@ fn plan_prompt_cache(
     }
 }
 
+/// Build the canonical full prompt for the persistent native-MTP path and
+/// decide whether the already-resident trunk + MTP caches form a strict prefix.
+/// Unlike the older DFlash helper, this supports both scaffold and Jinja chat:
+/// Jinja assistant turns splice the exact previously-emitted token body back
+/// into the trained template so the LCP is a byte-for-byte cache claim.
+#[allow(clippy::too_many_arguments)]
+fn plan_mtp_prompt_cache(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    asst_turn_cache: &mut AsstTurnCache,
+    conversation_tokens: &[u32],
+    eviction_is_none: bool,
+    cold_render: &[u32],
+    jinja_active: bool,
+    chat_template: Option<&str>,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: &[hipfire_runtime::prompt_frame::Message],
+    cache_disabled: bool,
+    checkpoint_positions: &[usize],
+    resume_enabled: bool,
+) -> PromptCachePlan {
+    let trace = std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+    let rendered = if jinja_active {
+        let primer: Vec<u32> = {
+            let im_start = tokenizer.special_token_id("<|im_start|>");
+            let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
+            match im_start.and_then(|id| cold_render.iter().rposition(|&token| token == id)) {
+                Some(pos) if pos + opener_len <= cold_render.len() => {
+                    cold_render[pos + opener_len..].to_vec()
+                }
+                _ => Vec::new(),
+            }
+        };
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template: chat_template.expect("Jinja MTP cache requires a chat template"),
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        match hipfire_runtime::prompt_frame::build_cached_history_jinja(
+            &frame,
+            messages_history,
+            tools,
+            |message| {
+                let stripped = strip_think_for_fingerprint(&message.content);
+                let normalized =
+                    hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                let fingerprint = asst_turn_fingerprint(&normalized, &message.tool_calls);
+                let hit = asst_turn_cache.get(&fingerprint).map(|cached| {
+                    let mut tokens = primer.clone();
+                    tokens.extend_from_slice(cached);
+                    tokens
+                });
+                if trace {
+                    eprintln!(
+                        "[qwen-cache mtp jinja lookup] fp={:#018x} primer={} hit={}",
+                        fingerprint,
+                        primer.len(),
+                        hit.is_some(),
+                    );
+                }
+                hit
+            },
+        ) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                eprintln!(
+                    "[qwen-cache mtp] jinja cached-history build failed ({error}) — cold render"
+                );
+                cold_render.to_vec()
+            }
+        }
+    } else {
+        let query_tokens = tokenizer.encode(prompt);
+        hipfire_runtime::prompt_frame::build_cached_history(
+            tokenizer,
+            system_prompt,
+            messages_history,
+            &query_tokens,
+            assistant_prefix,
+            |message| {
+                let stripped = strip_think_for_fingerprint(&message.content);
+                let normalized =
+                    hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                let fingerprint = asst_turn_fingerprint(&normalized, &message.tool_calls);
+                let hit = asst_turn_cache.get(&fingerprint).cloned();
+                if trace {
+                    eprintln!(
+                        "[qwen-cache mtp lookup] fp={:#018x} hit={}",
+                        fingerprint,
+                        hit.is_some(),
+                    );
+                }
+                hit
+            },
+        )
+    };
+
+    let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
+    if cache_eligible {
+        let prior_len = conversation_tokens.len();
+        let max_match = prior_len.min(rendered.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && conversation_tokens[lcp] == rendered[lcp] {
+            lcp += 1;
+        }
+        if trace {
+            eprintln!(
+                "[qwen-cache mtp lcp] prior_len={} rendered_len={} lcp={}",
+                prior_len,
+                rendered.len(),
+                lcp,
+            );
+        }
+        if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
+            return PromptCachePlan {
+                new_tokens: rendered[lcp..].to_vec(),
+                start_pos: lcp,
+                cached_tokens: lcp,
+                cache_hit: true,
+                resume_from: None,
+                rendered,
+            };
+        }
+        if resume_enabled {
+            if let Some(&checkpoint) = checkpoint_positions
+                .iter()
+                .filter(|&&position| position <= lcp && position < rendered.len())
+                .max()
+            {
+                if trace {
+                    eprintln!(
+                        "[qwen-cache mtp resume] checkpoint={} lcp={} prior_len={} rendered_len={}",
+                        checkpoint,
+                        lcp,
+                        prior_len,
+                        rendered.len(),
+                    );
+                }
+                return PromptCachePlan {
+                    new_tokens: rendered[checkpoint..].to_vec(),
+                    start_pos: checkpoint,
+                    cached_tokens: checkpoint,
+                    cache_hit: true,
+                    resume_from: Some(checkpoint),
+                    rendered,
+                };
+            }
+        }
+    }
+
+    PromptCachePlan {
+        new_tokens: rendered.clone(),
+        start_pos: 0,
+        cached_tokens: 0,
+        cache_hit: false,
+        resume_from: None,
+        rendered,
+    }
+}
+
 /// Zero qwen3.5 (arch 5/6) recurrent DeltaNet + KV state IN PLACE for a fresh
 /// turn. The state lives in the bundle (ModelState::Qwen35), NOT the always-None
 /// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
@@ -5968,6 +6134,55 @@ fn mtp_request_seed(request_id: &str) -> u64 {
     (now ^ id_hash ^ seq.rotate_left(17)).max(1)
 }
 
+fn prefill_mtp_suffix_with_checkpoints(
+    gpu: &mut rdna_compute::Gpu,
+    target: &mut speculative::ModelSlot,
+    head: &hipfire_arch_qwen35::mtp_head::Qwen35MtpHead,
+    state: &mut hipfire_arch_qwen35::mtp_spec::MtpSpecState,
+    tokens: &[u32],
+    start_pos: usize,
+    checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+) -> hip_bridge::HipResult<hipfire_arch_qwen35::mtp_spec::TrunkSpinePrefillTimings> {
+    use hipfire_arch_qwen35::mtp_spec::{prefill_trunk_and_mtp_cache, TrunkSpinePrefillTimings};
+
+    if tokens.is_empty() {
+        return Ok(TrunkSpinePrefillTimings::default());
+    }
+    let checkpointing = ckpt_resume_enabled();
+    let chunk_size = if checkpointing {
+        ckpt_interval()
+    } else {
+        tokens.len()
+    };
+    let mut timings = TrunkSpinePrefillTimings::default();
+    let mut offset = 0usize;
+    while offset < tokens.len() {
+        let end = (offset + chunk_size).min(tokens.len());
+        let chunk_timings = prefill_trunk_and_mtp_cache(
+            gpu,
+            target,
+            head,
+            state,
+            &tokens[offset..end],
+            start_pos + offset,
+        )?;
+        timings.trunk_prefill_secs += chunk_timings.trunk_prefill_secs;
+        timings.mtp_prompt_fill_secs += chunk_timings.mtp_prompt_fill_secs;
+        if checkpointing {
+            speculative::take_dn_checkpoint(
+                checkpoints,
+                &target.dn_state,
+                gpu,
+                start_pos + end,
+                ckpt_interval(),
+                ckpt_max(),
+            );
+        }
+        offset = end;
+    }
+    Ok(timings)
+}
+
 /// Qwen3.5/3.6 native-MTP (NextN) speculative decode serve path.
 ///
 /// Analog of [`generate_deepseek4`]'s spec branch and [`generate_dflash`], but
@@ -5976,20 +6191,17 @@ fn mtp_request_seed(request_id: &str) -> u64 {
 /// genres ≥1.15× AR, lossless): K=3, p_min=0.4, compressed-serial.
 ///
 /// Call sequence (mirrors `mtp_only_demo`):
-///   1. cold-reset trunk DeltaNet/KV (v1 is single-turn — no LCP cache),
-///   2. `prefill_trunk_and_mtp_cache` (trunk batched prefill + MTP private KV
-///      fill over the prompt positions),
+///   1. render the canonical multi-turn prompt and reuse the resident trunk +
+///      MTP prefix on a strict forward extension (cold-reset on divergence),
+///   2. `prefill_trunk_and_mtp_cache` over only the uncached suffix,
 ///   3. seed token = trunk argmax at the last prefill position,
 ///   4. loop `spec_step_mtp_compressed_serial` (the production path), committing
 ///      `result.committed` and advancing `cur_pos += result.advance` each cycle.
 ///
-/// Per-request lifecycle (state-bleed guard, the serve-multiturn class): the
-/// `MtpSpecState` (which owns the trunk DN snapshot + the MTP-private KV cache)
-/// is allocated FRESH at the top of this function and freed at EVERY exit — so
-/// no recurrent MTP state survives between requests. The trunk's persistent DN
-/// state lives in the bundle and is cold-zeroed at the start of each request
-/// (mirrors `generate_dflash`'s `!cache_hit` reset). The MTP head itself is
-/// persistent (loaded once on `LoadedModel.qwen35_mtp_head`).
+/// The `LoadedModel` owns both the sidecar head and `MtpSpecState`. State is
+/// retained only after the final deferred token is baked into both caches and
+/// `conversation_tokens`; aborts, errors, and mid-block user stops invalidate
+/// it so the next request cold-prefills rather than making a false cache claim.
 ///
 /// Gated behind opt-in: this is only reached when `HIPFIRE_QWEN_MTP=1` AND the
 /// head is present (see the dispatch site in `generate`), so the DEFAULT serve
@@ -6063,7 +6275,7 @@ fn generate_qwen35_mtp(
     // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
-    let prompt_tokens: Vec<u32> = if try_jinja {
+    let cold_prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
@@ -6128,10 +6340,62 @@ fn generate_qwen35_mtp(
         .build()
     };
 
-    if prompt_tokens.is_empty() {
+    if cold_prompt_tokens.is_empty() {
         emit_error_with_id(stdout, id, "empty prompt after tokenize");
         return;
     }
+
+    let mtp_cache_compatible = m
+        .qwen35_mtp_state
+        .as_ref()
+        .map(|state| state.max_n == max_n)
+        .unwrap_or(false)
+        && m.seq_pos == m.conversation_tokens.len()
+        && m.qwen35_mtp_conversation_tokens == m.conversation_tokens;
+    let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0")
+        || !mtp_cache_compatible;
+    let mtp_checkpoint_positions: Vec<usize> = m
+        .qwen35_mtp_checkpoints
+        .iter()
+        .map(|(position, _)| *position)
+        .collect();
+    let mtp_resume_enabled = ckpt_resume_enabled() && m.eviction.is_none();
+    let cache_plan = messages_history.map(|history| {
+        plan_mtp_prompt_cache(
+            tokenizer,
+            &mut m.asst_turn_cache,
+            &m.conversation_tokens,
+            m.eviction.is_none(),
+            &cold_prompt_tokens,
+            try_jinja,
+            m.chat_template.as_deref(),
+            system_prompt,
+            prompt,
+            max_think_tokens,
+            assistant_prefix,
+            tools,
+            history,
+            cache_disabled,
+            &mtp_checkpoint_positions,
+            mtp_resume_enabled,
+        )
+    });
+    let prompt_tokens = cache_plan
+        .as_ref()
+        .map(|plan| plan.rendered.clone())
+        .unwrap_or(cold_prompt_tokens);
+    let (mut prefill_tokens, mut prefill_start, mut cache_hit, mut cached_tokens) = cache_plan
+        .as_ref()
+        .map(|plan| {
+            (
+                plan.new_tokens.clone(),
+                plan.start_pos,
+                plan.cache_hit,
+                plan.cached_tokens,
+            )
+        })
+        .unwrap_or_else(|| (prompt_tokens.clone(), 0, false, 0));
+    let resume_from = cache_plan.as_ref().and_then(|plan| plan.resume_from);
 
     let im_end = tokenizer.encode("<|im_end|>");
     let im_end_token = if im_end.len() == 1 {
@@ -6140,26 +6404,28 @@ fn generate_qwen35_mtp(
         None
     };
 
-    // ── Cold-reset the trunk recurrent state (v1 = single-turn) ─────────
-    // Like generate_dflash's !cache_hit branch: zero the bundle's DeltaNet
-    // recurrent state + reset the KV write head so a fresh prompt prefills
-    // from position 0 over clean buffers. (No LCP prompt-cache in v1.)
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+    // A strict extension keeps both resident caches. Every other render starts
+    // from clean trunk state; the paired MTP state is reset after it is taken.
+    if !cache_hit {
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        m.qwen35_mtp_conversation_tokens.clear();
+        free_checkpoints(&mut m.qwen35_mtp_checkpoints, gpu);
+        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
         }
-        for s in &dn.s_scales {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.kv_cache.compact_offset = 0;
         }
-        for s in &dn.conv_states {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-    }
-    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-        b.kv_cache.compact_offset = 0;
     }
 
     // ── Take the bundle → build a transient ModelSlot ───────────────────
@@ -6214,12 +6480,14 @@ fn generate_qwen35_mtp(
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
 
-    // Capacity guard: worst case per cycle writes max_n+1 verify slots before
-    // the rollback truncates. seq budget must hold prompt + max*(max_n+1).
+    // Capacity guard: accepted tokens advance `cur_pos` by exactly the number
+    // returned to the client. A verify window needs only max_n transient slots
+    // beyond that eventual output, not max_n extra slots PER generated token.
     let max_seq_total = m.physical_cap;
     if prompt_tokens
         .len()
-        .saturating_add(max_tokens.saturating_mul(max_n + 1))
+        .saturating_add(max_tokens)
+        .saturating_add(max_n)
         .saturating_add(16)
         > max_seq_total
     {
@@ -6227,10 +6495,10 @@ fn generate_qwen35_mtp(
             stdout,
             id,
             format!(
-                "prompt ({}) + max ({}) × (max_n+1) ({}) exceeds context capacity {} — reload with a larger max_seq",
+                "prompt ({}) + max ({}) + verify slack ({}) exceeds context capacity {} — reload with a larger max_seq",
                 prompt_tokens.len(),
                 max_tokens,
-                max_n + 1,
+                max_n + 16,
                 max_seq_total
             ),
         );
@@ -6244,7 +6512,49 @@ fn generate_qwen35_mtp(
         return;
     }
 
-    // ── Allocate a FRESH per-request MtpSpecState (no cross-request bleed) ─
+    if let Some(resume_position) = resume_from {
+        let checkpoint_index = m
+            .qwen35_mtp_checkpoints
+            .iter()
+            .position(|(position, _)| *position == resume_position);
+        let restored = checkpoint_index
+            .and_then(|index| {
+                m.qwen35_mtp_checkpoints
+                    .get(index)
+                    .map(|entry| (index, &entry.1))
+            })
+            .is_some_and(|(_, snapshot)| snapshot.restore_to(&mut target.dn_state, gpu).is_ok());
+        if let Some(index) = checkpoint_index.filter(|_| restored) {
+            m.seq_pos = resume_position;
+            m.conversation_tokens.truncate(resume_position);
+            m.qwen35_mtp_conversation_tokens.truncate(resume_position);
+            truncate_checkpoints(&mut m.qwen35_mtp_checkpoints, index + 1, gpu);
+        } else {
+            // A failed recurrent-state restore is not a usable cache hit. Fall
+            // back to the same clean state as a normal miss and prefill all of
+            // the canonical render.
+            for tensor in &target.dn_state.s_matrices {
+                let _ = gpu.hip.memset(&tensor.buf, 0, tensor.buf.size());
+            }
+            for tensor in &target.dn_state.s_scales {
+                let _ = gpu.hip.memset(&tensor.buf, 0, tensor.buf.size());
+            }
+            for tensor in &target.dn_state.conv_states {
+                let _ = gpu.hip.memset(&tensor.buf, 0, tensor.buf.size());
+            }
+            target.kv_cache.compact_offset = 0;
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            m.qwen35_mtp_conversation_tokens.clear();
+            free_checkpoints(&mut m.qwen35_mtp_checkpoints, gpu);
+            prefill_tokens = prompt_tokens.clone();
+            prefill_start = 0;
+            cache_hit = false;
+            cached_tokens = 0;
+        }
+    }
+
+    // ── Reuse or allocate the persistent MTP state ─────────────────────
     let head = m
         .qwen35_mtp_head
         .as_ref()
@@ -6254,8 +6564,26 @@ fn generate_qwen35_mtp(
     // alloc below needs &mut state + &mut gpu.
     let cvs_opt = head.weights.compressed_vocab_size;
     let kv_mode = MtpKvMode::Q8;
-    let mut state =
-        match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, max_n, kv_mode) {
+    let mut state = match m.qwen35_mtp_state.take() {
+        Some(state) if state.max_n == max_n && state.mtp_kv.kv_mode == kv_mode => state,
+        Some(state) => {
+            state.free_gpu(gpu);
+            match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, max_n, kv_mode) {
+                Ok(state) => state,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
+                    m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                        config: orig_config,
+                        weights: target.weights,
+                        scratch: target.scratch,
+                        kv_cache: target.kv_cache,
+                        dn_state: target.dn_state,
+                    }));
+                    return;
+                }
+            }
+        }
+        None => match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, max_n, kv_mode) {
             Ok(s) => s,
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
@@ -6268,7 +6596,22 @@ fn generate_qwen35_mtp(
                 }));
                 return;
             }
-        };
+        },
+    };
+    if !cache_hit {
+        if let Err(e) = state.reset(gpu) {
+            emit_error_with_id(stdout, id, format!("reset MtpSpecState: {e:?}"));
+            state.free_gpu(gpu);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights: target.weights,
+                scratch: target.scratch,
+                kv_cache: target.kv_cache,
+                dn_state: target.dn_state,
+            }));
+            return;
+        }
+    }
     // Compressed-serial (cvs) head needs its compressed-logits scratch allocated
     // up front (mtp_only_demo does this; the daemon previously only set up the
     // full-vocab path, so a cvs sidecar panicked inside spec_step). Full-vocab
@@ -6276,10 +6619,34 @@ fn generate_qwen35_mtp(
     if let Some(cvs) = cvs_opt {
         if let Err(e) = state.mtp_scratch.ensure_compressed_logits(gpu, cvs) {
             emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
+            state.free_gpu(gpu);
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            m.qwen35_mtp_conversation_tokens.clear();
+            free_checkpoints(&mut m.qwen35_mtp_checkpoints, gpu);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights: target.weights,
+                scratch: target.scratch,
+                kv_cache: target.kv_cache,
+                dn_state: target.dn_state,
+            }));
             return;
         }
         if let Err(e) = state.ensure_compressed_lm_logits(gpu, cvs) {
             emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
+            state.free_gpu(gpu);
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            m.qwen35_mtp_conversation_tokens.clear();
+            free_checkpoints(&mut m.qwen35_mtp_checkpoints, gpu);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights: target.weights,
+                scratch: target.scratch,
+                kv_cache: target.kv_cache,
+                dn_state: target.dn_state,
+            }));
             return;
         }
     }
@@ -6310,17 +6677,22 @@ fn generate_qwen35_mtp(
 
     // ── Prefill: trunk batched + MTP private-KV fill (trunk-spine) ──────
     let head = m.qwen35_mtp_head.as_ref().unwrap();
-    let prefill_res = mtp_spec::prefill_trunk_and_mtp_cache(
+    let prefill_res = prefill_mtp_suffix_with_checkpoints(
         gpu,
         &mut target,
         head,
         &mut state,
-        &prompt_tokens,
-        0,
+        &prefill_tokens,
+        prefill_start,
+        &mut m.qwen35_mtp_checkpoints,
     );
     if let Err(e) = prefill_res {
         emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
         state.free_gpu(gpu);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        m.qwen35_mtp_conversation_tokens.clear();
+        free_checkpoints(&mut m.qwen35_mtp_checkpoints, gpu);
         m.state = Some(ModelState::Qwen35(Qwen35Bundle {
             config: orig_config,
             weights: target.weights,
@@ -6340,6 +6712,10 @@ fn generate_qwen35_mtp(
         Err(e) => {
             emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
             state.free_gpu(gpu);
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            m.qwen35_mtp_conversation_tokens.clear();
+            free_checkpoints(&mut m.qwen35_mtp_checkpoints, gpu);
             m.state = Some(ModelState::Qwen35(Qwen35Bundle {
                 config: orig_config,
                 weights: target.weights,
@@ -6380,6 +6756,8 @@ fn generate_qwen35_mtp(
     let mut accepted_total = 0usize;
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
+    let mut state_consistent = true;
+    let mut hit_length_guard = false;
     // Once the cap closes the first reasoning span, stop counting and continue
     // into the visible answer. The close is applied at a spec-block boundary so
     // the emitted stream and trunk/MTP caches remain aligned.
@@ -6419,9 +6797,19 @@ fn generate_qwen35_mtp(
     let mut step_error: Option<String> = None;
     while !seed_is_eos && generated < max_tokens {
         if check_abort(id) {
+            state_consistent = false;
+            break;
+        }
+        // A speculative cycle may commit max_n+1 tokens. Never launch one if
+        // the visible output budget cannot hold the complete committed block;
+        // truncating it after verify would leave resident caches ahead of the
+        // conversation returned to the client.
+        if max_tokens.saturating_sub(generated) < max_n + 1 {
+            hit_length_guard = true;
             break;
         }
         if cur_pos + max_n + 1 >= max_seq_total {
+            hit_length_guard = true;
             break;
         }
 
@@ -6437,6 +6825,7 @@ fn generate_qwen35_mtp(
             Ok(r) => r,
             Err(e) => {
                 step_error = Some(format!("{e:?}"));
+                state_consistent = false;
                 break;
             }
         };
@@ -6444,7 +6833,7 @@ fn generate_qwen35_mtp(
         accepted_total += result.accept_count;
 
         let mut hit_eos = false;
-        for &tok in &result.committed {
+        for (block_index, &tok) in result.committed.iter().enumerate() {
             if generated >= max_tokens {
                 break;
             }
@@ -6474,12 +6863,16 @@ fn generate_qwen35_mtp(
             generated += 1;
             if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) {
                 hit_eos = true;
+                if block_index + 1 != result.committed.len() {
+                    state_consistent = false;
+                }
                 break;
             }
             if !stop.is_empty() {
                 let decoded_suffix = tokenizer.decode(&streamed_tokens);
                 if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
                     hit_eos = true;
+                    state_consistent = false;
                     break;
                 }
             }
@@ -6519,10 +6912,11 @@ fn generate_qwen35_mtp(
         {
             let close_ids = tokenizer.encode(&think_continuation());
             if !close_ids.is_empty() {
+                if max_tokens.saturating_sub(generated) < close_ids.len() {
+                    hit_length_guard = true;
+                    break;
+                }
                 for &ct in &close_ids {
-                    if generated >= max_tokens {
-                        break;
-                    }
                     emitted.push(ct);
                     streamed_tokens.push(ct);
                     emit_committed_event(
@@ -6564,6 +6958,7 @@ fn generate_qwen35_mtp(
                     cur_pos,
                 ) {
                     step_error = Some(format!("think force-close: {e:?}"));
+                    state_consistent = false;
                     break;
                 }
                 cur_pos += advance_toks.len();
@@ -6575,18 +6970,54 @@ fn generate_qwen35_mtp(
         }
     }
 
-    let t_end = Instant::now();
+    // The spec loop keeps its newest token deferred: the trunk and MTP cache
+    // have consumed every visible token except `last_committed`. Bake that one
+    // token before advertising a persistent prefix to the next request.
+    if state_consistent && step_error.is_none() {
+        if let Err(error) = mtp_spec::prefill_trunk_and_mtp_cache(
+            gpu,
+            &mut target,
+            head,
+            &mut state,
+            &[last_committed],
+            cur_pos,
+        ) {
+            step_error = Some(format!("final cache bake: {error:?}"));
+            state_consistent = false;
+        } else {
+            cur_pos += 1;
+        }
+    }
 
-    // ── Free the per-request MtpSpecState + put the bundle back ─────────
-    // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV cache
-    // + the trunk DN snapshot, so the NEXT request starts with no residue.
-    state.free_gpu(gpu);
-    // The trunk's mid-decode DN/KV is advanced past the (un-baked) prompt; the
-    // next request cold-resets at the top of this fn (and the DFlash/AR paths
-    // reset on their own !cache_hit branch), so we leave it as-is here. Bake an
-    // empty conversation tracker (v1 is single-turn / no LCP reuse).
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    if state_consistent && step_error.is_none() {
+        let mut conversation = prompt_tokens.clone();
+        conversation.extend_from_slice(&emitted);
+        debug_assert_eq!(cur_pos, conversation.len());
+        if ckpt_resume_enabled() && m.eviction.is_none() {
+            // Always retain a turn-boundary checkpoint. Periodic prompt
+            // checkpoints handle long/edited prefixes; this one gives the
+            // common multi-turn divergence case a nearby exact rewind point.
+            speculative::take_dn_checkpoint(
+                &mut m.qwen35_mtp_checkpoints,
+                &target.dn_state,
+                gpu,
+                cur_pos,
+                1,
+                ckpt_max(),
+            );
+        }
+        m.seq_pos = cur_pos;
+        m.conversation_tokens = conversation;
+        m.qwen35_mtp_conversation_tokens = m.conversation_tokens.clone();
+        m.qwen35_mtp_state = Some(state);
+    } else {
+        state.free_gpu(gpu);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        m.qwen35_mtp_conversation_tokens.clear();
+        free_checkpoints(&mut m.qwen35_mtp_checkpoints, gpu);
+        m.qwen35_mtp_state = None;
+    }
     m.state = Some(ModelState::Qwen35(Qwen35Bundle {
         config: orig_config,
         weights: target.weights,
@@ -6595,9 +7026,37 @@ fn generate_qwen35_mtp(
         dn_state: target.dn_state,
     }));
 
+    let t_end = Instant::now();
+
     if let Some(e) = step_error {
         emit_error_with_id(stdout, id, format!("mtp spec_step: {e}"));
         return;
+    }
+
+    // Prime byte-exact assistant replay for turn N+1. The cache stores the
+    // model-emitted body only; canonical prompt rendering re-adds the trained
+    // assistant opener/primer and turn trailer.
+    let decoded_full = tokenizer.decode(&streamed_tokens);
+    let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+    let newline_tokens: std::collections::HashSet<u32> =
+        tokenizer.encode("\n").into_iter().collect();
+    let mut cached_seq = streamed_tokens.clone();
+    while cached_seq
+        .last()
+        .is_some_and(|token| newline_tokens.contains(token))
+    {
+        cached_seq.pop();
+    }
+    if cached_seq.last().copied().is_some_and(|token| {
+        token == eos_token || im_end_token == Some(token) || tokenizer.is_terminator(token)
+    }) {
+        cached_seq.pop();
+    }
+    if !cached_seq.is_empty() {
+        let stripped = strip_think_for_fingerprint(&decoded_full);
+        let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+        let fingerprint = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+        m.asst_turn_cache.insert(fingerprint, cached_seq);
     }
 
     // ── Done envelope ──────────────────────────────────────────────────
@@ -6615,7 +7074,7 @@ fn generate_qwen35_mtp(
         0.0
     };
     let prefill_tok_s = if prefill_s > 0.0 {
-        prompt_tokens.len() as f64 / prefill_s
+        prefill_tokens.len() as f64 / prefill_s
     } else {
         0.0
     };
@@ -6626,14 +7085,15 @@ fn generate_qwen35_mtp(
         0.0
     };
     let _ = accepted_total;
-    let hit_length_cap = generated >= max_tokens;
+    let hit_length_cap = generated >= max_tokens || hit_length_guard;
     let finish_reason = if hit_length_cap { "length" } else { "stop" };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{},"mtp":true,"tau":{:.2},"cycles":{},"cached_tokens":0,"finish_reason":"{}"}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prompt_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{},"mtp":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"}}"#,
         id,
         generated,
         tok_s,
+        prefill_tokens.len(),
         prompt_tokens.len(),
         prefill_ms,
         prefill_tok_s,
@@ -6641,6 +7101,7 @@ fn generate_qwen35_mtp(
         prefill_ms,
         tau,
         cycles,
+        cached_tokens,
         finish_reason,
     );
     let _ = stdout.flush();
@@ -8229,6 +8690,10 @@ fn generate(
         && m.qwen35_mtp_head.is_some()
         && (temp <= 1e-6 || mtp_sampled_on)
         && (m.arch_id == 5 || m.arch_id == 6)
+        // Native MTP does not yet run Qwen's tool grammar. Preserve request
+        // semantics by falling through to the grammar-capable DFlash/AR path
+        // rather than silently sampling unconstrained tool syntax.
+        && tools.is_none_or(|tools| tools.is_empty())
     {
         generate_qwen35_mtp(
             m,
