@@ -393,6 +393,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     match kernel {
         "copy_u32_range" => Some(vec![read(0), write(8)]),
+        "attention_q8_0_kv" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
         "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -578,6 +579,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     match kernel {
         "copy_u32_range" => Some(32),
+        "attention_q8_0_kv" => Some(64),
         "softmax_f32" => Some(16),
         "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
