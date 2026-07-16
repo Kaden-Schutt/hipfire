@@ -29,10 +29,12 @@ gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer_gfx1151(
     const int tid = threadIdx.x;
     const int routing_index = bid * K_TOP + krank;
 
-    const auto indices_rsrc = HIPFIRE_WEIGHT_RSRC(topk_indices);
+    const auto indices_rsrc = HIPFIRE_WEIGHT_RSRC(
+        reinterpret_cast<const char*>(topk_indices));
     const unsigned int expert_id = HIPFIRE_WEIGHT_LOAD_U32(
         indices_rsrc, (unsigned int)routing_index * 4u);
-    const auto pointers_rsrc = HIPFIRE_WEIGHT_RSRC(expert_ptrs);
+    const auto pointers_rsrc = HIPFIRE_WEIGHT_RSRC(
+        reinterpret_cast<const char*>(expert_ptrs));
     const unsigned int expert_lo = HIPFIRE_WEIGHT_LOAD_U32(
         pointers_rsrc, expert_id * 8u);
     const unsigned int expert_hi = HIPFIRE_WEIGHT_LOAD_U32(
