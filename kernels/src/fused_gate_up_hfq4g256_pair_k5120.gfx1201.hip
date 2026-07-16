@@ -82,7 +82,10 @@ extern "C" __global__ void fused_gate_up_hfq4g256_pair_k5120_global_gfx1201(
                 + (_usc * (float)((_upk >> 28) & 0xFu) + _uzp) * _xb.w; \
     } while (0)
 
-    #pragma unroll
+    // Full unroll holds all five quads live and spills one VGPR to private
+    // memory on gfx1201. Preserve the compact loop just like the admitted
+    // dual-row residual kernel: it stays below Redline's zero-scratch limit.
+    #pragma unroll 1
     for (int q = 0; q < 5; q++) {
         const int g = q << 2;
         PAIRED_DOG(g + 0, gacc0, uacc0);
