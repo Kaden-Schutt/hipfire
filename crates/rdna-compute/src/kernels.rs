@@ -3859,6 +3859,9 @@ pub const BATCHED_CATEGORICAL_SAMPLE_SRC: &str =
 /// {accept_len, bonus_token, rejected_at, new_rng} in a 16-byte int[4].
 pub const CHAIN_ACCEPT_SPEC_SRC: &str = include_str!("../../../kernels/src/chain_accept_spec.hip");
 
+/// Compact row-wise probability gather used by native sampled MTP.
+pub const GATHER_PROB_ROWS_SRC: &str = include_str!("../../../kernels/src/gather_prob_rows.hip");
+
 /// Batched argmax: one block per row, writes B indices with one kernel launch.
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");

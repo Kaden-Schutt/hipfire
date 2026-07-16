@@ -39,6 +39,93 @@ fn sample_fast_stable_enabled() -> bool {
 }
 
 impl Gpu {
+    /// Gather `out[row] = probs[row, indices[row]]` for a dense probability
+    /// matrix. All buffers remain device-resident; callers normally download
+    /// only the resulting `rows` scalars.
+    pub fn gather_prob_rows_f32(
+        &mut self,
+        probs: &GpuTensor,
+        indices: &GpuTensor,
+        out: &GpuTensor,
+        row_stride: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gather_prob_rows",
+            kernels::GATHER_PROB_ROWS_SRC,
+            "gather_prob_rows_f32",
+        )?;
+        let probs_ptr = probs.buf.as_ptr();
+        let indices_ptr = indices.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let stride = row_stride as i32;
+        let n_rows = rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &probs_ptr as *const _ as *mut c_void,
+            &indices_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &stride as *const _ as *mut c_void,
+            &n_rows as *const _ as *mut c_void,
+        ];
+        let block = 64u32;
+        let grid = ((rows as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "gather_prob_rows_f32",
+            [grid.max(1), 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(probs_ptr);
+                blob.push_ptr(indices_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(stride);
+                blob.push_i32(n_rows);
+                blob
+            },
+        )
+    }
+
+    /// Reduce a non-negative probability row to its maximum value.
+    pub fn max_value_f32(
+        &mut self,
+        values: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gather_prob_rows",
+            kernels::GATHER_PROB_ROWS_SRC,
+            "max_value_f32",
+        )?;
+        let values_ptr = values.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let count = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &values_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &count as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        self.launch_maybe_blob(
+            "max_value_f32",
+            [1, 1, 1],
+            [block, 1, 1],
+            block * 4,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(values_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(count);
+                blob
+            },
+        )
+    }
+
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
         &mut self,
