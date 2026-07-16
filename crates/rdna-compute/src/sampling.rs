@@ -156,6 +156,83 @@ impl Gpu {
         Ok(result[0] as u32)
     }
 
+    /// Apply the same repeat/presence/frequency penalty prepass used by
+    /// [`Self::sample_top_p_pf`] to a logits row in place.
+    ///
+    /// This is exposed separately for speculative decoders: draft and target
+    /// distributions must both be built from the adjusted logits, while their
+    /// residual-acceptance rule still needs the resulting probability rows.
+    /// `history` is clipped to both `repeat_window` and `repeat_buf` capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_sampling_penalties_f32(
+        &mut self,
+        logits: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        history: &[u32],
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<()> {
+        let any_penalty = repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
+        if !any_penalty || repeat_window == 0 || history.is_empty() {
+            return Ok(());
+        }
+
+        let window = repeat_window
+            .min(repeat_buf.buf.size() / std::mem::size_of::<u32>())
+            .min(history.len());
+        if window == 0 {
+            return Ok(());
+        }
+        let recent = &history[history.len() - window..];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                recent.as_ptr() as *const u8,
+                window * std::mem::size_of::<u32>(),
+            )
+        };
+        self.hip.memcpy_htod(&repeat_buf.buf, bytes)?;
+
+        self.bind_thread()?;
+        const MODULE: &str = "sample_penalty_prepass";
+        const FUNCTION: &str = "sample_apply_repeat_penalty";
+        if !self.functions.contains_key(FUNCTION) {
+            let src =
+                kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20");
+            self.ensure_kernel(MODULE, &src, FUNCTION)?;
+        }
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut repeat_ptr = repeat_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut rw = window as i32;
+        let mut rp = repeat_penalty;
+        let mut pp = presence_penalty;
+        let mut fp = frequency_penalty;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut c_void,
+            &mut repeat_ptr as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut rw as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut fp as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[FUNCTION];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// GPU-side top-K + top-P sampling. Returns (token_id, new_rng_state).
     /// Eliminates 600KB logits download per token.
     pub fn sample_top_p(

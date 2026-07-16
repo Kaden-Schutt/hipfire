@@ -340,6 +340,7 @@ fn main() {
             top_k,
             top_p,
             min_p,
+            ..Default::default()
         };
         state.set_sampling(cfg, seed);
         eprintln!("sampling: temp={temp} top_k={top_k} top_p={top_p} min_p={min_p} seed={seed}");
@@ -470,21 +471,30 @@ fn main() {
             .expect("capture prev_hidden");
     }
 
-    // Pick the seed_token: argmax of the trunk's logits for the last prefill
-    // position. This becomes cycle 0's `last_committed`.
+    // Pick the seed from the same requested distribution used by later MTP
+    // cycles. This becomes cycle 0's `last_committed`.
     let logits0 = gpu
         .download_f32(&target.scratch.logits)
         .expect("download seed logits");
-    let mut seed_token = 0u32;
-    let mut best = f32::NEG_INFINITY;
-    for (i, &v) in logits0.iter().enumerate() {
-        if v > best {
-            best = v;
-            seed_token = i as u32;
-        }
-    }
+    let seed_token = if state.sampling.is_greedy() {
+        logits0
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
+            })
+            .0
+    } else {
+        hipfire_arch_qwen35::mtp_spec::sample_from_logits(&logits0, &state.sampling, &mut state.rng)
+            .0
+    };
+    state.push_sampling_history(seed_token);
     eprintln!(
-        "seed token (greedy after prefill): {} ('{}')",
+        "seed token after prefill: {} ('{}')",
         seed_token,
         tokenizer
             .decode(&[seed_token])

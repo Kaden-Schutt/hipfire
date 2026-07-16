@@ -5945,6 +5945,29 @@ fn generate_spec(
     })
 }
 
+fn mtp_request_seed(request_id: &str) -> u64 {
+    if let Some(seed) = std::env::var("HIPFIRE_MTP_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return seed.max(1);
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let id_hash = request_id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    (now ^ id_hash ^ seq.rotate_left(17)).max(1)
+}
+
 /// Qwen3.5/3.6 native-MTP (NextN) speculative decode serve path.
 ///
 /// Analog of [`generate_deepseek4`]'s spec branch and [`generate_dflash`], but
@@ -6004,6 +6027,10 @@ fn generate_qwen35_mtp(
     // applied to BOTH draft + target nuclei → lossless == AR-at-(min_p,top_k,top_p).
     // 0.0 = disabled. Ignored on the greedy path.
     min_p: f32,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
 ) {
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -6256,29 +6283,26 @@ fn generate_qwen35_mtp(
             return;
         }
     }
-    if temp > 1e-6 {
-        // Sampled MTP. temp/top_p/top_k AND the sampling min_p are honored (folded
-        // into the GPU nucleus tau). The draft-chain p_min now ALSO composes with
-        // sampling via DraftMode::SampledPMin (sampled draft + early chain-cutoff
-        // on the head's raw top prob — lossless, the tau lever for sampled MTP), so
-        // we feed the resolved p_min through instead of clearing it. p_min<=0
-        // (HIPFIRE_MTP_P_MIN=0) → plain DraftMode::Sampled (no chain pruning).
-        state.set_p_min(p_min);
-        // set_sampling asserts top_p in (0,1]; a request top_p of 0.0 means
-        // "disabled", so clamp it to 1.0 (the no-nucleus sentinel).
-        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
-        state.set_sampling(
-            mtp_spec::MtpSamplingConfig {
-                temp,
-                top_k: top_k.map(|k| k as usize).unwrap_or(0),
-                top_p: top_p_eff,
-                min_p,
-            },
-            42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
-        );
-    } else {
-        state.set_p_min(p_min); // greedy MTP confidence cutoff
-    }
+    // The same request sampling contract is applied to every proposal and
+    // verify row. Penalty history contains generated tokens only (never prompt
+    // tokens), matching the plain-AR path. Row k additionally sees candidates
+    // 0..k, never future speculative tokens.
+    state.set_p_min(p_min);
+    let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
+    let request_seed = mtp_request_seed(id);
+    state.set_sampling(
+        mtp_spec::MtpSamplingConfig {
+            temp: temp.max(0.0),
+            top_k: top_k.map(|k| k as usize).unwrap_or(0),
+            top_p: top_p_eff,
+            min_p,
+            repeat_penalty: repeat_penalty.max(1.0),
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+        },
+        request_seed,
+    );
 
     let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new
 
@@ -6326,17 +6350,22 @@ fn generate_qwen35_mtp(
             return;
         }
     };
-    let seed_token = seed_logits
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
-        })
-        .0;
+    let seed_token = if temp > 1e-6 {
+        mtp_spec::sample_from_logits(&seed_logits, &state.sampling, &mut state.rng).0
+    } else {
+        seed_logits
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
+            })
+            .0
+    };
+    state.push_sampling_history(seed_token);
 
     // ── Decode loop ─────────────────────────────────────────────────────
     let t_prefill = Instant::now();
@@ -6539,6 +6568,7 @@ fn generate_qwen35_mtp(
                 }
                 cur_pos += advance_toks.len();
                 last_committed = *close_ids.last().unwrap();
+                state.extend_sampling_history(&close_ids);
                 think_closed = true;
                 prev_in_think = false;
             }
@@ -8217,14 +8247,14 @@ fn generate(
             top_p, // nucleus cutoff: honored on the sampled MTP path
             top_k, // top-k cutoff: honored on the sampled MTP path (both nuclei)
             min_p.unwrap_or(0.0), // min_p floor: honored on the sampled MTP nuclei
-        );
-        // Silence unused-variable warnings for AR-only / DFlash-only knobs the
-        // MTP serve path does not consume.
-        let _ = (
             repeat_penalty,
             repeat_window,
             presence_penalty,
             frequency_penalty,
+        );
+        // Silence unused-variable warnings for AR-only / DFlash-only knobs the
+        // MTP serve path does not consume.
+        let _ = (
             budget_alert_at_tok,
             budget_alert_text,
             pflash_state,

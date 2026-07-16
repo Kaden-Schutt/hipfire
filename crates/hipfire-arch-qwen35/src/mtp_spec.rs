@@ -37,6 +37,7 @@ use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::collections::HashMap;
 use std::time::Instant;
 
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
@@ -51,6 +52,10 @@ pub struct MtpSamplingConfig {
     pub top_k: usize, // 0 = disabled (no top-K cutoff)
     pub top_p: f32,   // 1.0 = disabled (no nucleus cutoff)
     pub min_p: f32,   // 0.0 = disabled (no min-prob cutoff)
+    pub repeat_penalty: f32,
+    pub repeat_window: usize,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
 }
 
 impl Default for MtpSamplingConfig {
@@ -60,6 +65,10 @@ impl Default for MtpSamplingConfig {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -67,6 +76,13 @@ impl Default for MtpSamplingConfig {
 impl MtpSamplingConfig {
     pub fn is_greedy(&self) -> bool {
         self.temp <= 0.0
+    }
+
+    pub fn penalties_active(&self) -> bool {
+        self.repeat_window > 0
+            && (self.repeat_penalty > 1.0
+                || self.presence_penalty > 0.0
+                || self.frequency_penalty > 0.0)
     }
 }
 
@@ -200,9 +216,11 @@ fn mtp_device_token_chain_eligible_for(
     embd_format: llama::EmbeddingFormat,
     use_sampling: bool,
     use_p_min: bool,
+    penalties_active: bool,
 ) -> bool {
     !use_sampling
         && !use_p_min
+        && !penalties_active
         && matches!(
             embd_format,
             llama::EmbeddingFormat::HFQ4G256 | llama::EmbeddingFormat::Q8_0
@@ -503,9 +521,8 @@ pub struct MtpSpecState {
     /// Result buffer for `gpu.sample_top_p`: shape `[2]` u32-as-F32. Slot 0
     /// = sampled token id, slot 1 = updated rng state.
     pub mtp_sample_result: GpuTensor,
-    /// Dummy repeat-penalty buffer for `gpu.sample_top_p` (we pass
-    /// `repeat_window=0`, so the kernel skips this branch entirely;
-    /// only allocated so the dispatch wrapper has a valid pointer).
+    /// Repeat-token scratch shared by per-row speculative penalty prepasses.
+    /// Sized like the AR sampler's long-window buffer (2048 u32 tokens).
     pub mtp_sample_repeat_buf: GpuTensor,
     /// Single-element index buf for the per-step p_draft gather. Shape `[1]`
     /// i32-as-F32. H2D'd with the sampled token id, fed to
@@ -545,6 +562,15 @@ pub struct MtpSpecState {
     /// RNG state for sampling. Seeded via [`Self::set_sampling`].
     /// Single global stream across all spec-decode positions in a generation.
     pub rng: MtpRng,
+
+    /// Generated-token history visible to sampling penalties. Prompt tokens
+    /// are deliberately excluded, matching the plain-AR daemon path.
+    pub sampling_history: Vec<u32>,
+
+    /// Full-vocab token id → compressed draft-vocab row. Needed so a penalty
+    /// applied to the trunk token history adjusts the corresponding compressed
+    /// MTP logit rather than treating the full token id as a row index.
+    mtp_vocab_inverse: Option<HashMap<u32, u32>>,
 }
 
 impl MtpSpecState {
@@ -627,11 +653,18 @@ impl MtpSpecState {
         // GPU sampling scratches (always allocated; only used when temp > 0).
         // All are tiny so the unconditional alloc is fine.
         let mtp_sample_result = gpu.alloc_tensor(&[2], DType::F32)?;
-        let mtp_sample_repeat_buf = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_sample_repeat_buf = gpu.alloc_tensor(&[2048], DType::F32)?;
         let mtp_gather_idx_draft = gpu.alloc_tensor(&[1], DType::F32)?;
         let mtp_gather_prob_draft = gpu.alloc_tensor(&[1], DType::F32)?;
         let mtp_gather_idx_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
         let mtp_gather_prob_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
+
+        let mtp_vocab_inverse = head.weights.lm_head_draft_vocab_map.as_ref().map(|map| {
+            map.iter()
+                .enumerate()
+                .map(|(draft_id, &token_id)| (token_id, draft_id as u32))
+                .collect()
+        });
 
         Ok(Self {
             prev_hidden,
@@ -674,10 +707,12 @@ impl MtpSpecState {
             p_min: default_mtp_p_min(gpu.arch.as_str()),
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
+            sampling_history: Vec::new(),
+            mtp_vocab_inverse,
         })
     }
 
-    /// Configure sampling (temp/top_p/top_k/min_p) and reseed the per-state RNG.
+    /// Configure sampling and reseed the per-state RNG.
     /// `cfg.temp == 0.0` keeps the legacy greedy path. `cfg.temp > 0` enables
     /// residual-acceptance sampling per the Unsloth/llama.cpp MTP recipe.
     /// Reseeds BOTH the host RNG (used for the residual accept rule) and the
@@ -698,8 +733,24 @@ impl MtpSpecState {
             "set_sampling: min_p must be in [0,1], got {}",
             cfg.min_p
         );
+        assert!(
+            cfg.repeat_penalty.is_finite() && cfg.repeat_penalty >= 1.0,
+            "set_sampling: repeat_penalty must be finite and >= 1.0, got {}",
+            cfg.repeat_penalty
+        );
+        assert!(
+            cfg.presence_penalty.is_finite() && cfg.presence_penalty >= 0.0,
+            "set_sampling: presence_penalty must be finite and >= 0.0, got {}",
+            cfg.presence_penalty
+        );
+        assert!(
+            cfg.frequency_penalty.is_finite() && cfg.frequency_penalty >= 0.0,
+            "set_sampling: frequency_penalty must be finite and >= 0.0, got {}",
+            cfg.frequency_penalty
+        );
         self.sampling = cfg;
         self.rng = MtpRng::new(seed);
+        self.sampling_history.clear();
         // GPU rng uses u32; mix the lower + upper halves so different seeds
         // produce different on-device streams.
         self.gpu_rng_state = ((seed >> 32) as u32) ^ (seed as u32) | 1;
@@ -714,6 +765,14 @@ impl MtpSpecState {
             "MtpSpecState::set_p_min: p_min must be in [0.0, 1.0], got {p_min}"
         );
         self.p_min = p_min;
+    }
+
+    pub fn push_sampling_history(&mut self, token: u32) {
+        self.sampling_history.push(token);
+    }
+
+    pub fn extend_sampling_history(&mut self, tokens: &[u32]) {
+        self.sampling_history.extend_from_slice(tokens);
     }
 
     /// Allocate `mtp_lm_logits_compressed` shape `[max_n * cvs]` for the
@@ -782,6 +841,7 @@ impl MtpSpecState {
         self.mtp_proposal_graph_warmed = false;
         self.mtp_proposal_graph_seq_cap = 0;
         self.mtp_kv.reset(gpu)?;
+        self.sampling_history.clear();
         Ok(())
     }
 
@@ -2260,6 +2320,43 @@ fn mtp_sampled_accept(
     Ok(hit_eos)
 }
 
+fn apply_mtp_penalties(
+    gpu: &mut Gpu,
+    state: &MtpSpecState,
+    logits: &GpuTensor,
+    vocab: usize,
+    history: &[u32],
+) -> HipResult<()> {
+    let sampling = state.sampling;
+    gpu.apply_sampling_penalties_f32(
+        logits,
+        &state.mtp_sample_repeat_buf,
+        vocab,
+        history,
+        sampling.repeat_window,
+        sampling.repeat_penalty,
+        sampling.presence_penalty,
+        sampling.frequency_penalty,
+    )
+}
+
+fn map_draft_penalty_history(
+    committed_history: &[u32],
+    speculative_prefix: &[u32],
+    compressed_inverse: Option<&HashMap<u32, u32>>,
+) -> Vec<u32> {
+    let full_history = committed_history
+        .iter()
+        .copied()
+        .chain(speculative_prefix.iter().copied());
+    let Some(inverse) = compressed_inverse else {
+        return full_history.collect();
+    };
+    full_history
+        .filter_map(|token| inverse.get(&token).copied())
+        .collect()
+}
+
 // ─── FastMTP-style compressed SERIAL spec step (K serial roundtrips) ──────
 //
 // Variant of [`spec_step_mtp_compressed`] that runs K MTP steps as
@@ -2421,7 +2518,10 @@ pub fn spec_step_mtp_compressed_serial(
         (true, false) => DraftMode::Greedy,
     };
     let use_p_min = matches!(draft_mode, DraftMode::PMin { .. });
-    let use_sampling = matches!(draft_mode, DraftMode::Sampled | DraftMode::SampledPMin { .. });
+    let use_sampling = matches!(
+        draft_mode,
+        DraftMode::Sampled | DraftMode::SampledPMin { .. }
+    );
     let use_sampled_pmin = matches!(draft_mode, DraftMode::SampledPMin { .. });
     let log_p_min = match draft_mode {
         DraftMode::PMin { log_p_min } | DraftMode::SampledPMin { log_p_min } => log_p_min,
@@ -2453,8 +2553,14 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         Vec::new()
     };
+    let penalties_active = sampling.penalties_active();
     let use_device_token_chain = mtp_device_token_chain_enabled_from_env()
-        && mtp_device_token_chain_eligible_for(trunk_weights.embd_format, use_sampling, use_p_min);
+        && mtp_device_token_chain_eligible_for(
+            trunk_weights.embd_format,
+            use_sampling,
+            use_p_min,
+            penalties_active,
+        );
     if use_device_token_chain && !use_full_vocab {
         assert!(
             head.weights.lm_head_draft_vocab_map_gpu.is_some(),
@@ -2674,6 +2780,30 @@ pub fn spec_step_mtp_compressed_serial(
                 state.mtp_scratch.logits_compressed.as_ref().unwrap()
             };
             let argmax_vocab = cvs; // = full vocab in full-vocab mode, = compressed vocab in compressed mode
+
+            if penalties_active {
+                let penalty_history = map_draft_penalty_history(
+                    &state.sampling_history,
+                    &candidates,
+                    if use_full_vocab {
+                        None
+                    } else {
+                        Some(
+                            state
+                                .mtp_vocab_inverse
+                                .as_ref()
+                                .expect("compressed MTP missing inverse vocab map"),
+                        )
+                    },
+                );
+                apply_mtp_penalties(
+                    gpu,
+                    state,
+                    logits_for_argmax,
+                    argmax_vocab,
+                    &penalty_history,
+                )?;
+            }
 
             let draft_idx: usize;
             if use_sampling {
@@ -3066,6 +3196,17 @@ pub fn spec_step_mtp_compressed_serial(
         }
     }
 
+    if penalties_active {
+        let mut row_history = state.sampling_history.clone();
+        for row in 0..n_verify {
+            let row_logits = state.verify_logits.sub_offset(row * vocab, vocab);
+            apply_mtp_penalties(gpu, state, &row_logits, vocab, &row_history)?;
+            if row < candidates.len() {
+                row_history.push(candidates[row]);
+            }
+        }
+    }
+
     let mut accept_count = 0usize;
     // Assigned exactly once in each arm below (sampled accept returns it; the
     // legacy arm copies it out of the accept result), so no dead initializer.
@@ -3246,6 +3387,8 @@ pub fn spec_step_mtp_compressed_serial(
         }
     }
 
+    state.extend_sampling_history(&committed);
+
     Ok(MtpSpecResult {
         committed,
         accept_count,
@@ -3309,28 +3452,55 @@ mod tests {
         assert!(mtp_device_token_chain_eligible_for(
             llama::EmbeddingFormat::HFQ4G256,
             false,
+            false,
             false
         ));
         assert!(mtp_device_token_chain_eligible_for(
             llama::EmbeddingFormat::Q8_0,
+            false,
             false,
             false
         ));
         assert!(!mtp_device_token_chain_eligible_for(
             llama::EmbeddingFormat::HFQ4G128,
             false,
+            false,
             false
         ));
         assert!(!mtp_device_token_chain_eligible_for(
             llama::EmbeddingFormat::HFQ4G256,
+            true,
+            false,
+            false
+        ));
+        assert!(!mtp_device_token_chain_eligible_for(
+            llama::EmbeddingFormat::HFQ4G256,
+            false,
             true,
             false
         ));
         assert!(!mtp_device_token_chain_eligible_for(
             llama::EmbeddingFormat::HFQ4G256,
             false,
+            false,
             true
         ));
+    }
+
+    #[test]
+    fn penalty_history_is_row_specific_and_maps_compressed_vocab() {
+        let committed = [10, 20, 20];
+        let prefix = [30, 40];
+        assert_eq!(
+            map_draft_penalty_history(&committed, &prefix, None),
+            vec![10, 20, 20, 30, 40]
+        );
+
+        let inverse = HashMap::from([(20, 2), (40, 4)]);
+        assert_eq!(
+            map_draft_penalty_history(&committed, &prefix, Some(&inverse)),
+            vec![2, 2, 4]
+        );
     }
 
     #[test]
