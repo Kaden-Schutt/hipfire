@@ -97,6 +97,7 @@ class FakeGitHub:
         self.revoke_before_next_review: dict | None = None
         self.inject_review_on_completion = False
         self.inject_review_on_labels = False
+        self.inject_review_on_remove = False
         self.deleted_comment_ids: set[int] = set()
         self.edited_comment_ids: set[int] = set()
 
@@ -238,6 +239,16 @@ class FakeGitHub:
             raise RuntimeError("label removal failed")
         self.removed_labels.append(label)
         self.labels.discard(label)
+        if self.inject_review_on_remove and self.reviews:
+            stale = deepcopy(self.reviews[0])
+            stale["id"] = 903
+            stale["node_id"] = "stale-during-remove"
+            stale_payload = json.loads(self.payload_from_body(stale["body"]))
+            stale_payload["record_id"] = "stale-during-remove"
+            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
+            stale["body"] = json.dumps(stale_payload)
+            self.reviews.append(stale)
+            self.inject_review_on_remove = False
         return GitHubResponse({}, {}, 204)
 
     def dismiss_workflow_review(self, repository: str, number: int, review_id: int, *, message: str) -> GitHubResponse:
@@ -626,3 +637,25 @@ def test_completion_history_refresh_dismisses_review_appearing_after_completion_
     assert result.status == "complete", result.reason
     assert ("dismiss", 901) in client.calls
     assert client.removed_labels == ["needs-review"]
+
+
+def test_review_appearing_during_label_removal_is_reconciled_before_complete():
+    client = FakeGitHub()
+    client.inject_review_on_remove = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "complete", result.reason
+    assert ("dismiss", 903) in client.calls
+    assert client.removed_labels == ["needs-review"]
+
+
+def test_review_race_dismissal_failure_reapplies_needs_review():
+    client = FakeGitHub()
+    client.inject_review_on_remove = True
+    client.fail.add("dismiss")
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status in {"incomplete", "error"}
+    assert "needs-review" in client.labels

@@ -480,6 +480,12 @@ class ReviewPublisher:
                 attempt_id=attempt_id,
                 intent_node=canonical.node_id,
             )
+            try:
+                self._assert_target(target)
+                self._reconcile_workflow_reviews(target, attempt_id, intent_node, keep_node)
+            except Exception:
+                self._reapply_label(target, attempt_id)
+                raise
 
     def _recover(self, target: ReviewTarget, attempt_id: str, status: str, reason: str) -> PublishResult:
         try:
