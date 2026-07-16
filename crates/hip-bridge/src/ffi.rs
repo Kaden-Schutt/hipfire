@@ -165,6 +165,8 @@ pub struct HipRuntime {
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
+    fn_mem_get_address_range:
+        unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32,
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
@@ -356,6 +358,11 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
                 ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
+                fn_mem_get_address_range: load_fn!(
+                    lib,
+                    "hipMemGetAddressRange",
+                    unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32
+                ),
                 fn_memcpy: load_fn!(
                     lib,
                     "hipMemcpy",
@@ -706,6 +713,26 @@ impl HipRuntime {
     pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
+    }
+
+    /// Return the base and byte extent of the HIP allocation containing
+    /// `device_ptr`. This is used by retained replay to conservatively treat
+    /// distinct subviews of one allocation as aliasing resources.
+    pub fn mem_get_address_range(
+        &self,
+        device_ptr: *mut c_void,
+    ) -> HipResult<(*mut c_void, usize)> {
+        let mut base = ptr::null_mut();
+        let mut size = 0usize;
+        let code = unsafe { (self.fn_mem_get_address_range)(&mut base, &mut size, device_ptr) };
+        self.check(code, "hipMemGetAddressRange")?;
+        if base.is_null() || size == 0 {
+            return Err(HipError::new(
+                0,
+                "hipMemGetAddressRange returned an empty allocation",
+            ));
+        }
+        Ok((base, size))
     }
 
     /// Copy host data into GPU buffer at a byte offset.

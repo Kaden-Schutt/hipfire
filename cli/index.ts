@@ -5812,13 +5812,18 @@ interface BenchResult {
   ttft: number[];
 }
 
-function stats(arr: number[]): { mean: number; min: number; max: number; stdev: number } {
-  if (arr.length === 0) return { mean: 0, min: 0, max: 0, stdev: 0 };
+function stats(arr: number[]): { mean: number; median: number; min: number; max: number; stdev: number } {
+  if (arr.length === 0) return { mean: 0, median: 0, min: 0, max: 0, stdev: 0 };
   const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
   const min = Math.min(...arr);
   const max = Math.max(...arr);
   const variance = arr.reduce((sum, v) => sum + (v - mean) ** 2, 0) / arr.length;
-  return { mean, min, max, stdev: Math.sqrt(variance) };
+  return { mean, median, min, max, stdev: Math.sqrt(variance) };
 }
 
 function fmtNum(n: number, w = 7): string {
@@ -5855,6 +5860,17 @@ interface BenchRunResult {
   tokens: number;
   ok: boolean;
   poisoned: boolean;
+}
+
+interface BenchMatrixOptions {
+  ppSizes: number[];
+  contexts: number[];
+  tg: number;
+  sustainedTg: number | null;
+  sustainedContexts: number[];
+  warmups: number;
+  redlinePm4: boolean;
+  kvMode: string | null;
 }
 
 async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs = 120_000): Promise<BenchRunResult> {
@@ -5916,7 +5932,53 @@ async function benchPrefill(e: Engine, tokens: number, timeoutMs = 60_000): Prom
   }
 }
 
-async function bench(model: string, runs: number, experimental: boolean, prompt: string, jsonOut = false) {
+// Synthetic context-conditioned decode measurement. The daemon primes exactly
+// `contextTokens` deterministic tokens outside the measured interval, then
+// synchronously times `iterations` single-token forwards. This avoids prompt,
+// sampler, EOS, and tokenizer confounds while still exercising the production
+// KV/attention path at the requested context length.
+async function benchDecode(
+  e: Engine,
+  contextTokens: number,
+  iterations: number,
+  timeoutMs = 600_000,
+): Promise<{ tokS: number; ms: number; usPerToken: number } | null> {
+  try {
+    await withTimeout(e.send({
+      type: "bench_decode",
+      context_tokens: contextTokens,
+      iterations,
+    }), 5_000, "bench_decode send");
+    const res = await withTimeout(
+      e.recv(),
+      timeoutMs,
+      `bench_decode (ctx=${contextTokens}, tg=${iterations})`,
+    );
+    if (res.type === "decode_result") {
+      return {
+        tokS: res.tok_s || 0,
+        ms: res.ms || 0,
+        usPerToken: res.us_per_token || 0,
+      };
+    }
+    if (res.type === "error" && res.message) {
+      console.error(`  tg${iterations}@${contextTokens}: ${res.message}`);
+    }
+    return null;
+  } catch (err: any) {
+    console.error(`  tg${iterations}@${contextTokens}: ${err?.message || "failed"}`);
+    return null;
+  }
+}
+
+async function bench(
+  model: string,
+  runs: number,
+  experimental: boolean,
+  prompt: string,
+  jsonOut = false,
+  matrix: BenchMatrixOptions | null = null,
+) {
   let modelPath = findModel(model);
   if (!modelPath) {
     const resolved = resolveModelTag(model);
@@ -5930,6 +5992,20 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
   }
 
   applyConfigEnv(cfg, model);
+
+  // Matrix mode is an explicit product-path benchmark. Keep clocks under the
+  // driver's automatic policy, but make the retained-PM4 selection unambiguous
+  // when requested instead of depending on the caller's shell environment.
+  if (matrix?.redlinePm4) {
+    process.env.HIPFIRE_REPLAY_BACKEND = "auto";
+    process.env.HIPFIRE_REPLAY_TRANSPORT = "pm4";
+    process.env.HIPFIRE_AR_GRAPH = "1";
+    process.env.HIPFIRE_GRAPH = "1";
+    process.env.HIPFIRE_CASK_OFF = "1";
+  }
+  if (matrix && !process.env.HIPFIRE_DPM_WARMUP_SECS) {
+    process.env.HIPFIRE_DPM_WARMUP_SECS = "10";
+  }
 
   // Start daemon
   const e = new Engine();
@@ -5948,6 +6024,19 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
   const isRdna2 = gpuArch === "gfx1030" || gpuArch === "gfx1031";
 
   const loadMsg = buildLoadMessage(modelPath, model);
+  if (matrix) {
+    if (matrix.kvMode) loadMsg.params.kv_mode = matrix.kvMode;
+    const longestPrefill = matrix.ppSizes.length ? Math.max(...matrix.ppSizes) : 0;
+    const longestDecode = matrix.contexts.length
+      ? Math.max(...matrix.contexts) + Math.max(matrix.tg, matrix.sustainedTg || 0)
+      : 0;
+    // Both daemon probes reserve 32 physical slots after their measured span.
+    loadMsg.params.max_seq = Math.max(
+      loadMsg.params.max_seq,
+      longestPrefill + 32,
+      longestDecode + 32,
+    );
+  }
   await e.send(loadMsg);
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
@@ -5967,7 +6056,18 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
   if (loadedMb > 0) console.error(`  vram:      ${loadedMb} MB loaded  (${vramFreePostMb}/${vramTotalMb} MB free)`);
   else              console.error(`  vram:      ${vramFreePostMb}/${vramTotalMb} MB free`);
   console.error(`  runs:      ${runs}`);
-  console.error(`  prompt:    "${prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt}"`);
+  if (matrix) {
+    console.error(`  benchmark: synthetic pp/decode matrix`);
+    console.error(`  pp:        ${matrix.ppSizes.join(",")}`);
+    console.error(`  decode:    tg${matrix.tg} @ ctx ${matrix.contexts.join(",")}`);
+    if (matrix.sustainedTg) {
+      console.error(`  sustained: tg${matrix.sustainedTg} @ ctx ${matrix.sustainedContexts.join(",")}`);
+    }
+    console.error(`  warmups:   ${matrix.warmups} retained-decode rows`);
+    console.error(`  replay:    ${matrix.redlinePm4 ? "auto/pm4" : "configured default"}`);
+  } else {
+    console.error(`  prompt:    "${prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt}"`);
+  }
 
   if (experimental && !isRdna2) {
     console.error(`\n--exp requires RDNA2 (gfx1030/gfx1031), detected ${gpuArch}. Running standard bench.`);
@@ -6094,7 +6194,182 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 
   } else {
     // ── Standard bench ──
-    console.error(`  mode:      standard\n`);
+    console.error(`  mode:      ${matrix ? "matrix" : "standard"}\n`);
+
+    if (matrix) {
+      type MatrixRow = {
+        tokens: number;
+        samples: number[];
+        ms: number[];
+      };
+      type DecodeMatrixRow = MatrixRow & {
+        context: number;
+        usPerToken: number[];
+      };
+
+      // Shape/JIT warmup for prefill. One discarded pass per PP size is
+      // sufficient because the measured rows stay continuous afterward.
+      process.stderr.write("  warming pp shapes: ");
+      for (const size of matrix.ppSizes) {
+        const warmed = await benchPrefill(e, size, 600_000);
+        process.stderr.write(warmed ? `pp${size} ` : `pp${size}=skip `);
+      }
+      console.error("");
+
+      // Retained replay needs several complete rows to pass recording, shadow,
+      // and steady-state preparation. Warm only at the shortest context: the
+      // dispatch tape is context-invariant, while each longer-context row gets
+      // one additional discarded local warmup below.
+      const warmContext = matrix.contexts[0] || 128;
+      process.stderr.write(`  warming tg${matrix.tg}@${warmContext}: `);
+      for (let i = 0; i < matrix.warmups; i++) {
+        const warmed = await benchDecode(e, warmContext, matrix.tg);
+        if (!warmed) {
+          console.error("FAIL");
+          await e.stop();
+          process.exit(1);
+        }
+        process.stderr.write(".");
+      }
+      console.error(" done\n");
+
+      const ppRows: MatrixRow[] = [];
+      for (const size of matrix.ppSizes) {
+        process.stderr.write(`  pp${size}: `);
+        const samples: number[] = [];
+        const ms: number[] = [];
+        for (let r = 0; r < runs; r++) {
+          const result = await benchPrefill(e, size, 600_000);
+          if (!result) break;
+          samples.push(result.tokS);
+          ms.push(result.ms);
+          process.stderr.write(".");
+        }
+        console.error(samples.length ? ` ${stats(samples).median.toFixed(1)} tok/s` : " FAIL");
+        if (samples.length) ppRows.push({ tokens: size, samples, ms });
+      }
+
+      const measureDecodeRows = async (
+        tg: number,
+        contexts: number[],
+        skipFirstWarmup: boolean,
+      ): Promise<DecodeMatrixRow[]> => {
+        const rows: DecodeMatrixRow[] = [];
+        for (const context of contexts) {
+          process.stderr.write(`  tg${tg}@${context}: `);
+          if (!(skipFirstWarmup && context === warmContext && tg === matrix.tg)) {
+            const warmed = await benchDecode(e, context, tg);
+            if (!warmed) {
+              console.error("warmup FAIL");
+              continue;
+            }
+          }
+          const samples: number[] = [];
+          const ms: number[] = [];
+          const usPerToken: number[] = [];
+          for (let r = 0; r < runs; r++) {
+            const result = await benchDecode(e, context, tg);
+            if (!result) break;
+            samples.push(result.tokS);
+            ms.push(result.ms);
+            usPerToken.push(result.usPerToken);
+            process.stderr.write(".");
+          }
+          console.error(samples.length ? ` ${stats(samples).median.toFixed(2)} tok/s` : " FAIL");
+          if (samples.length) rows.push({ tokens: tg, context, samples, ms, usPerToken });
+        }
+        return rows;
+      };
+
+      const decodeRows = await measureDecodeRows(matrix.tg, matrix.contexts, true);
+      const sustainedRows = matrix.sustainedTg
+        ? await measureDecodeRows(matrix.sustainedTg, matrix.sustainedContexts, false)
+        : [];
+
+      const serializeStats = (values: number[]) => {
+        const s = stats(values);
+        return {
+          median: Number(s.median.toFixed(3)),
+          mean: Number(s.mean.toFixed(3)),
+          min: Number(s.min.toFixed(3)),
+          max: Number(s.max.toFixed(3)),
+          stdev: Number(s.stdev.toFixed(3)),
+        };
+      };
+      const pp512 = ppRows.find(row => row.tokens === 512) || ppRows[0];
+      const headline = decodeRows.find(row => row.context === 128) || decodeRows[0];
+      const report = {
+        protocol: "synthetic-pp-tg-matrix-v1",
+        model: basename(modelPath!),
+        arch: loaded.arch ?? null,
+        gpu: gpuArch,
+        hip_version: hipVer,
+        kv_mode: matrix.kvMode || cfg.kv_cache,
+        max_seq: loadMsg.params.max_seq,
+        automatic_clocks: true,
+        replay: matrix.redlinePm4 ? { backend: "auto", transport: "pm4" } : { backend: "configured" },
+        warmups: matrix.warmups,
+        runs,
+        prefill_tok_s: pp512 ? Number(stats(pp512.samples).median.toFixed(2)) : 0,
+        gen_tok_s: headline ? Number(stats(headline.samples).median.toFixed(2)) : 0,
+        prefill: ppRows.map(row => ({
+          pp: row.tokens,
+          tok_s: serializeStats(row.samples),
+          ms: serializeStats(row.ms),
+          samples: row.samples,
+        })),
+        decode: decodeRows.map(row => ({
+          tg: row.tokens,
+          context: row.context,
+          tok_s: serializeStats(row.samples),
+          us_per_token: serializeStats(row.usPerToken),
+          samples: row.samples,
+        })),
+        sustained_decode: sustainedRows.map(row => ({
+          tg: row.tokens,
+          context: row.context,
+          tok_s: serializeStats(row.samples),
+          us_per_token: serializeStats(row.usPerToken),
+          samples: row.samples,
+        })),
+      };
+
+      if (jsonOut) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log("\n  Prefill       median tok/s       min       max     stdev        ms");
+        console.log("  " + "─".repeat(72));
+        for (const row of ppRows) {
+          const s = stats(row.samples);
+          const ms = stats(row.ms);
+          console.log(
+            `  pp${String(row.tokens).padEnd(8)}` +
+            `${fmtNum(s.median,14)}${fmtNum(s.min,10)}${fmtNum(s.max,10)}` +
+            `${fmtNum(s.stdev,10)}${fmtNum(ms.median,10)}`
+          );
+        }
+
+        const printDecodeTable = (title: string, rows: DecodeMatrixRow[]) => {
+          if (!rows.length) return;
+          console.log(`\n  ${title}      median tok/s       min       max     stdev    us/tok`);
+          console.log("  " + "─".repeat(72));
+          for (const row of rows) {
+            const s = stats(row.samples);
+            const us = stats(row.usPerToken);
+            console.log(
+              `  tg${row.tokens}@${String(row.context).padEnd(7)}` +
+              `${fmtNum(s.median,14)}${fmtNum(s.min,10)}${fmtNum(s.max,10)}` +
+              `${fmtNum(s.stdev,10)}${fmtNum(us.median,10)}`
+            );
+          }
+        };
+        printDecodeTable("Decode", decodeRows);
+        printDecodeTable("Sustained", sustainedRows);
+      }
+
+      await e.stop();
+      return;
+    }
 
     // Warmup
     process.stderr.write("  warming up...");
@@ -8670,36 +8945,126 @@ Examples:
   }
   case "bench": {
     const benchJson = takeFlag(rest, "-j", "--json");
-    const exp = rest.includes("--exp");
-    const runsIdx = rest.indexOf("--runs");
-    const runs = runsIdx >= 0 && runsIdx + 1 < rest.length ? parseInt(rest[runsIdx + 1]) : 5;
-    if (isNaN(runs) || runs < 1) { console.error("Error: --runs must be a positive integer"); process.exit(1); }
-    // Filter out flags to find model and prompt
-    const skipSet = new Set<number>();
-    if (exp) skipSet.add(rest.indexOf("--exp"));
-    if (runsIdx >= 0) { skipSet.add(runsIdx); skipSet.add(runsIdx + 1); }
-    const positional = rest.filter((_, i) => !skipSet.has(i));
-    const benchModel = positional[0];
-    if (!benchModel) {
-      console.error(`Usage: hipfire bench <model> [--exp] [--runs N] [--json] [prompt]
+    const exp = takeFlag(rest, "--exp");
+    const matrixFlag = takeFlag(rest, "--matrix");
+    const redlinePm4 = takeFlag(rest, "--redline");
+    const runsRaw = takeFlagValue(rest, "--runs");
+    const ppRaw = takeFlagValue(rest, "--pp");
+    const contextsRaw = takeFlagValue(rest, "--ctx");
+    const tgRaw = takeFlagValue(rest, "--tg");
+    const sustainedTgRaw = takeFlagValue(rest, "--sustained-tg");
+    const sustainedContextsRaw = takeFlagValue(rest, "--sustained-ctx");
+    const warmupsRaw = takeFlagValue(rest, "--warmups");
+    const kvMode = takeFlagValue(rest, "--kv-mode");
+    const help = takeFlag(rest, "-h", "--help");
+    const runs = runsRaw === null ? 5 : (/^\d+$/.test(runsRaw) ? parseInt(runsRaw, 10) : NaN);
+    if (!Number.isSafeInteger(runs) || runs < 1) { console.error("Error: --runs must be a positive integer"); process.exit(1); }
+    rejectUnknownFlags(rest, "bench");
+    const benchModel = rest[0];
+    if (!benchModel || help) {
+      console.error(`Usage: hipfire bench <model> [--runs N] [--json] [prompt]
+       hipfire bench <model> --matrix [matrix options]
 
   Standard benchmark: measure decode + prefill tok/s over N runs.
   --exp    RDNA2 only: test all 5 kernel variants (occupancy/unroll/cache tradeoffs)
   --runs   Number of runs per variant (default: 5)
-  --json   Emit machine-readable {model,prefill_tok_s,gen_tok_s,runs,...} (standard mode only)
+  --json   Emit machine-readable benchmark results
+
+Matrix benchmark (single-GPU Qwen3.5/Qwen3.6):
+  --matrix              Use deterministic synthetic prefill + context-conditioned decode
+  --pp CSV              Prefill lengths (default: 128,512,2048,4096,8192,20000)
+  --ctx CSV             Starting decode contexts (same default spread)
+  --tg N                Timed decode positions per context (default: 128)
+  --sustained-tg N      Additional sustained-decode length
+  --sustained-ctx CSV   Contexts for sustained decode (default: 128,8192)
+  --warmups N           Complete retained-decode warmup rows (default: 10)
+  --kv-mode MODE        q8, fwht2, fwht3, or fwht4
+  --redline             Explicitly benchmark retained PM4 (auto backend, PM4 transport)
 
 Examples:
   hipfire bench qwen3.5:4b
   hipfire bench qwen3.5:9b --runs 3 --json
-  hipfire bench --exp qwen3.5:4b --runs 5`);
+  hipfire bench --exp qwen3.5:4b --runs 5
+  hipfire bench qwen3.6:35b-a3b --matrix --redline --kv-mode q8 \\
+    --pp 128,512,2048,4096,8192,20000 \\
+    --ctx 128,512,2048,8192,20000 --tg 128 \\
+    --sustained-tg 512 --sustained-ctx 128,8192 --runs 5 --json`);
+      process.exit(help ? 0 : 1);
+    }
+    const matrixRequested = matrixFlag || redlinePm4 || ppRaw !== null || contextsRaw !== null ||
+      tgRaw !== null || sustainedTgRaw !== null || sustainedContextsRaw !== null ||
+      warmupsRaw !== null || kvMode !== null;
+    if (exp && matrixRequested) {
+      console.error("Error: --exp and matrix benchmark options cannot be combined");
       process.exit(1);
     }
     if (benchJson && exp) {
       console.error("Error: --json is not supported with --exp (variant comparison is human-only). Drop one.");
       process.exit(1);
     }
-    const benchPrompt = positional.slice(1).join(" ") || "Explain the theory of general relativity in simple terms.";
-    await bench(benchModel, runs, exp, benchPrompt, benchJson);
+
+    const parsePositiveCsv = (raw: string | null, fallback: number[], flag: string): number[] => {
+      if (raw === null) return fallback;
+      const parts = raw.split(",").map(v => v.trim());
+      if (!parts.length || parts.some(v => !/^\d+$/.test(v))) {
+        console.error(`Error: ${flag} must be a comma-separated list of positive integers`);
+        process.exit(1);
+      }
+      const values = parts.map(v => Number.parseInt(v, 10));
+      if (values.some(v => !Number.isSafeInteger(v) || v < 1)) {
+        console.error(`Error: ${flag} must be a comma-separated list of positive integers`);
+        process.exit(1);
+      }
+      return [...new Set(values)];
+    };
+    const parsePositive = (raw: string | null, fallback: number, flag: string): number => {
+      if (raw === null) return fallback;
+      if (!/^\d+$/.test(raw)) {
+        console.error(`Error: ${flag} must be a positive integer`);
+        process.exit(1);
+      }
+      const value = Number.parseInt(raw, 10);
+      if (!Number.isSafeInteger(value) || value < 1) {
+        console.error(`Error: ${flag} must be a positive integer`);
+        process.exit(1);
+      }
+      return value;
+    };
+
+    let matrix: BenchMatrixOptions | null = null;
+    if (matrixRequested) {
+      const defaultSpread = [128, 512, 2048, 4096, 8192, 20000];
+      const contexts = parsePositiveCsv(contextsRaw, defaultSpread, "--ctx");
+      let sustainedContexts = parsePositiveCsv(
+        sustainedContextsRaw,
+        contexts.filter(v => v === 128 || v === 8192),
+        "--sustained-ctx",
+      );
+      if (!sustainedContexts.length) {
+        sustainedContexts = [...new Set([contexts[0], contexts[contexts.length - 1]])];
+      }
+      const sustainedTg = sustainedTgRaw === null
+        ? null
+        : parsePositive(sustainedTgRaw, 512, "--sustained-tg");
+      const validKvModes = new Set(["q8", "fwht2", "fwht3", "fwht4"]);
+      if (kvMode !== null && !validKvModes.has(kvMode)) {
+        console.error("Error: --kv-mode must be q8, fwht2, fwht3, or fwht4");
+        process.exit(1);
+      }
+      matrix = {
+        ppSizes: parsePositiveCsv(ppRaw, defaultSpread, "--pp"),
+        contexts,
+        tg: parsePositive(tgRaw, 128, "--tg"),
+        sustainedTg,
+        sustainedContexts,
+        warmups: parsePositive(warmupsRaw, 10, "--warmups"),
+        redlinePm4,
+        kvMode,
+      };
+    }
+
+    const benchPrompt = rest.slice(1).join(" ") || "Explain the theory of general relativity in simple terms.";
+    await bench(benchModel, runs, exp, benchPrompt, benchJson, matrix);
     break;
   }
   case "rm": {
@@ -9507,7 +9872,7 @@ Examples:
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
-  bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
+  bench <model> [opts]  Benchmark prefill/decode tok/s (--matrix for PP/context/TG sweep)
   profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
   list [-r]             Show local models (-r: show available too)
   config                Interactive settings editor (TUI); also: config [list|set|get|reset]

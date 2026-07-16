@@ -45,6 +45,15 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 /// instrumented sweep.
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 
+fn pm4_dynamic_grid_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
 /// at N ≤ 512, 0.82-1.26× only at N ≥ 2048 with high DPM variance —
@@ -402,6 +411,8 @@ pub struct Gpu {
     pub active_stream: Option<hip_bridge::Stream>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
+    /// Model-scoped Redline warmup recorder and fail-closed backend gate.
+    pub replay: crate::replay::ReplayController,
 
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
     pub mmq_screen: MmqScreenState,
@@ -695,7 +706,7 @@ impl Gpu {
         // controller. GDDR6 on the 7900 XTX is 24 GB so 256 MB is trivial.
         const SCRATCH_BYTES: usize = 256 * 1024 * 1024;
         let scratch = self.hip.malloc(SCRATCH_BYTES)?;
-        eprintln!("[dpm-warmup] running memset loop for {secs:.1}s to pin GPU at high DPM...");
+        eprint!("warming caches...");
         let t0 = std::time::Instant::now();
         let mut n: u64 = 0;
         while t0.elapsed().as_secs_f32() < secs {
@@ -707,11 +718,7 @@ impl Gpu {
             n = n.wrapping_add(1);
         }
         let elapsed = t0.elapsed().as_secs_f32();
-        eprintln!(
-            "[dpm-warmup] {n} memsets in {elapsed:.2}s ({:.2} ms/iter, {:.1} GiB/s effective)",
-            1000.0 * elapsed / n as f32,
-            (n as f64 * SCRATCH_BYTES as f64) / (1024.0 * 1024.0 * 1024.0) / elapsed as f64
-        );
+        eprintln!(" took {elapsed:.2}s");
         // Free the 256 MB scratch — DeviceBuffer has no Drop, so scope exit
         // would otherwise leak it for the lifetime of the process.
         let _ = self.hip.free(scratch);
@@ -826,6 +833,7 @@ impl Gpu {
                 mq_x_rot_fp8_bytes: 0,
                 mq_x_q8: None,
                 mq_x_scales: None,
+                mq_rmsnorm_wavegrid_scratch: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
@@ -841,6 +849,7 @@ impl Gpu {
                 sample_partials: None,
                 sample_partials_bytes: 0,
             },
+            replay: crate::replay::ReplayController::from_env(),
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,
@@ -1175,20 +1184,208 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        crate::scratch::launch_maybe_blob(
-            &self.hip,
-            &self.functions,
-            self.active_stream.as_ref(),
-            &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+        self.launch_maybe_blob_bound(
             func_name,
             grid,
             block,
             shared_mem,
             params,
+            None,
             blob_builder,
         )
+    }
+
+    /// Record a position-derived PM4 workgroup binding while retaining the
+    /// recorded maximum grid for HIP, hipGraph, AQL, and capture validation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_maybe_blob_position_grid(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut Vec<*mut std::ffi::c_void>,
+        axis: u8,
+        addend: u32,
+        divisor: u32,
+        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
+        let grid_binding = pm4_dynamic_grid_enabled().then_some(
+            crate::replay::ReplayGridBinding::PositionCeilDiv {
+                axis,
+                addend,
+                divisor,
+            },
+        );
+        self.launch_maybe_blob_bound(
+            func_name,
+            grid,
+            block,
+            shared_mem,
+            params,
+            grid_binding,
+            blob_builder,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_maybe_blob_bound(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut Vec<*mut std::ffi::c_void>,
+        grid_binding: Option<crate::replay::ReplayGridBinding>,
+        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
+        let record = self.replay.is_recording();
+        if record || self.graphs.capture_mode || self.flags.force_blob_path {
+            let mut blob = blob_builder();
+            blob.pad_to(16);
+            if record {
+                let artifact = self
+                    .compiler
+                    .compiled_kernels()
+                    .get(func_name)
+                    .or_else(|| match func_name {
+                        "mq_rotate_x" => self.compiler.compiled_kernels().get("gemv_mq4g256"),
+                        "deinterleave_f32_batched" => {
+                            self.compiler.compiled_kernels().get("deinterleave_batched")
+                        }
+                        name
+                            if name.starts_with(
+                                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                            ) => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_residual_scaled"),
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed" => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_moe_gate_up_indexed"),
+                        name if name.starts_with("gemv_hfq4g256_multirow_r") => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_multirow_default")
+                            .or_else(|| {
+                                self.compiler
+                                    .compiled_kernels()
+                                    .get("gemv_hfq4g256_multirow_rdna3")
+                            }),
+                        name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_residual_multirow_default")
+                            .or_else(|| {
+                                self.compiler
+                                    .compiled_kernels()
+                                    .get("gemv_hfq4g256_residual_multirow_rdna3")
+                            }),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        func_name
+                            .strip_suffix("_f32")
+                            .and_then(|name| self.compiler.compiled_kernels().get(name))
+                    })
+                    .cloned();
+                self.replay.record_hip_launch_typed_bound(
+                    &self.hip,
+                    func_name,
+                    artifact,
+                    grid,
+                    block,
+                    shared_mem,
+                    blob.as_bytes(),
+                    grid_binding,
+                );
+            }
+            let func = &self.functions[func_name];
+            if self.graphs.capture_mode {
+                self.graphs.capture_blobs.push(blob.into_vec());
+                let buf = self.graphs.capture_blobs.last_mut().unwrap();
+                // SAFETY: every caller's builder encodes the same argument
+                // values supplied by `params`; graph-owned storage stays live
+                // through graph instantiation and replay.
+                unsafe {
+                    self.hip.launch_kernel_blob(
+                        func,
+                        grid,
+                        block,
+                        shared_mem,
+                        self.active_stream.as_ref(),
+                        buf.as_mut_slice(),
+                    )
+                }
+            } else {
+                let mut bytes = blob.into_vec();
+                // SAFETY: HIP consumes the contiguous argument bytes during
+                // this one-shot launch; `bytes` remains live across the call.
+                unsafe {
+                    self.hip.launch_kernel_blob(
+                        func,
+                        grid,
+                        block,
+                        shared_mem,
+                        self.active_stream.as_ref(),
+                        bytes.as_mut_slice(),
+                    )
+                }
+            }
+        } else {
+            let func = &self.functions[func_name];
+            // SAFETY: forwarded from the typed launch wrapper that assembled
+            // `params` for this kernel signature.
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    self.active_stream.as_ref(),
+                    params,
+                )
+            }
+        }
+    }
+
+    /// Diagnostic oracle for Redline prefix localization: relaunch the exact
+    /// captured HIP blob sequence without re-entering model dispatch logic.
+    /// Inputs/state must be restored by the caller first.
+    pub fn replay_recorded_hip_prefix(&self, count: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        if count > self.replay.recorded_launches().len() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "captured HIP prefix {count} exceeds {} launches",
+                    self.replay.recorded_launches().len()
+                ),
+            ));
+        }
+        for launch in self.replay.recorded_launches().iter().take(count) {
+            let func = self.functions.get(&launch.kernel).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("captured HIP function {:?} is not loaded", launch.kernel),
+                )
+            })?;
+            let mut kernarg = launch.kernarg.clone();
+            // SAFETY: the bytes were captured from this exact loaded function
+            // and all pointees remain owned by this Gpu/model instance.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    launch.grid,
+                    launch.block,
+                    launch.shared_mem,
+                    self.active_stream.as_ref(),
+                    &mut kernarg,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
@@ -1945,10 +2142,29 @@ impl Gpu {
                 // gate+up). Cross-arch — same 4-accumulator inner loop as
                 // gemv_hfq4g256.hip; precompile on every arch that uses
                 // the HFQ4 weight path.
-                specs.push((
-                    "fused_qkvza_hfq4g256",
-                    kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
-                ));
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_hoist_x32 {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_hoist_x32_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC.to_string(),
+                    ));
+                } else {
+                    specs.push((
+                        "fused_qkvza_hfq4g256",
+                        kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
+                    ));
+                }
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_2wave",
+                        kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC.to_string(),
+                    ));
+                }
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_k2048_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC.to_string(),
+                    ));
+                }
                 specs.push((
                     "fused_qkv_hfq4g256",
                     kernels::FUSED_QKV_HFQ4G256_SRC.to_string(),
@@ -1961,8 +2177,12 @@ impl Gpu {
                 // wavefront pressure in half on the hottest kernels. Wave32
                 // block=[32,1,1] kernels otherwise waste the upper 32 lanes
                 // of every wave slot on these wave64-native arches.
-                if self.arch_caps.is_wave64_native() {
-                    // Single-token (draft / single-layer paths).
+                if self.arch_caps.is_wave64_native()
+                    || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
+                {
+                    // Single-token QKV paths. RDNA3 may opt into Radiowave's
+                    // explicit wave64 packing experiment; native-wave64
+                    // targets retain their established selection.
                     specs.push((
                         "fused_qkvza_hfq4g256_wave64",
                         kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
@@ -1971,6 +2191,9 @@ impl Gpu {
                         "fused_qkv_hfq4g256_wave64",
                         kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string(),
                     ));
+                }
+                if self.arch_caps.is_wave64_native() {
+                    // Remaining single-token and batched native-wave64 paths.
                     specs.push((
                         "fused_gate_up_hfq4g256_wave64",
                         kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string(),
@@ -2032,10 +2255,29 @@ impl Gpu {
                     kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
-                specs.push((
-                    "fused_qkvza_hfq4g256",
-                    kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
-                ));
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_hoist_x32 {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_hoist_x32_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC.to_string(),
+                    ));
+                } else {
+                    specs.push((
+                        "fused_qkvza_hfq4g256",
+                        kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
+                    ));
+                }
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_2wave",
+                        kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC.to_string(),
+                    ));
+                }
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 {
+                    specs.push((
+                        "fused_qkvza_hfq4g256_k2048_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC.to_string(),
+                    ));
+                }
                 specs.push((
                     "fused_qkv_hfq4g256",
                     kernels::FUSED_QKV_HFQ4G256_SRC.to_string(),
@@ -2048,13 +2290,39 @@ impl Gpu {
                     "fused_rmsnorm_mq_rotate",
                     kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string(),
                 ));
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_wavegrid {
+                    specs.push((
+                        "fused_rmsnorm_mq_rotate_wavegrid",
+                        kernels::FUSED_RMSNORM_MQ_ROTATE_WAVEGRID_GFX1100_SRC.to_string(),
+                    ));
+                }
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_split {
+                    specs.push((
+                        "rmsnorm_reduce_gfx1100",
+                        kernels::RMSNORM_REDUCE_GFX1100_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "rotate_with_rms_gfx1100",
+                        kernels::ROTATE_WITH_RMS_GFX1100_SRC.to_string(),
+                    ));
+                }
+                if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_vecsum {
+                    specs.push((
+                        "fused_rmsnorm_mq_rotate_vecsum",
+                        kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC.to_string(),
+                    ));
+                }
                 specs.push((
                     "fused_silu_mul_mq_rotate",
                     kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string(),
                 ));
                 // gfx906/gfx908/gfx94x wave64 variants — see hfq4 branch for rationale.
-                if self.arch_caps.is_wave64_native() {
-                    // Single-token (draft / single-layer paths).
+                if self.arch_caps.is_wave64_native()
+                    || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
+                {
+                    // Single-token QKV paths. RDNA3 may opt into Radiowave's
+                    // explicit wave64 packing experiment; native-wave64
+                    // targets retain their established selection.
                     specs.push((
                         "fused_qkvza_hfq4g256_wave64",
                         kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
@@ -2063,6 +2331,9 @@ impl Gpu {
                         "fused_qkv_hfq4g256_wave64",
                         kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string(),
                     ));
+                }
+                if self.arch_caps.is_wave64_native() {
+                    // Remaining single-token and batched native-wave64 paths.
                     specs.push((
                         "fused_gate_up_hfq4g256_wave64",
                         kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string(),

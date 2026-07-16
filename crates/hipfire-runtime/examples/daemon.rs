@@ -124,6 +124,283 @@ enum DaemonMsg {
 
 pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
 
+fn redline_capture_json(
+    gpu: &rdna_compute::Gpu,
+    summary: rdna_compute::replay::ReplayCaptureSummary,
+    detail: bool,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "launches": summary.launch_count,
+        "unique_kernels": summary.unique_kernel_count,
+        "sequence_hash": format!("{:016x}", summary.sequence_hash),
+    });
+    if detail {
+        value["sequence"] = serde_json::Value::Array(
+            gpu.replay
+                .recorded_launches()
+                .iter()
+                .map(|launch| {
+                    serde_json::json!({
+                        "kernel": launch.kernel.as_str(),
+                        "artifact": launch.artifact.as_ref().map(|path| path.display().to_string()),
+                        "grid": launch.grid,
+                        "block": launch.block,
+                        "shared_mem": launch.shared_mem,
+                        "kernarg_bytes": launch.kernarg.len(),
+                        "kernarg_hex": launch.kernarg.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                        "kernarg_hash": format!("{:016x}", {
+                            let mut hash = 0xcbf29ce484222325_u64;
+                            for byte in &launch.kernarg {
+                                hash ^= u64::from(*byte);
+                                hash = hash.wrapping_mul(0x100000001b3);
+                            }
+                            hash
+                        }),
+                    })
+                })
+                .collect(),
+        );
+    }
+    value
+}
+
+#[derive(PartialEq)]
+struct RedlineQwenSnapshot {
+    logits: Vec<u8>,
+    kv: Vec<u8>,
+    recurrent: Vec<u8>,
+}
+
+impl RedlineQwenSnapshot {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "logits_bytes": self.logits.len(),
+            "logits_hash": format!("{:016x}", redline_hash(&self.logits)),
+            "kv_bytes": self.kv.len(),
+            "kv_hash": format!("{:016x}", redline_hash(&self.kv)),
+            "recurrent_bytes": self.recurrent.len(),
+            "recurrent_hash": format!("{:016x}", redline_hash(&self.recurrent)),
+        })
+    }
+}
+
+fn redline_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn redline_append_buffer(
+    gpu: &rdna_compute::Gpu,
+    output: &mut Vec<u8>,
+    buffer: &hip_bridge::DeviceBuffer,
+) -> Result<(), String> {
+    let start = output.len();
+    output.resize(start + buffer.size(), 0);
+    gpu.hip
+        .memcpy_dtoh(&mut output[start..], buffer)
+        .map_err(|error| error.to_string())
+}
+
+fn redline_qwen_snapshot(
+    gpu: &rdna_compute::Gpu,
+    bundle: &Qwen35Bundle,
+) -> Result<RedlineQwenSnapshot, String> {
+    let mut logits = Vec::new();
+    redline_append_buffer(gpu, &mut logits, &bundle.scratch.logits.buf)?;
+    let mut kv = Vec::new();
+    for tensor in bundle
+        .kv_cache
+        .k_gpu
+        .iter()
+        .chain(bundle.kv_cache.v_gpu.iter())
+        .chain(bundle.kv_cache.k_scales.iter())
+        .chain(bundle.kv_cache.v_scales.iter())
+    {
+        redline_append_buffer(gpu, &mut kv, &tensor.buf)?;
+    }
+    let mut recurrent = Vec::new();
+    for tensor in bundle
+        .dn_state
+        .s_matrices
+        .iter()
+        .chain(bundle.dn_state.s_scales.iter())
+        .chain(bundle.dn_state.conv_states.iter())
+        .chain(bundle.dn_state.s_ef_residual.iter())
+    {
+        redline_append_buffer(gpu, &mut recurrent, &tensor.buf)?;
+    }
+    Ok(RedlineQwenSnapshot {
+        logits,
+        kv,
+        recurrent,
+    })
+}
+
+fn redline_qwen_debug_hashes(
+    gpu: &rdna_compute::Gpu,
+    bundle: &Qwen35Bundle,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let tensors: &[(&str, &hip_bridge::DeviceBuffer)] = &[
+        ("x", &bundle.scratch.x.buf),
+        ("tmp", &bundle.scratch.tmp.buf),
+        ("pos", &bundle.scratch.pos_buf),
+        ("dn_qkv", &bundle.scratch.dn_qkv.buf),
+        ("dn_z", &bundle.scratch.dn_z.buf),
+        ("dn_alpha", &bundle.scratch.dn_alpha.buf),
+        ("dn_beta", &bundle.scratch.dn_beta.buf),
+        ("dn_conv_out", &bundle.scratch.dn_conv_out.buf),
+        ("dn_q", &bundle.scratch.dn_q.buf),
+        ("dn_k", &bundle.scratch.dn_k.buf),
+        ("dn_v", &bundle.scratch.dn_v.buf),
+        ("dn_q_raw", &bundle.scratch.dn_q_raw.buf),
+        ("dn_k_raw", &bundle.scratch.dn_k_raw.buf),
+        ("dn_attn_out", &bundle.scratch.dn_attn_out.buf),
+        ("dn_normed", &bundle.scratch.dn_normed.buf),
+        ("fa_q_full", &bundle.scratch.fa_q_full.buf),
+        ("fa_q", &bundle.scratch.fa_q.buf),
+        ("fa_gate", &bundle.scratch.fa_gate.buf),
+        ("fa_k", &bundle.scratch.fa_k.buf),
+        ("fa_v", &bundle.scratch.fa_v.buf),
+        ("fa_attn_out", &bundle.scratch.fa_attn_out.buf),
+        ("o", &bundle.scratch.o.buf),
+        ("gate_ffn", &bundle.scratch.gate_ffn.buf),
+        ("up", &bundle.scratch.up.buf),
+        ("ffn_hidden", &bundle.scratch.ffn_hidden.buf),
+        ("ffn_out", &bundle.scratch.ffn_out.buf),
+        ("logits", &bundle.scratch.logits.buf),
+        ("x_rot", &bundle.scratch.x_rot.buf),
+        ("flash_partials", &bundle.scratch.flash_partials.buf),
+    ];
+    let mut hashes = std::collections::BTreeMap::new();
+    for (name, buffer) in tensors {
+        let mut bytes = Vec::new();
+        redline_append_buffer(gpu, &mut bytes, buffer)?;
+        hashes.insert((*name).to_owned(), format!("{:016x}", redline_hash(&bytes)));
+    }
+    let state = redline_qwen_snapshot(gpu, bundle)?;
+    hashes.insert(
+        "all_kv".to_owned(),
+        format!("{:016x}", redline_hash(&state.kv)),
+    );
+    hashes.insert(
+        "all_recurrent".to_owned(),
+        format!("{:016x}", redline_hash(&state.recurrent)),
+    );
+    Ok(hashes)
+}
+
+fn redline_reset_qwen(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut Qwen35Bundle,
+) -> Result<(), String> {
+    bundle
+        .kv_cache
+        .clear_gpu(gpu)
+        .map_err(|error| error.to_string())?;
+    bundle.kv_cache.compact_offset = 0;
+    for tensor in bundle
+        .dn_state
+        .s_matrices
+        .iter()
+        .chain(bundle.dn_state.s_scales.iter())
+        .chain(bundle.dn_state.conv_states.iter())
+        .chain(bundle.dn_state.s_ef_residual.iter())
+    {
+        gpu.hip
+            .memset(&tensor.buf, 0, tensor.buf.size())
+            .map_err(|error| error.to_string())?;
+    }
+    let scratch = &bundle.scratch;
+    let buffers: &[&hip_bridge::DeviceBuffer] = &[
+        &scratch.x.buf,
+        &scratch.tmp.buf,
+        &scratch.pos_buf,
+        &scratch.dn_qkv.buf,
+        &scratch.dn_z.buf,
+        &scratch.dn_alpha.buf,
+        &scratch.dn_beta.buf,
+        &scratch.dn_conv_out.buf,
+        &scratch.dn_q.buf,
+        &scratch.dn_k.buf,
+        &scratch.dn_v.buf,
+        &scratch.dn_q_raw.buf,
+        &scratch.dn_k_raw.buf,
+        &scratch.dn_attn_out.buf,
+        &scratch.dn_normed.buf,
+        &scratch.fa_q_full.buf,
+        &scratch.fa_q.buf,
+        &scratch.fa_gate.buf,
+        &scratch.fa_k.buf,
+        &scratch.fa_v.buf,
+        &scratch.fa_attn_out.buf,
+        &scratch.o.buf,
+        &scratch.gate_ffn.buf,
+        &scratch.up.buf,
+        &scratch.ffn_hidden.buf,
+        &scratch.ffn_out.buf,
+        &scratch.logits.buf,
+        &scratch.sample_buf.buf,
+        &scratch.repeat_buf.buf,
+        &scratch.x_rot.buf,
+        &scratch.flash_partials.buf,
+    ];
+    for buffer in buffers {
+        gpu.hip
+            .memset(buffer, 0, buffer.size())
+            .map_err(|error| error.to_string())?;
+    }
+    for buffer in [
+        gpu.scratch.mq_x_rot.as_ref().map(|tensor| &tensor.buf),
+        gpu.scratch.mq_x_rot_fp8.as_ref(),
+        gpu.scratch.mq_x_q8.as_ref(),
+        gpu.scratch.mq_x_scales.as_ref(),
+        gpu.scratch.fp16_x_scratch.as_ref(),
+        gpu.scratch.fp8_x_scratch.as_ref(),
+        gpu.scratch.q8_1_mmq_x_scratch.as_ref(),
+        gpu.scratch.ksplit_det_partials.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        gpu.hip
+            .memset(buffer, 0, buffer.size())
+            .map_err(|error| error.to_string())?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+fn redline_prime_qwen(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut Qwen35Bundle,
+    context: usize,
+) -> Result<(), String> {
+    let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
+    qwen35::forward_prefill_batch(
+        gpu,
+        &bundle.weights,
+        &bundle.config,
+        &synthetic,
+        0,
+        &mut bundle.kv_cache,
+        &mut bundle.dn_state,
+        &bundle.scratch,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
 ///
 /// On Unix: flock(2) is the kernel-level lock. The kernel releases it
@@ -1349,6 +1626,15 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
+                        let redline_default = hipfire_runtime::config::gfx12_mq4r_redline_default(
+                            &gpu.arch, path, m.arch_id, pp, tp,
+                        );
+                        if gpu.replay.configure_model_default(redline_default) && redline_default {
+                            eprintln!(
+                                "[redline] enabling fail-closed gfx12 MQ4R default (transport={})",
+                                gpu.replay.transport_name()
+                            );
+                        }
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {
@@ -2631,6 +2917,838 @@ fn main() {
                         r#"{{"type":"error","message":"bench_prefill forward failed"}}"#
                     );
                 }
+                let _ = stdout.flush();
+            }
+
+            "bench_decode" => {
+                // Resident single-token decode probe for Redline and regular
+                // daemon benchmarking. Prime deterministic Qwen3.5 state
+                // outside the measured/captured interval, then time only the
+                // requested number of forward_scratch calls.
+                let m = match model.as_mut() {
+                    Some(m) => m,
+                    None => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            r#"{"type":"error","message":"no model loaded"}"#
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                if m.pp > 1 || m.ep.is_some() || (m.arch_id != 5 && m.arch_id != 6) {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        r#"{"type":"error","message":"bench_decode currently requires a single-GPU Qwen3.5 model"}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(128) as usize;
+                let iterations =
+                    msg.get("iterations").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                let capture = msg
+                    .get("redline_capture")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let capture_detail = msg
+                    .get("redline_detail")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if context == 0 || iterations == 0 {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        r#"{"type":"error","message":"bench_decode context_tokens and iterations must be non-zero"}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                if context.saturating_add(iterations).saturating_add(32) > m.physical_cap {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": format!(
+                                "bench_decode context+iterations exceeds loaded physical_cap={}",
+                                m.physical_cap
+                            ),
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                reset_qwen35_recurrent(m, &mut gpu);
+                let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
+                let prime_ok = {
+                    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    qwen35::forward_prefill_batch(
+                        &mut gpu,
+                        &b.weights,
+                        &b.config,
+                        &synthetic,
+                        0,
+                        &mut b.kv_cache,
+                        &mut b.dn_state,
+                        &b.scratch,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .is_ok()
+                };
+                let _ = gpu.hip.device_synchronize();
+                if !prime_ok {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        r#"{"type":"error","message":"bench_decode prefill prime failed"}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                m.seq_pos = context;
+
+                if capture {
+                    if let Err(reason) = gpu.replay.begin_capture() {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("redline decode capture refused: {reason}"),
+                            })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
+
+                let _ = gpu.hip.device_synchronize();
+                let t0 = Instant::now();
+                let run_ok = {
+                    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    let mut ok = true;
+                    for i in 0..iterations {
+                        let token = 101 + (i as u32 % 1000);
+                        if qwen35::forward_scratch(
+                            &mut gpu,
+                            &b.weights,
+                            &b.config,
+                            token,
+                            context + i,
+                            &mut b.kv_cache,
+                            &mut b.dn_state,
+                            &b.scratch,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                };
+                let _ = gpu.hip.device_synchronize();
+                let elapsed = t0.elapsed().as_secs_f64();
+                let capture_summary = if capture {
+                    match gpu.replay.finish_capture() {
+                        Ok(summary) => Some(summary),
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": format!("redline decode capture failed: {reason}"),
+                                })
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                reset_qwen35_recurrent(m, &mut gpu);
+
+                if run_ok {
+                    let tok_s = iterations as f64 / elapsed.max(f64::MIN_POSITIVE);
+                    let mut response = serde_json::json!({
+                        "type": "decode_result",
+                        "context_tokens": context,
+                        "iterations": iterations,
+                        "ms": elapsed * 1000.0,
+                        "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
+                        "tok_s": tok_s,
+                    });
+                    if let Some(summary) = capture_summary {
+                        response["redline_capture"] =
+                            redline_capture_json(&gpu, summary, capture_detail);
+                    }
+                    let _ = writeln!(stdout, "{response}");
+                } else {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        r#"{"type":"error","message":"bench_decode forward failed"}"#
+                    );
+                }
+                let _ = stdout.flush();
+            }
+
+            "redline_probe_aql" => {
+                match gpu.replay.probe_aql_contracts(gpu.device_id as usize) {
+                    Ok(probes) => {
+                        let rows = probes
+                            .into_iter()
+                            .map(|probe| {
+                                serde_json::json!({
+                                    "kernel": probe.kernel,
+                                    "captured_kernarg_bytes": probe.captured_kernarg_bytes,
+                                    "loader_kernarg_bytes": probe.loader_kernarg_bytes,
+                                    "loader_kernarg_alignment": probe.loader_kernarg_alignment,
+                                    "static_group_bytes": probe.static_group_bytes,
+                                    "dynamic_group_bytes": probe.dynamic_group_bytes,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "redline_aql_probe",
+                                "kernels": rows.len(),
+                                "contracts": rows,
+                            })
+                        );
+                    }
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("redline AQL contract probe failed: {reason}"),
+                            })
+                        );
+                    }
+                }
+                let _ = stdout.flush();
+            }
+
+            "redline_shadow_aql" | "redline_shadow_pm4" => {
+                let pm4 =
+                    msg.get("type").and_then(|value| value.as_str()) == Some("redline_shadow_pm4");
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(128) as usize;
+                let iterations = msg
+                    .get("iterations")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(1) as usize;
+                let eligible = model.as_ref().is_some_and(|loaded| {
+                    loaded.pp == 1
+                        && loaded.ep.is_none()
+                        && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+                });
+                if !eligible {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "redline_shadow_aql requires a loaded single-GPU Qwen3.5 model",
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                let prepared = match if pm4 {
+                    let launch_count = gpu.replay.recorded_launches().len();
+                    gpu.replay
+                        .prepare_pm4_prefix(gpu.device_id as usize, launch_count)
+                        .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+                } else {
+                    gpu.replay
+                        .prepare_linear_aql(gpu.device_id as usize)
+                        .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+                } {
+                    Ok(summary) => summary,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("redline AQL prepare failed: {reason}"),
+                            })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+
+                let aql_result = (|| -> Result<(RedlineQwenSnapshot, f64, f64), String> {
+                    let loaded = model.as_mut().expect("eligibility checked");
+                    let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    redline_reset_qwen(&mut gpu, bundle)?;
+                    redline_prime_qwen(&mut gpu, bundle, context)?;
+                    let started = Instant::now();
+                    let mut gpu_us = 0.0;
+                    for i in 0..iterations {
+                        qwen35::prepare_scratch_inputs(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101 + i as u32,
+                            context + i,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        if pm4 {
+                            let timing = unsafe { gpu.replay.replay_pm4(context + i) }?;
+                            gpu_us += timing.span_microseconds();
+                        } else {
+                            let timing = unsafe { gpu.replay.replay_linear_aql() }?;
+                            gpu_us += timing.span_microseconds();
+                        }
+                    }
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+                    let snapshot = redline_qwen_snapshot(&gpu, bundle)?;
+                    Ok((snapshot, host_us, gpu_us))
+                })();
+                let (aql_snapshot, aql_host_us, aql_gpu_us) = match aql_result {
+                    Ok(result) => result,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("redline AQL shadow execution failed: {reason}"),
+                            })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+
+                let blob_result = (|| -> Result<RedlineQwenSnapshot, String> {
+                    let loaded = model.as_mut().expect("eligibility checked");
+                    let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    redline_reset_qwen(&mut gpu, bundle)?;
+                    redline_prime_qwen(&mut gpu, bundle, context)?;
+                    for i in 0..iterations {
+                        qwen35::prepare_scratch_inputs(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101 + i as u32,
+                            context + i,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        gpu.replay_recorded_hip_prefix(prepared.0)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    redline_qwen_snapshot(&gpu, bundle)
+                })();
+                let blob_snapshot = match blob_result {
+                    Ok(result) => result,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("redline HIP blob oracle failed: {reason}"),
+                            })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+
+                let hip_result = (|| -> Result<(RedlineQwenSnapshot, f64), String> {
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                    let loaded = model.as_mut().expect("eligibility checked");
+                    let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    redline_reset_qwen(&mut gpu, bundle)?;
+                    redline_prime_qwen(&mut gpu, bundle, context)?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let started = Instant::now();
+                    for i in 0..iterations {
+                        qwen35::forward_scratch(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101 + i as u32,
+                            context + i,
+                            &mut bundle.kv_cache,
+                            &mut bundle.dn_state,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+                    let snapshot = redline_qwen_snapshot(&gpu, bundle)?;
+                    Ok((snapshot, host_us))
+                })();
+                let (hip_snapshot, hip_host_us) = match hip_result {
+                    Ok(result) => result,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("redline HIP shadow execution failed: {reason}"),
+                            })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let logits_equal = aql_snapshot.logits == hip_snapshot.logits;
+                let kv_equal = aql_snapshot.kv == hip_snapshot.kv;
+                let recurrent_equal = aql_snapshot.recurrent == hip_snapshot.recurrent;
+                let bit_exact = logits_equal && kv_equal && recurrent_equal;
+                let blob_bit_exact = aql_snapshot.logits == blob_snapshot.logits
+                    && aql_snapshot.kv == blob_snapshot.kv
+                    && aql_snapshot.recurrent == blob_snapshot.recurrent;
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({
+                        "type": "redline_shadow_result",
+                        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+                        "context_tokens": context,
+                        "iterations": iterations,
+                        "dispatches": prepared.0,
+                        "packets": prepared.1,
+                        "queue_id": prepared.2,
+                        "command_dwords": prepared.3,
+                        "bit_exact": bit_exact,
+                        "blob_bit_exact": blob_bit_exact,
+                        "logits_equal": logits_equal,
+                        "kv_equal": kv_equal,
+                        "recurrent_equal": recurrent_equal,
+                        "aql_host_us": aql_host_us,
+                        "aql_gpu_us": aql_gpu_us,
+                        "hip_host_us": hip_host_us,
+                        "aql": aql_snapshot.json(),
+                        "hip": hip_snapshot.json(),
+                        "blob": blob_snapshot.json(),
+                    })
+                );
+                let _ = stdout.flush();
+            }
+
+            "redline_pm4_prefix_profile" => {
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(128) as usize;
+                let step = msg
+                    .get("step")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(16) as usize;
+                let repeats = msg
+                    .get("repeats")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(3) as usize;
+                let steady_state = msg
+                    .get("steady_state")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let eligible = model.as_ref().is_some_and(|loaded| {
+                    loaded.pp == 1
+                        && loaded.ep.is_none()
+                        && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+                });
+                let launch_count = gpu.replay.recorded_launches().len();
+                let start = msg
+                    .get("start")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(step as u64) as usize;
+                if !eligible
+                    || launch_count == 0
+                    || step == 0
+                    || repeats == 0
+                    || start == 0
+                    || start > launch_count
+                {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "redline_pm4_prefix_profile requires captured single-GPU Qwen3.5 and valid start/step/repeats",
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
+                let mut prefixes = (start..launch_count).step_by(step).collect::<Vec<_>>();
+                if prefixes.last().copied() != Some(launch_count) {
+                    prefixes.push(launch_count);
+                }
+                let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                let profile_result = (|| -> Result<Vec<serde_json::Value>, String> {
+                    // Correctness-oriented prefix profiling resets and primes
+                    // every sample by default. A full dispatch-level bill of
+                    // debt needs hundreds of adjacent prefixes, where repeated
+                    // prefill dominates the requested PM4 measurement. The
+                    // explicit steady-state mode primes once and then keeps the
+                    // resident model/cache state warm. It is timing-only: exact
+                    // shadow remains a separate mandatory harness gate.
+                    if steady_state {
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
+                            frame_checkpoint,
+                        );
+                        let loaded = model.as_mut().expect("eligibility checked");
+                        let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                            unreachable!()
+                        };
+                        redline_reset_qwen(&mut gpu, bundle)?;
+                        redline_prime_qwen(&mut gpu, bundle, context)?;
+                    }
+                    let mut rows = Vec::with_capacity(prefixes.len());
+                    for prefix in prefixes {
+                        let launch = gpu.replay.recorded_launches()[prefix - 1].clone();
+                        let (_, dwords, _) = gpu
+                            .replay
+                            .prepare_pm4_prefix(gpu.device_id as usize, prefix)?;
+                        let mut samples = Vec::with_capacity(repeats);
+                        for _ in 0..repeats {
+                            let loaded = model.as_mut().expect("eligibility checked");
+                            let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                                unreachable!()
+                            };
+                            if !steady_state {
+                                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
+                                    frame_checkpoint,
+                                );
+                                redline_reset_qwen(&mut gpu, bundle)?;
+                                redline_prime_qwen(&mut gpu, bundle, context)?;
+                            }
+                            qwen35::prepare_scratch_inputs(
+                                &mut gpu,
+                                &bundle.weights,
+                                &bundle.config,
+                                101,
+                                context,
+                                &bundle.scratch,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            gpu.hip
+                                .device_synchronize()
+                                .map_err(|error| error.to_string())?;
+                            let timing = unsafe { gpu.replay.replay_pm4(context) }?;
+                            samples.push(timing.span_microseconds());
+                        }
+                        let mut ordered = samples.clone();
+                        ordered.sort_by(f64::total_cmp);
+                        let median_gpu_us = ordered[ordered.len() / 2];
+                        rows.push(serde_json::json!({
+                            "prefix": prefix,
+                            "last_kernel": launch.kernel,
+                            "last_grid": launch.grid,
+                            "last_block": launch.block,
+                            "command_dwords": dwords,
+                            "samples_gpu_us": samples,
+                            "median_gpu_us": median_gpu_us,
+                        }));
+                    }
+                    Ok(rows)
+                })();
+                match profile_result {
+                    Ok(rows) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "redline_pm4_prefix_profile",
+                                "context_tokens": context,
+                                "launches": launch_count,
+                                "start": start,
+                                "step": step,
+                                "repeats": repeats,
+                                "steady_state": steady_state,
+                                "rows": rows,
+                            })
+                        );
+                    }
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("retained PM4 prefix profile failed: {reason}"),
+                            })
+                        );
+                    }
+                }
+                let _ = stdout.flush();
+            }
+
+            "redline_prefix_shadow" => {
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(128) as usize;
+                let prefix = msg
+                    .get("prefix")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(2) as usize;
+                let pm4 = msg
+                    .get("pm4")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let eligible = model.as_ref().is_some_and(|loaded| {
+                    loaded.pp == 1
+                        && loaded.ep.is_none()
+                        && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+                });
+                if !eligible {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "redline_prefix_shadow requires single-GPU Qwen3.5",
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                let prepared = match if pm4 {
+                    gpu.replay
+                        .prepare_pm4_prefix(gpu.device_id as usize, prefix)
+                        .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+                } else {
+                    gpu.replay
+                        .prepare_linear_aql_prefix(gpu.device_id as usize, prefix)
+                        .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+                } {
+                    Ok(summary) => summary,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type":"error", "message": reason})
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let aql_hashes = (|| -> Result<_, String> {
+                    let loaded = model.as_mut().unwrap();
+                    let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    redline_reset_qwen(&mut gpu, bundle)?;
+                    redline_prime_qwen(&mut gpu, bundle, context)?;
+                    qwen35::prepare_scratch_inputs(
+                        &mut gpu,
+                        &bundle.weights,
+                        &bundle.config,
+                        101,
+                        context,
+                        &bundle.scratch,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let initial = redline_qwen_debug_hashes(&gpu, bundle)?;
+                    let replay_started = Instant::now();
+                    if pm4 {
+                        unsafe { gpu.replay.replay_pm4(context) }?;
+                    } else {
+                        unsafe { gpu.replay.replay_linear_aql() }?;
+                    }
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let replay_host_us = replay_started.elapsed().as_secs_f64() * 1e6;
+                    let hashes = redline_qwen_debug_hashes(&gpu, bundle)?;
+                    let mut dn_k = Vec::new();
+                    redline_append_buffer(&gpu, &mut dn_k, &bundle.scratch.dn_k.buf)?;
+                    Ok((initial, hashes, dn_k, replay_host_us))
+                })();
+                let (aql_initial, aql_hashes, aql_dn_k, direct_host_us) = match aql_hashes {
+                    Ok(result) => result,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type":"error", "message": format!("AQL prefix failed: {reason}")})
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let hip_hashes = (|| -> Result<_, String> {
+                    let loaded = model.as_mut().unwrap();
+                    let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    redline_reset_qwen(&mut gpu, bundle)?;
+                    redline_prime_qwen(&mut gpu, bundle, context)?;
+                    qwen35::prepare_scratch_inputs(
+                        &mut gpu,
+                        &bundle.weights,
+                        &bundle.config,
+                        101,
+                        context,
+                        &bundle.scratch,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let initial = redline_qwen_debug_hashes(&gpu, bundle)?;
+                    let replay_started = Instant::now();
+                    gpu.replay_recorded_hip_prefix(prefix)
+                        .map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let replay_host_us = replay_started.elapsed().as_secs_f64() * 1e6;
+                    let hashes = redline_qwen_debug_hashes(&gpu, bundle)?;
+                    let mut dn_k = Vec::new();
+                    redline_append_buffer(&gpu, &mut dn_k, &bundle.scratch.dn_k.buf)?;
+                    Ok((initial, hashes, dn_k, replay_host_us))
+                })();
+                let (hip_initial, hip_hashes, hip_dn_k, hip_host_us) = match hip_hashes {
+                    Ok(result) => result,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type":"error", "message": format!("HIP prefix failed: {reason}")})
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let differing = aql_hashes
+                    .iter()
+                    .filter_map(|(name, hash)| (hip_hashes.get(name) != Some(hash)).then_some(name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let dn_k_mismatches = aql_dn_k
+                    .iter()
+                    .zip(&hip_dn_k)
+                    .filter(|(aql, hip)| aql != hip)
+                    .count();
+                let dn_k_first_mismatch = aql_dn_k
+                    .iter()
+                    .zip(&hip_dn_k)
+                    .position(|(aql, hip)| aql != hip)
+                    .map(|index| {
+                        serde_json::json!({
+                            "byte": index,
+                            "aql": aql_dn_k[index],
+                            "hip": hip_dn_k[index],
+                        })
+                    });
+                let pointer_debug = model.as_ref().and_then(|loaded| {
+                    let ModelState::Qwen35(bundle) = loaded.state.as_ref()? else {
+                        return None;
+                    };
+                    let launch = gpu.replay.recorded_launches().get(prefix.checked_sub(1)?)?;
+                    let pointers = launch
+                        .kernarg
+                        .chunks_exact(8)
+                        .take(5)
+                        .map(|chunk| {
+                            format!(
+                                "{:016x}",
+                                u64::from_ne_bytes(chunk.try_into().expect("eight-byte chunk"))
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    Some(serde_json::json!({
+                        "kernel": launch.kernel,
+                        "captured_first_five_u64": pointers,
+                        "x": format!("{:016x}", bundle.scratch.x.buf.as_ptr() as usize),
+                        "gate_ffn": format!("{:016x}", bundle.scratch.gate_ffn.buf.as_ptr() as usize),
+                        "up": format!("{:016x}", bundle.scratch.up.buf.as_ptr() as usize),
+                        "x_rot": format!("{:016x}", bundle.scratch.x_rot.buf.as_ptr() as usize),
+                        "ffn_hidden": format!("{:016x}", bundle.scratch.ffn_hidden.buf.as_ptr() as usize),
+                        "q_raw": format!("{:016x}", bundle.scratch.dn_q_raw.buf.as_ptr() as usize),
+                        "k_raw": format!("{:016x}", bundle.scratch.dn_k_raw.buf.as_ptr() as usize),
+                        "q_dst": format!("{:016x}", bundle.scratch.dn_q.buf.as_ptr() as usize),
+                        "k_dst": format!("{:016x}", bundle.scratch.dn_k.buf.as_ptr() as usize),
+                    }))
+                });
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({
+                        "type": "redline_prefix_result",
+                        "prefix": prefix,
+                        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+                        "dispatches": prepared.0,
+                        "packets": prepared.1,
+                        "queue_id": prepared.2,
+                        "command_dwords": prepared.3,
+                        "direct_host_us": direct_host_us,
+                        "hip_host_us": hip_host_us,
+                        "speedup_over_hip": hip_host_us / direct_host_us,
+                        "equal": differing.is_empty(),
+                        "differing": differing,
+                        "initial_equal": aql_initial == hip_initial,
+                        "aql_initial": aql_initial,
+                        "hip_initial": hip_initial,
+                        "dn_k_mismatched_bytes": dn_k_mismatches,
+                        "dn_k_first_mismatch": dn_k_first_mismatch,
+                        "pointer_debug": pointer_debug,
+                        "aql": aql_hashes,
+                        "hip": hip_hashes,
+                    })
+                );
                 let _ = stdout.flush();
             }
 
@@ -6800,8 +7918,10 @@ fn generate(
                       // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
                       // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
                       // was hardcoded greedy-only (temp>0 → AR).
-        let spec_temp_ok =
-            temp <= 1e-6 || m.speculator.as_ref().map_or(false, |s| !s.requires_greedy());
+        let spec_temp_ok = temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .map_or(false, |s| !s.requires_greedy());
         let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(

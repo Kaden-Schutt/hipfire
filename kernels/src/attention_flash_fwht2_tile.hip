@@ -68,7 +68,46 @@ __global__ void attention_flash_fwht2_tile(
         mq[half * 4 + 3] = d;
     }
 
-    for (int t_local = 0; t_local < tile_len; t_local++) {
+    int t_local = 0;
+    for (; t_local + 3 < tile_len; t_local += 4) {
+        const unsigned char* kb0 = k_cache + (size_t)(tile_start + t_local + 0) * k_bytes_per_pos + k_head_off;
+        const unsigned char* kb1 = k_cache + (size_t)(tile_start + t_local + 1) * k_bytes_per_pos + k_head_off;
+        const unsigned char* kb2 = k_cache + (size_t)(tile_start + t_local + 2) * k_bytes_per_pos + k_head_off;
+        const unsigned char* kb3 = k_cache + (size_t)(tile_start + t_local + 3) * k_bytes_per_pos + k_head_off;
+        float cn0 = *(const float*)kb0, cn1 = *(const float*)kb1;
+        float cn2 = *(const float*)kb2, cn3 = *(const float*)kb3;
+        float partial0 = 0.0f, partial1 = 0.0f, partial2 = 0.0f, partial3 = 0.0f;
+        for (int half = 0; half < n_halves; half++) {
+            unsigned char pk0 = kb0[4 + half * 32 + tid];
+            unsigned char pk1 = kb1[4 + half * 32 + tid];
+            unsigned char pk2 = kb2[4 + half * 32 + tid];
+            unsigned char pk3 = kb3[4 + half * 32 + tid];
+            #define DOT2(P, CN, PK) do { \
+                (P) += mq[half * 4 + 0] * ((CN) * TURBO_C2[(PK) & 3]) \
+                     + mq[half * 4 + 1] * ((CN) * TURBO_C2[((PK) >> 2) & 3]) \
+                     + mq[half * 4 + 2] * ((CN) * TURBO_C2[((PK) >> 4) & 3]) \
+                     + mq[half * 4 + 3] * ((CN) * TURBO_C2[((PK) >> 6) & 3]); \
+            } while (0)
+            DOT2(partial0, cn0, pk0);
+            DOT2(partial1, cn1, pk1);
+            DOT2(partial2, cn2, pk2);
+            DOT2(partial3, cn3, pk3);
+            #undef DOT2
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            partial0 += __shfl_xor(partial0, off);
+            partial1 += __shfl_xor(partial1, off);
+            partial2 += __shfl_xor(partial2, off);
+            partial3 += __shfl_xor(partial3, off);
+        }
+        if (tid == 0) {
+            scores[t_local + 0] = partial0 * scale_attn;
+            scores[t_local + 1] = partial1 * scale_attn;
+            scores[t_local + 2] = partial2 * scale_attn;
+            scores[t_local + 3] = partial3 * scale_attn;
+        }
+    }
+    for (; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
         float cnorm = *(const float*)kb;

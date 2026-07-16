@@ -57,6 +57,11 @@ pub struct AttnParams<'a> {
     pub block_start: usize,
     /// Tree window cols (0 for plain causal).
     pub block_cols: usize,
+    /// Optional Qwen decode gate. When present on the narrow Q8 single-token
+    /// path, the family pairs the K/V writes and applies the gate plus MQ
+    /// rotation in the flash-reduce epilogue; all other callers leave this
+    /// `None`.
+    pub output_gate: Option<&'a GpuTensor>,
     pub output: &'a GpuTensor,
 }
 
@@ -337,14 +342,32 @@ fn dispatch_kv_write(
         }
         KernelKey::KvWriteQ8_0 => {
             debug_assert_eq!(plan.batch_size, 1);
-            hip!(gpu.kv_cache_write_q8_0(
-                io.k_cache,
-                io.k,
-                io.pos_buf,
-                io.n_kv_heads,
-                io.head_dim
-            ))?;
-            hip!(gpu.kv_cache_write_q8_0(io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim))
+            if io.output_gate.is_some() {
+                hip!(gpu.kv_cache_write_q8_0_pair(
+                    io.k_cache,
+                    io.v_cache,
+                    io.k,
+                    io.v,
+                    io.pos_buf,
+                    io.n_kv_heads,
+                    io.head_dim,
+                ))
+            } else {
+                hip!(gpu.kv_cache_write_q8_0(
+                    io.k_cache,
+                    io.k,
+                    io.pos_buf,
+                    io.n_kv_heads,
+                    io.head_dim
+                ))?;
+                hip!(gpu.kv_cache_write_q8_0(
+                    io.v_cache,
+                    io.v,
+                    io.pos_buf,
+                    io.n_kv_heads,
+                    io.head_dim,
+                ))
+            }
         }
         KernelKey::KvWriteAsym4 => {
             debug_assert_eq!(plan.batch_size, 1);
@@ -716,19 +739,36 @@ fn dispatch_attend(
                 debug_assert_eq!(plan.batch_size, 1);
                 let seq_len = io.pos + 1;
                 let fp = io.flash_partials.unwrap();
-                hip!(gpu.attention_flash_q8_0(
-                    io.q,
-                    io.k_cache,
-                    io.v_cache,
-                    io.output,
-                    io.pos_buf,
-                    seq_len,
-                    io.n_heads,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.physical_cap,
-                    fp,
-                ))
+                if let Some(gate) = io.output_gate {
+                    hip!(gpu.attention_flash_q8_0_gated_mq_rotate_gfx1100(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        gate,
+                        io.pos_buf,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                    ))
+                } else {
+                    hip!(gpu.attention_flash_q8_0(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                    ))
+                }
             }
             KernelKey::AttnFlashQ8_0Windowed => {
                 debug_assert_eq!(plan.batch_size, 1);

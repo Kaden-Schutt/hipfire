@@ -1,0 +1,9 @@
+[package]
+name = "redline-rocr"
+version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Auditable public ROCr/HSA ABI, resource ownership, and AQL packet publication"
+
+[dependencies]
+libloading = "0.8.9"

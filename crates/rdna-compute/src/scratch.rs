@@ -27,6 +27,11 @@ pub struct ScratchState {
     pub mq_x_rot_fp8_bytes: usize,
     pub mq_x_q8: Option<DeviceBuffer>,
     pub mq_x_scales: Option<DeviceBuffer>,
+    /// Persistent gfx1100 K=2048 RMSNorm+MQ state shared by the split and
+    /// wavegrid experiments. The wavegrid layout is eight f32 partials, one
+    /// f32 RMS value, and three u32 epoch counters, padded to 64 bytes; the
+    /// split path uses its first f32 as the RMS handoff.
+    pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -71,6 +76,13 @@ pub(crate) fn compile_and_load_kernel(
     }
     let obj_path = compiler.compile(module_name, source)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
+    // Alias the launched function name to this arch's compiled artifact so the
+    // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
+    // arch-selected module name differs (e.g. gemv_hfq4g256_residual launched vs
+    // module gemv_hfq4g256_residual_rdna3 on RDNA3). Additive; no-op when equal.
+    if func_name != module_name {
+        compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
+    }
     if !modules.contains_key(module_name) {
         let module = module_load_or_recompile(hip, compiler, module_name, source, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
@@ -216,6 +228,21 @@ impl ScratchState {
         self.mq_x_rot = Some(x_rot);
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
+        Ok(())
+    }
+
+    /// Lazily allocate and zero the persistent gfx1100 RMSNorm state.
+    pub fn ensure_mq_rmsnorm_wavegrid_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if self.mq_rmsnorm_wavegrid_scratch.is_none() {
+            let scratch = hip.malloc(64)?;
+            hip.memset(&scratch, 0, 64)?;
+            self.mq_rmsnorm_wavegrid_scratch = Some(scratch);
+        }
         Ok(())
     }
 

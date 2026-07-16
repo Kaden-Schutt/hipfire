@@ -2366,8 +2366,60 @@ impl Gpu {
             return self.fused_qkv_hfq4g256_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k);
         }
 
-        let cdna_wave64 = self.arch_caps.is_wave64_native();
-        let (func_name, block, grid_x) = if cdna_wave64 {
+        static GFX1151_QKVZA_WAVE64: OnceLock<bool> = OnceLock::new();
+        let gfx1151_wave64 = self.arch_caps.is_gfx1151()
+            && *GFX1151_QKVZA_WAVE64.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_WAVE64").as_deref() == Ok("1")
+            });
+        static GFX1151_QKV_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
+        let gfx1151_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
+            GFX1151_QKV_ALL_BUFFER_CPOL
+                .get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                })
+                .as_str()
+        } else {
+            ""
+        };
+        static GFX1151_QKV_X_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_x_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKV_X_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKV_X_BUFFER").as_deref() == Ok("1")
+            });
+        let cdna_wave64 = self.arch_caps.is_wave64_native()
+            || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
+            || gfx1151_wave64;
+        let (func_name, block, grid_x) = if gfx1151_x_buffer {
+            self.ensure_kernel(
+                "fused_qkv_hfq4g256_k2048_x_buffer_gfx1151",
+                kernels::FUSED_QKV_HFQ4G256_K2048_X_BUFFER_GFX1151_SRC,
+                "fused_qkv_hfq4g256_k2048_x_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkv_hfq4g256_k2048_x_buffer_gfx1151",
+                [32u32, 1, 1],
+                (q_m + k_m + v_m) as u32,
+            )
+        } else if matches!(gfx1151_all_buffer_cpol, "temporal" | "slc") {
+            let (module, source, function) = if gfx1151_all_buffer_cpol == "slc" {
+                (
+                    "fused_qkv_hfq4g256_k2048_all_buffer_slc_gfx1151",
+                    kernels::FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC,
+                    "fused_qkv_hfq4g256_k2048_all_buffer_slc_gfx1151",
+                )
+            } else {
+                (
+                    "fused_qkv_hfq4g256_k2048_all_buffer_gfx1151",
+                    kernels::FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC,
+                    "fused_qkv_hfq4g256_k2048_all_buffer_gfx1151",
+                )
+            };
+            self.ensure_kernel(module, source, function)?;
+            (function, [32u32, 1, 1], (q_m + k_m + v_m) as u32)
+        } else if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
             // HIPFIRE_GFX942_GEMV_V2=0.
@@ -2499,8 +2551,342 @@ impl Gpu {
         // 2 rows per block, halves grid count vs wave32 kernel which wastes half
         // the wave slot. This kernel uses no MFMA, just FMA + shfl_down within
         // wave64, so it is safe for Vega 20 as well as CDNA.
-        let cdna_wave64 = self.arch_caps.is_wave64_native();
-        let (func_name, block, grid_x) = if cdna_wave64 {
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        // gfx1100 has 96 CUs: the 1,281-row DeltaNet shape exposes only
+        // 13.3 independent waves/CU, while the 12,352-row shape already has
+        // ample scheduler freedom. Keep the cooperative split restricted to
+        // the genuinely underfilled shape instead of paying its LDS join on
+        // every QKVZA projection.
+        let rdna3_2wave =
+            self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_2wave && total_m <= 2_048;
+        let rdna3_wavepack4 = self.arch_caps.is_rdna3_dgpu()
+            && self.flags.rdna3_hfq4_qkvza_wavepack4
+            && total_m <= 2_048;
+        let rdna3_ldsx8 = self.arch_caps.is_gfx1100()
+            && self.flags.rdna3_hfq4_qkvza_ldsx8
+            && k == 2_048;
+        let rdna3_reduce_chain =
+            self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_reduce_chain;
+        let rdna3_k2048 = self.arch_caps.is_gfx1100()
+            && self.flags.rdna3_hfq4_qkvza_k2048
+            && k == 2_048;
+        static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA").as_deref()
+                        == Ok("1")
+            });
+        static GFX1151_QKVZA_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_all_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_ALL_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER").as_deref() == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_hybrid_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && total_m == 1_281
+            && *GFX1151_QKVZA_HYBRID_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER").as_deref() == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_X_BUFFER_LARGE: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_x_buffer_large = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && total_m > 2_048
+            && *GFX1151_QKVZA_X_BUFFER_LARGE.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
+        let gfx1151_k2048_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
+            GFX1151_QKVZA_ALL_BUFFER_CPOL
+                .get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                })
+                .as_str()
+        } else {
+            ""
+        };
+        static GFX1151_QKVZA_LDSX8_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_ldsx8_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_LDSX8_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_PAIR_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_pair_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_PAIR_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_K2048_HOIST: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_hoist = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_K2048_HOIST.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_K2048_HOIST").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_R2: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_r2 = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_R2.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_R2").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_R2_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_r2_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_R2_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_R2_BUFFER").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_R4_STREAM: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_r4_stream = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && total_m > 2_048
+            && qkv_m.is_multiple_of(4)
+            && z_m.is_multiple_of(4)
+            && beta_m.is_multiple_of(4)
+            && alpha_m.is_multiple_of(4)
+            && *GFX1151_QKVZA_R4_STREAM.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_R4_STREAM").as_deref() == Ok("1")
+            });
+        static GFX1151_QKVZA_WAVE64_SHARE_X: OnceLock<bool> = OnceLock::new();
+        let gfx1151_wave64_share_x = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_WAVE64_SHARE_X.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X").as_deref() == Ok("1")
+            });
+        static QKVZA_R2: OnceLock<bool> = OnceLock::new();
+        let rdna3_k2048_r2 = rdna3_k2048
+            && *QKVZA_R2.get_or_init(|| {
+                std::env::var("HIPFIRE_RDNA3_QKVZA_R2").as_deref() == Ok("1")
+            });
+        static QKVZA_CPOL_SLC: OnceLock<bool> = OnceLock::new();
+        let rdna3_k2048_cpol_slc = rdna3_k2048
+            && *QKVZA_CPOL_SLC.get_or_init(|| {
+                std::env::var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc")
+            });
+        let cdna_wave64 = self.arch_caps.is_wave64_native()
+            || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
+        let (func_name, block, grid_x) = if rdna3_ldsx8 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_ldsx8_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_LDSX8_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_ldsx8",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_ldsx8",
+                [256u32, 1, 1],
+                (total_m as u32).div_ceil(8),
+            )
+        } else if rdna3_2wave {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_2wave",
+                kernels::FUSED_QKVZA_HFQ4G256_2WAVE_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_2wave",
+            )?;
+            ("fused_qkvza_hfq4g256_2wave", [64u32, 1, 1], total_m as u32)
+        } else if rdna3_wavepack4 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_wavepack4",
+                kernels::FUSED_QKVZA_HFQ4G256_WAVEPACK4_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_wavepack4",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_wavepack4",
+                [128u32, 1, 1],
+                (total_m as u32).div_ceil(4),
+            )
+        } else if rdna3_reduce_chain {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_reduce_chain_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_REDUCE_CHAIN_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_reduce_chain",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_reduce_chain",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if rdna3_k2048_r2 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_r2_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_R2_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_k2048_r2",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_r2",
+                [32u32, 1, 1],
+                (total_m as u32).div_ceil(2),
+            )
+        } else if rdna3_k2048_cpol_slc {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_cpol_slc_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_CPOL_SLC_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_k2048_cpol_slc",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_cpol_slc",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if rdna3_k2048 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_gfx1100",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_k2048",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if gfx1151_wave64_share_x {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_wave64_share_x_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SHARE_X_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_wave64_share_x_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_wave64_share_x_gfx1151",
+                [64u32, 1, 1],
+                (total_m as u32).div_ceil(2),
+            )
+        } else if gfx1151_k2048_r4_stream {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_R4_STREAM_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151",
+                [32u32, 1, 1],
+                (total_m as u32).div_ceil(4),
+            )
+        } else if gfx1151_k2048_x_buffer_large {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_X_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if gfx1151_k2048_ldsx8_buffer {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_ldsx8_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_LDSX8_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_ldsx8_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_ldsx8_buffer_gfx1151",
+                [256u32, 1, 1],
+                (total_m as u32).div_ceil(8),
+            )
+        } else if matches!(gfx1151_k2048_all_buffer_cpol, "glc" | "slc" | "dlc") {
+            let (module, source, function) = match gfx1151_k2048_all_buffer_cpol {
+                "glc" => (
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151",
+                    kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GLC_GFX1151_SRC,
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151",
+                ),
+                "slc" => (
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151",
+                    kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC,
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151",
+                ),
+                "dlc" => (
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151",
+                    kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_DLC_GFX1151_SRC,
+                    "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151",
+                ),
+                _ => unreachable!(),
+            };
+            self.ensure_kernel(module, source, function)?;
+            (function, [32u32, 1, 1], total_m as u32)
+        } else if gfx1151_k2048_hybrid_buffer {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_HYBRID_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if gfx1151_k2048_all_buffer && !gfx1151_k2048_pair_buffer {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if gfx1151_k2048_r2_buffer {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_r2_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_R2_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_r2",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_r2",
+                [32u32, 1, 1],
+                (total_m as u32).div_ceil(2),
+            )
+        } else if gfx1151_k2048_pair_buffer {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_PAIR_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if gfx1151_k2048_r2 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_r2_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_R2_GFX1100_SRC,
+                "fused_qkvza_hfq4g256_k2048_r2",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_r2",
+                [32u32, 1, 1],
+                (total_m as u32).div_ceil(2),
+            )
+        } else if gfx1151_k2048_hoist {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_hoist_x32_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_HOIST_X32_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_hoist_x32_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_hoist_x32_gfx1151",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if gfx1151_k2048_buffer {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_buffer_gfx1151",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
             // HIPFIRE_GFX942_GEMV_V2=0.
@@ -2512,7 +2898,7 @@ impl Gpu {
                     kernels::FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC,
                     "fused_qkvza_hfq4g256_v2_gfx942",
                 )?;
-                let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+                let total = total_m as u32;
                 (
                     "fused_qkvza_hfq4g256_v2_gfx942",
                     [128u32, 1, 1],
@@ -2524,7 +2910,7 @@ impl Gpu {
                     kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
                     "fused_qkvza_hfq4g256_wave64",
                 )?;
-                let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+                let total = total_m as u32;
                 (
                     "fused_qkvza_hfq4g256_wave64",
                     [64u32, 1, 1],
@@ -2532,16 +2918,17 @@ impl Gpu {
                 )
             }
         } else {
-            self.ensure_kernel(
-                "fused_qkvza_hfq4g256",
-                kernels::FUSED_QKVZA_HFQ4G256_SRC,
-                "fused_qkvza_hfq4g256",
-            )?;
-            (
-                "fused_qkvza_hfq4g256",
-                [32u32, 1, 1],
-                (qkv_m + z_m + beta_m + alpha_m) as u32,
-            )
+            let (module, source) =
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkvza_hoist_x32 {
+                    (
+                        "fused_qkvza_hfq4g256_hoist_x32_gfx1100",
+                        kernels::FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC,
+                    )
+                } else {
+                    ("fused_qkvza_hfq4g256", kernels::FUSED_QKVZA_HFQ4G256_SRC)
+                };
+            self.ensure_kernel(module, source, "fused_qkvza_hfq4g256")?;
+            ("fused_qkvza_hfq4g256", [32u32, 1, 1], total_m as u32)
         };
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
@@ -2593,6 +2980,114 @@ impl Gpu {
             b.push_ptr(yz);
             b.push_ptr(yb);
             b.push_ptr(ya);
+            b.push_i32(q_m_i);
+            b.push_i32(z_m_i);
+            b.push_i32(b_m_i);
+            b.push_i32(a_m_i);
+            b.push_i32(k_i);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1100/K=2048 QKVZA experiment that also prepares the DeltaNet beta
+    /// and alpha scalars. The projection FMAs and reduction are identical to
+    /// `fused_qkvza_hfq4g256`; only the two tiny output tails absorb the
+    /// elementwise work from `fused_sigmoid_alpha_gate_f32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_hfq4g256_scalar_prep_gfx1100(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() || k != 2_048 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "scalar-prep QKVZA requires gfx1100 and K=2048",
+            ));
+        }
+
+        const KERNEL: &str = "fused_qkvza_hfq4g256_k2048_scalar_prep";
+        self.ensure_kernel(
+            "fused_qkvza_hfq4g256_k2048_scalar_prep_gfx1100",
+            kernels::FUSED_QKVZA_HFQ4G256_K2048_SCALAR_PREP_GFX1100_SRC,
+            KERNEL,
+        )?;
+
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let db = dt_bias.buf.as_ptr();
+        let al = a_log.buf.as_ptr();
+        let q_m_i = qkv_m as i32;
+        let z_m_i = z_m as i32;
+        let b_m_i = beta_m as i32;
+        let a_m_i = alpha_m as i32;
+        let k_i = k as i32;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+            + (beta_m + alpha_m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &db as *const _ as *mut c_void,
+            &al as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &z_m_i as *const _ as *mut c_void,
+            &b_m_i as *const _ as *mut c_void,
+            &a_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let grid = [(qkv_m + z_m + beta_m + alpha_m) as u32, 1, 1];
+        let result = self.launch_maybe_blob(KERNEL, grid, [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(aq);
+            b.push_ptr(az);
+            b.push_ptr(ab);
+            b.push_ptr(aa);
+            b.push_ptr(xp);
+            b.push_ptr(yq);
+            b.push_ptr(yz);
+            b.push_ptr(yb);
+            b.push_ptr(ya);
+            b.push_ptr(db);
+            b.push_ptr(al);
             b.push_i32(q_m_i);
             b.push_i32(z_m_i);
             b.push_i32(b_m_i);

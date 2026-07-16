@@ -3526,6 +3526,7 @@ fn llama_kv_write_attend(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &scratch.attn_out,
         };
         attention_family()
@@ -3905,6 +3906,7 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &s.attn_out,
         };
         Ok(Some((plan, io)))
@@ -4040,6 +4042,7 @@ pub fn forward_scratch_layers(
                 tree_bias: None,
                 block_start: 0,
                 block_cols: 0,
+                output_gate: None,
                 output: &scratch.attn_out,
             };
             attention_family()
@@ -4630,6 +4633,7 @@ pub fn forward_scratch_compute_capture(
                 tree_bias: None,
                 block_start: 0,
                 block_cols: 0,
+                output_gate: None,
                 output: &scratch.attn_out,
             };
             attention_family()

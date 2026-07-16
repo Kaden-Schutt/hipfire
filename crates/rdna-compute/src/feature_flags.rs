@@ -37,6 +37,56 @@ pub struct FeatureFlags {
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
+    /// Radiowave experiment: pack two independent HFQ4 QKV rows into one
+    /// explicitly compiled wave64 on RDNA3. Default off until model-level
+    /// correctness and throughput gates promote it.
+    pub rdna3_hfq4_qkv_wave64: bool,
+    /// Radiowave experiment: split each gfx1100 QKVZA output row across two
+    /// lighter wave32s and join their partials through LDS.
+    pub rdna3_hfq4_qkvza_2wave: bool,
+    /// Radiowave experiment: package four independent gfx1100 QKVZA row
+    /// waves in one workgroup without changing per-row arithmetic.
+    pub rdna3_hfq4_qkvza_wavepack4: bool,
+    /// Stage the K=2048 QKVZA activation once per eight exact row waves in a
+    /// transposed LDS tile on gfx1100.
+    pub rdna3_hfq4_qkvza_ldsx8: bool,
+    /// Radiowave recovery of the exact gfx1100 autoresearch schedule: keep an
+    /// explicit row stride and spell out the five shuffle-reduction stages so
+    /// LLVM cannot re-form the reduction as a loop.
+    pub rdna3_hfq4_qkvza_reduce_chain: bool,
+    /// Radiowave experiment: port the gfx12 QKVZA float4 activation-hoist
+    /// schedule to gfx1100 while retaining one independent wave per row.
+    pub rdna3_hfq4_qkvza_hoist_x32: bool,
+    /// Compile the exact A3B decode shape with eight HFQ4 groups fixed at
+    /// compile time, deleting the general QKVZA loop and tail machinery.
+    /// Certified default on gfx1100; set
+    /// `HIPFIRE_RDNA3_HFQ4_QKVZA_K2048=0` to restore the general kernel.
+    pub rdna3_hfq4_qkvza_k2048: bool,
+    /// Stage one residual GEMV row's 32 activation values ahead of the
+    /// independent packed-weight loads. Certified default on exact gfx1100;
+    /// other RDNA3 targets remain explicit opt-in until separately measured.
+    pub rdna3_hfq4_residual_stage_x32: bool,
+    /// Combine the certified activation staging with a fixed eight-group
+    /// K=2048 loop on gfx1100. Opt-in until exact and tg128 gates promote it.
+    pub rdna3_hfq4_residual_k2048: bool,
+    /// Launch only the active half of the two-row shared-expert down grid.
+    /// The kernel maps row0 = blockIdx.x * 2; the legacy launcher submits M
+    /// workgroups, leaving the upper half to return immediately.
+    pub rdna3_hfq4_sigmoid_tight_grid: bool,
+    /// Compile the shared-expert sigmoid-scaled down kernel with gfx1100
+    /// temporal buffer-resource weight loads instead of global addressing.
+    /// Default-on for gfx1100; set `HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER=0`
+    /// to restore global addressing for comparison.
+    pub rdna3_hfq4_sigmoid_buffer: bool,
+    /// Schedule four shared-expert down rows per wave on gfx1100, reusing
+    /// each activation load across four independent weight streams.
+    pub rdna3_hfq4_sigmoid_rows4: bool,
+    /// Compile the exact Qwen3.5-35B LM-head shape (M=248320, K=2048) with
+    /// its eight HFQ4 groups fixed at compile time. gfx1100 experiment only.
+    pub rdna3_hfq4_lm_head_k2048: bool,
+    /// Compile the gfx1100 A3B MoE gate/up GEMV with its eight K groups fixed
+    /// at compile time. Opt-in until exact shadow and tg128 gates promote it.
+    pub rdna3_hfq4_moe_gate_up_k2048: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -63,6 +113,27 @@ pub struct FeatureFlags {
     pub gfx942_gemv_v2: Option<bool>,
     pub gfx942_gemv_v3: bool,
     pub gfx942_rmsnorm_split: bool,
+    /// Reserve only the reduction scratch still used by the current fused
+    /// RMSNorm+MQ kernel. The historical K-float LDS cache was removed when
+    /// the prefetch schedule landed, but its launch reservation remained.
+    pub rmsnorm_mq_tight_lds: bool,
+    /// Radiowave experiment: split the K=2048 fused RMSNorm+MQ rotation over
+    /// eight resident wave32 workgroups on gfx1100. The workgroups retain the
+    /// baseline reduction order and rendezvous through persistent GPU scratch.
+    pub rdna3_rmsnorm_wavegrid: bool,
+    /// Radiowave experiment: replace the cross-workgroup rendezvous with one
+    /// exact reduction dispatch followed by eight independent rotate waves.
+    pub rdna3_rmsnorm_split: bool,
+    /// Compute the K=2048 RMS sum from each FWHT wave's prefetched float4
+    /// values, eliminating the baseline's second x load. Certified default on
+    /// gfx1100; set `HIPFIRE_RDNA3_RMSNORM_VECSUM=0` to restore the baseline.
+    pub rdna3_rmsnorm_vecsum: bool,
+    /// Radiowave experiment: stage the two shared MQ sign tables once in LDS
+    /// for the gfx1100 vecsum kernel instead of reloading them in eight waves.
+    pub rdna3_rmsnorm_sign_lds: bool,
+    /// Radiowave experiment: compile the deterministic MQ sign streams as
+    /// packed constants and apply them with FP32 sign-bit XORs.
+    pub rdna3_rmsnorm_sign_const: bool,
     pub gfx942_mfma_prefill: Option<String>,
     pub moe_grouped_i8: Option<bool>,
     pub moe_grouped_i8_k8: bool,
@@ -70,6 +141,9 @@ pub struct FeatureFlags {
     pub moe_grouped_i8_k4_gfx12: bool,
     pub moe_grouped_m2: bool,
     pub moe_grouped_4w: bool,
+    /// Radiowave experiment: fold four adjacent K=8 MoE down outputs per
+    /// thread with vector loads and independent exact accumulators.
+    pub moe_down_combine_vec4: bool,
     pub moe_hfq6_i8: bool,
     pub moe_hfq6_v2: bool,
     // ── MoE prefill (Ship 4.2) ────────────────────────────────────
@@ -179,6 +253,48 @@ impl FeatureFlags {
             _ => 2,
         };
 
+        let mut hipcc_extra_flags = std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
+        let mut append_hipcc_flag = |flag: &str| {
+            if !hipcc_extra_flags.is_empty() {
+                hipcc_extra_flags.push(' ');
+            }
+            hipcc_extra_flags.push_str(flag);
+        };
+        if arch == "gfx1100" {
+            match std::env::var("HIPFIRE_GFX11_WEIGHT_LOAD_POLICY")
+                .ok()
+                .as_deref()
+            {
+                None | Some("") | Some("buffer") => {}
+                Some("global") => append_hipcc_flag("-DHIPFIRE_GFX11_WEIGHT_GLOBAL_LOADS=1"),
+                Some("flat-buffer") => {
+                    append_hipcc_flag("-DHIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN=1")
+                }
+                Some(other) => {
+                    eprintln!("unknown HIPFIRE_GFX11_WEIGHT_LOAD_POLICY={other:?}; using buffer")
+                }
+            }
+        }
+        if arch == "gfx1201" {
+            let policy_flag = match std::env::var("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY")
+                .ok()
+                .as_deref()
+            {
+                None | Some("") | Some("rt") => None,
+                Some("global") => Some("-DHIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS=1"),
+                Some("ht") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=18"),
+                Some("nt-rt") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=20"),
+                Some("nt-ht") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=22"),
+                Some(other) => {
+                    eprintln!("unknown HIPFIRE_GFX12_WEIGHT_LOAD_POLICY={other:?}; using rt");
+                    None
+                }
+            };
+            if let Some(flag) = policy_flag {
+                append_hipcc_flag(flag);
+            }
+        }
+
         Self {
             arch: arch.to_string(),
 
@@ -205,6 +321,55 @@ impl FeatureFlags {
             fp8_wmma: std::env::var("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: std::env::var("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
+            rdna3_hfq4_qkv_wave64: std::env::var("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_2wave: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_wavepack4: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4",
+            )
+            .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_ldsx8: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8")
+                .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_reduce_chain: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN",
+            )
+            .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_hoist_x32: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
+                .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_k2048: parse_bool("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_hfq4_residual_k2048: std::env::var("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048")
+                .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_sigmoid_tight_grid: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID",
+            )
+            .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_sigmoid_buffer: parse_bool("HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_hfq4_sigmoid_rows4: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4",
+            )
+            .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_lm_head_k2048: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048",
+            )
+            .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_moe_gate_up_k2048: std::env::var(
+                "HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048",
+            )
+            .as_deref()
+                == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -247,6 +412,21 @@ impl FeatureFlags {
             gfx942_gemv_v3: std::env::var("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
                 && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
+            rmsnorm_mq_tight_lds: std::env::var("HIPFIRE_RMSNORM_MQ_TIGHT_LDS").as_deref()
+                == Ok("1"),
+            rdna3_rmsnorm_wavegrid: std::env::var("HIPFIRE_RDNA3_RMSNORM_WAVEGRID")
+                .as_deref()
+                == Ok("1"),
+            rdna3_rmsnorm_split: std::env::var("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref()
+                == Ok("1"),
+            rdna3_rmsnorm_vecsum: parse_bool("HIPFIRE_RDNA3_RMSNORM_VECSUM")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_rmsnorm_sign_lds: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS")
+                .as_deref()
+                == Ok("1"),
+            rdna3_rmsnorm_sign_const: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST")
+                .as_deref()
+                == Ok("1"),
             gfx942_mfma_prefill: std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
             moe_grouped_i8: match std::env::var("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
                 Some("1") => Some(true),
@@ -259,6 +439,8 @@ impl FeatureFlags {
                 == Ok("1"),
             moe_grouped_m2: std::env::var("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1"),
             moe_grouped_4w: std::env::var("HIPFIRE_MOE_GROUPED_4W").as_deref() == Ok("1"),
+            moe_down_combine_vec4: std::env::var("HIPFIRE_MOE_DOWN_COMBINE_VEC4").as_deref()
+                == Ok("1"),
             moe_hfq6_i8: std::env::var("HIPFIRE_MOE_HFQ6_I8").as_deref() == Ok("1"),
             moe_hfq6_v2: std::env::var("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
             // MoE prefill (Ship 4.2)
@@ -297,7 +479,7 @@ impl FeatureFlags {
                 .and_then(|s| s.parse::<u32>().ok()),
 
             // Compiler.rs
-            hipcc_extra_flags: std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default(),
+            hipcc_extra_flags,
 
             // Interpreter Phase 2a
             force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
@@ -424,6 +606,20 @@ impl FeatureFlags {
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
+            rdna3_hfq4_qkv_wave64: false,
+            rdna3_hfq4_qkvza_2wave: false,
+            rdna3_hfq4_qkvza_wavepack4: false,
+            rdna3_hfq4_qkvza_ldsx8: false,
+            rdna3_hfq4_qkvza_reduce_chain: false,
+            rdna3_hfq4_qkvza_hoist_x32: false,
+            rdna3_hfq4_qkvza_k2048: false,
+            rdna3_hfq4_residual_stage_x32: false,
+            rdna3_hfq4_residual_k2048: false,
+            rdna3_hfq4_sigmoid_tight_grid: false,
+            rdna3_hfq4_sigmoid_buffer: false,
+            rdna3_hfq4_sigmoid_rows4: false,
+            rdna3_hfq4_lm_head_k2048: false,
+            rdna3_hfq4_moe_gate_up_k2048: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,
@@ -446,6 +642,12 @@ impl FeatureFlags {
             gfx942_gemv_v2: None,
             gfx942_gemv_v3: false,
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),
+            rmsnorm_mq_tight_lds: false,
+            rdna3_rmsnorm_wavegrid: false,
+            rdna3_rmsnorm_split: false,
+            rdna3_rmsnorm_vecsum: false,
+            rdna3_rmsnorm_sign_lds: false,
+            rdna3_rmsnorm_sign_const: false,
             gfx942_mfma_prefill: None,
             moe_grouped_i8: None,
             moe_grouped_i8_k8: false,
@@ -453,6 +655,7 @@ impl FeatureFlags {
             moe_grouped_i8_k4_gfx12: false,
             moe_grouped_m2: false,
             moe_grouped_4w: false,
+            moe_down_combine_vec4: false,
             moe_hfq6_i8: false,
             moe_hfq6_v2: false,
             moe_grouped_gemm: true,

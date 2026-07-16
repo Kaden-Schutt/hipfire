@@ -85,6 +85,11 @@ if [ -z "$DRAFT_27B" ]; then
 fi
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-dflash-$(date +%Y%m%d-%H%M%S).md}"
 CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-240}"
+KV_MODE="${HIPFIRE_GATE_KV_MODE:-q8}"
+case "$KV_MODE" in
+    q8|fwht2|fwht3|fwht4) ;;
+    *) echo "HIPFIRE_GATE_KV_MODE must be q8|fwht2|fwht3|fwht4" >&2; exit 2 ;;
+esac
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 # ── Rebuild dflash_spec_demo if any relevant source is newer ──────────────
@@ -95,7 +100,10 @@ else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/dflash.rs crates/hipfire-arch-qwen35/src/speculative.rs \
                crates/hipfire-runtime/src/ddtree.rs crates/hipfire-runtime/examples/dflash_spec_demo.rs \
-               crates/rdna-compute/src/dispatch.rs; do
+               crates/rdna-compute/src/dispatch.rs crates/rdna-compute/src/attention.rs \
+               kernels/src/attention_flash_fwht2_tile.hip \
+               kernels/src/attention_flash_fwht3_tile.hip \
+               kernels/src/attention_flash_fwht4_tile.hip; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
             break
@@ -171,7 +179,7 @@ hard_errors=0
     echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "- date:   $(date -Iseconds)"
     echo "- mode:   $( [ "$FAST" -eq 1 ] && echo fast || ( [ "$FULL" -eq 1 ] && echo full || echo short ) )"
-    echo "- kv_mode: q8"
+    echo "- kv_mode: $KV_MODE"
     echo "- target: $TARGET_27B"
     echo "- draft:  $DRAFT_27B"
     echo
@@ -343,7 +351,7 @@ for entry in "${tests[@]}"; do
     timeout "$CASE_TIMEOUT" "$EXE" \
         --target "$TARGET_27B" --draft "$DRAFT_27B" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
-        --kv-mode q8 --no-chatml \
+        --kv-mode "$KV_MODE" --no-chatml \
         --state-quant "${HIPFIRE_GATE_STATE_QUANT:-q8}" \
         "${extra[@]}" \
         > "$out_file" 2>&1

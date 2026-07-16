@@ -271,6 +271,20 @@ pub fn run_moe_decode(
     // executor and added into x_residual once). `None` → x_residual directly
     // (single-GPU, byte-identical).
     let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_residual);
+    // gfx1100 experiment: retain one independently schedulable workgroup per
+    // expert rank, but let the last rank for each four-row tile perform the
+    // deterministic expanded-output fold. This is deliberately narrower than
+    // the dtype resolver: mixed/Paro/E8/Lloyd paths keep their existing
+    // kernels and combine semantics.
+    static DOWN_LAST_COMBINE: OnceLock<bool> = OnceLock::new();
+    let down_last_combine = ctx.arch.is_gfx1100()
+        && p.batch_size == 1
+        && p.k == 8
+        && p.expert_dtype_tags.is_none()
+        && p.dtypes.routed_down == DType::MQ4G256
+        && *DOWN_LAST_COMBINE.get_or_init(|| {
+            std::env::var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
+        });
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
@@ -430,14 +444,80 @@ pub fn run_moe_decode(
             }
         }
     }
-    hip!(gpu.softmax_f32(p.router_logits))?;
-    hip!(gpu.moe_topk_renorm_k8(
-        p.router_logits,
-        p.topk_indices,
-        p.topk_weights,
-        p.n_exp,
-        p.norm_topk_prob
-    ))?;
+    let gfx1100_router_mode = std::env::var("HIPFIRE_GFX1100_ROUTER_W64").ok();
+    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151()
+        && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1");
+    let exact_wave64_router = p.n_exp == 256
+        && ((ctx.arch.is_gfx1100()
+            // The exact fused router is the production gfx1100 path. `0` retains
+            // the two-launch reference path for A/B diagnosis; `approx` retains
+            // the old non-bit-exact research kernel without exposing it by
+            // accident through the former `1` opt-in.
+            && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx")))
+            || gfx1151_radiowave_fusions);
+    static ROUTER_SHARED_FUSE: OnceLock<bool> = OnceLock::new();
+    let router_shared_fuse = exact_wave64_router
+        && p.batch_size == 1
+        && !p.skip_shared
+        && p.smi == 512
+        && p.shared_down_w.dtype == DType::MQ4G256
+        && p.shared_down_w.awq_scale.is_none()
+        && *ROUTER_SHARED_FUSE
+            .get_or_init(|| std::env::var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1"));
+    let wave64_router = (ctx.arch.is_gfx1201()
+        && std::env::var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
+        || (ctx.arch.is_gfx1100()
+            && p.n_exp == 256
+            // Research-only: faster on gfx1100, but its routing drift can
+            // change greedy trajectories and trigger an attractor.
+            && gfx1100_router_mode.as_deref() == Some("approx"));
+    if router_shared_fuse {
+        let shared_x_rot = unsafe {
+            GpuTensor {
+                buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            }
+        };
+        hip!(
+            gpu.moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob,
+                &shared_gate,
+                &shared_up,
+                &shared_x_rot,
+                p.smi,
+            )
+        )?;
+    } else if exact_wave64_router {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else if wave64_router {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else {
+        hip!(gpu.softmax_f32(p.router_logits))?;
+        hip!(gpu.moe_topk_renorm_k8(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    }
 
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
@@ -463,7 +543,7 @@ pub fn run_moe_decode(
                     &x_rot_alias,
                     p.smi
                 ))?;
-            } else {
+            } else if !router_shared_fuse {
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
             }
             hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
@@ -786,6 +866,19 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
+        } else if down_last_combine {
+            hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_last_combine(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                p.topk_weights,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
         } else {
             hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
@@ -815,12 +908,13 @@ pub fn run_moe_decode(
     // experts double-count (atomic + combine) or zero out (expanded written,
     // combine skipped) — silent numerical corruption. The merged kernel's
     // expanded write replaces the standalone Lloyd atomic GEMV.
-    let routed_down_self_combines = p.expert_dtype_tags.is_none()
-        && matches!(
-            p.dtypes.routed_down,
-            DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
-        );
-    if !routed_down_self_combines {
+    let routed_down_self_combines = down_last_combine
+        || (p.expert_dtype_tags.is_none()
+            && matches!(
+                p.dtypes.routed_down,
+                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+            ));
+    if !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,

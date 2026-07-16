@@ -94,16 +94,16 @@ detected arch. This is the load-bearing correctness gate for any
 arch port; if it fails on your hardware we want to hear about it
 (see issue template / autoheal skill).
 
-### The three gates
+### Runtime and performance validation
 
 Any change to kernels, dispatch, fusion, rotation, rmsnorm, sampling,
-the spec-decode path, or the forward pass MUST pass the relevant gates
-before commit. The pre-commit hook runs them automatically when staged
-files match the hotspot regex.
+the spec-decode path, or the forward pass MUST validate the actual path under
+test. The fixed `coherence-gate*.sh` batteries are retired and must not be
+used as acceptance evidence.
 
 ```bash
-./scripts/coherence-gate.sh             # AR coherence (panic / zero-tokens / timeout = hard fail)
-./scripts/coherence-gate-dflash.sh      # spec-decode token-attractor detection
+python3 scripts/redline_daemon_harness.py --model /path/to/model --pm4
+python3 scripts/serve_harness.py --model /path/to/model --mode battery --sampling greedy
 ./scripts/speed-gate.sh --fast          # 4B prefill+decode regression vs tests/speed-baselines/<arch>.txt
 ```
 

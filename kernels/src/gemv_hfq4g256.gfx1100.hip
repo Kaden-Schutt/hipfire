@@ -8,8 +8,12 @@
 // launch_bounds(32, 16) — gfx1100 max is 16 waves/SIMD (NOT 20 like gfx1010).
 // 1536 VGPRs / 16 = 96 VGPRs budget at full occupancy.
 
+#ifndef HIPFIRE_HFQ4G256_KERNEL
+#define HIPFIRE_HFQ4G256_KERNEL gemv_hfq4g256
+#endif
+
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256(
+extern "C" __global__ void HIPFIRE_HFQ4G256_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -19,14 +23,27 @@ extern "C" __global__ void gemv_hfq4g256(
     if (row >= M) return;
     const int tid = threadIdx.x;
 
+#if defined(HIPFIRE_HFQ4G256_K2048)
+    // The Qwen3.5-35B LM head is always K=2048. Baking its eight groups into
+    // the code removes the dynamic divide, loop trip count, and all tail
+    // control while retaining the exact four-accumulator FMA order.
+    const int groups_per_row = 8;
+#else
     const int groups_per_row = K / 256;
+#endif
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
+#endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
+#if defined(HIPFIRE_HFQ4G256_K2048)
+    #pragma unroll
+#endif
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const char* gp0 = row_ptr + g * 136;
@@ -34,19 +51,19 @@ extern "C" __global__ void gemv_hfq4g256(
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
 
-        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
-        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
-        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
-        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
-        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
-        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
-        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
-        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
+        float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
+        float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
+        float sc1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 136));
+        float zp1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4, (g + 1) * 136 + 4));
+        float sc2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136));
+        float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
+        float sc3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136));
+        float zp3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4));
 
-        unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
-        unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
-        unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
-        unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
+        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
+        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
+        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
 
         int base = g * 256 + tid * 8;
 
@@ -67,6 +84,7 @@ extern "C" __global__ void gemv_hfq4g256(
         #undef DOG
     }
 
+#if !defined(HIPFIRE_HFQ4G256_K2048)
     // Tail handling: groups_per_row may not be a multiple of 4. Each tail
     // group must accumulate into its OWN accumulator (acc[g % 4]) to
     // preserve the 4-way interleaving that the combine step assumes.
@@ -87,31 +105,32 @@ extern "C" __global__ void gemv_hfq4g256(
     if (tail >= 1) {
         const int g = quads << 2;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc2);
     }
     #undef TAIL_DOG
+#endif
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
