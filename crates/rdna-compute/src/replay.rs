@@ -638,7 +638,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "repeat_interleave_qk_f32_batched"
         | "rope_partial_halfsplit_f32" => Some(48),
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => Some(56),
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => Some(64),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "qwen35_fa_prep_gfx1100"
@@ -2733,7 +2733,7 @@ mod tests {
         );
         assert_eq!(
             expected_kernarg_bytes("gemv_hfq4g256_moe_gate_up_k8_indexed_batched"),
-            Some(56),
+            Some(64),
         );
         let shared = pointer_effects("gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched")
             .expect("batched shared-expert ABI must be catalogued");
