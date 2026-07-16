@@ -166,6 +166,7 @@ impl Gfx11DispatchInterleave {
 pub enum Gfx11ComputeResourceLimitsPolicy {
     #[default]
     Legacy,
+    SimdDestAlways,
     Radv {
         force_simd_dist_for_single_wave: bool,
     },
@@ -176,11 +177,12 @@ impl Gfx11ComputeResourceLimitsPolicy {
         const SIMD_DEST_CNTL: u32 = 1 << 22;
         const FORCE_SIMD_DIST: u32 = 1 << 23;
 
-        let Self::Radv {
-            force_simd_dist_for_single_wave,
-        } = self
-        else {
-            return 0;
+        let force_simd_dist_for_single_wave = match self {
+            Self::Legacy => return 0,
+            Self::SimdDestAlways => return SIMD_DEST_CNTL,
+            Self::Radv {
+                force_simd_dist_for_single_wave,
+            } => force_simd_dist_for_single_wave,
         };
         let threads = workgroup.into_iter().map(u64::from).product::<u64>();
         let wave_size = if wave32 { 32 } else { 64 };
@@ -804,6 +806,10 @@ mod tests {
         assert_eq!(resource_word(256, true, false), 1 << 22);
         assert_eq!(resource_word(64, false, true), 1 << 23);
         assert_eq!(resource_word(256, false, false), 1 << 22);
+        assert_eq!(
+            Gfx11ComputeResourceLimitsPolicy::SimdDestAlways.bits([32, 1, 1], true),
+            1 << 22
+        );
     }
 
     #[test]

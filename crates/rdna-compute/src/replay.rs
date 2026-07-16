@@ -1162,6 +1162,9 @@ fn gfx1151_resource_limits_policy_from_value(
 
     match value.to_ascii_lowercase().as_str() {
         "" | "legacy" | "zero" | "off" => Some(Gfx11ComputeResourceLimitsPolicy::Legacy),
+        "simd-always" | "simd_always" | "always" => {
+            Some(Gfx11ComputeResourceLimitsPolicy::SimdDestAlways)
+        }
         // The certified gfx1151 host exposes 40 CUs over 2 SEs. Its 20 CUs/SE
         // are divisible by four, so Mesa's FORCE_SIMD_DIST guard is false.
         "radv" | "simd-dest" | "simd_dest" => Some(Gfx11ComputeResourceLimitsPolicy::Radv {
@@ -3086,6 +3089,14 @@ mod tests {
                 "radv",
             ),
             Some(radv)
+        );
+        assert_eq!(
+            gfx1151_resource_limits_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "simd-always",
+            ),
+            Some(Gfx11ComputeResourceLimitsPolicy::SimdDestAlways)
         );
         assert_eq!(
             gfx1151_resource_limits_policy_from_value(
