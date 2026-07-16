@@ -372,7 +372,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151"
-            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_wg2_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151"
@@ -668,7 +668,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151"
-            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_wg2_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151"
@@ -2984,7 +2984,7 @@ mod tests {
     fn gfx1151_radiowave_symbols_keep_resource_contracts() {
         let gate = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151";
         let gate_hybrid =
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_wg2_gfx1151";
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(gate), Some(48));
         assert_eq!(pointer_effects(gate).map(|effects| effects.len()), Some(5));

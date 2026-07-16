@@ -6759,11 +6759,11 @@ impl Gpu {
                 && *GFX1151_GATE_UP_PAIR_BUFFER.get_or_init(|| {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_BUFFER").as_deref() == Ok("1")
                 });
-            static GFX1151_GATE_UP_HYBRID_WG2: OnceLock<bool> = OnceLock::new();
-            let gfx1151_hybrid_wg2 = self.arch_caps.is_gfx1151()
+            static GFX1151_GATE_UP_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
+            let gfx1151_hybrid_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
-                && *GFX1151_GATE_UP_HYBRID_WG2.get_or_init(|| {
-                    std::env::var("HIPFIRE_GFX1151_GATE_UP_HYBRID_WG2").as_deref() == Ok("1")
+                && *GFX1151_GATE_UP_HYBRID_BUFFER.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER").as_deref() == Ok("1")
                 });
             static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
             let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
@@ -6793,16 +6793,16 @@ impl Gpu {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER").as_deref()
                         == Ok("1")
                 });
-            if gfx1151_hybrid_wg2 {
+            if gfx1151_hybrid_buffer {
                 self.ensure_kernel(
-                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_hybrid_wg2_gfx1151",
-                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_WG2_GFX1151_SRC,
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_wg2_gfx1151",
+                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_hybrid_gfx1151",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_GFX1151_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151",
                 )?;
                 (
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_wg2_gfx1151",
-                    [64u32, 1, 1],
-                    ((m as u32) >> 1).div_ceil(2),
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151",
+                    [32u32, 1, 1],
+                    (m as u32) >> 1,
                 )
             } else if gfx1151_route_all_buffer {
                 self.ensure_kernel(
