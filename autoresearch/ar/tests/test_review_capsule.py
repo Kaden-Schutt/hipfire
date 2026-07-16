@@ -1,5 +1,6 @@
 # Copyright (c) Kaden Schutt
 import base64
+import hashlib
 import json
 
 import pytest
@@ -9,6 +10,16 @@ from autoresearch.ar.review.models import ReviewTarget
 
 
 TARGET = ReviewTarget("owner/repo", 42, "fork/repo", "head", "main", "base", "merge")
+
+
+def git_blob_oid(payload):
+    return hashlib.sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
+
+
+OLD_OID = git_blob_oid(b"old\n")
+NEW_OID = git_blob_oid(b"new\n")
+A_OID = git_blob_oid(b"a\n")
+B_OID = git_blob_oid(b"b\n")
 
 
 def response(data):
@@ -56,40 +67,40 @@ class FakeGitHub:
 def test_capsule_uses_merge_base_tree_not_base_tip_and_retrieves_changed_blobs():
     client = FakeGitHub(
         {
-            "merge-tree": tree("merge-tree", [{"path": "z.py", "mode": "100644", "type": "blob", "sha": "z0"}]),
+            "merge-tree": tree("merge-tree", [{"path": "z.py", "mode": "100644", "type": "blob", "sha": OLD_OID}]),
             "head-tree": tree("head-tree", [
-                {"path": "a.py", "mode": "100644", "type": "blob", "sha": "a1"},
-                {"path": "z.py", "mode": "100644", "type": "blob", "sha": "z1"},
+                {"path": "a.py", "mode": "100644", "type": "blob", "sha": A_OID},
+                {"path": "z.py", "mode": "100644", "type": "blob", "sha": NEW_OID},
             ]),
         },
-        {"z0": blob("z0", b"old\n"), "z1": blob("z1", b"new\n"), "a1": blob("a1", b"a\n")},
+        {OLD_OID: blob(OLD_OID, b"old\n"), NEW_OID: blob(NEW_OID, b"new\n"), A_OID: blob(A_OID, b"a\n")},
     )
     capsule = build_review_capsule(client, TARGET)
 
     assert capsule.complete
     assert [item.path for item in capsule.manifest] == ["a.py", "z.py"]
     assert capsule.manifest[0].base_blob_oid is None
-    assert capsule.manifest[0].head_blob_oid == "a1"
-    assert capsule.manifest[1].base_blob_oid == "z0"
-    assert capsule.manifest[1].head_blob_oid == "z1"
+    assert capsule.manifest[0].head_blob_oid == A_OID
+    assert capsule.manifest[1].base_blob_oid == OLD_OID
+    assert capsule.manifest[1].head_blob_oid == NEW_OID
     assert capsule.files[0].head_source == "a\n"
     assert client.commit_calls == [("owner/repo", "merge"), ("fork/repo", "head")]
     assert client.tree_calls == [("owner/repo", "merge-tree", True), ("fork/repo", "head-tree", True)]
-    assert client.blob_calls == [("fork/repo", "a1"), ("owner/repo", "z0"), ("fork/repo", "z1")]
+    assert client.blob_calls == [("fork/repo", A_OID), ("owner/repo", OLD_OID), ("fork/repo", NEW_OID)]
 
 
 def test_capsule_order_and_digest_are_stable_across_api_order():
     entries = [
-        {"path": "b.txt", "mode": "100644", "type": "blob", "sha": "b"},
-        {"path": "a.txt", "mode": "100644", "type": "blob", "sha": "a"},
+        {"path": "b.txt", "mode": "100644", "type": "blob", "sha": B_OID},
+        {"path": "a.txt", "mode": "100644", "type": "blob", "sha": A_OID},
     ]
     first = FakeGitHub(
         {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", entries)},
-        {"a": blob("a", b"a\n"), "b": blob("b", b"b\n")},
+        {A_OID: blob(A_OID, b"a\n"), B_OID: blob(B_OID, b"b\n")},
     )
     second = FakeGitHub(
         {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", list(reversed(entries)))},
-        {"a": blob("a", b"a\n"), "b": blob("b", b"b\n")},
+        {A_OID: blob(A_OID, b"a\n"), B_OID: blob(B_OID, b"b\n")},
     )
 
     left = build_review_capsule(first, TARGET)
@@ -108,6 +119,31 @@ def test_truncated_tree_is_explicitly_incomplete():
     assert any("truncat" in reason for reason in capsule.rejections)
 
 
+def test_directory_entries_are_not_changed_files():
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", [
+            {"path": "src", "mode": "040000", "type": "tree", "sha": "old-dir"},
+            {"path": "src/a.py", "mode": "100644", "type": "blob", "sha": OLD_OID},
+        ]), "head-tree": tree("head-tree", [
+            {"path": "src", "mode": "040000", "type": "tree", "sha": "new-dir"},
+            {"path": "src/a.py", "mode": "100644", "type": "blob", "sha": NEW_OID},
+        ])},
+        {OLD_OID: blob(OLD_OID, b"old\n"), NEW_OID: blob(NEW_OID, b"new\n")},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert capsule.complete
+    assert [item.path for item in capsule.manifest] == ["src/a.py"]
+
+
+def test_missing_truncated_marker_is_incomplete():
+    client = FakeGitHub(
+        {"merge-tree": response({"sha": "merge-tree", "tree": []}), "head-tree": tree("head-tree", [])}, {}
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert any("truncat" in reason for reason in capsule.rejections)
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
@@ -116,12 +152,13 @@ def test_truncated_tree_is_explicitly_incomplete():
     ],
 )
 def test_binary_and_declared_size_rejection(payload, message):
-    blob_data = blob("x", payload, size=2 if payload == b"x" else None)
+    oid = git_blob_oid(payload)
+    blob_data = blob(oid, payload, size=2 if payload == b"x" else None)
     client = FakeGitHub(
         {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
-            {"path": "x.bin", "mode": "100644", "type": "blob", "sha": "x"},
+            {"path": "x.bin", "mode": "100644", "type": "blob", "sha": oid},
         ])},
-        {"x": blob_data},
+        {oid: blob_data},
     )
     capsule = build_review_capsule(client, TARGET)
     assert not capsule.complete
@@ -129,11 +166,12 @@ def test_binary_and_declared_size_rejection(payload, message):
 
 
 def test_invalid_base64_and_encoding_are_rejected():
+    oid = git_blob_oid(b"not-base64")
     client = FakeGitHub(
         {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
-            {"path": "x.py", "mode": "100644", "type": "blob", "sha": "x"},
+            {"path": "x.py", "mode": "100644", "type": "blob", "sha": oid},
         ])},
-        {"x": response({"sha": "x", "encoding": "utf-8", "content": "not-base64", "size": 3})},
+        {oid: response({"sha": oid, "encoding": "utf-8", "content": "not-base64", "size": 3})},
     )
     capsule = build_review_capsule(client, TARGET)
     assert not capsule.complete
@@ -141,39 +179,68 @@ def test_invalid_base64_and_encoding_are_rejected():
 
 
 def test_symlink_blob_is_retrieved_but_submodule_is_explicitly_incomplete():
+    link_oid = git_blob_oid(b"target")
     client = FakeGitHub(
         {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
-            {"path": "link", "mode": "120000", "type": "blob", "sha": "link"},
+            {"path": "link", "mode": "120000", "type": "blob", "sha": link_oid},
             {"path": "vendor", "mode": "160000", "type": "commit", "sha": "submodule"},
         ])},
-        {"link": blob("link", b"target")},
+        {link_oid: blob(link_oid, b"target")},
     )
     capsule = build_review_capsule(client, TARGET)
     assert not capsule.complete
-    assert client.blob_calls == [("fork/repo", "link")]
+    assert client.blob_calls == [("fork/repo", link_oid)]
     assert {item.path for item in capsule.manifest} == {"link", "vendor"}
-    assert any("opaque" in reason or "binary" in reason for reason in capsule.rejections)
+    assert any("submodule" in reason or "opaque" in reason or "binary" in reason for reason in capsule.rejections)
 
 
 def test_blob_sha_mismatch_is_incomplete():
+    expected = git_blob_oid(b"x\n")
     client = FakeGitHub(
         {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
-            {"path": "x.py", "mode": "100644", "type": "blob", "sha": "expected"},
+            {"path": "x.py", "mode": "100644", "type": "blob", "sha": expected},
         ])},
-        {"expected": blob("returned", b"x\n")},
+        {expected: blob("returned", b"x\n")},
     )
     capsule = build_review_capsule(client, TARGET)
     assert not capsule.complete
     assert any("identity mismatch" in reason for reason in capsule.rejections)
 
 
-def test_canonical_byte_limit_returns_rejected_capsule(monkeypatch):
-    monkeypatch.setattr("autoresearch.ar.review.capsule.MAX_CANONICAL_BYTES", 2048)
+def test_supported_sha1_oid_must_match_git_blob_object_hash():
+    payload = b"x = 1\n"
+    expected = git_blob_oid(payload)
     client = FakeGitHub(
         {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
-            {"path": "large.py", "mode": "100644", "type": "blob", "sha": "large"},
+            {"path": "x.py", "mode": "100644", "type": "blob", "sha": expected},
         ])},
-        {"large": blob("large", b"x" * 5000)},
+        {expected: blob(expected, b"different\n")},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert any("object" in reason or "hash" in reason for reason in capsule.rejections)
+
+
+def test_non_sha1_blob_oid_is_explicitly_incomplete():
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
+            {"path": "x.py", "mode": "100644", "type": "blob", "sha": "short-oid"},
+        ])},
+        {"short-oid": blob("short-oid", b"x\n")},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert any("OID" in reason or "oid" in reason for reason in capsule.rejections)
+
+
+def test_canonical_byte_limit_returns_rejected_capsule(monkeypatch):
+    monkeypatch.setattr("autoresearch.ar.review.capsule.MAX_CANONICAL_BYTES", 2048)
+    large_oid = git_blob_oid(b"x" * 5000)
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
+            {"path": "large.py", "mode": "100644", "type": "blob", "sha": large_oid},
+        ])},
+        {large_oid: blob(large_oid, b"x" * 5000)},
     )
     capsule = build_review_capsule(client, TARGET)
     assert not capsule.complete

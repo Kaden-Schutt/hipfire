@@ -1,18 +1,24 @@
 # Copyright (c) Kaden Schutt
 import base64
 from copy import deepcopy
+import hashlib
 import json
+from pathlib import Path
+import shutil
+import tempfile
+from urllib.error import HTTPError
 
 import pytest
 
 from autoresearch.ar.review.capsule import build_review_capsule
 from autoresearch.ar.review.inference import (
+    BoundedHttpTransport,
     HttpRequest,
     HttpResponse,
     ToollessReviewAdapter,
     ToollessInferenceError,
 )
-from autoresearch.ar.review.config import ReviewConfiguration
+from autoresearch.ar.review.config import ReviewConfiguration, load_review_configuration
 from autoresearch.ar.review.models import ReviewTarget
 
 
@@ -35,6 +41,25 @@ POLICY = {
         "max_cost_usd": 5.0,
     }],
 }
+ROOT = Path(__file__).parents[3]
+_CONFIGURATION = None
+X_OID = hashlib.sha1(b"blob 6\0x = 1\n").hexdigest()
+
+
+def protected_configuration(policy=None):
+    global _CONFIGURATION
+    if policy is None and _CONFIGURATION is not None:
+        return _CONFIGURATION
+    root = Path(tempfile.mkdtemp())
+    config_dir = root / ".github" / "agentic-review"
+    config_dir.mkdir(parents=True)
+    (config_dir / "providers.json").write_text(json.dumps(policy or POLICY), encoding="utf-8")
+    for name in ("capabilities-v1.json", "trusted-publishers.json"):
+        shutil.copy(ROOT / ".github" / "agentic-review" / name, config_dir / name)
+    loaded = load_review_configuration(root)
+    if policy is None:
+        _CONFIGURATION = loaded
+    return loaded
 
 
 def capsule():
@@ -44,7 +69,7 @@ def capsule():
             return type("Response", (), {"data": {"sha": sha, "tree": {"sha": tree_sha}}})()
 
         def get_tree(self, repository, sha, *, recursive=False):
-            entries = [] if sha == "merge-tree" else [{"path": "x.py", "mode": "100644", "type": "blob", "sha": "x"}]
+            entries = [] if sha == "merge-tree" else [{"path": "x.py", "mode": "100644", "type": "blob", "sha": X_OID}]
             return type("Response", (), {"data": {"sha": sha, "tree": entries, "truncated": False}})()
 
         def get_blob(self, repository, sha):
@@ -74,7 +99,7 @@ def valid_response(**changes):
 
 
 def adapter(transport):
-    configuration = ReviewConfiguration(POLICY, {}, {})
+    configuration = protected_configuration()
     return ToollessReviewAdapter.from_configuration(configuration, "review-adapter", transport, {"REVIEW_API_KEY": "secret"})
 
 
@@ -109,30 +134,33 @@ def test_provider_selection_is_exact_and_empty_policy_fails_closed():
     with pytest.raises(ToollessInferenceError, match="provider"):
         ToollessReviewAdapter.from_configuration(ReviewConfiguration({"schema": POLICY["schema"], "version": 1, "providers": []}, {}, {}), "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
     with pytest.raises(ToollessInferenceError, match="exact|configured"):
-        ToollessReviewAdapter.from_configuration(ReviewConfiguration(POLICY, {}, {}), "review-adapter-extra", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
+        ToollessReviewAdapter.from_configuration(protected_configuration(), "review-adapter-extra", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
 
 
 def test_provider_requires_protected_configuration_and_injected_non_github_environment():
-    with pytest.raises(ToollessInferenceError, match="protected"):
-        ToollessReviewAdapter.from_configuration(POLICY, "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
+    with pytest.raises(ToollessInferenceError, match="protected|loaded"):
+        ToollessReviewAdapter.from_configuration(ReviewConfiguration(POLICY, {}, {}), "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
     with pytest.raises(ToollessInferenceError, match="GitHub"):
         ToollessReviewAdapter.from_configuration(
-            ReviewConfiguration(POLICY, {}, {}), "review-adapter", Transport(valid_response()),
+            protected_configuration(), "review-adapter", Transport(valid_response()),
             {"REVIEW_API_KEY": "secret", "GITHUB_TOKEN": "must-not-forward"},
         )
     with pytest.raises(ToollessInferenceError, match="absent"):
-        ToollessReviewAdapter.from_configuration(ReviewConfiguration(POLICY, {}, {}), "review-adapter", Transport(valid_response()), {})
+        ToollessReviewAdapter.from_configuration(protected_configuration(), "review-adapter", Transport(valid_response()), {})
     unsupported = deepcopy(POLICY)
     unsupported["providers"][0]["adapter_id"] = "arbitrary-provider"
     with pytest.raises(ToollessInferenceError, match="supported"):
-        ToollessReviewAdapter.from_configuration(ReviewConfiguration(unsupported, {}, {}), "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
+        ToollessReviewAdapter.from_configuration(protected_configuration(unsupported), "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
+    unsupported["providers"][0]["adapter_id"] = "neutral-review"
+    with pytest.raises(ToollessInferenceError, match="supported"):
+        ToollessReviewAdapter.from_configuration(protected_configuration(unsupported), "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
 
 
 @pytest.mark.parametrize(
     "response",
     [
         HttpResponse(302, {"location": "https://other.invalid"}, b""),
-        HttpResponse(200, {"transfer-encoding": "chunked"}, b"{}"),
+        HttpResponse(200, {"TrAnSfEr-EnCoDiNg": "chunked"}, b"{}"),
         HttpResponse(200, {"content-type": "application/json"}, b"{"),
         HttpResponse(200, {"content-type": "application/json"}, b'{"choices":[],"usage":{},"cost_usd":0,"extra":1}'),
     ],
@@ -143,8 +171,8 @@ def test_redirect_streaming_malformed_and_unknown_response_are_rejected(response
 
 
 def test_transport_rejects_redirect_flag_and_enforces_response_limit_before_download():
-    redirected = Transport(HttpResponse(200, {}, b"{}", redirected=True))
-    with pytest.raises(ToollessInferenceError, match="redirect"):
+    redirected = Transport(HttpResponse(302, {"Location": "https://other.invalid"}, b"{}"))
+    with pytest.raises(ToollessInferenceError, match="redirect|status"):
         adapter(redirected).review(capsule())
 
     class BoundedTransport:
@@ -161,6 +189,53 @@ def test_transport_rejects_redirect_flag_and_enforces_response_limit_before_down
     with pytest.raises(ToollessInferenceError, match="request failed"):
         adapter(bounded).review(capsule())
     assert bounded.called
+
+
+def test_owned_transport_disables_redirects_streams_and_bounds_reads():
+    class Opener:
+        def __init__(self, result):
+            self.result = result
+            self.calls = 0
+
+        def open(self, request, timeout):
+            self.calls += 1
+            if isinstance(self.result, BaseException):
+                raise self.result
+            return self.result
+
+    request = HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 1, 3)
+    oversized = type("Response", (), {
+        "status": 200,
+        "headers": {"Content-Length": "4"},
+        "read": lambda self, size: b"abcd",
+    })()
+    opener = Opener(oversized)
+    transport = BoundedHttpTransport(opener)
+    with pytest.raises(ToollessInferenceError, match="byte"):
+        transport.send(request)
+    with pytest.raises(ToollessInferenceError, match="exactly one"):
+        transport.send(request)
+
+    redirect_opener = Opener(HTTPError(request.url, 302, "redirect", {}, None))
+    with pytest.raises(ToollessInferenceError, match="redirect"):
+        BoundedHttpTransport(redirect_opener).send(request)
+
+    streaming = type("Response", (), {
+        "status": 200,
+        "headers": {"Content-Type": "text/event-stream"},
+        "read": lambda self, size: b"data",
+    })()
+    with pytest.raises(ToollessInferenceError, match="stream"):
+        BoundedHttpTransport(Opener(streaming)).send(request)
+
+
+@pytest.mark.parametrize("token", ["ghp_x", "github_pat_x", "gho_x", "ghu_x", "ghs_x", "ghr_x"])
+def test_all_github_token_families_are_rejected(token):
+    with pytest.raises(ToollessInferenceError, match="GitHub|credential"):
+        ToollessReviewAdapter.from_configuration(
+            protected_configuration(), "review-adapter", Transport(valid_response()),
+            {"REVIEW_API_KEY": token},
+        )
 
 
 def test_input_tokens_do_not_consume_output_token_ceiling():

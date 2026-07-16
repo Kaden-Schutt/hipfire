@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import base64
 import binascii
+import hashlib
+import re
 from typing import Any
 
 from .canonical import DEFAULT_MAX_BYTES, canonical_digest, canonical_json
@@ -20,6 +22,7 @@ MAX_TOTAL_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BLOB_BYTES = 2 * 1024 * 1024
 MAX_TREE_DEPTH = 64
 MAX_CANONICAL_BYTES = DEFAULT_MAX_BYTES
+_SHA1_OID = re.compile(r"[0-9a-f]{40}")
 
 
 class ReviewCapsuleError(ValueError):
@@ -132,10 +135,8 @@ def _trees(
         raw_tree = _data(client.get_tree(repository, tree_oid, recursive=True))
         if raw_tree.get("sha") != tree_oid:
             reasons.append(f"{label} tree identity mismatch")
-        if not isinstance(raw_tree.get("truncated", False), bool):
-            reasons.append(f"{label} tree truncation marker is malformed")
-        elif raw_tree.get("truncated") is True:
-            reasons.append(f"{label} recursive tree is truncated")
+        if raw_tree.get("truncated") is not False:
+            reasons.append(f"{label} recursive tree truncation marker is missing or true")
         entries = raw_tree.get("tree")
         if not isinstance(entries, list):
             reasons.append(f"{label} tree entries are unavailable")
@@ -168,6 +169,8 @@ def _trees(
             if not all(isinstance(entry.get(field), str) and entry[field] for field in ("mode", "type", "sha")):
                 reasons.append(f"{label} tree entry is missing identity: {path}")
                 continue
+            if entry["type"] == "tree":
+                continue
             result[path] = entry
         return tree_oid, result, reasons
     except Exception as exc:
@@ -185,6 +188,9 @@ def _blob(
 ) -> tuple[str | None, int | None, list[str]]:
     reasons: list[str] = []
     try:
+        if _SHA1_OID.fullmatch(oid) is None:
+            reasons.append(f"{side} blob OID is unsupported (expected SHA-1): {path}")
+            return None, None, reasons
         data = _data(client.get_blob(repository, oid))
         if data.get("sha") != oid:
             reasons.append(f"{side} blob identity mismatch: {path}")
@@ -206,6 +212,10 @@ def _blob(
             return None, declared, reasons
         if len(raw) != declared:
             reasons.append(f"{side} blob byte size mismatch: {path}")
+            return None, declared, reasons
+        actual_oid = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+        if actual_oid != oid:
+            reasons.append(f"{side} blob Git object hash mismatch: {path}")
             return None, declared, reasons
         if b"\x00" in raw:
             reasons.append(f"{side} blob is binary: {path}")
@@ -243,7 +253,11 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
         base = base_tree.get(path)
         head = head_tree.get(path)
         if (base and base.get("type") != "blob") or (head and head.get("type") != "blob"):
-            reasons.append(f"binary or opaque tree entry: {path}")
+            entries = [entry for entry in (base, head) if entry is not None]
+            if any(entry.get("type") == "commit" or entry.get("mode") == "160000" for entry in entries):
+                reasons.append(f"submodule commit entry is unsupported: {path}")
+            else:
+                reasons.append(f"unsupported or opaque tree leaf: {path}")
             manifest.append(ReviewManifestEntry(
                 path,
                 base.get("mode") if base else None,

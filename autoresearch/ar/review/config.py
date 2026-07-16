@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 import re
@@ -34,6 +34,11 @@ class ReviewConfiguration:
     providers: Mapping[str, Any]
     capabilities: Mapping[str, Any]
     trusted_publishers: Mapping[str, Any]
+    _loaded_from_protected_paths: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def is_protected(self) -> bool:
+        return self._loaded_from_protected_paths
 
     def with_trusted_publishers(self, policy: Mapping[str, Any]) -> "ReviewConfiguration":
         validate_trusted_publishers_policy(policy)
@@ -72,11 +77,14 @@ def load_review_configuration(
     with provider_file.open(encoding="utf-8") as stream:
         provider_policy = json.load(stream)
     validate_provider_policy(provider_policy)
-    return ReviewConfiguration(
+    configuration = ReviewConfiguration(
         providers=provider_policy,
         capabilities=load_capability_policy(capability_file),
         trusted_publishers=load_trusted_publishers_policy(trusted_file),
     )
+    if providers_path == _PROVIDERS and capabilities_path == _CAPABILITIES and trusted_publishers_path == _TRUSTED:
+        object.__setattr__(configuration, "_loaded_from_protected_paths", True)
+    return configuration
 
 
 def validate_operator_credential_manifest(manifest: Mapping[str, Any]) -> None:
