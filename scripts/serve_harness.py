@@ -110,6 +110,7 @@ def build_config(args):
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
+        "session_file": getattr(args, "session", None),
     }
 
 
@@ -118,8 +119,21 @@ def load_prompt_battery(prompts_file):
     if not prompts_file:
         return list(GENRE_BATTERY)
     import json
-    rows = json.load(open(prompts_file))
+    with open(prompts_file) as handle:
+        rows = json.load(handle)
     return [(r.get("genre", "prose"), r["prompt"]) for r in rows]
+
+
+def load_session(session_file):
+    """Load the ordered user turns consumed by session mode."""
+    with open(session_file) as handle:
+        rows = json.load(handle)
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("session JSON must be a non-empty list")
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict) or not isinstance(row.get("content"), str):
+            raise ValueError(f"session turn {index} must contain string field 'content'")
+    return rows
 
 
 def show_config(cfg):
@@ -127,7 +141,8 @@ def show_config(cfg):
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
     print(f"  kv_mode       : {cfg['kv']}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
-    print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
+    input_file = cfg.get("session_file") if cfg["mode"] == "session" else cfg.get("prompts_file")
+    print(f"  seed          : {cfg.get('seed')}   input_file: {input_file or '(built-in battery)'}")
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {cfg['thinking_cap_tokens']} tok (CONCRETE cap)")
     print(f"  max_tokens     : {cfg['max_tokens']}  ({'>cap, model can answer' if cfg['max_tokens'] > cfg['thinking_cap_tokens'] or cfg['thinking_cap_tokens']==0 else 'WARNING: <= think cap -> empty/think-only risk'})")
     print("  sampling (what IS set):")
@@ -288,12 +303,13 @@ def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
-    battery = load_prompt_battery(cfg.get("prompts_file"))
     if cfg["mode"] == "battery":
+        battery = load_prompt_battery(cfg.get("prompts_file"))
         for genre, prompt in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
             rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
     elif cfg["mode"] == "chain":
+        battery = load_prompt_battery(cfg.get("prompts_file"))
         messages = []
         for genre, prompt in battery:
             messages.append({"role": "user", "content": prompt})
@@ -301,7 +317,7 @@ def run(cfg, args):
             messages.append({"role": "assistant", "content": r["assistant_content"]})
             rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
     elif cfg["mode"] == "session":
-        turns = json.load(open(args.session))
+        turns = load_session(args.session)
         messages = []
         for i, t in enumerate(turns):
             messages.append({"role": "user", "content": t["content"]})
