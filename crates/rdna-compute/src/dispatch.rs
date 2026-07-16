@@ -1354,17 +1354,24 @@ impl Gpu {
     /// captured HIP blob sequence without re-entering model dispatch logic.
     /// Inputs/state must be restored by the caller first.
     pub fn replay_recorded_hip_prefix(&self, count: usize) -> HipResult<()> {
+        self.replay_recorded_hip_range(0, count)
+    }
+
+    /// Diagnostic companion to [`Self::replay_recorded_hip_prefix`] used to
+    /// localize a retained-transport mismatch with a PM4-prefix/HIP-suffix
+    /// hybrid. The captured sequence is immutable after preparation.
+    pub fn replay_recorded_hip_range(&self, start: usize, end: usize) -> HipResult<()> {
         self.bind_thread()?;
-        if count > self.replay.recorded_launches().len() {
+        if start > end || end > self.replay.recorded_launches().len() {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "captured HIP prefix {count} exceeds {} launches",
+                    "captured HIP range {start}..{end} is outside {} launches",
                     self.replay.recorded_launches().len()
                 ),
             ));
         }
-        for launch in self.replay.recorded_launches().iter().take(count) {
+        for launch in &self.replay.recorded_launches()[start..end] {
             let func = self.functions.get(&launch.kernel).ok_or_else(|| {
                 hip_bridge::HipError::new(
                     0,

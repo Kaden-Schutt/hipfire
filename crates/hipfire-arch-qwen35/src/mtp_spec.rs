@@ -3296,8 +3296,8 @@ pub fn spec_step_mtp_compressed_serial(
 
     let replayed = if redline_verify_eligible && gpu.replay.should_route_pm4() {
         qwen35::upload_prefill_batch_inputs(gpu, &state.trunk_pbs, &verify_tokens, cur_pos)?;
+        let launches = gpu.replay.recorded_launches().len();
         if std::env::var_os("HIPFIRE_MTP_REPLAY_HIP_PREFIX").is_some() {
-            let launches = gpu.replay.recorded_launches().len();
             gpu.replay_recorded_hip_prefix(launches)?;
         } else {
             unsafe { gpu.replay.replay_pm4(cur_pos) }.map_err(|reason| {
@@ -3305,6 +3305,14 @@ pub fn spec_step_mtp_compressed_serial(
                     .poison(format!("MTP verify PM4 replay failed: {reason}"));
                 hip_bridge::HipError::new(0, &reason)
             })?;
+            let pm4_prefix = std::env::var("HIPFIRE_MTP_PM4_PREFIX")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(launches)
+                .min(launches);
+            if pm4_prefix < launches {
+                gpu.replay_recorded_hip_range(pm4_prefix, launches)?;
+            }
         }
         true
     } else {
@@ -3357,13 +3365,18 @@ pub fn spec_step_mtp_compressed_serial(
                         eprintln!("[redline-mtp-capture] {count:4} {kernel}");
                     }
                 }
+                let pm4_prefix = std::env::var("HIPFIRE_MTP_PM4_PREFIX")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(launches)
+                    .clamp(1, launches);
                 match gpu
                     .replay
-                    .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                    .prepare_pm4_prefix(gpu.device_id as usize, pm4_prefix)
                 {
                     Ok((dispatches, dwords, queue_id)) => eprintln!(
-                        "[redline-mtp] retained K={} verify: dispatches={} pm4_dwords={} queue={}",
-                        state.max_n, dispatches, dwords, queue_id
+                        "[redline-mtp] retained K={} verify: dispatches={}/{} pm4_dwords={} queue={}",
+                        state.max_n, dispatches, launches, dwords, queue_id
                     ),
                     Err(reason) => {
                         gpu.replay
