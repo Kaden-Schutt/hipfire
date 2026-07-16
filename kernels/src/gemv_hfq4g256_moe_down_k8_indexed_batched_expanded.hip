@@ -8,10 +8,6 @@
 #define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded
 #endif
 
-#ifndef HIPFIRE_GFX1151_MOE_DOWN_K512_M2048
-#define HIPFIRE_GFX1151_MOE_DOWN_K512_M2048 0
-#endif
-
 // Atomic-free variant of `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched`.
 //
 // Same per-(token, krank) GEMV compute. Instead of `atomicAdd(scale * acc)`
@@ -58,36 +54,6 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
 #endif
     int M, int K, int K_TOP
 ) {
-#if HIPFIRE_GFX1151_MOE_DOWN_K512_M2048
-    (void)M;
-    (void)K;
-    (void)K_TOP;
-    const int row0 = blockIdx.x * 4;
-    if (row0 >= 2048) return;
-    const int row1 = row0 + 1;
-    const int row2 = row0 + 2;
-    const int row3 = row0 + 3;
-    const int krank = blockIdx.y;
-    const int bid = blockIdx.z;
-    const int tid = threadIdx.x;
-
-    // Certified A3B decode shape: batch=1, K_TOP=8, M=2048, K=512.
-    // Keep bid in the address expressions so the ABI remains batch-correct if
-    // the host contract is widened later, while deleting all runtime divides
-    // and row-stride multiplies from the current one-token path.
-    const int routing_base = bid * 8;
-    const int expert_id = topk_indices[routing_base + krank];
-    const char* __restrict__ A =
-        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
-    const float* __restrict__ x =
-        rot_batch + ((long long)routing_base + krank) * 512;
-    constexpr long long row_stride = 272;
-    const char* row_ptr0 = A + (long long)row0 * row_stride;
-    const char* row_ptr1 = row_ptr0 + row_stride;
-    const char* row_ptr2 = row_ptr1 + row_stride;
-    const char* row_ptr3 = row_ptr2 + row_stride;
-    const int boff = tid * 4;
-#else
     const int row0 = blockIdx.x * 4;
     if (row0 >= M) return;
     const int row1 = row0 + 1;
@@ -116,7 +82,6 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     const char* row_ptr2 = A + (long long)(have_row2 ? row2 : row0) * row_stride;
     const char* row_ptr3 = A + (long long)(have_row3 ? row3 : row0) * row_stride;
     const int boff = tid * 4;
-#endif
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
     const auto row_rsrc0 = HIPFIRE_WEIGHT_RSRC(row_ptr0);
     const auto row_rsrc1 = HIPFIRE_WEIGHT_RSRC(row_ptr1);
@@ -213,21 +178,12 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     if (tid == 0) {
         // Direct store to per-(token, krank) row — no atomic contention.
         // Layout: expert_outputs[bid][krank][row].
-#if HIPFIRE_GFX1151_MOE_DOWN_K512_M2048
-        const long long out_base =
-            ((long long)bid * 8 + krank) * 2048;
-        expert_outputs[out_base + row0] = acc;
-        expert_outputs[out_base + row1] = bcc;
-        expert_outputs[out_base + row2] = ccc;
-        expert_outputs[out_base + row3] = dcc;
-#else
         const long long out_base =
             ((long long)bid * K_TOP + krank) * (long long)M;
         expert_outputs[out_base + row0] = acc;
         if (have_row1) expert_outputs[out_base + row1] = bcc;
         if (have_row2) expert_outputs[out_base + row2] = ccc;
         if (have_row3) expert_outputs[out_base + row3] = dcc;
-#endif
     }
 
 #if HIPFIRE_MOE_DOWN_LAST_COMBINE
