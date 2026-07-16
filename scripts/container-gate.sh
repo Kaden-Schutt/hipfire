@@ -39,17 +39,21 @@ if [ "${HIPFIRE_SKIP_BUILD:-0}" != "1" ]; then
 fi
 
 # Rootless podman needs --group-add keep-groups to keep the host render/video
-# gids for /dev/kfd + /dev/dri access. seccomp=unconfined avoids HSA syscall
+# gids for /dev/kfd + /dev/dri access. Docker does not implement Podman's
+# special keep-groups token (it treats it as a literal group name), and its
+# default rootful mode does not need it. seccomp=unconfined avoids HSA syscall
 # filtering. Share the host GPU lock file if it exists so a containerized gate
 # coordinates with host GPU work (see scripts/gpu-lock.sh).
 GPU_ARGS=(
     --device /dev/kfd
     --device /dev/dri
-    --group-add keep-groups
     --security-opt seccomp=unconfined
     -v "$MODELS_DIR:/root/.hipfire/models"
     -v hipfire-kcache:/var/cache/hipfire
 )
+if [ "$RUNTIME" = "podman" ]; then
+    GPU_ARGS+=(--group-add keep-groups)
+fi
 LOCKFILE="${HIPFIRE_GPU_LOCKFILE:-/tmp/hipfire-gpu.lock}"
 [ -e "$LOCKFILE" ] && GPU_ARGS+=(-v "$LOCKFILE:$LOCKFILE")
 

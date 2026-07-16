@@ -8,7 +8,9 @@ ROCm base:
 | `runtime`     | Deliverable inference image          | daemon + standalone `hipfire` CLI          |
 | `gate-runner` | PR / dev-build GPU-gate validation   | full toolchain + source + gate scripts     |
 
-Everything is podman-native but works unchanged with `docker` (swap the command).
+The image builds with either podman or Docker. The run examples below use
+podman; Docker does not support Podman's special `--group-add keep-groups`
+token, so omit that flag under rootful Docker.
 
 ## Why it's built this way
 
@@ -36,7 +38,7 @@ podman build -f Containerfile --target runtime     -t hipfire .
 podman build -f Containerfile --target gate-runner -t hipfire-gate .
 ```
 
-`.containerignore` prunes the ~160 GB working tree (target/, worktrees, venv,
+`.dockerignore` prunes the ~160 GB working tree (target/, worktrees, venv,
 models) down to a small source context.
 
 ## Run the deliverable
@@ -54,9 +56,11 @@ podman run --rm -it \
   hipfire run qwen3.5:4b "2+2="
 ```
 
-`hipfire serve qwen3.5:4b 0.0.0.0:11435 -d` exposes the JSON-lines daemon on the
-published port. The `hipfire-kcache` volume persists JIT-compiled kernels across
-container runs; `hipfire-models` persists pulled models.
+`hipfire serve qwen3.5:4b 0.0.0.0:11435` exposes the OpenAI-compatible API on
+the published port. Keep it in the foreground: `-d` makes container PID 1 exit,
+at which point the container runtime stops the detached child. The
+`hipfire-kcache` volume persists JIT-compiled kernels across container runs;
+`hipfire-models` persists pulled models.
 
 ## Validate a dev build / PR (GPU gates)
 
