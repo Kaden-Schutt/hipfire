@@ -2611,6 +2611,19 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+/// Exact gfx1151 A3B candidate: expose the fixed K=2048 contract and hoist
+/// the complete 32-value activation quad before the weight/FMA stream. Keep
+/// ordinary global weight loads: temporal raw-buffer addressing was neutral
+/// in isolation on gfx1151 and must not be coupled to this codegen probe.
+pub const FUSED_QKVZA_HFQ4G256_K2048_HOIST_X32_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_HOIST_X32 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_hoist_x32_gfx1151\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 pub const FUSED_QKVZA_HFQ4G256_HOIST_X32_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     "#define HIPFIRE_RDNA3_QKVZA_HOIST_X32 1\n",
