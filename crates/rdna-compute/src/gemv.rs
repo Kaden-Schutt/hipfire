@@ -5072,6 +5072,11 @@ impl Gpu {
             && self.flags.gfx1201_hfq4_27b_global
             && m == 5_120
             && matches!(k, 6_144 | 17_408);
+        static GFX1201_27B_RESIDUAL_R4: OnceLock<bool> = OnceLock::new();
+        let gfx1201_27b_residual_r4 = gfx1201_27b_global
+            && *GFX1201_27B_RESIDUAL_R4.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_RESIDUAL_R4").as_deref() == Ok("1")
+            });
         let (src, module, func_name) = if gfx1201_27b_global {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_GLOBAL_GFX1201_SRC,
@@ -5187,14 +5192,18 @@ impl Gpu {
         // kernel to the default path if/when the non-residual multi-row wins
         // scale to justify residual too.)
         let rdna3 = self.arch_caps.is_rdna3_dgpu();
-        let rows = if gfx1151_multirow_r2 {
+        let rows = if gfx1201_27b_residual_r4 {
+            4
+        } else if gfx1151_multirow_r2 {
             2
         } else if rdna3 {
             self.flags.gemv_rows.unwrap_or(1)
         } else {
             1
         };
-        let use_multirow = (rdna3 && rows > 1) || gfx1151_multirow_r2;
+        let use_multirow = (rdna3 && rows > 1)
+            || gfx1151_multirow_r2
+            || gfx1201_27b_residual_r4;
 
         // Bandwidth: weight + x + y_read (for residual) + y_write.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
@@ -5286,14 +5295,25 @@ impl Gpu {
                 })
             }
         } else if use_multirow {
-            let (func_name, grid_div) = match (gfx1151_multirow_r2, rows) {
-                (true, 2) => ("gemv_hfq4g256_residual_multirow_r2_gfx1151", 2u32),
-                (false, 2) => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
-                (false, 4) => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
-                (false, 8) => ("gemv_hfq4g256_residual_multirow_r8", 8u32),
-                _ => unreachable!(),
+            let (func_name, grid_div) = if gfx1201_27b_residual_r4 {
+                ("gemv_hfq4g256_residual_multirow_r4_gfx1201", 4u32)
+            } else {
+                match (gfx1151_multirow_r2, rows) {
+                    (true, 2) => {
+                        ("gemv_hfq4g256_residual_multirow_r2_gfx1151", 2u32)
+                    }
+                    (false, 2) => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
+                    (false, 4) => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
+                    (false, 8) => ("gemv_hfq4g256_residual_multirow_r8", 8u32),
+                    _ => unreachable!(),
+                }
             };
-            let (module, source) = if gfx1151_multirow_r2 {
+            let (module, source) = if gfx1201_27b_residual_r4 {
+                (
+                    "gemv_hfq4g256_residual_multirow_gfx1201",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1201_SRC,
+                )
+            } else if gfx1151_multirow_r2 {
                 (
                     "gemv_hfq4g256_residual_multirow_gfx1151",
                     kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1151_SRC,

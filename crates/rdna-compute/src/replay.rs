@@ -601,6 +601,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_residual_k2048"
         | "gemv_hfq4g256_residual_k4096_gfx1151"
         | "gemv_hfq4g256_residual_multirow_r2_gfx1151"
+        | "gemv_hfq4g256_residual_multirow_r4_gfx1201"
         | "gemv_hfq4g256_residual_rt_low_gfx1151"
         | "gemv_hfq4g256_residual_wave64"
         | "gemv_hfq4g256_wide"
@@ -784,6 +785,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_residual_k2048"
         | "gemv_hfq4g256_residual_k4096_gfx1151"
         | "gemv_hfq4g256_residual_multirow_r2_gfx1151"
+        | "gemv_hfq4g256_residual_multirow_r4_gfx1201"
         | "gemv_hfq4g256_residual_rt_low_gfx1151"
         | "gemv_hfq4g256_residual_wave64"
         | "gemv_hfq4g256_wide"
@@ -3014,6 +3016,7 @@ mod tests {
         "gemv_hfq4g256_residual_cpol_rt_low",
         "gemv_hfq4g256_residual_cpol_slc",
         "gemv_hfq4g256_residual_k2048",
+        "gemv_hfq4g256_residual_multirow_r4_gfx1201",
         "gemv_hfq4g256_residual_rt_low_gfx1151",
         "gemv_hfq4g256",
         "gemv_hfq4g256_k2048",
