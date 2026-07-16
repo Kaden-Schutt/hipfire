@@ -132,6 +132,7 @@ class GitHubEnvelope(Mapping[str, Any]):
     author: str
     created_at: str
     updated_at: str
+    author_type: str = "User"
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload, Mapping):
@@ -141,26 +142,34 @@ class GitHubEnvelope(Mapping[str, Any]):
         _require_text("author", self.author)
         _require_text("created_at", self.created_at)
         _require_text("updated_at", self.updated_at)
+        if self.author_type not in {"User", "Bot", "Organization"}:
+            raise ValueError("author_type is not supported")
 
     def __getitem__(self, key: str) -> Any:
-        if key not in {"payload", "node_id", "author", "created_at", "updated_at"}:
+        if key not in {"payload", "node_id", "author", "created_at", "updated_at", "author_type"}:
             raise KeyError(key)
         return getattr(self, key)
 
     def __iter__(self):
-        return iter(("payload", "node_id", "author", "created_at", "updated_at"))
+        return iter(("payload", "node_id", "author", "created_at", "updated_at", "author_type"))
 
     def __len__(self) -> int:
-        return 5
+        return 6
 
 
 def _freeze_payload(value: Any) -> Any:
+    if isinstance(value, ReviewTarget):
+        return value
     if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("payload mapping keys must be strings")
         return MappingProxyType({key: _freeze_payload(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_payload(item) for item in value)
     if isinstance(value, (set, frozenset)):
         raise ValueError("payload must not contain sets")
+    if value is not None and not isinstance(value, (bool, int, float, str)):
+        raise ValueError("payload contains a mutable or unsupported value")
     return value
 
 
