@@ -3343,6 +3343,15 @@ pub fn spec_step_mtp_compressed_serial(
                     .poison(format!("MTP verify capture close failed: {reason}"));
             } else {
                 let launches = gpu.replay.recorded_launches().len();
+                if std::env::var_os("HIPFIRE_MTP_REPLAY_DUMP").is_some() {
+                    let mut counts = std::collections::BTreeMap::new();
+                    for launch in gpu.replay.recorded_launches() {
+                        *counts.entry(launch.kernel.as_str()).or_insert(0usize) += 1;
+                    }
+                    for (kernel, count) in counts {
+                        eprintln!("[redline-mtp-capture] {count:4} {kernel}");
+                    }
+                }
                 match gpu
                     .replay
                     .prepare_pm4_prefix(gpu.device_id as usize, launches)
