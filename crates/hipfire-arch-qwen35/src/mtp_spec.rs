@@ -3313,6 +3313,46 @@ pub fn spec_step_mtp_compressed_serial(
             if pm4_prefix < launches {
                 gpu.replay_recorded_hip_range(pm4_prefix, launches)?;
             }
+            if std::env::var_os("HIPFIRE_MTP_PM4_SHADOW").is_some() {
+                let hybrid = gpu.download_f32(&logits_view)?;
+                state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
+                qwen35::upload_prefill_batch_inputs(
+                    gpu,
+                    &state.trunk_pbs,
+                    &verify_tokens,
+                    cur_pos,
+                )?;
+                gpu.replay_recorded_hip_prefix(launches)?;
+                let reference = gpu.download_f32(&logits_view)?;
+                let mut max_abs = 0.0f32;
+                let mut sum_sq = 0.0f64;
+                let mut top_mismatches = 0usize;
+                for row in 0..n_verify {
+                    let range = row * vocab..(row + 1) * vocab;
+                    let hybrid_top = hybrid[range.clone()]
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    let reference_top = reference[range]
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    top_mismatches += usize::from(hybrid_top != reference_top);
+                }
+                for (actual, expected) in hybrid.iter().zip(&reference) {
+                    let delta = (actual - expected).abs();
+                    max_abs = max_abs.max(delta);
+                    sum_sq += f64::from(delta) * f64::from(delta);
+                }
+                let rms = (sum_sq / hybrid.len().max(1) as f64).sqrt();
+                eprintln!(
+                    "[redline-mtp-shadow] pm4_prefix={pm4_prefix}/{launches} max_abs={max_abs:.6e} rms={rms:.6e} top_mismatches={top_mismatches}/{n_verify}"
+                );
+            }
         }
         true
     } else {
