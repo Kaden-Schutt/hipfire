@@ -2695,7 +2695,14 @@ impl Gpu {
         static GFX1201_27B_QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let gfx1201_27b_r2 = gfx1201_27b_global
             && *GFX1201_27B_QKVZA_R2.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_QKVZA_R2").as_deref() == Ok("1")
+                // The exact dense 27B shape is shadow-verified and spill-free.
+                // Keep an opt-out for bisecting without penalizing the default path.
+                !matches!(
+                    std::env::var("HIPFIRE_GFX1201_HFQ4_27B_QKVZA_R2")
+                        .ok()
+                        .as_deref(),
+                    Some("0" | "off" | "false")
+                )
             });
         let (func_name, block, grid_x) = if gfx1201_27b_r2 {
             let kernel = "fused_qkvza_hfq4g256_r2_k5120_global_gfx1201";
