@@ -1049,6 +1049,16 @@ fn mtp_proposal_graph_seq_cap(cur_pos: usize, max_n: usize, kv_max_seq: usize) -
     needed.next_power_of_two().max(256).min(kv_max_seq)
 }
 
+fn mtp_proposal_replay_seq_cap(
+    cur_pos: usize,
+    max_n: usize,
+    head_dim: usize,
+    kv_max_seq: usize,
+) -> usize {
+    let needed = cur_pos + max_n;
+    needed.max(head_dim).next_power_of_two().min(kv_max_seq)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_mtp_proposal_graph_body_q8(
     gpu: &mut Gpu,
@@ -1294,7 +1304,12 @@ fn try_run_mtp_sampled_proposal_redline(
         return Ok(false);
     }
 
-    let required_cap = mtp_proposal_graph_seq_cap(cur_pos, max_n, state.mtp_kv.max_seq);
+    let required_cap = mtp_proposal_replay_seq_cap(
+        cur_pos,
+        max_n,
+        head.config.head_dim,
+        state.mtp_kv.max_seq,
+    );
     if state.mtp_proposal_replay_seq_cap != 0
         && required_cap > state.mtp_proposal_replay_seq_cap
     {
@@ -3965,5 +3980,7 @@ mod tests {
         assert_eq!(mtp_proposal_graph_seq_cap(27, 5, 4096), 256);
         assert_eq!(mtp_proposal_graph_seq_cap(260, 5, 4096), 512);
         assert_eq!(mtp_proposal_graph_seq_cap(3000, 5, 4096), 4096);
+        assert_eq!(mtp_proposal_replay_seq_cap(27, 5, 128, 4096), 128);
+        assert_eq!(mtp_proposal_replay_seq_cap(126, 3, 128, 4096), 256);
     }
 }
