@@ -11,6 +11,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from .canonical import canonical_json
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _VERDICTS = frozenset({"clean", "changes-requested", "incomplete"})
@@ -111,7 +112,7 @@ class ReviewTarget:
             "number": self.number,
             "repository": self.repository,
         }
-        encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        encoded = canonical_json(canonical)
         return hashlib.sha256(encoded).hexdigest()
 
 
@@ -292,8 +293,7 @@ def capability_contract_digest(capability: Mapping[str, Any]) -> str:
     if not isinstance(capability, Mapping) or frozenset(capability) != _CAPABILITY_KEYS:
         raise ValueError("capability has unexpected or missing keys")
     without_digest = {key: capability[key] for key in capability if key != "contract_digest"}
-    serialized = json.dumps(without_digest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    return "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(canonical_json(without_digest)).hexdigest()
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:

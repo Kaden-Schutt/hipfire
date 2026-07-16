@@ -1,0 +1,25 @@
+{
+  "canonical": [
+    {
+      "value": {"b": 2, "a": 1},
+      "canonical_utf8": "{\"a\":1,\"b\":2}",
+      "sha256": "43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
+    },
+    {
+      "value": {"text": "café", "values": [true, null, -3]},
+      "canonical_utf8": "{\"text\":\"café\",\"values\":[true,null,-3]}",
+      "sha256": "13b3712cf60d89b3a47e42b72db671a4be0070e92874d762067d73bdd9e3621a"
+    }
+  ],
+  "metadata": [
+    {
+      "value": {
+        "author": "review-bot",
+        "report_body_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target_key": "target-1",
+        "metadata_digest": "pending"
+      },
+      "digest": "3114aa0dc947719f39ea74a4dda7b03ee272a72fb086a9160c6a052ab956cc63"
+    }
+  ]
+}

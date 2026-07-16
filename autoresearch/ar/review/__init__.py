@@ -18,6 +18,17 @@ from .models import (
     validate_provider_policy,
     validate_trusted_publishers_policy,
 )
+from .canonical import canonical_digest, canonical_json, canonical_loads, metadata_digest
+from .protocol import (
+    elect_canonical_attempt,
+    validate_append_only,
+    validate_completion,
+    validate_intent,
+    validate_protocol,
+    validate_report,
+    validate_review_metadata,
+    validate_revocation,
+)
 
 __all__ = [
     "AttemptIntent",
@@ -35,4 +46,16 @@ __all__ = [
     "validate_capability_policy",
     "validate_provider_policy",
     "validate_trusted_publishers_policy",
+    "canonical_digest",
+    "canonical_json",
+    "canonical_loads",
+    "metadata_digest",
+    "elect_canonical_attempt",
+    "validate_append_only",
+    "validate_completion",
+    "validate_intent",
+    "validate_protocol",
+    "validate_report",
+    "validate_review_metadata",
+    "validate_revocation",
 ]
