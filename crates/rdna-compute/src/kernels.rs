@@ -1247,12 +1247,26 @@ pub const GEMV_HFQ4G256_RESIDUAL_CPOL_RT_LOW_GFX1100_SRC: &str = concat!(
 /// consume source shape, but keep an exact-arch artifact and cache-policy-zero
 /// VMEM contract instead of inheriting gfx1100 admission.
 pub const GEMV_HFQ4G256_RESIDUAL_RT_LOW_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
     "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
     "#define HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN 1\n",
     "#define HIPFIRE_RDNA3_RESIDUAL_STAGE_X32 1\n",
     "#define HIPFIRE_RDNA3_RESIDUAL_MATRIX_RSRC 1\n",
     "#define HIPFIRE_RDNA3_RESIDUAL_BUFFER_CONSUME 1\n",
     "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_rt_low_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip")
+);
+/// Global-load control for the gfx1151 one-row immediate-consume schedule.
+/// Kept distinct from the temporal-buffer artifact so scheduling and cache
+/// lowering can be admitted independently.
+pub const GEMV_HFQ4G256_RESIDUAL_ROW1_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_RESIDUAL_STAGE_X32 1\n",
+    "#define HIPFIRE_RDNA3_RESIDUAL_MATRIX_RSRC 1\n",
+    "#define HIPFIRE_RDNA3_RESIDUAL_BUFFER_CONSUME 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_row1_gfx1151\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),

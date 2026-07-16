@@ -4914,6 +4914,11 @@ impl Gpu {
             && *GFX1151_RESIDUAL_RT_LOW.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_RESIDUAL_RT_LOW").as_deref() == Ok("1")
             });
+        static GFX1151_RESIDUAL_ROW1: OnceLock<bool> = OnceLock::new();
+        let gfx1151_row1 = self.arch_caps.is_gfx1151()
+            && *GFX1151_RESIDUAL_ROW1.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_RESIDUAL_ROW1").as_deref() == Ok("1")
+            });
         static RESIDUAL_CPOL: OnceLock<Option<String>> = OnceLock::new();
         let cpol = RESIDUAL_CPOL
             .get_or_init(|| std::env::var("HIPFIRE_RESIDUAL_CPOL").ok())
@@ -4930,6 +4935,12 @@ impl Gpu {
                 kernels::GEMV_HFQ4G256_RESIDUAL_RT_LOW_GFX1151_SRC,
                 "gemv_hfq4g256_residual_rt_low_gfx1151",
                 "gemv_hfq4g256_residual_rt_low_gfx1151",
+            )
+        } else if gfx1151_row1 {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_ROW1_GFX1151_SRC,
+                "gemv_hfq4g256_residual_row1_gfx1151",
+                "gemv_hfq4g256_residual_row1_gfx1151",
             )
         } else if cpol == Some("rt-low") {
             (
