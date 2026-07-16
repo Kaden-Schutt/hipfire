@@ -239,7 +239,7 @@ impl Pm4Commands {
 }
 
 /// Candidate-only cache classification produced by Radiowave inspection of
-/// the exact gfx1100 code objects in the 833-launch MQ4R tape. This list is
+/// the exact gfx11 code objects captured by the MQ4R replay tapes. This list is
 /// deliberately gated by `HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE`: the legacy
 /// Hipfire JIT path does not yet emit hash-bound Radiowave manifests, so the
 /// safe default remains scalar-or-unknown until that binding is added.
@@ -247,12 +247,22 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
     matches!(
         kernel,
         "conv1d_silu_split_f32"
+            | "conv1d_silu_split_qknorm_b256"
             | "deinterleave_f32"
             | "fused_qk_l2_norm_scale_f32"
+            | "fused_qkv_hfq4g256_k2048_all_buffer_gfx1151"
+            | "fused_qkv_hfq4g256_k2048_all_buffer_slc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151"
             | "fused_rmsnorm_mq_rotate"
+            | "fused_rmsnorm_mq_rotate_vecsum"
             | "fused_sigmoid_alpha_gate_f32"
             | "fused_silu_mul_mq_rotate"
             | "gated_norm_f32"
+            | "gated_norm_mq_rotate_gfx1100"
+            | "moe_router_softmax_topk_k8_wave64_exact"
             | "moe_topk_renorm_k8"
             | "mq_rotate_x"
             | "repeat_interleave_qk_f32"
@@ -2568,10 +2578,17 @@ mod tests {
     #[test]
     fn radiowave_vmem_cache_classification_fails_closed() {
         assert!(radiowave_vmem_only_consumer("fused_rmsnorm_mq_rotate"));
+        assert!(radiowave_vmem_only_consumer(
+            "fused_rmsnorm_mq_rotate_vecsum"
+        ));
+        assert!(radiowave_vmem_only_consumer(
+            "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"
+        ));
         assert!(radiowave_vmem_only_consumer("mq_rotate_x"));
         assert!(!radiowave_vmem_only_consumer(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         ));
+        assert!(!radiowave_vmem_only_consumer("fused_qkvza_hfq4g256"));
         assert!(!radiowave_vmem_only_consumer("unknown_kernel"));
     }
 
