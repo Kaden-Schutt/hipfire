@@ -1364,14 +1364,44 @@ impl Gpu {
                 ),
             ));
         }
-        for launch in self.replay.recorded_launches().iter().take(count) {
+        let launches: Vec<_> = self.replay.recorded_launches().iter().take(count).collect();
+        let mut kernargs = Vec::with_capacity(launches.len());
+        for launch in &launches {
+            let mut kernarg = launch.kernarg.clone();
+            if launch.kernel == "gated_delta_net_q8_fast"
+                || launch.kernel.starts_with("gated_delta_net_q8_compact2_")
+            {
+                let frame_count = if launch.kernel == "gated_delta_net_q8_fast" {
+                    let n_tokens = kernarg
+                        .get(64..68)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u32::from_ne_bytes)
+                        .ok_or_else(|| {
+                            hip_bridge::HipError::new(0, "captured GDN kernarg is too short")
+                        })?;
+                    n_tokens.checked_mul(launch.grid[2]).ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "captured GDN frame reservation overflow")
+                    })?
+                } else {
+                    1
+                };
+                let frame = crate::norm::reserve_gdn_requant_frames(frame_count);
+                kernarg
+                    .get_mut(76..80)
+                    .ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "captured GDN kernarg is too short")
+                    })?
+                    .copy_from_slice(&frame.to_ne_bytes());
+            }
+            kernargs.push(kernarg);
+        }
+        for (launch, kernarg) in launches.into_iter().zip(&mut kernargs) {
             let func = self.functions.get(&launch.kernel).ok_or_else(|| {
                 hip_bridge::HipError::new(
                     0,
                     &format!("captured HIP function {:?} is not loaded", launch.kernel),
                 )
             })?;
-            let mut kernarg = launch.kernarg.clone();
             // SAFETY: the bytes were captured from this exact loaded function
             // and all pointees remain owned by this Gpu/model instance.
             unsafe {
@@ -1381,11 +1411,13 @@ impl Gpu {
                     launch.block,
                     launch.shared_mem,
                     self.active_stream.as_ref(),
-                    &mut kernarg,
+                    kernarg,
                 )?;
             }
         }
-        Ok(())
+        // HIP may retain the contiguous `extra` buffer until the queued
+        // dispatch consumes it. Keep every blob live through completion.
+        self.hip.device_synchronize()
     }
 
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`

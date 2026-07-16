@@ -1653,7 +1653,7 @@ pub struct AqlContractProbe {
 
 pub struct PreparedLinearAqlReplay {
     graph: SingleQueueBatchGraph,
-    dynamic_gdn_frames: Vec<usize>,
+    dynamic_gdn_frames: Vec<(usize, u32)>,
 }
 
 impl PreparedLinearAqlReplay {
@@ -1662,10 +1662,10 @@ impl PreparedLinearAqlReplay {
     /// Every pointer captured in the immutable explicit kernarg prefixes must
     /// still refer to the same live Hipfire allocation and model instance.
     pub unsafe fn replay_and_wait(&mut self) -> Result<GpuBatchTiming, String> {
-        for dispatch in &self.dynamic_gdn_frames {
-            let frame = crate::norm::reserve_gdn_requant_frames(1);
+        for &(dispatch, frame_count) in &self.dynamic_gdn_frames {
+            let frame = crate::norm::reserve_gdn_requant_frames(frame_count);
             self.graph
-                .patch_kernarg_u32(*dispatch, 76, frame)
+                .patch_kernarg_u32(dispatch, 76, frame)
                 .map_err(|error| error.to_string())?;
         }
         // SAFETY: forwarded from the caller that owns the model allocations.
@@ -1745,7 +1745,7 @@ pub struct PreparedPm4Replay {
     // programmed into the immutable indirect buffer.
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
-    dynamic_gdn_frames: Vec<usize>,
+    dynamic_gdn_frames: Vec<(usize, u32)>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3])>,
     dispatch_count: usize,
     command_dwords: u32,
@@ -1760,9 +1760,9 @@ impl PreparedPm4Replay {
         &mut self,
         position: usize,
     ) -> Result<GpuMultiQueueTiming, String> {
-        for dispatch in &self.dynamic_gdn_frames {
-            let frame = crate::norm::reserve_gdn_requant_frames(1);
-            let bytes = self.kernargs[*dispatch].as_mut_bytes();
+        for &(dispatch, frame_count) in &self.dynamic_gdn_frames {
+            let frame = crate::norm::reserve_gdn_requant_frames(frame_count);
+            let bytes = self.kernargs[dispatch].as_mut_bytes();
             bytes
                 .get_mut(76..80)
                 .ok_or_else(|| "PM4 GDN kernarg is too short for frame patch".to_owned())?
@@ -2142,7 +2142,17 @@ impl ReplayController {
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
                     ));
                 }
-                dynamic_gdn_frames.push(dispatches.len());
+                let frame_count = if launch.kernel == "gated_delta_net_q8_fast" {
+                    let bytes: [u8; 4] = launch.kernarg[64..68]
+                        .try_into()
+                        .map_err(|_| format!("{symbol}: missing GDN n_tokens kernarg"))?;
+                    u32::from_ne_bytes(bytes)
+                        .checked_mul(launch.grid[2])
+                        .ok_or_else(|| format!("{symbol}: GDN frame reservation overflow"))?
+                } else {
+                    1
+                };
+                dynamic_gdn_frames.push((dispatches.len(), frame_count));
             }
             dispatches.push(dispatch);
         }
@@ -2303,7 +2313,17 @@ impl ReplayController {
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
                     ));
                 }
-                dynamic_gdn_frames.push(kernargs.len());
+                let frame_count = if launch.kernel == "gated_delta_net_q8_fast" {
+                    let bytes: [u8; 4] = launch.kernarg[64..68]
+                        .try_into()
+                        .map_err(|_| format!("{symbol}: missing GDN n_tokens kernarg"))?;
+                    u32::from_ne_bytes(bytes)
+                        .checked_mul(launch.grid[2])
+                        .ok_or_else(|| format!("{symbol}: GDN frame reservation overflow"))?
+                } else {
+                    1
+                };
+                dynamic_gdn_frames.push((kernargs.len(), frame_count));
             }
             if let Some(binding) = launch.grid_binding {
                 dynamic_grids.push((kernargs.len(), binding, launch.grid));

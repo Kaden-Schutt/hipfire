@@ -1503,6 +1503,60 @@ impl Gpu {
         )
     }
 
+    /// Lane-major Q8 KV write for independent-sequence decode.
+    pub fn kv_cache_write_q8_0_independent(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        lane_capacity: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_cache_write_q8_0_independent",
+            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+            "kv_cache_write_q8_0_independent",
+        )?;
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut cap = lane_capacity as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cap as *mut _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_q8_0_independent",
+            [total_blocks, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_i32(cap);
+                b
+            },
+        )
+    }
+
     /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
     pub fn kv_cache_write_q8_0(
         &mut self,
@@ -1695,6 +1749,80 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        self.attention_q8_0_kv_batched_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            tree_bias,
+            block_start,
+            block_cols,
+            false,
+        )
+    }
+
+    /// Q8 attention for a batch of independent decode sequences. Every row
+    /// reads a private lane-major KV slice of `lane_capacity` positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_kv_independent(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        lane_capacity: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.attention_q8_0_kv_batched_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            lane_capacity,
+            max_ctx_len,
+            batch_size,
+            None,
+            0,
+            0,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_q8_0_kv_batched_impl(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        independent: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
             "attention_q8_0_kv_batched",
@@ -1715,7 +1843,12 @@ impl Gpu {
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
-        let mut ms = max_seq as i32;
+        assert!(max_seq <= i32::MAX as usize, "Q8 KV capacity exceeds i32");
+        let mut ms = if independent {
+            -(max_seq as i32)
+        } else {
+            max_seq as i32
+        };
         let mut sc = scale;
         let mut bs = block_start as i32;
         let mut bc = block_cols as i32;
