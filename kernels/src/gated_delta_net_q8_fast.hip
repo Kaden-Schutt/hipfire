@@ -130,11 +130,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
                 make_float4(out0, out1, out2, out3);
         }
 #elif TILE_ROWS == 8
-        const float4 v_rows0 = *reinterpret_cast<const float4*>(v_t + row_start);
-        const float4 v_rows1 = *reinterpret_cast<const float4*>(v_t + row_start + 4);
-        float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
-        float out4 = 0.0f, out5 = 0.0f, out6 = 0.0f, out7 = 0.0f;
-#pragma unroll
+#pragma clang loop unroll(disable)
         for (int r = 0; r < TILE_ROWS; r++) {
             float4 s = S_f4[r * 32 + tid];
             float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
@@ -144,14 +140,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
                 kv += __shfl_down(kv, o);
             kv = __shfl(kv, 0);
 
-            const float v_row =
-                (r == 0) ? v_rows0.x :
-                (r == 1) ? v_rows0.y :
-                (r == 2) ? v_rows0.z :
-                (r == 3) ? v_rows0.w :
-                (r == 4) ? v_rows1.x :
-                (r == 5) ? v_rows1.y :
-                (r == 6) ? v_rows1.z : v_rows1.w;
+            const float v_row = v_t[row_start + r];
             float delta = (v_row - alpha * kv) * beta_v;
 
             s0 = alpha * s0 + k0 * delta;
@@ -163,22 +152,8 @@ __global__ void HIPFIRE_GDN_KERNEL(
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
             for (int o = 16; o > 0; o >>= 1)
                 out_v += __shfl_down(out_v, o);
-            if (tid == 0) {
-                if (r == 0) out0 = out_v;
-                else if (r == 1) out1 = out_v;
-                else if (r == 2) out2 = out_v;
-                else if (r == 3) out3 = out_v;
-                else if (r == 4) out4 = out_v;
-                else if (r == 5) out5 = out_v;
-                else if (r == 6) out6 = out_v;
-                else out7 = out_v;
-            }
-        }
-        if (tid == 0) {
-            *reinterpret_cast<float4*>(output + t * stride + h * HD + row_start) =
-                make_float4(out0, out1, out2, out3);
-            *reinterpret_cast<float4*>(output + t * stride + h * HD + row_start + 4) =
-                make_float4(out4, out5, out6, out7);
+            if (tid == 0)
+                output[t * stride + h * HD + row_start + r] = out_v;
         }
 #else
 #error "unsupported HIPFIRE_GDN_TILE_ROWS"
