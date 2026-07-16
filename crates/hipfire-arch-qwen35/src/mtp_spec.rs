@@ -811,6 +811,10 @@ impl MtpSpecState {
         self.sampling_history.extend_from_slice(tokens);
     }
 
+    pub fn pop_sampling_history(&mut self) -> Option<u32> {
+        self.sampling_history.pop()
+    }
+
     /// Allocate `mtp_lm_logits_compressed` shape `[max_n * cvs]` for the
     /// compressed batched-lm_head dispatch path. Idempotent — reallocates
     /// only if the existing tensor has the wrong size. Call once after

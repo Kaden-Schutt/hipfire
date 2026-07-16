@@ -2061,6 +2061,11 @@ fn main() {
                     .get("temperature")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_temp) as f32;
+                // Preserve the OpenAI request seed all the way into sampled
+                // MTP.  The AR/DFlash paths already have their own sampler
+                // seeding contracts; native MTP must not silently replace an
+                // explicit request seed with a process-local random value.
+                let sampling_seed = msg.get("seed").and_then(|v| v.as_u64());
                 let max_tokens = msg
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
@@ -2435,6 +2440,7 @@ fn main() {
                         prompt,
                         system,
                         user_explicit_sampling,
+                        sampling_seed,
                         temp,
                         top_p,
                         top_k,
@@ -6111,7 +6117,10 @@ fn generate_spec(
     })
 }
 
-fn mtp_request_seed(request_id: &str) -> u64 {
+fn mtp_request_seed(request_id: &str, requested: Option<u64>) -> u64 {
+    if let Some(seed) = requested {
+        return seed.max(1);
+    }
     if let Some(seed) = std::env::var("HIPFIRE_MTP_SEED")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -6243,6 +6252,7 @@ fn generate_qwen35_mtp(
     repeat_window: usize,
     presence_penalty: f32,
     frequency_penalty: f32,
+    sampling_seed: Option<u64>,
 ) {
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -6656,7 +6666,7 @@ fn generate_qwen35_mtp(
     // 0..k, never future speculative tokens.
     state.set_p_min(p_min);
     let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
-    let request_seed = mtp_request_seed(id);
+    let request_seed = mtp_request_seed(id, sampling_seed);
     state.set_sampling(
         mtp_spec::MtpSamplingConfig {
             temp: temp.max(0.0),
@@ -6833,9 +6843,35 @@ fn generate_qwen35_mtp(
         accepted_total += result.accept_count;
 
         let mut hit_eos = false;
+        let mut replace_open_think_terminator = false;
         for (block_index, &tok) in result.committed.iter().enumerate() {
             if generated >= max_tokens {
                 break;
+            }
+            let terminator = tok == eos_token
+                || im_end_token == Some(tok)
+                || tokenizer.is_terminator(tok);
+            if terminator && !think_closed {
+                // A speculative step leaves its newest committed token
+                // deferred, so a terminal token at the tail has not entered
+                // either the trunk or MTP cache yet.  If it would terminate
+                // an open reasoning frame, replace that deferred token with
+                // the trained `</think>\n` continuation and let the model
+                // sample the visible answer.  This is a framing invariant,
+                // not the retired content/repetition loop guard.
+                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let in_think = currently_in_think(
+                    raw_str,
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
+                );
+                if in_think && block_index + 1 == result.committed.len() {
+                    replace_open_think_terminator = true;
+                    break;
+                }
             }
             emitted.push(tok);
             streamed_tokens.push(tok);
@@ -6861,7 +6897,7 @@ fn generate_qwen35_mtp(
                 }
             }
             generated += 1;
-            if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) {
+            if terminator {
                 hit_eos = true;
                 if block_index + 1 != result.committed.len() {
                     state_consistent = false;
@@ -6899,11 +6935,80 @@ fn generate_qwen35_mtp(
                 // model state.
             }
         }
+        cur_pos += result.advance;
+        if replace_open_think_terminator {
+            if state.pop_sampling_history() != result.committed.last().copied() {
+                step_error = Some("MTP sampling history lost deferred terminator".to_owned());
+                state_consistent = false;
+                break;
+            }
+
+            let close_ids = tokenizer.encode(&think_continuation());
+            if close_ids.is_empty() {
+                step_error = Some("MTP think continuation encoded to no tokens".to_owned());
+                state_consistent = false;
+                break;
+            }
+            if max_tokens.saturating_sub(generated) < close_ids.len() {
+                hit_length_guard = true;
+                state_consistent = false;
+                break;
+            }
+            for &ct in &close_ids {
+                emitted.push(ct);
+                streamed_tokens.push(ct);
+                emit_committed_event(
+                    stdout,
+                    id,
+                    ct,
+                    streamed_tokens.len() - 1,
+                    t0.elapsed().as_millis() as u64,
+                );
+                let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                let new_bytes = &all_bytes[bytes_fed_to_filter..];
+                bytes_fed_to_filter = all_bytes.len();
+                if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                    if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"token","id":"{}","text":{}}}"#,
+                            id,
+                            serde_json::to_string(&text).unwrap_or_default()
+                        );
+                        let _ = stdout.flush();
+                    }
+                }
+                generated += 1;
+            }
+
+            // `spec_step` consumed the prior deferred seed and every token
+            // preceding the terminal tail.  Feed only the replacement close
+            // tokens except their new deferred tail.
+            if close_ids.len() > 1 {
+                if let Err(e) = mtp_spec::prefill_trunk_and_mtp_cache(
+                    gpu,
+                    &mut target,
+                    head,
+                    &mut state,
+                    &close_ids[..close_ids.len() - 1],
+                    cur_pos,
+                ) {
+                    step_error = Some(format!("think terminal close: {e:?}"));
+                    state_consistent = false;
+                    break;
+                }
+                cur_pos += close_ids.len() - 1;
+            }
+            last_committed = *close_ids.last().unwrap();
+            state.extend_sampling_history(&close_ids);
+            think_closed = true;
+            prev_in_think = false;
+            continue;
+        }
         last_committed = match result.committed.last() {
             Some(&t) => t,
             None => break, // defensive: spec_step always commits ≥ 1
         };
-        cur_pos += result.advance;
         if result.hit_eos || hit_eos {
             break;
         }
@@ -8189,6 +8294,7 @@ fn generate(
     // (top_p/top_k/min_p/penalties). Gates temp>0 spec routing: explicit controls
     // force the AR sampler (the SWOR spec verify can only honor temperature).
     user_explicit_sampling: bool,
+    sampling_seed: Option<u64>,
     temp: f32,
     top_p: f32,
     top_k: Option<u32>,
@@ -8716,6 +8822,7 @@ fn generate(
             repeat_window,
             presence_penalty,
             frequency_penalty,
+            sampling_seed,
         );
         // Silence unused-variable warnings for AR-only / DFlash-only knobs the
         // MTP serve path does not consume.
@@ -14971,7 +15078,13 @@ fn run_dots_ocr_ngram_loop(
 
 #[cfg(test)]
 mod tool_call_parser_tests {
-    use super::extract_tool_calls_from_text;
+    use super::{extract_tool_calls_from_text, mtp_request_seed};
+
+    #[test]
+    fn mtp_request_seed_honors_explicit_seed() {
+        assert_eq!(mtp_request_seed("request-a", Some(0x1357_9bdf)), 0x1357_9bdf);
+        assert_eq!(mtp_request_seed("request-b", Some(0)), 1);
+    }
 
     #[test]
     fn parses_valid_block() {
