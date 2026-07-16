@@ -95,10 +95,10 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     } while (0)
 
 #if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
-    // Two quads are enough to expose independent row chains to the gfx1151
-    // VOPD scheduler. Full unroll doubles the instruction footprint and
-    // reduces, rather than increases, the number of paired FMACs.
-    #pragma unroll 2
+    // Keep the fixed four-quad bound without expanding the body. Full unroll
+    // doubles the instruction footprint; factor-two unroll spills private=16
+    // and is not admissible for direct gfx1151 PM4 replay.
+    #pragma unroll 1
 #endif
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
