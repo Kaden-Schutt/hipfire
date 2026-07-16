@@ -3121,6 +3121,17 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_R2_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256_r2.gfx1100.hip")
 );
 
+/// gfx1151 large-QKVZA four-row stream tile. One wave reuses each eight-value
+/// activation stripe across four adjacent weight rows while retaining the
+/// shipping four-chain arithmetic independently for every output row.
+pub const FUSED_QKVZA_HFQ4G256_K2048_R4_STREAM_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_r4_stream.gfx1151.hip")
+);
+
 /// gfx1151-only wave64 activation-sharing experiment. Matching lanes in the
 /// two physical wave32 halves consume one K=2048 activation load stream via
 /// V_PERMLANE64 while retaining independent row weights and reductions.

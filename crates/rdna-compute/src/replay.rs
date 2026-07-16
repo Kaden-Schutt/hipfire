@@ -403,6 +403,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151"
     ) {
         return Some(vec![
             read(0),
@@ -710,6 +711,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151"
     ) {
         return Some(96);
     }
@@ -3038,6 +3040,7 @@ mod tests {
             "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151";
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
         let qkvza_hybrid = "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151";
+        let qkvza_r4 = "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151";
         assert_eq!(expected_kernarg_bytes(gate), Some(48));
         assert_eq!(pointer_effects(gate).map(|effects| effects.len()), Some(5));
         assert_eq!(expected_kernarg_bytes(gate_hybrid), Some(48));
@@ -3058,6 +3061,12 @@ mod tests {
             Some(9)
         );
         assert!(!radiowave_vmem_only_consumer(qkvza_hybrid));
+        assert_eq!(expected_kernarg_bytes(qkvza_r4), Some(96));
+        assert_eq!(
+            pointer_effects(qkvza_r4).map(|effects| effects.len()),
+            Some(9)
+        );
+        assert!(!radiowave_vmem_only_consumer(qkvza_r4));
         for producer in [
             "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
             "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
