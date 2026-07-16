@@ -1326,7 +1326,10 @@ fn try_run_mtp_sampled_proposal_redline(
             // allocation belongs to this live MtpSpecState at the same address.
             unsafe {
                 gpu.replay
-                    .replay_pm4(cur_pos)
+                    // Absolute MTP positions flow through mtp_positions. Keep
+                    // any generic position-bound launch geometry at the fixed
+                    // tier cap used during capture, matching hipGraph replay.
+                    .replay_pm4(seq_cap - 1)
                     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
             }
             state.gpu_rng_state = seed;
