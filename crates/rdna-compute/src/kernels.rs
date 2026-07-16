@@ -3598,8 +3598,21 @@ pub const ATTENTION_GQA_WARP_DV_SRC: &str =
 
 /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per layer).
 /// Grid: [gate_m + up_m, 1, 1]. Each block processes one row from gate or up weight.
-pub const FUSED_GATE_UP_HFQ4G256_SRC: &str =
-    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip");
+pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+/// gfx1201 dense decode specialization. The host admits this artifact only
+/// for K=1024, allowing LLVM to remove the generic quad loop and dead tail
+/// bodies while retaining the base kernel's exact load/FMA/reduction order.
+pub const FUSED_GATE_UP_HFQ4G256_K1024_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_k1024_gfx1201\n",
+    "#define HIPFIRE_FUSED_GATE_UP_K1024 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
 /// Fused gate+up for Q8_0 weights. Two Q8 GEMVs in one launch.
 /// Grid=[gate_m + up_m], block=[32]. +5.8 tok/s decode on dots.ocr.
 pub const FUSED_GATE_UP_Q8_0_SRC: &str =
