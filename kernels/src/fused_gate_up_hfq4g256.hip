@@ -44,6 +44,8 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
 
 #if defined(HIPFIRE_FUSED_GATE_UP_K1024)
     const int groups_per_row = 4;
+#elif defined(HIPFIRE_FUSED_GATE_UP_K5120)
+    const int groups_per_row = 20;
 #else
     const int groups_per_row = K / 256;
 #endif

@@ -18966,6 +18966,20 @@ impl Gpu {
                 [32u32, 1, 1],
                 (gate_m + up_m) as u32,
             )
+        } else if self.arch_caps.is_gfx1201()
+            && k == 5120
+            && self.flags.gfx1201_hfq4_gate_up_k5120
+        {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_k5120_gfx1201",
+                kernels::FUSED_GATE_UP_HFQ4G256_K5120_GFX1201_SRC,
+                "fused_gate_up_hfq4g256_k5120_gfx1201",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_k5120_gfx1201",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
         } else {
             self.ensure_kernel(
                 "fused_gate_up_hfq4g256",
