@@ -331,13 +331,13 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         // lowering these to scalar-memory loads. Only the lane-divergent
         // packed word below uses raw-buffer VMEM.
         const hipfire_gate_u32x2 gh0 =
-            *reinterpret_cast<const hipfire_gate_u32x2 __attribute__((address_space(4)))*>(gg0);
+            *(const hipfire_gate_u32x2 __attribute__((address_space(4)))*)gg0;
         const hipfire_gate_u32x2 gh1 =
-            *reinterpret_cast<const hipfire_gate_u32x2 __attribute__((address_space(4)))*>(gg1);
+            *(const hipfire_gate_u32x2 __attribute__((address_space(4)))*)gg1;
         const hipfire_gate_u32x2 gh2 =
-            *reinterpret_cast<const hipfire_gate_u32x2 __attribute__((address_space(4)))*>(gg2);
+            *(const hipfire_gate_u32x2 __attribute__((address_space(4)))*)gg2;
         const hipfire_gate_u32x2 gh3 =
-            *reinterpret_cast<const hipfire_gate_u32x2 __attribute__((address_space(4)))*>(gg3);
+            *(const hipfire_gate_u32x2 __attribute__((address_space(4)))*)gg3;
         float gsc0 = __builtin_bit_cast(float, gh0.x);
         float gzp0 = __builtin_bit_cast(float, gh0.y);
         float gsc1 = __builtin_bit_cast(float, gh1.x);
@@ -383,13 +383,13 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
 #endif
 #if defined(HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER)
         const hipfire_gate_u32x2 uh0 =
-            *reinterpret_cast<const hipfire_gate_u32x2 __attribute__((address_space(4)))*>(uu0);
+            *(const hipfire_gate_u32x2 __attribute__((address_space(4)))*)uu0;
         const hipfire_gate_u32x2 uh1 =
-            *reinterpret_cast<const hipfire_gate_u32x2 __attribute__((address_space(4)))*>(uu1);
+            *(const hipfire_gate_u32x2 __attribute__((address_space(4)))*)uu1;
         const hipfire_gate_u32x2 uh2 =
-            *reinterpret_cast<const hipfire_gate_u32x2 __attribute__((address_space(4)))*>(uu2);
+            *(const hipfire_gate_u32x2 __attribute__((address_space(4)))*)uu2;
         const hipfire_gate_u32x2 uh3 =
-            *reinterpret_cast<const hipfire_gate_u32x2 __attribute__((address_space(4)))*>(uu3);
+            *(const hipfire_gate_u32x2 __attribute__((address_space(4)))*)uu3;
         float usc0 = __builtin_bit_cast(float, uh0.x);
         float uzp0 = __builtin_bit_cast(float, uh0.y);
         float usc1 = __builtin_bit_cast(float, uh1.x);
