@@ -111,8 +111,8 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 
-#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_K2048)
-    // The gfx1100 A3B decode route is fixed at K=2048. Host dispatch enforces
+#if defined(HIPFIRE_MOE_GATE_UP_K2048) || defined(HIPFIRE_RDNA3_MOE_GATE_UP_K2048)
+    // The specialized A3B route is fixed at K=2048. Host dispatch enforces
     // that contract so LLVM can delete the runtime divide and constant-fold
     // both row strides and the two-quad loop bound.
     const int groups_per_row = 8;

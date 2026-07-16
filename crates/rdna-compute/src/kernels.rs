@@ -1537,6 +1537,18 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// Exact-K specialization of the default fused B=4 schedule. The caller admits
+/// it only for K=2048, allowing LLVM to delete the divide, tail, and dynamic
+/// two-quad loop control while retaining the same loads and arithmetic chains.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_K2048_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_BATCHED 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_batched\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// Two-group activation/weight schedule for the fused B=4 probe. This targets
 /// the occupancy band between the default four-group (95 VGPR on gfx1201) and
 /// the one-group low-register schedule without changing any arithmetic chain.

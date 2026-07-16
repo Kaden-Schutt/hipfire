@@ -7001,6 +7001,11 @@ impl Gpu {
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_SRC,
                     2,
                 ),
+                "k2048" if k == 2_048 => (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched_fused_k2048",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_K2048_SRC,
+                    2,
+                ),
                 "pair" => (
                     "gemv_hfq4g256_moe_gate_up_indexed_batched_fused_pair",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_PAIR_SRC,
