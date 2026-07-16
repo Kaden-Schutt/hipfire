@@ -4,6 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_RESIDUAL_KERNEL
+#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual
+#endif
+
 // HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
 //
 // VARIANT R36c1 res_w_preload:
@@ -28,7 +32,7 @@ __launch_bounds__(32, 32)
 #else
 __launch_bounds__(32, 16)
 #endif
-extern "C" __global__ void gemv_hfq4g256_residual(
+extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -69,9 +73,17 @@ extern "C" __global__ void gemv_hfq4g256_residual(
              + ((sc) * (float)(((pk) >> 28) & 0xFu) + (zp)) * (x7); \
     } while (0)
 
+    #if HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER
+    #define HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset) (*(const unsigned int*)(gp))
+    #define HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset) (*(const unsigned int*)((gp) + 4))
+    #else
+    #define HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
+    #define HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)
+    #endif
+
     #define LOAD_W(gp, weight_offset, sc, zp, pk) do { \
-        (sc) = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)); \
-        (zp) = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)); \
+        (sc) = __builtin_bit_cast(float, HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset)); \
+        (zp) = __builtin_bit_cast(float, HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset)); \
         (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
 
@@ -167,6 +179,8 @@ extern "C" __global__ void gemv_hfq4g256_residual(
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
     }
     #undef LOAD_W
+    #undef HIPFIRE_RESIDUAL_LOAD_SC
+    #undef HIPFIRE_RESIDUAL_LOAD_ZP
     #undef DOG_X8
 
     float acc = (acc0 + acc1) + (acc2 + acc3);

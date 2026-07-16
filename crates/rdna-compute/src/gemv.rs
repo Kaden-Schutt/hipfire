@@ -4953,6 +4953,11 @@ impl Gpu {
                 // which is not admissible for the scratch-free PM4 replay.
                 std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_RESIDUAL").as_deref() == Ok("1")
             });
+        static GFX1151_RESIDUAL_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_hybrid_buffer = self.arch_caps.is_gfx1151()
+            && *GFX1151_RESIDUAL_HYBRID_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER").as_deref() == Ok("1")
+            });
         static GFX1151_RESIDUAL_RT_LOW: OnceLock<bool> = OnceLock::new();
         let gfx1151_rt_low = self.arch_caps.is_gfx1151()
             && *GFX1151_RESIDUAL_RT_LOW.get_or_init(|| {
@@ -4974,7 +4979,13 @@ impl Gpu {
         } else {
             None
         };
-        let (src, module, func_name) = if gfx1151_rt_low {
+        let (src, module, func_name) = if gfx1151_hybrid_buffer {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_HYBRID_BUFFER_GFX1151_SRC,
+                "gemv_hfq4g256_residual_hybrid_buffer_gfx1151",
+                "gemv_hfq4g256_residual_hybrid_buffer_gfx1151",
+            )
+        } else if gfx1151_rt_low {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_RT_LOW_GFX1151_SRC,
                 "gemv_hfq4g256_residual_rt_low_gfx1151",

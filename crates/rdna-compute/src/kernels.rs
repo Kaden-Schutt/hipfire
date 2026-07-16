@@ -1202,6 +1202,18 @@ pub const GEMV_HFQ4G256_RESIDUAL_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
+/// gfx1151 hybrid residual cache lowering. Keep wave-uniform scale and
+/// zero-point headers on scalar/global loads; lower only per-lane packed
+/// weights to cache-policy-zero buffer VMEM.
+pub const GEMV_HFQ4G256_RESIDUAL_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_hybrid_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
