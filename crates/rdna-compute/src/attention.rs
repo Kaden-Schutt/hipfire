@@ -2030,11 +2030,20 @@ impl Gpu {
         );
 
         // ── Tile kernel ──
-        self.ensure_kernel(
-            "attention_flash_q8_0_tile",
-            kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
-            "attention_flash_q8_0_tile",
-        )?;
+        let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
+            && std::env::var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref() == Ok("1");
+        let (tile_module, tile_src) = if gfx1151_tile_dpp {
+            (
+                "attention_flash_q8_0_tile_dpp_gfx1151",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC,
+            )
+        } else {
+            (
+                "attention_flash_q8_0_tile",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+            )
+        };
+        self.ensure_kernel(tile_module, tile_src, "attention_flash_q8_0_tile")?;
         {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let q_ptr = q.buf.as_ptr();

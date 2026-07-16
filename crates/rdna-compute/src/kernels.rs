@@ -3726,6 +3726,13 @@ pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str =
 pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip");
 
+/// gfx1151-only ISA experiment: preserve the flash tile's reduction tree but
+/// lower cross-lane exchanges to ds_swizzle + DPP8/quad-perm operations.
+pub const ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE 1\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip")
+);
+
 /// Flash attention reduce kernel — combines tile partials via online softmax
 /// correction. Grid: [n_heads]. Reads per-tile {max, sum, out[head_dim]},
 /// combines across tiles, normalizes, writes final output.
