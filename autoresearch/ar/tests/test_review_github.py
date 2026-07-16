@@ -16,7 +16,11 @@ from autoresearch.ar.review.github import (
     _subprocess_runner,
     preflight_read_only,
 )
-from autoresearch.ar.review.config import load_operator_credential_manifest, load_review_configuration
+from autoresearch.ar.review.config import (
+    load_operator_credential_manifest,
+    load_review_configuration,
+    validate_operator_credential_manifest,
+)
 from autoresearch.ar.review.models import ReviewTarget
 
 
@@ -100,8 +104,12 @@ def record(node_id="IC_1", *, updated_at="2026-01-01T00:00:00Z", author_login="r
     }
 
 
-def review_record():
-    return dict(record("PRR_1"), id=7, state="APPROVED", commit_id="head-sha")
+def review_record(*, submitted_at="2026-01-01T00:00:00Z"):
+    review = dict(record("PRR_1"), id=7, state="APPROVED", commit_id="head-sha")
+    review.pop("created_at")
+    review.pop("updated_at")
+    review["submitted_at"] = submitted_at
+    return review
 
 
 def permission(login="review-bot", role="pull", principal_type="Bot"):
@@ -116,9 +124,23 @@ def app_manifest(operation="publish", *, login="review-bot", digest=None):
     return {
         "schema": "hipfire.agentic-review.operator-credentials",
         "version": 1,
+        "repository": REPO,
         "principal": {"login": login, "type": "Bot"},
         "allowed_operations": [operation],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
         "credential_attestation_digest": digest or "sha256:" + "a" * 64,
+    }
+
+
+def discovery_manifest():
+    return {
+        "schema": "hipfire.agentic-review.operator-credentials",
+        "version": 1,
+        "repository": REPO,
+        "principal": {"login": "review-bot", "type": "User"},
+        "allowed_operations": ["discover"],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
+        "credential_attestation_digest": "sha256:" + "a" * 64,
     }
 
 
@@ -227,12 +249,10 @@ def test_paginated_pull_requests_are_flattened_and_bounded():
     ])
     client = GitHubClient(runner)
 
-    # gh --paginate is represented by one response per invocation in this fake.
-    # The second page is consumed by the client's pagination callback.
-    pulls = client.list_pull_requests(REPO, pages=2)
+    pulls = client.list_pull_requests(REPO, max_pages=2)
     assert [item["number"] for item in pulls.data] == [1, 2]
     assert all("--paginate" not in call[0] for call in runner.calls)
-    assert all("per_page=1" in " ".join(call[0]) for call in runner.calls)
+    assert all("per_page=100" in " ".join(call[0]) for call in runner.calls)
 
 
 def test_pagination_fails_closed_when_link_exceeds_configured_bound():
@@ -240,7 +260,16 @@ def test_pagination_fails_closed_when_link_exceeds_configured_bound():
     with pytest.raises(GitHubBoundaryError, match="pagination|page|bound"):
         GitHubClient(FakeRunner([
             result([pull(1)], headers={"X-OAuth-Scopes": "read:user", "Link": next_page}),
-        ])).list_pull_requests(REPO, pages=1)
+        ])).list_pull_requests(REPO, max_pages=1)
+
+
+def test_exhaustive_pull_listing_fails_with_explicit_incomplete_scan_at_page_cap():
+    responses = []
+    for page in range(1, 17):
+        link = f'<https://api.github.com/repos/owner/repo/pulls?page={page + 1}>; rel="next"'
+        responses.append(result([pull(page)], headers={"X-OAuth-Scopes": "read:user", "Link": link}))
+    with pytest.raises(GitHubBoundaryError, match="incomplete|page|bound"):
+        GitHubClient(FakeRunner(responses)).list_pull_requests(REPO, max_pages=16)
 
 
 def test_paginated_http_output_has_a_fixed_page_bound():
@@ -296,14 +325,30 @@ def test_envelope_acquisition_uses_server_author_for_later_app_bot_trust():
 
 
 def test_review_envelope_is_constructed_from_authenticated_review():
-    review = dict(record("PRR_1"), id=7, state="APPROVED", commit_id="head-sha")
+    review = review_record()
     runner = FakeRunner([result(review)])
     envelope = GitHubClient(runner).review_envelope(
         REPO, 42, 7
     )
     assert envelope.node_id == "PRR_1"
     assert envelope.author_type == "Bot"
+    assert envelope.created_at == "2026-01-01T00:00:00Z"
+    assert envelope.updated_at == envelope.created_at
     assert "/pulls/42/reviews/7" in runner.calls[0][0][-1]
+
+
+@pytest.mark.parametrize("submitted_at", [None, "not-a-timestamp"])
+def test_review_envelope_rejects_missing_or_invalid_submitted_timestamp(submitted_at):
+    review = review_record(submitted_at=submitted_at)
+    with pytest.raises(GitHubBoundaryError, match="timestamp|submitted"):
+        GitHubClient(FakeRunner([result(review)])).review_envelope(REPO, 42, 7)
+
+
+def test_protocol_body_recursion_failure_is_a_bounded_boundary_error():
+    nested = "[" * 2000 + "]" * 2000
+    hostile = dict(record(), body=nested)
+    with pytest.raises(GitHubBoundaryError, match="protocol payload|body"):
+        GitHubClient(FakeRunner([result(hostile)])).comment_envelope(REPO, 11)
 
 
 def test_effective_permission_is_normalized():
@@ -383,8 +428,10 @@ def test_operator_manifest_loader_is_repository_root_relative(tmp_path):
     manifest = {
         "schema": "hipfire.agentic-review.operator-credentials",
         "version": 1,
+        "repository": REPO,
         "principal": {"login": "review-bot", "type": "Bot"},
         "allowed_operations": ["publish"],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
         "credential_attestation_digest": "sha256:" + "a" * 64,
     }
     path = tmp_path / "custom-manifest.json"
@@ -395,26 +442,41 @@ def test_operator_manifest_loader_is_repository_root_relative(tmp_path):
             load_operator_credential_manifest(tmp_path, manifest_path=override)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"repository": "../repo"},
+        {"write_permissions": {"contents": "write"}},
+        {"write_permissions": {"issues": "read", "pull_requests": "write"}},
+    ],
+)
+def test_operator_manifest_declares_exact_repository_and_intended_write_permissions(change):
+    manifest = app_manifest()
+    manifest.update(change)
+    with pytest.raises(ValueError, match="repository|permission"):
+        validate_operator_credential_manifest(manifest)
+
+
 def test_config_loader_uses_task_one_validators():
     configuration = load_review_configuration(ROOT)
     assert configuration.capabilities["schema"] == "hipfire.agentic-review.capabilities"
     assert configuration.providers["providers"] == []
 
 
-def preflight_responses(*, scopes="read:user, repo:status", accepted=None, probe=True, tree_probe=False):
+def preflight_responses(*, scopes="read:user, repo:status", accepted=None, probe=True, tree_probe=False, principal_type="Bot"):
     headers = {"X-OAuth-Scopes": scopes}
     if accepted is not None:
         headers = {"X-Accepted-GitHub-Permissions": accepted}
         if scopes != "read:user, repo:status":
             headers["X-OAuth-Scopes"] = scopes
-    responses = [result(user(), headers=headers), result(repository(), headers=headers), result([pull()], headers=headers)]
+    responses = [result(user(principal_type=principal_type), headers=headers), result(repository(), headers=headers), result([pull()], headers=headers)]
     if probe:
         responses.append(result(pull(), headers=headers))
         if tree_probe:
             responses.extend([result(tree(), headers=headers), result(blob(), headers=headers)])
         else:
             responses.extend([result([record()], headers=headers), result([review_record()], headers=headers)])
-        responses.append(result(permission(), headers=headers))
+        responses.append(result(permission(principal_type=principal_type), headers=headers))
     return responses
 
 
@@ -477,7 +539,7 @@ def test_app_token_repository_enumeration_fails_when_link_remains_at_page_cap():
 
 
 def test_preflight_probes_only_read_endpoints_with_bounded_pages_and_explicit_principal():
-    runner = FakeRunner(preflight_responses())
+    runner = FakeRunner(preflight_responses(principal_type="User"))
     configuration = load_review_configuration(ROOT)
     # The repository fixture has no trusted apps, so provide a minimal valid
     # configuration copy for the preflight's trust check.
@@ -487,9 +549,12 @@ def test_preflight_probes_only_read_endpoints_with_bounded_pages_and_explicit_pr
              "credential_attestation_digest": "sha256:" + "a" * 64}
         ]}
     )
-    outcome = preflight_read_only(GitHubClient(runner), REPO, mode="discovery", configuration=configuration)
-    assert outcome.principal_type == "Bot"
-    assert len(runner.calls) == 7
+    outcome = preflight_read_only(
+        GitHubClient(runner), REPO, mode="discovery", configuration=configuration,
+        operator_manifest=discovery_manifest(),
+    )
+    assert outcome.principal_type == "User"
+    assert len(runner.calls) == 6
     assert "--method" in runner.calls[0][0]
     assert "per_page=1" in " ".join(runner.calls[2][0])
     assert all(call[0][1] == "api" for call in runner.calls)
@@ -505,10 +570,11 @@ def test_preflight_rejects_classic_repo_scope_and_empty_trust():
     )
     with pytest.raises(PreflightError, match="classic|scope"):
         preflight_read_only(
-            GitHubClient(FakeRunner(preflight_responses(scopes="repo, read:user", probe=False))),
+            GitHubClient(FakeRunner(preflight_responses(scopes="repo, read:user", probe=False, principal_type="User"))),
             REPO,
             mode="discovery",
             configuration=configuration,
+            operator_manifest=discovery_manifest(),
         )
 
 
@@ -516,20 +582,22 @@ def test_preflight_rejects_malformed_scope_header():
     configuration = load_review_configuration(ROOT)
     with pytest.raises(PreflightError, match="scope"):
         preflight_read_only(
-            GitHubClient(FakeRunner(preflight_responses(scopes="read:user,,repo:status", probe=False))),
+            GitHubClient(FakeRunner(preflight_responses(scopes="read:user,,repo:status", probe=False, principal_type="User"))),
             REPO,
             mode="discovery",
             configuration=configuration,
+            operator_manifest=discovery_manifest(),
         )
 
 
 def test_read_only_preflight_accepts_task_one_empty_apps():
     configuration = load_review_configuration(ROOT)
     outcome = preflight_read_only(
-        GitHubClient(FakeRunner(preflight_responses())),
+        GitHubClient(FakeRunner(preflight_responses(principal_type="User"))),
         REPO,
         mode="discovery",
         configuration=configuration,
+        operator_manifest=discovery_manifest(),
     )
     assert outcome.login == "review-bot"
 
@@ -557,8 +625,10 @@ def test_publisher_preflight_requires_matching_app_and_operator_manifest():
     manifest = {
         "schema": "hipfire.agentic-review.operator-credentials",
         "version": 1,
+        "repository": REPO,
         "principal": {"login": "review-bot", "type": "Bot"},
         "allowed_operations": ["publish"],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
         "credential_attestation_digest": "sha256:" + "a" * 64,
     }
     with pytest.raises(PreflightError, match="matching|App"):
@@ -581,8 +651,10 @@ def test_publisher_preflight_accepts_matching_app_and_operator_manifest():
     manifest = {
         "schema": "hipfire.agentic-review.operator-credentials",
         "version": 1,
+        "repository": REPO,
         "principal": {"login": "review-bot", "type": "Bot"},
         "allowed_operations": ["publish"],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
         "credential_attestation_digest": "sha256:" + "a" * 64,
     }
     runner = FakeRunner(app_preflight_responses())
@@ -604,8 +676,10 @@ def test_dismissal_preflight_requires_dismissal_attestation():
     manifest = {
         "schema": "hipfire.agentic-review.operator-credentials",
         "version": 1,
+        "repository": REPO,
         "principal": {"login": "review-bot", "type": "Bot"},
         "allowed_operations": ["dismiss-workflow-review"],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
         "credential_attestation_digest": "sha256:" + "a" * 64,
     }
     preflight_read_only(
@@ -624,8 +698,10 @@ def test_publisher_preflight_accepts_attested_human_fine_grained_pat():
     manifest = {
         "schema": "hipfire.agentic-review.operator-credentials",
         "version": 1,
+        "repository": REPO,
         "principal": {"login": "reviewer", "type": "User"},
         "allowed_operations": ["publish"],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
         "credential_attestation_digest": "sha256:" + "a" * 64,
     }
     outcome = preflight_read_only(
@@ -667,7 +743,7 @@ def test_app_publisher_preflight_with_attestation_avoids_user_and_repo_installat
     assert all("/repos/owner/repo/installation" not in call[0] for call in runner.calls)
 
 
-@pytest.mark.parametrize("mode", ["publisher", "dismissal"])
+@pytest.mark.parametrize("mode", ["discovery", "publisher", "dismissal"])
 def test_write_preflight_requires_operator_manifest_for_configured_app(mode):
     configuration = load_review_configuration(ROOT).with_trusted_publishers(
         {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [
@@ -679,6 +755,36 @@ def test_write_preflight_requires_operator_manifest_for_configured_app(mode):
     with pytest.raises(PreflightError, match="manifest|attest"):
         preflight_read_only(GitHubClient(runner), REPO, mode=mode, configuration=configuration)
     assert runner.calls == []
+
+
+def test_publisher_preflight_does_not_claim_get_permission_proves_write_authority():
+    configuration = load_review_configuration(ROOT)
+    manifest = {
+        "schema": "hipfire.agentic-review.operator-credentials",
+        "version": 1,
+        "repository": REPO,
+        "principal": {"login": "reviewer", "type": "User"},
+        "allowed_operations": ["publish"],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
+        "credential_attestation_digest": "sha256:" + "a" * 64,
+    }
+    runner = FakeRunner(human_preflight_responses()[:-1])
+    outcome = preflight_read_only(
+        GitHubClient(runner), REPO, mode="publisher", configuration=configuration,
+        operator_manifest=manifest,
+    )
+    assert outcome.login == "reviewer"
+    assert all("collaborators" not in call[0][-1] for call in runner.calls)
+
+
+def test_publisher_preflight_rejects_manifest_repository_mismatch():
+    configuration = load_review_configuration(ROOT)
+    manifest = {**app_manifest(), "repository": "other/repo"}
+    with pytest.raises(PreflightError, match="repository|manifest"):
+        preflight_read_only(
+            GitHubClient(FakeRunner([])), REPO, mode="publisher", configuration=configuration,
+            operator_manifest=manifest,
+        )
 
 
 def test_preflight_sample_accepts_next_link_without_claiming_exhaustive_discovery():
@@ -709,7 +815,8 @@ def test_preflight_rejects_missing_or_unsupported_principal_type(bad_user):
     )
     with pytest.raises(PreflightError, match="principal|type"):
         preflight_read_only(
-            GitHubClient(FakeRunner([result(bad_user)])), REPO, mode="discovery", configuration=configuration
+            GitHubClient(FakeRunner([result(bad_user)])), REPO, mode="discovery", configuration=configuration,
+            operator_manifest=discovery_manifest(),
         )
 
 
@@ -724,7 +831,7 @@ def test_preflight_rejects_incomplete_page_and_bad_repository():
     with pytest.raises(PreflightError, match="page|pull"):
         preflight_read_only(
             GitHubClient(FakeRunner([result(user()), result(repository()), result({})])),
-            REPO, mode="discovery", configuration=configuration,
+            REPO, mode="discovery", configuration=configuration, operator_manifest=discovery_manifest(),
         )
 
 
@@ -732,8 +839,8 @@ def test_preflight_has_explicit_no_open_pr_behavior():
     configuration = load_review_configuration(ROOT)
     with pytest.raises(PreflightError, match="open|pull request"):
         preflight_read_only(
-            GitHubClient(FakeRunner(preflight_responses(probe=False)[:2] + [result([])])),
-            REPO, mode="discovery", configuration=configuration,
+            GitHubClient(FakeRunner(preflight_responses(probe=False, principal_type="User")[:2] + [result([])])),
+            REPO, mode="discovery", configuration=configuration, operator_manifest=discovery_manifest(),
         )
 
 
@@ -741,14 +848,14 @@ def test_preflight_accepts_fine_grained_permission_headers_and_requires_needed_p
     configuration = load_review_configuration(ROOT)
     accepted = "metadata=read, pull_requests=read, issues=read, contents=read"
     outcome = preflight_read_only(
-        GitHubClient(FakeRunner(preflight_responses(accepted=accepted))),
-        REPO, mode="discovery", configuration=configuration,
+        GitHubClient(FakeRunner(preflight_responses(accepted=accepted, principal_type="User"))),
+        REPO, mode="discovery", configuration=configuration, operator_manifest=discovery_manifest(),
     )
     assert outcome.scopes == ()
     with pytest.raises(PreflightError, match="permission"):
         preflight_read_only(
-            GitHubClient(FakeRunner(preflight_responses(accepted="metadata=read"))),
-            REPO, mode="discovery", configuration=configuration,
+            GitHubClient(FakeRunner(preflight_responses(accepted="metadata=read", principal_type="User"))),
+            REPO, mode="discovery", configuration=configuration, operator_manifest=discovery_manifest(),
         )
 
 
@@ -759,10 +866,12 @@ def test_preflight_rejects_visible_classic_repo_even_with_fine_grained_permissio
             GitHubClient(FakeRunner(preflight_responses(
                 scopes="repo",
                 accepted="metadata=read, pull_requests=write, issues=write",
+                principal_type="User",
             ))),
             REPO,
             mode="discovery",
             configuration=configuration,
+            operator_manifest=discovery_manifest(),
         )
 
 

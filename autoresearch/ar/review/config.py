@@ -23,6 +23,9 @@ _PROVIDERS = f"{_CONFIG_DIR}/providers.json"
 _CAPABILITIES = f"{_CONFIG_DIR}/capabilities-v1.json"
 _TRUSTED = f"{_CONFIG_DIR}/trusted-publishers.json"
 _OPERATOR = f"{_CONFIG_DIR}/operator-credentials.json"
+_REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
+_WRITE_PERMISSION_NAMES = {"issues", "pull_requests"}
+_WRITE_PERMISSION_LEVELS = {"write", "admin"}
 _OPERATOR_SCHEMA = "hipfire.agentic-review.operator-credentials"
 
 
@@ -79,11 +82,16 @@ def load_review_configuration(
 def validate_operator_credential_manifest(manifest: Mapping[str, Any]) -> None:
     if not isinstance(manifest, Mapping):
         raise ValueError("operator credential manifest must be an object")
-    expected = {"schema", "version", "principal", "allowed_operations", "credential_attestation_digest"}
+    expected = {
+        "schema", "version", "repository", "principal", "allowed_operations",
+        "write_permissions", "credential_attestation_digest",
+    }
     if set(manifest) != expected:
         raise ValueError("operator credential manifest has unexpected or missing keys")
     if manifest["schema"] != _OPERATOR_SCHEMA or manifest["version"] != 1:
         raise ValueError("invalid operator credential manifest schema")
+    if not isinstance(manifest["repository"], str) or re.fullmatch(_REPOSITORY_RE, manifest["repository"]) is None:
+        raise ValueError("operator repository is invalid")
     principal = manifest["principal"]
     if not isinstance(principal, Mapping) or set(principal) != {"login", "type"}:
         raise ValueError("operator principal must contain login and type")
@@ -93,9 +101,15 @@ def validate_operator_credential_manifest(manifest: Mapping[str, Any]) -> None:
         raise ValueError("operator principal type is unsupported")
     operations = manifest["allowed_operations"]
     if not isinstance(operations, list) or not operations or any(
-        operation not in {"publish", "dismiss-workflow-review"} for operation in operations
+        operation not in {"discover", "publish", "dismiss-workflow-review"} for operation in operations
     ):
         raise ValueError("operator allowed_operations is unsupported or empty")
+    permissions = manifest["write_permissions"]
+    if not isinstance(permissions, Mapping) or not permissions or any(
+        permission not in _WRITE_PERMISSION_NAMES or level not in _WRITE_PERMISSION_LEVELS
+        for permission, level in permissions.items()
+    ):
+        raise ValueError("operator write_permissions is unsupported or empty")
     digest = manifest["credential_attestation_digest"]
     if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
         raise ValueError("operator credential attestation digest is invalid")

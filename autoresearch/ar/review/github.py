@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -156,7 +157,7 @@ _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_STDERR_BYTES = 1 << 20
 _MAX_REQUEST_BYTES = 1 << 20
 _PAGE_SIZE = 100
-_PULL_PAGE_SIZE = 1
+_PROBE_PAGE_SIZE = 1
 _PROTOCOL_RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
 _PROTOCOL_FIELDS = {
     "intent": {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"},
@@ -539,33 +540,43 @@ class GitHubClient:
             raise GitHubBoundaryError("GitHub installation repository pagination reached its fixed page bound")
         return GitHubResponse({"total_count": total_count, "repositories": repositories}, headers, 200)
 
-    def list_pull_requests(
-        self, repository: str, *, pages: int = 1, require_complete: bool = True
+    def list_pull_requests(self, repository: str, *, max_pages: int = _MAX_PAGINATED_PAGES) -> GitHubResponse:
+        return self._list_pull_requests(repository, max_pages=max_pages, page_size=_PAGE_SIZE, allow_incomplete=False)
+
+    def _list_pull_requests(
+        self, repository: str, *, max_pages: int, page_size: int, allow_incomplete: bool
     ) -> GitHubResponse:
         repository = _repository(repository)
-        if isinstance(pages, bool) or not isinstance(pages, int) or not 0 < pages <= _MAX_PAGINATED_PAGES:
-            raise GitHubBoundaryError("pages must be within the fixed positive bound")
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int) or not 0 < max_pages <= _MAX_PAGINATED_PAGES:
+            raise GitHubBoundaryError("max_pages must be within the fixed positive bound")
         responses = []
-        for page in range(1, pages + 1):
-            responses.append(self._request("GET", f"/repos/{repository}/pulls", query={"per_page": _PULL_PAGE_SIZE, "page": page}))
-        data = []
-        headers = {}
-        for page, response in enumerate(responses, start=1):
+        for page in range(1, max_pages + 1):
+            response = self._request(
+                "GET", f"/repos/{repository}/pulls", query={"per_page": page_size, "page": page}
+            )
             if not isinstance(response.data, list):
                 raise GitHubBoundaryError("pull request response is not a list")
+            responses.append(response)
+            if not _has_next_page(response.headers):
+                break
+            if len(responses) == max_pages:
+                if allow_incomplete:
+                    break
+                raise GitHubBoundaryError("GitHub pull request scan is incomplete at the fixed page bound")
+        data = []
+        headers = {}
+        for response in responses:
             if len(data) + len(response.data) > _MAX_PAGINATED_ITEMS:
-                raise GitHubBoundaryError("GitHub pull request pagination exceeds the fixed item bound")
+                raise GitHubBoundaryError("GitHub pull request scan exceeds the fixed item bound")
             data.extend(response.data)
             headers.update(response.headers)
-            if require_complete and page == pages and _has_next_page(response.headers):
-                raise GitHubBoundaryError("GitHub pull request pagination exceeds the configured page bound")
         for item in data:
             self._validate_pull(self._require_mapping(item, "pull request"), expected_repository=repository)
         return GitHubResponse(data, headers, 200)
 
     def sample_pull_requests(self, repository: str) -> GitHubResponse:
         """Return one bounded probe page without claiming exhaustive discovery."""
-        return self.list_pull_requests(repository, pages=1, require_complete=False)
+        return self._list_pull_requests(repository, max_pages=1, page_size=_PROBE_PAGE_SIZE, allow_incomplete=True)
 
     @classmethod
     def _validate_pull(cls, data: Mapping[str, Any], *, expected_number: int | None = None, expected_repository: str | None = None) -> None:
@@ -609,7 +620,9 @@ class GitHubClient:
         repository = _repository(repository)
         comment_id = _positive_integer(comment_id, "comment ID")
         response = self._request("GET", f"/repos/{repository}/issues/comments/{comment_id}")
-        self._validate_record_response(response, "issue comment", extra=("body",), expected_id=comment_id)
+        self._validate_record_response(
+            response, "issue comment", record_kind="comment", extra=("body",), expected_id=comment_id
+        )
         return response
 
     def get_pull_review(self, repository: str, number: int, review_id: int) -> GitHubResponse:
@@ -618,16 +631,18 @@ class GitHubClient:
         review_id = _positive_integer(review_id, "review ID")
         response = self._request("GET", f"/repos/{repository}/pulls/{number}/reviews/{review_id}")
         self._validate_record_response(
-            response, "pull review", extra=("state", "commit_id", "body"), expected_id=review_id
+            response, "pull review", record_kind="review",
+            extra=("state", "commit_id", "body"), expected_id=review_id
         )
         return response
 
     @classmethod
     def _validate_record_response(
-        cls, response: GitHubResponse, name: str, *, extra: Sequence[str], expected_id: int | None = None
+        cls, response: GitHubResponse, name: str, *, record_kind: str,
+        extra: Sequence[str], expected_id: int | None = None
     ) -> None:
         record = cls._require_mapping(response.data, name)
-        cls._validate_api_record(record, name, extra=extra)
+        cls._validate_api_record(record, name, record_kind=record_kind, extra=extra)
         if expected_id is not None and record["id"] != expected_id:
             raise GitHubBoundaryError(f"GitHub {name} response ID does not match requested ID")
         author = cls._require(cls._require_mapping(record["user"], f"{name} author"), ("login", "type"), f"{name} author")
@@ -657,8 +672,14 @@ class GitHubClient:
                 raise GitHubBoundaryError(f"GitHub {name} pagination exceeds the fixed item bound")
             for item in response.data:
                 record = self._require_mapping(item, name)
-                extra = ("body",) if name == "issue comments" else ("state", "commit_id")
-                self._validate_record_response(GitHubResponse(record, response.headers, response.status_code), name, extra=extra)
+                if name == "issue comments":
+                    record_kind, extra = "comment", ("body",)
+                else:
+                    record_kind, extra = "review", ("state", "commit_id")
+                self._validate_record_response(
+                    GitHubResponse(record, response.headers, response.status_code), name,
+                    record_kind=record_kind, extra=extra,
+                )
                 records.append(record)
             if len(records) > _MAX_PAGINATED_ITEMS or not has_next:
                 break
@@ -668,18 +689,27 @@ class GitHubClient:
 
     @staticmethod
     def _validate_api_record(
-        record: Mapping[str, Any], name: str, *, extra: Sequence[str] = ()
+        record: Mapping[str, Any], name: str, *, record_kind: str, extra: Sequence[str] = ()
     ) -> None:
-        GitHubClient._require(record, ("id", "node_id", "user", "created_at", "updated_at", *extra), name)
+        timestamps = ("created_at", "updated_at") if record_kind == "comment" else ("submitted_at",)
+        GitHubClient._require(record, ("id", "node_id", "user", *extra), name)
         if (
             isinstance(record["id"], bool)
             or not isinstance(record["id"], int)
             or record["id"] <= 0
             or not isinstance(record["node_id"], str)
             or not record["node_id"].strip()
-            or any(not isinstance(record[field], str) or not record[field].strip() for field in ("created_at", "updated_at"))
         ):
             raise GitHubBoundaryError(f"GitHub {name} response has malformed server fields")
+        for field in timestamps:
+            if field not in record or record[field] in (None, ""):
+                raise GitHubBoundaryError(f"GitHub {name} response has a missing {field} timestamp")
+            try:
+                parsed = datetime.fromisoformat(record[field].replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise GitHubBoundaryError(f"GitHub {name} response has an invalid {field} timestamp") from exc
+            if parsed.tzinfo is None:
+                raise GitHubBoundaryError(f"GitHub {name} response has an invalid {field} timestamp")
 
     def collaborator_effective_permission(self, repository: str, login: str) -> EffectivePermission:
         repository = _repository(repository)
@@ -806,10 +836,11 @@ class GitHubClient:
     def _envelope(self, record: Mapping[str, Any], *, record_name: str = "authenticated GitHub record") -> GitHubEnvelope:
         try:
             author = record["user"]
-            extra = ("body",) if record_name == "issue comment" else ("state", "commit_id")
-            self._validate_api_record(record, record_name, extra=extra)
+            record_kind = "comment" if record_name == "issue comment" else "review"
+            extra = ("body",) if record_kind == "comment" else ("state", "commit_id")
+            self._validate_api_record(record, record_name, record_kind=record_kind, extra=extra)
             self._require(author, ("login", "type"), "authenticated author")
-        except (KeyError, TypeError) as exc:
+        except (KeyError, TypeError, RecursionError) as exc:
             raise GitHubBoundaryError("authenticated record is missing server fields") from exc
         if (
             not isinstance(author["login"], str)
@@ -818,7 +849,7 @@ class GitHubClient:
             or author["type"] not in _PRINCIPAL_TYPES
         ):
             raise GitHubBoundaryError("authenticated author has unsupported principal type")
-        if record["updated_at"] != record["created_at"]:
+        if record_kind == "comment" and record["updated_at"] != record["created_at"]:
             raise GitHubBoundaryError("edited GitHub record is not admissible")
         body = record["body"]
         if not isinstance(body, str) or not body.strip():
@@ -828,9 +859,12 @@ class GitHubClient:
             if not isinstance(payload, Mapping):
                 raise ValueError("protocol body must be an object")
             _validate_protocol_payload(payload)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
             raise GitHubBoundaryError(f"GitHub {record_name} body is not a valid protocol payload") from exc
-        return GitHubEnvelope(payload, record["node_id"], author["login"], record["created_at"], record["updated_at"], author["type"])
+        publication_time = record["created_at"] if record_kind == "comment" else record["submitted_at"]
+        return GitHubEnvelope(
+            payload, record["node_id"], author["login"], publication_time, publication_time, author["type"]
+        )
 
     def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:
         response = self.get_issue_comment(repository, comment_id)
@@ -880,11 +914,6 @@ def _scope_header(response: GitHubResponse) -> tuple[str, ...]:
     return _capability_signal(response)[0]
 
 
-def _require_write_permission(permission: str, name: str) -> None:
-    if permission not in {"write", "admin"}:
-        raise PreflightError(f"{name} requires effective write or admin permission")
-
-
 def _validate_app_token_repository_access(
     client: GitHubClient,
     repository: str,
@@ -921,7 +950,11 @@ def _validate_app_token_repository_access(
             raise PreflightError("operator manifest does not match the trusted App")
         if operator_manifest["credential_attestation_digest"] != configured["credential_attestation_digest"]:
             raise PreflightError("operator manifest does not match the trusted App attestation")
-        operation = "publish" if mode == "publisher" else "dismiss-workflow-review"
+        operation = {
+            "discovery": "discover",
+            "publisher": "publish",
+            "dismissal": "dismiss-workflow-review",
+        }[mode]
         if operation not in operator_manifest["allowed_operations"]:
             raise PreflightError("operator manifest does not attest to the requested operation")
     return configured["login"], "Bot", scopes
@@ -943,10 +976,10 @@ def preflight_read_only(
         validate_trusted_publishers_policy(trusted)
     except ValueError as exc:
         raise PreflightError(str(exc)) from exc
-    write_mode = mode in {"publisher", "dismissal"}
+    write_mode = mode in {"discovery", "publisher", "dismissal"}
     operator: Mapping[str, Any] | None = None
     if write_mode and operator_manifest is None:
-        raise PreflightError("publisher and dismissal modes require an operator credential manifest")
+        raise PreflightError("mutation-capable preflight modes require an operator credential manifest")
     if write_mode:
         assert operator_manifest is not None
         try:
@@ -956,6 +989,18 @@ def preflight_read_only(
         operator = operator_manifest
         if operator["principal"]["type"] not in {"User", "Bot"}:
             raise PreflightError("publisher operator principal type is unsupported")
+        if operator["repository"] != repository:
+            raise PreflightError("operator manifest repository does not match the preflight repository")
+        operation = {
+            "discovery": "discover",
+            "publisher": "publish",
+            "dismissal": "dismiss-workflow-review",
+        }[mode]
+        if operation not in operator["allowed_operations"]:
+            raise PreflightError("operator manifest does not attest to the requested operation")
+        required_permissions = {"pull_requests"} if mode == "dismissal" else {"issues", "pull_requests"}
+        if any(operator["write_permissions"].get(permission) not in {"write", "admin"} for permission in required_permissions):
+            raise PreflightError("operator manifest does not declare the required intended write permissions")
     try:
         user_response = None
         user_data: Mapping[str, Any] | None = None
@@ -1017,11 +1062,6 @@ def preflight_read_only(
             permission = client.collaborator_effective_permission(repository, user_login)
             if permission.principal_type != principal_type:
                 raise PreflightError("effective permission principal type mismatch")
-        elif user_data is not None:
-            permission = client.collaborator_effective_permission(repository, user_login)
-            if permission.principal_type != principal_type:
-                raise PreflightError("effective permission principal type mismatch")
-            _require_write_permission(permission.permission, "publisher")
         if write_mode and user_data is None:
             user_login, principal_type, scopes = _validate_app_token_repository_access(
                 client, repository, repository_data["id"], trusted,
@@ -1029,9 +1069,13 @@ def preflight_read_only(
             )
         if write_mode and user_data is not None:
             if principal_type != "User" or operator is None:
-                raise PreflightError("publisher requires an attested human User credential")
+                raise PreflightError("mutation-capable preflight requires an attested human User credential")
             manifest_principal = operator["principal"]
-            operation = "publish" if mode == "publisher" else "dismiss-workflow-review"
+            operation = {
+                "discovery": "discover",
+                "publisher": "publish",
+                "dismissal": "dismiss-workflow-review",
+            }[mode]
             if (
                 manifest_principal["login"] != user_login
                 or manifest_principal["type"] != principal_type
