@@ -50,7 +50,11 @@ __global__ void moe_softmax_topk_renorm_k8_batched(
     __syncthreads();
 
     // ── 2. Softmax over n_exp ──
-    float my_max = -INFINITY;
+    // Match softmax_f32 exactly: its reduction seeds every lane with -1e30
+    // and normalizes with direct division.  Keeping the same rounding points
+    // lets this kernel replace softmax_f32 + moe_topk_renorm_k8_batched
+    // without changing expert selection or route weights.
+    float my_max = -1e30f;
     for (int i = tid; i < n_exp; i += BLOCK_SIZE) {
         my_max = fmaxf(my_max, smem_v[i]);
     }
@@ -75,10 +79,10 @@ __global__ void moe_softmax_topk_renorm_k8_batched(
         if (tid < s) reduce_v[tid] += reduce_v[tid + s];
         __syncthreads();
     }
-    const float inv_sum = 1.0f / reduce_v[0];
+    const float sum = reduce_v[0];
 
     for (int i = tid; i < n_exp; i += BLOCK_SIZE) {
-        smem_v[i] = smem_v[i] * inv_sum;
+        smem_v[i] /= sum;
     }
     __syncthreads();
 
@@ -124,8 +128,7 @@ __global__ void moe_softmax_topk_renorm_k8_batched(
         float s = 0.0f;
         for (int k = 0; k < K_TOP; k++) s += picked_w[k];
         if (norm_topk && s > 0.0f) {
-            const float inv = 1.0f / s;
-            for (int k = 0; k < K_TOP; k++) picked_w[k] *= inv;
+            for (int k = 0; k < K_TOP; k++) picked_w[k] /= s;
         }
     }
     __syncthreads();

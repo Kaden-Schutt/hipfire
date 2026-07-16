@@ -7797,25 +7797,44 @@ fn prefill_moe_ffn_body_batched(
 
     // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
     //
-    // Same Path B split as the decode call site: split the fused
-    // softmax+topk+renorm into gpu.softmax_f32 + moe_topk_renorm_k8_batched
-    // so prefill activations match the CPU-reference softmax math
-    // exactly. router_logits is allocated 1D as [n × n_exp]; alias it
-    // into a 2D view so gpu.softmax_f32 takes rows = n.
-    let router_logits_2d = GpuTensor {
-        buf: unsafe { router_logits.buf.alias() },
-        shape: vec![n, n_exp],
-        dtype: DType::F32,
-    };
-    gpu.softmax_f32(&router_logits_2d)?;
-    gpu.moe_topk_renorm_k8_batched(
-        router_logits,
-        topk_indices,
-        topk_weights,
-        n_exp,
-        config.norm_topk_prob,
-        n,
-    )?;
+    // The gfx1201 MTP B=4 experiment removes the softmax/top-K dispatch
+    // boundary. The fused kernel deliberately uses the same reduction seeds
+    // and direct divisions as this split path, preserving expert selection
+    // and route weights while deleting one launch per MoE layer.
+    static FUSED_MTP_ROUTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fused_mtp_router = *FUSED_MTP_ROUTER.get_or_init(|| {
+        std::env::var("HIPFIRE_MTP_FUSED_BATCHED_ROUTER")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if fused_mtp_router && gpu.arch_caps.is_gfx1201() && n == 4 {
+        gpu.moe_softmax_topk_renorm_k8_batched(
+            router_logits,
+            topk_indices,
+            topk_weights,
+            n_exp,
+            config.norm_topk_prob,
+            n,
+        )?;
+    } else {
+        // router_logits is allocated 1D as [n × n_exp]; alias it into a
+        // 2D view so gpu.softmax_f32 takes rows = n.
+        let router_logits_2d = GpuTensor {
+            buf: unsafe { router_logits.buf.alias() },
+            shape: vec![n, n_exp],
+            dtype: DType::F32,
+        };
+        gpu.softmax_f32(&router_logits_2d)?;
+        gpu.moe_topk_renorm_k8_batched(
+            router_logits,
+            topk_indices,
+            topk_weights,
+            n_exp,
+            config.norm_topk_prob,
+            n,
+        )?;
+    }
     trace_batched_moe_routes(gpu, topk_indices, layer_idx, n, k_top);
 
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
