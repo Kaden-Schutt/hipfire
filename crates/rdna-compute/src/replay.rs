@@ -582,6 +582,18 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
+        "qwen35_fa_prep_q8_kv_gfx1151" => Some(vec![
+            read(0),
+            write(8),
+            write(16),
+            read(24),
+            read(32),
+            read(40),
+            read(48),
+            write(56),
+            write(64),
+            read(72),
+        ]),
         "kv_cache_write_q8_0_pair" => {
             Some(vec![write(0), write(8), read(16), read(24), read(32)])
         }
@@ -836,6 +848,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_wavepack4"
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
+        | "qwen35_fa_prep_q8_kv_gfx1151"
         | "gated_delta_net_q8_fast" => Some(96),
         _ => None,
     }
@@ -2964,6 +2977,7 @@ mod tests {
         "gated_norm_mq_rotate_gfx1151",
         "qwen35_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
+        "qwen35_fa_prep_q8_kv_gfx1151",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
@@ -3124,6 +3138,7 @@ mod tests {
         for (symbol, kernarg_bytes, pointer_count) in [
             ("gated_norm_mq_rotate_gfx1151", 64, 6),
             ("qwen35_fa_prep_gfx1151", 64, 7),
+            ("qwen35_fa_prep_q8_kv_gfx1151", 96, 10),
             (
                 "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
                 64,
@@ -3141,6 +3156,26 @@ mod tests {
                 Some(pointer_count)
             );
         }
+        let fa_q8_kv = pointer_effects("qwen35_fa_prep_q8_kv_gfx1151")
+            .expect("fused FA prep/Q8 KV replay contract");
+        assert_eq!(
+            fa_q8_kv
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, RecordedAccessMode::Read),
+                (8, RecordedAccessMode::Write),
+                (16, RecordedAccessMode::Write),
+                (24, RecordedAccessMode::Read),
+                (32, RecordedAccessMode::Read),
+                (40, RecordedAccessMode::Read),
+                (48, RecordedAccessMode::Read),
+                (56, RecordedAccessMode::Write),
+                (64, RecordedAccessMode::Write),
+                (72, RecordedAccessMode::Read),
+            ]
+        );
         assert_eq!(expected_kernarg_bytes("attention_flash_q8_0_tile"), Some(80));
         assert_eq!(
             pointer_effects("attention_flash_q8_0_tile").map(|effects| effects.len()),

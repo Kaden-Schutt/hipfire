@@ -13351,13 +13351,40 @@ fn kv_cache_attention_dispatch(
     layer_idx: usize,
     pos: usize,
 ) -> HipResult<bool> {
-    let plan = KvTierPlan::derive(KvTierInputs {
+    let plan = kv_cache_attention_plan(gpu, kv_cache, s, pos)?;
+    kv_cache_attention_dispatch_planned(
+        ctx, gpu, kv_cache, s, config, wo, layer_idx, pos, plan, false,
+    )
+}
+
+fn kv_cache_attention_plan(
+    gpu: &Gpu,
+    kv_cache: &llama::KvCache,
+    s: &Qwen35Scratch,
+    pos: usize,
+) -> HipResult<KvTierPlan> {
+    KvTierPlan::derive(KvTierInputs {
         pos,
         flash_mode: s.flash_mode as usize,
         capture_mode: gpu.graphs.capture_mode,
         ..kv_cache.tier_inputs()
     })
-    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kv_cache_attention_dispatch_planned(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    kv_cache: &mut llama::KvCache,
+    s: &Qwen35Scratch,
+    config: &Qwen35Config,
+    wo: &WeightTensor,
+    layer_idx: usize,
+    pos: usize,
+    plan: KvTierPlan,
+    kv_already_written: bool,
+) -> HipResult<bool> {
     let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo)
         && plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteQ8_0
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
@@ -13387,8 +13414,12 @@ fn kv_cache_attention_dispatch(
         output_gate: fused_epilogue.then_some(&s.fa_gate),
         output: &s.fa_attn_out,
     };
-    execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
-        .map_err(|e| HipError::new(0, &e.to_string()))?;
+    let step = if kv_already_written {
+        Step::AttendAfterKvWrite { plan, io }
+    } else {
+        Step::Attend { plan, io }
+    };
+    execute_steps(gpu, ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
     Ok(fused_epilogue)
 }
 
@@ -13930,8 +13961,17 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     LayerWeights::FullAttnMoe(l) => (&l.q_norm, &l.k_norm, &l.wo),
                     _ => return Err(HipError::new(0, "ATTEND_FULL on non-FullAttn layer")),
                 };
+                let plan = kv_cache_attention_plan(gpu, self.kv_cache, s, self.pos)?;
                 let tap_enabled = hipfire_runtime::triattn::tap_enabled();
-                let fused_prep = qwen35_fa_prep_enabled(gpu, config) && !tap_enabled;
+                let fused_prep_q8_kv = qwen35_fa_prep_q8_kv_enabled(
+                    gpu,
+                    config,
+                    tap_enabled,
+                    self.kv_cache.compact_offset,
+                    &plan,
+                );
+                let fused_prep =
+                    fused_prep_q8_kv || (qwen35_fa_prep_enabled(gpu, config) && !tap_enabled);
                 if !fused_prep {
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
@@ -13965,7 +14005,22 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                if fused_prep {
+                if fused_prep_q8_kv {
+                    gpu.qwen35_fa_prep_q8_kv_gfx1151(
+                        &s.fa_q_full,
+                        &s.fa_q,
+                        &s.fa_gate,
+                        &s.fa_k,
+                        q_norm,
+                        k_norm,
+                        &s.pos_buf,
+                        &self.kv_cache.k_gpu[self.layer_idx],
+                        &self.kv_cache.v_gpu[self.layer_idx],
+                        &s.fa_v,
+                        config.norm_eps,
+                        config.rope_theta,
+                    )?;
+                } else if fused_prep {
                     gpu.qwen35_fa_prep_gfx1100(
                         &s.fa_q_full,
                         &s.fa_q,
@@ -13993,7 +14048,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     let phys = self.pos as i32;
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
-                let fused_epilogue = kv_cache_attention_dispatch(
+                let fused_epilogue = kv_cache_attention_dispatch_planned(
                     ctx,
                     gpu,
                     self.kv_cache,
@@ -14002,6 +14057,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     wo,
                     self.layer_idx,
                     self.pos,
+                    plan,
+                    fused_prep_q8_kv,
                 )?;
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -14398,6 +14455,32 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && config.n_kv_heads == 2
         && config.head_dim == 256
         && n_rot == 64
+}
+
+/// Experimental gfx1151-only extension of the exact FA prep launch that also
+/// writes Q8_0 K/V cache blocks. It remains opt-in until its one product round
+/// passes exact replay shadow and the campaign promotion threshold. Compacted
+/// caches retain the legacy two-position sequence because RoPE needs the
+/// absolute position while the cache write needs the physical position.
+fn qwen35_fa_prep_q8_kv_enabled(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    tap_enabled: bool,
+    compact_offset: usize,
+    plan: &KvTierPlan,
+) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX1151_FA_PREP_Q8_KV").as_deref() == Ok("1")
+    });
+    enabled
+        && gpu.arch_caps.is_gfx1151()
+        && qwen35_fa_prep_enabled(gpu, config)
+        && !tap_enabled
+        && compact_offset == 0
+        && plan.batch_size == 1
+        && plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteQ8_0
+        && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0
 }
 
 /// Pair Q8 K/V cache writes and fold the Qwen output gate plus MQ rotation into

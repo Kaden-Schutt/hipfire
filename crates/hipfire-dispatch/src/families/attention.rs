@@ -135,6 +135,32 @@ impl AttentionFamily {
         dispatch_attend(gpu, plan.attend_key, attend_var.tile, plan, io)
     }
 
+    /// Attend using a `KvTierPlan` whose KV write has already been performed by
+    /// an admitted fused producer. The write-key resolve is retained as a
+    /// fail-closed tier/architecture check; only the duplicate dispatch is
+    /// omitted.
+    pub fn run_attention_after_kv_write(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        plan: &crate::families::kv_tier::KvTierPlan,
+        io: &AttnParams,
+    ) -> Result<(), DispatchError> {
+        let shape = ShapeInfo {
+            batch_size: plan.batch_size,
+            head_dim: io.head_dim,
+            m: if plan.batch_size > 1 {
+                io.max_ctx_len
+            } else {
+                io.pos + 1
+            },
+            is_tree: io.tree_bias.is_some(),
+        };
+        self.resolve(plan.write_key, ctx, Some(&shape))?;
+        let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
+        dispatch_attend(gpu, plan.attend_key, attend_var.tile, plan, io)
+    }
+
     /// Full-attention entry point (no KV cache — vision / DFlash cross-attention).
     /// Resolves under the given key (AttnFullF16 / AttnFullF32 / causal variants)
     /// and dispatches on the resolved variant's `tile`. The caller is responsible

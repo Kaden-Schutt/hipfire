@@ -56,6 +56,13 @@ pub enum Step<'a> {
         plan: crate::families::kv_tier::KvTierPlan,
         io: crate::families::attention::AttnParams<'a>,
     },
+    /// Flash-attention after an admitted producer has already written the K/V
+    /// cache using the same `KvTierPlan`. This is a distinct typed step so a
+    /// fused producer cannot accidentally dispatch the legacy writer again.
+    AttendAfterKvWrite {
+        plan: crate::families::kv_tier::KvTierPlan,
+        io: crate::families::attention::AttnParams<'a>,
+    },
     /// In-place RoPE on Q and K. Per-op only (no fused entry) — present so the
     /// attention block can be one contiguous step list (future fusion seam).
     Rope {
@@ -89,7 +96,7 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::Gemv { .. } => PipelineOp::Gemv,
         Step::GemvResidual { .. } => PipelineOp::GemvResidual,
         Step::RmsnormAutomatic { .. } => PipelineOp::RmsnormAutomatic,
-        Step::Attend { .. } => PipelineOp::Attend,
+        Step::Attend { .. } | Step::AttendAfterKvWrite { .. } => PipelineOp::Attend,
         Step::Rope { .. } => PipelineOp::Rope,
         Step::QkNorm { .. } => PipelineOp::QkNorm,
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
@@ -807,6 +814,12 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             static ATTENTION: OnceLock<AttentionFamily> = OnceLock::new();
             let attn = ATTENTION.get_or_init(AttentionFamily::new);
             attn.run_attention(ctx, gpu, plan, io)
+        }
+        Step::AttendAfterKvWrite { plan, io } => {
+            use crate::families::attention::AttentionFamily;
+            static ATTENTION: OnceLock<AttentionFamily> = OnceLock::new();
+            let attn = ATTENTION.get_or_init(AttentionFamily::new);
+            attn.run_attention_after_kv_write(ctx, gpu, plan, io)
         }
         Step::Rope {
             q,

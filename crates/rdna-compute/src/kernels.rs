@@ -3998,6 +3998,12 @@ pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
+/// gfx1151-only 20-workgroup FA prep that also writes exact Q8_0 K/V cache
+/// blocks. Kept in a distinct translation unit so its extra branches and live
+/// ranges cannot perturb the certified gfx1100 or legacy gfx1151 object.
+#[cfg(feature = "deltanet")]
+pub const QWEN35_FA_PREP_Q8_KV_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/qwen35_fa_prep_q8_kv.gfx1151.hip");
 
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
@@ -5220,6 +5226,13 @@ mod dispatch_tests {
         #[cfg(feature = "deltanet")]
         assert!(QWEN35_FA_PREP_GFX1151_SRC
             .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151"));
+        #[cfg(feature = "deltanet")]
+        {
+            assert!(QWEN35_FA_PREP_Q8_KV_GFX1151_SRC
+                .contains("qwen35_fa_prep_q8_kv_gfx1151"));
+            assert!(!QWEN35_FA_PREP_GFX1100_SRC.contains("qwen35_fa_prep_q8_kv_gfx1151"));
+            assert!(!QWEN35_FA_PREP_GFX1151_SRC.contains("qwen35_fa_prep_q8_kv_gfx1151"));
+        }
         assert!(MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SHARED_SILU_MQ_ROTATE_SRC.starts_with(
             "#define HIPFIRE_ROUTER_SHARED_SILU_MQ_ROTATE 1\n#define HIPFIRE_ROUTER_EXACT_KERNEL moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate\n"
         ));
