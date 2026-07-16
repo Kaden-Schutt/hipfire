@@ -51,9 +51,10 @@ def _configuration() -> ReviewConfiguration:
     return configuration
 
 
-def _proposal(verdict: str = "clean", response_digest: str = "sha256:" + "c" * 64) -> ReviewProposal:
+def _proposal(verdict: str = "clean", response_digest: str = "sha256:" + "c" * 64,
+              message: str = "Use **the checked value** <instead>.") -> ReviewProposal:
     findings = () if verdict == "clean" else (
-        Finding("src/main.py", (3, 4), "error", "Use **the checked value** <instead>.") ,
+        Finding("src/main.py", (3, 4), "error", message),
     )
     values = {
         "target": TARGET,
@@ -90,6 +91,7 @@ class FakeGitHub:
         self.fail: set[str] = set()
         self.removed_labels: list[str] = []
         self.labels = {"needs-review"}
+        self.label_pages: list[list[dict]] | None = None
         self.mutate_head_after: str | None = None
         self.revoke_before_next_review: dict | None = None
         self.deleted_comment_ids: set[int] = set()
@@ -134,7 +136,10 @@ class FakeGitHub:
 
     def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
         self.calls.append(("list_labels", None))
-        return GitHubResponse([{"name": label} for label in sorted(self.labels)], {}, 200)
+        if self.label_pages is None:
+            return GitHubResponse([{"name": label} for label in sorted(self.labels)], {}, 200)
+        self.calls.extend(("list_labels", None) for _ in self.label_pages[1:])
+        return GitHubResponse([label for page in self.label_pages for label in page], {}, 200)
 
     @staticmethod
     def payload_from_body(body: str) -> str:
@@ -191,7 +196,7 @@ class FakeGitHub:
         now = self._now()
         record = {
             "id": self.next_id, "node_id": f"R_{self.next_id}", "user": {"login": TRUSTED, "type": "Bot"},
-            "submitted_at": now, "body": body, "state": event, "commit_id": commit_id,
+            "submitted_at": now, "body": body, "state": "CHANGES_REQUESTED", "commit_id": commit_id,
         }
         self.next_id += 1
         self.reviews.append(record)
@@ -470,8 +475,8 @@ def test_canonical_change_before_review_aborts_without_completion():
         _proposal("changes-requested", response_digest="sha256:" + "d" * 64), TARGET
     )
 
-    assert result.status in {"error", "incomplete", "stale"}
-    assert not client.removed_labels
+    assert result.status == "complete", result.reason
+    assert ("dismiss", 3) in client.calls
 
 
 @pytest.mark.parametrize("state,commit", [("COMMENTED", TARGET.head_sha), ("DISMISSED", TARGET.head_sha), ("REQUEST_CHANGES", "wrong-head")])
@@ -536,3 +541,44 @@ def test_label_add_failure_is_explicit():
 
     assert result.status == "error"
     assert "reapply" in (result.reason or "").lower()
+
+
+def test_completion_retry_revalidates_active_changes_review_before_label_removal():
+    client = FakeGitHub()
+    client.fail.add("remove_label")
+    first = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert first.status == "incomplete"
+    client.fail.remove("remove_label")
+    client.reviews[0]["state"] = "COMMENTED"
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "error"
+    assert not client.removed_labels
+
+
+def test_visible_report_neutralizes_tilde_backtick_backslash_ordered_list_and_multiline_input():
+    client = FakeGitHub()
+    message = "~~strike~~\n1. list\n`code` \\path\n# heading\n- bullet"
+    result = _publisher(client).publish(_proposal("changes-requested", message=message), TARGET)
+    assert result.status == "complete", result.reason
+    report = next(item for item in client.comments if json.loads(client.payload_from_body(item["body"]))["record_type"] == "report")
+    visible = report["body"].split("<!-- agentic-review/v1", 1)[0]
+
+    assert "~~strike~~" not in visible
+    assert "1. list" not in visible
+    assert "`code`" not in visible
+    assert "\\path" not in visible
+    assert "\n# heading" not in visible
+    assert "\n- bullet" not in visible
+
+
+def test_needs_review_is_verified_across_all_label_pages_before_removal():
+    client = FakeGitHub()
+    client.label_pages = [[{"name": "other"}], [{"name": "needs-review"}]]
+
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "complete", result.reason
+    assert client.removed_labels == ["needs-review"]
+    assert [call[0] for call in client.calls if call[0] == "list_labels"].count("list_labels") == 2

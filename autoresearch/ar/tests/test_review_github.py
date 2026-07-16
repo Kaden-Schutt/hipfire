@@ -258,6 +258,30 @@ def test_paginated_pull_requests_are_flattened_and_bounded():
     assert all("per_page=100" in " ".join(call[0]) for call in runner.calls)
 
 
+def test_issue_labels_follow_bounded_link_pagination():
+    next_page = '<https://api.github.com/repos/owner/repo/issues/42/labels?page=2>; rel="next"'
+    runner = FakeRunner([
+        result([{"name": "other"}], headers={"X-OAuth-Scopes": "read:user", "Link": next_page}),
+        result([{"name": "needs-review"}], headers={"X-OAuth-Scopes": "read:user"}),
+    ])
+
+    labels = GitHubClient(runner).list_issue_labels(REPO, 42)
+
+    assert [item["name"] for item in labels.data] == ["other", "needs-review"]
+    assert all("per_page=100" in " ".join(call[0]) for call in runner.calls)
+
+
+def test_issue_labels_fail_closed_at_pagination_bound():
+    next_page = '<https://api.github.com/repos/owner/repo/issues/42/labels?page=2>; rel="next"'
+    runner = FakeRunner([
+        result([], headers={"X-OAuth-Scopes": "read:user", "Link": next_page})
+        for _ in range(16)
+    ])
+
+    with pytest.raises(GitHubBoundaryError, match="labels pagination"):
+        GitHubClient(runner).list_issue_labels(REPO, 42)
+
+
 def test_pagination_fails_closed_when_link_exceeds_configured_bound():
     next_page = '<https://api.github.com/repos/owner/repo/pulls?page=2>; rel="next"'
     with pytest.raises(GitHubBoundaryError, match="pagination|page|bound"):

@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import html
 import json
@@ -20,7 +21,7 @@ from .config import (
 )
 from .github import decode_protocol_body, encode_protocol_body
 from .models import GitHubEnvelope, ReviewProposal, ReviewTarget
-from .protocol import validate_protocol
+from .protocol import validate_intent, validate_protocol, validate_revocation
 
 
 class PublisherError(RuntimeError):
@@ -90,7 +91,8 @@ def _target_from_payload(payload: Mapping[str, Any]) -> ReviewTarget:
 def _escape_markdown(value: str) -> str:
     escaped = html.escape(value, quote=False)
     escaped = escaped.replace("\r\n", "\n").replace("\r", "\n")
-    escaped = re.sub(r"([\\`*_\[\]#>+-])", r"\\\1", escaped)
+    escaped = escaped.replace("\\", "&#92;")
+    escaped = re.sub(r"([\\`*_\[\]#>+\-~\.])", r"\\\1", escaped)
     return escaped.replace("\n", "  \n")
 
 
@@ -228,28 +230,70 @@ class ReviewPublisher:
                 raise PublisherError("revocation has no complete historical target")
             groups.setdefault(key, []).append(record)
 
+        def event_key(record: _HistoryRecord) -> tuple[datetime, str]:
+            value = record.envelope.created_at
+            normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+            return datetime.fromisoformat(normalized), record.envelope.node_id
+
         valid: list[_HistoryRecord] = []
         current: list[_HistoryRecord] = []
         for key, group in groups.items():
             expected = targets.get(key)
             if expected is None:
                 continue
-            try:
-                validate_protocol(
-                    [record.envelope for record in group],
-                    expected_target=expected,
-                    trusted_authors=self._trusted_authors,
-                )
-            except ValueError as exc:
-                if expected == target:
-                    if "no valid non-revoked intent" not in str(exc):
+            intents = {
+                record.envelope.payload["attempt_id"]: record
+                for record in group
+                if record.envelope.payload.get("record_type") == "intent"
+            }
+            revoked: set[str] = set()
+            for record in sorted(group, key=event_key):
+                payload = record.envelope.payload
+                if payload.get("record_type") != "revocation":
+                    continue
+                intent = intents.get(payload.get("attempt_id"))
+                if intent is None:
+                    continue
+                try:
+                    validate_revocation(record.envelope, intent.envelope, trusted_authors=self._trusted_authors)
+                except ValueError:
+                    continue
+                revoked.add(payload["attempt_id"])
+            active = [record for attempt, record in intents.items() if attempt not in revoked]
+            canonical_attempt = min(active, key=event_key).envelope.payload["attempt_id"] if active else None
+            attempt_groups: dict[str, list[_HistoryRecord]] = {}
+            for record in group:
+                attempt = record.envelope.payload.get("attempt_id")
+                if isinstance(attempt, str):
+                    attempt_groups.setdefault(attempt, []).append(record)
+            for attempt, attempt_group in attempt_groups.items():
+                if attempt in revoked:
+                    historical = [record for record in attempt_group if record.envelope.payload.get("record_type") != "revocation"]
+                    try:
+                        validate_protocol(
+                            [record.envelope for record in historical],
+                            expected_target=expected,
+                            trusted_authors=self._trusted_authors,
+                        )
+                    except ValueError:
+                        continue
+                    valid.extend(historical)
+                    continue
+                try:
+                    elected = validate_protocol(
+                        [record.envelope for record in attempt_group],
+                        expected_target=expected,
+                        trusted_authors=self._trusted_authors,
+                    )
+                except ValueError as exc:
+                    if expected == target and attempt == canonical_attempt and "no valid non-revoked intent" not in str(exc):
                         raise PublisherError(f"invalid current review history: {exc}") from exc
-                if "no valid non-revoked intent" in str(exc):
-                    valid.extend(group)
-                continue
-            valid.extend(group)
-            if expected == target:
-                current.extend(group)
+                    if "no valid non-revoked intent" in str(exc):
+                        valid.extend(attempt_group)
+                    continue
+                valid.extend(attempt_group)
+                if expected == target and attempt == canonical_attempt:
+                    current.extend(attempt_group)
         return _History(tuple(current), tuple(valid))
 
     def _canonical(self, target: ReviewTarget, attempt_id: str, intent_node: str | None = None) -> GitHubEnvelope:
@@ -360,8 +404,8 @@ class ReviewPublisher:
             raise PublisherError("GitHub review mutation did not return a server record")
         server = self._client.get_pull_review(target.repository, target.number, record["id"]).data
         envelope = self._client.review_envelope(target.repository, target.number, record["id"])
-        if server.get("state") != "REQUEST_CHANGES" or server.get("commit_id") != target.head_sha:
-            raise PublisherError("created review metadata is not an active exact-head REQUEST_CHANGES review")
+        if server.get("state") != "CHANGES_REQUESTED" or server.get("commit_id") != target.head_sha:
+            raise PublisherError("created review metadata is not an active exact-head CHANGES_REQUESTED review")
         return _HistoryRecord(envelope, True, record["id"], server["state"], server["commit_id"])
 
     def _find_record(self, history: _History, target: ReviewTarget, attempt_id: str, record_type: str) -> _HistoryRecord | None:
@@ -377,8 +421,8 @@ class ReviewPublisher:
         if metadata is None:
             return None
         if verdict == "changes-requested":
-            if not metadata.is_review or metadata.state != "REQUEST_CHANGES" or metadata.commit_id != target.head_sha:
-                raise PublisherError("review metadata is not an active exact-head REQUEST_CHANGES review")
+            if not metadata.is_review or metadata.state != "CHANGES_REQUESTED" or metadata.commit_id != target.head_sha:
+                raise PublisherError("review metadata is not an active exact-head CHANGES_REQUESTED review")
         elif metadata.is_review:
             raise PublisherError("clean verdict cannot reuse a pull request review")
         return metadata
@@ -391,7 +435,7 @@ class ReviewPublisher:
             if (
                 not record.is_review or record.envelope.node_id == keep_node
                 or payload.get("record_type") != "review-metadata"
-                or record.state != "REQUEST_CHANGES" or record_target is None
+                or record.state != "CHANGES_REQUESTED" or record_target is None
                 or record.commit_id != record_target.head_sha
                 or record.envelope.author not in self._trusted_authors
             ):
@@ -463,7 +507,7 @@ class ReviewPublisher:
             completion = self._find_record(history, target, attempt_id, "completion")
             if completion is not None:
                 report = self._find_record(history, target, attempt_id, "report")
-                metadata = self._find_record(history, target, attempt_id, "review-metadata")
+                metadata = self._review_metadata(history, target, attempt_id, proposal.verdict)
                 if report is None or metadata is None:
                     raise PublisherError("completion dependencies are missing")
                 self._remove_label(target, attempt_id, canonical.node_id)

@@ -201,7 +201,7 @@ _ENDPOINTS = (
     ("GET", re.compile(rf"/repos/{_REPO}/compare/{_SHA}\.{3}{_SHA}$"), False),
     ("GET", re.compile(r"/installation/repositories$"), False),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
-    ("GET", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
+    ("GET", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), True),
     ("DELETE", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels/[^/]+$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/collaborators/[^/]+/permission$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/commits/{_SHA}$"), False),
@@ -728,14 +728,31 @@ class GitHubClient:
     def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
         repository = _repository(repository)
         number = _positive_integer(number, "issue number")
-        response = self._request("GET", f"/repos/{repository}/issues/{number}/labels", query={"per_page": _PAGE_SIZE})
-        if not isinstance(response.data, list):
-            raise GitHubBoundaryError("GitHub labels response is not a list")
-        for item in response.data:
-            label = self._require_mapping(item, "label")
-            if not isinstance(label.get("name"), str) or not label["name"].strip():
-                raise GitHubBoundaryError("GitHub label response is malformed")
-        return response
+        labels: list[Mapping[str, Any]] = []
+        headers: dict[str, str] = {}
+        for page in range(1, _MAX_PAGINATED_PAGES + 1):
+            response = self._request(
+                "GET", f"/repos/{repository}/issues/{number}/labels",
+                query={"per_page": _PAGE_SIZE, "page": page},
+            )
+            if not isinstance(response.data, list):
+                raise GitHubBoundaryError("GitHub labels response is not a list")
+            for item in response.data:
+                label = self._require_mapping(item, "label")
+                if not isinstance(label.get("name"), str) or not label["name"].strip():
+                    raise GitHubBoundaryError("GitHub label response is malformed")
+                labels.append(label)
+                if len(labels) > _MAX_PAGINATED_ITEMS:
+                    raise GitHubBoundaryError("GitHub labels pagination exceeds its fixed item bound")
+            headers.update(response.headers)
+            has_next = _has_next_page(response.headers)
+            if page == _MAX_PAGINATED_PAGES and has_next:
+                raise GitHubBoundaryError("GitHub labels pagination reached its fixed page bound")
+            if not has_next:
+                break
+        else:
+            raise GitHubBoundaryError("GitHub labels pagination reached its fixed page bound")
+        return GitHubResponse(labels, headers, 200)
 
     @classmethod
     def _validate_record_response(
