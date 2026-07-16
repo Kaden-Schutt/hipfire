@@ -1559,6 +1559,22 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_BUFFER_GFX1151_SRC: &str = con
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// First task-1 gfx1151 gate/up candidate: two independent wave32 rows per
+/// workgroup, exact K=2048, typed plain B64 scale/zero headers, and temporal
+/// raw-buffer loads only for lane-divergent packed weights. The 64-thread
+/// workgroup owns two rows, so the A3B launch is exactly 512x8 workgroups.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_WG2_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_WG_WAVES 2\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_wg2_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// gfx1151 Radiowave all-input cache candidate: retain the fixed-K gate/up
 /// schedule while routing both weights and aligned activation vectors through
 /// temporal VMEM. This mirrors the proven geometry/reduction lowering without

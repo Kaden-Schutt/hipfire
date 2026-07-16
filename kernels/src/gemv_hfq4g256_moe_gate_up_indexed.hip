@@ -8,7 +8,8 @@
 using hipfire_gate_i32x4 = int __attribute__((ext_vector_type(4)));
 using hipfire_gate_f32x4 = float __attribute__((ext_vector_type(4)));
 #endif
-#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_ROUTE_BUFFER)
+#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_ROUTE_BUFFER) || \
+    defined(HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER)
 using hipfire_gate_u32x2 = unsigned int __attribute__((ext_vector_type(2)));
 #endif
 
@@ -324,6 +325,27 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
         const unsigned int gate_base = gate_row_offset + (unsigned int)g * 136u;
 #endif
+#if defined(HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER)
+        // Scale and zero-point share one aligned, wave-uniform 8-byte header.
+        // Keep these plain typed loads eligible for scalarization; only the
+        // lane-divergent packed word below uses raw-buffer VMEM.
+        const hipfire_gate_u32x2 gh0 =
+            *reinterpret_cast<const hipfire_gate_u32x2*>(gg0);
+        const hipfire_gate_u32x2 gh1 =
+            *reinterpret_cast<const hipfire_gate_u32x2*>(gg1);
+        const hipfire_gate_u32x2 gh2 =
+            *reinterpret_cast<const hipfire_gate_u32x2*>(gg2);
+        const hipfire_gate_u32x2 gh3 =
+            *reinterpret_cast<const hipfire_gate_u32x2*>(gg3);
+        float gsc0 = __builtin_bit_cast(float, gh0.x);
+        float gzp0 = __builtin_bit_cast(float, gh0.y);
+        float gsc1 = __builtin_bit_cast(float, gh1.x);
+        float gzp1 = __builtin_bit_cast(float, gh1.y);
+        float gsc2 = __builtin_bit_cast(float, gh2.x);
+        float gzp2 = __builtin_bit_cast(float, gh2.y);
+        float gsc3 = __builtin_bit_cast(float, gh3.x);
+        float gzp3 = __builtin_bit_cast(float, gh3.y);
+#else
         float gsc0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg0, 0, gate_base));
         float gzp0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg0 + 4, 4, gate_base));
         float gsc1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg1, 136, gate_base));
@@ -332,6 +354,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         float gzp2 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg2 + 4, 276, gate_base));
         float gsc3 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg3, 408, gate_base));
         float gzp3 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg3 + 4, 412, gate_base));
+#endif
         unsigned int gpk0 = LOAD_PACKED_U32(gg0 + 8 + boff, 8, gate_base);
         unsigned int gpk1 = LOAD_PACKED_U32(gg1 + 8 + boff, 144, gate_base);
         unsigned int gpk2 = LOAD_PACKED_U32(gg2 + 8 + boff, 280, gate_base);
@@ -357,6 +380,24 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
         const unsigned int up_base = up_row_offset + (unsigned int)g * 136u;
 #endif
+#if defined(HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER)
+        const hipfire_gate_u32x2 uh0 =
+            *reinterpret_cast<const hipfire_gate_u32x2*>(uu0);
+        const hipfire_gate_u32x2 uh1 =
+            *reinterpret_cast<const hipfire_gate_u32x2*>(uu1);
+        const hipfire_gate_u32x2 uh2 =
+            *reinterpret_cast<const hipfire_gate_u32x2*>(uu2);
+        const hipfire_gate_u32x2 uh3 =
+            *reinterpret_cast<const hipfire_gate_u32x2*>(uu3);
+        float usc0 = __builtin_bit_cast(float, uh0.x);
+        float uzp0 = __builtin_bit_cast(float, uh0.y);
+        float usc1 = __builtin_bit_cast(float, uh1.x);
+        float uzp1 = __builtin_bit_cast(float, uh1.y);
+        float usc2 = __builtin_bit_cast(float, uh2.x);
+        float uzp2 = __builtin_bit_cast(float, uh2.y);
+        float usc3 = __builtin_bit_cast(float, uh3.x);
+        float uzp3 = __builtin_bit_cast(float, uh3.y);
+#else
         float usc0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu0, 0, up_base));
         float uzp0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu0 + 4, 4, up_base));
         float usc1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu1, 136, up_base));
@@ -365,6 +406,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         float uzp2 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu2 + 4, 276, up_base));
         float usc3 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu3, 408, up_base));
         float uzp3 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu3 + 4, 412, up_base));
+#endif
         unsigned int upk0 = LOAD_PACKED_U32(uu0 + 8 + boff, 8, up_base);
         unsigned int upk1 = LOAD_PACKED_U32(uu1 + 8 + boff, 144, up_base);
         unsigned int upk2 = LOAD_PACKED_U32(uu2 + 8 + boff, 280, up_base);
