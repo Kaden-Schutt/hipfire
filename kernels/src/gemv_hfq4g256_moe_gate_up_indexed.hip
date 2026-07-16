@@ -108,12 +108,12 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const char* gate_ptr = A + (long long)row * groups_per_row * 136;
     const char* up_ptr = A + (long long)(row + mi) * groups_per_row * 136;
     const int boff = tid * 4;
-#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
-    // One expert-wide SRD. Keep row/group displacement in scalar `soffset`
-    // and only the lane's packed-weight byte displacement in `voffset`.
     const unsigned int row_stride = (unsigned int)groups_per_row * 136u;
     const unsigned int gate_row_offset = (unsigned int)row * row_stride;
     const unsigned int up_row_offset = (unsigned int)(row + mi) * row_stride;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    // One expert-wide SRD. Keep row/group displacement in scalar `soffset`
+    // and only the lane's packed-weight byte displacement in `voffset`.
     const auto expert_rsrc = HIPFIRE_WEIGHT_RSRC(A);
 #endif
 
@@ -195,7 +195,10 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         const float4 x1b = *reinterpret_cast<const float4*>(x + base + 260); \
         const char* gg0 = gate_ptr + group * 136; \
         const char* gg1 = gg0 + 136; \
-        const unsigned int gate_base = gate_row_offset + (unsigned int)group * 136u; \
+        const unsigned int gate_base = \
+            HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS \
+                ? gate_row_offset + (unsigned int)group * 136u \
+                : 0u; \
         float gsc0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg0, 0, gate_base)); \
         float gzp0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg0 + 4, 4, gate_base)); \
         float gsc1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(gg1, 136, gate_base)); \
@@ -208,7 +211,10 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
                x1a.x, x1a.y, x1a.z, x1a.w, x1b.x, x1b.y, x1b.z, x1b.w); \
         const char* uu0 = up_ptr + group * 136; \
         const char* uu1 = uu0 + 136; \
-        const unsigned int up_base = up_row_offset + (unsigned int)group * 136u; \
+        const unsigned int up_base = \
+            HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS \
+                ? up_row_offset + (unsigned int)group * 136u \
+                : 0u; \
         float usc0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu0, 0, up_base)); \
         float uzp0 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu0 + 4, 4, up_base)); \
         float usc1 = __builtin_bit_cast(float, LOAD_UNIFORM_U32(uu1, 136, up_base)); \

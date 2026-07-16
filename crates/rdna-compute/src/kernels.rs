@@ -1243,6 +1243,22 @@ pub const GEMV_HFQ4G256_RESIDUAL_CPOL_RT_LOW_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip")
 );
+/// gfx1151 temporal-buffer residual candidate. Reuse the one-row immediate-
+/// consume source shape, but keep an exact-arch artifact and cache-policy-zero
+/// VMEM contract instead of inheriting gfx1100 admission.
+pub const GEMV_HFQ4G256_RESIDUAL_RT_LOW_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN 1\n",
+    "#define HIPFIRE_RDNA3_RESIDUAL_STAGE_X32 1\n",
+    "#define HIPFIRE_RDNA3_RESIDUAL_K2048 1\n",
+    "#define HIPFIRE_RDNA3_RESIDUAL_MATRIX_RSRC 1\n",
+    "#define HIPFIRE_RDNA3_RESIDUAL_BUFFER_CONSUME 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_rt_low_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip")
+);
 /// Radiowave gfx1100 residual probe: preserve the certified activation staging
 /// and reduction order while replacing flat weight loads with SLC raw-buffer
 /// loads. Kept as a distinct replay artifact until model-level certification.
@@ -1450,6 +1466,19 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_PAIR_VGPR_GFX1151_SRC: &str = 
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
+/// gfx1151 Radiowave candidate: the two-group live range paired with temporal
+/// raw-buffer weight loads. The pair schedule aims to retain enough MLP while
+/// avoiding the register growth of the four-group buffer lowering.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_PAIR_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
 /// Exact gfx1151 A3B candidate: expose K=2048 to LLVM and use temporal
 /// raw-buffer weight loads without importing gfx1100 cache or scheduling
 /// policy.
@@ -1628,6 +1657,18 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_BUFFER_GFX1151_SRC:
         "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
         include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
         include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+    );
+/// gfx1151 one-row routed-down schedule with temporal buffer VMEM for routing
+/// tables, expert pointers, and weights.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW1_BUFFER_GFX1151_SRC: &str =
+    concat!(
+        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+        "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!(
+            "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer.gfx1151.hip"
+        )
     );
 
 /// Radiowave gfx1100 cache-policy probe for the atomic-free MoE down stream.

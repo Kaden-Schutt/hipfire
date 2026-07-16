@@ -4909,6 +4909,12 @@ impl Gpu {
                 // which is not admissible for the scratch-free PM4 replay.
                 std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_RESIDUAL").as_deref() == Ok("1")
             });
+        static GFX1151_RESIDUAL_RT_LOW: OnceLock<bool> = OnceLock::new();
+        let gfx1151_rt_low = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_RESIDUAL_RT_LOW.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_RESIDUAL_RT_LOW").as_deref() == Ok("1")
+            });
         static RESIDUAL_CPOL: OnceLock<Option<String>> = OnceLock::new();
         let cpol = RESIDUAL_CPOL
             .get_or_init(|| std::env::var("HIPFIRE_RESIDUAL_CPOL").ok())
@@ -4920,7 +4926,13 @@ impl Gpu {
         } else {
             None
         };
-        let (src, module, func_name) = if cpol == Some("rt-low") {
+        let (src, module, func_name) = if gfx1151_rt_low {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_RT_LOW_GFX1151_SRC,
+                "gemv_hfq4g256_residual_rt_low_gfx1151",
+                "gemv_hfq4g256_residual_rt_low_gfx1151",
+            )
+        } else if cpol == Some("rt-low") {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_CPOL_RT_LOW_GFX1100_SRC,
                 "gemv_hfq4g256_residual_cpol_rt_low_gfx1100",
@@ -6583,6 +6595,12 @@ impl Gpu {
                 && *GFX1151_GATE_UP_PAIR_VGPR.get_or_init(|| {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_VGPR").as_deref() == Ok("1")
                 });
+            static GFX1151_GATE_UP_PAIR_BUFFER: OnceLock<bool> = OnceLock::new();
+            let gfx1151_pair_buffer = self.arch_caps.is_gfx1151()
+                && k == 2_048
+                && *GFX1151_GATE_UP_PAIR_BUFFER.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_BUFFER").as_deref() == Ok("1")
+                });
             static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
             let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
@@ -6591,7 +6609,18 @@ impl Gpu {
                         || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP").as_deref()
                             == Ok("1")
                 });
-            if gfx1151_low_vgpr {
+            if gfx1151_pair_buffer {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_pair_buffer_gfx1151",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_PAIR_BUFFER_GFX1151_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151",
+                    [32u32, 1, 1],
+                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                )
+            } else if gfx1151_low_vgpr {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_k2048_low_vgpr_gfx1151",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_LOW_VGPR_GFX1151_SRC,
@@ -7312,11 +7341,23 @@ impl Gpu {
                 std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
                     || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_DOWN").as_deref() == Ok("1")
             });
+        static GFX1151_DOWN_ROW1_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_row1_buffer = self.arch_caps.is_gfx1151()
+            && k == 512
+            && *GFX1151_DOWN_ROW1_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_DOWN_ROW1_BUFFER").as_deref() == Ok("1")
+            });
         let (module_name, source, func_name) = if cpol_slc {
             (
                 "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc_gfx1100",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC,
                 "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
+            )
+        } else if gfx1151_row1_buffer {
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer_gfx1151",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW1_BUFFER_GFX1151_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer_gfx1151",
             )
         } else if gfx1151_buffer {
             (
@@ -7372,7 +7413,9 @@ impl Gpu {
         } else {
             false
         };
-        let grid_x = if tight_grid {
+        let grid_x = if gfx1151_row1_buffer {
+            m as u32
+        } else if tight_grid {
             (m as u32).div_ceil(4)
         } else {
             m as u32
