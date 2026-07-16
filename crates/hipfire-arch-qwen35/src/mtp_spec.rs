@@ -3398,7 +3398,15 @@ pub fn spec_step_mtp_compressed_serial(
                 let launches = gpu.replay.recorded_launches().len();
                 if std::env::var_os("HIPFIRE_MTP_REPLAY_DUMP").is_some() {
                     let mut counts = std::collections::BTreeMap::new();
-                    for launch in gpu.replay.recorded_launches() {
+                    for (index, launch) in gpu.replay.recorded_launches().iter().enumerate() {
+                        eprintln!(
+                            "[redline-mtp-launch] {:4}/{} {} grid={:?} block={:?}",
+                            index + 1,
+                            launches,
+                            launch.kernel,
+                            launch.grid,
+                            launch.block,
+                        );
                         *counts.entry(launch.kernel.as_str()).or_insert(0usize) += 1;
                     }
                     for (kernel, count) in counts {
