@@ -2634,6 +2634,12 @@ impl Gpu {
             && *GFX1151_QKVZA_R2_BUFFER.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_QKVZA_R2_BUFFER").as_deref() == Ok("1")
             });
+        static GFX1151_QKVZA_WAVE64_SHARE_X: OnceLock<bool> = OnceLock::new();
+        let gfx1151_wave64_share_x = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKVZA_WAVE64_SHARE_X.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X").as_deref() == Ok("1")
+            });
         static QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_r2 = rdna3_k2048
             && *QKVZA_R2.get_or_init(|| {
@@ -2718,6 +2724,17 @@ impl Gpu {
                 "fused_qkvza_hfq4g256_k2048",
                 [32u32, 1, 1],
                 total_m as u32,
+            )
+        } else if gfx1151_wave64_share_x {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_wave64_share_x_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SHARE_X_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_wave64_share_x_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_wave64_share_x_gfx1151",
+                [64u32, 1, 1],
+                (total_m as u32).div_ceil(2),
             )
         } else if gfx1151_k2048_x_buffer_large {
             self.ensure_kernel(

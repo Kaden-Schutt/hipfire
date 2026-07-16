@@ -3041,6 +3041,12 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_R2_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256_r2.gfx1100.hip")
 );
 
+/// gfx1151-only wave64 activation-sharing experiment. Matching lanes in the
+/// two physical wave32 halves consume one K=2048 activation load stream via
+/// V_PERMLANE64 while retaining independent row weights and reductions.
+pub const FUSED_QKVZA_HFQ4G256_WAVE64_SHARE_X_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64_share_x.gfx1151.hip");
+
 /// gfx1100 decode experiment: keep the certified K=2048 projection schedule
 /// and fold the beta sigmoid plus alpha softplus/decay preparation into the
 /// two scalar projection tails. This removes one launch per DeltaNet layer.
