@@ -1267,6 +1267,10 @@ pub const GEMV_HFQ4G256_RESIDUAL_K2048_GFX1100_SRC: &str = concat!(
 );
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_GFX1151_SRC: &str = concat!(
+    "// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX942_SRC: &str =
@@ -1529,6 +1533,10 @@ pub const GEMV_PARO_Q4G128_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
 /// half a wave64 per workgroup. Byte-exact math.
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_wave64.hip");
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_GFX1151_SRC: &str = concat!(
+    "// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_wave64.hip")
+);
 
 /// Index-aware MoE down GEMV — same pattern as the indexed gate_up,
 /// also reads scales from a device topk_weights buffer. Pairs with the

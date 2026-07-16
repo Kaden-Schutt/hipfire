@@ -4979,7 +4979,12 @@ impl Gpu {
         // CDNA3 wave64 fast path: 2 rows per block, halves grid.x. The base
         // kernel runs at half throughput on a wave64-native arch because
         // half the wave masks out per `__shfl_down`. Byte-exact with base.
-        let cdna3 = self.arch_caps.is_wave64_native();
+        static GFX1151_RESIDUAL_WAVE64: OnceLock<bool> = OnceLock::new();
+        let gfx1151_wave64 = self.arch_caps.is_gfx1151()
+            && *GFX1151_RESIDUAL_WAVE64.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_RESIDUAL_WAVE64").as_deref() == Ok("1")
+            });
+        let cdna3 = self.arch_caps.is_wave64_native() || gfx1151_wave64;
 
         // RDNA3 multi-row override path. Same selector as the non-residual
         // variant but there's currently no gfx1010-default multi-row residual
@@ -5052,20 +5057,29 @@ impl Gpu {
                     },
                 )
             } else {
-                let (kname, ksrc): (&str, &str) = if self.arch_caps.gemv_prefetch_enabled() {
+                let (module, ksrc, kname): (&str, &str, &str) = if gfx1151_wave64 {
+                    (
+                        "gemv_hfq4g256_residual_wave64_gfx1151",
+                        kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_GFX1151_SRC,
+                        "gemv_hfq4g256_residual_wave64",
+                    )
+                } else if self.arch_caps.gemv_prefetch_enabled() {
                     (
                         "gemv_hfq4g256_residual_wave64_prefetch",
                         kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC,
+                        "gemv_hfq4g256_residual_wave64_prefetch",
                     )
                 } else {
                     (
                         "gemv_hfq4g256_residual_wave64",
                         kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                        "gemv_hfq4g256_residual_wave64",
                     )
                 };
-                self.ensure_kernel(kname, ksrc, kname)?;
+                self.ensure_kernel(module, ksrc, kname)?;
                 let grid = ((m as u32) + 1) / 2;
-                self.launch_maybe_blob(kname, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let block = if gfx1151_wave64 { 64 } else { 32 };
+                self.launch_maybe_blob(kname, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
                     let mut b = hip_bridge::KernargBlob::new();
                     b.push_ptr(a_ptr);
                     b.push_ptr(x_ptr);
@@ -6433,11 +6447,28 @@ impl Gpu {
         n_ranks: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let cdna_wave64 = self.arch_caps.is_wave64_native();
+        use std::sync::OnceLock;
+        static GFX1151_GATE_UP_WAVE64: OnceLock<bool> = OnceLock::new();
+        let gfx1151_wave64 = self.arch_caps.is_gfx1151()
+            && *GFX1151_GATE_UP_WAVE64.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_GATE_UP_WAVE64").as_deref() == Ok("1")
+            });
+        let cdna_wave64 = self.arch_caps.is_wave64_native() || gfx1151_wave64;
         let (func_name, block, grid_x) = if cdna_wave64 {
+            let (module, source) = if gfx1151_wave64 {
+                (
+                    "gemv_hfq4g256_moe_gate_up_indexed_wave64_gfx1151",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_GFX1151_SRC,
+                )
+            } else {
+                (
+                    "gemv_hfq4g256_moe_gate_up_indexed_wave64",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC,
+                )
+            };
             self.ensure_kernel(
-                "gemv_hfq4g256_moe_gate_up_indexed_wave64",
-                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC,
+                module,
+                source,
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64",
             )?;
             (
