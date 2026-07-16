@@ -5171,12 +5171,6 @@ impl Gpu {
             && *GFX1151_RESIDUAL_TIGHT_GRID.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_RESIDUAL_TIGHT_GRID").as_deref() == Ok("1")
             });
-        static GFX1201_27B_RESIDUAL_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
-        let gfx1201_27b_tight_grid = gfx1201_27b_global
-            && *GFX1201_27B_RESIDUAL_TIGHT_GRID.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_RESIDUAL_TIGHT_GRID").as_deref()
-                    == Ok("1")
-            });
         static GFX1151_RESIDUAL_MULTIROW_R2: OnceLock<bool> = OnceLock::new();
         let gfx1151_multirow_r2 = self.arch_caps.is_gfx1151()
             && m == 2_048
@@ -5326,7 +5320,7 @@ impl Gpu {
             // Its legacy M-sized launch leaves the upper half of the grid to
             // exit at the row0 guard. Qualify that target-neutral contraction
             // independently on gfx1151 instead of coupling it to wave64.
-            let grid = if gfx1151_tight_grid || gfx1201_27b_tight_grid {
+            let grid = if gfx1151_tight_grid {
                 (m as u32).div_ceil(2)
             } else {
                 m as u32
