@@ -2950,10 +2950,10 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
-/// gfx1151 QKVZA hybrid cache path: immutable wave-uniform scale/zero headers
-/// use scalar B64 loads, while packed weights and the shared activation retain
-/// the admitted temporal buffer lowering. This removes redundant per-lane
-/// header VMEM without changing row ownership or the arithmetic tree.
+/// gfx1151 small-QKVZA hybrid cache path: immutable wave-uniform scale/zero
+/// headers use scalar B64 loads, while packed weights and the shared activation
+/// retain the admitted temporal buffer lowering. This removes redundant
+/// per-lane header VMEM without changing row ownership or the arithmetic tree.
 pub const FUSED_QKVZA_HFQ4G256_K2048_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
     "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",

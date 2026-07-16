@@ -2588,6 +2588,7 @@ impl Gpu {
         static GFX1151_QKVZA_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_hybrid_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
+            && total_m == 1_281
             && *GFX1151_QKVZA_HYBRID_BUFFER.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER").as_deref() == Ok("1")
             });
