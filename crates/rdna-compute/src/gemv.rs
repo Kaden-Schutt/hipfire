@@ -6982,15 +6982,34 @@ impl Gpu {
                 2,
             )
         } else {
+            use std::sync::OnceLock;
+            static BATCHED_FUSED: OnceLock<bool> = OnceLock::new();
+            let fused = self.arch_caps.is_rdna4()
+                && *BATCHED_FUSED.get_or_init(|| {
+                    std::env::var("HIPFIRE_MOE_GATE_UP_BATCHED_FUSED").as_deref() == Ok("1")
+                });
+            let (module, source, grid_div) = if fused {
+                (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched_fused",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_SRC,
+                    2,
+                )
+            } else {
+                (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+                    1,
+                )
+            };
             self.ensure_kernel(
-                "gemv_hfq4g256_moe_gate_up_indexed_batched",
-                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+                module,
+                source,
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
             )?;
             (
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
                 [32, 1, 1],
-                1,
+                grid_div,
             )
         };
         let pp = expert_ptrs.buf.as_ptr();
