@@ -6765,18 +6765,6 @@ impl Gpu {
                 && *GFX1151_GATE_UP_HYBRID_BUFFER.get_or_init(|| {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER").as_deref() == Ok("1")
                 });
-            static GFX1151_GATE_UP_HYBRID_PAIR: OnceLock<bool> = OnceLock::new();
-            let gfx1151_hybrid_pair = self.arch_caps.is_gfx1151()
-                && k == 2_048
-                && *GFX1151_GATE_UP_HYBRID_PAIR.get_or_init(|| {
-                    std::env::var("HIPFIRE_GFX1151_GATE_UP_HYBRID_PAIR").as_deref() == Ok("1")
-                });
-            static GFX1151_GATE_UP_HYBRID_LOW: OnceLock<bool> = OnceLock::new();
-            let gfx1151_hybrid_low = self.arch_caps.is_gfx1151()
-                && k == 2_048
-                && *GFX1151_GATE_UP_HYBRID_LOW.get_or_init(|| {
-                    std::env::var("HIPFIRE_GFX1151_GATE_UP_HYBRID_LOW").as_deref() == Ok("1")
-                });
             static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
             let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
@@ -6805,29 +6793,7 @@ impl Gpu {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER").as_deref()
                         == Ok("1")
                 });
-            if gfx1151_hybrid_pair {
-                self.ensure_kernel(
-                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_hybrid_pair_gfx1151",
-                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_PAIR_GFX1151_SRC,
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_pair_gfx1151",
-                )?;
-                (
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_pair_gfx1151",
-                    [32u32, 1, 1],
-                    (m as u32) >> 1,
-                )
-            } else if gfx1151_hybrid_low {
-                self.ensure_kernel(
-                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_hybrid_low_gfx1151",
-                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_LOW_GFX1151_SRC,
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_low_gfx1151",
-                )?;
-                (
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_low_gfx1151",
-                    [32u32, 1, 1],
-                    (m as u32) >> 1,
-                )
-            } else if gfx1151_hybrid_buffer {
+            if gfx1151_hybrid_buffer {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_k2048_hybrid_gfx1151",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_GFX1151_SRC,

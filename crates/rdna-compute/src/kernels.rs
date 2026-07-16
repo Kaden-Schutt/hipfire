@@ -1574,36 +1574,6 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_GFX1151_SRC: &str = con
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
-/// gfx1151 hybrid load path with two groups live at once. This isolates the
-/// middle live-range schedule while retaining scalar headers, temporal packed
-/// weights, exact K=2048, and the one-row wave32 ownership contract.
-pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_PAIR_GFX1151_SRC: &str = concat!(
-    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
-    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
-    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
-    "#define HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER 1\n",
-    "#define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 1\n",
-    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_pair_gfx1151\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
-);
-
-/// gfx1151 hybrid load path with one group live at once. This is the minimum
-/// register-pressure schedule and remains a separate admission candidate so a
-/// lower VGPR count cannot be mistaken for a throughput win.
-pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_LOW_GFX1151_SRC: &str = concat!(
-    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
-    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
-    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
-    "#define HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER 1\n",
-    "#define HIPFIRE_MOE_GATE_UP_LOW_VGPR 1\n",
-    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_low_gfx1151\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
-);
-
 /// gfx1151 Radiowave all-input cache candidate: retain the fixed-K gate/up
 /// schedule while routing both weights and aligned activation vectors through
 /// temporal VMEM. This mirrors the proven geometry/reduction lowering without

@@ -187,16 +187,8 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
              + ((sc) * (float)(((pk) >> 28) & 0xFu) + (zp)) * (x7); \
     } while (0)
 
-#if defined(HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER)
-    // The pair/low-live-range schedules use the common scalar header helper.
-    // Preserve the hybrid contract there as well: immutable wave-uniform
-    // headers use SMEM, while only lane-dependent packed words use MUBUF.
-    #define LOAD_UNIFORM_U32(ptr, vector_offset, scalar_offset) \
-        (*(const unsigned int __attribute__((address_space(4)))*)(ptr))
-#else
     #define LOAD_UNIFORM_U32(ptr, vector_offset, scalar_offset) \
         HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(expert_rsrc, ptr, vector_offset, scalar_offset)
-#endif
     #define LOAD_PACKED_U32(ptr, vector_offset, scalar_offset) \
         HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(expert_rsrc, ptr, boff + vector_offset, scalar_offset)
 
