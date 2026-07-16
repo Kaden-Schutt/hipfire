@@ -9,8 +9,7 @@
 //! generation guards owned by the daemon: ChatML framing via
 //! `hipfire_runtime::prompt_frame::ChatFrame`, top-p sampling via
 //! `hipfire_runtime::sampler::sample`, output-stream filtering via
-//! `hipfire_runtime::eos_filter::EosFilter`, and the n-gram repetition detector
-//! via `hipfire_runtime::loop_guard::LoopGuard`. The default keeps today's bare
+//! `hipfire_runtime::eos_filter::EosFilter`. The default keeps today's bare
 //! semantics so kernel/loading sanity probes are unchanged byte-for-byte.
 
 use hipfire_arch_qwen35::qwen35;
@@ -18,7 +17,6 @@ use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
-use hipfire_runtime::loop_guard::LoopGuard;
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::Write;
@@ -76,7 +74,7 @@ fn main() {
     eprintln!("=== hipfire Qwen3.5 inference ===");
     eprintln!("Model: {model_path}");
     if use_guards {
-        eprintln!("Guards: ON (prompt_frame + sampler + eos_filter + loop_guard)");
+        eprintln!("Guards: ON (prompt_frame + sampler + eos_filter)");
     }
 
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
@@ -286,11 +284,9 @@ fn main() {
     let mut in_thinking = true;
     let mut generated = Vec::new();
 
-    // Production guards path: stream output through EosFilter and watch
-    // for n-gram loops via LoopGuard. Set up here so the loop body can
-    // route bytes/tokens through them when use_guards is true.
+    // Production guards path: stream output through EosFilter. Set up here
+    // so the loop body can route bytes through it when use_guards is true.
     let mut filter = EosFilter::new(EosFilterConfig::default());
-    let loop_guard = LoopGuard::from_config(hipfire_runtime::config::get());
     let mut bytes_fed_to_filter = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
 
@@ -376,20 +372,7 @@ fn main() {
             break;
         }
 
-        // N-gram loop detector (guards on only). When the streamed
-        // tokens trigger the LoopGuard, force EOS — same shape as the
-        // daemon's loop-guard early-exit.
         if use_guards {
-            if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-                loop_guard.check(&streamed_tokens)
-            {
-                let window_len = loop_guard.window_len(streamed_tokens.len());
-                eprintln!(
-                    "\n[guards] ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS",
-                    count, window_len
-                );
-                break;
-            }
             // Track think state for guards-on path so the temperature
             // mode switches at </think>, even though the EosFilter is
             // not configured to strip it (we want the example to still

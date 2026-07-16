@@ -12,12 +12,10 @@
 //!      human eyeball, NOT an automatic hard fail. This detector only
 //!      ever returns `Ok` or `Warn`.
 //!
-//!   2. **`loop_guard` mirror** — observational reflection of the
-//!      runtime's `LoopGuard` (4-gram, threshold ≥8, window 256). Fires
-//!      `Warn` when the live guard would have force-stopped the
-//!      generation. Useful for confirming the protective layer is doing
-//!      its job AND for surfacing borderline cases that approached but
-//!      did not cross the threshold.
+//!   2. **historical `loop_guard` mirror** — passive observation of the
+//!      retired runtime predicate (4-gram, threshold ≥8, window 256).
+//!      It still surfaces highly repetitive output for diagnostics but
+//!      never mutates generation.
 //!
 //! Both consume `Event::Committed` only — token IDs are the canonical
 //! stream for n-gram analysis (text-level n-grams collide with
@@ -101,8 +99,8 @@ impl Detector for NgramDensity {
 
 // ─── loop_guard mirror ───────────────────────────────────────────────────
 
-/// Observational mirror of `crates/hipfire-runtime/src/loop_guard.rs`.
-/// Fires `Warn` when the live guard's predicate would have triggered
+/// Observational mirror of the retired runtime loop-guard predicate.
+/// Fires `Warn` when that historical predicate would have triggered
 /// (`>=` `DEFAULT_NGRAM_THRESHOLD` repeats of any 4-gram inside the
 /// trailing `DEFAULT_NGRAM_WINDOW`). Never `Fail` — purely observational.
 pub struct LoopGuardMirror {

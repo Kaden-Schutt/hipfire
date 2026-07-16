@@ -6618,8 +6618,8 @@ fn generate_qwen35_mtp(
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
-/// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
-/// detection, repeat penalty, attractor block on unclosed tool/think
+/// EosFilter UTF-8 streaming + strip-think + stop_at, repeat penalty,
+/// attractor block on unclosed tool/think
 /// openers, max_think_tokens force-close, budget-alert nudge, ChatML \n
 /// trailer. Forward calls fan out to per-device tensors via
 /// `gpus.devices[dev]` and `scratch_set.per_device[dev]`; the final
@@ -7208,9 +7208,6 @@ fn generate_multi(
         .and_then(|s| s.parse().ok())
         .unwrap_or(768);
     let mut latch_gen_mark: Option<usize> = None;
-    let loop_guard =
-        hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
-
     while generated < max_tokens {
         if check_abort(id) {
             reset_pp_uncommitted_state!();
@@ -7412,20 +7409,6 @@ fn generate_multi(
                     break;
                 }
             }
-        }
-
-        // N-gram loop detector (token-side, no GPU work).
-        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-            loop_guard.check(&streamed_tokens)
-        {
-            let window_len = loop_guard.window_len(streamed_tokens.len());
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
-                id, count, window_len
-            );
-            let _ = stdout.flush();
-            break;
         }
 
         // Budget-alert injection: gated to inside an open <think> block.
@@ -9736,17 +9719,6 @@ fn generate(
             .unwrap_or(768);
         let mut latch_gen_mark: Option<usize> = None;
 
-        // N-gram loop detector: track 4-gram token sequences. When any
-        // 4-gram repeats more than `ngram_loop_threshold` times in the
-        // last `ngram_window` tokens, force EOS. This catches answer-phase
-        // repetition loops that the think cap and repeat penalty miss.
-        // Operates on token IDs (no decode overhead).
-        // Implementation lives in `hipfire_runtime::loop_guard`; defaults read from
-        // HIPFIRE_NGRAM_LOOP_THRESHOLD (default 8, 0 = disabled) and
-        // HIPFIRE_NGRAM_WINDOW (default 256). See loop_guard.rs.
-        let loop_guard =
-            hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
-
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
         // push generated past max_tokens: each loop start rechecks the cap.
@@ -10044,23 +10016,6 @@ fn generate(
                         break;
                     }
                 }
-            }
-
-            // N-gram loop detector: check if any 4-gram in the recent window
-            // repeats excessively. When detected, emit an info message and
-            // force EOS to prevent wasting the remaining token budget on
-            // repetitive output. Logic lives in `hipfire_runtime::loop_guard`.
-            if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-                loop_guard.check(&streamed_tokens)
-            {
-                let window_len = loop_guard.window_len(streamed_tokens.len());
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
-                    id, count, window_len
-                );
-                let _ = stdout.flush();
-                break;
             }
 
             // Budget-alert injection: once we hit the configured token count,
@@ -13726,11 +13681,6 @@ fn generate_vl(
     let mut think_depth: usize = 0; // number of unmatched opens seen
     let mut think_count: usize = 0; // tokens emitted while depth > 0
 
-    // N-gram loop detector — mirrors the text path. Catches answer-phase
-    // attractor loops that the think cap and repeat penalty miss.
-    let loop_guard =
-        hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
-
     while generated < max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
@@ -13768,19 +13718,6 @@ fn generate_vl(
             break;
         }
         if tokenizer.is_terminator(next_token) {
-            break;
-        }
-
-        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-            loop_guard.check(&streamed_tokens)
-        {
-            let window_len = loop_guard.window_len(streamed_tokens.len());
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
-                id, count, window_len,
-            );
-            let _ = stdout.flush();
             break;
         }
 
@@ -14229,11 +14166,8 @@ fn generate_vl_dots_ocr(
     let mut streamed: Vec<u32> = Vec::new();
     let mut emitted_bytes = 0usize;
     let mut generated = 0usize;
-    // No ngram loop-guard here: dots.ocr layout-JSON legitimately repeats
-    // short structures (`<td>…</td>`, `"category":`, bracket patterns), and
-    // the default guard force-stops mid-table (observed: truncation at 391
-    // tokens on a table-heavy page). The proven ocr_e2e path decodes
-    // straight to EOS without a guard; see DotsOcr::loop_guard_overrides.
+    // dots.ocr layout-JSON legitimately repeats short structures
+    // (`<td>…</td>`, `"category":`, bracket patterns); decode to EOS.
 
     while generated < max_tokens {
         if eos_set.contains(&next) {

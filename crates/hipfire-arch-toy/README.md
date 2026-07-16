@@ -10,8 +10,8 @@ The smallest impl that compiles, type-checks against
 method. Each method is a one-liner with a doc-comment explaining what a
 real arch would do.
 
-The four optional override structs (`LoopGuardOverrides`,
-`SamplerOverrides`, `PromptFrameOverrides`, `EosFilterOverrides`) are
+The three optional override structs (`SamplerOverrides`,
+`PromptFrameOverrides`, `EosFilterOverrides`) are
 shown with their default value plus an example of when you'd override.
 
 ## What this crate is not

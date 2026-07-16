@@ -51,8 +51,6 @@ pub struct RuntimeConfig {
     /// (default). `Some(false)` (HIPFIRE_TP_USE_RCCL=0) → opt out of the RCCL
     /// path. `Some(true)` → force on. Read by `multi_gpu::Gpus::ensure_rccl`.
     pub tp_use_rccl: Option<bool>,
-    pub ngram_loop_threshold: usize,
-    pub ngram_window: usize,
     pub devices: Option<String>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
@@ -113,19 +111,6 @@ impl RuntimeConfig {
                 .ok()
                 .as_deref()
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
-            // Default OFF (0 = disabled). The content-blind 4-gram guard can
-            // false-positive on repeated markdown/list scaffolding inside
-            // sampled reasoning and force-EOS before a visible answer. The
-            // think-budget force-close handles runaway reasoning instead;
-            // operators can opt this guard back in with an explicit threshold.
-            ngram_loop_threshold: std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            ngram_window: std::env::var("HIPFIRE_NGRAM_WINDOW")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(256),
             devices: std::env::var("HIPFIRE_DEVICES").ok(),
             allow_mixed_arch: std::env::var("HIPFIRE_ALLOW_MIXED_ARCH").ok().as_deref()
                 == Some("1"),
@@ -149,21 +134,6 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn ngram_loop_guard_is_off_by_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD").ok();
-        std::env::remove_var("HIPFIRE_NGRAM_LOOP_THRESHOLD");
-
-        let cfg = RuntimeConfig::from_env();
-        assert_eq!(cfg.ngram_loop_threshold, 0);
-
-        match prev {
-            Some(value) => std::env::set_var("HIPFIRE_NGRAM_LOOP_THRESHOLD", value),
-            None => std::env::remove_var("HIPFIRE_NGRAM_LOOP_THRESHOLD"),
-        }
-    }
 
     #[test]
     fn normalize_prompt_accepts_no_as_false() {

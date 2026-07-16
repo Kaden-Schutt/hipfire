@@ -127,8 +127,6 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | MMQ | — | `crates/rdna-compute/src/dispatch.rs:648` |
 | `HIPFIRE_MODEL` | DAEMON-RUNTIME | — | `cli/index.ts:1350` |
 | `HIPFIRE_MW16` | LIB | — | `crates/rdna-compute/src/dispatch.rs:7332` |
-| `HIPFIRE_NGRAM_LOOP_THRESHOLD` | NGRAM-DETECTOR | — | `crates/hipfire-runtime/src/loop_guard.rs:47` |
-| `HIPFIRE_NGRAM_WINDOW` | NGRAM-DETECTOR | — | `crates/hipfire-runtime/src/loop_guard.rs:49` |
 | `HIPFIRE_NO_PID_FILE` | DAEMON-RUNTIME | — | `cli/index.ts:1286` |
 | `HIPFIRE_NORMALIZE_PROMPT` | PROMPT-FRAME | — | `cli/index.ts:817` |
 | `HIPFIRE_PFLASH_SCORE_LAYER` | LIB | — | `crates/hipfire-arch-qwen35/src/pflash.rs:676` |
@@ -335,13 +333,6 @@ re-prefilling cold. Resolved once at speculator-build time (`build_dflash_specul
   floored at 256). Smaller ⇒ finer resume granularity, more snapshots.
 - `HIPFIRE_CACHE_CKPT_MAX` — checkpoint ring capacity (default 8, floored at 1).
   Bounds snapshot VRAM; oldest entries drop when exceeded.
-
-### `NGRAM-DETECTOR` (2)
-
-Loop-detector for output-loop guard (#125, #111).
-
-- `HIPFIRE_NGRAM_LOOP_THRESHOLD` — N-gram repeat threshold.
-- `HIPFIRE_NGRAM_WINDOW` — sliding window size.
 
 ### `PROMPT-FRAME` (2)
 

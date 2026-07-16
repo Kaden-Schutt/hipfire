@@ -117,11 +117,9 @@ fi
 md5sum "$DAEMON" "$MODEL"
 echo
 
-# Run A trips the n-gram loop guard on legitimate "    *   " bullet-list
-# formatting after ~400 tokens — a false positive on coherent reasoning,
-# unrelated to the spiral being tested. Disable the guard so the full
-# trajectory (think → </think> → final answer) is visible.
-NOGUARD="export HIPFIRE_NGRAM_LOOP_THRESHOLD=0;"
+# Runtime generation no longer contains a content-blind n-gram stopper,
+# so the full trajectory (think → </think> → final answer) is observable.
+NOGUARD=""
 
 run_one "A_rp1.0" "1.0" "$NOGUARD"
 run_one "B_rp1.3" "1.3" "$NOGUARD"

@@ -26,8 +26,8 @@
 //! The trait gives:
 //!   - one entry point per arch for config parsing + weight load + state
 //!     init (the bring-up triple),
-//!   - a place to register arch-specific overrides for loop_guard /
-//!     sampler / prompt_frame / eos_filter without growing daemon's
+//!   - a place to register arch-specific overrides for sampler /
+//!     prompt_frame / eos_filter without growing daemon's
 //!     `match arch_id` ladder,
 //!   - a discoverable contract for adding a new arch ("implement this trait
 //!     and register your `arch_id`").

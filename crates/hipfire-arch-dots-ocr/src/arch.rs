@@ -24,8 +24,9 @@
 
 use crate::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
 use hipfire_arch_qwen2::qwen2::Qwen2State;
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{
+    Architecture, EosFilterOverrides, PromptFrameOverrides, SamplerOverrides,
+};
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
@@ -73,13 +74,6 @@ impl Architecture for DotsOcr {
     // and `eos_filter_overrides` MUST diverge from defaults — see §2.5
     // of the bring-up plan.
 
-    fn loop_guard_overrides(_cfg: &Self::Config) -> LoopGuardOverrides {
-        // Layout-JSON output has short repeats (category names, bracket
-        // patterns) but should not exceed the default n-gram threshold.
-        // Tighten only if phase-4 coherence runs trip the default.
-        LoopGuardOverrides::default()
-    }
-
     fn sampler_overrides(_cfg: &Self::Config) -> SamplerOverrides {
         // No arch-specific blocked tokens at bring-up.
         SamplerOverrides::default()
@@ -112,10 +106,7 @@ impl Architecture for DotsOcr {
         // `strip_think = Some(false)` — dots.ocr is an OCR model, not
         // thinking-mode; it does not emit <think> blocks.
         EosFilterOverrides {
-            stop_at: vec![
-                b"<|endofassistant|>".to_vec(),
-                b"<|endoftext|>".to_vec(),
-            ],
+            stop_at: vec![b"<|endofassistant|>".to_vec(), b"<|endoftext|>".to_vec()],
             holdback_prefixes: vec![b"<|end".to_vec()],
             strip_think: Some(false),
         }

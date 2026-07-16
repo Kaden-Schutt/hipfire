@@ -14,8 +14,9 @@
 //! [`crate::qwen2::forward_step_greedy`] directly.
 
 use crate::qwen2::{Qwen2Config, Qwen2State, Qwen2Weights};
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{
+    Architecture, EosFilterOverrides, PromptFrameOverrides, SamplerOverrides,
+};
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
@@ -67,10 +68,6 @@ impl Architecture for Qwen2 {
     // `<|im_end|>`) and emits no `<think>` blocks. The qwen35 defaults
     // mostly fit; the one explicit override is to disable `<think>`
     // stripping since Qwen2-1.5B-Instruct doesn't emit thinking blocks.
-
-    fn loop_guard_overrides(_cfg: &Self::Config) -> LoopGuardOverrides {
-        LoopGuardOverrides::default()
-    }
 
     fn sampler_overrides(_cfg: &Self::Config) -> SamplerOverrides {
         SamplerOverrides::default()

@@ -39,7 +39,6 @@ pub mod kv_mode;
 pub mod llama;
 pub mod llama_spec;
 pub mod loader_api;
-pub mod loop_guard;
 pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;

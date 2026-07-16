@@ -10,8 +10,7 @@
 //! generation guards owned by the daemon: ChatML framing via
 //! `hipfire_runtime::prompt_frame::ChatFrame`, top-p sampling via
 //! `hipfire_runtime::sampler::sample`, output-stream filtering via
-//! `hipfire_runtime::eos_filter::EosFilter`, and the n-gram repetition detector
-//! via `hipfire_runtime::loop_guard::LoopGuard`. The default keeps today's bare
+//! `hipfire_runtime::eos_filter::EosFilter`. The default keeps today's bare
 //! semantics so kernel/loading sanity probes are unchanged byte-for-byte.
 
 use hipfire_arch_llama::Llama;
@@ -19,7 +18,6 @@ use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
-use hipfire_runtime::loop_guard::LoopGuard;
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::Write;
@@ -107,7 +105,7 @@ fn main() {
         eprintln!("Sampling: temp={temp}, top_p={top_p}");
     }
     if use_guards {
-        eprintln!("Guards: ON (prompt_frame + sampler + eos_filter + loop_guard)");
+        eprintln!("Guards: ON (prompt_frame + sampler + eos_filter)");
     }
 
     // Parse HFQ. PR 11: route bring-up triple through `Architecture` trait
@@ -386,11 +384,10 @@ fn main() {
     let t2 = Instant::now();
     let mut generated = Vec::new();
 
-    // EosFilter / LoopGuard / streamed-tokens state — only used when
+    // EosFilter / streamed-tokens state — only used when
     // --guards on, but constructed unconditionally to keep the loop
     // body simple. Construction is cheap (no allocations until use).
     let mut filter = EosFilter::new(EosFilterConfig::default());
-    let loop_guard = LoopGuard::from_config(hipfire_runtime::config::get());
     let mut bytes_fed_to_filter = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
 
@@ -419,20 +416,6 @@ fn main() {
 
         if next_token == config.eos_token || !RUNNING.load(Ordering::Relaxed) {
             break;
-        }
-
-        // N-gram loop detector (guards on only).
-        if use_guards {
-            if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-                loop_guard.check(&streamed_tokens)
-            {
-                let window_len = loop_guard.window_len(streamed_tokens.len());
-                eprintln!(
-                    "\n[guards] ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS",
-                    count, window_len
-                );
-                break;
-            }
         }
 
         token_history.push(next_token);

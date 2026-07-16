@@ -73,7 +73,7 @@ use rdna_compute::Gpu;
 ///
 /// # Optional: override hooks
 ///
-/// `loop_guard_overrides`, `sampler_overrides`, `prompt_frame_overrides`,
+/// `sampler_overrides`, `prompt_frame_overrides`, and
 /// `eos_filter_overrides`. Default impls match Qwen3.5 conventions.
 /// Override per-arch when the arch's prompt format / sampling
 /// requirements / end-of-turn markers diverge.
@@ -164,17 +164,6 @@ pub trait Architecture: Send + 'static {
     // the trait is intentionally minimal — just enough scaffolding for
     // a canary arch crate to implement and the runtime to type-check.
 
-    /// Override loop-guard config for this arch. Default is None on
-    /// every field, falling back to runtime/env defaults.
-    ///
-    /// Override when a base or instruct-tuned model legitimately
-    /// emits short repeating sequences (e.g. structured output, code
-    /// boilerplate) that the default n-gram threshold would falsely
-    /// flag. See `LoopGuardOverrides` for fields.
-    fn loop_guard_overrides(_cfg: &Self::Config) -> LoopGuardOverrides {
-        LoopGuardOverrides::default()
-    }
-
     /// Override sampler config for this arch. Default is empty on
     /// `blocked_tokens`, None on `repeat_penalty`.
     ///
@@ -202,23 +191,6 @@ pub trait Architecture: Send + 'static {
     fn eos_filter_overrides(_cfg: &Self::Config) -> EosFilterOverrides {
         EosFilterOverrides::default()
     }
-}
-
-/// Per-arch overrides for the loop-guard n-gram blocker.
-///
-/// The runtime's loop guard (`hipfire_runtime::loop_guard`) detects
-/// repeated n-grams in the recent decode window and blocks the
-/// repeating token before sampler draws it. Defaults come from env
-/// (`HIPFIRE_NGRAM_THRESHOLD`, `HIPFIRE_NGRAM_WINDOW`); per-arch
-/// overrides take precedence.
-#[derive(Debug, Clone, Default)]
-pub struct LoopGuardOverrides {
-    /// If `Some`, replace the env-derived n-gram threshold (count of
-    /// repeats before block fires). Lower = more aggressive blocking.
-    pub ngram_threshold: Option<usize>,
-    /// If `Some`, replace the env-derived window length (recent-token
-    /// span the n-gram detector scans).
-    pub ngram_window: Option<usize>,
 }
 
 /// Per-arch overrides for the sampler.

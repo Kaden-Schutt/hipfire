@@ -60,7 +60,6 @@ declare -A PATH_MAP=(
     ["crates/engine/src/image.rs"]="crates/hipfire-arch-qwen35-vl/src/image.rs"
     ["crates/engine/src/speculative.rs"]="crates/hipfire-arch-qwen35/src/speculative.rs"
     ["crates/engine/src/pflash.rs"]="crates/hipfire-arch-qwen35/src/pflash.rs"
-    ["crates/engine/src/loop_guard.rs"]="crates/hipfire-runtime/src/loop_guard.rs"
     ["crates/engine/src/sampler.rs"]="crates/hipfire-runtime/src/sampler.rs"
     ["crates/engine/src/prompt_frame.rs"]="crates/hipfire-runtime/src/prompt_frame.rs"
     ["crates/engine/src/eos_filter.rs"]="crates/hipfire-runtime/src/eos_filter.rs"

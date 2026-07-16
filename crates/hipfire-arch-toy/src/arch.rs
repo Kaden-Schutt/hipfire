@@ -14,8 +14,9 @@
 //! `crates/hipfire-arch-qwen35/src/arch.rs`.
 
 use crate::toy_model::{ToyConfig, ToyState, ToyWeights};
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{
+    Architecture, EosFilterOverrides, PromptFrameOverrides, SamplerOverrides,
+};
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
@@ -78,17 +79,10 @@ impl Architecture for Toy {
     //
     // The trait's defaults assume Qwen3.5 family conventions (ChatML
     // framing with `<|im_start|>` / `<|im_end|>` markers, `<think>`
-    // suppression, default n-gram thresholds, default sampler config).
-    // Override only what diverges for your arch. The four override
+    // suppression and default sampler config).
+    // Override only what diverges for your arch. The three override
     // structs are short enough to inline here as documentation;
     // see `hipfire_runtime::arch` for full field-level docs.
-
-    /// Loop-guard overrides: tighten or loosen n-gram block thresholds.
-    /// Example for a base model that legitimately repeats short phrases:
-    /// `LoopGuardOverrides { ngram_threshold: Some(8), ngram_window: Some(256) }`.
-    fn loop_guard_overrides(_cfg: &Self::Config) -> LoopGuardOverrides {
-        LoopGuardOverrides::default()
-    }
 
     /// Sampler overrides: per-arch blocked tokens and repeat-penalty.
     /// Example for an arch that uses a custom `<tool_call>` opener at

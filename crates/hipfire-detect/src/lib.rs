@@ -31,9 +31,8 @@ pub mod timing;
 pub mod toolcall;
 pub mod whitespace_only;
 
-/// Re-exported `loop_guard` constants. Keep the observational
-/// `loop_guard_mirror` detector in lock-step with the runtime guard's
-/// thresholds without depending on `hipfire-runtime`.
+/// Historical `loop_guard` constants retained for the passive
+/// `loop_guard_mirror` diagnostic. Runtime generation does not use them.
 pub mod loop_guard_constants {
     pub const DEFAULT_NGRAM_THRESHOLD: usize = 8;
     pub const DEFAULT_NGRAM_WINDOW: usize = 256;
