@@ -297,6 +297,7 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
             | "gated_norm_f32"
             | "gated_norm_mq_rotate_gfx1100"
             | "gated_norm_mq_rotate_gfx1151"
+            | "gemv_hfq4g256_residual_rt_low_gfx1151"
             | "moe_router_softmax_topk_k8_wave64_exact"
             | "moe_topk_renorm_k8"
             | "mq_rotate_x"
@@ -574,6 +575,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_residual_k2048"
         | "gemv_hfq4g256_residual_k4096_gfx1151"
         | "gemv_hfq4g256_residual_multirow_r2_gfx1151"
+        | "gemv_hfq4g256_residual_rt_low_gfx1151"
         | "gemv_hfq4g256_residual_wave64"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
@@ -732,6 +734,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_residual_k2048"
         | "gemv_hfq4g256_residual_k4096_gfx1151"
         | "gemv_hfq4g256_residual_multirow_r2_gfx1151"
+        | "gemv_hfq4g256_residual_rt_low_gfx1151"
         | "gemv_hfq4g256_residual_wave64"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
@@ -2910,6 +2913,7 @@ mod tests {
         "gemv_hfq4g256_residual_cpol_rt_low",
         "gemv_hfq4g256_residual_cpol_slc",
         "gemv_hfq4g256_residual_k2048",
+        "gemv_hfq4g256_residual_rt_low_gfx1151",
         "gemv_hfq4g256",
         "gemv_hfq4g256_k2048",
         "gemv_hfq4g256_wide",
@@ -2977,6 +2981,9 @@ mod tests {
         assert!(radiowave_vmem_only_consumer("mq_rotate_x"));
         assert!(!radiowave_vmem_only_consumer(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        ));
+        assert!(radiowave_vmem_only_consumer(
+            "gemv_hfq4g256_residual_rt_low_gfx1151"
         ));
         assert!(!radiowave_vmem_only_consumer("fused_qkvza_hfq4g256"));
         assert!(!radiowave_vmem_only_consumer("unknown_kernel"));
@@ -3049,6 +3056,13 @@ mod tests {
             pointer_effects(residual_k4096).map(|effects| effects.len()),
             Some(3)
         );
+        let residual_rt_low = "gemv_hfq4g256_residual_rt_low_gfx1151";
+        assert_eq!(expected_kernarg_bytes(residual_rt_low), Some(32));
+        assert_eq!(
+            pointer_effects(residual_rt_low).map(|effects| effects.len()),
+            Some(3)
+        );
+        assert!(radiowave_vmem_only_consumer(residual_rt_low));
         let down =
             "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(down), Some(48));
