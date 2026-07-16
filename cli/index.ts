@@ -2210,7 +2210,7 @@ class Engine {
   /// the daemon's stdout before sending the next command.
   /// If drain times out, kills and restarts the daemon — a dangling recv()
   /// on a killed process resolves with "daemon closed" harmlessly.
-  async drain() {
+  async drain(): Promise<boolean> {
     let drained = false;
     try {
       // Use a single timeout for the entire drain operation
@@ -2241,7 +2241,7 @@ class Engine {
       if (err instanceof DaemonClosedError) {
         console.error(`[hipfire] daemon closed during drain (code ${err.code}) — restarting daemon`);
         await this.restart();
-        return;
+        return true;
       }
       /* daemon closed — already clean */ drained = true;
     }
@@ -2254,7 +2254,9 @@ class Engine {
       // one's flock during teardown.
       console.error("[hipfire] drain timed out — restarting daemon");
       await this.restart();
+      return true;
     }
+    return false;
   }
 
   generating = false;
@@ -2929,7 +2931,23 @@ async function serve(port: number, host: string) {
           if (warmErr instanceof DaemonClosedError) throw warmErr; // daemon died → outer restart
           warmedOk = false;
           console.error(`[hipfire] warm-up generate hiccup: ${warmErr?.message} — model is loaded; serving anyway (kernels JIT on first request)`);
-          try { await e.drain(); } catch {} // resync the stdout stream if a stray line desynced it
+          // A successfully-drained warm-up still mutated the model's KV/cache
+          // state. Cache-capable arches deliberately skip the per-request
+          // reset below, so serving immediately would leak the discarded
+          // "Hi" warm-up into the first user's request. Reset explicitly and
+          // require its acknowledgement before declaring the resident model
+          // usable. If drain had to restart the daemon, the model is no longer
+          // resident; fall through to the outer clean-restart path instead of
+          // recording a stale `current = warmPath`.
+          const daemonRestarted = await e.drain();
+          if (daemonRestarted) {
+            throw new Error("daemon restarted while recovering warm-up stream");
+          }
+          await e.send({ type: "reset" });
+          const resetResult = await e.recv();
+          if (resetResult.type === "error") {
+            throw new Error(`warm-up recovery reset failed: ${resetResult.message ?? "daemon error"}`);
+          }
         }
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
