@@ -283,15 +283,26 @@ def test_trusted_publisher_policy_shape():
 
     assert policy["schema"] == "hipfire.agentic-review.trusted-publishers"
     assert policy["version"] == 1
-    assert policy["users"] == []
+    assert set(policy) == {"schema", "version", "apps"}
     assert policy["apps"] == []
 
 
-def test_trusted_publishers_accepts_structured_app_and_explicit_user():
+def test_trusted_publishers_rejects_static_users_key():
     policy = {
         "schema": "hipfire.agentic-review.trusted-publishers",
         "version": 1,
         "users": ["Kaden-Schutt"],
+        "apps": [],
+    }
+
+    with pytest.raises(ValueError, match="unexpected|users"):
+        validate_trusted_publishers_policy(policy)
+
+
+def test_trusted_publishers_accepts_structured_app():
+    policy = {
+        "schema": "hipfire.agentic-review.trusted-publishers",
+        "version": 1,
         "apps": [
             {
                 "app_id": 123,
@@ -321,7 +332,6 @@ def test_trusted_publishers_rejects_incomplete_app(missing):
     policy = {
         "schema": "hipfire.agentic-review.trusted-publishers",
         "version": 1,
-        "users": [],
         "apps": [app],
     }
 
@@ -333,7 +343,6 @@ def test_trusted_publishers_rejects_generic_app_entry():
     policy = {
         "schema": "hipfire.agentic-review.trusted-publishers",
         "version": 1,
-        "users": [],
         "apps": ["github-actions"],
     }
 

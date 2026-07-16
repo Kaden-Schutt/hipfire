@@ -44,7 +44,7 @@ _PROVIDER_KEYS = frozenset(
     }
 )
 _PROVIDER_ROOT_KEYS = frozenset({"schema", "version", "providers"})
-_TRUSTED_ROOT_KEYS = frozenset({"schema", "version", "users", "apps"})
+_TRUSTED_ROOT_KEYS = frozenset({"schema", "version", "apps"})
 _TRUSTED_APP_KEYS = frozenset(
     {"app_id", "login", "installation_id", "repository_id", "credential_attestation_digest"}
 )
@@ -260,16 +260,11 @@ class TrustedApp:
 
 @dataclass(frozen=True)
 class TrustedPublisher:
-    users: tuple[str, ...]
     apps: tuple[TrustedApp, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.users, tuple) or not isinstance(self.apps, tuple):
-            raise ValueError("users and apps must be tuples")
-        if any(not isinstance(user, str) or not user.strip() for user in self.users):
-            raise ValueError("users must contain non-empty strings")
-        if len(self.users) != len(set(self.users)):
-            raise ValueError("users must not contain duplicates")
+        if not isinstance(self.apps, tuple):
+            raise ValueError("apps must be a tuple")
         if any(not isinstance(app, TrustedApp) for app in self.apps):
             raise ValueError("apps must contain TrustedApp values")
 
@@ -387,9 +382,6 @@ def validate_trusted_publishers_policy(policy: Mapping[str, Any]) -> None:
     _require_exact_keys(policy, _TRUSTED_ROOT_KEYS, "trusted publisher policy")
     if policy["schema"] != "hipfire.agentic-review.trusted-publishers" or policy["version"] != 1:
         raise ValueError("invalid trusted publisher schema or version")
-    _require_string_list("users", policy["users"], nonempty=False)
-    if "github-actions" in policy["users"]:
-        raise ValueError("generic github-actions identity is not trusted")
     apps = policy["apps"]
     if not isinstance(apps, list):
         raise ValueError("apps must be a list")
