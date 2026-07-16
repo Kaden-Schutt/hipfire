@@ -2730,6 +2730,19 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+/// gfx1151 temporal-buffer candidate with pairwise load/consume scheduling.
+/// It retains two groups of VMEM overlap while avoiding the four-group
+/// artifact's higher VGPR band.
+pub const FUSED_QKVZA_HFQ4G256_K2048_PAIR_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_PAIR_BUFFER 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 /// Exact gfx1151 A3B candidate: expose the fixed K=2048 contract and hoist
 /// the complete 32-value activation quad before the weight/FMA stream. Keep
 /// ordinary global weight loads: temporal raw-buffer addressing was neutral
