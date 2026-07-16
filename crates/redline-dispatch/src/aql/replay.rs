@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use redline_rocr::abi;
 use redline_rocr::packet::{
-    BARRIER_DEPENDENCY_CAPACITY, BarrierAndPacket, KernelDispatchPacket, LaunchGeometry,
-    PacketError, PacketImage,
+    BarrierAndPacket, KernelDispatchPacket, LaunchGeometry, PacketError, PacketImage,
+    BARRIER_DEPENDENCY_CAPACITY,
 };
 use redline_rocr::{
-    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
-    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, QueueDepthReport, QueueSet,
-    RuntimeError,
+    CompletionSignal, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer, GpuDevice, HeaderPolicy,
+    KernargBuffer, KernargPool, Kernel, QueueDepthReport, QueueSet, RuntimeError,
+    DEFAULT_WAIT_TIMEOUT,
 };
 
 fn retained_queue_size(
@@ -466,6 +466,16 @@ impl PhasedMultiQueuePm4Ib {
         Self::create_profiled_native_legacy(device, pool, phases)
     }
 
+    /// GFX12 retains the same compute-ring memory semaphore packet protocol,
+    /// but uses the RDNA4 dispatch/register command builder for each phase.
+    pub fn create_profiled_native_gfx12(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        phases: &[Vec<Gfx12Pm4CommandBuffer>],
+    ) -> Result<Self, ReplayError> {
+        Self::create_profiled_native_gfx12_inner(device, pool, phases)
+    }
+
     fn create_profiled_legacy(
         device: &GpuDevice,
         pool: &KernargPool,
@@ -501,8 +511,9 @@ impl PhasedMultiQueuePm4Ib {
             .any(|commands| !commands.ends_with_compute_idle())
         {
             return Err(ReplayError::PolicyShapeMismatch {
-                detail: "native PM4 semaphore publication requires every phase lane to end compute-idle"
-                    .to_owned(),
+                detail:
+                    "native PM4 semaphore publication requires every phase lane to end compute-idle"
+                        .to_owned(),
             });
         }
         let queue_count = phases.iter().map(Vec::len).max().unwrap();
@@ -514,15 +525,19 @@ impl PhasedMultiQueuePm4Ib {
         let parallel_phase_count = phases.iter().filter(|phase| phase.len() > 1).count();
         if parallel_phase_count == 1 {
             return Err(ReplayError::PolicyShapeMismatch {
-                detail: "native PM4 retained epochs require either zero or at least two parallel phases"
-                    .to_owned(),
+                detail:
+                    "native PM4 retained epochs require either zero or at least two parallel phases"
+                        .to_owned(),
             });
         }
-        let semaphore_bytes = (queue_count - 1)
-            .checked_mul(8)
-            .ok_or_else(|| ReplayError::PolicyShapeMismatch {
-                detail: format!("native PM4 semaphore count for {queue_count} queues overflowed"),
-            })?;
+        let semaphore_bytes =
+            (queue_count - 1)
+                .checked_mul(8)
+                .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                    detail: format!(
+                        "native PM4 semaphore count for {queue_count} queues overflowed"
+                    ),
+                })?;
         let mut semaphores = pool.allocate_executable_bytes(semaphore_bytes)?;
         semaphores.as_mut_bytes().fill(0);
         let semaphore_base = semaphores.address() as usize as u64;
@@ -538,11 +553,12 @@ impl PhasedMultiQueuePm4Ib {
                 streams[0].append_stream(&phase[0]);
                 continue;
             }
-            parallel_epoch = parallel_epoch.checked_add(1).ok_or_else(|| {
-                ReplayError::PolicyShapeMismatch {
-                    detail: "native PM4 parallel phase count exceeds u32".to_owned(),
-                }
-            })?;
+            parallel_epoch =
+                parallel_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                        detail: "native PM4 parallel phase count exceeds u32".to_owned(),
+                    })?;
             for lane in 1..phase.len() {
                 let (start, _) = semaphore_addresses(lane);
                 streams[lane].wait_memory_value(start, parallel_epoch);
@@ -590,11 +606,144 @@ impl PhasedMultiQueuePm4Ib {
             let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
             indirect.write_exact(&bytes)?;
             let completion = CompletionSignal::new(device)?;
-            let packet = PacketImage::pm4_indirect_buffer(
-                indirect.address(),
-                dwords,
-                completion.raw(),
-            )?;
+            let packet =
+                PacketImage::pm4_indirect_buffer(indirect.address(), dwords, completion.raw())?;
+            timestamps.push(timestamp);
+            indirects.push(indirect);
+            completions.push(completion);
+            batches.push(vec![packet]);
+        }
+
+        let queue_size = retained_queue_size(
+            1,
+            *device.queue_size_range().start(),
+            *device.queue_size_range().end(),
+        )?;
+        let queues = QueueSet::create(device, queue_count, queue_size)?;
+        Ok(Self {
+            queues,
+            phase_completions: vec![completions],
+            logical_phase_count: phases.len(),
+            indirects,
+            batches,
+            timestamps: Some(timestamps),
+            _native_semaphores: Some(semaphores),
+            timestamp_frequency_hz: Some(frequency_hz),
+            usable: true,
+        })
+    }
+
+    fn create_profiled_native_gfx12_inner(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        phases: &[Vec<Gfx12Pm4CommandBuffer>],
+    ) -> Result<Self, ReplayError> {
+        if phases.is_empty() || phases.iter().any(Vec::is_empty) {
+            return Err(ReplayError::EmptyGraph);
+        }
+        if phases
+            .iter()
+            .flatten()
+            .any(|commands| !commands.ends_with_compute_idle())
+        {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail:
+                    "native PM4 semaphore publication requires every phase lane to end compute-idle"
+                        .to_owned(),
+            });
+        }
+        let queue_count = phases.iter().map(Vec::len).max().unwrap();
+        if queue_count < 2 {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: "native PM4 phase synchronization requires at least two queues".to_owned(),
+            });
+        }
+        let parallel_phase_count = phases.iter().filter(|phase| phase.len() > 1).count();
+        if parallel_phase_count == 1 {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail:
+                    "native PM4 retained epochs require either zero or at least two parallel phases"
+                        .to_owned(),
+            });
+        }
+        let semaphore_bytes =
+            (queue_count - 1)
+                .checked_mul(8)
+                .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                    detail: format!(
+                        "native PM4 semaphore count for {queue_count} queues overflowed"
+                    ),
+                })?;
+        let mut semaphores = pool.allocate_executable_bytes(semaphore_bytes)?;
+        semaphores.as_mut_bytes().fill(0);
+        let semaphore_base = semaphores.address() as usize as u64;
+        let semaphore_addresses = |lane: usize| {
+            let start = semaphore_base + ((lane - 1) * 8) as u64;
+            (start, start + 4)
+        };
+
+        let mut streams = vec![Gfx12Pm4CommandBuffer::new(); queue_count];
+        let mut parallel_epoch = 0_u32;
+        for phase in phases {
+            if phase.len() == 1 {
+                streams[0].append_stream(&phase[0]);
+                continue;
+            }
+            parallel_epoch =
+                parallel_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                        detail: "native PM4 parallel phase count exceeds u32".to_owned(),
+                    })?;
+            for lane in 1..phase.len() {
+                let (start, _) = semaphore_addresses(lane);
+                streams[lane].wait_memory_value(start, parallel_epoch);
+            }
+            for lane in 1..phase.len() {
+                let (start, _) = semaphore_addresses(lane);
+                if streams[0].ends_with_compute_idle() {
+                    streams[0].write_memory_value_after_idle(start, parallel_epoch);
+                } else {
+                    streams[0].release_memory_value(start, parallel_epoch);
+                }
+            }
+            streams[0].append_stream(&phase[0]);
+            for lane in 1..phase.len() {
+                let (_, done) = semaphore_addresses(lane);
+                streams[lane].append_stream(&phase[lane]);
+                streams[lane].write_memory_value_after_idle(done, parallel_epoch);
+            }
+            for lane in 1..phase.len() {
+                let (_, done) = semaphore_addresses(lane);
+                streams[0].wait_memory_value(done, parallel_epoch);
+            }
+        }
+        if parallel_epoch == 0 {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: "native PM4 phase synchronization found no parallel phase".to_owned(),
+            });
+        }
+
+        let frequency_hz = device.gpu_timestamp_frequency_hz()?;
+        let mut completions = Vec::with_capacity(queue_count);
+        let mut indirects = Vec::with_capacity(queue_count);
+        let mut batches = Vec::with_capacity(queue_count);
+        let mut timestamps = Vec::with_capacity(queue_count);
+        for commands in streams {
+            let mut timestamp = pool.allocate_executable_bytes(16)?;
+            timestamp.as_mut_bytes().fill(0);
+            let start = timestamp.address() as usize as u64;
+            let timed = commands.with_gpu_timestamps(start, start + 8);
+            let bytes = timed.as_bytes();
+            let dwords = timed.len_dwords();
+            if dwords == 0 {
+                return Err(ReplayError::EmptyGraph);
+            }
+            let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
+            indirect.write_exact(&bytes)?;
+            let completion = CompletionSignal::new(device)?;
+            let packet =
+                PacketImage::pm4_indirect_buffer(indirect.address(), dwords, completion.raw())?;
             timestamps.push(timestamp);
             indirects.push(indirect);
             completions.push(completion);

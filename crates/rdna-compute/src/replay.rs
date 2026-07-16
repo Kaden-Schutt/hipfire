@@ -111,11 +111,6 @@ fn create_phased_pm4_graph(
             }
         }
         Pm4Architecture::Gfx12 => {
-            if native_sync {
-                return Err(
-                    "native PM4 phase synchronization is not yet lowered for gfx12".to_owned(),
-                );
-            }
             let gfx12 = phases
                 .iter()
                 .map(|phase| {
@@ -130,7 +125,11 @@ fn create_phased_pm4_graph(
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            PhasedMultiQueuePm4Ib::create_profiled(device, pool, &gfx12)
+            if native_sync {
+                PhasedMultiQueuePm4Ib::create_profiled_native_gfx12(device, pool, &gfx12)
+            } else {
+                PhasedMultiQueuePm4Ib::create_profiled(device, pool, &gfx12)
+            }
         }
     }
     .map_err(|error| error.to_string())
@@ -458,9 +457,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
-        "gated_norm_mq_rotate_gfx1100" => {
-            Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)])
-        }
+        "gated_norm_mq_rotate_gfx1100" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
         "qwen35_fa_prep_gfx1100" => Some(vec![
             read(0),
             write(8),
@@ -470,9 +474,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        "kv_cache_write_q8_0_pair" => {
-            Some(vec![write(0), write(8), read(16), read(24), read(32)])
-        }
+        "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
         | "gemv_hfq4g256_k2048"
@@ -552,9 +554,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(48),
         ]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
-        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100" => {
-            Some(vec![read(0), write(8), read(16), read(24), read(32), read(48)])
-        }
+        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100" => Some(vec![
+            read(0),
+            write(8),
+            read(16),
+            read(24),
+            read(32),
+            read(48),
+        ]),
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
         _ => None,
     }
@@ -634,8 +641,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rotate_with_rms_gfx1100" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
-        "fused_qkv_hfq4g256"
-        | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
+        "fused_qkv_hfq4g256" | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => {
+            Some(80)
+        }
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_k2048"
@@ -818,10 +826,9 @@ fn pm4_phase_plan(
     for indices in antichains {
         let workgroups = indices.iter().fold(0_u64, |total, index| {
             let launch = &recorded[*index];
-            let launch_workgroups = launch
-                .grid
-                .iter()
-                .fold(1_u64, |product, axis| product.saturating_mul(u64::from(*axis)));
+            let launch_workgroups = launch.grid.iter().fold(1_u64, |product, axis| {
+                product.saturating_mul(u64::from(*axis))
+            });
             total.saturating_add(launch_workgroups)
         });
         let parallel = indices.len() >= min_parallel_width
@@ -1236,11 +1243,7 @@ pub struct RecordedHipLaunch {
 /// The recorded grid remains the hard maximum; replay may only narrow it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayGridBinding {
-    PositionCeilDiv {
-        axis: u8,
-        addend: u32,
-        divisor: u32,
-    },
+    PositionCeilDiv { axis: u8, addend: u32, divisor: u32 },
 }
 
 impl ReplayGridBinding {
@@ -1261,8 +1264,8 @@ impl ReplayGridBinding {
             .checked_add(u64::from(addend))
             .ok_or_else(|| "dynamic replay extent overflow".to_owned())?;
         let units = extent.div_ceil(u64::from(divisor)).max(1);
-        let units = u32::try_from(units)
-            .map_err(|_| format!("dynamic replay grid {units} exceeds u32"))?;
+        let units =
+            u32::try_from(units).map_err(|_| format!("dynamic replay grid {units} exceeds u32"))?;
         let mut bound = recorded;
         bound[axis] = units.min(recorded[axis]);
         Ok(bound)
@@ -1367,9 +1370,9 @@ impl PreparedPm4Graph {
             Self::Single(graph) => graph
                 .patch_dispatch_workgroups(dispatch, workgroups)
                 .map_err(|error| error.to_string()),
-            Self::Phased(_) => Err(
-                "dynamic PM4 geometry requires the certified single-queue replay".to_owned(),
-            ),
+            Self::Phased(_) => {
+                Err("dynamic PM4 geometry requires the certified single-queue replay".to_owned())
+            }
         }
     }
 }
@@ -1800,10 +1803,7 @@ impl ReplayController {
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
                     ));
                 }
-                dynamic_gdn_frames.push((
-                    dispatches.len(),
-                    captured_gdn_frame_count(launch)?,
-                ));
+                dynamic_gdn_frames.push((dispatches.len(), captured_gdn_frame_count(launch)?));
             }
             dispatches.push(dispatch);
         }
@@ -1959,10 +1959,7 @@ impl ReplayController {
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
                     ));
                 }
-                dynamic_gdn_frames.push((
-                    kernargs.len(),
-                    captured_gdn_frame_count(launch)?,
-                ));
+                dynamic_gdn_frames.push((kernargs.len(), captured_gdn_frame_count(launch)?));
             }
             if let Some(binding) = launch.grid_binding {
                 dynamic_grids.push((kernargs.len(), binding, launch.grid));
@@ -2244,10 +2241,7 @@ impl ReplayController {
     ///
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
-    pub unsafe fn replay_pm4(
-        &mut self,
-        position: usize,
-    ) -> Result<GpuMultiQueueTiming, String> {
+    pub unsafe fn replay_pm4(&mut self, position: usize) -> Result<GpuMultiQueueTiming, String> {
         let prepared = self
             .prepared_pm4
             .as_mut()
@@ -2755,10 +2749,12 @@ mod tests {
             "fused_qk_l2_norm_scale_f32",
             "repeat_interleave_qk_f32_batched"
         ));
-        assert!(!Pm4MidAcquirePolicy::WithoutRepeatInterleave.acquire_between(
-            "fused_qk_l2_norm_scale_f32",
-            "repeat_interleave_qk_f32_batched"
-        ));
+        assert!(
+            !Pm4MidAcquirePolicy::WithoutRepeatInterleave.acquire_between(
+                "fused_qk_l2_norm_scale_f32",
+                "repeat_interleave_qk_f32_batched"
+            )
+        );
         assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
     }
 
@@ -2779,9 +2775,7 @@ mod tests {
         );
         assert!(pointer_effects("conv1d_silu_split_qknorm_b256").is_some());
         assert_eq!(
-            expected_kernarg_bytes(
-                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
-            ),
+            expected_kernarg_bytes("moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"),
             Some(80)
         );
         assert_eq!(
@@ -2888,14 +2882,8 @@ mod tests {
         };
         assert_eq!(binding.bind(0, [16, 16, 1]).unwrap(), [16, 1, 1]);
         assert_eq!(binding.bind(128, [16, 16, 1]).unwrap(), [16, 2, 1]);
-        assert_eq!(
-            binding.bind(2047, [16, 16, 1]).unwrap(),
-            [16, 16, 1]
-        );
-        assert_eq!(
-            binding.bind(4095, [16, 16, 1]).unwrap(),
-            [16, 16, 1]
-        );
+        assert_eq!(binding.bind(2047, [16, 16, 1]).unwrap(), [16, 16, 1]);
+        assert_eq!(binding.bind(4095, [16, 16, 1]).unwrap(), [16, 16, 1]);
     }
 
     #[test]
@@ -3032,12 +3020,7 @@ mod tests {
             }]),
         };
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                2,
-                0,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 0, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: true,
@@ -3065,24 +3048,14 @@ mod tests {
             }]
         );
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                3,
-                0,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 3, 0, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
             }]
         );
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                2,
-                3,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 3, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
