@@ -354,11 +354,48 @@ def test_review_contracts_bind_required_identity_and_target_fields():
     intent = AttemptIntent(TARGET, "attempt-1", "principal", "intent-node-1", "capability", "suite-v1")
     assert intent.target == TARGET
 
-    finding = Finding("src/main.py", (1, 2), "error", "broken")
+    finding = Finding("src/main.py", (1, 2), "warning", "nonblocking")
     proposal = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))
     assert proposal.findings == (finding,)
     request = ValidationRequest(TARGET, "request-1", "capability", "sha256:" + "a" * 64, "sha256:" + "b" * 64)
     assert request.target == TARGET
+
+
+@pytest.mark.parametrize("severity", ["critical", "blocker", "unknown"])
+def test_finding_rejects_arbitrary_severity(severity):
+    with pytest.raises(ValueError, match="severity"):
+        Finding("src/main.py", (1, 2), severity, "message")
+
+
+@pytest.mark.parametrize("source_range", [(2, 1), (0, 1), (-1, 1), (1, 0)])
+def test_finding_rejects_invalid_source_range(source_range):
+    with pytest.raises(ValueError, match="range"):
+        Finding("src/main.py", source_range, "error", "message")
+
+
+def test_clean_proposal_rejects_actionable_finding():
+    finding = Finding("src/main.py", (1, 2), "error", "must fix")
+
+    with pytest.raises(ValueError, match="clean|actionable"):
+        ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))
+
+
+def test_changes_requested_requires_actionable_finding():
+    finding = Finding("src/main.py", (1, 2), "warning", "consider this")
+
+    with pytest.raises(ValueError, match="actionable"):
+        ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "changes-requested", (finding,))
+
+
+def test_changes_requested_accepts_error_finding_and_incomplete_is_explicit():
+    finding = Finding("src/main.py", (1, 2), "error", "must fix")
+    proposal = ReviewProposal(
+        TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "changes-requested", (finding,)
+    )
+    incomplete = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "incomplete", ())
+
+    assert proposal.verdict == "changes-requested"
+    assert incomplete.verdict == "incomplete"
 
 
 @pytest.mark.parametrize("verdict", ["approved", "reject", "unknown"])

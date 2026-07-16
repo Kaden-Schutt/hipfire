@@ -14,6 +14,9 @@ from urllib.parse import urlparse
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _VERDICTS = frozenset({"clean", "changes-requested", "incomplete"})
+ACTIONABLE_SEVERITIES = frozenset({"error"})
+NONBLOCKING_SEVERITIES = frozenset({"warning", "info"})
+FINDING_SEVERITIES = ACTIONABLE_SEVERITIES | NONBLOCKING_SEVERITIES
 _CAPABILITY_KEYS = frozenset(
     {
         "id",
@@ -149,9 +152,12 @@ class Finding:
             not isinstance(self.range, tuple)
             or len(self.range) != 2
             or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in self.range)
+            or self.range[0] > self.range[1]
         ):
             raise ValueError("range must be a tuple of two positive integers")
         _require_text("severity", self.severity)
+        if self.severity not in FINDING_SEVERITIES:
+            raise ValueError("severity is not supported")
         _require_text("message", self.message)
 
 
@@ -172,6 +178,13 @@ class ReviewProposal:
             raise ValueError("verdict is not supported")
         if not isinstance(self.findings, tuple) or any(not isinstance(finding, Finding) for finding in self.findings):
             raise ValueError("findings must be a tuple of Finding values")
+        has_actionable_finding = any(finding.severity in ACTIONABLE_SEVERITIES for finding in self.findings)
+        if self.verdict == "clean" and has_actionable_finding:
+            raise ValueError("clean proposals cannot contain actionable findings")
+        if self.verdict == "changes-requested" and not has_actionable_finding:
+            raise ValueError("changes-requested proposals require an actionable finding")
+        if self.verdict == "incomplete":
+            return
 
 
 @dataclass(frozen=True)
