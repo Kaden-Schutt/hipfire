@@ -156,6 +156,7 @@ _MAX_PAGINATED_ITEMS = 4096
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_STDERR_BYTES = 1 << 20
 _MAX_REQUEST_BYTES = 1 << 20
+_MAX_TREE_ENTRIES = 65536
 _PAGE_SIZE = 100
 _PROBE_PAGE_SIZE = 1
 _PROTOCOL_RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
@@ -191,6 +192,7 @@ _ENDPOINTS = (
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
     ("DELETE", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels/[^/]+$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/collaborators/[^/]+/permission$"), False),
+    ("GET", re.compile(rf"/repos/{_REPO}/git/commits/{_SHA}$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/trees/{_SHA}$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/blobs/{_SHA}$"), False),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/comments$"), False),
@@ -753,11 +755,29 @@ class GitHubClient:
         self._require(data, ("sha", "tree"), "tree")
         if data["sha"] != tree_sha or not isinstance(data["tree"], list):
             raise GitHubBoundaryError("GitHub tree sha or entries do not match request")
+        if len(data["tree"]) > _MAX_TREE_ENTRIES:
+            raise GitHubBoundaryError("GitHub tree exceeds the fixed entry bound")
+        if "truncated" in data and not isinstance(data["truncated"], bool):
+            raise GitHubBoundaryError("GitHub tree truncation marker is malformed")
         for entry in data["tree"]:
             item = self._require_mapping(entry, "tree entry")
             self._require(item, ("path", "mode", "type", "sha"), "tree entry")
             if any(not isinstance(item[field], str) or not item[field].strip() for field in ("path", "mode", "type", "sha")):
                 raise GitHubBoundaryError("GitHub tree entry is malformed")
+        return response
+
+    def get_commit(self, repository: str, commit_sha: str) -> GitHubResponse:
+        """Fetch the exact commit object needed to resolve its tree OID."""
+        repository = _repository(repository)
+        commit_sha = _identifier(commit_sha, "commit SHA")
+        response = self._request("GET", f"/repos/{repository}/git/commits/{commit_sha}")
+        data = self._require_mapping(response.data, "commit")
+        self._require(data, ("sha", "commit"), "commit")
+        commit = self._require_mapping(data["commit"], "commit details")
+        tree = self._require_mapping(commit.get("tree"), "commit tree")
+        self._require(tree, ("sha",), "commit tree")
+        if data["sha"] != commit_sha or not isinstance(tree["sha"], str) or not tree["sha"].strip():
+            raise GitHubBoundaryError("GitHub commit or tree identity does not match request")
         return response
 
     def get_blob(self, repository: str, blob_sha: str) -> GitHubResponse:
