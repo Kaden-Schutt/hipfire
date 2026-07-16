@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import subprocess
+import base64
 import sys
 import time
 
@@ -17,6 +18,7 @@ from autoresearch.ar.review.github import (
     preflight_read_only,
 )
 from autoresearch.ar.review.config import (
+    configuration_source_digest,
     load_operator_credential_manifest,
     load_review_configuration,
     validate_operator_credential_manifest,
@@ -428,6 +430,32 @@ def test_commit_tree_is_read_from_github_top_level_tree_field():
         GitHubClient(FakeRunner([nested])).get_commit(REPO, "commit-sha")
 
 
+def test_authenticated_config_source_binds_branch_commit_and_policy_blobs(tmp_path):
+    paths = (
+        ".github/agentic-review/providers.json",
+        ".github/agentic-review/capabilities-v1.json",
+        ".github/agentic-review/trusted-publishers.json",
+    )
+    contents = tuple((ROOT / path).read_bytes() for path in paths)
+    blob_ids = [f"{index + 1:040x}" for index in range(3)]
+    tree_entries = [
+        {"path": path, "mode": "100644", "type": "blob", "sha": oid}
+        for path, oid in zip(paths, blob_ids)
+    ]
+    responses = [
+        result({"id": 8, "full_name": REPO, "default_branch": "main"}),
+        result({"sha": "c" * 40, "tree": {"sha": "t" * 40}}),
+        result({"sha": "t" * 40, "tree": tree_entries, "truncated": False}),
+        *(result({"sha": oid, "encoding": "base64", "content": base64.b64encode(content).decode(), "size": len(content)})
+          for oid, content in zip(blob_ids, contents)),
+    ]
+    source = GitHubClient(FakeRunner(responses)).authenticated_config_source(
+        REPO, default_branch="main", commit_sha="c" * 40, repository_root=str(ROOT)
+    )
+    assert source.authenticated
+    assert source.config_digest == configuration_source_digest(*contents)
+
+
 def test_create_review_sends_exact_commit_id():
     runner = FakeRunner([result({"id": 17, "node_id": "PRR_17"})])
     GitHubClient(runner).create_pull_request_review(
@@ -508,7 +536,7 @@ def test_operator_manifest_declares_exact_repository_and_intended_write_permissi
 def test_config_loader_uses_task_one_validators():
     configuration = load_review_configuration(ROOT)
     assert configuration.capabilities["schema"] == "hipfire.agentic-review.capabilities"
-    assert configuration.providers["providers"] == []
+    assert configuration.providers["providers"] == ()
 
 
 def preflight_responses(*, scopes="read:user, repo:status", accepted=None, probe=True, tree_probe=False, principal_type="Bot"):

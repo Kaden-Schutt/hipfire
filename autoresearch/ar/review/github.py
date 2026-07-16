@@ -6,6 +6,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -17,7 +19,12 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 from .canonical import canonical_digest, canonical_loads, metadata_digest
-from .config import ReviewConfiguration, validate_operator_credential_manifest
+from .config import (
+    ReviewConfiguration,
+    AuthenticatedConfigSource,
+    configuration_source_digest,
+    validate_operator_credential_manifest,
+)
 from .models import GitHubEnvelope, IntentPayload, validate_trusted_publishers_policy
 
 
@@ -778,6 +785,52 @@ class GitHubClient:
         if data["sha"] != commit_sha or not isinstance(tree["sha"], str) or not tree["sha"].strip():
             raise GitHubBoundaryError("GitHub commit or tree identity does not match request")
         return response
+
+    def authenticated_config_source(
+        self, repository: str, *, default_branch: str, commit_sha: str, repository_root: str
+    ) -> AuthenticatedConfigSource:
+        """Authenticate the exact default-branch commit and its checked-in policies."""
+        repository = _repository(repository)
+        default_branch = _identifier(default_branch, "default branch")
+        commit_sha = _identifier(commit_sha, "config commit SHA")
+        repository_data = self.get_repository(repository).data
+        if repository_data.get("default_branch") != default_branch:
+            raise GitHubBoundaryError("authenticated config source default branch does not match repository")
+        commit = self.get_commit(repository, commit_sha).data
+        tree = self._require_mapping(commit.get("tree"), "config commit tree")
+        tree_sha = _identifier(tree.get("sha"), "config tree SHA")
+        tree_data = self.get_tree(repository, tree_sha, recursive=True).data
+        entries = {
+            item["path"]: item
+            for item in tree_data["tree"]
+            if isinstance(item, Mapping) and item.get("path") in {
+                ".github/agentic-review/providers.json",
+                ".github/agentic-review/capabilities-v1.json",
+                ".github/agentic-review/trusted-publishers.json",
+            }
+        }
+        paths = (
+            ".github/agentic-review/providers.json",
+            ".github/agentic-review/capabilities-v1.json",
+            ".github/agentic-review/trusted-publishers.json",
+        )
+        contents = []
+        for path in paths:
+            entry = entries.get(path)
+            if not isinstance(entry, Mapping) or entry.get("type") != "blob" or not isinstance(entry.get("sha"), str):
+                raise GitHubBoundaryError("authenticated config source is missing a policy blob")
+            blob = self.get_blob(repository, entry["sha"]).data
+            try:
+                contents.append(base64.b64decode(blob["content"].encode("ascii"), validate=True))
+            except (KeyError, UnicodeEncodeError, binascii.Error) as exc:
+                raise GitHubBoundaryError("authenticated config source contains invalid blob encoding") from exc
+        return AuthenticatedConfigSource._from_authenticated_boundary(
+            repository,
+            default_branch,
+            commit_sha,
+            configuration_source_digest(*contents),
+            repository_root,
+        )
 
     def get_blob(self, repository: str, blob_sha: str) -> GitHubResponse:
         repository = _repository(repository)

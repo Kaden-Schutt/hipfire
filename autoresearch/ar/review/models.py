@@ -12,7 +12,7 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlparse
 
-from .canonical import canonical_digest, canonical_json
+from .canonical import DEFAULT_MAX_BYTES, canonical_digest, canonical_json
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _RAW_SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -77,7 +77,7 @@ def _require_exact_keys(value: Mapping[str, Any], expected: frozenset[str], name
 
 
 def _require_string_list(name: str, value: Any, *, nonempty: bool = True) -> None:
-    if not isinstance(value, list) or (nonempty and not value):
+    if not isinstance(value, (list, tuple)) or (nonempty and not value):
         raise ValueError(f"{name} must be a non-empty list")
     if any(not isinstance(item, str) or not item.strip() for item in value):
         raise ValueError(f"{name} must contain non-empty strings")
@@ -372,6 +372,8 @@ class ProviderPolicy:
             ("max_tokens", self.max_tokens),
         ):
             _require_positive_integer(name, value)
+        if self.max_capsule_bytes > DEFAULT_MAX_BYTES or self.max_response_bytes > DEFAULT_MAX_BYTES:
+            raise ValueError("provider capsule and response byte limits exceed canonical digest ceiling")
         if (
             isinstance(self.request_deadline_seconds, bool)
             or not isinstance(self.request_deadline_seconds, (int, float))
@@ -444,7 +446,7 @@ def validate_capability_policy(policy: Mapping[str, Any]) -> None:
     if policy["schema"] != "hipfire.agentic-review.capabilities" or policy["version"] != 1:
         raise ValueError("invalid capability policy schema or version")
     capabilities = policy["capabilities"]
-    if not isinstance(capabilities, list) or not capabilities:
+    if not isinstance(capabilities, (list, tuple)) or not capabilities:
         raise ValueError("capability policy must contain capabilities")
     expected_ids = {
         "hipfire/rdna3-smoke@1",
@@ -484,7 +486,7 @@ def validate_provider_policy(policy: Mapping[str, Any]) -> None:
     if policy["schema"] != "hipfire.agentic-review.providers" or policy["version"] != 1:
         raise ValueError("invalid provider policy schema or version")
     providers = policy["providers"]
-    if not isinstance(providers, list):
+    if not isinstance(providers, (list, tuple)):
         raise ValueError("providers must be a list")
     ids: list[str] = []
     for provider in providers:
@@ -528,7 +530,7 @@ def validate_trusted_publishers_policy(policy: Mapping[str, Any]) -> None:
     if policy["schema"] != "hipfire.agentic-review.trusted-publishers" or policy["version"] != 1:
         raise ValueError("invalid trusted publisher schema or version")
     apps = policy["apps"]
-    if not isinstance(apps, list):
+    if not isinstance(apps, (list, tuple)):
         raise ValueError("apps must be a list")
     for app in apps:
         if not isinstance(app, Mapping):

@@ -18,7 +18,12 @@ from autoresearch.ar.review.inference import (
     ToollessReviewAdapter,
     ToollessInferenceError,
 )
-from autoresearch.ar.review.config import ReviewConfiguration, load_review_configuration
+from autoresearch.ar.review.config import (
+    AuthenticatedConfigSource,
+    ReviewConfiguration,
+    configuration_source_digest,
+    load_review_configuration,
+)
 from autoresearch.ar.review.models import ReviewTarget
 
 
@@ -56,7 +61,13 @@ def protected_configuration(policy=None):
     (config_dir / "providers.json").write_text(json.dumps(policy or POLICY), encoding="utf-8")
     for name in ("capabilities-v1.json", "trusted-publishers.json"):
         shutil.copy(ROOT / ".github" / "agentic-review" / name, config_dir / name)
-    loaded = load_review_configuration(root)
+    source_digest = configuration_source_digest(
+        (config_dir / "providers.json").read_bytes(),
+        (config_dir / "capabilities-v1.json").read_bytes(),
+        (config_dir / "trusted-publishers.json").read_bytes(),
+    )
+    source = AuthenticatedConfigSource._from_authenticated_boundary("owner/repo", "main", "commit-sha", source_digest, root)
+    loaded = load_review_configuration(root, source=source)
     if policy is None:
         _CONFIGURATION = loaded
     return loaded
@@ -78,7 +89,7 @@ def capsule():
     return build_review_capsule(Client(), TARGET)
 
 
-class Transport:
+class Transport(BoundedHttpTransport):
     def __init__(self, response):
         self.response = response
         self.calls = []
@@ -137,10 +148,29 @@ def test_provider_selection_is_exact_and_empty_policy_fails_closed():
         ToollessReviewAdapter.from_configuration(protected_configuration(), "review-adapter-extra", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
 
 
+def test_protected_configuration_is_deep_immutable_and_root_forgery_is_rejected():
+    configuration = protected_configuration()
+    with pytest.raises((TypeError, AttributeError)):
+        configuration.providers["providers"].append({})
+    with pytest.raises(TypeError):
+        configuration.capabilities["capabilities"] = ()
+
+    forged_root = Path(tempfile.mkdtemp())
+    config_dir = forged_root / ".github" / "agentic-review"
+    config_dir.mkdir(parents=True)
+    (config_dir / "providers.json").write_text(json.dumps(POLICY), encoding="utf-8")
+    for name in ("capabilities-v1.json", "trusted-publishers.json"):
+        shutil.copy(ROOT / ".github" / "agentic-review" / name, config_dir / name)
+    forged = load_review_configuration(forged_root, source=configuration.source)
+    assert not forged.is_protected
+    with pytest.raises(ToollessInferenceError, match="protected"):
+        ToollessReviewAdapter.from_configuration(forged, "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
+
+
 def test_provider_requires_protected_configuration_and_injected_non_github_environment():
     with pytest.raises(ToollessInferenceError, match="protected|loaded"):
         ToollessReviewAdapter.from_configuration(ReviewConfiguration(POLICY, {}, {}), "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
-    with pytest.raises(ToollessInferenceError, match="GitHub"):
+    with pytest.raises(ToollessInferenceError, match="GitHub|exactly"):
         ToollessReviewAdapter.from_configuration(
             protected_configuration(), "review-adapter", Transport(valid_response()),
             {"REVIEW_API_KEY": "secret", "GITHUB_TOKEN": "must-not-forward"},
@@ -175,7 +205,7 @@ def test_transport_rejects_redirect_flag_and_enforces_response_limit_before_down
     with pytest.raises(ToollessInferenceError, match="redirect|status"):
         adapter(redirected).review(capsule())
 
-    class BoundedTransport:
+    class BoundedTransport(BoundedHttpTransport):
         def __init__(self):
             self.called = False
 
@@ -229,12 +259,33 @@ def test_owned_transport_disables_redirects_streams_and_bounds_reads():
         BoundedHttpTransport(Opener(streaming)).send(request)
 
 
-@pytest.mark.parametrize("token", ["ghp_x", "github_pat_x", "gho_x", "ghu_x", "ghs_x", "ghr_x"])
-def test_all_github_token_families_are_rejected(token):
+@pytest.mark.parametrize("environment_name", ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_API_TOKEN", "GH_ENTERPRISE_TOKEN"])
+def test_known_github_environment_names_are_rejected(environment_name):
+    policy = deepcopy(POLICY)
+    policy["providers"][0]["api_key_env"] = environment_name
     with pytest.raises(ToollessInferenceError, match="GitHub|credential"):
         ToollessReviewAdapter.from_configuration(
+            protected_configuration(policy), "review-adapter", Transport(valid_response()),
+            {environment_name: "secret"},
+        )
+
+
+def test_provider_environment_rejects_any_extra_secret_capability():
+    with pytest.raises(ToollessInferenceError, match="exactly|capability"):
+        ToollessReviewAdapter.from_configuration(
             protected_configuration(), "review-adapter", Transport(valid_response()),
-            {"REVIEW_API_KEY": token},
+            {"REVIEW_API_KEY": "secret", "CUSTOM_GITHUB_TOKEN": "must-not-forward"},
+        )
+
+
+def test_arbitrary_send_object_is_not_an_accepted_transport():
+    class FakeTransport:
+        def send(self, request):
+            return valid_response()
+
+    with pytest.raises(ToollessInferenceError, match="concrete|transport"):
+        ToollessReviewAdapter.from_configuration(
+            protected_configuration(), "review-adapter", FakeTransport(), {"REVIEW_API_KEY": "secret"}
         )
 
 

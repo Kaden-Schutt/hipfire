@@ -188,12 +188,12 @@ def _blob(
 ) -> tuple[str | None, int | None, list[str]]:
     reasons: list[str] = []
     try:
-        if _SHA1_OID.fullmatch(oid) is None:
-            reasons.append(f"{side} blob OID is unsupported (expected SHA-1): {path}")
-            return None, None, reasons
         data = _data(client.get_blob(repository, oid))
         if data.get("sha") != oid:
             reasons.append(f"{side} blob identity mismatch: {path}")
+            return None, None, reasons
+        if _SHA1_OID.fullmatch(oid) is None:
+            reasons.append(f"{side} blob OID is unsupported (expected SHA-1): {path}")
             return None, None, reasons
         declared = data.get("size")
         if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
@@ -269,21 +269,9 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
             ))
             files.append(ReviewFile(path, None, None))
             continue
-        if (base and base.get("mode") not in {"100644", "100755", "120000"}) or (
+        unsupported_mode = (base and base.get("mode") not in {"100644", "100755", "120000"}) or (
             head and head.get("mode") not in {"100644", "100755", "120000"}
-        ):
-            reasons.append(f"binary or opaque file mode: {path}")
-            manifest.append(ReviewManifestEntry(
-                path,
-                base.get("mode") if base else None,
-                head.get("mode") if head else None,
-                base.get("sha") if base else None,
-                head.get("sha") if head else None,
-                None,
-                None,
-            ))
-            files.append(ReviewFile(path, None, None))
-            continue
+        )
         base_source = head_source = None
         base_size = head_size = None
         if base is not None:
@@ -296,6 +284,8 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
                 client, target, target.head_repository, head["sha"], path, "head"
             )
             reasons.extend(blob_reasons)
+        if unsupported_mode:
+            reasons.append(f"binary or opaque file mode: {path}")
         for size in (base_size, head_size):
             if size is not None:
                 total_bytes += size

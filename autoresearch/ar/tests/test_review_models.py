@@ -281,6 +281,13 @@ def test_provider_policy_requires_fixed_fields_and_finite_bounds(field):
         validate_provider_policy(provider_policy(provider))
 
 
+def test_provider_digest_limits_do_not_exceed_model_canonical_ceiling():
+    provider = deepcopy(VALID_PROVIDER)
+    provider["max_response_bytes"] = (1 << 20) + 1
+    with pytest.raises(ValueError, match="canonical|response"):
+        validate_provider_policy(provider_policy(provider))
+
+
 @pytest.mark.parametrize("cost", [float("nan"), float("inf"), float("-inf")])
 def test_provider_policy_rejects_nonfinite_cost(cost):
     with pytest.raises(ValueError, match="max_cost_usd"):

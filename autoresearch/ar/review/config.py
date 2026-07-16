@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -27,6 +28,67 @@ _REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.
 _WRITE_PERMISSION_NAMES = {"issues", "pull_requests"}
 _WRITE_PERMISSION_LEVELS = {"write", "admin"}
 _OPERATOR_SCHEMA = "hipfire.agentic-review.operator-credentials"
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_SOURCE_PROOF = object()
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("configuration mapping keys must be strings")
+        from types import MappingProxyType
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        raise ValueError("configuration must not contain sets")
+    if value is not None and not isinstance(value, (bool, int, float, str)):
+        raise ValueError("configuration contains a mutable or unsupported value")
+    return value
+
+
+def _root_identity(root: str | Path) -> str:
+    return "sha256:" + hashlib.sha256(str(Path(root).resolve()).encode("utf-8")).hexdigest()
+
+
+def configuration_source_digest(*contents: bytes) -> str:
+    digest = hashlib.sha256()
+    for content in contents:
+        if not isinstance(content, bytes):
+            raise ValueError("configuration source contents must be bytes")
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return "sha256:" + digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class AuthenticatedConfigSource:
+    repository: str
+    default_branch: str
+    commit_sha: str
+    config_digest: str
+    root_identity: str
+    _proof: object = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(value, str) and value.strip() for value in (
+            self.repository, self.default_branch, self.commit_sha,
+        )):
+            raise ValueError("authenticated config source identity is incomplete")
+        if _DIGEST_RE.fullmatch(self.config_digest) is None or _DIGEST_RE.fullmatch(self.root_identity) is None:
+            raise ValueError("authenticated config source digests are invalid")
+
+    @classmethod
+    def _from_authenticated_boundary(
+        cls, repository: str, default_branch: str, commit_sha: str, config_digest: str, root: str | Path
+    ) -> "AuthenticatedConfigSource":
+        source = cls(repository, default_branch, commit_sha, config_digest, _root_identity(root))
+        object.__setattr__(source, "_proof", _SOURCE_PROOF)
+        return source
+
+    @property
+    def authenticated(self) -> bool:
+        return self._proof is _SOURCE_PROOF
 
 
 @dataclass(frozen=True)
@@ -34,15 +96,31 @@ class ReviewConfiguration:
     providers: Mapping[str, Any]
     capabilities: Mapping[str, Any]
     trusted_publishers: Mapping[str, Any]
+    source: AuthenticatedConfigSource | None = None
     _loaded_from_protected_paths: bool = field(default=False, init=False, repr=False)
+    _loaded_source_digest: str | None = field(default=None, init=False, repr=False)
+    _loaded_root_identity: str | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "providers", _freeze(self.providers))
+        object.__setattr__(self, "capabilities", _freeze(self.capabilities))
+        object.__setattr__(self, "trusted_publishers", _freeze(self.trusted_publishers))
+        if self.source is not None and not isinstance(self.source, AuthenticatedConfigSource):
+            raise ValueError("configuration source must be typed provenance")
 
     @property
     def is_protected(self) -> bool:
-        return self._loaded_from_protected_paths
+        return bool(
+            self._loaded_from_protected_paths
+            and self.source is not None
+            and self.source.authenticated
+            and self._loaded_source_digest == self.source.config_digest
+            and self._loaded_root_identity == self.source.root_identity
+        )
 
     def with_trusted_publishers(self, policy: Mapping[str, Any]) -> "ReviewConfiguration":
         validate_trusted_publishers_policy(policy)
-        return replace(self, trusted_publishers=dict(policy))
+        return replace(self, trusted_publishers=policy)
 
 
 def _safe_path(root: str | Path, override: str) -> Path:
@@ -67,6 +145,7 @@ def load_review_configuration(
     providers_path: str = _PROVIDERS,
     capabilities_path: str = _CAPABILITIES,
     trusted_publishers_path: str = _TRUSTED,
+    source: AuthenticatedConfigSource | None = None,
 ) -> ReviewConfiguration:
     """Load only the three checked-in policy files below ``repository_root``."""
     # The provider validator intentionally requires a selected provider.  Task
@@ -74,16 +153,29 @@ def load_review_configuration(
     provider_file = _safe_path(repository_root, providers_path)
     capability_file = _safe_path(repository_root, capabilities_path)
     trusted_file = _safe_path(repository_root, trusted_publishers_path)
-    with provider_file.open(encoding="utf-8") as stream:
-        provider_policy = json.load(stream)
+    provider_bytes = provider_file.read_bytes()
+    capabilities_bytes = capability_file.read_bytes()
+    trusted_bytes = trusted_file.read_bytes()
+    provider_policy = json.loads(provider_bytes)
     validate_provider_policy(provider_policy)
     configuration = ReviewConfiguration(
         providers=provider_policy,
         capabilities=load_capability_policy(capability_file),
         trusted_publishers=load_trusted_publishers_policy(trusted_file),
+        source=source,
     )
-    if providers_path == _PROVIDERS and capabilities_path == _CAPABILITIES and trusted_publishers_path == _TRUSTED:
+    if (
+        providers_path == _PROVIDERS
+        and capabilities_path == _CAPABILITIES
+        and trusted_publishers_path == _TRUSTED
+        and source is not None
+        and source.authenticated
+        and source.root_identity == _root_identity(repository_root)
+        and source.config_digest == configuration_source_digest(provider_bytes, capabilities_bytes, trusted_bytes)
+    ):
         object.__setattr__(configuration, "_loaded_from_protected_paths", True)
+        object.__setattr__(configuration, "_loaded_source_digest", source.config_digest)
+        object.__setattr__(configuration, "_loaded_root_identity", source.root_identity)
     return configuration
 
 

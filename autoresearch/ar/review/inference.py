@@ -108,7 +108,6 @@ _GITHUB_CREDENTIAL_ENV_NAMES = frozenset({
     "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_API_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_ENTERPRISE_TOKEN",
     "GITHUB_OAUTH_TOKEN",
 })
-_GITHUB_TOKEN_PREFIXES = ("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_")
 
 
 def _json_depth(value: Any, depth: int = 0) -> int:
@@ -132,7 +131,7 @@ def _provider(configuration: ReviewConfiguration, provider_id: str) -> ProviderP
     except (TypeError, ValueError) as exc:
         raise ToollessInferenceError(str(exc)) from exc
     providers = policy.get("providers")
-    if not isinstance(providers, list):
+    if not isinstance(providers, (list, tuple)):
         raise ToollessInferenceError("provider configuration is malformed")
     selected = [item for item in providers if isinstance(item, Mapping) and item.get("id") == provider_id]
     if len(selected) != 1:
@@ -168,20 +167,22 @@ class ToollessReviewAdapter:
         transport: HttpTransport,
         environment: Mapping[str, str],
     ):
-        if not isinstance(configuration, ReviewConfiguration) or not hasattr(transport, "send"):
+        if not isinstance(configuration, ReviewConfiguration) or not isinstance(transport, BoundedHttpTransport):
             raise ToollessInferenceError("protected review configuration and HTTP transport are required")
+        self._policy = _provider(configuration, provider_id)
         if not isinstance(environment, Mapping) or any(
             not isinstance(key, str) or not isinstance(value, str) for key, value in environment.items()
         ):
             raise ToollessInferenceError("injected provider environment is malformed")
-        if _GITHUB_CREDENTIAL_ENV_NAMES.intersection(environment):
-            raise ToollessInferenceError("GitHub credential environment variables are not provider credentials")
-        self._policy = _provider(configuration, provider_id)
+        if not environment:
+            raise ToollessInferenceError("configured provider API key is absent")
+        if set(environment) != {self._policy.api_key_env}:
+            raise ToollessInferenceError("provider environment must contain exactly the configured API-key capability")
         if self._policy.api_key_env in _GITHUB_CREDENTIAL_ENV_NAMES:
             raise ToollessInferenceError("provider api_key_env may not name a GitHub credential")
         credential = environment.get(self._policy.api_key_env)
-        if not credential or credential.startswith(_GITHUB_TOKEN_PREFIXES):
-            raise ToollessInferenceError("configured provider API key is absent or is a GitHub credential")
+        if not credential:
+            raise ToollessInferenceError("configured provider API key is absent")
         self._transport = transport
         self._credential = credential
         self._requests = 0

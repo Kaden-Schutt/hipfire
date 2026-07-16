@@ -233,6 +233,21 @@ def test_non_sha1_blob_oid_is_explicitly_incomplete():
     assert any("OID" in reason or "oid" in reason for reason in capsule.rejections)
 
 
+def test_unsupported_blob_mode_is_retrieved_before_incompleteness():
+    payload = b"opaque-mode\n"
+    oid = git_blob_oid(payload)
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
+            {"path": "mode.bin", "mode": "100640", "type": "blob", "sha": oid},
+        ])},
+        {oid: blob(oid, payload)},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert client.blob_calls == [("fork/repo", oid)]
+    assert any("mode" in reason for reason in capsule.rejections)
+
+
 def test_canonical_byte_limit_returns_rejected_capsule(monkeypatch):
     monkeypatch.setattr("autoresearch.ar.review.capsule.MAX_CANONICAL_BYTES", 2048)
     large_oid = git_blob_oid(b"x" * 5000)
