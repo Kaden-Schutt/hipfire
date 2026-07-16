@@ -3268,6 +3268,17 @@ pub const FUSED_QKV_HFQ4G256_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
 );
 
+/// gfx1151 fixed-K FullAttention projection. This only exposes the exact
+/// K=2048 shape to LLVM; unlike the buffer probes below, it intentionally
+/// retains the incumbent global-memory policy for weights and activations.
+pub const FUSED_QKV_HFQ4G256_K2048_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_QKV_K2048 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256_k2048_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+);
+
 /// gfx1151 fixed-K FullAttention projection with Radiowave temporal buffer
 /// lowering for weights and aligned activation vectors.
 pub const FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC: &str = concat!(

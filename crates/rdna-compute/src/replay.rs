@@ -645,7 +645,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             write(48),
         ]),
-        "fused_qkv_hfq4g256" => Some(vec![
+        "fused_qkv_hfq4g256" | "fused_qkv_hfq4g256_k2048_gfx1151" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -825,6 +825,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
+        | "fused_qkv_hfq4g256_k2048_gfx1151"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1151" => Some(80),
         "attention_flash_fwht3_tile"
@@ -3002,6 +3003,7 @@ mod tests {
         "moe_down_combine_rmsnorm_mq_rotate_vecsum",
         "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
         "fused_qkv_hfq4g256",
+        "fused_qkv_hfq4g256_k2048_gfx1151",
         "deinterleave_f32",
         "rmsnorm_f32",
         "rope_partial_halfsplit_f32",
@@ -3062,6 +3064,7 @@ mod tests {
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
         let qkvza_hybrid = "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151";
         let qkvza_r4 = "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151";
+        let qkv = "fused_qkv_hfq4g256_k2048_gfx1151";
         assert_eq!(expected_kernarg_bytes(gate), Some(48));
         assert_eq!(pointer_effects(gate).map(|effects| effects.len()), Some(5));
         assert_eq!(expected_kernarg_bytes(gate_hybrid), Some(48));
@@ -3093,6 +3096,18 @@ mod tests {
             Some(9)
         );
         assert!(!radiowave_vmem_only_consumer(qkvza_r4));
+        assert_eq!(expected_kernarg_bytes(qkv), Some(80));
+        let qkv_effects = pointer_effects(qkv).expect("fixed-K QKV replay contract");
+        assert_eq!(qkv_effects.len(), 7);
+        assert_eq!(qkv_effects[0].mode, RecordedAccessMode::Read);
+        assert_eq!(qkv_effects[0].offset, 0);
+        assert_eq!(qkv_effects[3].mode, RecordedAccessMode::Read);
+        assert_eq!(qkv_effects[3].offset, 24);
+        assert_eq!(qkv_effects[4].mode, RecordedAccessMode::Write);
+        assert_eq!(qkv_effects[4].offset, 32);
+        assert_eq!(qkv_effects[6].mode, RecordedAccessMode::Write);
+        assert_eq!(qkv_effects[6].offset, 48);
+        assert!(!radiowave_vmem_only_consumer(qkv));
         for producer in [
             "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
             "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
