@@ -2808,6 +2808,15 @@ pub const GEMV_HFQ4G256_MULTIROW_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
 );
+/// Exact gfx1151 LM-head shape specialization with the established global
+/// load path unchanged. This isolates compile-time K=2048 loop/tail/address
+/// simplification from the independently rejected buffer-load experiments.
+pub const GEMV_HFQ4G256_MULTIROW_K2048_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GFX1151_LM_HEAD_K2048 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
+);
 /// gfx1151 LM-head R2 candidate: retain the existing exact dual-row schedule
 /// and lower its dominant matrix stream through temporal raw-buffer VMEM.
 /// The selector constrains this artifact to M=248320, K=2048 on gfx1151.

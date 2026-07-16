@@ -4875,6 +4875,14 @@ impl Gpu {
         } else {
             None
         };
+        static GFX1151_LM_HEAD_K2048: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_k2048 = self.arch_caps.is_gfx1151()
+            && rows == 2
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_K2048.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_LM_HEAD_K2048").as_deref() == Ok("1")
+            });
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
@@ -4906,6 +4914,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_multirow_gfx1151_hybrid_dlc",
                     kernels::GEMV_HFQ4G256_MULTIROW_HYBRID_DLC_GFX1151_SRC,
+                )
+            } else if gfx1151_lm_head_k2048 {
+                (
+                    "gemv_hfq4g256_multirow_gfx1151_k2048",
+                    kernels::GEMV_HFQ4G256_MULTIROW_K2048_GFX1151_SRC,
                 )
             } else if gfx1151_lm_head_all_buffer {
                 (
