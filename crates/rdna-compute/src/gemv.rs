@@ -6634,8 +6634,16 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         use std::sync::OnceLock;
+        static GFX1151_GATE_UP_PERSISTENT_RANK8: OnceLock<bool> = OnceLock::new();
+        let gfx1151_persistent_rank8 = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && n_ranks == 8
+            && *GFX1151_GATE_UP_PERSISTENT_RANK8.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_GATE_UP_PERSISTENT_RANK8").as_deref() == Ok("1")
+            });
         static GFX1151_GATE_UP_PAIRED_WAVES: OnceLock<bool> = OnceLock::new();
-        let gfx1151_paired_waves = self.arch_caps.is_gfx1151()
+        let gfx1151_paired_waves = !gfx1151_persistent_rank8
+            && self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_GATE_UP_PAIRED_WAVES.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIRED_WAVES").as_deref() == Ok("1")
@@ -6646,7 +6654,7 @@ impl Gpu {
             && *GFX1151_GATE_UP_SPLIT.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_GATE_UP_SPLIT").as_deref() == Ok("1")
             });
-        if !gfx1151_paired_waves && gfx1151_split {
+        if !gfx1151_persistent_rank8 && !gfx1151_paired_waves && gfx1151_split {
             return self.gemv_hfq4g256_moe_gate_up_k8_indexed_split_gfx1151(
                 expert_ptrs,
                 topk_indices,
@@ -6659,7 +6667,8 @@ impl Gpu {
             );
         }
         static GFX1151_GATE_UP_WAVE64: OnceLock<bool> = OnceLock::new();
-        let gfx1151_wave64 = !gfx1151_paired_waves
+        let gfx1151_wave64 = !gfx1151_persistent_rank8
+            && !gfx1151_paired_waves
             && self.arch_caps.is_gfx1151()
             && *GFX1151_GATE_UP_WAVE64.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_GATE_UP_WAVE64").as_deref() == Ok("1")
@@ -6820,7 +6829,16 @@ impl Gpu {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER").as_deref()
                         == Ok("1")
                 });
-            if gfx1151_paired_waves {
+            if gfx1151_persistent_rank8 {
+                const PERSISTENT: &str =
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151";
+                self.ensure_kernel(
+                    PERSISTENT,
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_PERSISTENT_RANK8_GFX1151_SRC,
+                    PERSISTENT,
+                )?;
+                (PERSISTENT, [256u32, 1, 1], ((m as u32) >> 1).min(160))
+            } else if gfx1151_paired_waves {
                 const PAIRED: &str =
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151";
                 self.ensure_kernel(
@@ -7085,7 +7103,11 @@ impl Gpu {
             func_name,
             [
                 grid_x,
-                if func_name == "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave" {
+                if matches!(
+                    func_name,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
+                        | "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151"
+                ) {
                     1
                 } else {
                     n_ranks as u32

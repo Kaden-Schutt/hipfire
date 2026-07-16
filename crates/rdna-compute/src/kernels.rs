@@ -1538,6 +1538,16 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_PAIRED_WAVES_K2048_GFX1151_SRC: &str = conca
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_projection_indexed_gfx1151.hip")
 );
 
+/// gfx1151 persistent rank tile: eight waves share one LDS activation, retain
+/// one expert route each, and walk multiple rows with fused gate/up ownership.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_PERSISTENT_RANK8_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_persistent_rank8.gfx1151.hip")
+);
+
 /// gfx1151 occupancy probe: one-group-at-a-time activation/header live range,
 /// fixed K=2048, and ordinary global loads. Kept separate from gfx1100's
 /// admitted buffer/cache policy so one ISA cannot silently tune the other.

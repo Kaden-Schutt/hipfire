@@ -388,6 +388,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_vgpr_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64"
     ) {
@@ -696,6 +697,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_vgpr_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64"
     ) {
@@ -3038,6 +3040,8 @@ mod tests {
             "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
         let gate_up_paired =
             "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151";
+        let gate_up_persistent =
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151";
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
         let qkvza_hybrid = "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151";
         let qkvza_r4 = "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151";
@@ -3051,6 +3055,11 @@ mod tests {
         assert_eq!(expected_kernarg_bytes(gate_up_paired), Some(48));
         assert_eq!(
             pointer_effects(gate_up_paired).map(|effects| effects.len()),
+            Some(5)
+        );
+        assert_eq!(expected_kernarg_bytes(gate_up_persistent), Some(48));
+        assert_eq!(
+            pointer_effects(gate_up_persistent).map(|effects| effects.len()),
             Some(5)
         );
         assert_eq!(expected_kernarg_bytes(qkvza), Some(96));
