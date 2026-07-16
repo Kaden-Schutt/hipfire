@@ -2322,6 +2322,38 @@ impl ReplayController {
             .patch_kernel_u32(kernel, offset, values)
     }
 
+    pub fn patch_recorded_kernel_u32(
+        &mut self,
+        kernel: &str,
+        offset: usize,
+        values: &[u32],
+    ) -> Result<(), String> {
+        let dispatches = self
+            .recorded
+            .iter_mut()
+            .filter(|launch| launch.kernel == kernel)
+            .collect::<Vec<_>>();
+        if dispatches.len() != values.len() {
+            return Err(format!(
+                "recorded kernel {kernel:?} occurs {} times, patch supplied {} values",
+                dispatches.len(),
+                values.len()
+            ));
+        }
+        for (launch, value) in dispatches.into_iter().zip(values.iter().copied()) {
+            let end = offset
+                .checked_add(4)
+                .ok_or_else(|| "recorded kernarg patch offset overflow".to_owned())?;
+            let slot = launch.kernarg.get_mut(offset..end).ok_or_else(|| {
+                format!(
+                    "recorded {kernel:?} kernarg patch {offset}..{end} is out of bounds"
+                )
+            })?;
+            slot.copy_from_slice(&value.to_ne_bytes());
+        }
+        Ok(())
+    }
+
     /// Start one explicitly delimited prefill or decode capture. This clears
     /// only the prior launch sequence; validation observations and the backend
     /// request remain intact.

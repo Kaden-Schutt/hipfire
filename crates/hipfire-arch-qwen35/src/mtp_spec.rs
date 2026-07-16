@@ -144,6 +144,17 @@ fn mtp_redline_capture_only_from_env() -> bool {
         .unwrap_or(false)
 }
 
+fn mtp_redline_hip_replay_from_env() -> bool {
+    std::env::var("HIPFIRE_MTP_REDLINE_HIP_REPLAY")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[inline]
 fn mtp_gpu_rng_next(seed: u32) -> u32 {
     seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223)
@@ -1323,13 +1334,18 @@ fn try_run_mtp_sampled_proposal_redline(
     std::mem::swap(&mut gpu.replay, &mut state.mtp_proposal_replay);
     let result = (|| -> HipResult<bool> {
         if gpu.replay.should_route_pm4() || gpu.replay.should_route_aql() {
+            let hip_replay = mtp_redline_hip_replay_from_env();
             let mut seed = state.gpu_rng_state;
             let mut seeds = Vec::with_capacity(max_n);
             for _ in 0..max_n {
                 seeds.push(seed);
                 seed = mtp_gpu_rng_next(seed);
             }
-            if gpu.replay.should_route_pm4() {
+            if hip_replay {
+                gpu.replay
+                    .patch_recorded_kernel_u32("batched_categorical_sample_f32", 28, &seeds)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            } else if gpu.replay.should_route_pm4() {
                 gpu.replay
                     .patch_pm4_kernel_u32("batched_categorical_sample_f32", 28, &seeds)
                     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
@@ -1340,18 +1356,25 @@ fn try_run_mtp_sampled_proposal_redline(
             }
             // SAFETY: every captured weight, scratch, token, and position
             // allocation belongs to this live MtpSpecState at the same address.
-            unsafe {
-                if gpu.replay.should_route_pm4() {
-                    gpu.replay
-                        // Absolute MTP positions flow through mtp_positions. Keep
-                        // any generic position-bound launch geometry at the fixed
-                        // tier cap used during capture, matching hipGraph replay.
-                        .replay_pm4(seq_cap - 1)
-                        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
-                } else {
-                    gpu.replay
-                        .replay_linear_aql()
-                        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            if hip_replay {
+                gpu.replay_recorded_hip_prefix(gpu.replay.recorded_launches().len())?;
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.stream_synchronize(stream)?;
+                }
+            } else {
+                unsafe {
+                    if gpu.replay.should_route_pm4() {
+                        gpu.replay
+                            // Absolute MTP positions flow through mtp_positions. Keep
+                            // any generic position-bound launch geometry at the fixed
+                            // tier cap used during capture, matching hipGraph replay.
+                            .replay_pm4(seq_cap - 1)
+                            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                    } else {
+                        gpu.replay
+                            .replay_linear_aql()
+                            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                    }
                 }
             }
             state.gpu_rng_state = seed;
