@@ -4450,6 +4450,145 @@ mod tq2g128_tests {
     }
 }
 
+/// imatrix-weighted ternary GPTQ packer. Same 34 B / 128-elem block layout as
+/// `quantize_tq2g128`, but per block it (a) sweeps a small set of candidate
+/// scales `d` around `max|w|` and keeps the one minimizing the
+/// `col_weights`-weighted squared *decoded* reconstruction error (instead of
+/// unconditionally `d = max|w|`), then (b) applies the same damped 1-D residual
+/// feed-forward as `quantize_mq2g256_lloyd_gptq` (`HIPFIRE_GPTQ_DAMPING`,
+/// default 0.0 → residual pass is a no-op and codes match the swept-scale
+/// plain packer) before packing bytes identically to `quantize_tq2g128`.
+/// `col_weights.len()` must be a multiple of 128; the per-input-column slice
+/// for block `b` starts at `col_off = (b % (col_weights.len()/128)) * 128`.
+fn quantize_tq2g128_gptq(f32_data: &[f32], col_weights: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let blocks_per_row = (col_weights.len() / GROUP).max(1);
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    // Forward-propagation damping — same env knob as quantize_mq2g256_lloyd_gptq
+    // (:3502); default 0.0 leaves the residual pass a no-op.
+    let damping: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let col_off = (b % blocks_per_row) * GROUP;
+        let block_w = &col_weights[col_off..col_off + GROUP];
+
+        let mut amax = 0.0f32;
+        for &w in group {
+            amax = amax.max(w.abs());
+        }
+
+        // Sweep candidate scales, pick the least imatrix-weighted *decoded*
+        // error. factor=1.0 reproduces `quantize_tq2g128` exactly (same codes,
+        // same f16 header, same decode), so the winner is always ≤ plain.
+        let mut best_d = amax;
+        let mut best_err = f64::INFINITY;
+        for &factor in &[0.6f32, 0.7, 0.8, 0.9, 1.0] {
+            let d = amax * factor;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let dd = f16_to_f32(f32_to_f16(d)) as f64; // decode uses the f16 scale
+            let mut err = 0.0f64;
+            for i in 0..GROUP {
+                let w = if i < actual { group[i] } else { 0.0 };
+                let mut q = (w * id).round() as i32 + 1;
+                if q < 0 {
+                    q = 0;
+                }
+                if q > 3 {
+                    q = 3;
+                }
+                let recon = (q - 1) as f64 * dd;
+                let diff = w as f64 - recon;
+                err += block_w[i] as f64 * diff * diff;
+            }
+            if err < best_err {
+                best_err = err;
+                best_d = d;
+            }
+        }
+
+        let d = best_d;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let dd = f16_to_f32(f32_to_f16(d));
+
+        // Damped residual feed-forward across columns → codes.
+        let mut codes = [0u8; GROUP];
+        let mut residual = 0.0f32;
+        for i in 0..GROUP {
+            let w = if i < actual { group[i] } else { 0.0 };
+            let target = w + residual;
+            let mut q = (target * id).round() as i32 + 1;
+            if q < 0 {
+                q = 0;
+            }
+            if q > 3 {
+                q = 3;
+            }
+            let recon = (q - 1) as f32 * dd;
+            residual = (target - recon) * damping;
+            codes[i] = q as u8;
+        }
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                byte_val |= (codes[4 * i + j] & 0x3) << (j * 2);
+            }
+            output[out_off + 2 + i] = byte_val;
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tq2g128_gptq_tests {
+    use super::*;
+
+    fn weighted_mse(orig: &[f32], packed: &[u8], w: &[f32]) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "wmse".to_string(),
+            shape: vec![orig.len()],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        orig.iter()
+            .zip(&deq)
+            .zip(w)
+            .map(|((o, q), wi)| (*wi as f64) * ((o - q) as f64).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn gptq_ternary_not_worse_than_plain() {
+        // skewed importance: first 32 columns matter 10×.
+        let g: Vec<f32> = (0..128).map(|i| ((i as f32) - 64.0) * 0.03).collect();
+        let mut w = vec![1.0f32; 128];
+        for k in 0..32 {
+            w[k] = 10.0;
+        }
+        let plain = quantize_tq2g128(&g);
+        let gptq = quantize_tq2g128_gptq(&g, &w);
+        assert!(
+            weighted_mse(&g, &gptq, &w) <= weighted_mse(&g, &plain, &w) + 1e-9,
+            "imatrix-weighted GPTQ error must be ≤ plain packer error"
+        );
+    }
+}
+
 /// Quantize F32 weights to HFQ6-G256: 6-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights (0.78125 B/w).
 pub(crate) fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
@@ -5379,6 +5518,151 @@ fn quantize_bq1g128(f32_data: &[f32]) -> Vec<u8> {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod bq1g128_tests {
+    use super::*;
+
+    #[test]
+    fn quantize_bq1g128_byte_exact() {
+        // group of 128: [0]=+2, [1]=-2, rest 0 (0 → sign bit set → +d)
+        let mut g = vec![0.0f32; 128];
+        g[0] = 2.0;
+        g[1] = -2.0;
+        // d = mean|w| = (2+2)/128 = 0.03125
+        let out = quantize_bq1g128(&g);
+        assert_eq!(out.len(), 18);
+        assert_eq!(&out[0..2], &f32_to_f16(0.03125).to_le_bytes());
+        // byte 2 = elements 0..7: bit0 (e0,+)=1, bit1 (e1,-)=0,
+        // bits2..7 (0.0≥0)=1 → 0b1111_1101 = 0xFD
+        assert_eq!(out[2], 0xFD);
+        // bytes 3..18 = elements 8..127 all 0.0 ≥ 0 → all bits set → 0xFF
+        assert_eq!(&out[3..18], &[0xFFu8; 15]);
+    }
+
+    #[test]
+    fn quantize_bq1g128_round_trips() {
+        let g: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) * 0.01).collect();
+        let packed = quantize_bq1g128(&g);
+        let info = gguf_input::TensorInfo {
+            name: "rt".to_string(),
+            shape: vec![256],
+            dtype: gguf_input::GgmlType::Q1_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, &packed);
+        // every element recovers sign; magnitude == block mean|w|
+        for i in 0..256 {
+            assert_eq!(deq[i] >= 0.0, g[i] >= 0.0);
+        }
+    }
+}
+
+/// imatrix-weighted 1-bit GPTQ packer. Same 18 B / 128-elem block layout as
+/// `quantize_bq1g128`. Signs follow the residual-compensated value (which
+/// equals `w` when `HIPFIRE_GPTQ_DAMPING`=0.0, the default → signs fixed by
+/// `w >= 0`); the lever is the importance-weighted optimal magnitude
+/// `d = (Σ w_i|x_i|) / (Σ w_i)` — the exact minimizer of
+/// `Σ_i w_i (x_i - sign_i·d)²` over the block — with a fallback to the plain
+/// unweighted mean-abs when `Σ w_i == 0`. A damped 1-D residual feed-forward
+/// (mirror of `quantize_mq2g256_lloyd_gptq`) is threaded across columns.
+/// `col_weights.len()` must be a multiple of 128;
+/// `col_off = (b % (col_weights.len()/128)) * 128`.
+fn quantize_bq1g128_gptq(f32_data: &[f32], col_weights: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let blocks_per_row = (col_weights.len() / GROUP).max(1);
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    let damping: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let col_off = (b % blocks_per_row) * GROUP;
+        let block_w = &col_weights[col_off..col_off + GROUP];
+
+        // Importance-weighted optimal magnitude d = Σ w|x| / Σ w.
+        let mut wsum = 0.0f64;
+        let mut wabs = 0.0f64;
+        for i in 0..actual {
+            let wi = block_w[i] as f64;
+            wsum += wi;
+            wabs += wi * (group[i].abs() as f64);
+        }
+        let d = if wsum > 0.0 {
+            (wabs / wsum) as f32
+        } else {
+            // fallback: plain unweighted mean-abs (matches quantize_bq1g128)
+            let mut s = 0.0f32;
+            for &w in group {
+                s += w.abs();
+            }
+            if actual > 0 {
+                s / actual as f32
+            } else {
+                0.0
+            }
+        };
+        let dd = f16_to_f32(f32_to_f16(d));
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+
+        let mut residual = 0.0f32;
+        for j in 0..GROUP {
+            let w = if j < actual { group[j] } else { 0.0 };
+            let target = w + residual;
+            let bit = target >= 0.0;
+            let recon = if bit { dd } else { -dd };
+            residual = (target - recon) * damping;
+            if bit {
+                output[out_off + 2 + (j >> 3)] |= 1u8 << (j & 7);
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod bq1g128_gptq_tests {
+    use super::*;
+
+    fn wmse_bq1(orig: &[f32], packed: &[u8], w: &[f32]) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "wmse".to_string(),
+            shape: vec![orig.len()],
+            dtype: gguf_input::GgmlType::Q1_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        orig.iter()
+            .zip(&deq)
+            .zip(w)
+            .map(|((o, q), wi)| (*wi as f64) * ((o - q) as f64).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn gptq_binary_not_worse_than_plain() {
+        let g: Vec<f32> = (0..128).map(|i| ((i as f32) - 64.0) * 0.05).collect();
+        let mut w = vec![1.0f32; 128];
+        for k in 96..128 {
+            w[k] = 8.0;
+        } // tail columns important
+        let plain = quantize_bq1g128(&g);
+        let gptq = quantize_bq1g128_gptq(&g, &w);
+        assert!(wmse_bq1(&g, &gptq, &w) <= wmse_bq1(&g, &plain, &w) + 1e-9);
+    }
 }
 
 /// `--input <file>.hfq` requant pipeline. Reads an already-coherent `.hfq` (the
