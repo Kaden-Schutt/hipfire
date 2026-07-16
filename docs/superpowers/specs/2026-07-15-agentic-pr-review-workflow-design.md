@@ -1,7 +1,7 @@
 # Agentic PR Review Workflow Design
 
 **Date:** 2026-07-15
-**Status:** Revised after adversarial review; pending approval
+**Status:** Revised with tool-less provider inference; pending approval
 
 ## Purpose
 
@@ -77,11 +77,12 @@ closed, retains `needs-review`, and reports the unresolved workflow review.
 
 The static-review skill has two isolated stages.
 
-The untrusted **inspector subagent** accepts one open PR currently labelled
-`needs-review`. It has no write-capable GitHub credential, shell access, or
-checkout capability. Through a read-only, fixed-endpoint proxy, it reviews
-the diff and repository context statically, without executing PR code or
-tests. It emits a strict `ReviewProposal` document and assesses:
+The read-only **review controller** accepts one open PR currently labelled
+`needs-review`. It has a read-only GitHub credential and a model-provider
+credential, but no GitHub mutation credential. It reads only fixed GitHub API
+endpoints and never checks out, executes, or exposes PR code. It builds a
+strict `ReviewCapsule`, sends it as one tool-less structured-inference request,
+and validates the resulting `ReviewProposal`. It assesses:
 
 - correctness and behavioral regressions;
 - safety, data-integrity, compatibility, and error-handling risks;
@@ -90,12 +91,12 @@ tests. It emits a strict `ReviewProposal` document and assesses:
   behavior; and
 - relevant API, documentation, and performance implications.
 
-Before inspection, the read-only proxy builds a pinned merge-base/head manifest
+Before inference, the controller builds a pinned merge-base/head manifest
 from Git-tree and Git-blob API objects. It records every changed path, mode,
 base and head blob OID, and byte size, then retrieves every required changed
 blob by OID. Tree truncation, API file caps, a missing blob, an unavailable
 or truncated patch/blob, or any manifest mismatch produces an incomplete
-proposal. Counts alone never prove coverage.
+capsule. Counts alone never prove coverage.
 
 The trusted, non-LLM **publisher** independently fetches the selected PR
 target, validates the proposal against a closed schema, and permits only the
@@ -244,11 +245,34 @@ checkout`, clone the PR, execute commands suggested by PR content, initialize
 submodules, invoke Git hooks, fetch LFS objects, or execute any repository
 code.
 
-The inspector presents PR-controlled text as quoted data and never treats it
-as instructions. Tooling exposes only an allowlist of GitHub API reads and
-the publisher's specific GitHub mutations. Mutation credentials are held only
-by the publisher and are unavailable to the inspector, arbitrary commands,
-or PR content.
+The controller presents PR-controlled text as quoted data and never treats it
+as instructions. There is no local agent runtime, shell, tool registry, or
+checkout to which PR content can issue commands. The controller is fixed code:
+it exposes only allowlisted GitHub API reads, one configured model request,
+and the publisher's separately implemented GitHub mutations.
+
+## Tool-less provider inference
+
+The static-review skill supplies `run-inspector.sh`, a shorthand launcher for
+the controller's provider-neutral inference client. It accepts a canonical
+`ReviewCapsule` and writes one schema-valid `ReviewProposal`; it neither runs
+Codex/OpenCode nor starts a container image.
+
+The protected-default-branch provider configuration selects an approved model
+adapter, model identifier, endpoint, request deadline, capsule byte ceiling,
+`max_output_tokens`, and per-run cost ceiling. Each adapter must send exactly
+one model request with tools, function calling, browser access, code execution,
+and provider-specific arbitrary headers disabled or absent. It sends fixed
+review instructions plus the escaped capsule, never a PR-supplied instruction
+or destination. The model-provider credential belongs only to the controller;
+the model receives no GitHub credential and has no host runtime to inspect.
+
+The client rejects redirects, unknown provider configuration, additional model
+requests, incomplete streams, oversized input/output, deadline or cost-limit
+violations, and any response that fails the `ReviewProposal` schema. It records
+the capsule digest, provider adapter/version, model identifier, and response
+digest in the proposal so the publisher can bind a report to the exact
+inference input. Provider configuration and limits never come from the PR.
 
 ## Trust model
 
@@ -279,8 +303,9 @@ token identity and target-repository access, probes every read endpoint used
 by that skill with bounded pagination, and checks response permission headers
 when available. Discovery requires pull-request reads, issue-comment reads,
 the collaborator-permission endpoint, and issues write access only when it
-will label PRs. The inspector needs immutable content reads only; discovery
-and the publisher need pull-request writes to reconcile workflow-owned review
+will label PRs. The review controller needs immutable content reads and its
+configured model-provider credential only; it receives no GitHub mutation
+credential. Discovery and the publisher need pull-request writes to reconcile workflow-owned review
 records and to submit or dismiss `REQUEST_CHANGES` respectively. Discovery's
 credential must be explicitly attested as authorized to dismiss the
 workflow's reviews on the target branch; otherwise it delegates reconciliation
