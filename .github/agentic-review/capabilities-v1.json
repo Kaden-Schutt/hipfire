@@ -5,38 +5,32 @@
     {
       "id": "hipfire/rdna3-smoke@1",
       "parameters": {},
-      "contract_digest": "sha256:ed6dcbe6bf832b076c806ddf56a0d82007fa75e5cf82580834b8237ab025a929",
+      "contract_digest": "sha256:a3399687fc211d9073ed52daa02162cc052c63c79f923fce25acf5409c9852d9",
       "allowed_suite_revisions": ["rdna3-smoke-v1"],
       "required_checks": ["build", "smoke"],
+      "eligible_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
       "artifacts": ["test-report.json"],
-      "pass_criteria": {
-        "status": "passed",
-        "required_checks": "all"
-      }
+      "pass_criteria": {"all_required_checks_pass": true}
     },
     {
       "id": "hipfire/gfx1151-kernel-validation@1",
       "parameters": {},
-      "contract_digest": "sha256:65b1e80e962efdcce6663204f216faec27df49a0e348aef08f347748a1374c39",
+      "contract_digest": "sha256:1a0759dacc12dc31f1da1a7f82cda92d31d91148460fdae104132e01f0e5fb7f",
       "allowed_suite_revisions": ["gfx1151-kernel-validation-v1"],
       "required_checks": ["build", "kernel-validation"],
+      "eligible_hardware": ["gfx1151"],
       "artifacts": ["kernel-validation.json"],
-      "pass_criteria": {
-        "status": "passed",
-        "required_checks": "all"
-      }
+      "pass_criteria": {"all_required_checks_pass": true}
     },
     {
       "id": "hipfire/dflash-coherence@1",
       "parameters": {},
-      "contract_digest": "sha256:9ebc333966b6a53efabf73f0b59d0ff9c3f8ed907707ab249c35d549d9fc5b42",
+      "contract_digest": "sha256:f1b82cd79f8ed45c196fadb9e5e50c6185a392c9aabc6029bef97f7d85a01243",
       "allowed_suite_revisions": ["dflash-coherence-v1"],
       "required_checks": ["build", "coherence-gate"],
+      "eligible_hardware": ["gfx1100", "gfx1151"],
       "artifacts": ["coherence-report.md"],
-      "pass_criteria": {
-        "status": "passed",
-        "required_checks": "all"
-      }
+      "pass_criteria": {"all_required_checks_pass": true}
     }
   ]
 }

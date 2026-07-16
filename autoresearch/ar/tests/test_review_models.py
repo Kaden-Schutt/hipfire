@@ -1,5 +1,7 @@
 # Copyright (c) Kaden Schutt
 import json
+import hashlib
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -7,17 +9,26 @@ import pytest
 
 from autoresearch.ar.review.models import (
     AttemptIntent,
+    Finding,
     ProviderPolicy,
     ReviewProposal,
     ReviewTarget,
+    TrustedApp,
     TrustedPublisher,
     ValidationRequest,
+    capability_contract_digest,
+    load_capability_policy,
+    load_provider_policy,
+    load_trusted_publishers_policy,
     validate_capability_policy,
+    validate_provider_policy,
+    validate_trusted_publishers_policy,
 )
 
 
 ROOT = Path(__file__).parents[3]
 POLICY_DIR = ROOT / ".github" / "agentic-review"
+TARGET = ReviewTarget("owner/repo", 42, "owner/repo", "head", "main", "base", "merge")
 
 
 def test_review_target_key_is_stable_and_base_sha_sensitive():
@@ -52,9 +63,11 @@ def test_contracts_are_frozen():
         getattr(cls, "__dataclass_params__").frozen
         for cls in (
             AttemptIntent,
+            Finding,
             ReviewProposal,
             ValidationRequest,
             ProviderPolicy,
+            TrustedApp,
             TrustedPublisher,
         )
     )
@@ -84,8 +97,47 @@ def test_capability_policy_rejects_invalid_contract_digests(digest):
         validate_capability_policy(policy)
 
 
-def test_capability_policy_shape():
-    policy = json.loads((POLICY_DIR / "capabilities-v1.json").read_text())
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("id", "hipfire/changed@1"),
+        ("allowed_suite_revisions", ["changed-suite-v1"]),
+        ("required_checks", ["changed-check"]),
+        ("artifacts", ["changed-artifact.json"]),
+        ("eligible_hardware", ["changed-hardware"]),
+        ("pass_criteria", {"all_required_checks_pass": False}),
+    ],
+)
+def test_capability_digest_covers_complete_capability(field, value):
+    policy = load_capability_policy(POLICY_DIR / "capabilities-v1.json")
+    mutated = deepcopy(policy)
+    capability = mutated["capabilities"][0]
+    original_digest = capability["contract_digest"]
+    capability[field] = value
+
+    changed_digest = capability_contract_digest(capability)
+    assert changed_digest != original_digest
+
+    with pytest.raises(ValueError, match="digest|capability ID|pass_criteria"):
+        validate_capability_policy(mutated)
+
+    capability["contract_digest"] = changed_digest
+    if field not in ("id", "pass_criteria"):
+        validate_capability_policy(mutated)
+
+
+def test_capability_digest_uses_documented_canonical_json():
+    policy = load_capability_policy(POLICY_DIR / "capabilities-v1.json")
+    capability = policy["capabilities"][0]
+    without_digest = {key: value for key, value in capability.items() if key != "contract_digest"}
+    serialized = json.dumps(without_digest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    expected = "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    assert capability_contract_digest(capability) == expected
+
+
+def test_capability_policy_shape_and_loader():
+    policy = load_capability_policy(POLICY_DIR / "capabilities-v1.json")
 
     assert policy["schema"] == "hipfire.agentic-review.capabilities"
     assert policy["version"] == 1
@@ -97,6 +149,7 @@ def test_capability_policy_shape():
     }
     for capability in capabilities:
         assert capability["parameters"] == {}
+        assert capability["eligible_hardware"]
         for field in (
             "contract_digest",
             "allowed_suite_revisions",
@@ -105,6 +158,26 @@ def test_capability_policy_shape():
             "pass_criteria",
         ):
             assert field in capability
+        assert capability["pass_criteria"] == {"all_required_checks_pass": True}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda policy: policy.pop("version"),
+        lambda policy: policy["capabilities"][0].pop("artifacts"),
+        lambda policy: policy["capabilities"][0].update(extra=True),
+        lambda policy: policy["capabilities"][0]["required_checks"].append(3),
+        lambda policy: policy["capabilities"][0]["required_checks"].append("build"),
+        lambda policy: policy["capabilities"][0].update(eligible_hardware=[]),
+        lambda policy: policy["capabilities"][0].update(pass_criteria={"other": True}),
+    ],
+)
+def test_capability_loader_rejects_malformed_policy(mutation):
+    policy = json.loads((POLICY_DIR / "capabilities-v1.json").read_text())
+    mutation(policy)
+
+    with pytest.raises(ValueError):
         validate_capability_policy(policy)
 
 
@@ -113,26 +186,173 @@ def test_provider_policy_shape_has_bounded_env_based_configuration():
 
     assert policy["schema"] == "hipfire.agentic-review.providers"
     assert policy["version"] == 1
-    assert policy["providers"]
-    for provider in policy["providers"]:
-        assert provider["endpoint_env"].isidentifier() or provider["endpoint_env"].startswith("HIPFIRE_")
-        assert provider["api_key_env"].isidentifier() or provider["api_key_env"].startswith("HIPFIRE_")
-        assert provider["model_env"].isidentifier() or provider["model_env"].startswith("HIPFIRE_")
-        limits = provider["limits"]
-        assert all(isinstance(limits[key], (int, float)) and limits[key] > 0 for key in limits)
-        assert {"max_requests", "max_response_bytes", "max_tokens", "max_cost_usd"} <= limits.keys()
+    assert policy["providers"] == []
+    validate_provider_policy(policy)
+
+
+def test_provider_loader_fails_closed_for_unspecified_provider():
+    with pytest.raises(ValueError, match="provider"):
+        load_provider_policy(POLICY_DIR / "providers.json", "missing")
+
+
+VALID_PROVIDER = {
+    "id": "review-adapter",
+    "adapter_id": "neutral-review",
+    "adapter_version": "1",
+    "endpoint": "https://review.example.invalid/v1",
+    "model": "review-model-v1",
+    "api_key_env": "HIPFIRE_REVIEW_API_KEY",
+    "max_requests": 1,
+    "request_deadline_seconds": 30,
+    "max_capsule_bytes": 1048576,
+    "max_response_bytes": 1048576,
+    "max_tokens": 16384,
+    "max_cost_usd": 5.0,
+}
+
+
+def provider_policy(provider=None):
+    return {
+        "schema": "hipfire.agentic-review.providers",
+        "version": 1,
+        "providers": [provider or VALID_PROVIDER],
+    }
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("endpoint_env", "HIPFIRE_ENDPOINT"),
+        ("model_env", "HIPFIRE_MODEL"),
+        ("endpoint", "http://review.example.invalid"),
+        ("max_requests", 2),
+    ],
+)
+def test_provider_policy_rejects_unprotected_selection_or_budget(field, value):
+    provider = deepcopy(VALID_PROVIDER)
+    provider[field] = value
+
+    with pytest.raises(ValueError):
+        validate_provider_policy(provider_policy(provider))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "adapter_id",
+        "adapter_version",
+        "endpoint",
+        "model",
+        "api_key_env",
+        "request_deadline_seconds",
+        "max_capsule_bytes",
+        "max_response_bytes",
+        "max_tokens",
+        "max_cost_usd",
+    ],
+)
+def test_provider_policy_requires_fixed_fields_and_finite_bounds(field):
+    provider = deepcopy(VALID_PROVIDER)
+    provider.pop(field)
+
+    with pytest.raises(ValueError):
+        validate_provider_policy(provider_policy(provider))
 
 
 @pytest.mark.parametrize("cost", [float("nan"), float("inf"), float("-inf")])
 def test_provider_policy_rejects_nonfinite_cost(cost):
     with pytest.raises(ValueError, match="max_cost_usd"):
-        ProviderPolicy("default", "ENDPOINT", "API_KEY", "MODEL", 1, 1, 1, cost)
+        ProviderPolicy(
+            "review-adapter",
+            "neutral-review",
+            "1",
+            "https://review.example.invalid/v1",
+            "review-model-v1",
+            "HIPFIRE_REVIEW_API_KEY",
+            1,
+            30,
+            1,
+            1,
+            1,
+            cost,
+        )
 
 
 def test_trusted_publisher_policy_shape():
-    policy = json.loads((POLICY_DIR / "trusted-publishers.json").read_text())
+    policy = load_trusted_publishers_policy(POLICY_DIR / "trusted-publishers.json")
 
     assert policy["schema"] == "hipfire.agentic-review.trusted-publishers"
     assert policy["version"] == 1
-    assert isinstance(policy["users"], list)
-    assert isinstance(policy["apps"], list)
+    assert policy["users"] == []
+    assert policy["apps"] == []
+
+
+def test_trusted_publishers_accepts_structured_app_and_explicit_user():
+    policy = {
+        "schema": "hipfire.agentic-review.trusted-publishers",
+        "version": 1,
+        "users": ["Kaden-Schutt"],
+        "apps": [
+            {
+                "app_id": 123,
+                "login": "review-app[bot]",
+                "installation_id": 456,
+                "repository_id": 789,
+                "credential_attestation_digest": "sha256:" + "a" * 64,
+            }
+        ],
+    }
+    validate_trusted_publishers_policy(policy)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["app_id", "login", "installation_id", "repository_id", "credential_attestation_digest"],
+)
+def test_trusted_publishers_rejects_incomplete_app(missing):
+    app = {
+        "app_id": 123,
+        "login": "review-app[bot]",
+        "installation_id": 456,
+        "repository_id": 789,
+        "credential_attestation_digest": "sha256:" + "a" * 64,
+    }
+    app.pop(missing)
+    policy = {
+        "schema": "hipfire.agentic-review.trusted-publishers",
+        "version": 1,
+        "users": [],
+        "apps": [app],
+    }
+
+    with pytest.raises(ValueError):
+        validate_trusted_publishers_policy(policy)
+
+
+def test_trusted_publishers_rejects_generic_app_entry():
+    policy = {
+        "schema": "hipfire.agentic-review.trusted-publishers",
+        "version": 1,
+        "users": [],
+        "apps": ["github-actions"],
+    }
+
+    with pytest.raises(ValueError):
+        validate_trusted_publishers_policy(policy)
+
+
+def test_review_contracts_bind_required_identity_and_target_fields():
+    intent = AttemptIntent(TARGET, "attempt-1", "principal", "intent-node-1", "capability", "suite-v1")
+    assert intent.target == TARGET
+
+    finding = Finding("src/main.py", (1, 2), "error", "broken")
+    proposal = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))
+    assert proposal.findings == (finding,)
+    request = ValidationRequest(TARGET, "request-1", "capability", "sha256:" + "a" * 64, "sha256:" + "b" * 64)
+    assert request.target == TARGET
+
+
+@pytest.mark.parametrize("verdict", ["approved", "reject", "unknown"])
+def test_review_proposal_rejects_arbitrary_verdict(verdict):
+    with pytest.raises(ValueError, match="verdict"):
+        ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, verdict, ())

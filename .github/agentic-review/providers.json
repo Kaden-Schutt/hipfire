@@ -1,18 +1,5 @@
 {
   "schema": "hipfire.agentic-review.providers",
   "version": 1,
-  "providers": [
-    {
-      "id": "default",
-      "endpoint_env": "HIPFIRE_REVIEW_ENDPOINT",
-      "api_key_env": "HIPFIRE_REVIEW_API_KEY",
-      "model_env": "HIPFIRE_REVIEW_MODEL",
-      "limits": {
-        "max_requests": 20,
-        "max_response_bytes": 1048576,
-        "max_tokens": 16384,
-        "max_cost_usd": 5.0
-      }
-    }
-  ]
+  "providers": []
 }

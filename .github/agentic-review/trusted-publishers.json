@@ -1,6 +1,6 @@
 {
   "schema": "hipfire.agentic-review.trusted-publishers",
   "version": 1,
-  "users": ["Kaden-Schutt"],
-  "apps": ["github-actions"]
+  "users": [],
+  "apps": []
 }
