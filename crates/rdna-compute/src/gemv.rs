@@ -6634,6 +6634,24 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         use std::sync::OnceLock;
+        static GFX1151_GATE_UP_SPLIT: OnceLock<bool> = OnceLock::new();
+        let gfx1151_split = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_GATE_UP_SPLIT.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_GATE_UP_SPLIT").as_deref() == Ok("1")
+            });
+        if gfx1151_split {
+            return self.gemv_hfq4g256_moe_gate_up_k8_indexed_split_gfx1151(
+                expert_ptrs,
+                topk_indices,
+                x,
+                y_gate,
+                y_up,
+                m,
+                k,
+                n_ranks,
+            );
+        }
         static GFX1151_GATE_UP_WAVE64: OnceLock<bool> = OnceLock::new();
         let gfx1151_wave64 = self.arch_caps.is_gfx1151()
             && *GFX1151_GATE_UP_WAVE64.get_or_init(|| {
@@ -7073,6 +7091,98 @@ impl Gpu {
                 b
             },
         );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1151-only structural gate/up decomposition for fixed-K=2048 MQ4R
+    /// decode. The two launches are sequential on ordinary HIP, but their
+    /// disjoint output contracts let retained Redline PM4 replay place them on
+    /// separate queues and join once at the existing SiLU×multiply consumer.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_hfq4g256_moe_gate_up_k8_indexed_split_gfx1151(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        n_ranks: usize,
+    ) -> HipResult<()> {
+        debug_assert!(self.arch_caps.is_gfx1151());
+        debug_assert_eq!(k, 2_048);
+
+        const GATE: &str = "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151";
+        const UP: &str = "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151";
+        self.ensure_kernel(
+            GATE,
+            kernels::GEMV_HFQ4G256_MOE_GATE_INDEXED_K2048_GFX1151_SRC,
+            GATE,
+        )?;
+        self.ensure_kernel(
+            UP,
+            kernels::GEMV_HFQ4G256_MOE_UP_INDEXED_K2048_GFX1151_SRC,
+            UP,
+        )?;
+
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let grid = [(m as u32) >> 1, n_ranks as u32, 1];
+        let block = [32, 1, 1];
+        let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq4g256_moe_gate_up_split_gfx1151",
+            bytes,
+        );
+
+        let mut gate_params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(GATE, grid, block, 0, &mut gate_params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(ip);
+            b.push_ptr(xp);
+            b.push_ptr(ygp);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })?;
+
+        let mut up_params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(UP, grid, block, 0, &mut up_params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(ip);
+            b.push_ptr(xp);
+            b.push_ptr(yup);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

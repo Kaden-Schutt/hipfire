@@ -370,6 +370,15 @@ const fn write(offset: usize) -> PointerEffect {
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     if matches!(
         kernel,
+        "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151"
+            | "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151"
+    ) {
+        // The split producers share read-only routing, activation, and packed
+        // expert allocations but write distinct gate/up output allocations.
+        return Some(vec![read(0), read(8), read(16), write(24)]);
+    }
+    if matches!(
+        kernel,
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151"
@@ -667,6 +676,13 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if matches!(
+        kernel,
+        "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151"
+            | "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151"
+    ) {
+        return Some(48);
+    }
     if matches!(
         kernel,
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151"
@@ -1464,6 +1480,18 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
         ("fused_sigmoid_alpha_gate_f32", "conv1d_silu_split_f32")
             | ("rmsnorm_f32", "rmsnorm_f32")
             | ("kv_cache_write_q8_0", "kv_cache_write_q8_0")
+            | (
+                "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
+                "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
+            )
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
                 "gemv_hfq4g256_moe_gate_up_k8_indexed",
@@ -2935,6 +2963,8 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+        "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
+        "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151",
@@ -3014,6 +3044,19 @@ mod tests {
             Some(9)
         );
         assert!(!radiowave_vmem_only_consumer(qkvza_hybrid));
+        for producer in [
+            "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
+            "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
+        ] {
+            assert_eq!(expected_kernarg_bytes(producer), Some(48));
+            let effects = pointer_effects(producer).expect("split projection contract");
+            assert_eq!(effects.len(), 4);
+            assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+            assert_eq!(effects[1].mode, RecordedAccessMode::Read);
+            assert_eq!(effects[2].mode, RecordedAccessMode::Read);
+            assert_eq!(effects[3].mode, RecordedAccessMode::Write);
+            assert_eq!(effects[3].offset, 24);
+        }
         for (symbol, kernarg_bytes, pointer_count) in [
             ("gated_norm_mq_rotate_gfx1151", 64, 6),
             ("qwen35_fa_prep_gfx1151", 64, 7),
@@ -3087,6 +3130,10 @@ mod tests {
 
     #[test]
     fn moe_shared_down_and_routed_gate_up_are_independent_siblings() {
+        assert!(independent_sibling(
+            "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
+            "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
+        ));
         assert!(independent_sibling(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
             "gemv_hfq4g256_moe_gate_up_k8_indexed",

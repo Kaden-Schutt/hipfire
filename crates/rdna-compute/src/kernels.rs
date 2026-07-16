@@ -1497,6 +1497,33 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
+
+/// gfx1151 structural gate producer for MQ4R A3B decode. Gate and up are
+/// intentionally compiled as separate fixed-K=2048 kernels so Redline can
+/// overlap their independent weight streams on retained PM4 queues.
+pub const GEMV_HFQ4G256_MOE_GATE_INDEXED_K2048_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_PROJECTION_KERNEL gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151\n",
+    "#define HIPFIRE_MOE_PROJECTION 0\n",
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_projection_indexed_gfx1151.hip")
+);
+
+/// gfx1151 structural up producer. See the gate producer above; the only
+/// source-level distinction is the projection row selected from the packed
+/// gate_up expert allocation.
+pub const GEMV_HFQ4G256_MOE_UP_INDEXED_K2048_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_PROJECTION_KERNEL gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151\n",
+    "#define HIPFIRE_MOE_PROJECTION 1\n",
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_projection_indexed_gfx1151.hip")
+);
+
 /// gfx1151 occupancy probe: one-group-at-a-time activation/header live range,
 /// fixed K=2048, and ordinary global loads. Kept separate from gfx1100's
 /// admitted buffer/cache policy so one ISA cannot silently tune the other.
