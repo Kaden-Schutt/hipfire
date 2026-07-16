@@ -4,6 +4,9 @@
 
 #include <hip/hip_runtime.h>
 
+using hipfire_gate_persistent_u32x2 =
+    unsigned int __attribute__((ext_vector_type(2)));
+
 // gfx1151 fixed-K=2048, fixed-rank=8 gate/up producer.
 //
 // One 256-thread workgroup contains one wave per selected expert rank. The
@@ -43,9 +46,24 @@ gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151(
 
     // Rank is fixed for the lifetime of this persistent wave, so routing and
     // the expert SRD are paid once rather than once for every output row.
-    const int expert_id = topk_indices[krank];
-    const char* __restrict__ A =
-        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    const auto topk_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<int*>(topk_indices), 0, 0xffffffffu, 0x31004000u);
+    const unsigned int expert_id_v = __builtin_amdgcn_raw_buffer_load_b32(
+        topk_rsrc, (unsigned int)krank * 4u, 0, 0);
+    const int expert_id = __builtin_amdgcn_readfirstlane(expert_id_v);
+    const auto expert_ptrs_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<unsigned long long*>(expert_ptrs),
+        0, 0xffffffffu, 0x31004000u);
+    const hipfire_gate_persistent_u32x2 expert_ptr_v =
+        __builtin_amdgcn_raw_buffer_load_b64(
+            expert_ptrs_rsrc, (unsigned int)expert_id * 8u, 0, 0);
+    const unsigned int expert_ptr_lo =
+        (unsigned int)__builtin_amdgcn_readfirstlane(expert_ptr_v.x);
+    const unsigned int expert_ptr_hi =
+        (unsigned int)__builtin_amdgcn_readfirstlane(expert_ptr_v.y);
+    const unsigned long long expert_ptr = (unsigned long long)expert_ptr_lo |
+        ((unsigned long long)expert_ptr_hi << 32);
+    const char* __restrict__ A = reinterpret_cast<const char*>(expert_ptr);
     const auto expert_rsrc = HIPFIRE_WEIGHT_RSRC(A);
     constexpr unsigned int row_bytes = 8u * 136u;
     const int boff = tid * 4;
