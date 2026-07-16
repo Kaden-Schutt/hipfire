@@ -9,11 +9,13 @@ from autoresearch.ar.review.canonical import canonical_digest, canonical_json, c
 from autoresearch.ar.review.models import ReviewTarget
 from autoresearch.ar.review.protocol import (
     elect_canonical_attempt,
+    validate_append_only,
     validate_completion,
     validate_intent,
     validate_protocol,
     validate_report,
     validate_review_metadata,
+    validate_revocation,
 )
 
 
@@ -49,12 +51,18 @@ def _refresh_envelope(envelope):
     return envelope
 
 
-def _intent(record_id="intent-a", node_id="gh-intent-a", *, created_at="2026-01-01T00:00:00Z"):
+def _intent(
+    record_id="intent-a",
+    node_id="gh-intent-a",
+    *,
+    created_at="2026-01-01T00:00:00Z",
+    target=TARGET,
+):
     payload = {
         "record_type": "intent",
         "record_id": record_id,
-        "target": TARGET,
-        "target_key": TARGET.target_key(),
+        "target": target,
+        "target_key": target.target_key(),
         "attempt_id": "attempt-" + record_id,
         "canonical_digest": "",
     }
@@ -415,3 +423,91 @@ def test_all_record_types_use_one_timestamp_then_node_id_event_order():
         trusted_authors=TRUSTED,
     )
     assert selected["node_id"] == "f-node"
+
+
+def test_mixed_expected_targets_are_rejected_before_election():
+    other_target = ReviewTarget("other/repo", 7, "other/repo", "other-head", "main", "base", "merge")
+    with pytest.raises(ValueError, match="target"):
+        elect_canonical_attempt(
+            [_intent(), _intent(record_id="other", node_id="other-node", target=other_target)],
+            [],
+            expected_target=TARGET,
+            trusted_authors=TRUSTED,
+        )
+
+
+def test_noncanonical_metadata_after_revocation_is_rejected():
+    first = _intent(record_id="first", node_id="first-node")
+    report = _report(first)
+    second = _intent(record_id="second", node_id="second-node", created_at="2026-01-01T00:04:00Z")
+    revocation = _revocation(first, created_at="2026-01-01T00:05:00Z")
+    metadata = _metadata(first, report, created_at="2026-01-01T00:06:00Z")
+    with pytest.raises(ValueError, match="canonical"):
+        validate_protocol(
+            [first, report, second, revocation, metadata], expected_target=TARGET, trusted_authors=TRUSTED
+        )
+
+
+def test_untrusted_revocations_are_rejected_from_the_authenticated_envelope():
+    intent = _intent()
+    revocation = dict(_revocation(intent), author="untrusted")
+    with pytest.raises(ValueError, match="trusted"):
+        validate_revocation(revocation, intent, trusted_authors=TRUSTED)
+
+
+def test_altered_report_logical_id_node_and_digest_references_are_rejected():
+    intent = _intent()
+    report = _report(intent)
+    metadata = _metadata(intent, report)
+
+    altered_id = _refresh_envelope(dict(report, payload=dict(report["payload"], record_id="other-report")))
+    with pytest.raises(ValueError, match="report|reference"):
+        validate_review_metadata(metadata, intent, altered_id, canonical_intent=intent, trusted_authors=TRUSTED)
+
+    altered_node = _refresh_envelope(dict(report, node_id="other-report-node"))
+    with pytest.raises(ValueError, match="node"):
+        validate_review_metadata(metadata, intent, altered_node, canonical_intent=intent, trusted_authors=TRUSTED)
+
+    altered_digest = dict(report, payload_digest="0" * 64)
+    with pytest.raises(ValueError, match="digest"):
+        validate_review_metadata(metadata, intent, altered_digest, canonical_intent=intent, trusted_authors=TRUSTED)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("report_record_id", "other-report"),
+        ("report_node_id", "other-report-node"),
+        ("report_digest", "other-report-digest"),
+        ("metadata_record_id", "other-metadata"),
+    ],
+)
+def test_completion_rejects_report_and_metadata_reference_mismatches(field, value):
+    intent = _intent()
+    report = _report(intent)
+    metadata = _metadata(intent, report)
+    completion = _refresh_envelope(dict(_completion(intent, report, metadata), payload={}))
+    completion["payload"].update(_completion(intent, report, metadata)["payload"])
+    completion["payload"][field] = value
+    _refresh_envelope(completion)
+    with pytest.raises(ValueError, match="report|metadata"):
+        validate_completion(
+            completion,
+            intent,
+            report,
+            metadata,
+            canonical_intent=intent,
+            trusted_authors=TRUSTED,
+        )
+
+
+def test_append_only_snapshot_rejects_alteration_and_deletion():
+    intent = _intent()
+    report = _report(intent)
+    snapshot = [intent, report]
+    validate_append_only(snapshot, previous=snapshot)
+    altered = _refresh_envelope(dict(intent, payload=dict(intent["payload"], attempt_id="altered")))
+    with pytest.raises(ValueError, match="altered"):
+        validate_append_only([altered, report], previous=snapshot)
+    with pytest.raises(ValueError, match="deleted"):
+        validate_append_only([intent], previous=snapshot)
