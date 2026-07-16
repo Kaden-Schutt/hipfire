@@ -1904,6 +1904,9 @@ impl ReplayController {
         let gfx11_vmem_acquire = std::env::var("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE")
             .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
             .unwrap_or(false);
+        let terminal_acquire = std::env::var("HIPFIRE_REPLAY_PM4_TERMINAL_ACQUIRE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
+            .unwrap_or(false);
         let mut wait_audit = Pm4WaitAudit::default();
         let mut audit_frontier = ResourceFrontier::default();
         for index in 0..prefix {
@@ -1987,6 +1990,9 @@ impl ReplayController {
                     .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
             }
             commands.wait_compute_idle();
+            if terminal_acquire {
+                commands.acquire_system(false);
+            }
             let command_dwords = commands.len_dwords();
             let graph = commands.create_graph(&device, &pool)?;
             (PreparedPm4Graph::Single(graph), command_dwords)
@@ -2044,6 +2050,9 @@ impl ReplayController {
                     }
                     for commands in &mut lanes {
                         commands.wait_compute_idle();
+                        if terminal_acquire {
+                            commands.acquire_system(false);
+                        }
                         command_dwords = command_dwords
                             .checked_add(commands.len_dwords())
                             .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -2098,6 +2107,9 @@ impl ReplayController {
                         .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
                 }
                 commands.wait_compute_idle();
+                if terminal_acquire {
+                    commands.acquire_system(false);
+                }
                 command_dwords = command_dwords
                     .checked_add(commands.len_dwords())
                     .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
