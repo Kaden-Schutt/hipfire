@@ -36,11 +36,19 @@
 #define HIPFIRE_GDN_MIN_BLOCKS 8
 #endif
 
+#ifndef HIPFIRE_GDN_BLOCK_SIZE
+#define HIPFIRE_GDN_BLOCK_SIZE 32
+#endif
+
+#ifndef HIPFIRE_GDN_WAVES_PER_BLOCK
+#define HIPFIRE_GDN_WAVES_PER_BLOCK 1
+#endif
+
 #ifndef HIPFIRE_GDN_KERNEL
 #define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast
 #endif
 
-extern "C" __launch_bounds__(32, HIPFIRE_GDN_MIN_BLOCKS)
+extern "C" __launch_bounds__(HIPFIRE_GDN_BLOCK_SIZE, HIPFIRE_GDN_MIN_BLOCKS)
 __global__ void HIPFIRE_GDN_KERNEL(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -59,22 +67,38 @@ __global__ void HIPFIRE_GDN_KERNEL(
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
     if (h >= n_heads) return;
+#if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
+    const int wave = threadIdx.x >> 5;
+    const int tid = threadIdx.x & 31;
+#else
     const int tid = threadIdx.x;
+#endif
     const int stride = n_heads * HD;
     const int qk_heads = n_heads / HIPFIRE_GDN_QK_HEAD_DIV;
     const int qk_stride = qk_heads * HD;
     const int qk_head = h / HIPFIRE_GDN_QK_HEAD_DIV;
+#if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
+    const int row_start = tile * (TILE_ROWS * 2) + wave * TILE_ROWS;
+#else
     const int row_start = tile * TILE_ROWS;
+#endif
 
     // Packed layout: S_f4[r * 32 + tid] = {S[r][tid], S[r][tid+32],
     // S[r][tid+64], S[r][tid+96]} — same 4*128 floats as the scalar tile.
+#if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
+    __shared__ float4 S_f4[TILE_ROWS * 2 * 32];
+    __shared__ float qk_f32[HD * 2];
+#define HIPFIRE_GDN_S_INDEX(r, lane) (((wave * TILE_ROWS + (r)) * 32) + (lane))
+#else
     __shared__ float4 S_f4[TILE_ROWS * 32];
+#define HIPFIRE_GDN_S_INDEX(r, lane) (((r) * 32) + (lane))
+#endif
 
     signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
     for (int r = 0; r < TILE_ROWS; r++) {
         const float scale = s_scales[h * HD + row_start + r];
         const signed char* src = sq_base + r * HD;
-        S_f4[r * 32 + tid] = make_float4(
+        S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(
             scale * (float)src[tid],
             scale * (float)src[tid + 32],
             scale * (float)src[tid + 64],
@@ -88,14 +112,27 @@ __global__ void HIPFIRE_GDN_KERNEL(
         float alpha = expf(gate[t * n_heads + h]);
         float beta_v = beta[t * n_heads + h];
 
+#if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
+        const int wg_tid = threadIdx.x;
+        for (int i = wg_tid; i < HD; i += HIPFIRE_GDN_BLOCK_SIZE) {
+            qk_f32[i] = q_t[i];
+            qk_f32[HD + i] = k_t[i];
+        }
+        __syncthreads();
+        float k0 = qk_f32[HD + tid], k1 = qk_f32[HD + tid+32];
+        float k2 = qk_f32[HD + tid+64], k3 = qk_f32[HD + tid+96];
+        float q0 = qk_f32[tid], q1 = qk_f32[tid+32];
+        float q2 = qk_f32[tid+64], q3 = qk_f32[tid+96];
+#else
         float k0 = k_t[tid], k1 = k_t[tid+32], k2 = k_t[tid+64], k3 = k_t[tid+96];
         float q0 = q_t[tid], q1 = q_t[tid+32], q2 = q_t[tid+64], q3 = q_t[tid+96];
+#endif
 #if TILE_ROWS == 4
         const float4 v_rows = *reinterpret_cast<const float4*>(v_t + row_start);
         float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
         for (int r = 0; r < TILE_ROWS; r++) {
             int row = row_start + r;
-            float4 s = S_f4[r * 32 + tid];
+            float4 s = S_f4[HIPFIRE_GDN_S_INDEX(r, tid)];
             float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
@@ -113,7 +150,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             s1 = alpha * s1 + k1 * delta;
             s2 = alpha * s2 + k2 * delta;
             s3 = alpha * s3 + k3 * delta;
-            S_f4[r * 32 + tid] = make_float4(s0, s1, s2, s3);
+            S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(s0, s1, s2, s3);
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
             for (int o = 16; o > 0; o >>= 1)
@@ -158,6 +195,10 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #else
 #error "unsupported HIPFIRE_GDN_TILE_ROWS"
 #endif
+#if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
+        if (t + 1 < n_tokens)
+            __syncthreads();
+#endif
     }
 
     // Requant FP32 → Q8 — OUTSIDE the token loop.
@@ -165,7 +206,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
     const bool use_ef = (s_ef_residual != nullptr);
     for (int r = 0; r < TILE_ROWS; r++) {
         int rr = row_start + r;
-        float4 s = S_f4[r * 32 + tid];
+        float4 s = S_f4[HIPFIRE_GDN_S_INDEX(r, tid)];
         float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
         __half* efr = use_ef ? (s_ef_residual + h * HD * HD + rr * HD) : nullptr;
@@ -219,4 +260,6 @@ __global__ void HIPFIRE_GDN_KERNEL(
             }
         }
     }
+
+#undef HIPFIRE_GDN_S_INDEX
 }

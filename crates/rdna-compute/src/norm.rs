@@ -2391,11 +2391,21 @@ impl Gpu {
         self.bind_thread()?;
         let gfx1151_r8 = self.arch_caps.is_gfx1151()
             && std::env::var("HIPFIRE_GFX1151_GDN_R8").as_deref() == Ok("1");
-        let (kernel_name, kernel_src, n_tiles) = if gfx1151_r8 {
+        let gfx1151_r4x2 = self.arch_caps.is_gfx1151()
+            && std::env::var("HIPFIRE_GFX1151_GDN_R4X2").as_deref() == Ok("1");
+        let (kernel_name, kernel_src, n_tiles, block_size) = if gfx1151_r4x2 {
+            (
+                "gated_delta_net_q8_compact2_r4x2_gfx1151",
+                kernels::GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC,
+                128 / 8,
+                64,
+            )
+        } else if gfx1151_r8 {
             (
                 "gated_delta_net_q8_compact2_r8_gfx1151",
                 kernels::GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC,
                 128 / 8,
+                32,
             )
         } else {
             let (kernel_name, kernel_src) =
@@ -2425,7 +2435,7 @@ impl Gpu {
                         kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
                     ),
                 };
-            (kernel_name, kernel_src, 128 / 4)
+            (kernel_name, kernel_src, 128 / 4, 32)
         };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
 
@@ -2464,7 +2474,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [n_heads as u32, n_tiles as u32, 1],
-            [32, 1, 1],
+            [block_size, 1, 1],
             0,
             &mut params,
             || {

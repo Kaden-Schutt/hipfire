@@ -4240,6 +4240,14 @@ pub const GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
+/// gfx1151 decode experiment: pair two four-row waves in one workgroup and
+/// stage Q/K once in LDS. This preserves the baseline wave count while halving
+/// Q/K traffic and workgroup setup for the recurrent state update.
+pub const GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_BLOCK_SIZE 64\n#define HIPFIRE_GDN_WAVES_PER_BLOCK 2\n#define HIPFIRE_GDN_MIN_BLOCKS 2\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_r4x2_gfx1151\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
 /// post-update state rather than the previous sibling's. Required for
