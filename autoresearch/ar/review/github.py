@@ -705,7 +705,12 @@ class GitHubClient:
         ):
             raise GitHubBoundaryError(f"GitHub {name} response has malformed server fields")
         for field in timestamps:
-            if record_kind == "review" and not require_timestamp and record.get(field) in (None, ""):
+            if (
+                record_kind == "review"
+                and not require_timestamp
+                and record.get("state") == "PENDING"
+                and record.get(field) in (None, "")
+            ):
                 continue
             if field not in record or record[field] in (None, ""):
                 raise GitHubBoundaryError(f"GitHub {name} response has a missing {field} timestamp")
@@ -856,6 +861,8 @@ class GitHubClient:
             raise GitHubBoundaryError("authenticated author has unsupported principal type")
         if record_kind == "comment" and record["updated_at"] != record["created_at"]:
             raise GitHubBoundaryError("edited GitHub record is not admissible")
+        if record_kind == "review" and record["state"] == "PENDING":
+            raise GitHubBoundaryError("pending GitHub review is not an immutable authenticated envelope")
         body = record["body"]
         if not isinstance(body, str) or not body.strip():
             raise GitHubBoundaryError(f"GitHub {record_name} body is missing")

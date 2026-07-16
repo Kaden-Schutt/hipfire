@@ -351,10 +351,23 @@ def test_pull_review_listing_accepts_pending_review_without_submitted_timestamp(
     assert response.data[0]["state"] == "PENDING"
 
 
+def test_pull_review_listing_rejects_non_pending_review_without_submitted_timestamp():
+    review = review_record(state="APPROVED")
+    review.pop("submitted_at")
+    with pytest.raises(GitHubBoundaryError, match="timestamp|submitted"):
+        GitHubClient(FakeRunner([result([review])])).list_pull_reviews(REPO, 42)
+
+
 def test_pending_pull_review_is_rejected_when_building_authenticated_envelope():
     pending = review_record(state="PENDING")
     pending.pop("submitted_at")
     with pytest.raises(GitHubBoundaryError, match="timestamp|submitted"):
+        GitHubClient(FakeRunner([result(pending)])).review_envelope(REPO, 42, 7)
+
+
+def test_pending_pull_review_with_timestamp_is_rejected_as_an_authenticated_envelope():
+    pending = review_record(state="PENDING")
+    with pytest.raises(GitHubBoundaryError, match="pending|submitted"):
         GitHubClient(FakeRunner([result(pending)])).review_envelope(REPO, 42, 7)
 
 
