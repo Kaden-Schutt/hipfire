@@ -15,7 +15,8 @@
 
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::{
-    prefill_trunk_and_mtp_cache, spec_step_mtp_compressed_serial, MtpSamplingConfig, MtpSpecState,
+    prefill_trunk_and_mtp_cache_abortable, spec_step_mtp_compressed_serial, MtpSamplingConfig,
+    MtpSpecState,
 };
 use crate::speculative::ModelSlot;
 use hipfire_runtime::spec::{
@@ -82,41 +83,27 @@ impl MtpDrafter for Qwen35MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
     ) -> Result<u32, String> {
-        // Cold start: reset the trunk recurrent state (target owns it) BEFORE
-        // borrowing the concrete slot, so positions start at 0.
-        if !cache_hit {
-            target.reset_recurrent(gpu);
+        fn never() -> bool {
+            false
         }
-        let slot = Self::slot(target)?;
-        self.ensure_state(gpu, slot)?;
-        let state = self.state.as_mut().expect("ensure_state set it");
-        if !cache_hit {
-            // Clear the head KV so its absolute positions start clean too.
-            state
-                .reset(gpu)
-                .map_err(|e| format!("mtp state reset: {e}"))?;
+        self.mtp_prefill_with_abort(gpu, target, fill_tokens, start_pos, cache_hit, &never)
+            .map(|token| token.expect("non-abortable qwen35 MTP prefill aborted"))
         }
 
-        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, fill_tokens, start_pos)
-            .map_err(|e| format!("mtp prefill: {e}"))?;
-
-        // Seed = greedy argmax of the trunk logits at the last prefilled
-        // position (`prefill_trunk_and_mtp_cache` leaves them in scratch.logits).
-        let logits = gpu
-            .download_f32(&slot.scratch.logits)
-            .map_err(|e| format!("download seed logits: {e}"))?;
-        let first_token = logits
-            .iter()
-            .enumerate()
-            .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                if v > bv {
-                    (i as u32, v)
-                } else {
-                    (bi, bv)
+    fn mtp_prefill_abortable(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: Option<&dyn Fn() -> bool>,
+    ) -> Result<Option<u32>, String> {
+        fn never() -> bool {
+            false
                 }
-            })
-            .0;
-        Ok(first_token)
+        let abort = abort.unwrap_or(&never);
+        self.mtp_prefill_with_abort(gpu, target, fill_tokens, start_pos, cache_hit, abort)
     }
 
     fn mtp_step(
@@ -172,6 +159,80 @@ impl MtpDrafter for Qwen35MtpDrafter {
 
     fn requires_greedy(&self) -> bool {
         true
+    }
+}
+
+impl Qwen35MtpDrafter {
+    fn mtp_prefill_with_abort(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Option<u32>, String> {
+        if abort() {
+            return Ok(None);
+        }
+        // Cold start: reset the trunk recurrent state (target owns it) BEFORE
+        // borrowing the concrete slot, so positions start at 0.
+        if !cache_hit {
+            target.reset_recurrent(gpu);
+        }
+        if abort() {
+            return Ok(None);
+        }
+        let slot = Self::slot(target)?;
+        self.ensure_state(gpu, slot)?;
+        let state = self.state.as_mut().expect("ensure_state set it");
+        if !cache_hit {
+            // Clear the head KV so its absolute positions start clean too.
+            state
+                .reset(gpu)
+                .map_err(|e| format!("mtp state reset: {e}"))?;
+        }
+
+        if abort() {
+            return Ok(None);
+        }
+        let prefill = prefill_trunk_and_mtp_cache_abortable(
+            gpu,
+            slot,
+            &self.head,
+            state,
+            fill_tokens,
+            start_pos,
+            abort,
+        )
+        .map_err(|e| format!("mtp prefill: {e}"))?;
+        if prefill.is_none() {
+            return Ok(None);
+        }
+
+        // Seed = greedy argmax of the trunk logits at the last prefilled
+        // position (`prefill_trunk_and_mtp_cache` leaves them in scratch.logits).
+        if abort() {
+            return Ok(None);
+        }
+        let logits = gpu
+            .download_f32(&slot.scratch.logits)
+            .map_err(|e| format!("download seed logits: {e}"))?;
+        if abort() {
+            return Ok(None);
+        }
+        let first_token = logits
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (bi, bv)
+                }
+            })
+            .0;
+        Ok((!abort()).then_some(first_token))
     }
 }
 

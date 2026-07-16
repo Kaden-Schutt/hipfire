@@ -157,11 +157,13 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
         if first_token == self.eos_token {
             return EmitOutcome {
                 events: Vec::new(),
+                generation_advanced: false,
                 stop: Some(StopReason::Eos),
             };
         }
         EmitOutcome {
             events: self.feed_and_emit(first_token),
+            generation_advanced: true,
             stop: None,
         }
     }
@@ -174,11 +176,13 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
         if token == self.eos_token {
             return EmitOutcome {
                 events: Vec::new(),
+                generation_advanced: false,
                 stop: Some(StopReason::Eos),
             };
         }
         EmitOutcome {
             events: self.feed_and_emit(token),
+            generation_advanced: true,
             stop: None,
         }
     }
@@ -214,6 +218,7 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
             events,
             finish_reason,
             tool_calls,
+            finalized: None,
         }
     }
 }

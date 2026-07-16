@@ -495,9 +495,9 @@ fn main() {
         }
     }
 
-    // Drain any bytes the EosFilter was holding back at end-of-stream.
+    // Finalize the EosFilter and drain any bytes held back at end-of-stream.
     if use_guards {
-        let drained = filter.flush_pending();
+        let drained = filter.finish();
         if !drained.is_empty() {
             if let Ok(text) = std::str::from_utf8(&drained) {
                 print!("{text}");

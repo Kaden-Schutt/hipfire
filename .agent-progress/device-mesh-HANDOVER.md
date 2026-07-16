@@ -1,5 +1,23 @@
 > **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](device-mesh-refactor-tracker.md).
 
+> **Current synchronization (2026-07-16):** COR-003 is complete. The
+> implementation work described by the later lifecycle migration passed its
+> CPU, DFlash coherence, and real multi-turn serving gates:
+> Terminal stop/finalization, sealed Qwen speculative turns, architecture
+> discard/reset paths, and native Qwen/DeepSeek/DSpark MTP in-flight
+> cancellation are implemented with production-owned lifecycle tests. The
+> full CPU `nix develop --command cargo test --workspace --locked` suite passed
+> (GPU tests ignored as applicable); `nix develop --command
+> ./scripts/coherence-gate-dflash.sh` passed with no hard or soft warnings
+> (report `/tmp/coherence-dflash-20260716-110721.md`); `nix develop --command
+> ./scripts/serve-multiturn-gate.sh` passed (report
+> `/tmp/serve-multiturn-20260716-110919.md`); and `git diff --check` passed.
+> Native Qwen MTP cancellation is done, while transactional target loading is
+> still deferred to `SPEC-003`. Remaining architecture migrations and separate
+> physical PP/TP/EP hardware tasks remain open. This handover remains
+> historical; use the tracker and its terminal lifecycle migration matrix for
+> current work.
+
 # Device-mesh — HANDOVER for the next session
 
 > ⚠️ **PIVOT (2026-07-06) — the executor plan changed. Read the plan's `## PIVOT` section BEFORE

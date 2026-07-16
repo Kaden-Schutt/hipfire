@@ -49,6 +49,8 @@ pub mod safetensors_source;
 pub mod sampler;
 pub mod spec;
 pub mod spec_ngram;
+pub mod spec_transcript;
+mod stop_quarantine;
 pub mod tp_forward;
 pub mod tp_serve;
 pub mod tp_shard;

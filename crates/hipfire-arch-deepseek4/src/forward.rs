@@ -10108,6 +10108,40 @@ pub fn prefill_with_mtp_fill(
     prompt_tokens: &[u32],
     start_pos: u32,
 ) -> Result<Vec<f32>, String> {
+    fn never() -> bool {
+        false
+    }
+    prefill_with_mtp_fill_abortable(
+        cfg,
+        weights,
+        state,
+        gpu,
+        pbs,
+        prompt_tokens,
+        start_pos,
+        &never,
+    )?
+    .ok_or_else(|| "deepseek4 MTP prefill unexpectedly aborted".to_string())
+}
+
+/// Abort-aware DeepSeek MTP prefill. Checks cancellation at chunk boundaries,
+/// around each native MTP fill, and before/after the final head. `None` means
+/// the caller must take the canonical whole-turn reset path; this function does
+/// not attempt a partial token/cache rollback.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_with_mtp_fill_abortable(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    prompt_tokens: &[u32],
+    start_pos: u32,
+    abort: &dyn Fn() -> bool,
+) -> Result<Option<Vec<f32>>, String> {
+    if abort() {
+        return Ok(None);
+    }
     let stream_len = cfg.hc_mult * cfg.hidden_size;
     if state.mtp_last_hidden.is_none() {
         state.mtp_last_hidden = Some(
@@ -10122,6 +10156,9 @@ pub fn prefill_with_mtp_fill(
     let mut last_logits: Vec<f32> = vec![];
     let mut pos_cursor: usize = 0;
     while pos_cursor < prompt_tokens.len() {
+        if abort() {
+            return Ok(None);
+        }
         let chunk_size = (prompt_tokens.len() - pos_cursor).min(pbs.max_batch);
         let chunk = &prompt_tokens[pos_cursor..pos_cursor + chunk_size];
         let abs_chunk_start = start_pos as usize + pos_cursor;
@@ -10131,6 +10168,9 @@ pub fn prefill_with_mtp_fill(
         //    pbs.streams_batch holds [chunk_size, hc_mult, hidden] residuals
         //    — these are the per-position h_n inputs the MTP layer needs.
         forward_prefill_batch_chunk(cfg, weights, state, gpu, pbs, chunk, abs_chunk_start as u32)?;
+        if abort() {
+            return Ok(None);
+        }
 
         // 2. Capture the last position's stream for the head on the last
         //    chunk, BEFORE mtp_forward_batched overwrites streams_batch.
@@ -10159,11 +10199,15 @@ pub fn prefill_with_mtp_fill(
             chunk_size
         };
         if mtp_end_b > 0 {
+            if abort() {
+                std::env::remove_var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD");
+                return Ok(None);
+            }
             let h_n_streams = pbs.streams_batch.sub_offset(0, mtp_end_b * stream_len);
             let next_tokens: Vec<u32> = (0..mtp_end_b)
                 .map(|b| prompt_tokens[pos_cursor + b + 1])
                 .collect();
-            mtp_forward_batched(
+            let mtp_result = mtp_forward_batched(
                 cfg,
                 weights,
                 state,
@@ -10173,7 +10217,12 @@ pub fn prefill_with_mtp_fill(
                 &next_tokens,
                 abs_chunk_start as u32,
                 mtp_end_b,
-            )?;
+            );
+            std::env::remove_var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD");
+            mtp_result?;
+            if abort() {
+                return Ok(None);
+            }
         }
         std::env::remove_var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD");
 
@@ -10185,6 +10234,9 @@ pub fn prefill_with_mtp_fill(
         //    the snapshot back into the last slot so the existing
         //    final_norm_and_head_last_batched can read it.
         if is_last_chunk {
+            if abort() {
+                return Ok(None);
+            }
             if let Some(snap) = last_stream_pre_mtp {
                 let off = (chunk_size - 1) * stream_len;
                 let dst = pbs.streams_batch.sub_offset(off, stream_len);
@@ -10193,9 +10245,16 @@ pub fn prefill_with_mtp_fill(
             }
             last_logits =
                 final_norm_and_head_last_batched(cfg, weights, state, pbs, gpu, chunk_size)?;
+            if abort() {
+                return Ok(None);
         }
     }
-    Ok(last_logits)
+    }
+    if abort() {
+        Ok(None)
+    } else {
+        Ok(Some(last_logits))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════

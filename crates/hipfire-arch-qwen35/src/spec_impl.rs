@@ -19,8 +19,8 @@
 use crate::qwen35::{self, DeltaNetState};
 use crate::speculative::{
     apply_topp_trunc, download_hidden_block, sample_categorical,
-    scatter_hidden_block_to_interleaved, verify_dflash_block, xorshift_next_unit,
-    DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
+    scatter_hidden_block_to_interleaved, verify_dflash_block, xorshift_next_unit, DeltaNetSnapshot,
+    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -190,7 +190,7 @@ impl SpecTarget for ModelSlot {
                 return Ok(SpecAdvance::Aborted);
             }
             let end = (off + chunk_max).min(tokens.len());
-            qwen35::forward_prefill_batch(
+            let completed = qwen35::forward_prefill_batch_abortable(
                 gpu,
                 &self.weights,
                 &self.config,
@@ -203,16 +203,29 @@ impl SpecTarget for ModelSlot {
                 None,
                 None,
                 None,
+                abort,
             )
             .map_err(|e| e.to_string())?;
+            if !completed {
+                self.reset_state(gpu);
+                return Ok(SpecAdvance::Aborted);
+            }
             pos += end - off;
             off = end;
         }
         // Last-position argmax (the per-token forward left last-token logits in
         // scratch.logits).
+        if abort() {
+            self.reset_state(gpu);
+            return Ok(SpecAdvance::Aborted);
+        }
         let logits = gpu
             .download_f32(&self.scratch.logits)
             .map_err(|e| e.to_string())?;
+        if abort() {
+            self.reset_state(gpu);
+            return Ok(SpecAdvance::Aborted);
+        }
         Ok(SpecAdvance::Ready {
             last_argmax: argmax(&logits),
         })
@@ -302,8 +315,12 @@ impl SpecTarget for ModelSlot {
         let probs_gpu = gpu
             .alloc_tensor(&[b * vocab], DType::F32)
             .map_err(|e| e.to_string())?;
-        let tau_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
-        let z_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
+        let tau_gpu = gpu
+            .alloc_tensor(&[b], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let z_gpu = gpu
+            .alloc_tensor(&[b], DType::F32)
+            .map_err(|e| e.to_string())?;
         gpu.softmax_temp_topp_batched_into_f32(
             &logits_batch,
             &probs_gpu,
@@ -515,8 +532,12 @@ impl SpecTarget for ModelSlot {
         let probs_gpu = gpu
             .alloc_tensor(&[b * vocab], DType::F32)
             .map_err(|e| e.to_string())?;
-        let tau_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
-        let z_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
+        let tau_gpu = gpu
+            .alloc_tensor(&[b], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let z_gpu = gpu
+            .alloc_tensor(&[b], DType::F32)
+            .map_err(|e| e.to_string())?;
         gpu.softmax_temp_topp_batched_into_f32(
             &logits_batch,
             &probs_gpu,

@@ -91,28 +91,49 @@ impl Deepseek4MtpDrafter {
     }
 }
 
-impl MtpDrafter for Deepseek4MtpDrafter {
-    fn mtp_prefill(
+impl Deepseek4MtpDrafter {
+    fn mtp_prefill_native(
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
         fill_tokens: &[u32],
         start_pos: usize,
         cache_hit: bool,
-    ) -> Result<u32, String> {
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Option<u32>, String> {
+        let bundle = Self::bundle(target)?;
+        self.mtp_prefill_with_abort(gpu, bundle, fill_tokens, start_pos, cache_hit, abort)
+    }
+}
+
+impl Deepseek4MtpDrafter {
+    fn mtp_prefill_with_abort(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &mut Deepseek4Bundle,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Option<u32>, String> {
+        if abort() {
+            return Ok(None);
+        }
         // Cold start: reset recurrent state (n_tokens → 0, mtp_last_hidden → None).
         // DeepseekV4State::reset() does no GPU work.
         if !cache_hit {
-            target.reset_recurrent(gpu);
+            bundle.state.reset();
         }
 
-        let bundle = Self::bundle(target)?;
         let Deepseek4Bundle {
             config,
             weights,
             state,
             ..
         } = bundle;
+        if abort() {
+            return Ok(None);
+        }
 
         // Lazily build the PBS. Sized identically to the loader's deepseek4_pbs
         // (carriers.rs:645-649): HIPFIRE_DEEPSEEK4_PP_BATCH, default 1024.
@@ -127,8 +148,11 @@ impl MtpDrafter for Deepseek4MtpDrafter {
             );
         }
         let pbs = self.pbs.as_ref().expect("just built");
+        if abort() {
+            return Ok(None);
+        }
 
-        let logits = crate::forward::prefill_with_mtp_fill(
+        let logits = crate::forward::prefill_with_mtp_fill_abortable(
             config,
             weights,
             state,
@@ -136,10 +160,55 @@ impl MtpDrafter for Deepseek4MtpDrafter {
             pbs,
             fill_tokens,
             start_pos as u32,
+            abort,
         )
         .map_err(|e| format!("mtp prefill: {e}"))?;
+        let Some(logits) = logits else {
+            return Ok(None);
+        };
+        if abort() {
+            return Ok(None);
+        }
 
-        Ok(logits_argmax(&logits) as u32)
+        let first_token = logits_argmax(&logits) as u32;
+        if abort() {
+            Ok(None)
+        } else {
+            Ok(Some(first_token))
+        }
+    }
+}
+
+impl MtpDrafter for Deepseek4MtpDrafter {
+    fn mtp_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+    ) -> Result<u32, String> {
+        fn never() -> bool {
+            false
+        }
+        self.mtp_prefill_native(gpu, target, fill_tokens, start_pos, cache_hit, &never)
+            .map(|token| token.expect("non-abortable deepseek4 MTP prefill aborted"))
+    }
+
+    fn mtp_prefill_abortable(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: Option<&dyn Fn() -> bool>,
+    ) -> Result<Option<u32>, String> {
+        fn never() -> bool {
+            false
+        }
+        let abort = abort.unwrap_or(&never);
+        self.mtp_prefill_native(gpu, target, fill_tokens, start_pos, cache_hit, abort)
     }
 
     fn mtp_step(

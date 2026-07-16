@@ -1,5 +1,23 @@
 > **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](device-mesh-refactor-tracker.md).
 
+> **Current synchronization (2026-07-16):** COR-003 is complete. The
+> implementation covers terminal `StopQuarantine`/`EosFilter`
+> behavior, `StreamParser` finalization, Cohere recovery, generic AR/spec
+> normal-versus-discard handling, sealed Qwen speculative-turn authority and
+> cache/reset behavior, Qwen PP sealed-boundary/reset behavior, DeepSeek AR
+> discard reset/cache zeroing, and native Qwen/DeepSeek/DSpark MTP in-flight
+> cancellation with production-owned lifecycle tests. The full CPU
+> `nix develop --command cargo test --workspace --locked` suite passed (GPU
+> tests ignored as applicable); `nix develop --command
+> ./scripts/coherence-gate-dflash.sh` passed with no hard or soft warnings
+> (report `/tmp/coherence-dflash-20260716-110721.md`);
+> `nix develop --command ./scripts/serve-multiturn-gate.sh` passed (report
+> `/tmp/serve-multiturn-20260716-110919.md`); and `git diff --check` passed.
+> Native Qwen MTP cancellation is done; transactional target loading remains
+> deferred to `SPEC-003`. Remaining architecture migrations and separate
+> physical PP/TP/EP hardware tasks remain open. See the canonical tracker for
+> current task status and the mandatory terminal lifecycle migration matrix.
+
 # Device-mesh implementation — consolidated status
 
 Branch: feature/device-mesh (off feature/parallel-expansion; has HIPFIRE_EMULATE_GPUS)

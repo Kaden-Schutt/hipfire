@@ -1141,8 +1141,37 @@ pub fn prefill_trunk_and_mtp_cache(
     prompt_tokens: &[u32],
     start_pos: usize,
 ) -> HipResult<TrunkSpinePrefillTimings> {
+    Ok(prefill_trunk_and_mtp_cache_abortable(
+        gpu,
+        target,
+        head,
+        state,
+        prompt_tokens,
+        start_pos,
+        &|| false,
+    )?
+    .expect("non-abortable qwen35 MTP prefill aborted"))
+}
+
+/// Abort-aware Qwen MTP prefill. The callback is checked at every native MTP
+/// token boundary and around the blocking trunk/final-head work. Returning
+/// `Ok(None)` deliberately leaves cleanup to the caller's canonical reset path;
+/// the native state may already contain a partially filled turn.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_trunk_and_mtp_cache_abortable(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    abort: &dyn Fn() -> bool,
+) -> HipResult<Option<TrunkSpinePrefillTimings>> {
+    if abort() {
+        return Ok(None);
+    }
     if prompt_tokens.is_empty() {
-        return Ok(TrunkSpinePrefillTimings::default());
+        return Ok(Some(TrunkSpinePrefillTimings::default()));
     }
 
     let dim = target.config.dim;
@@ -1150,8 +1179,11 @@ pub fn prefill_trunk_and_mtp_cache(
     let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
 
     let result = (|| -> HipResult<TrunkSpinePrefillTimings> {
+        if abort() {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
         let t_trunk = Instant::now();
-        qwen35::forward_prefill_batch(
+        let completed = qwen35::forward_prefill_batch_abortable(
             gpu,
             &target.weights,
             &target.config,
@@ -1164,11 +1196,21 @@ pub fn prefill_trunk_and_mtp_cache(
             Some(&prompt_hidden),
             None,
             None,
+            abort,
         )?;
+        if !completed {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
+        if abort() {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
         let trunk_prefill_secs = t_trunk.elapsed().as_secs_f64();
 
         let t_mtp_fill = Instant::now();
         for (i, &token) in prompt_tokens.iter().enumerate() {
+            if abort() {
+                return Ok(TrunkSpinePrefillTimings::default());
+            }
             let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
             mtp_head::mtp_head_forward_block_only(
                 gpu,
@@ -1181,9 +1223,15 @@ pub fn prefill_trunk_and_mtp_cache(
                 start_pos + i,
                 &target.weights,
             )?;
+            if abort() {
+                return Ok(TrunkSpinePrefillTimings::default());
+            }
         }
 
         let last = prompt_tokens.len() - 1;
+        if abort() {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
         gpu.hip.memcpy_dtod_at(
             &state.prev_hidden.buf,
             0,
@@ -1191,6 +1239,9 @@ pub fn prefill_trunk_and_mtp_cache(
             last * dim_bytes,
             dim_bytes,
         )?;
+        if abort() {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
         let mtp_prompt_fill_secs = t_mtp_fill.elapsed().as_secs_f64();
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
@@ -1199,7 +1250,11 @@ pub fn prefill_trunk_and_mtp_cache(
     })();
 
     let _ = gpu.free_tensor(prompt_hidden);
-    result
+    if abort() {
+        Ok(None)
+    } else {
+        result.map(Some)
+    }
 }
 
 /// Explicit DS4-shaped Qwen MTP spec step.
@@ -2421,7 +2476,10 @@ pub fn spec_step_mtp_compressed_serial(
         (true, false) => DraftMode::Greedy,
     };
     let use_p_min = matches!(draft_mode, DraftMode::PMin { .. });
-    let use_sampling = matches!(draft_mode, DraftMode::Sampled | DraftMode::SampledPMin { .. });
+    let use_sampling = matches!(
+        draft_mode,
+        DraftMode::Sampled | DraftMode::SampledPMin { .. }
+    );
     let use_sampled_pmin = matches!(draft_mode, DraftMode::SampledPMin { .. });
     let log_p_min = match draft_mode {
         DraftMode::PMin { log_p_min } | DraftMode::SampledPMin { log_p_min } => log_p_min,

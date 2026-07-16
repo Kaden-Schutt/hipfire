@@ -6008,7 +6008,45 @@ pub fn forward_prefill_batch(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
-    forward_prefill_batch_with_pbs(
+    forward_prefill_batch_abortable(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        &|| false,
+    )
+    .map(|_| ())
+}
+
+/// Abort-aware trunk prefill used by speculative callers. The boolean is false
+/// when the callback observed cancellation; the forward may already have
+/// advanced part of the target state, so callers must take their canonical
+/// reset path rather than treating this as a clean error.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_abortable(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    abort: &dyn Fn() -> bool,
+) -> HipResult<bool> {
+    forward_prefill_batch_with_pbs_abortable(
         gpu,
         weights,
         config,
@@ -6024,6 +6062,8 @@ pub fn forward_prefill_batch(
         scratch.prefill_batch.as_ref(),
         None, // mask_override: MTP probe is the only consumer; default callers don't override
         None, // max_layer: pflash uses this; non-pflash default is full stack
+        true,
+        abort,
     )
 }
 
@@ -6044,7 +6084,7 @@ pub fn forward_prefill_batch_with_pbs(
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
 ) -> HipResult<()> {
-    forward_prefill_batch_with_pbs_opts(
+    forward_prefill_batch_with_pbs_abortable(
         gpu,
         weights,
         config,
@@ -6060,7 +6100,53 @@ pub fn forward_prefill_batch_with_pbs(
         pbs_in,
         mask_override,
         max_layer,
-        true, // preserve legacy post-condition: scratch.logits is last-token logits
+        true,
+        &|| false,
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_batch_with_pbs_abortable(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    max_layer: Option<usize>,
+    needs_last_token_logits: bool,
+    abort: &dyn Fn() -> bool,
+) -> HipResult<bool> {
+    if abort() {
+        return Ok(false);
+    }
+    forward_prefill_batch_with_pbs_opts_abortable(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        pbs_in,
+        mask_override,
+        max_layer,
+        needs_last_token_logits,
+        abort,
     )
 }
 
@@ -6096,6 +6182,48 @@ pub fn forward_prefill_batch_with_pbs_opts(
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
 ) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts_abortable(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        pbs_in,
+        mask_override,
+        max_layer,
+        needs_last_token_logits,
+        &|| false,
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_batch_with_pbs_opts_abortable(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    max_layer: Option<usize>,
+    needs_last_token_logits: bool,
+    abort: &dyn Fn() -> bool,
+) -> HipResult<bool> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
     // marker (tree_verify / gdn_tape / per-token-hidden extraction / hidden ring)
@@ -6128,7 +6256,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
 
     let n = tokens.len();
     if n == 0 {
-        return Ok(());
+        return Ok(true);
     }
 
     // Cross-path safety: refuse MQ3 / MQ3-Lloyd weights inside any MoE
@@ -6255,6 +6383,9 @@ pub fn forward_prefill_batch_with_pbs_opts(
         // hidden row-by-row into the caller's buffer.
         let dim = config.dim;
         for (i, &tok) in tokens.iter().enumerate() {
+            if abort() {
+                return Ok(false);
+            }
             if let Some(rb) = hidden_rb.as_mut() {
                 forward_scratch_with_hidden(
                     gpu,
@@ -6289,8 +6420,11 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 gpu.hip
                     .memcpy_dtod_at(&dst.buf, i * dim * 4, &scratch.tmp.buf, 0, dim * 4)?;
             }
+            if abort() {
+                return Ok(false);
         }
-        return Ok(());
+        }
+        return Ok(true);
     }
 
     // Tree-verify mode runs as a single chunk (tree is small, O(16) nodes);
@@ -6314,7 +6448,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // to e.g. `block_size` or `1 + tree_budget` keeps DFlash verify in one
     // chunk without the full 256-row MAX_BATCH footprint.
     let mut own_pbs: Option<PrefillBatchScratch> = None;
-    let result = (|| -> HipResult<()> {
+    let result = (|| -> HipResult<bool> {
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
             None => {
@@ -6325,6 +6459,9 @@ pub fn forward_prefill_batch_with_pbs_opts(
         let chunk_batch = pbs.max_batch;
         let mut chunk_start = 0usize;
         while chunk_start < n {
+            if abort() {
+                return Ok(false);
+            }
             let chunk_end = (chunk_start + chunk_batch).min(n);
             let chunk = &tokens[chunk_start..chunk_end];
             let chunk_n = chunk.len();
@@ -6385,6 +6522,13 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 max_layer,
                 None, // routed_out: non-EP single-GPU path
             )?;
+            // The chunk contains the bounded unit of trunk work. Check before
+            // committing any staging/ring writes and again after that GPU work;
+            // an abort must never fall through as a successful final-head
+            // result to the speculative caller.
+            if abort() {
+                return Ok(false);
+            }
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
                 // to the ring at the current head, then advance head by n.
@@ -6394,9 +6538,12 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 // into a captured graph node).
                 rb.commit_staging_to_ring(gpu, chunk_n)?;
             }
+            if abort() {
+                return Ok(false);
+            }
             chunk_start = chunk_end;
         }
-        Ok(())
+        Ok(true)
     })();
     if let Some(owned) = own_pbs {
         owned.free_gpu(gpu);

@@ -18,14 +18,16 @@
 //! - `FilterAction::Hold` — buffer until the stream disambiguates (a
 //!   trailing partial marker prefix, a UTF-8 boundary mid-codepoint,
 //!   or bytes inside a `<think>` block while `strip_think=true`).
-//! - `FilterAction::Stop` — generation should stop. Any buffered bytes
-//!   are discarded; the caller must not emit further output.
+//! - `FilterAction::Stop { emit }` — generation should stop. The stop
+//!   marker is discarded and `emit` contains safe visible bytes before it.
 //!
-//! Construction is config-only; no allocations until the first
-//! `observe` call. The filter is `Send` and stateless across requests
+//! Construction normalizes the configuration and allocates the bounded
+//! stop-marker state. The filter is `Send` and stateless across requests
 //! after `reset()`.
 
 use std::cmp::Ordering;
+
+use crate::stop_quarantine::{QuarantineOutcome, StopQuarantine};
 
 /// Output action emitted by `EosFilter::observe`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +38,9 @@ pub enum FilterAction {
     /// disambiguates (e.g. partial marker prefix that may or may not
     /// be a stop token, or bytes inside an active `<think>` block).
     Hold,
-    /// Generation should stop. Any buffered bytes are discarded.
-    Stop,
+    /// Generation should stop. The stop marker and following bytes are
+    /// discarded; `emit` contains safe visible bytes before it.
+    Stop { emit: Vec<u8> },
 }
 
 /// Configuration for `EosFilter`. All fields default to "filter does
@@ -54,17 +57,17 @@ pub struct EosFilterConfig {
     /// compact-EOT marker that some Gemma 4 GGUFs decode to.
     pub stop_at: Vec<Vec<u8>>,
     /// Byte prefixes that are ambiguous — buffer until disambiguated.
-    /// Use for partial markers that may or may not be a stop token.
-    /// On a true match, the buffered bytes are dropped (Stop).
+    /// Use for non-stop downstream patterns. Prefixes of `stop_at` markers
+    /// are already quarantined upstream and are removed from this list.
     /// On a false match, the buffered bytes are flushed (Emit).
     pub holdback_prefixes: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct EosFilterState {
-    /// Bytes accumulated since the last full flush. Includes any bytes
-    /// held back for marker-prefix disambiguation, UTF-8 boundary
-    /// safety, or in-flight `<think>` content. Cleared by `reset()`.
+    /// Bytes accumulated by the downstream stage since the last emitted
+    /// prefix. Includes UTF-8 boundary safety and in-flight `<think>`
+    /// content. Cleared by `reset()`.
     buf: Vec<u8>,
     /// True while we are inside a `<think>...</think>` block and
     /// `strip_think` is on. Set when the opener is seen, cleared on
@@ -73,6 +76,27 @@ struct EosFilterState {
     /// Number of bytes already returned to the caller (in Emit
     /// actions). Used to compute the "new emit" delta on each call.
     emitted: usize,
+    /// Lifecycle state. Stopped retains safe visible bytes for the final
+    /// flush; Finished is inert until reset.
+    terminal: EosFilterTerminal,
+    /// Offset at which the current stripped think block starts.
+    think_start: Option<usize>,
+    /// Scan cursor for the current stripped think block. Unlike
+    /// `emitted`, this advances through hidden reasoning content.
+    think_scan: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EosFilterTerminal {
+    Open,
+    Stopped,
+    Finished,
+}
+
+impl Default for EosFilterTerminal {
+    fn default() -> Self {
+        Self::Open
+    }
 }
 
 /// Per-request output-stream filter. Construct from a
@@ -80,6 +104,7 @@ struct EosFilterState {
 /// decoded bytes to `observe`. Reset between conversations / requests.
 pub struct EosFilter {
     config: EosFilterConfig,
+    quarantine: StopQuarantine,
     state: EosFilterState,
 }
 
@@ -89,15 +114,19 @@ impl EosFilter {
     /// pre-extraction behavior: a UTF-8-boundary-safe pass-through.
     pub fn new(config: EosFilterConfig) -> Self {
         // Sort holdback_prefixes longest-first so prefix-match scans
-        // pick the longest matching prefix, not the first one. Same
-        // for stop_at (an early shorter match must not preempt a
-        // longer one starting at the same offset).
+        // pick the longest matching prefix, not the first one.
         let mut config = config;
         config
             .holdback_prefixes
             .sort_by(|a, b| b.len().cmp(&a.len()));
-        config.stop_at.sort_by(|a, b| b.len().cmp(&a.len()));
+        config.holdback_prefixes.retain(|prefix| {
+            !config
+                .stop_at
+                .iter()
+                .any(|marker| !prefix.is_empty() && marker.starts_with(prefix))
+        });
         Self {
+            quarantine: StopQuarantine::new(config.stop_at.clone()),
             config,
             state: EosFilterState::default(),
         }
@@ -106,32 +135,37 @@ impl EosFilter {
     /// Reset between turns / requests. After this, the filter behaves
     /// as if freshly constructed from the same config.
     pub fn reset(&mut self) {
+        self.quarantine.reset();
         self.state = EosFilterState::default();
     }
 
     /// Whether the filter currently has buffered bytes that have not
     /// been emitted. Useful for decisions like "did we drop content?"
-    /// at end-of-stream. The caller can call `flush_pending` to drain.
+    /// at end-of-stream. Unresolved raw scanner bytes count as pending.
     pub fn has_pending(&self) -> bool {
-        self.state.emitted < self.state.buf.len()
+        self.quarantine.has_pending() || self.state.emitted < self.state.buf.len()
     }
 
-    /// Drain any bytes currently held back due to UTF-8 boundary or
-    /// marker-prefix buffering, *not* including bytes inside an open
-    /// `<think>` block. Intended for use at end-of-stream when the
-    /// caller has already broken on a token-level stop signal and
-    /// wants to flush any bytes the filter was holding pending
-    /// disambiguation. Returns the bytes that were held; caller is
-    /// responsible for emitting them.
-    pub fn flush_pending(&mut self) -> Vec<u8> {
-        if self.state.in_think {
-            // We never flush mid-think content — that was the whole
-            // point of strip_think. Drop pending and stay quiet.
-            self.state.emitted = self.state.buf.len();
+    /// Finalize the stream and drain safe visible bytes held back due to
+    /// UTF-8 or marker-prefix buffering. EOF disambiguates ordinary
+    /// `holdback_prefixes`; incomplete UTF-8 and open `<think>` content are
+    /// discarded. A false stop-marker prefix is recovered. Intended for use
+    /// at end-of-stream; repeated calls are idempotent and return no bytes
+    /// after the first call.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.state.terminal != EosFilterTerminal::Open {
             return Vec::new();
         }
-        let pending = self.state.buf[self.state.emitted..].to_vec();
-        self.state.emitted = self.state.buf.len();
+
+        let mut pending = Vec::new();
+        let raw_pending = self.quarantine.finish();
+        if !raw_pending.is_empty() {
+            if let FilterAction::Emit(bytes) = self.observe_downstream(&raw_pending) {
+                pending.extend(bytes);
+            }
+        }
+        pending.extend(self.finish_visible_pending());
+        self.state.terminal = EosFilterTerminal::Finished;
         pending
     }
 
@@ -139,72 +173,60 @@ impl EosFilter {
     /// action.
     ///
     /// State machine, per call:
-    /// 1. Append `raw_bytes` to the internal buffer.
-    /// 2. Scan from `state.emitted` for any complete `stop_at` match.
-    ///    If found, return `Stop` immediately — the held bytes plus
-    ///    the new bytes are discarded together with the stop marker.
-    /// 3. If `strip_think` is on:
-    ///    - If we are inside a think block, scan for the closer
-    ///      `</think>`. On hit, jump `emitted` past the closer and
-    ///      clear `in_think`; otherwise advance `emitted` to the start
-    ///      of any partial trailing closer prefix and Hold.
-    ///    - If we are outside a think block, scan from `emitted` for
-    ///      the opener `<think>`. On hit, the bytes before the opener
-    ///      are emit candidates; jump `emitted` past the opener and
-    ///      set `in_think`. Otherwise leave `emitted` where it is.
-    /// 4. Compute the maximal "safe" emit prefix:
+    /// 1. Prepend the bounded unresolved raw suffix from the previous call.
+    /// 2. Scan that raw candidate for a complete stop marker. If found,
+    ///    forward only the raw prefix before it downstream and return Stop.
+    /// 3. Otherwise retain the longest unresolved stop-marker prefix and
+    ///    forward the resolved raw prefix downstream.
+    /// 4. The downstream stage computes the maximal "safe" emit prefix:
     ///    - It must end on a UTF-8 codepoint boundary.
     ///    - Its tail must not match any `holdback_prefix`.
     ///    Anything after that point stays buffered.
     /// 5. Return `Emit(prefix)` if non-empty, else `Hold`.
     pub fn observe(&mut self, raw_bytes: &[u8]) -> FilterAction {
-        if raw_bytes.is_empty() && self.state.buf.is_empty() {
+        if self.state.terminal != EosFilterTerminal::Open {
+            return FilterAction::Hold;
+        }
+        if raw_bytes.is_empty() && !self.quarantine.has_pending() && self.state.buf.is_empty() {
             // Nothing in flight. Pre-existing daemon behavior on
             // zero-byte tokens (e.g. "decode_bytes returned empty")
             // was to emit nothing — match it with Hold so the caller
             // does not write a JSON token frame for an empty payload.
             return FilterAction::Hold;
         }
-        self.state.buf.extend_from_slice(raw_bytes);
 
-        // (1) Stop-at scan. Look across the whole accumulated buffer
-        //     so that a marker spanning two tokens still trips. We
-        //     don't scan inside the already-emitted prefix repeatedly
-        //     except for the last `max_stop_len - 1` bytes to catch
-        //     boundary-spanning matches, but keeping it simple and
-        //     scanning from 0 is correct (just O(buf.len())).
-        if !self.config.stop_at.is_empty() {
-            for needle in &self.config.stop_at {
-                if needle.is_empty() {
-                    continue;
+        match self.quarantine.push(raw_bytes) {
+            QuarantineOutcome::Stop { bytes } => {
+                let mut emit = match self.observe_downstream(&bytes) {
+                    FilterAction::Emit(bytes) => bytes,
+                    FilterAction::Hold => Vec::new(),
+                    FilterAction::Stop { .. } => unreachable!("stop scanner owns stop markers"),
+                };
+                emit.extend(self.finish_visible_pending());
+                self.state.terminal = EosFilterTerminal::Stopped;
+                FilterAction::Stop { emit }
                 }
-                if memmem(&self.state.buf, needle).is_some() {
-                    // Discard everything; signal Stop.
-                    return FilterAction::Stop;
+            QuarantineOutcome::Continue { bytes } => self.observe_downstream(&bytes),
                 }
             }
-        }
 
-        // (2) Strip-think state machine.
+    fn observe_downstream(&mut self, raw_bytes: &[u8]) -> FilterAction {
+        if raw_bytes.is_empty() {
+            return FilterAction::Hold;
+        }
+        self.state.buf.extend_from_slice(raw_bytes);
+
         if self.config.strip_think {
             self.advance_think_state();
         }
 
-        // If a strip moved emitted forward past where the buffer
-        // currently ends (impossible, but defensively clamp), bail
-        // with Hold rather than panicking on slice bounds.
         if self.state.emitted > self.state.buf.len() {
             self.state.emitted = self.state.buf.len();
         }
-
-        // While inside a think block, hold everything.
         if self.state.in_think {
             return FilterAction::Hold;
         }
 
-        // (3) Compute safe emit prefix from `emitted` to the start of
-        //     any holdback-prefix tail (or open-think-tag tail when
-        //     strip_think is on).
         let safe_end = self.compute_safe_end();
         if safe_end > self.state.emitted {
             let out = self.state.buf[self.state.emitted..safe_end].to_vec();
@@ -215,8 +237,52 @@ impl EosFilter {
         }
     }
 
-    /// Internal: advance `state.emitted` and toggle `state.in_think`
-    /// based on the buffer contents. Called only when
+    fn finish_visible_pending(&mut self) -> Vec<u8> {
+        let visible_end = if self.state.in_think {
+            self.state
+                .think_start
+                .unwrap_or(self.state.emitted)
+                .min(self.state.buf.len())
+        } else {
+            self.state.buf.len()
+        };
+        let safe_end = self.compute_finish_end_for(visible_end);
+        let pending = if safe_end > self.state.emitted {
+            self.state.buf[self.state.emitted..safe_end].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.state.emitted = self.state.buf.len();
+        self.state.in_think = false;
+        self.state.think_start = None;
+        self.state.think_scan = None;
+        pending
+    }
+
+    fn compute_finish_end_for(&self, hi: usize) -> usize {
+        let buf = &self.state.buf;
+        let lo = self.state.emitted;
+        let hi = hi.min(buf.len());
+        if lo >= hi {
+            return lo;
+        }
+
+        let mut end = utf8_safe_end(&buf[lo..hi]) + lo;
+        if self.config.strip_think {
+            const OPEN: &[u8] = b"<think>";
+            let max_overlap = (end - lo).min(OPEN.len() - 1);
+            for len in (1..=max_overlap).rev() {
+                if buf[end - len..end] == OPEN[..len] {
+                    end -= len;
+                    break;
+                }
+            }
+        }
+        end
+    }
+
+    /// Internal: advance the think scan cursor and toggle
+    /// `state.in_think` based on the buffer contents. Called only when
     /// `config.strip_think` is true.
     ///
     /// We loop because a single token may close one think block and
@@ -231,23 +297,23 @@ impl EosFilter {
             if self.state.in_think {
                 // Inside a think block. Look for `</think>` anywhere
                 // in the unscanned tail.
-                if let Some(idx) = memmem(&self.state.buf[self.state.emitted..], CLOSE) {
-                    // Skip the closer entirely. Bytes after it are
-                    // emit candidates (subject to a possible new
-                    // opener and to the holdback / UTF-8 trims below).
-                    self.state.emitted += idx + CLOSE.len();
+                let scan = self.state.think_scan.unwrap_or(self.state.buf.len());
+                if let Some(idx) = memmem(&self.state.buf[scan..], CLOSE) {
+                    // Remove hidden reasoning and the closer while
+                    // keeping any visible prefix before the opener.
+                    let close_start = scan + idx;
+                    let think_start = self.state.think_start.unwrap_or(close_start);
+                    self.state.buf.drain(think_start..close_start + CLOSE.len());
                     self.state.in_think = false;
+                    self.state.think_start = None;
+                    self.state.think_scan = None;
                     continue;
                 } else {
-                    // No complete closer yet. Advance `emitted` up to
-                    // the start of any partial trailing prefix of
-                    // `</think>`, so when the next token completes it
-                    // we recognize and skip the closer instead of
-                    // re-scanning from 0. The bytes between the old
-                    // `emitted` and the prefix start are inside the
-                    // think block and stay un-emitted.
-                    let cut = trailing_prefix_start(&self.state.buf[self.state.emitted..], CLOSE);
-                    self.state.emitted += cut;
+                    // No complete closer yet. Advance only the hidden
+                    // scan cursor, never the output cursor: visible
+                    // bytes before the opener may still need flushing.
+                    let cut = trailing_prefix_start(&self.state.buf[scan..], CLOSE);
+                    self.state.think_scan = Some(scan + cut);
                     return;
                 }
             } else {
@@ -281,6 +347,8 @@ impl EosFilter {
                     // Mark the think state. `emitted` does not move:
                     // the pre-opener bytes are still pending.
                     self.state.in_think = true;
+                    self.state.think_start = Some(opener_start);
+                    self.state.think_scan = Some(opener_start);
                     continue;
                 } else {
                     // No complete opener. Stop scanning; the
@@ -297,15 +365,16 @@ impl EosFilter {
     ///
     /// - Ends on a UTF-8 codepoint boundary.
     /// - Does NOT have a tail that is a non-empty prefix of any
-    ///   `holdback_prefix` or, if `strip_think` is on, of `<think>`
-    ///   (which would otherwise leak the start of an opener).
-    /// - Does NOT have a tail that is a non-empty prefix of any
-    ///   `stop_at` sequence (else we'd leak the head of a stop marker
-    ///   we would have caught next iteration).
+    ///   non-stop `holdback_prefix` or, if `strip_think` is on, of
+    ///   `<think>` (which would otherwise leak the start of an opener).
     fn compute_safe_end(&self) -> usize {
+        self.compute_safe_end_for(self.state.buf.len())
+    }
+
+    fn compute_safe_end_for(&self, hi: usize) -> usize {
         let buf = &self.state.buf;
         let lo = self.state.emitted;
-        let hi = buf.len();
+        let hi = hi.min(buf.len());
         if lo >= hi {
             return lo;
         }
@@ -314,16 +383,11 @@ impl EosFilter {
         let mut end = utf8_safe_end(&buf[lo..hi]) + lo;
 
         // Trim back further if the trailing bytes match a non-empty
-        // prefix of any holdback / stop-at / think-opener pattern.
+        // prefix of any downstream holdback / think-opener pattern.
         let mut watch_prefixes: Vec<&[u8]> = Vec::new();
         for p in &self.config.holdback_prefixes {
             if !p.is_empty() {
                 watch_prefixes.push(p.as_slice());
-            }
-        }
-        for s in &self.config.stop_at {
-            if !s.is_empty() {
-                watch_prefixes.push(s.as_slice());
             }
         }
         if self.config.strip_think {
@@ -429,14 +493,54 @@ mod tests {
 
     fn cfg_gemma4_eot() -> EosFilterConfig {
         // Mirrors the Gemma 4 daemon path: literal '<end_of_turn>' is
-        // a stop marker, and any prefix of it must be held back so
-        // false-prefix bytes (e.g. '<en' followed by something else)
-        // can flush correctly.
+        // a stop marker. Keep the legacy duplicate prefix here to verify
+        // EosFilter removes stop-owned holdback entries at construction.
         EosFilterConfig {
             strip_think: false,
             stop_at: vec![b"<end_of_turn>".to_vec()],
             holdback_prefixes: vec![b"<end_of_turn>".to_vec()],
         }
+    }
+
+    #[test]
+    fn stop_marker_prefixes_are_not_reheld_downstream() {
+        let filter = EosFilter::new(EosFilterConfig {
+            strip_think: false,
+            stop_at: vec![b"<stop>".to_vec()],
+            holdback_prefixes: vec![b"<st".to_vec(), b"<partial>".to_vec()],
+        });
+        assert_eq!(filter.config.holdback_prefixes, vec![b"<partial>".to_vec()]);
+    }
+
+    fn drain_chunks(config: EosFilterConfig, input: &[u8], cuts: u32) -> (Vec<u8>, bool) {
+        let mut filter = EosFilter::new(config);
+        let mut emitted = Vec::new();
+        let mut offset = 0;
+        for end in 1..=input.len() {
+            if cuts & (1 << (end - 1)) != 0 {
+                match filter.observe(&input[offset..end]) {
+                    FilterAction::Emit(bytes) => emitted.extend(bytes),
+                    FilterAction::Hold => {}
+                    FilterAction::Stop { emit } => {
+                        emitted.extend(emit);
+                        return (emitted, true);
+                    }
+                }
+                offset = end;
+            }
+        }
+        if offset < input.len() {
+            match filter.observe(&input[offset..]) {
+                FilterAction::Emit(bytes) => emitted.extend(bytes),
+                FilterAction::Hold => {}
+                FilterAction::Stop { emit } => {
+                    emitted.extend(emit);
+                    return (emitted, true);
+                }
+            }
+        }
+        emitted.extend(filter.finish());
+        (emitted, false)
     }
 
     #[test]
@@ -498,7 +602,136 @@ mod tests {
     fn stop_at_full_match_returns_stop() {
         let mut f = EosFilter::new(cfg_im_end());
         assert_eq!(f.observe(b"hi"), FilterAction::Emit(b"hi".to_vec()));
-        assert_eq!(f.observe(b"<|im_end|>"), FilterAction::Stop);
+        assert_eq!(
+            f.observe(b"<|im_end|>"),
+            FilterAction::Stop { emit: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn stop_discards_marker_but_preserves_safe_visible_prefix_once() {
+        let mut f = EosFilter::new(cfg_im_end());
+        assert_eq!(
+            f.observe(b"safe<|im_end|>"),
+            FilterAction::Stop {
+                emit: b"safe".to_vec()
+            }
+        );
+        assert_eq!(f.finish(), Vec::<u8>::new());
+        assert_eq!(f.finish(), Vec::<u8>::new());
+        assert_eq!(f.observe(b"after-stop"), FilterAction::Hold);
+    }
+
+    #[test]
+    fn stop_inside_think_discards_hidden_bytes() {
+        let mut f = EosFilter::new(EosFilterConfig {
+            strip_think: true,
+            stop_at: vec![b"<|im_end|>".to_vec()],
+            holdback_prefixes: Vec::new(),
+        });
+        assert_eq!(
+            f.observe(b"safe<think>hidden<|im_end|></think>"),
+            FilterAction::Stop {
+                emit: b"safe".to_vec()
+            }
+        );
+        assert_eq!(f.finish(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn literal_marker_inside_reasoning_stops_at_raw_position() {
+        let mut f = EosFilter::new(EosFilterConfig {
+            strip_think: true,
+            stop_at: vec![b"<stop>".to_vec()],
+            holdback_prefixes: Vec::new(),
+        });
+        assert_eq!(
+            f.observe(b"visible<think>hidden<stop>after"),
+            FilterAction::Stop {
+                emit: b"visible".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn marker_after_prior_stripped_reasoning_stops_normally() {
+        let mut f = EosFilter::new(EosFilterConfig {
+            strip_think: true,
+            stop_at: vec![b"<stop>".to_vec()],
+            holdback_prefixes: Vec::new(),
+        });
+        assert_eq!(
+            f.observe(b"before<think>hidden</think>after"),
+            FilterAction::Emit(b"beforeafter".to_vec())
+        );
+        assert_eq!(
+            f.observe(b"<stop>suffix"),
+            FilterAction::Stop { emit: Vec::new() }
+        );
+        assert_eq!(f.finish(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn reasoning_stripping_does_not_synthesize_stop_marker() {
+        let mut f = EosFilter::new(EosFilterConfig {
+            strip_think: true,
+            stop_at: vec![b"ab".to_vec()],
+            holdback_prefixes: Vec::new(),
+        });
+        // The bytes forming `ab` are separated by stripped reasoning in the
+        // literal input, so they must not become a stop marker after stripping.
+        assert_eq!(
+            f.observe(b"a<think>hidden</think>b"),
+            FilterAction::Emit(b"ab".to_vec())
+        );
+        assert_eq!(f.observe(b"c"), FilterAction::Emit(b"c".to_vec()));
+        assert!(f.finish().is_empty());
+    }
+
+    #[test]
+    fn identical_start_stop_markers_choose_longest() {
+        let mut f = EosFilter::new(EosFilterConfig {
+            strip_think: false,
+            stop_at: vec![b"ab".to_vec(), b"abc".to_vec()],
+            holdback_prefixes: Vec::new(),
+        });
+        assert_eq!(
+            f.observe(b"safeabc-tail"),
+            FilterAction::Stop {
+                emit: b"safe".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn earliest_stop_marker_wins_across_multiple_patterns() {
+        let mut f = EosFilter::new(EosFilterConfig {
+            strip_think: false,
+            stop_at: vec![b"!".to_vec(), b"<long>".to_vec()],
+            holdback_prefixes: Vec::new(),
+        });
+        assert_eq!(
+            f.observe(b"safe!leak<long>"),
+            FilterAction::Stop {
+                emit: b"safe".to_vec()
+            }
+        );
+        // The later, longer marker must not cause `!leak` to be retained or
+        // leak either marker during finalization.
+        assert_eq!(f.finish(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn observe_is_silent_while_stopped_before_finish() {
+        let mut f = EosFilter::new(cfg_im_end());
+        assert_eq!(
+            f.observe(b"safe<|im_end|>"),
+            FilterAction::Stop {
+                emit: b"safe".to_vec()
+            }
+        );
+        assert_eq!(f.observe(b"after-stop"), FilterAction::Hold);
+        assert_eq!(f.finish(), Vec::<u8>::new());
     }
 
     #[test]
@@ -523,7 +756,56 @@ mod tests {
         let mut f = EosFilter::new(cfg_gemma4_eot());
         assert_eq!(f.observe(b"<en"), FilterAction::Hold);
         // The continuation completes the marker — Stop.
-        assert_eq!(f.observe(b"d_of_turn>"), FilterAction::Stop);
+        assert_eq!(
+            f.observe(b"d_of_turn>"),
+            FilterAction::Stop { emit: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn finish_flushes_ordinary_holdback_prefix() {
+        let mut f = EosFilter::new(EosFilterConfig {
+            strip_think: false,
+            stop_at: Vec::new(),
+            holdback_prefixes: vec![b"<partial>".to_vec()],
+        });
+        assert_eq!(
+            f.observe(b"visible<part"),
+            FilterAction::Emit(b"visible".to_vec())
+        );
+        assert_eq!(f.finish(), b"<part");
+    }
+
+    #[test]
+    fn exhaustive_splits_stop_on_overlapping_markers() {
+        let input = b"safeabab-tail";
+        let config = EosFilterConfig {
+            strip_think: false,
+            stop_at: vec![b"aba".to_vec(), b"bab".to_vec()],
+            holdback_prefixes: Vec::new(),
+        };
+        let split_count = input.len() - 1;
+        for cuts in 0..(1u32 << split_count) {
+            assert_eq!(
+                drain_chunks(config.clone(), input, cuts),
+                (b"safe".to_vec(), true),
+                "cuts={cuts:#b}"
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_splits_finish_false_stop_prefix_when_valid_utf8() {
+        let input = b"visible<en";
+        let config = cfg_gemma4_eot();
+        let split_count = input.len() - 1;
+        for cuts in 0..(1u32 << split_count) {
+            assert_eq!(
+                drain_chunks(config.clone(), input, cuts),
+                (input.to_vec(), false),
+                "cuts={cuts:#b}"
+            );
+        }
     }
 
     #[test]
@@ -537,20 +819,54 @@ mod tests {
     }
 
     #[test]
-    fn flush_pending_drains_held_utf8_bytes() {
-        // When the caller breaks on a token-level stop signal but the
-        // filter still has half a UTF-8 codepoint buffered, the caller
-        // can call flush_pending to drain. (In practice the held
-        // bytes are a half-codepoint and would render as REPLACEMENT
-        // CHARACTER; flush_pending exposes them so the caller can
-        // decide what to do.)
+    fn finish_discards_incomplete_utf8_bytes() {
         let mut f = EosFilter::new(cfg_default());
         let smile = "😀".as_bytes();
         assert_eq!(f.observe(&smile[..2]), FilterAction::Hold);
-        let drained = f.flush_pending();
-        assert_eq!(drained, &smile[..2]);
-        // After flush, has_pending must be false.
+        let drained = f.finish();
+        assert!(drained.is_empty());
+        // After finish, has_pending must be false.
         assert!(!f.has_pending());
+    }
+
+    #[test]
+    fn finish_emits_valid_unresolved_marker_suffix() {
+        let mut f = EosFilter::new(cfg_gemma4_eot());
+        assert_eq!(
+            f.observe(b"visible<en"),
+            FilterAction::Emit(b"visible".to_vec())
+        );
+        assert_eq!(f.finish(), b"<en");
+        assert_eq!(f.finish(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn finish_discards_open_think_content_but_keeps_visible_prefix() {
+        let mut f = EosFilter::new(cfg_strip_think());
+        assert_eq!(f.observe(b"visible<think>secret"), FilterAction::Hold);
+        assert_eq!(f.finish(), b"visible");
+        assert_eq!(f.finish(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn reset_reopens_a_stopped_or_finished_filter() {
+        let mut f = EosFilter::new(cfg_im_end());
+        assert_eq!(
+            f.observe(b"<|im_end|>"),
+            FilterAction::Stop { emit: Vec::new() }
+        );
+        assert!(f.finish().is_empty());
+        f.reset();
+        assert_eq!(f.observe(b"open"), FilterAction::Emit(b"open".to_vec()));
+
+        let mut f = EosFilter::new(cfg_default());
+        assert_eq!(f.observe(b"held<"), FilterAction::Emit(b"held<".to_vec()));
+        assert!(f.finish().is_empty());
+        f.reset();
+        assert_eq!(
+            f.observe(b"open-again"),
+            FilterAction::Emit(b"open-again".to_vec())
+        );
     }
 
     #[test]
@@ -561,6 +877,17 @@ mod tests {
         // a stop_at sequence, so they must be held back, not emitted
         // as plain text.
         assert_eq!(f.observe(b"<|im_"), FilterAction::Hold);
-        assert_eq!(f.observe(b"end|>"), FilterAction::Stop);
+        assert_eq!(f.observe(b"end|>"), FilterAction::Stop { emit: Vec::new() });
+    }
+
+    #[test]
+    fn finish_flushes_unresolved_scanner_suffix() {
+        let mut f = EosFilter::new(cfg_im_end());
+        assert_eq!(
+            f.observe(b"safe<|im_"),
+            FilterAction::Emit(b"safe".to_vec())
+        );
+        assert_eq!(f.finish(), b"<|im_");
+        assert_eq!(f.finish(), Vec::<u8>::new());
     }
 }

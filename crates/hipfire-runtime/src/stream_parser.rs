@@ -229,13 +229,29 @@ impl StreamParser for DefaultStreamParser {
         self.decoded.extend_from_slice(bytes);
 
         // ── Emit (running-vector delta through the filter). ──
-        if let FilterAction::Emit(text_bytes) = self.filter.observe(bytes) {
+        match self.filter.observe(bytes) {
+            FilterAction::Emit(text_bytes) => {
             if let Ok(text) = std::str::from_utf8(&text_bytes) {
                 acts.push(StreamAction::Emit {
                     text: text.to_string(),
                     reasoning: false,
                 });
             }
+        }
+            FilterAction::Stop { emit } => {
+                if let Ok(text) = std::str::from_utf8(&emit) {
+                    if !text.is_empty() {
+                        acts.push(StreamAction::Emit {
+                            text: text.to_string(),
+                            reasoning: false,
+                        });
+                    }
+                }
+                self.generated += 1;
+                acts.push(StreamAction::Stop);
+                return acts;
+            }
+            FilterAction::Hold => {}
         }
         self.generated += 1;
 
@@ -351,13 +367,27 @@ impl StreamParser for DefaultStreamParser {
         self.streamed.push(tok);
         self.decoded.extend_from_slice(bytes);
         let mut acts = Vec::new();
-        if let FilterAction::Emit(text_bytes) = self.filter.observe(bytes) {
+        match self.filter.observe(bytes) {
+            FilterAction::Emit(text_bytes) => {
             if let Ok(text) = std::str::from_utf8(&text_bytes) {
                 acts.push(StreamAction::Emit {
                     text: text.to_string(),
                     reasoning: false,
                 });
             }
+        }
+            FilterAction::Stop { emit } => {
+                if let Ok(text) = std::str::from_utf8(&emit) {
+                    if !text.is_empty() {
+                        acts.push(StreamAction::Emit {
+                            text: text.to_string(),
+                            reasoning: false,
+                        });
+                    }
+                }
+                acts.push(StreamAction::Stop);
+            }
+            FilterAction::Hold => {}
         }
         acts
     }
@@ -367,8 +397,17 @@ impl StreamParser for DefaultStreamParser {
     }
 
     fn finish(&mut self) -> Vec<StreamAction> {
-        // Current behavior DROPS EosFilter pending bytes at end of turn (never flushes).
-        Vec::new()
+        let pending = self.filter.finish();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        match std::str::from_utf8(&pending) {
+            Ok(text) if !text.is_empty() => vec![StreamAction::Emit {
+                text: text.to_string(),
+                reasoning: false,
+            }],
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -394,6 +433,62 @@ mod tests {
     }
 
     #[test]
+    fn filter_stop_emits_safe_prefix_then_stop_without_marker() {
+        let mut cfg = plain_cfg();
+        cfg.eos_filter = EosFilterConfig {
+            strip_think: false,
+            stop_at: vec![b"<stop>".to_vec()],
+            holdback_prefixes: Vec::new(),
+        };
+        let mut p = DefaultStreamParser::new(cfg);
+        assert_eq!(
+            p.feed(1, b"safe<stop>leaked"),
+            vec![
+                StreamAction::Emit {
+                    text: "safe".into(),
+                    reasoning: false,
+                },
+                StreamAction::Stop,
+            ]
+        );
+    }
+
+    #[test]
+    fn emit_only_returns_filter_stop_prefix_without_marker() {
+        let mut cfg = plain_cfg();
+        cfg.eos_filter = EosFilterConfig {
+            strip_think: false,
+            stop_at: vec![b"<stop>".to_vec()],
+            holdback_prefixes: Vec::new(),
+        };
+        let mut p = DefaultStreamParser::new(cfg);
+        let actions = p.emit_only(1, b"safe<stop>leaked");
+        assert_eq!(
+            actions,
+            vec![
+                StreamAction::Emit {
+                    text: "safe".into(),
+                    reasoning: false,
+                },
+                StreamAction::Stop,
+            ]
+        );
+        assert!(p.emit_only(2, b"after-stop").is_empty());
+    }
+
+    #[test]
+    fn filter_stop_without_visible_prefix_returns_only_stop() {
+        let mut cfg = plain_cfg();
+        cfg.eos_filter = EosFilterConfig {
+            strip_think: false,
+            stop_at: vec![b"<stop>".to_vec()],
+            holdback_prefixes: Vec::new(),
+        };
+        let mut p = DefaultStreamParser::new(cfg);
+        assert_eq!(p.feed(1, b"<stop>"), vec![StreamAction::Stop]);
+    }
+
+    #[test]
     fn on_eos_default_is_commit_and_stop() {
         let mut p = DefaultStreamParser::new(plain_cfg());
         assert_eq!(p.on_eos(), EosDecision::CommitAndStop);
@@ -416,9 +511,36 @@ mod tests {
     }
 
     #[test]
-    fn finish_is_empty_no_flush() {
-        let mut p = DefaultStreamParser::new(plain_cfg());
-        let _ = p.feed(1, b"partial");
+    fn finish_emits_held_visible_suffix_once() {
+        let mut cfg = plain_cfg();
+        cfg.eos_filter = EosFilterConfig {
+            strip_think: true,
+            stop_at: Vec::new(),
+            holdback_prefixes: vec![b"<partial>".to_vec()],
+        };
+        let mut p = DefaultStreamParser::new(cfg);
+        assert!(p.feed(1, b"visible<think>reason").is_empty());
+        assert_eq!(
+            p.finish(),
+            vec![StreamAction::Emit {
+                text: "visible".into(),
+                reasoning: false,
+            }]
+        );
+        assert_eq!(p.finish(), Vec::new());
+    }
+
+    #[test]
+    fn finish_suppresses_open_thinking_content() {
+        let mut cfg = plain_cfg();
+        cfg.eos_filter = EosFilterConfig {
+            strip_think: true,
+            stop_at: Vec::new(),
+            holdback_prefixes: Vec::new(),
+        };
+        let mut p = DefaultStreamParser::new(cfg);
+        assert!(p.feed(1, b"<think>secret").is_empty());
+        assert_eq!(p.finish(), Vec::new());
         assert_eq!(p.finish(), Vec::new());
     }
 
