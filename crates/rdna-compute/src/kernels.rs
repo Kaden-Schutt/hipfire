@@ -1568,6 +1568,7 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_GFX1151_SRC: &str = con
     "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
     "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
     "#define HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_DPP_REDUCE 1\n",
     "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),

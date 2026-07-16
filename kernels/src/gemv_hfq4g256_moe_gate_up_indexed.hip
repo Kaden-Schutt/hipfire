@@ -33,6 +33,10 @@ using hipfire_gate_u32x2 = unsigned int __attribute__((ext_vector_type(2)));
 #define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 0
 #endif
 
+#ifndef HIPFIRE_MOE_GATE_UP_DPP_REDUCE
+#define HIPFIRE_MOE_GATE_UP_DPP_REDUCE 0
+#endif
+
 #if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
 #define HIPFIRE_MOE_GATE_UP_BLOCK 64
 #define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 8
@@ -507,10 +511,33 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     float gacc = (gacc0 + gacc1) + (gacc2 + gacc3);
     float uacc = (uacc0 + uacc1) + (uacc2 + uacc3);
     // Dual-issue gate+up shfl-reduce (residual style); per-acc add order unchanged.
+#if HIPFIRE_MOE_GATE_UP_DPP_REDUCE
+    // Preserve the __shfl_down reduction tree exactly. The offset-16 step
+    // crosses DPP's 16-lane row boundary and remains a shuffle; the remaining
+    // steps read higher lanes within each row through row_shl DPP controls.
+    // Only lane 0 stores, so out-of-row values cannot feed the result.
+    gacc += __shfl_down(gacc, 16);
+    uacc += __shfl_down(uacc, 16);
+    #define HIPFIRE_GATE_UP_DPP_DOWN(value, ctrl) do { \
+        const int _bits = __hip_move_dpp( \
+            __float_as_int(value), (ctrl), 0xf, 0xf, false); \
+        (value) += __int_as_float(_bits); \
+    } while (0)
+    HIPFIRE_GATE_UP_DPP_DOWN(gacc, 0x108);
+    HIPFIRE_GATE_UP_DPP_DOWN(uacc, 0x108);
+    HIPFIRE_GATE_UP_DPP_DOWN(gacc, 0x104);
+    HIPFIRE_GATE_UP_DPP_DOWN(uacc, 0x104);
+    HIPFIRE_GATE_UP_DPP_DOWN(gacc, 0x102);
+    HIPFIRE_GATE_UP_DPP_DOWN(uacc, 0x102);
+    HIPFIRE_GATE_UP_DPP_DOWN(gacc, 0x101);
+    HIPFIRE_GATE_UP_DPP_DOWN(uacc, 0x101);
+    #undef HIPFIRE_GATE_UP_DPP_DOWN
+#else
     for (int offset = 16; offset > 0; offset >>= 1) {
         gacc += __shfl_down(gacc, offset);
         uacc += __shfl_down(uacc, offset);
     }
+#endif
 
     if (tid == 0) {
         y_gate[krank * mi + row] = gacc;
