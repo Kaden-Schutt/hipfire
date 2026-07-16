@@ -3526,6 +3526,106 @@ impl Gpu {
         result
     }
 
+    /// gfx1201 fixed-B4 verifier fusion of conv+SiLU, Q/K normalization, and
+    /// repeat-interleave. Q/K outputs use the expanded value-head layout.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_silu_split_qknorm_interleave_b4_gfx12(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_heads: usize,
+        ratio: usize,
+        head_dim: usize,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() || head_dim != 128 || n_tokens != 4 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "conv QK-interleave B4 fusion requires gfx1201, head_dim=128, n_tokens=4",
+            ));
+        }
+        const KERNEL: &str = "conv1d_silu_split_qknorm_interleave_b4";
+        const BLOCK: u32 = 256;
+        self.ensure_kernel(
+            KERNEL,
+            kernels::CONV1D_SILU_SPLIT_QKNORM_INTERLEAVE_B4_GFX12_SRC,
+            KERNEL,
+        )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nh = n_heads as i32;
+        let rt = ratio as i32;
+        let hd = head_dim as i32;
+        let nt = n_tokens as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &rt as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let v_blocks = (v_dim as u32 + BLOCK - 1) / BLOCK;
+        let grid = n_heads as u32 + v_blocks;
+        let bytes = crate::profile::conv1d_silu_bytes(2 * k_dim + v_dim) * n_tokens;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid, 1, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nh);
+                b.push_i32(rt);
+                b.push_i32(hd);
+                b.push_i32(nt);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// gfx1100 decode experiment: use one extra workgroup in the existing
     /// conv/QK-normalization launch to prepare the independent DeltaNet beta
     /// and alpha scalars. This removes the standalone scalar launch without

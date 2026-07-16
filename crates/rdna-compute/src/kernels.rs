@@ -3743,6 +3743,11 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
     include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
 );
 
+/// gfx1201 fixed-B4 verifier fusion: conv+SiLU, Q/K normalization, and
+/// repeat-interleave in one launch while preserving sequential conv state.
+pub const CONV1D_SILU_SPLIT_QKNORM_INTERLEAVE_B4_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm_interleave_b4.gfx12.hip");
+
 /// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
 /// ancestor chain via parent_indices[] for the 3-tap causal window, falling
 /// back to pre-block conv_state when the chain exits the block. Leaves

@@ -10571,6 +10571,18 @@ fn forward_prefill_chunk(
                 }
                 // Same tree-aware dispatch gate as dense LA branch above.
                 let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+                static MTP_CONV_QKI_B4: std::sync::OnceLock<bool> =
+                    std::sync::OnceLock::new();
+                let mtp_conv_qki_b4 = *MTP_CONV_QKI_B4.get_or_init(|| {
+                    std::env::var("HIPFIRE_MTP_CONV_QKI_B4")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                }) && gpu.arch_caps.is_gfx1201()
+                    && n == 4
+                    && config.linear_key_head_dim == 128
+                    && config.linear_num_key_heads < n_v_heads
+                    && tree_parents.is_none();
                 if let Some(parents) = tree_parents {
                     gpu.conv1d_silu_split_tree_f32_n(
                         &pbs.dn_q_raw_batch,
@@ -10583,6 +10595,24 @@ fn forward_prefill_chunk(
                         k_dim,
                         v_dim,
                         n,
+                    )?;
+                } else if mtp_conv_qki_b4 {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    gpu.conv1d_silu_split_qknorm_interleave_b4_gfx12(
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim,
+                        v_dim,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
+                        n,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
                     )?;
                 } else {
                     gpu.conv1d_silu_split_f32_n(
@@ -10608,7 +10638,9 @@ fn forward_prefill_chunk(
                         .as_deref()
                         == Some("1")
                 });
-                if fused_mtp_qk_interleave
+                if mtp_conv_qki_b4 {
+                    // Produced directly in expanded, normalized form above.
+                } else if fused_mtp_qk_interleave
                     && gpu.arch_caps.is_gfx1201()
                     && n == 4
                     && config.linear_num_key_heads < n_v_heads
