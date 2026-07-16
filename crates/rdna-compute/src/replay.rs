@@ -490,7 +490,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
-        "gemv_hfq4g256_residual_sigmoid_scaled_gpu" => {
+        "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        | "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched" => {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
@@ -501,7 +502,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2" => {
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
@@ -627,12 +630,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        | "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched"
         | "kv_cache_write_asym_k_fwht3"
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
         | "repeat_interleave_qk_f32_batched"
         | "rope_partial_halfsplit_f32" => Some(48),
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => Some(56),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "qwen35_fa_prep_gfx1100"
@@ -1181,6 +1187,14 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
+            )
+            | (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
             )
     )
 }
@@ -2709,6 +2723,30 @@ mod tests {
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
             "fused_silu_mul_mq_rotate",
         ));
+        assert!(independent_sibling(
+            "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
+        ));
+        assert_eq!(
+            expected_kernarg_bytes("gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched"),
+            Some(48),
+        );
+        assert_eq!(
+            expected_kernarg_bytes("gemv_hfq4g256_moe_gate_up_k8_indexed_batched"),
+            Some(56),
+        );
+        let shared = pointer_effects("gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched")
+            .expect("batched shared-expert ABI must be catalogued");
+        assert_eq!(shared.len(), 4);
+        assert_eq!(shared[2].offset, 16);
+        assert_eq!(shared[2].mode, RecordedAccessMode::Write);
+        let routed = pointer_effects("gemv_hfq4g256_moe_gate_up_k8_indexed_batched")
+            .expect("batched routed-expert ABI must be catalogued");
+        assert_eq!(routed.len(), 5);
+        assert_eq!(routed[3].offset, 24);
+        assert_eq!(routed[3].mode, RecordedAccessMode::Write);
+        assert_eq!(routed[4].offset, 32);
+        assert_eq!(routed[4].mode, RecordedAccessMode::Write);
     }
 
     #[test]
