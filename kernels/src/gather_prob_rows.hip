@@ -55,3 +55,14 @@ extern "C" __global__ void copy_f32_replayable(
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) dst[i] = src[i];
 }
+
+// Replay-visible replacement for hipMemsetAsync inside a retained kernel
+// sequence. PM4 replay does not re-enter the HIP runtime, so residual GEMM
+// outputs that require zero-init must make that write part of the tape.
+extern "C" __global__ void zero_f32_replayable(
+    float* __restrict__ dst,
+    int n
+) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) dst[i] = 0.0f;
+}

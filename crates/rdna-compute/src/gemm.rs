@@ -15414,20 +15414,15 @@ impl Gpu {
         // gfx12 falls through to the scalar `gemm_hfq4g256` and pays the
         // 8-10× per-call penalty (rocprof on R9700 / gfx1201 measured
         // ~26.68% of composition cycle wall in this scalar path).
-        let arch = self.arch.as_str();
+        let gfx12 = self.arch.starts_with("gfx12");
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
-            match self.active_stream.as_ref() {
-                Some(stream) => self
-                    .hip
-                    .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
-                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
-            }
-            return if arch.starts_with("gfx12") {
+            self.zero_f32_replayable(y, batch_size * m)?;
+            return if gfx12 {
                 self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
             } else {
                 self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)

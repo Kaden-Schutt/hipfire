@@ -171,6 +171,48 @@ impl Gpu {
         )
     }
 
+    /// Zero an F32 tensor view while making the write visible to a retained
+    /// Redline sequence. Ordinary HIP execution keeps the runtime memset.
+    pub fn zero_f32_replayable(&mut self, dst: &GpuTensor, n: usize) -> HipResult<()> {
+        if !self.replay.is_recording() {
+            return match self.active_stream.as_ref() {
+                Some(stream) => {
+                    self.hip
+                        .memset_async(&dst.buf, 0, n * std::mem::size_of::<f32>(), stream)
+                }
+                None => self.hip.memset(&dst.buf, 0, n * std::mem::size_of::<f32>()),
+            };
+        }
+
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gather_prob_rows",
+            kernels::GATHER_PROB_ROWS_SRC,
+            "zero_f32_replayable",
+        )?;
+        let dst_ptr = dst.buf.as_ptr();
+        let count = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &dst_ptr as *const _ as *mut c_void,
+            &count as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (n as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "zero_f32_replayable",
+            [grid.max(1), 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(dst_ptr);
+                blob.push_i32(count);
+                blob
+            },
+        )
+    }
+
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
         &mut self,

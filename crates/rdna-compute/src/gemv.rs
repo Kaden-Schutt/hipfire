@@ -3122,22 +3122,44 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        // bind_thread: skip — delegated to scratch.rs
+        self.bind_thread()?;
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
-        self.scratch.rotate_x_mq_batched(
-            &self.hip,
-            &self.functions,
-            self.active_stream.as_ref(),
-            &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
-            &mut self.pool,
-            self.device_id,
-            x,
-            x_rot,
-            k,
-            batch_size,
-        )
+        self.ensure_mq_signs()?;
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "mq_rotate_x",
+            [(k / 256) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xrp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
     }
 
     /// FWHT-128 standalone rotation for MQ4G128 activations.
