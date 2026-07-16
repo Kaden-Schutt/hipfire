@@ -4,6 +4,7 @@
 from .models import (
     AttemptIntent,
     Finding,
+    GitHubEnvelope,
     ProviderPolicy,
     ReviewProposal,
     ReviewTarget,
@@ -33,6 +34,7 @@ from .protocol import (
 __all__ = [
     "AttemptIntent",
     "Finding",
+    "GitHubEnvelope",
     "ProviderPolicy",
     "ReviewProposal",
     "ReviewTarget",

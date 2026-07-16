@@ -117,11 +117,42 @@ class ReviewTarget:
 
 
 @dataclass(frozen=True)
+class GitHubEnvelope(Mapping[str, Any]):
+    """Server-supplied GitHub facts paired with an immutable protocol payload.
+
+    Construction is a typed data contract only.  This class does not prove
+    provenance; the fixed-endpoint GitHub client in Task 3 must supply and
+    authenticate these fields before protocol validators consume the value.
+    """
+
+    payload: Mapping[str, Any]
+    node_id: str
+    author: str
+    created_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload, Mapping):
+            raise ValueError("payload must be a mapping")
+        _require_text("node_id", self.node_id)
+        _require_text("author", self.author)
+        _require_text("created_at", self.created_at)
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in {"payload", "node_id", "author", "created_at"}:
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __iter__(self):
+        return iter(("payload", "node_id", "author", "created_at"))
+
+    def __len__(self) -> int:
+        return 4
+
+
+@dataclass(frozen=True)
 class AttemptIntent:
     target: ReviewTarget
     attempt_id: str
-    principal: str
-    intent_node_id: str
     capability_id: str
     suite_revision: str
     provider_id: str = "default"
@@ -131,8 +162,6 @@ class AttemptIntent:
             raise ValueError("target must be a ReviewTarget")
         for name, value in (
             ("attempt_id", self.attempt_id),
-            ("principal", self.principal),
-            ("intent_node_id", self.intent_node_id),
             ("capability_id", self.capability_id),
             ("suite_revision", self.suite_revision),
             ("provider_id", self.provider_id),

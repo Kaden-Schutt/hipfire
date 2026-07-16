@@ -1,12 +1,14 @@
 # Copyright (c) Kaden Schutt
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from autoresearch.ar.review.canonical import canonical_digest, canonical_json, canonical_loads, metadata_digest
 from autoresearch.ar.review.models import ReviewTarget
+from autoresearch.ar.review.models import GitHubEnvelope
 from autoresearch.ar.review.protocol import (
     elect_canonical_attempt,
     validate_append_only,
@@ -30,25 +32,22 @@ def _self_digest(payload, field):
 
 
 def _envelope(payload, node_id, *, author="review-bot", created_at="2026-01-01T00:00:00Z"):
-    envelope = {
-        "payload": payload,
-        "payload_digest": canonical_digest(payload),
-        "node_id": node_id,
-        "author": author,
-        "created_at": created_at,
-    }
-    envelope["envelope_digest"] = canonical_digest(
-        {key: envelope[key] for key in ("author", "created_at", "node_id", "payload_digest")}
-    )
-    return envelope
+    return GitHubEnvelope(payload=payload, node_id=node_id, author=author, created_at=created_at)
 
 
 def _refresh_envelope(envelope):
-    envelope["payload_digest"] = canonical_digest(envelope["payload"])
-    envelope["envelope_digest"] = canonical_digest(
-        {key: envelope[key] for key in ("author", "created_at", "node_id", "payload_digest")}
+    if isinstance(envelope, GitHubEnvelope):
+        return envelope
+    return GitHubEnvelope(
+        payload=envelope["payload"],
+        node_id=envelope["node_id"],
+        author=envelope["author"],
+        created_at=envelope["created_at"],
     )
-    return envelope
+
+
+def _payload_digest(envelope):
+    return canonical_digest(envelope.payload)
 
 
 def _intent(
@@ -98,7 +97,7 @@ def _metadata(intent, report, node_id="gh-metadata-a", *, created_at="2026-01-01
         "head_sha": TARGET.head_sha,
         "report_record_id": report_payload["record_id"],
         "report_node_id": report["node_id"],
-        "report_digest": report["payload_digest"],
+        "report_digest": _payload_digest(report),
         "report_body_sha256": report_payload["report_body_sha256"],
         "canonical_intent_digest": intent["payload"]["canonical_digest"],
         "canonical_intent_node_id": intent["node_id"],
@@ -120,7 +119,7 @@ def _completion(intent, report, metadata, node_id="gh-completion-a", *, created_
         "canonical_intent_node_id": intent["node_id"],
         "report_record_id": report["payload"]["record_id"],
         "report_node_id": report["node_id"],
-        "report_digest": report["payload_digest"],
+        "report_digest": _payload_digest(report),
         "metadata_record_id": metadata["payload"]["record_id"],
         "metadata_digest": metadata["payload"]["metadata_digest"],
     }
@@ -150,6 +149,10 @@ def test_jcs_vectors_cover_reordered_keys_controls_utf16_and_safe_numbers():
     for value in VECTORS["regressions"]["unsafe_integers"]:
         with pytest.raises(ValueError, match="safe range"):
             canonical_json(value)
+    for vector in VECTORS["regressions"]["floats"]:
+        encoded = canonical_json(vector["value"])
+        assert encoded == vector["canonical_utf8"].encode()
+        assert hashlib.sha256(encoded).hexdigest() == vector["sha256"]
     metadata_vector = VECTORS["metadata"][0]
     assert metadata_digest(metadata_vector["value"]) == metadata_vector["digest"]
 
@@ -161,33 +164,63 @@ def test_canonical_json_rejects_duplicate_keys_nonfinite_and_limits():
         canonical_json(float("inf"))
     with pytest.raises(ValueError, match="byte limit"):
         canonical_json("abcd", max_bytes=3)
+    with pytest.raises(ValueError, match="surrogate|Unicode"):
+        canonical_json("\ud800")
+    with pytest.raises(ValueError, match="malformed|surrogate|Unicode"):
+        canonical_loads('"\\ud800"')
+    with pytest.raises(ValueError, match="malformed|Unicode"):
+        canonical_loads(b'"\xed\xa0\x80"')
+
+
+def test_trusted_authors_requires_a_collection_of_complete_identities():
+    with pytest.raises(ValueError, match="trusted_authors"):
+        validate_intent(_intent(), trusted_authors="review-bot")
+    with pytest.raises(ValueError, match="trusted_authors"):
+        validate_intent(_intent(), trusted_authors=b"review-bot")
+    with pytest.raises(ValueError, match="trusted_authors"):
+        validate_intent(_intent(), trusted_authors=["", "review-bot"])
+
+
+def test_direct_intent_and_revocation_validators_require_nonempty_fields():
+    intent = _intent()
+    intent_payload = dict(intent.payload, attempt_id="")
+    intent_payload["canonical_digest"] = canonical_digest(
+        {key: value for key, value in intent_payload.items() if key != "canonical_digest"}
+    )
+    intent = replace(intent, payload=intent_payload)
+    with pytest.raises(ValueError, match="attempt_id"):
+        validate_intent(intent, trusted_authors=TRUSTED)
+    valid_intent = _intent()
+    revocation = _revocation(valid_intent)
+    revocation = replace(revocation, payload=dict(revocation.payload, reason=""))
+    with pytest.raises(ValueError, match="reason"):
+        validate_revocation(revocation, valid_intent, trusted_authors=TRUSTED)
 
 
 def test_envelopes_bind_payload_and_do_not_accept_spoofed_server_facts():
     intent = _intent()
     validate_intent(intent, trusted_authors=TRUSTED)
     tampered = dict(intent, node_id="spoofed")
-    with pytest.raises(ValueError, match="envelope"):
+    with pytest.raises(ValueError, match="typed GitHubEnvelope"):
         validate_intent(tampered, trusted_authors=TRUSTED)
     tampered = _intent()
-    tampered["payload"]["author"] = "attacker"
-    tampered["payload_digest"] = canonical_digest(tampered["payload"])
+    tampered = _refresh_envelope(dict(tampered, payload=dict(tampered["payload"], author="attacker")))
     with pytest.raises(ValueError, match="server|payload"):
         validate_intent(tampered, trusted_authors=TRUSTED)
     tampered = _intent()
-    tampered["payload_digest"] = "0" * 64
-    with pytest.raises(ValueError, match="payload digest"):
-        validate_intent(tampered, trusted_authors=TRUSTED)
+    with pytest.raises(ValueError, match="typed GitHubEnvelope"):
+        validate_intent(dict(tampered), trusted_authors=TRUSTED)
 
 
 def test_post_publication_envelope_facts_are_authenticated_and_trusted():
     intent = _intent()
     with pytest.raises(ValueError, match="trusted"):
-        validate_intent(dict(intent, author="untrusted"), trusted_authors=TRUSTED)
-    with pytest.raises(ValueError, match="envelope"):
-        validate_intent(dict(intent, created_at="2025-01-01T00:00:00Z"), trusted_authors=TRUSTED)
-    with pytest.raises(ValueError, match="envelope"):
-        validate_intent(dict(intent, node_id="different-node"), trusted_authors=TRUSTED)
+        validate_intent(replace(intent, author="untrusted"), trusted_authors=TRUSTED)
+    with pytest.raises(ValueError, match="timezone"):
+        validate_intent(replace(intent, created_at="2025-01-01T00:00:00"), trusted_authors=TRUSTED)
+    # The protocol consumes the typed envelope; provenance is authenticated by
+    # the future fixed-endpoint client, not by this validator.
+    assert validate_intent(replace(intent, node_id="different-node"), trusted_authors=TRUSTED)
 
 
 def test_valid_history_binds_report_metadata_and_completion_to_envelopes():
@@ -224,19 +257,11 @@ def test_metadata_digest_and_completion_references_are_verified():
     intent = _intent()
     report = _report(intent)
     metadata = _metadata(intent, report)
-    bad_metadata = dict(metadata, payload=dict(metadata["payload"], metadata_digest="0" * 64))
-    bad_metadata["payload_digest"] = canonical_digest(bad_metadata["payload"])
-    bad_metadata["envelope_digest"] = canonical_digest(
-        {key: bad_metadata[key] for key in ("author", "created_at", "node_id", "payload_digest")}
-    )
+    bad_metadata = _refresh_envelope(dict(metadata, payload=dict(metadata["payload"], metadata_digest="0" * 64)))
     with pytest.raises(ValueError, match="metadata digest"):
         validate_review_metadata(bad_metadata, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)
     completion = _completion(intent, report, metadata)
-    bad_completion = dict(completion, payload=dict(completion["payload"], metadata_digest="wrong"))
-    bad_completion["payload_digest"] = canonical_digest(bad_completion["payload"])
-    bad_completion["envelope_digest"] = canonical_digest(
-        {key: bad_completion[key] for key in ("author", "created_at", "node_id", "payload_digest")}
-    )
+    bad_completion = _refresh_envelope(dict(completion, payload=dict(completion["payload"], metadata_digest="wrong")))
     with pytest.raises(ValueError, match="metadata"):
         validate_completion(
             bad_completion, intent, report, metadata, canonical_intent=intent, trusted_authors=TRUSTED
@@ -286,10 +311,6 @@ def test_duplicate_logical_ids_and_node_ids_rejected_before_lookup():
     duplicate_attempt["payload"]["attempt_id"] = first["payload"]["attempt_id"]
     duplicate_attempt["payload"]["canonical_digest"] = canonical_digest(
         {key: value for key, value in duplicate_attempt["payload"].items() if key != "canonical_digest"}
-    )
-    duplicate_attempt["payload_digest"] = canonical_digest(duplicate_attempt["payload"])
-    duplicate_attempt["envelope_digest"] = canonical_digest(
-        {key: duplicate_attempt[key] for key in ("author", "created_at", "node_id", "payload_digest")}
     )
     with pytest.raises(ValueError, match="attempt"):
         elect_canonical_attempt(
@@ -401,9 +422,9 @@ def test_report_metadata_completion_all_propagate_envelope_trust():
     metadata = _metadata(intent, report)
     completion = _completion(intent, report, metadata)
     for record, validator in (
-        (dict(report, author="untrusted"), lambda item: validate_report(item, intent, canonical_intent=intent, trusted_authors=TRUSTED)),
-        (dict(metadata, author="untrusted"), lambda item: validate_review_metadata(item, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)),
-        (dict(completion, author="untrusted"), lambda item: validate_completion(item, intent, report, metadata, canonical_intent=intent, trusted_authors=TRUSTED)),
+        (replace(report, author="untrusted"), lambda item: validate_report(item, intent, canonical_intent=intent, trusted_authors=TRUSTED)),
+        (replace(metadata, author="untrusted"), lambda item: validate_review_metadata(item, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)),
+        (replace(completion, author="untrusted"), lambda item: validate_completion(item, intent, report, metadata, canonical_intent=intent, trusted_authors=TRUSTED)),
     ):
         with pytest.raises(ValueError, match="trusted"):
             validator(record)
@@ -450,7 +471,7 @@ def test_noncanonical_metadata_after_revocation_is_rejected():
 
 def test_untrusted_revocations_are_rejected_from_the_authenticated_envelope():
     intent = _intent()
-    revocation = dict(_revocation(intent), author="untrusted")
+    revocation = replace(_revocation(intent), author="untrusted")
     with pytest.raises(ValueError, match="trusted"):
         validate_revocation(revocation, intent, trusted_authors=TRUSTED)
 
@@ -468,9 +489,11 @@ def test_altered_report_logical_id_node_and_digest_references_are_rejected():
     with pytest.raises(ValueError, match="node"):
         validate_review_metadata(metadata, intent, altered_node, canonical_intent=intent, trusted_authors=TRUSTED)
 
-    altered_digest = dict(report, payload_digest="0" * 64)
+    altered_digest = _refresh_envelope(
+        dict(metadata, payload=dict(metadata["payload"], report_digest="other-report-digest"))
+    )
     with pytest.raises(ValueError, match="digest"):
-        validate_review_metadata(metadata, intent, altered_digest, canonical_intent=intent, trusted_authors=TRUSTED)
+        validate_review_metadata(altered_digest, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)
 
 
 @pytest.mark.parametrize(
@@ -511,3 +534,13 @@ def test_append_only_snapshot_rejects_alteration_and_deletion():
         validate_append_only([altered, report], previous=snapshot)
     with pytest.raises(ValueError, match="deleted"):
         validate_append_only([intent], previous=snapshot)
+
+
+def test_append_only_rejects_duplicate_ids_in_previous_snapshot_before_lookup():
+    intent = _intent()
+    duplicate_logical = _intent(record_id=intent.payload["record_id"], node_id="other-node")
+    with pytest.raises(ValueError, match="duplicate logical"):
+        validate_append_only([], previous=[intent, duplicate_logical])
+    duplicate_node = _intent(record_id="other-record", node_id=intent.node_id)
+    with pytest.raises(ValueError, match="duplicate authenticated"):
+        validate_append_only([], previous=[intent, duplicate_node])

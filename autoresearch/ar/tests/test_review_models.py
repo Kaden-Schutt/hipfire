@@ -10,6 +10,7 @@ import pytest
 from autoresearch.ar.review.models import (
     AttemptIntent,
     Finding,
+    GitHubEnvelope,
     ProviderPolicy,
     ReviewProposal,
     ReviewTarget,
@@ -351,8 +352,13 @@ def test_trusted_publishers_rejects_generic_app_entry():
 
 
 def test_review_contracts_bind_required_identity_and_target_fields():
-    intent = AttemptIntent(TARGET, "attempt-1", "principal", "intent-node-1", "capability", "suite-v1")
+    intent = AttemptIntent(TARGET, "attempt-1", "capability", "suite-v1")
     assert intent.target == TARGET
+    assert set(intent.__dataclass_fields__) == {
+        "target", "attempt_id", "capability_id", "suite_revision", "provider_id"
+    }
+    envelope = GitHubEnvelope({"record_id": "logical-intent"}, "gh-node", "review-bot", "2026-01-01T00:00:00Z")
+    assert envelope.node_id == "gh-node"
 
     finding = Finding("src/main.py", (1, 2), "warning", "nonblocking")
     proposal = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))

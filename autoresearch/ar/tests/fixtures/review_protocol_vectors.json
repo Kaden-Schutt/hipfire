@@ -38,6 +38,14 @@
     "overflow_value": "abcd",
     "overflow_limit": 3,
     "aware_timestamp_early": "2026-01-01T00:30:00+02:00",
-    "aware_timestamp_late": "2025-12-31T23:00:00Z"
+    "aware_timestamp_late": "2025-12-31T23:00:00Z",
+    "floats": [
+      {"value": 1.5, "canonical_utf8": "1.5", "sha256": "9f29a130438b81170b92a42650f9a94291ecad60bd47af2a3886e75f7f728725"},
+      {"value": 1e-6, "canonical_utf8": "0.000001", "sha256": "159fb29a827ad04b260aa6c8ab6d8637f8f2b38af5c4f3cb49d6a21205e040f8"},
+      {"value": 1e-7, "canonical_utf8": "1e-7", "sha256": "5b33e02f2c5103a05d32f6ba9cb058294452bfbf393967f68bb30c1bdcbbab22"},
+      {"value": 1e20, "canonical_utf8": "100000000000000000000", "sha256": "c344e9487bfbd5c4e03c9fb90d62a5dde5e00b54d55c46e9f4a803aea162b80c"},
+      {"value": 1e21, "canonical_utf8": "1e+21", "sha256": "241c4643fa70b1dcde1205b71be4e3bebb17e9f880c8e1a33d0ead6c27271d3c"},
+      {"value": -0.0, "canonical_utf8": "0", "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"}
+    ]
   }
 }

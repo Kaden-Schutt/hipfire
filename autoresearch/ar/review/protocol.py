@@ -1,20 +1,24 @@
 # Copyright (c) Kaden Schutt
-"""Validation rules for immutable payloads in authenticated review envelopes."""
+"""Validation rules for immutable payloads plus caller-authenticated GitHub facts.
+
+The protocol validates a :class:`GitHubEnvelope` supplied by an authenticated
+source; it never authenticates arbitrary mappings or treats an unkeyed digest
+as provenance.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 from typing import Any
 
 from .canonical import canonical_digest, canonical_json, metadata_digest
-from .models import ReviewTarget
+from .models import GitHubEnvelope, ReviewTarget
 
 
 _RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
-_ENVELOPE_KEYS = {"payload", "payload_digest", "node_id", "author", "created_at", "envelope_digest"}
-_SERVER_FIELDS = {"node_id", "author", "created_at", "payload_digest", "envelope_digest", "intent_node_id"}
+_SERVER_FIELDS = {"node_id", "author", "created_at", "payload_digest", "intent_node_id"}
 _TARGET_KEYS = {
     "repository", "number", "head_repository", "head_sha", "base_ref", "base_sha", "merge_base_sha"
 }
@@ -47,6 +51,8 @@ def _text(value: Any, name: str) -> str:
 def _trust_policy(trusted_authors: Iterable[str] | None) -> frozenset[str]:
     if trusted_authors is None:
         raise ValueError("trusted_authors policy is required")
+    if isinstance(trusted_authors, (str, bytes, bytearray)) or not isinstance(trusted_authors, Collection):
+        raise ValueError("trusted_authors must be a collection of complete identities")
     policy = frozenset(trusted_authors)
     if not policy or any(not isinstance(author, str) or not author.strip() for author in policy):
         raise ValueError("trusted_authors policy must not be empty")
@@ -86,9 +92,9 @@ def _require_author(envelope: Mapping[str, Any], trusted: frozenset[str]) -> Non
 
 
 def _payload(envelope: Mapping[str, Any]) -> Mapping[str, Any]:
-    payload = envelope.get("payload")
+    payload = envelope.payload if isinstance(envelope, GitHubEnvelope) else envelope
     if not isinstance(payload, Mapping):
-        raise ValueError("authenticated envelope payload must be an object")
+        raise ValueError("GitHub envelope payload must be an object")
     if set(payload) & _SERVER_FIELDS:
         raise ValueError("payload must not assert authenticated server facts")
     _text(payload.get("record_id"), "logical record ID")
@@ -98,26 +104,18 @@ def _payload(envelope: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _validate_envelope(envelope: Mapping[str, Any], trusted: frozenset[str]) -> Mapping[str, Any]:
-    if not isinstance(envelope, Mapping) or set(envelope) != _ENVELOPE_KEYS:
-        raise ValueError("invalid authenticated envelope")
-    payload = _payload(envelope)
-    _text(envelope["node_id"], "node_id")
+    if not isinstance(envelope, GitHubEnvelope):
+        raise ValueError("protocol requires a typed GitHubEnvelope from an authenticated source")
+    payload = _payload(envelope.payload)
+    _text(envelope.node_id, "node_id")
     _require_author(envelope, trusted)
     _time(envelope)
-    expected_payload_digest = canonical_digest(_plain(payload))
-    if envelope["payload_digest"] != expected_payload_digest:
-        raise ValueError("payload digest does not match envelope payload")
-    expected_envelope_digest = canonical_digest(
-        {
-            "author": envelope["author"],
-            "created_at": envelope["created_at"],
-            "node_id": envelope["node_id"],
-            "payload_digest": envelope["payload_digest"],
-        }
-    )
-    if envelope["envelope_digest"] != expected_envelope_digest:
-        raise ValueError("envelope digest does not match authenticated facts")
     return payload
+
+
+def _payload_digest(envelope: Mapping[str, Any]) -> str:
+    """Return an integrity digest; this does not authenticate the envelope."""
+    return canonical_digest(_plain(envelope.get("payload")))
 
 
 def _expected_target(value: ReviewTarget) -> ReviewTarget:
@@ -181,6 +179,7 @@ def validate_intent(
     target = _target(payload["target"])
     if payload["target_key"] != target.target_key():
         raise ValueError("intent target_key does not match target")
+    _text(payload.get("attempt_id"), "attempt_id")
     if payload["canonical_digest"] != _intent_digest(payload):
         raise ValueError("intent canonical digest does not match payload")
     return payload["canonical_digest"]
@@ -217,7 +216,7 @@ def validate_report(
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     if payload["report_body_sha256"] not in {digest, "sha256:" + digest}:
         raise ValueError("report body digest does not match body")
-    return envelope["payload_digest"]
+    return _payload_digest(envelope)
 
 
 def validate_review_metadata(
@@ -255,7 +254,7 @@ def validate_review_metadata(
         raise ValueError("review metadata references the wrong report")
     if payload["report_node_id"] != report_envelope.get("node_id"):
         raise ValueError("review metadata report node binding does not match")
-    if payload["report_digest"] != report_envelope.get("payload_digest"):
+    if payload["report_digest"] != _payload_digest(report_envelope):
         raise ValueError("review metadata report digest does not match")
     if payload["report_body_sha256"] != report.get("report_body_sha256"):
         raise ValueError("review metadata report body digest does not match")
@@ -313,7 +312,7 @@ def validate_completion(
     )
     if payload["report_record_id"] != report.get("record_id") or payload["report_node_id"] != report_envelope.get("node_id"):
         raise ValueError("completion report binding does not match")
-    if payload["report_digest"] != report_envelope.get("payload_digest"):
+    if payload["report_digest"] != _payload_digest(report_envelope):
         raise ValueError("completion report digest does not match")
     if payload["metadata_record_id"] != metadata.get("record_id"):
         raise ValueError("completion metadata binding does not match")
@@ -338,6 +337,7 @@ def validate_revocation(
         raise ValueError("revocation target does not match intent")
     if payload["canonical_intent_digest"] != intent.get("canonical_digest"):
         raise ValueError("revocation canonical intent digest does not match")
+    _text(payload.get("reason"), "reason")
     if not _before(intent_envelope, envelope):
         raise ValueError("revocation was published before its intent")
 
@@ -350,9 +350,9 @@ def _unique_records(records: Sequence[Mapping[str, Any]], trusted: frozenset[str
     logical: set[str] = set()
     nodes: set[str] = set()
     for envelope in records:
-        payload = envelope.get("payload") if isinstance(envelope, Mapping) else None
-        if not isinstance(payload, Mapping):
-            raise ValueError("invalid authenticated envelope history")
+        if not isinstance(envelope, GitHubEnvelope):
+            raise ValueError("append-only history requires typed GitHubEnvelope values")
+        payload = envelope.payload
         logical_id = _record_id(envelope)
         node_id = _text(envelope.get("node_id"), "node_id")
         if logical_id in logical:
@@ -365,6 +365,7 @@ def _unique_records(records: Sequence[Mapping[str, Any]], trusted: frozenset[str
 
 def validate_append_only(records: Sequence[Mapping[str, Any]], previous: Sequence[Mapping[str, Any]] = ()) -> None:
     _unique_records(records)
+    _unique_records(previous)
     old = {_record_id(record): canonical_json(_plain(record)) for record in previous}
     current = {_record_id(record): canonical_json(_plain(record)) for record in records}
     if not set(old).issubset(current):
