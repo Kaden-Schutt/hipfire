@@ -8,6 +8,14 @@
 #define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded
 #endif
 
+#ifndef HIPFIRE_GFX1151_MOE_DOWN_SCALAR_HEADER
+#define HIPFIRE_GFX1151_MOE_DOWN_SCALAR_HEADER 0
+#endif
+
+#if HIPFIRE_GFX1151_MOE_DOWN_SCALAR_HEADER
+typedef unsigned int hipfire_down_u32x2 __attribute__((ext_vector_type(2)));
+#endif
+
 // Atomic-free variant of `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched`.
 //
 // Same per-(token, krank) GEMV compute. Instead of `atomicAdd(scale * acc)`
@@ -105,21 +113,33 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     float ccc0 = 0.0f, ccc1 = 0.0f;
     float dcc0 = 0.0f, dcc1 = 0.0f;
 
-    #if HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER
+    #if HIPFIRE_GFX1151_MOE_DOWN_SCALAR_HEADER
+    // Every lane consumes the same scale/zero-point pair. Make that uniformity
+    // explicit to LLVM so the aligned 8-byte header is one scalar-memory load;
+    // the lane-divergent packed word remains on the existing global path.
+    #define HIPFIRE_MOE_DOWN_DECL_HEADER(gp, rsrc, weight_offset, sc, zp) \
+        const hipfire_down_u32x2 header = \
+            *(const hipfire_down_u32x2 __attribute__((address_space(4))) *)(gp); \
+        const float sc = __builtin_bit_cast(float, header.x); \
+        const float zp = __builtin_bit_cast(float, header.y)
+    #elif HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER
     // gfx1151 hybrid cache lowering: scale/zero-point are wave-uniform, so
     // preserve their scalar/global path. Only the lane-divergent packed nibbles
     // use temporal buffer VMEM. This avoids turning uniform headers into 64
     // redundant vector loads while retaining the lean packed-weight address.
-    #define HIPFIRE_MOE_DOWN_LOAD_SC(rsrc, gp, weight_offset) (*(const unsigned int*)(gp))
-    #define HIPFIRE_MOE_DOWN_LOAD_ZP(rsrc, gp, weight_offset) (*(const unsigned int*)((gp) + 4))
+    #define HIPFIRE_MOE_DOWN_DECL_HEADER(gp, rsrc, weight_offset, sc, zp) \
+        const float sc = __builtin_bit_cast(float, *(const unsigned int *)(gp)); \
+        const float zp = __builtin_bit_cast(float, *(const unsigned int *)((gp) + 4))
     #else
-    #define HIPFIRE_MOE_DOWN_LOAD_SC(rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, gp, weight_offset)
-    #define HIPFIRE_MOE_DOWN_LOAD_ZP(rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 4, (weight_offset) + 4)
+    #define HIPFIRE_MOE_DOWN_DECL_HEADER(gp, rsrc, weight_offset, sc, zp) \
+        const float sc = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, gp, weight_offset)); \
+        const float zp = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 4, (weight_offset) + 4))
     #endif
 
     #define DOG_X8(gp, rsrc, weight_offset, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
-        float sc = __builtin_bit_cast(float, HIPFIRE_MOE_DOWN_LOAD_SC(rsrc, gp, weight_offset)); \
-        float zp = __builtin_bit_cast(float, HIPFIRE_MOE_DOWN_LOAD_ZP(rsrc, gp, weight_offset)); \
+        HIPFIRE_MOE_DOWN_DECL_HEADER(gp, rsrc, weight_offset, sc, zp); \
         unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
@@ -158,8 +178,7 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     DOG_X8(row_ptr3 + 1 * 136, row_rsrc3, 1 * 136, dcc1,
            xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
     #undef DOG_X8
-    #undef HIPFIRE_MOE_DOWN_LOAD_SC
-    #undef HIPFIRE_MOE_DOWN_LOAD_ZP
+    #undef HIPFIRE_MOE_DOWN_DECL_HEADER
 
     // groups==2: only slots 0/1 live; (a0+a1) ≡ baseline (a0+a1)+(a2+a3) with a2=a3=0.
     float acc = acc0 + acc1;
