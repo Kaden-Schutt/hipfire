@@ -2383,10 +2383,27 @@ impl Gpu {
         } else {
             ""
         };
+        static GFX1151_QKV_X_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_x_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_QKV_X_BUFFER.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKV_X_BUFFER").as_deref() == Ok("1")
+            });
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
             || gfx1151_wave64;
-        let (func_name, block, grid_x) = if matches!(gfx1151_all_buffer_cpol, "temporal" | "slc") {
+        let (func_name, block, grid_x) = if gfx1151_x_buffer {
+            self.ensure_kernel(
+                "fused_qkv_hfq4g256_k2048_x_buffer_gfx1151",
+                kernels::FUSED_QKV_HFQ4G256_K2048_X_BUFFER_GFX1151_SRC,
+                "fused_qkv_hfq4g256_k2048_x_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkv_hfq4g256_k2048_x_buffer_gfx1151",
+                [32u32, 1, 1],
+                (q_m + k_m + v_m) as u32,
+            )
+        } else if matches!(gfx1151_all_buffer_cpol, "temporal" | "slc") {
             let (module, source, function) = if gfx1151_all_buffer_cpol == "slc" {
                 (
                     "fused_qkv_hfq4g256_k2048_all_buffer_slc_gfx1151",

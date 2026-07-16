@@ -3052,6 +3052,18 @@ pub const FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
 );
 
+/// gfx1151 selective Radiowave lowering: retain the established global weight
+/// stream and use temporal B128 buffer loads only for the small, repeatedly
+/// consumed K=2048 activation vector.
+pub const FUSED_QKV_HFQ4G256_K2048_X_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_QKV_K2048 1\n",
+    "#define HIPFIRE_RDNA3_QKV_X_BUFFER 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256_k2048_x_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+);
+
 /// Same gfx1151 addressing and activation schedule, with SLC on the large
 /// weight stream to reduce pollution of replay-resident data.
 pub const FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC: &str = concat!(
