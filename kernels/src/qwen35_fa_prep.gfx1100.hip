@@ -4,6 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_QWEN35_FA_PREP_KERNEL
+#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1100
+#endif
+
 // Exact gfx1100 Qwen3.6-35B full-attention preparation. The first 16
 // workgroups reproduce deinterleave_f32 plus one 256-wide rmsnorm_f32 Q
 // workgroup each; the final two reproduce the K rmsnorm workgroups. Each
@@ -12,7 +16,7 @@
 //
 // Fixed admitted shape: Q=16 heads, K=2 heads, head_dim=256, n_rot=64.
 extern "C" __launch_bounds__(256, 1)
-__global__ void qwen35_fa_prep_gfx1100(
+__global__ void HIPFIRE_QWEN35_FA_PREP_KERNEL(
     const float* __restrict__ q_interleaved,
     float* __restrict__ q,
     float* __restrict__ gate,

@@ -2103,12 +2103,20 @@ impl Gpu {
             let ts = tile_size as i32;
             let mt = max_tiles as i32;
             if let Some(gate) = output_gate {
-                const KERNEL: &str = "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100";
-                self.ensure_kernel(
-                    KERNEL,
-                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC,
-                    KERNEL,
-                )?;
+                let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+                    (
+                        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+                        kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC,
+                        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+                    )
+                } else {
+                    (
+                        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
+                        kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC,
+                        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
+                    )
+                };
+                self.ensure_kernel(module, src, kernel)?;
                 self.ensure_mq_signs()?;
                 let g_ptr = gate.buf.as_ptr();
                 let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -2126,7 +2134,7 @@ impl Gpu {
                     &mt as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
-                    KERNEL,
+                    kernel,
                     [n_heads as u32, 1, 1],
                     [256, 1, 1],
                     ((max_tiles + head_dim) * 4) as u32,

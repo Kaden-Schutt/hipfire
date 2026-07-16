@@ -1028,6 +1028,10 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 pub const GATED_NORM_MQ_ROTATE_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip");
+pub const GATED_NORM_MQ_ROTATE_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1151\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
+);
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
@@ -1955,6 +1959,10 @@ pub const MOE_DOWN_COMBINE_K8_BATCHED_SRC: &str =
 /// consume it immediately for the following K=2048 RMSNorm + MQ rotation.
 pub const MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_rmsnorm_mq_rotate_vecsum.gfx1100.hip");
+pub const MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_COMBINE_RMSNORM_MQ_KERNEL moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151\n",
+    include_str!("../../../kernels/src/moe_down_combine_rmsnorm_mq_rotate_vecsum.gfx1100.hip")
+);
 
 /// Four adjacent output columns per thread with four independent accumulator
 /// chains. Preserves the scalar K=8 reduction order per output.
@@ -3575,6 +3583,10 @@ pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str =
 pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC: &str = include_str!(
     "../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip"
 );
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
+);
 
 /// Turbo common header: shared definitions for turbo/givens kernels.
 pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common.h");
@@ -3802,6 +3814,11 @@ pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
+#[cfg(feature = "deltanet")]
+pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
+    include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
+);
 
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
@@ -4983,6 +5000,18 @@ mod dispatch_tests {
             .contains("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"));
         assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC
             .contains("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC.starts_with(
+            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
+        ));
+        assert!(GATED_NORM_MQ_ROTATE_GFX1151_SRC.starts_with(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1151"
+        ));
+        assert!(MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC.starts_with(
+            "#define HIPFIRE_MOE_COMBINE_RMSNORM_MQ_KERNEL moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151"
+        ));
+        #[cfg(feature = "deltanet")]
+        assert!(QWEN35_FA_PREP_GFX1151_SRC
+            .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151"));
     }
 
     // ── MQ4G256-Lloyd family ─────────────────────────────────────

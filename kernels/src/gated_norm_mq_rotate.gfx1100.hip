@@ -4,13 +4,17 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL
+#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1100
+#endif
+
 // gfx1100 Qwen3.6 DeltaNet decode specialization. Two wave32s reproduce two
 // independent head_dim=128 gated_norm_f32 workgroups, publish their normalized
 // 256-value group through LDS, then wave 0 performs the exact mq_rotate_x
 // butterfly. This removes the normalized global-memory round trip and one
 // dependent dispatch without changing either operation's arithmetic order.
 extern "C" __launch_bounds__(64, 1)
-__global__ void gated_norm_mq_rotate_gfx1100(
+__global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     const float* __restrict__ x,
     const float* __restrict__ z,
     const float* __restrict__ weight,

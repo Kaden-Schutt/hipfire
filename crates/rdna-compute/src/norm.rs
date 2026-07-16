@@ -819,8 +819,20 @@ impl Gpu {
         freq_base: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const KERNEL: &str = "qwen35_fa_prep_gfx1100";
-        self.ensure_kernel(KERNEL, kernels::QWEN35_FA_PREP_GFX1100_SRC, KERNEL)?;
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "qwen35_fa_prep_gfx1151",
+                kernels::QWEN35_FA_PREP_GFX1151_SRC,
+                "qwen35_fa_prep_gfx1151",
+            )
+        } else {
+            (
+                "qwen35_fa_prep_gfx1100",
+                kernels::QWEN35_FA_PREP_GFX1100_SRC,
+                "qwen35_fa_prep_gfx1100",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
 
         let qip = q_interleaved.buf.as_ptr();
         let qp = q.buf.as_ptr();
@@ -843,9 +855,9 @@ impl Gpu {
             &fb as *const _ as *mut c_void,
         ];
         let bytes = (16 * 256 * 3 + 2 * 256 * 2 + 18 * 256) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
-            KERNEL,
+            kernel,
             [18, 1, 1],
             [256, 1, 1],
             0,

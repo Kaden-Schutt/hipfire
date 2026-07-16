@@ -108,12 +108,20 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        const KERNEL: &str = "moe_down_combine_rmsnorm_mq_rotate_vecsum";
-        self.ensure_kernel(
-            "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100",
-            kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC,
-            KERNEL,
-        )?;
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+                kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC,
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+            )
+        } else {
+            (
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100",
+                kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC,
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
 
         let eop = expert_outputs.buf.as_ptr();
         let twp = topk_weights.buf.as_ptr();
@@ -139,8 +147,8 @@ impl Gpu {
         ];
 
         let bytes = (k_top * m + k_top + 2 * m + m + 512 + m) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
-        let result = self.launch_maybe_blob(KERNEL, [1, 1, 1], [256, 1, 1], 0, &mut params, || {
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(kernel, [1, 1, 1], [256, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(eop);
             b.push_ptr(twp);

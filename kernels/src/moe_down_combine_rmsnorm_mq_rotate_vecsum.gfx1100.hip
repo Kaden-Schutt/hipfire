@@ -4,6 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_MOE_COMBINE_RMSNORM_MQ_KERNEL
+#define HIPFIRE_MOE_COMBINE_RMSNORM_MQ_KERNEL moe_down_combine_rmsnorm_mq_rotate_vecsum
+#endif
+
 // gfx1100/K=2048 decode experiment. Fold the previous layer's atomic-free
 // routed-MoE output into the residual and immediately consume the completed
 // row for the next layer's RMSNorm + MagnumQuant FWHT rotation.
@@ -15,7 +19,7 @@
 // by the byte-exact moe_down_combine_k8_batched arithmetic first.
 
 __launch_bounds__(256, 1)
-extern "C" __global__ void moe_down_combine_rmsnorm_mq_rotate_vecsum(
+extern "C" __global__ void HIPFIRE_MOE_COMBINE_RMSNORM_MQ_KERNEL(
     const float* __restrict__ expert_outputs, // [K_TOP, M]
     const float* __restrict__ topk_weights,   // [K_TOP]
     float*       __restrict__ x_residual,     // [M], accumulated in place

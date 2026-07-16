@@ -262,6 +262,7 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
             | "fused_silu_mul_mq_rotate"
             | "gated_norm_f32"
             | "gated_norm_mq_rotate_gfx1100"
+            | "gated_norm_mq_rotate_gfx1151"
             | "moe_router_softmax_topk_k8_wave64_exact"
             | "moe_topk_renorm_k8"
             | "mq_rotate_x"
@@ -511,10 +512,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
-        "gated_norm_mq_rotate_gfx1100" => {
+        "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => {
             Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)])
         }
-        "qwen35_fa_prep_gfx1100" => Some(vec![
+        "qwen35_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => Some(vec![
             read(0),
             write(8),
             write(16),
@@ -574,7 +575,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "moe_down_combine_k8_batched" | "moe_down_combine_k8_batched_vec4" => {
             Some(vec![read(0), read(8), write(16)])
         }
-        "moe_down_combine_rmsnorm_mq_rotate_vecsum" => Some(vec![
+        "moe_down_combine_rmsnorm_mq_rotate_vecsum"
+        | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(vec![
             read(0),
             read(8),
             write(16),
@@ -616,7 +618,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
         ]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
-        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100" => {
+        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151" => {
             Some(vec![read(0), write(8), read(16), read(24), read(32), read(48)])
         }
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
@@ -731,11 +734,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rope_partial_halfsplit_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
+        | "gated_norm_mq_rotate_gfx1151"
         | "qwen35_fa_prep_gfx1100"
+        | "qwen35_fa_prep_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100" => Some(64),
-        "moe_down_combine_rmsnorm_mq_rotate_vecsum" => Some(72),
+        "moe_down_combine_rmsnorm_mq_rotate_vecsum"
+        | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
@@ -2619,7 +2626,9 @@ mod tests {
         "gated_delta_net_q8_fast",
         "gated_norm_f32",
         "gated_norm_mq_rotate_gfx1100",
+        "gated_norm_mq_rotate_gfx1151",
         "qwen35_fa_prep_gfx1100",
+        "qwen35_fa_prep_gfx1151",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
@@ -2651,6 +2660,7 @@ mod tests {
         "moe_down_combine_k8_batched",
         "moe_down_combine_k8_batched_vec4",
         "moe_down_combine_rmsnorm_mq_rotate_vecsum",
+        "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
         "fused_qkv_hfq4g256",
         "deinterleave_f32",
         "rmsnorm_f32",
@@ -2661,6 +2671,7 @@ mod tests {
         "attention_flash_fwht3_tile",
         "attention_flash_q8_0_reduce",
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
+        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
         "sigmoid_mul_f32",
         "gemv_hfq4g256_multirow_r2",
         "gemv_hfq4g256_multirow_r4",
@@ -2704,6 +2715,26 @@ mod tests {
         assert_eq!(pointer_effects(gate).map(|effects| effects.len()), Some(5));
         assert_eq!(expected_kernarg_bytes(qkvza), Some(96));
         assert_eq!(pointer_effects(qkvza).map(|effects| effects.len()), Some(9));
+        for (symbol, kernarg_bytes, pointer_count) in [
+            ("gated_norm_mq_rotate_gfx1151", 64, 6),
+            ("qwen35_fa_prep_gfx1151", 64, 7),
+            (
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+                64,
+                6,
+            ),
+            (
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+                72,
+                7,
+            ),
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(kernarg_bytes));
+            assert_eq!(
+                pointer_effects(symbol).map(|effects| effects.len()),
+                Some(pointer_count)
+            );
+        }
         assert_eq!(expected_kernarg_bytes("attention_flash_q8_0_tile"), Some(80));
         assert_eq!(
             pointer_effects("attention_flash_q8_0_tile").map(|effects| effects.len()),

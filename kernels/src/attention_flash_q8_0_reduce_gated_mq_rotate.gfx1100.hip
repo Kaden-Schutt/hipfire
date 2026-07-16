@@ -4,6 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL
+#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100
+#endif
+
 // Qwen3.5/3.6 decode epilogue sibling. It preserves the portable reducer's
 // operation order, applies the existing sigmoid gate, and emits the exact MQ
 // rotation expected by the following WO projection.
@@ -12,7 +16,7 @@
 // the portable reducer perturbs LLVM codegen for gfx12 even though dispatch is
 // architecture-gated.
 extern "C" __launch_bounds__(256, 4)
-__global__ void attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100(
+__global__ void HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL(
     const float* __restrict__ partials,
     float* __restrict__ out,
     const float* __restrict__ gate,

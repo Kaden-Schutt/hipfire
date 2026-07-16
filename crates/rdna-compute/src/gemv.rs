@@ -3019,12 +3019,20 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        const KERNEL: &str = "gated_norm_mq_rotate_gfx1100";
-        self.ensure_kernel(
-            KERNEL,
-            kernels::GATED_NORM_MQ_ROTATE_GFX1100_SRC,
-            KERNEL,
-        )?;
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "gated_norm_mq_rotate_gfx1151",
+                kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC,
+                "gated_norm_mq_rotate_gfx1151",
+            )
+        } else {
+            (
+                "gated_norm_mq_rotate_gfx1100",
+                kernels::GATED_NORM_MQ_ROTATE_GFX1100_SRC,
+                "gated_norm_mq_rotate_gfx1100",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
 
         let xp = x.buf.as_ptr();
         let zp = z.buf.as_ptr();
@@ -3048,9 +3056,9 @@ impl Gpu {
         ];
         let k = n_heads * head_dim;
         let bytes = crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k);
-        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
-            KERNEL,
+            kernel,
             [(n_heads / 2) as u32, 1, 1],
             [64, 1, 1],
             0,
