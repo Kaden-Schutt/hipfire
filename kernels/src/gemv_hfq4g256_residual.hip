@@ -95,7 +95,10 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     } while (0)
 
 #if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
-    #pragma unroll
+    // Two quads are enough to expose independent row chains to the gfx1151
+    // VOPD scheduler. Full unroll doubles the instruction footprint and
+    // reduces, rather than increases, the number of paired FMACs.
+    #pragma unroll 2
 #endif
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
