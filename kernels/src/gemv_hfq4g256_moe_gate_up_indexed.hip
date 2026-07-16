@@ -28,10 +28,6 @@
 #define HIPFIRE_MOE_GATE_UP_BATCHED 0
 #endif
 
-#ifndef HIPFIRE_MOE_GATE_UP_COALESCE_B4
-#define HIPFIRE_MOE_GATE_UP_COALESCE_B4 0
-#endif
-
 #if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
 #define HIPFIRE_MOE_GATE_UP_BLOCK 64
 #define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 8
@@ -105,24 +101,9 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
 
     // Read expert_id from device and index into the pointer table.
 #if HIPFIRE_MOE_GATE_UP_BATCHED
-#if HIPFIRE_MOE_GATE_UP_COALESCE_B4
-    // B4 verifier cache schedule: only the first route for an expert remains
-    // active. It executes every matching route consecutively below, retaining
-    // the exact per-route arithmetic while making repeated expert weights an
-    // immediate cache hit. Top-k is unique within a token, so at most four
-    // activation rows match one expert.
-    const int leader_bid = blockIdx.z;
-    const int leader_slot = leader_bid * K_TOP + krank;
-    const int expert_id = topk_indices[leader_slot];
-    #pragma unroll
-    for (int prior = 0; prior < leader_slot; prior++) {
-        if (topk_indices[prior] == expert_id) return;
-    }
-#else
     const int bid = blockIdx.z;
     const int expert_id = topk_indices[bid * K_TOP + krank];
     const float* __restrict__ x_row = x + (long long)bid * K;
-#endif
 #else
     const int expert_id = topk_indices[krank];
     const float* __restrict__ x_row = x;
@@ -148,15 +129,6 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const unsigned int gate_row_offset = (unsigned int)row * row_stride;
     const unsigned int up_row_offset = (unsigned int)(row + mi) * row_stride;
     const auto expert_rsrc = HIPFIRE_WEIGHT_RSRC(A);
-#endif
-
-#if HIPFIRE_MOE_GATE_UP_COALESCE_B4
-    #pragma unroll
-    for (int route_slot = leader_slot; route_slot < 4 * K_TOP; route_slot++) {
-        if (topk_indices[route_slot] != expert_id) continue;
-        const int route_bid = route_slot / K_TOP;
-        const int route_krank = route_slot - route_bid * K_TOP;
-        const float* __restrict__ x_row = x + (long long)route_bid * K;
 #endif
 
     float gacc0 = 0.0f, gacc1 = 0.0f, gacc2 = 0.0f, gacc3 = 0.0f;
@@ -436,13 +408,8 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
 
     if (tid == 0) {
 #if HIPFIRE_MOE_GATE_UP_BATCHED
-#if HIPFIRE_MOE_GATE_UP_COALESCE_B4
-        const long long output_base =
-            (long long)route_bid * K_TOP * mi + (long long)route_krank * mi;
-#else
         const long long output_base =
             (long long)bid * K_TOP * mi + (long long)krank * mi;
-#endif
         y_gate[output_base + row] = gacc;
         y_up[output_base + row] = uacc;
 #else
@@ -450,9 +417,6 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         y_up[krank * mi + row] = uacc;
 #endif
     }
-#if HIPFIRE_MOE_GATE_UP_COALESCE_B4
-    }
-#endif
 }
 
 #undef HIPFIRE_MOE_GATE_UP_BLOCK
