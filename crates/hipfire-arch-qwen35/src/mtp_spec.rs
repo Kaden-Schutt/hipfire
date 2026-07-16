@@ -37,7 +37,7 @@ use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
 use rdna_compute::replay::{ReplayBackendRequest, ReplayState};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, RecordedHipProfileEntry};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -58,6 +58,112 @@ fn mtp_phase_trace_enabled_from_env() -> bool {
         std::env::var("HIPFIRE_MTP_PHASE_TRACE").ok().as_deref(),
         Some("1" | "true" | "on" | "yes")
     )
+}
+
+fn mtp_verifier_census_enabled_from_env() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_MTP_VERIFIER_CENSUS").ok().as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+fn mtp_verifier_family(entry: &RecordedHipProfileEntry, launch_count: usize) -> &'static str {
+    if entry.dispatch_index >= launch_count.saturating_sub(3) {
+        return "output_projection";
+    }
+    let kernel = entry.kernel.as_str();
+    if kernel.contains("moe_gate_up")
+        || kernel.contains("moe_down_k8_indexed")
+        || (kernel == "fused_silu_mul_mq_rotate" && entry.grid[1] > 4)
+    {
+        "routed_moe"
+    } else if kernel.contains("gemm_gate_up")
+        || kernel.contains("residual_sigmoid_scaled")
+        || (kernel == "fused_silu_mul_mq_rotate" && entry.grid[1] <= 4)
+    {
+        "shared_moe"
+    } else if kernel.contains("moe_topk")
+        || kernel.contains("moe_down_combine")
+        || kernel == "softmax_f32"
+        || kernel == "gemm_hfq4g256"
+    {
+        "moe_control"
+    } else if kernel.contains("qkvza")
+        || kernel.contains("gated_delta")
+        || kernel.contains("conv1d")
+        || kernel.contains("repeat_interleave")
+        || kernel.contains("gated_norm")
+        || kernel.contains("alpha_gate")
+    {
+        "gdn"
+    } else if (kernel.contains("qkv") && !kernel.contains("qkvza"))
+        || kernel.contains("attention")
+        || kernel.contains("kv_cache")
+        || kernel.contains("rope")
+        || kernel.contains("deinterleave")
+        || kernel == "sigmoid_mul_f32"
+    {
+        "attention"
+    } else if kernel.contains("residual_wmma") {
+        "residual_projection"
+    } else if kernel.contains("rmsnorm")
+        || kernel.contains("mq_rotate")
+        || kernel.contains("convert_f32")
+    {
+        "norm_and_format"
+    } else if kernel.contains("copy_f32")
+        || kernel.contains("zero_f32")
+        || kernel.contains("embedding")
+    {
+        "state_io"
+    } else {
+        "other"
+    }
+}
+
+fn report_mtp_verifier_census(entries: &[RecordedHipProfileEntry], launch_count: usize) {
+    let total_us = entries.iter().map(|entry| entry.time_us).sum::<f64>();
+    let mut families = HashMap::<&'static str, (f64, usize)>::new();
+    let mut kernels = HashMap::<(&'static str, String, [u32; 3], [u32; 3]), (f64, usize)>::new();
+    for entry in entries {
+        let family = mtp_verifier_family(entry, launch_count);
+        let aggregate = families.entry(family).or_insert((0.0, 0));
+        aggregate.0 += entry.time_us;
+        aggregate.1 += 1;
+        let aggregate = kernels
+            .entry((family, entry.kernel.clone(), entry.grid, entry.block))
+            .or_insert((0.0, 0));
+        aggregate.0 += entry.time_us;
+        aggregate.1 += 1;
+    }
+    let mut families = families.into_iter().collect::<Vec<_>>();
+    families.sort_by(|left, right| right.1 .0.total_cmp(&left.1 .0));
+    let mut kernels = kernels.into_iter().collect::<Vec<_>>();
+    kernels.sort_by(|left, right| right.1 .0.total_cmp(&left.1 .0));
+
+    eprintln!(
+        "[mtp-verifier-census] mode=serialized-hip-events launches={launch_count} timed={} serialized_total_ms={:.3} retained_pm4_is_authoritative=true",
+        entries.len(),
+        total_us / 1_000.0,
+    );
+    for (family, (time_us, calls)) in families {
+        eprintln!(
+            "[mtp-verifier-family] family={family} calls={calls} total_ms={:.3} share={:.1}%",
+            time_us / 1_000.0,
+            100.0 * time_us / total_us.max(f64::EPSILON),
+        );
+    }
+    for (rank, ((family, kernel, grid, block), (time_us, calls))) in
+        kernels.into_iter().take(24).enumerate()
+    {
+        eprintln!(
+            "[mtp-verifier-kernel] rank={} family={family} kernel={kernel} grid={grid:?} block={block:?} calls={calls} total_ms={:.3} us_per_call={:.2} share={:.1}%",
+            rank + 1,
+            time_us / 1_000.0,
+            time_us / calls as f64,
+            100.0 * time_us / total_us.max(f64::EPSILON),
+        );
+    }
 }
 
 fn record_mtp_phase_trace(
@@ -4433,6 +4539,23 @@ pub fn spec_step_mtp_compressed_serial(
                     .poison(format!("MTP verify capture close failed: {reason}"));
             } else {
                 let launches = gpu.replay.recorded_launches().len();
+                if mtp_verifier_census_enabled_from_env() {
+                    // The direct capture above advanced verifier state. Restore
+                    // the same pre-verify snapshot, then replay the immutable
+                    // captured blobs once with serialized HIP-event brackets.
+                    // The replay leaves target state/logits at the same
+                    // post-verify point, so the surrounding spec cycle remains
+                    // semantically unchanged.
+                    state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
+                    qwen35::upload_prefill_batch_inputs(
+                        gpu,
+                        &state.trunk_pbs,
+                        &verify_tokens,
+                        cur_pos,
+                    )?;
+                    let entries = gpu.profile_recorded_hip_prefix(launches)?;
+                    report_mtp_verifier_census(&entries, launches);
+                }
                 if std::env::var_os("HIPFIRE_MTP_REPLAY_DUMP").is_some() {
                     let mut counts = std::collections::BTreeMap::new();
                     for (index, launch) in gpu.replay.recorded_launches().iter().enumerate() {
@@ -4990,5 +5113,54 @@ mod tests {
         assert_eq!(mtp_proposal_graph_seq_cap(27, 5, 4096), 256);
         assert_eq!(mtp_proposal_graph_seq_cap(260, 5, 4096), 512);
         assert_eq!(mtp_proposal_graph_seq_cap(3000, 5, 4096), 4096);
+    }
+
+    #[test]
+    fn verifier_census_separates_routed_shared_and_output_shapes() {
+        let entry = |dispatch_index: usize, kernel: &str, grid: [u32; 3]| {
+            RecordedHipProfileEntry {
+                dispatch_index,
+                kernel: kernel.to_owned(),
+                grid,
+                block: [32, 1, 1],
+                time_us: 1.0,
+            }
+        };
+        assert_eq!(
+            mtp_verifier_family(
+                &entry(
+                    10,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
+                    [1024, 8, 4]
+                ),
+                100,
+            ),
+            "routed_moe"
+        );
+        assert_eq!(
+            mtp_verifier_family(
+                &entry(11, "fused_silu_mul_mq_rotate", [2, 4, 1]),
+                100,
+            ),
+            "shared_moe"
+        );
+        assert_eq!(
+            mtp_verifier_family(
+                &entry(12, "fused_silu_mul_mq_rotate", [2, 32, 1]),
+                100,
+            ),
+            "routed_moe"
+        );
+        assert_eq!(
+            mtp_verifier_family(
+                &entry(
+                    99,
+                    "gemm_hfq4g256_residual_wmma_gfx12",
+                    [15520, 1, 1]
+                ),
+                100,
+            ),
+            "output_projection"
+        );
     }
 }

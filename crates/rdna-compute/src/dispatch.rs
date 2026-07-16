@@ -97,6 +97,19 @@ pub struct GpuTensor {
     pub dtype: DType,
 }
 
+/// One profiling-only HIP-event measurement from replaying an exact captured
+/// launch blob. The diagnostic replay serializes launches intentionally; its
+/// purpose is kernel attribution, while retained PM4 remains the source of the
+/// unperturbed whole-verifier time.
+#[derive(Clone, Debug)]
+pub struct RecordedHipProfileEntry {
+    pub dispatch_index: usize,
+    pub kernel: String,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub time_us: f64,
+}
+
 impl GpuTensor {
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
@@ -1355,6 +1368,89 @@ impl Gpu {
     /// Inputs/state must be restored by the caller first.
     pub fn replay_recorded_hip_prefix(&self, count: usize) -> HipResult<()> {
         self.replay_recorded_hip_range(0, count)
+    }
+
+    /// Profiling-only companion to [`Self::replay_recorded_hip_prefix`].
+    /// Replays each exact captured blob on the active HIP stream and places a
+    /// HIP event bracket around every launch. Synchronizing each stop event
+    /// deliberately destroys inter-kernel overlap, so callers must use these
+    /// measurements only for attribution and retain PM4 GPU timestamps for the
+    /// production makespan.
+    pub fn profile_recorded_hip_prefix(
+        &self,
+        count: usize,
+    ) -> HipResult<Vec<RecordedHipProfileEntry>> {
+        self.profile_recorded_hip_range(0, count)
+    }
+
+    fn profile_recorded_hip_range(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> HipResult<Vec<RecordedHipProfileEntry>> {
+        self.bind_thread()?;
+        if start > end || end > self.replay.recorded_launches().len() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "captured HIP profile range {start}..{end} is outside {} launches",
+                    self.replay.recorded_launches().len()
+                ),
+            ));
+        }
+        let start_event = self.hip.event_create()?;
+        let stop_event = match self.hip.event_create() {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = self.hip.event_destroy(start_event);
+                return Err(error);
+            }
+        };
+        let measured = (|| {
+            let mut entries = Vec::with_capacity(end - start);
+            for (relative, launch) in self.replay.recorded_launches()[start..end]
+                .iter()
+                .enumerate()
+            {
+                let func = self.functions.get(&launch.kernel).ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!("captured HIP function {:?} is not loaded", launch.kernel),
+                    )
+                })?;
+                let mut kernarg = launch.kernarg.clone();
+                self.hip
+                    .event_record(&start_event, self.active_stream.as_ref())?;
+                // SAFETY: the bytes were captured from this exact loaded
+                // function and the model owner retains every pointee.
+                unsafe {
+                    self.hip.launch_kernel_blob(
+                        func,
+                        launch.grid,
+                        launch.block,
+                        launch.shared_mem,
+                        self.active_stream.as_ref(),
+                        &mut kernarg,
+                    )?;
+                }
+                self.hip
+                    .event_record(&stop_event, self.active_stream.as_ref())?;
+                self.hip.event_synchronize(&stop_event)?;
+                let time_us =
+                    f64::from(self.hip.event_elapsed_ms(&start_event, &stop_event)?) * 1_000.0;
+                entries.push(RecordedHipProfileEntry {
+                    dispatch_index: start + relative,
+                    kernel: launch.kernel.clone(),
+                    grid: launch.grid,
+                    block: launch.block,
+                    time_us,
+                });
+            }
+            Ok(entries)
+        })();
+        let _ = self.hip.event_destroy(start_event);
+        let _ = self.hip.event_destroy(stop_event);
+        measured
     }
 
     /// Diagnostic companion to [`Self::replay_recorded_hip_prefix`] used to
