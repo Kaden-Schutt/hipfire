@@ -152,6 +152,27 @@ impl MtpSamplingConfig {
     }
 }
 
+fn mtp_draft_temp_scale_from_env_value(value: Option<&str>) -> f32 {
+    value
+        .and_then(|raw| raw.trim().parse::<f32>().ok())
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .map(|scale| scale.clamp(0.25, 4.0))
+        .unwrap_or(1.0)
+}
+
+fn mtp_draft_sampling_config(mut target: MtpSamplingConfig) -> MtpSamplingConfig {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let scale = *SCALE.get_or_init(|| {
+        mtp_draft_temp_scale_from_env_value(
+            std::env::var("HIPFIRE_MTP_DRAFT_TEMP_SCALE").ok().as_deref(),
+        )
+    });
+    if target.temp > 0.0 {
+        target.temp *= scale;
+    }
+    target
+}
+
 fn mtp_device_token_chain_enabled_from_env() -> bool {
     // Default on: this path is token-identical in greedy mode and removes the
     // proposal-loop host data dependency needed for later graph capture.
@@ -1606,7 +1627,7 @@ fn run_mtp_sampled_chain_graph_body_q8(
     seq_cap: usize,
 ) -> HipResult<()> {
     debug_assert_eq!(state.mtp_kv.kv_mode, crate::mtp_head::MtpKvMode::Q8);
-    let sampling = state.sampling;
+    let sampling = mtp_draft_sampling_config(state.sampling);
     debug_assert!(sampling.temp > 0.0 && (1..=MTP_EXACT_GPU_TOPK_MAX).contains(&sampling.top_k));
     let dim_bytes = dim * std::mem::size_of::<f32>();
     let logits_c = state
@@ -3522,6 +3543,7 @@ pub fn spec_step_mtp_compressed_serial(
     // verify, but we stop spending compute speculating further.
     let p_min = state.p_min;
     let sampling = state.sampling;
+    let draft_sampling = mtp_draft_sampling_config(sampling);
     // The K-step draft pick and the trunk-verify accept rule run in exactly ONE
     // of three modes per step. Modeling it as `DraftMode` makes the illegal
     // `p_min + sampling` combination unrepresentable downstream — it was
@@ -3819,8 +3841,13 @@ pub fn spec_step_mtp_compressed_serial(
         };
         gpu.hip.memcpy_dtoh(index_bytes, &idx_view.buf)?;
         let values = gpu.download_f32(&values_view)?;
-        sparse_draft_rows =
-            sparse_distributions_from_topk_host(&indices, &values, rows, k, &sampling);
+        sparse_draft_rows = sparse_distributions_from_topk_host(
+            &indices,
+            &values,
+            rows,
+            k,
+            &draft_sampling,
+        );
 
         let token_view = state.mtp_token_chain.sub_offset(1, rows);
         let mut token_host = vec![0i32; rows];
@@ -4072,7 +4099,8 @@ pub fn spec_step_mtp_compressed_serial(
                 let top_prob;
                 if exact_host_sampling {
                     let logits_host = gpu.download_f32(logits_for_argmax)?;
-                    let distribution = exact_truncated_distribution(&logits_host, &sampling);
+                    let distribution =
+                        exact_truncated_distribution(&logits_host, &draft_sampling);
                     draft_idx = crate::speculative::sample_categorical(
                         &distribution,
                         state.rng.next_uniform_f32(),
@@ -4090,7 +4118,7 @@ pub fn spec_step_mtp_compressed_serial(
                         &state.mtp_sample_sparse_logp,
                         argmax_vocab,
                         1,
-                        &sampling,
+                        &draft_sampling,
                     )?;
                     let distribution = distributions.pop().unwrap();
                     draft_idx = distribution.sample(state.rng.next_uniform_f32()) as usize;
@@ -4688,6 +4716,16 @@ pub fn spec_step_mtp_compressed_serial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_temperature_scale_is_bounded_and_defaults_safely() {
+        assert_eq!(mtp_draft_temp_scale_from_env_value(None), 1.0);
+        assert_eq!(mtp_draft_temp_scale_from_env_value(Some("bad")), 1.0);
+        assert_eq!(mtp_draft_temp_scale_from_env_value(Some("0")), 1.0);
+        assert_eq!(mtp_draft_temp_scale_from_env_value(Some("0.1")), 0.25);
+        assert_eq!(mtp_draft_temp_scale_from_env_value(Some("1.25")), 1.25);
+        assert_eq!(mtp_draft_temp_scale_from_env_value(Some("9")), 4.0);
+    }
 
     #[test]
     fn exact_host_distribution_applies_top_k_before_top_p() {
