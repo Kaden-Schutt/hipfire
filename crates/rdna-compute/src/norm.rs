@@ -2354,7 +2354,7 @@ impl Gpu {
         result
     }
 
-    /// Decode-only Q8 GDN path for a 2:1 value-head:QK-head layout.
+    /// Compact Q8 GDN path for a 2:1 value-head:QK-head layout.
     ///
     /// `q` and `k` remain compact (`n_heads / 2` heads). The kernel maps state
     /// head `h` to Q/K head `h / 2`, avoiding a separate repeat-interleave
@@ -2417,7 +2417,10 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let fr = reserve_gdn_requant_frames(1) as i32;
+        // Match the regular batched fast path's frame-accounting contract.
+        // The kernel requantizes once after the token loop, but reserving the
+        // full logical span keeps subsequent stochastic frame IDs identical.
+        let fr = reserve_gdn_requant_frames(n_tokens as u32) as i32;
         let efp: *mut c_void = ef_residual
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
