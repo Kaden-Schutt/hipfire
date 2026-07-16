@@ -100,6 +100,14 @@ class FakeGitHub:
         self.inject_review_on_remove = False
         self.inject_review_on_dismiss = False
         self.invalidate_keep_on_labels = False
+        self.arm_stale_on_canonical = False
+        self.arm_keep_invalidation_on_canonical = False
+        self.history_reads = 0
+        self.inject_stale_on_history_read: int | None = None
+        self.invalidate_keep_on_history_read: int | None = None
+        self.transient_stale_on_history_read: int | None = None
+        self.transient_keep_on_history_read: int | None = None
+        self.transient_records: dict[int, dict] = {}
         self.deleted_comment_ids: set[int] = set()
         self.edited_comment_ids: set[int] = set()
 
@@ -138,7 +146,39 @@ class FakeGitHub:
 
     def list_pull_reviews(self, repository: str, number: int) -> GitHubResponse:
         self.calls.append(("list_reviews", None))
-        return GitHubResponse(self.reviews, {}, 200)
+        self.history_reads += 1
+        if self.transient_stale_on_history_read == self.history_reads - 1:
+            self.transient_records.pop(905, None)
+            self.transient_stale_on_history_read = None
+        if self.transient_keep_on_history_read == self.history_reads - 1:
+            self.transient_keep_on_history_read = None
+        reviews = list(self.reviews)
+        if self.inject_stale_on_history_read == self.history_reads and self.reviews:
+            stale = deepcopy(self.reviews[0])
+            stale["id"] = 905
+            stale["node_id"] = "stale-in-canonical-history"
+            stale_payload = json.loads(self.payload_from_body(stale["body"]))
+            stale_payload["record_id"] = "stale-in-canonical-history"
+            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
+            stale["body"] = json.dumps(stale_payload)
+            self.reviews.append(stale)
+            self.inject_stale_on_history_read = None
+        if self.invalidate_keep_on_history_read == self.history_reads and self.reviews:
+            self.reviews[0]["state"] = "DISMISSED"
+            self.invalidate_keep_on_history_read = None
+        if self.transient_stale_on_history_read == self.history_reads:
+            stale = deepcopy(self.reviews[0])
+            stale["id"] = 905
+            stale["node_id"] = "stale-in-canonical-history"
+            stale_payload = json.loads(self.payload_from_body(stale["body"]))
+            stale_payload["record_id"] = "stale-in-canonical-history"
+            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
+            stale["body"] = json.dumps(stale_payload)
+            self.transient_records[905] = stale
+            reviews.append(stale)
+        if self.transient_keep_on_history_read == self.history_reads and reviews:
+            reviews[0] = {**reviews[0], "state": "DISMISSED"}
+        return GitHubResponse(reviews, {}, 200)
 
     def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
         self.calls.append(("list_labels", None))
@@ -183,7 +223,8 @@ class FakeGitHub:
         return self._envelope(next(item for item in self.comments if item["id"] == comment_id), "comment")
 
     def review_envelope(self, repository: str, number: int, review_id: int) -> GitHubEnvelope:
-        return self._envelope(next(item for item in self.reviews if item["id"] == review_id), "review")
+        records = [*self.reviews, *self.transient_records.values()]
+        return self._envelope(next(item for item in records if item["id"] == review_id), "review")
 
     def get_pull_review(self, repository: str, number: int, review_id: int) -> GitHubResponse:
         return GitHubResponse(next(item for item in self.reviews if item["id"] == review_id), {}, 200)
@@ -200,6 +241,12 @@ class FakeGitHub:
         }
         self.next_id += 1
         self.comments.append(record)
+        if record_type == "completion" and self.arm_stale_on_canonical:
+            self.transient_stale_on_history_read = self.history_reads + 2
+            self.arm_stale_on_canonical = False
+        if record_type == "completion" and self.arm_keep_invalidation_on_canonical:
+            self.transient_keep_on_history_read = self.history_reads + 2
+            self.arm_keep_invalidation_on_canonical = False
         if record_type == "completion" and self.inject_review_on_completion and self.reviews:
             stale = deepcopy(self.reviews[0])
             stale["id"] = 901
@@ -264,6 +311,7 @@ class FakeGitHub:
             if review["id"] == review_id:
                 review["state"] = "DISMISSED"
         self.reviews = [review for review in self.reviews if review["id"] != review_id]
+        self.transient_records.pop(review_id, None)
         if self.inject_review_on_dismiss and self.reviews:
             stale = deepcopy(self.reviews[0])
             stale["id"] = 904
@@ -691,6 +739,26 @@ def test_reconciliation_stabilizes_across_reviews_appearing_during_dismissal():
 def test_keep_review_invalidation_before_final_label_removal_fails_closed():
     client = FakeGitHub()
     client.invalidate_keep_on_labels = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status in {"error", "incomplete"}
+    assert "needs-review" in client.labels
+
+
+def test_stale_review_from_canonical_election_snapshot_is_reconciled():
+    client = FakeGitHub()
+    client.arm_stale_on_canonical = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "complete", result.reason
+    assert ("dismiss", 905) in client.calls
+
+
+def test_keep_review_change_from_canonical_election_snapshot_fails_closed():
+    client = FakeGitHub()
+    client.arm_keep_invalidation_on_canonical = True
 
     result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
 

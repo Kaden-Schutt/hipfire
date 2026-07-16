@@ -295,7 +295,9 @@ class ReviewPublisher:
                     current.extend(attempt_group)
         return _History(tuple(current), tuple(valid))
 
-    def _canonical(self, target: ReviewTarget, attempt_id: str, intent_node: str | None = None) -> GitHubEnvelope:
+    def _canonical(
+        self, target: ReviewTarget, attempt_id: str, intent_node: str | None = None,
+    ) -> tuple[GitHubEnvelope, _History]:
         history = self._history(target)
         try:
             elected = validate_protocol(
@@ -309,7 +311,7 @@ class ReviewPublisher:
             raise _CanonicalChanged("canonical intent is not an authenticated envelope")
         if elected.payload.get("attempt_id") != attempt_id or (intent_node and elected.node_id != intent_node):
             raise _CanonicalChanged("canonical review attempt changed")
-        return elected
+        return elected, history
 
     def _mutate(
         self,
@@ -446,8 +448,7 @@ class ReviewPublisher:
         self, target: ReviewTarget, attempt_id: str, intent_node: str, keep_node: str,
         *, keep_is_review: bool,
     ) -> tuple[_History, GitHubEnvelope]:
-        history = self._history(target)
-        canonical = self._canonical(target, attempt_id, intent_node)
+        canonical, history = self._canonical(target, attempt_id, intent_node)
         for _ in range(_MAX_RECONCILIATION_ROUNDS):
             if keep_is_review:
                 self._validate_keep_review(history, target, keep_node)
@@ -463,13 +464,11 @@ class ReviewPublisher:
                         attempt_id=attempt_id,
                         intent_node=canonical.node_id,
                     )
-                    history = self._history(target)
-                    canonical = self._canonical(target, attempt_id, intent_node)
+                    canonical, history = self._canonical(target, attempt_id, intent_node)
                 continue
             # Require two consecutive no-stale snapshots. The second fetch
             # closes the window between election and the next mutation.
-            stable_history = self._history(target)
-            stable_canonical = self._canonical(target, attempt_id, intent_node)
+            stable_canonical, stable_history = self._canonical(target, attempt_id, intent_node)
             if keep_is_review:
                 self._validate_keep_review(stable_history, target, keep_node)
             if not self._workflow_review_ids(stable_history, target, keep_node):
@@ -564,7 +563,7 @@ class ReviewPublisher:
                 return PublishResult("duplicate", attempt_id, reason="a different canonical attempt exists")
             intent = canonical or self._new_comment(target, self._intent_payload(target, attempt_id))
             history = self._history(target)
-            canonical = self._canonical(target, attempt_id, intent.node_id)
+            canonical, history = self._canonical(target, attempt_id, intent.node_id)
             completion = self._find_record(history, target, attempt_id, "completion")
             if completion is not None:
                 report = self._find_record(history, target, attempt_id, "report")
@@ -601,7 +600,7 @@ class ReviewPublisher:
                     metadata = _HistoryRecord(metadata_envelope, False, 0)
 
             history = self._history(target)
-            canonical = self._canonical(target, attempt_id, intent.node_id)
+            canonical, history = self._canonical(target, attempt_id, intent.node_id)
             completion = self._find_record(history, target, attempt_id, "completion")
             if completion is None:
                 history, canonical = self._reconcile_workflow_reviews(
