@@ -974,6 +974,31 @@ impl AqlQueue {
         )
     }
 
+    fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
+        if mask_bits == 0 || !mask_bits.is_multiple_of(32) {
+            return Err(RuntimeError::InvalidCuMask(
+                "mask bit count must be a non-zero multiple of 32",
+            ));
+        }
+        let required_words = usize::try_from(mask_bits / 32)
+            .map_err(|_| RuntimeError::InvalidCuMask("mask bit count exceeds usize"))?;
+        if mask.len() < required_words {
+            return Err(RuntimeError::InvalidCuMask(
+                "mask storage is shorter than its declared bit count",
+            ));
+        }
+        // SAFETY: the queue is live, the bit count is ABI-valid, and `mask`
+        // supplies at least the declared number of words for this call.
+        let status = unsafe {
+            (self.runtime().symbols.queue_cu_set_mask)(self.raw.as_ptr(), mask_bits, mask.as_ptr())
+        };
+        check_status(
+            &self.runtime().symbols,
+            "hsa_amd_queue_cu_set_mask",
+            status,
+        )
+    }
+
     fn depth_sample(&self) -> QueueDepthSample {
         let queue = self.raw.as_ptr();
         // These loads deliberately mirror the requested diagnostic: write
@@ -1230,6 +1255,13 @@ impl QueueSet {
     pub fn set_profiling(&self, enabled: bool) -> Result<(), RuntimeError> {
         for queue in &self.queues {
             queue.set_profiling(enabled)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
+        for queue in &self.queues {
+            queue.set_cu_mask(mask_bits, mask)?;
         }
         Ok(())
     }
@@ -2162,6 +2194,7 @@ pub enum RuntimeError {
     },
     ZeroQueues,
     DuplicateQueueId,
+    InvalidCuMask(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
     InvalidKernargAlignment(usize),
@@ -2254,6 +2287,7 @@ impl fmt::Display for RuntimeError {
             ),
             Self::ZeroQueues => write!(f, "at least one HSA queue is required"),
             Self::DuplicateQueueId => write!(f, "ROCr returned duplicate IDs for distinct queues"),
+            Self::InvalidCuMask(message) => write!(f, "invalid HSA CU mask: {message}"),
             Self::InvalidRuntimeObject(message) => write!(f, "invalid ROCr object: {message}"),
             Self::NoKernargPool => write!(
                 f,

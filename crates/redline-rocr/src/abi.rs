@@ -163,6 +163,7 @@ pub type QueueLoadReadIndexRelaxedFn = unsafe extern "C" fn(*const Queue) -> u64
 pub type QueueLoadReadIndexScAcquireFn = unsafe extern "C" fn(*const Queue) -> u64;
 pub type QueueLoadWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue) -> u64;
 pub type QueueAddWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue, u64) -> u64;
+pub type QueueCuSetMaskFn = unsafe extern "C" fn(*const Queue, u32, *const u32) -> Status;
 pub type ProfilingSetProfilerEnabledFn = unsafe extern "C" fn(*mut Queue, i32) -> Status;
 pub type ProfilingGetDispatchTimeFn =
     unsafe extern "C" fn(Agent, Signal, *mut ProfilingDispatchTime) -> Status;
@@ -220,6 +221,7 @@ pub struct Symbols {
     pub queue_load_read_index_scacquire: QueueLoadReadIndexScAcquireFn,
     pub queue_load_write_index_relaxed: QueueLoadWriteIndexRelaxedFn,
     pub queue_add_write_index_relaxed: QueueAddWriteIndexRelaxedFn,
+    pub queue_cu_set_mask: QueueCuSetMaskFn,
     pub profiling_set_profiler_enabled: ProfilingSetProfilerEnabledFn,
     pub profiling_get_dispatch_time: ProfilingGetDispatchTimeFn,
     pub agent_iterate_memory_pools: AgentIterateMemoryPoolsFn,
@@ -303,6 +305,7 @@ impl Symbols {
                 "hsa_queue_add_write_index_relaxed",
                 QueueAddWriteIndexRelaxedFn
             ),
+            queue_cu_set_mask: symbol!("hsa_amd_queue_cu_set_mask", QueueCuSetMaskFn),
             profiling_set_profiler_enabled: symbol!(
                 "hsa_amd_profiling_set_profiler_enabled",
                 ProfilingSetProfilerEnabledFn

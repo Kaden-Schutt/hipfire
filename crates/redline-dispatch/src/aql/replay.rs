@@ -230,6 +230,12 @@ impl SingleQueuePm4Ib {
             .expect("single-queue PM4 replay owns one queue")
     }
 
+    /// Restrict the retained replay queue to an ABI-valid WGP-paired CU mask.
+    /// This must be called before the first submission.
+    pub fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), ReplayError> {
+        self.queues.set_cu_mask(mask_bits, mask).map_err(Into::into)
+    }
+
     pub fn indirect_address(&self) -> usize {
         self.indirect.address() as usize
     }

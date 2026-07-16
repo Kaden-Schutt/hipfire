@@ -228,8 +228,9 @@ impl Pm4Commands {
         &self,
         device: &GpuDevice,
         pool: &KernargPool,
+        cu_mask: Option<&[u32; 2]>,
     ) -> Result<SingleQueuePm4Ib, String> {
-        match self {
+        let graph = match self {
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx10,
                 commands,
@@ -244,7 +245,13 @@ impl Pm4Commands {
             } => unreachable!("gfx12 never uses the legacy PM4 command variant"),
             Self::Gfx12(commands) => SingleQueuePm4Ib::create_profiled(device, pool, commands),
         }
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        if let Some(cu_mask) = cu_mask {
+            graph
+                .set_cu_mask(64, cu_mask)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(graph)
     }
 }
 
@@ -1174,6 +1181,57 @@ fn gfx1151_resource_limits_policy_from_value(
     }
 }
 
+fn gfx1151_cu_mask(
+    architecture: Pm4Architecture,
+    device_name: &str,
+) -> Option<[u32; 2]> {
+    let value =
+        std::env::var("HIPFIRE_GFX1151_REDLINE_CU_COUNT").unwrap_or_else(|_| "all".to_owned());
+    let mask = gfx1151_cu_mask_from_value(architecture, device_name, &value).unwrap_or_else(|| {
+        eprintln!(
+            "WARNING: unknown HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?}; retaining all CUs"
+        );
+        None
+    });
+    if let Some(mask) = mask {
+        let enabled = mask.into_iter().map(u32::count_ones).sum::<u32>();
+        eprintln!("[redline] gfx1151 queue CU mask enables {enabled}/40 CUs");
+    }
+    mask
+}
+
+fn gfx1151_cu_mask_from_value(
+    architecture: Pm4Architecture,
+    device_name: &str,
+    value: &str,
+) -> Option<Option<[u32; 2]>> {
+    if architecture != Pm4Architecture::Gfx11 || !device_name.eq_ignore_ascii_case("gfx1151") {
+        return Some(None);
+    }
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "" | "all" | "inherit" | "40"
+    ) {
+        return Some(None);
+    }
+    let count = value.parse::<u32>().ok()?;
+    if count == 0 || count >= 40 || !count.is_multiple_of(2) {
+        return None;
+    }
+    let low = if count >= 32 {
+        u32::MAX
+    } else {
+        (1_u32 << count) - 1
+    };
+    let high_count = count.saturating_sub(32);
+    let high = if high_count == 0 {
+        0
+    } else {
+        (1_u32 << high_count) - 1
+    };
+    Some(Some([low, high]))
+}
+
 impl Pm4WaitPolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -2087,6 +2145,7 @@ impl ReplayController {
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
+        let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -2200,6 +2259,9 @@ impl ReplayController {
         } else {
             1
         };
+        if cu_mask.is_some() && queue_limit != 1 {
+            return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
+        }
         let (graph, command_dwords) = if queue_limit == 1 {
             let mut commands = Pm4Commands::new(
                 pm4_architecture,
@@ -2252,7 +2314,7 @@ impl ReplayController {
             }
             commands.wait_compute_idle();
             let command_dwords = commands.len_dwords();
-            let graph = commands.create_graph(&device, &pool)?;
+            let graph = commands.create_graph(&device, &pool, cu_mask.as_ref())?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
             let min_parallel_width = pm4_min_parallel_width_from_env();
@@ -3120,6 +3182,38 @@ mod tests {
                 "gfx1151",
                 "invalid",
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn gfx1151_cu_mask_is_exact_arch_and_wgp_paired() {
+        assert_eq!(
+            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "all"),
+            Some(None)
+        );
+        assert_eq!(
+            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "32"),
+            Some(Some([u32::MAX, 0]))
+        );
+        assert_eq!(
+            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "36"),
+            Some(Some([u32::MAX, 0xf]))
+        );
+        assert_eq!(
+            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1100", "32"),
+            Some(None)
+        );
+        assert_eq!(
+            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx12, "gfx1201", "32"),
+            Some(None)
+        );
+        assert_eq!(
+            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "35"),
+            None
+        );
+        assert_eq!(
+            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "42"),
             None
         );
     }
