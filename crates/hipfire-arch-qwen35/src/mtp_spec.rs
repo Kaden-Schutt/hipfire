@@ -795,6 +795,7 @@ pub struct MtpSpecState {
     mtp_sampled_step_graph_seq_cap: usize,
     mtp_sampled_step_graph_warmed: bool,
     mtp_sampled_step_graph_disabled: bool,
+    mtp_sampled_step_graph_reported: bool,
 
     /// Optional FastMTP-style compressed batched-logits output, shape
     /// `[max_n * compressed_vocab_size]`. Populated by
@@ -1028,6 +1029,7 @@ impl MtpSpecState {
             mtp_sampled_step_graph_seq_cap: 0,
             mtp_sampled_step_graph_warmed: false,
             mtp_sampled_step_graph_disabled: false,
+            mtp_sampled_step_graph_reported: false,
             mtp_lm_logits_compressed: None,
             mtp_topk_idx,
             mtp_topk_logp,
@@ -1189,6 +1191,7 @@ impl MtpSpecState {
         self.mtp_proposal_graph_seq_cap = 0;
         self.mtp_sampled_step_graph_warmed = false;
         self.mtp_sampled_step_graph_seq_cap = 0;
+        self.mtp_sampled_step_graph_reported = false;
         self.mtp_kv.reset(gpu)?;
         self.sampling_history.clear();
         Ok(())
@@ -3335,6 +3338,19 @@ pub fn spec_step_mtp_compressed_serial(
             trunk_weights.embd_format,
             state.mtp_kv.kv_mode,
         );
+    if use_sampling && !state.mtp_sampled_step_graph_reported {
+        eprintln!(
+            "[mtp-sampled-step-graph] eligible={} exact_sparse={} full_vocab={} p_min={} embd={:?} kv={:?} cvs={}",
+            use_sampled_step_graph,
+            exact_sparse_sampling,
+            use_full_vocab,
+            p_min,
+            trunk_weights.embd_format,
+            state.mtp_kv.kv_mode,
+            cvs,
+        );
+        state.mtp_sampled_step_graph_reported = true;
+    }
     if use_device_token_chain && !use_full_vocab {
         assert!(
             head.weights.lm_head_draft_vocab_map_gpu.is_some(),
