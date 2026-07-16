@@ -261,6 +261,14 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         const hipfire_gate_f32x4 xv2b = LOAD_X4(base0 + 516);
         const hipfire_gate_f32x4 xv3a = LOAD_X4(base0 + 768);
         const hipfire_gate_f32x4 xv3b = LOAD_X4(base0 + 772);
+        // LLVM otherwise sinks each B128 activation request beside its first
+        // dependent DOG, collapsing the intended VMEM clause into a chain of
+        // load/wait/VALU islands. Keep all eight vectors live at one compiler
+        // barrier so gfx1151 can issue the hot activation stream before the
+        // independent expert-weight requests.
+        asm volatile("" : :
+            "v"(xv0a), "v"(xv0b), "v"(xv1a), "v"(xv1b),
+            "v"(xv2a), "v"(xv2b), "v"(xv3a), "v"(xv3b) : "memory");
 #else
         const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
         const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
