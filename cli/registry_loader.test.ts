@@ -146,6 +146,16 @@ describe("validateRegistryV1", () => {
     expect(validateRegistryV1(unknown)).toBeNull();
   });
 
+  test("accepts a valid DSpark sidecar and rejects a malformed one", () => {
+    const valid = goodRegistry();
+    valid.models["qwen3.5:9b"].dspark = { file: "draft-dspark.mq4" };
+    expect(validateRegistryV1(valid)).not.toBeNull();
+
+    const malformed = goodRegistry();
+    (malformed.models["qwen3.5:9b"] as unknown as Record<string, unknown>).dspark = { file: 42 };
+    expect(validateRegistryV1(malformed)).toBeNull();
+  });
+
   test("accepts a valid per-model default_kv_mode and null/missing", () => {
     const r = goodRegistry();
     (r.models["qwen3.5:9b"] as unknown as Record<string, unknown>).default_kv_mode = "q8";

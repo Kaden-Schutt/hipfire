@@ -1255,6 +1255,13 @@ interface ModelEntry {
   /// `crates/hipfire-arch-deepseek4/src/arch.rs`), so no explicit env var
   /// is required once the file is in MODELS_DIR.
   mtp?: { file: string };
+  /// Optional published DSpark 3-stage drafter sidecar — currently DeepSeek V4
+  /// only. When set, `hipfire pull` also fetches the file next to the weights.
+  /// The deepseek4 loader auto-discovers it via the `<stem>-dspark.<ext>`
+  /// sibling convention (see `crates/hipfire-arch-deepseek4/src/arch.rs`) at
+  /// load time, so no explicit env var is required once the file is in
+  /// MODELS_DIR; under `--spec dspark`/auto it wins over the in-trunk MTP head.
+  dspark?: { file: string };
   /// Optional per-model KV-cache default (the registry is the per-model card).
   /// When present it takes precedence over the q8 default in resolveKvMode (but
   /// still loses to HIPFIRE_KV_MODE env and per-model config). This is the
@@ -2297,6 +2304,80 @@ class Engine {
 
 // ─── Pull (Download) ────────────────────────────────────
 
+type RegistrySidecarKind = "triattn" | "mtp" | "dspark";
+
+interface RegistrySidecarDownload {
+  kind: RegistrySidecarKind;
+  label: string;
+  sizeDivisor: number;
+  sizeUnit: string;
+  sizeDigits: number;
+  unavailableHint: string;
+}
+
+const REGISTRY_SIDECAR_DOWNLOADS: readonly RegistrySidecarDownload[] = [
+  {
+    kind: "triattn",
+    label: "TriAttention",
+    sizeDivisor: 1e6,
+    sizeUnit: "MB",
+    sizeDigits: 1,
+    unavailableHint: "model is usable, run hipfire config cask-profile off to silence",
+  },
+  {
+    kind: "mtp",
+    label: "MTP",
+    sizeDivisor: 1e9,
+    sizeUnit: "GB",
+    sizeDigits: 2,
+    unavailableHint: "base is usable; spec-decode unavailable until sidecar present",
+  },
+  {
+    kind: "dspark",
+    label: "DSpark",
+    sizeDivisor: 1e9,
+    sizeUnit: "GB",
+    sizeDigits: 2,
+    unavailableHint: "base is usable; DSpark spec-decode unavailable until sidecar present",
+  },
+];
+
+async function pullRegisteredSidecars(entry: ModelEntry): Promise<void> {
+  for (const spec of REGISTRY_SIDECAR_DOWNLOADS) {
+    const sidecar = entry[spec.kind];
+    if (!sidecar?.file) continue;
+
+    const sidecarDest = join(MODELS_DIR, sidecar.file);
+    if (existsSync(sidecarDest)) {
+      console.error(`  ${spec.label} sidecar already present: ${sidecar.file}`);
+      continue;
+    }
+
+    const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${sidecar.file}`;
+    console.error(`  Fetching ${spec.label} sidecar: ${sidecar.file}`);
+    try {
+      const response = await fetch(sidecarUrl, { headers: hfHeaders() });
+      if (!response.ok) {
+        console.error(`  WARN: ${spec.label} sidecar fetch failed (${response.status} ${response.statusText}) — ${spec.unavailableHint}.`);
+        continue;
+      }
+
+      const tmpDest = sidecarDest + ".tmp";
+      const writer = Bun.file(tmpDest).writer();
+      for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
+        writer.write(chunk);
+      }
+      await writer.end();
+      const { renameSync } = await import("fs");
+      renameSync(tmpDest, sidecarDest);
+      const size = (statSync(sidecarDest).size / spec.sizeDivisor).toFixed(spec.sizeDigits);
+      console.error(`  Saved: ${sidecarDest} (${size}${spec.sizeUnit})`);
+    } catch (error) {
+      console.error(`  WARN: ${spec.label} sidecar fetch error: ${error} — non-fatal.`);
+    }
+  }
+}
+
 async function pull(tag: string): Promise<string> {
   const resolved = resolveModelTag(tag);
   const entry = REGISTRY[resolved];
@@ -2310,6 +2391,7 @@ async function pull(tag: string): Promise<string> {
   if (existsSync(dest)) {
     const sz = (statSync(dest).size / 1e9).toFixed(1);
     console.error(`Already downloaded: ${entry.file} (${sz}GB)`);
+    await pullRegisteredSidecars(entry);
     return dest;
   }
 
@@ -2405,67 +2487,9 @@ async function pull(tag: string): Promise<string> {
   const sz = (statSync(dest).size / 1e9).toFixed(1);
   console.error(`  Saved: ${dest} (${sz}GB)`);
 
-  // TriAttention sidecar: fetch alongside the weights when the registry
-  // entry has one. Sidecars are tiny (≈2 MB) so we don't gate this on a
-  // flag — getting the .triattn.bin into MODELS_DIR is the prereq for the
-  // run/serve auto-attach to fire. Failures are non-fatal: weights are
-  // already on disk and runnable; the user just won't get auto-eviction.
-  if (entry.triattn?.file) {
-    const sidecarDest = join(MODELS_DIR, entry.triattn.file);
-    if (existsSync(sidecarDest)) {
-      console.error(`  TriAttention sidecar already present: ${entry.triattn.file}`);
-    } else {
-      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
-      console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
-      try {
-        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
-        if (!sres.ok) {
-          console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
-        } else {
-          const sTmp = sidecarDest + ".tmp";
-          const sWriter = Bun.file(sTmp).writer();
-          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
-          await sWriter.end();
-          const { renameSync } = await import("fs");
-          renameSync(sTmp, sidecarDest);
-          const ssz = (statSync(sidecarDest).size / 1e6).toFixed(1);
-          console.error(`  Saved: ${sidecarDest} (${ssz}MB)`);
-        }
-      } catch (e) {
-        console.error(`  WARN: sidecar fetch error: ${e} — non-fatal.`);
-      }
-    }
-  }
-
-  // MTP sidecar: same pattern as TriAttention. Daemon auto-attaches via the
-  // `<stem>-mtp.<ext>` sibling convention (see arch-deepseek4/src/arch.rs);
-  // missing sidecar = plain decode only, no spec-decode.
-  if (entry.mtp?.file) {
-    const sidecarDest = join(MODELS_DIR, entry.mtp.file);
-    if (existsSync(sidecarDest)) {
-      console.error(`  MTP sidecar already present: ${entry.mtp.file}`);
-    } else {
-      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.mtp.file}`;
-      console.error(`  Fetching MTP sidecar: ${entry.mtp.file}`);
-      try {
-        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
-        if (!sres.ok) {
-          console.error(`  WARN: MTP sidecar fetch failed (${sres.status} ${sres.statusText}) — base is usable; spec-decode unavailable until sidecar present.`);
-        } else {
-          const sTmp = sidecarDest + ".tmp";
-          const sWriter = Bun.file(sTmp).writer();
-          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
-          await sWriter.end();
-          const { renameSync } = await import("fs");
-          renameSync(sTmp, sidecarDest);
-          const ssz = (statSync(sidecarDest).size / 1e9).toFixed(2);
-          console.error(`  Saved: ${sidecarDest} (${ssz}GB)`);
-        }
-      } catch (e) {
-        console.error(`  WARN: MTP sidecar fetch error: ${e} — non-fatal.`);
-      }
-    }
-  }
+  // Registered companions are always checked, including on a later re-pull
+  // after a new sidecar is added to the dynamic registry.
+  await pullRegisteredSidecars(entry);
 
   return dest;
 }
