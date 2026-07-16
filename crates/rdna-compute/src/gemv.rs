@@ -3276,6 +3276,82 @@ impl Gpu {
         result
     }
 
+    /// gfx1201 DeltaNet B4 verifier specialization: reproduce two independent
+    /// head-wise gated norms per workgroup and feed their 256 normalized
+    /// values directly from LDS into the MQ rotation. Grid.y is the batch row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_norm_rotate_mq_batched_gfx12(
+        &mut self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        const KERNEL: &str = "gated_norm_mq_rotate_batched_gfx12";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GATED_NORM_MQ_ROTATE_BATCHED_GFX12_SRC,
+            KERNEL,
+        )?;
+
+        let xp = x.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let k = n_heads * head_dim;
+        let bytes = (crate::profile::gated_norm_bytes(k)
+            + crate::profile::mq_rotate_bytes(k))
+            * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [(n_heads / 2) as u32, batch_size as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(zp);
+                b.push_ptr(wp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
     pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
         self.bind_thread()?;

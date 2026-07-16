@@ -584,7 +584,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
-        "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => Some(vec![
+        "gated_norm_mq_rotate_gfx1100"
+        | "gated_norm_mq_rotate_gfx1151"
+        | "gated_norm_mq_rotate_batched_gfx12" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -646,7 +648,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2" => {
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => {
+            Some(vec![read(0), read(8), read(16), write(24), write(32)])
+        }
+        "gemm_gate_up_hfq4g256_wmma_gfx12"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt8"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt12" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
         "gemm_qkvza_hfq4g256_wmma_gfx12" => Some(vec![
@@ -908,6 +918,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
+        | "gated_norm_mq_rotate_batched_gfx12"
         | "qwen35_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
@@ -3299,6 +3310,7 @@ mod tests {
         "gated_norm_f32",
         "gated_norm_mq_rotate_gfx1100",
         "gated_norm_mq_rotate_gfx1151",
+        "gated_norm_mq_rotate_batched_gfx12",
         "qwen35_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
         "kv_cache_write_q8_0_batched",
