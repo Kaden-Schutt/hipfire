@@ -14310,6 +14310,18 @@ fn forward_lowered_enabled() -> bool {
     *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
+/// Exact gfx1151 admission gate for the already-exact gfx1100 decode
+/// super-kernels.  Keep this separate from the broad RDNA3 capability checks:
+/// gfx1151 has a different cache hierarchy and occupancy balance, so each
+/// schedule must earn its own stationary product result before defaulting on.
+fn gfx1151_radiowave_fusions_enabled(gpu: &Gpu) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    gpu.arch_caps.is_gfx1151()
+        && *ENABLED.get_or_init(|| {
+            std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
+        })
+}
+
 /// Decode path that keeps DeltaNet Q/K at their native head count and
 /// lets each pair of value/state heads reuse one Q/K head. The architecture,
 /// Q8-state, and 2:1-head gates keep every other configuration isolated; the
@@ -14323,7 +14335,9 @@ fn gdn_compact2_enabled(
     quant: StateQuant,
 ) -> bool {
     let mode = std::env::var("HIPFIRE_GDN_COMPACT2").ok();
-    let arch_enabled = (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100")
+    let arch_enabled = (gpu.arch_caps.is_gfx1201()
+        || gpu.arch_caps.arch() == "gfx1100"
+        || gfx1151_radiowave_fusions_enabled(gpu))
         && mode.as_deref() != Some("0");
     arch_enabled && quant == StateQuant::Q8 && config.linear_num_key_heads * 2 == n_v_heads
 }
@@ -14348,7 +14362,7 @@ fn gated_norm_mq_rotate_enabled(
             != Some("0")
     });
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
         && config.dim == 2_048
         && n_v_heads == 32
         && config.linear_value_head_dim == 128
@@ -14372,7 +14386,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     });
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
         && !gpu.flags.rope_interleaved_legacy
         && config.n_heads == 16
         && config.n_kv_heads == 2
@@ -14392,7 +14406,7 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
             != Some("0")
     });
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2
         && config.head_dim == 256
@@ -14460,7 +14474,9 @@ fn conv_scalar_prep_enabled(
 
 fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
     let mode = std::env::var("HIPFIRE_CONV_QKNORM").ok();
-    let arch_enabled = (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100")
+    let arch_enabled = (gpu.arch_caps.is_gfx1201()
+        || gpu.arch_caps.arch() == "gfx1100"
+        || gfx1151_radiowave_fusions_enabled(gpu))
         && mode.as_deref() != Some("0");
     arch_enabled && quant == StateQuant::Q8 && config.linear_key_head_dim == 128
 }
@@ -14481,7 +14497,7 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
             != Some("0")
     });
     if !requested
-        || !gpu.arch_caps.is_gfx1100()
+        || !(gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
         || config.dim != 2_048
         || config.num_experts_per_tok != 8
         || config.n_layers < 2
