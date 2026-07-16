@@ -4,6 +4,11 @@
 
 #include <hip/hip_runtime.h>
 
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+using hipfire_lm_i32x4 = int __attribute__((ext_vector_type(4)));
+using hipfire_lm_f32x4 = float __attribute__((ext_vector_type(4)));
+#endif
+
 // HFQ4-G256 multi-row GEMV: one warp computes R output rows.
 // Default (non-RDNA3) variant used by archs that fall through to the
 // default gemv_hfq4g256 dispatch path: gfx1010, gfx1013 (BC-250), etc.
@@ -266,7 +271,11 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
     const bool have_row1 = row1 < M;
     const int tid = threadIdx.x;
 
+#if defined(HIPFIRE_GFX1151_LM_HEAD_K2048)
+    const int groups_per_row = 8;
+#else
     const int groups_per_row = K / 256;
+#endif
     const long long row_stride = (long long)groups_per_row * 136;
     // Clamp OOB row1 to row0 so weight reads stay in-bounds; store is masked.
     const char* row_ptr0 = A + (long long)row0 * row_stride;
@@ -280,17 +289,33 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
     // avoids extending the live descriptor set in this 94-VGPR kernel.
     const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
 #endif
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+    const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
+#endif
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+    #define LOAD_X8_INTO(b, pfx) \
+        const hipfire_lm_f32x4 pfx##v0 = __builtin_bit_cast( \
+            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
+                x_rsrc, (unsigned int)(b) * 4u, 0, 0)); \
+        const hipfire_lm_f32x4 pfx##v1 = __builtin_bit_cast( \
+            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
+                x_rsrc, ((unsigned int)(b) + 4u) * 4u, 0, 0)); \
+        const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
+        const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
+#else
     #define LOAD_X8_INTO(b, pfx) \
         const float4 pfx##v0 = *reinterpret_cast<const float4*>(x + (b)); \
         const float4 pfx##v1 = *reinterpret_cast<const float4*>(x + (b) + 4); \
         const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
         const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
+#endif
 
 #if defined(HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER)
     // Uniform per-group headers are cheaper on the scalar/global path. Only
@@ -326,6 +351,11 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r2(
         LOAD_X8_INTO(base0 + 256, xb);
         LOAD_X8_INTO(base0 + 512, xc);
         LOAD_X8_INTO(base0 + 768, xd);
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+        asm volatile("" : :
+            "v"(xav0), "v"(xav1), "v"(xbv0), "v"(xbv1),
+            "v"(xcv0), "v"(xcv1), "v"(xdv0), "v"(xdv1) : "memory");
+#endif
 
         // Branchless dual-row DOG with all x resident (no mid-quad x reload).
         DOG_X8(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a0, xa);

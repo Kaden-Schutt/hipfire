@@ -2756,6 +2756,19 @@ pub const GEMV_HFQ4G256_MULTIROW_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
 );
+/// Full gfx1151 LM-head specialization: fixed K removes tail machinery,
+/// uniform headers remain scalar, packed words use temporal buffer VMEM, and
+/// aligned activation vectors form an explicit B128 clause.
+pub const GEMV_HFQ4G256_MULTIROW_ALL_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_GFX1151_LM_HEAD_X_BUFFER 1\n",
+    "#define HIPFIRE_GFX1151_LM_HEAD_K2048 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
 
