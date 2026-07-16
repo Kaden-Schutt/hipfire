@@ -516,15 +516,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
-        "gemv_hfq4g256_moe_gate_up_k8_compact_b4_gfx12" => Some(vec![
-            read(0),
-            read(8),
-            read(16),
-            read(24),
-            read(32),
-            write(40),
-            write(48),
-        ]),
         "gemm_gate_up_hfq4g256_wmma_gfx12"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt8"
@@ -558,14 +549,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc" => {
             Some(vec![read(0), read(8), read(16), write(24)])
         }
-        "gemv_hfq4g256_moe_down_k8_compact_b4_gfx12" => Some(vec![
-            read(0),
-            read(8),
-            read(16),
-            read(24),
-            read(32),
-            write(40),
-        ]),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(vec![
             read(0),
             read(8),
@@ -725,8 +708,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => Some(64),
-        "gemv_hfq4g256_moe_gate_up_k8_compact_b4_gfx12" => Some(80),
-        "gemv_hfq4g256_moe_down_k8_compact_b4_gfx12" => Some(64),
         "gemm_gate_up_hfq4g256_wmma_gfx12"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt8"
@@ -2964,7 +2945,6 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
-        "gemv_hfq4g256_moe_gate_up_k8_compact_b4_gfx12",
         "gemm_gate_up_hfq4g256_wmma_gfx12",
         "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
         "gemm_gate_up_hfq4g256_wmma_gfx12_bt8",
@@ -2974,7 +2954,6 @@ mod tests {
         "gemm_hfq4g256_residual_wmma_gfx12",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
-        "gemv_hfq4g256_moe_down_k8_compact_b4_gfx12",
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
         "moe_down_combine_k8_batched",
         "moe_down_combine_k8_batched_vec4",

@@ -28,10 +28,6 @@
 #define HIPFIRE_MOE_GATE_UP_BATCHED 0
 #endif
 
-#ifndef HIPFIRE_MOE_GATE_UP_COMPACT_B4
-#define HIPFIRE_MOE_GATE_UP_COMPACT_B4 0
-#endif
-
 #if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
 #define HIPFIRE_MOE_GATE_UP_BLOCK 64
 #define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 8
@@ -72,10 +68,6 @@ __launch_bounds__(HIPFIRE_MOE_GATE_UP_BLOCK, HIPFIRE_MOE_GATE_UP_MIN_BLOCKS)
 extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp] device pointers
     const int* __restrict__ topk_indices,                // [k_top]
-#if HIPFIRE_MOE_GATE_UP_COMPACT_B4
-    const int* __restrict__ sorted_slot_index,           // [N * K_TOP]
-    const int* __restrict__ sorted_expert_ids,            // [N * K_TOP]
-#endif
     const float* __restrict__ x,                         // [K]
     float* __restrict__ y_gate,                          // [K_TOP × MI]
     float* __restrict__ y_up,                            // [K_TOP × MI]
@@ -103,21 +95,12 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const int row = blockIdx.x;
 #endif
     if (row >= mi) return;
-#if !HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE && !HIPFIRE_MOE_GATE_UP_COMPACT_B4
+#if !HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE
     const int krank = blockIdx.y;
 #endif
 
     // Read expert_id from device and index into the pointer table.
-#if HIPFIRE_MOE_GATE_UP_COMPACT_B4
-    const int sorted_pos = blockIdx.y;
-    const int flat_slot = sorted_slot_index[sorted_pos];
-    if (flat_slot < 0) return;
-    const int expert_id = sorted_expert_ids[sorted_pos];
-    if (expert_id < 0) return;
-    const int bid = flat_slot / K_TOP;
-    const int krank = flat_slot - bid * K_TOP;
-    const float* __restrict__ x_row = x + (long long)bid * K;
-#elif HIPFIRE_MOE_GATE_UP_BATCHED
+#if HIPFIRE_MOE_GATE_UP_BATCHED
     const int bid = blockIdx.z;
     const int expert_id = topk_indices[bid * K_TOP + krank];
     const float* __restrict__ x_row = x + (long long)bid * K;

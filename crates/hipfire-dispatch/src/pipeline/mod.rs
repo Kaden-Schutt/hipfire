@@ -2323,22 +2323,6 @@ pub fn run_moe_prefill(
     let (n, mi, k_top, n_exp) = (p.batch_size, p.mi, p.k_top, p.n_exp);
     let (down_m, down_k, gate_up_k) = (p.down_m, p.down_k, p.gate_up_k);
     let total_slots = n * k_top;
-    static MTP_COMPACT_ROUTED_MOE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let compact_routed_moe = !res.use_path2
-        && *MTP_COMPACT_ROUTED_MOE.get_or_init(|| {
-            std::env::var("HIPFIRE_MTP_COMPACT_ROUTED_MOE")
-                .ok()
-                .as_deref()
-                == Some("1")
-        })
-        && ctx.arch.is_gfx1201()
-        && n == 4
-        && k_top == 8
-        && gate_up_k == 2_048
-        && p.dtypes.routed_gate_up == DType::MQ4G256
-        && p.dtypes.routed_down == DType::MQ4G256
-        && p.expert_dtype_tags.is_none()
-        && p.expert_down_awq_ptrs.is_none();
 
     // EP (Ship 6 substrate-EP prefill): the routed combine accumulates into
     // `out_target` — the zeroed `[batch × dim]` partial when `routed_out` is set
@@ -2367,22 +2351,6 @@ pub fn run_moe_prefill(
             MOE_GROUPED_BLOCK_M,
         ))?;
         path2_m_total = m_total_max;
-    } else if compact_routed_moe {
-        // Exact, unpadded expert-major permutation for the B4 verifier. With
-        // block_m=1 every original route occupies exactly one sorted position;
-        // compact GEMVs map their stores back through sorted_slot_index.
-        hip!(gpu.moe_scatter_fused_k8(
-            p.topk_indices,
-            p.expert_token_counts,
-            p.expert_offsets,
-            p.sorted_slot_index,
-            p.expert_tile_ids,
-            p.inverse_perm,
-            total_slots,
-            n_exp,
-            total_slots,
-            1,
-        ))?;
     }
 
     // ── Gate_up ────────────────────────────────────────────────────────
@@ -2475,35 +2443,17 @@ pub fn run_moe_prefill(
             // MQ4/MQ6 indexed batched GEMV (x_rot_batch is already FWHT-rotated
             // by the model).
             let gate_up_result = match p.dtypes.routed_gate_up {
-                DType::MQ4G256 => {
-                    if compact_routed_moe {
-                        hip!(gpu.gemv_hfq4g256_moe_gate_up_compact_b4_gfx12(
-                            p.expert_gate_up_ptrs,
-                            p.topk_indices,
-                            p.sorted_slot_index,
-                            p.expert_tile_ids,
-                            p.x_rot_batch,
-                            p.gate_batch,
-                            p.up_batch,
-                            2 * mi,
-                            gate_up_k,
-                            k_top,
-                            total_slots,
-                        ))
-                    } else {
-                        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                            p.expert_gate_up_ptrs,
-                            p.topk_indices,
-                            p.x_rot_batch,
-                            p.gate_batch,
-                            p.up_batch,
-                            2 * mi,
-                            gate_up_k,
-                            k_top,
-                            n,
-                        ))
-                    }
-                }
+                DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    p.x_rot_batch,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )),
                 DType::MQ5G256 => hip!(gpu.gemv_hfq5g256_moe_gate_up_k8_indexed_batched(
                     p.expert_gate_up_ptrs,
                     p.topk_indices,
@@ -2712,33 +2662,16 @@ pub fn run_moe_prefill(
         // MQ6 only reaches here on archs where it's admitted without WMMA
         // (gfx12 via env override); the Gpu method exists.
         let down_result = match p.dtypes.routed_down {
-            DType::MQ4G256 => {
-                if compact_routed_moe {
-                    hip!(gpu.gemv_hfq4g256_moe_down_compact_b4_gfx12(
-                        p.expert_down_ptrs,
-                        p.topk_indices,
-                        p.sorted_slot_index,
-                        p.expert_tile_ids,
-                        p.rot_batch,
-                        p.down_expanded,
-                        down_m,
-                        down_k,
-                        k_top,
-                        total_slots,
-                    ))
-                } else {
-                    hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                        p.expert_down_ptrs,
-                        p.topk_indices,
-                        p.rot_batch,
-                        p.down_expanded,
-                        down_m,
-                        down_k,
-                        k_top,
-                        n,
-                    ))
-                }
-            }
+            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
+            )),
             DType::MQ5G256 => hip!(gpu.gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
                 p.topk_indices,
