@@ -47,11 +47,23 @@
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float    __attribute__((ext_vector_type(8))) float8_t;
 
+#ifdef HIPFIRE_WMMA_X_F32
+#define HIPFIRE_X_T float
+#define HIPFIRE_LOAD_X8(ptr) __builtin_convertvector(*(const float8_t*)(ptr), half8_t)
+#else
+#define HIPFIRE_X_T _Float16
+#define HIPFIRE_LOAD_X8(ptr) (*(const half8_t*)(ptr))
+#endif
+
+#ifndef HIPFIRE_KERNEL_NAME
+#define HIPFIRE_KERNEL_NAME gemm_gate_up_hfq4g256_wmma_gfx12
+#endif
+
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_gate_up_hfq4g256_wmma_gfx12(
+extern "C" __global__ void HIPFIRE_KERNEL_NAME(
     const char*    __restrict__ A_gate,
     const char*    __restrict__ A_up,
-    const _Float16* __restrict__ X,        // [N x K], FP16
+    const HIPFIRE_X_T* __restrict__ X,     // [N x K], FP16 or F32
     float*         __restrict__ Y_gate,    // [N x gate_m]
     float*         __restrict__ Y_up,      // [N x up_m]
     int gate_m, int up_m,
@@ -98,7 +110,7 @@ extern "C" __global__ void gemm_gate_up_hfq4g256_wmma_gfx12(
         _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
         _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
 
-        const _Float16* x_base = X + (long long)safe_batch * K + g * 256;
+        const HIPFIRE_X_T* x_base = X + (long long)safe_batch * K + g * 256;
 
         // K4 unroll (issue #65 lever 2): 4 K-tiles per loop body, all loads
         // up-front so the compiler can deep-pipeline the WMMA chain. 4
@@ -127,10 +139,10 @@ extern "C" __global__ void gemm_gate_up_hfq4g256_wmma_gfx12(
 
             // 4 X reads, all up-front. ~64 bytes/lane = 16 VGPR live across
             // the 4 dequant+WMMA pairs below.
-            half8_t b_a = *(const half8_t*)(x_base + k_off_a + k_grp * 8);
-            half8_t b_b = *(const half8_t*)(x_base + k_off_b + k_grp * 8);
-            half8_t b_c = *(const half8_t*)(x_base + k_off_c + k_grp * 8);
-            half8_t b_d = *(const half8_t*)(x_base + k_off_d + k_grp * 8);
+            half8_t b_a = HIPFIRE_LOAD_X8(x_base + k_off_a + k_grp * 8);
+            half8_t b_b = HIPFIRE_LOAD_X8(x_base + k_off_b + k_grp * 8);
+            half8_t b_c = HIPFIRE_LOAD_X8(x_base + k_off_c + k_grp * 8);
+            half8_t b_d = HIPFIRE_LOAD_X8(x_base + k_off_d + k_grp * 8);
 
             half8_t a_reg;
             DQ8(pka);

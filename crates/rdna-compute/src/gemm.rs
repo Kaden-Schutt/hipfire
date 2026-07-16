@@ -12,6 +12,17 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+/// Radiowave candidate for the fixed MTP verifier width on gfx12. The WMMA
+/// kernels load F32 activations and narrow each eight-value operand in-lane,
+/// deleting the standalone F32-to-F16 launch. Other batch widths retain the
+/// established pre-converted path until they are measured independently.
+fn gfx12_wmma_f32x_enabled(batch_size: usize) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    batch_size == 4
+        && *ENABLED
+            .get_or_init(|| std::env::var("HIPFIRE_MTP_WMMA_F32X").ok().as_deref() == Some("1"))
+}
+
 impl Gpu {
     /// CDNA3-only: prefill GEMM used by `gemm_hfq4g256` rocBLAS path.
     ///
@@ -8156,6 +8167,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let f32x = gfx12_wmma_f32x_enabled(batch_size);
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/residual).
         let bt_b: usize = if std::env::var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
@@ -8179,32 +8191,44 @@ impl Gpu {
         } else {
             1
         };
-        let (kname, ksrc): (&str, &str) = match bt_b {
-            12 => (
-                "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
-            ),
-            8 => (
-                "gemm_qkvza_hfq4g256_wmma_gfx12_bt8",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
-            ),
-            4 => (
-                "gemm_qkvza_hfq4g256_wmma_gfx12_bt4",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
-            ),
-            _ => (
-                "gemm_qkvza_hfq4g256_wmma_gfx12",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC,
-            ),
+        let (kname, ksrc): (&str, &str) = if f32x {
+            (
+                "gemm_qkvza_hfq4g256_wmma_gfx12_f32x",
+                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_F32X_SRC,
+            )
+        } else {
+            match bt_b {
+                12 => (
+                    "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
+                    kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+                ),
+                8 => (
+                    "gemm_qkvza_hfq4g256_wmma_gfx12_bt8",
+                    kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+                ),
+                4 => (
+                    "gemm_qkvza_hfq4g256_wmma_gfx12_bt4",
+                    kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+                ),
+                _ => (
+                    "gemm_qkvza_hfq4g256_wmma_gfx12",
+                    kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC,
+                ),
+            }
         };
         self.ensure_kernel(kname, ksrc, kname)?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let x_input_ptr = if f32x {
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            x.buf.as_ptr()
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
         let mut ab = a_beta.buf.as_ptr();
         let mut aa = a_alpha.buf.as_ptr();
-        let mut xp = x_f16_ptr;
+        let mut xp = x_input_ptr;
         let mut yq = y_qkv.buf.as_ptr();
         let mut yz = y_z.buf.as_ptr();
         let mut yb = y_beta.buf.as_ptr();
@@ -8242,7 +8266,7 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(z_m, k)
             + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
-            + batch_size * k * 2
+            + batch_size * k * if f32x { 4 } else { 2 }
             + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
@@ -8586,17 +8610,30 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_qkv_hfq4g256_wmma_gfx12",
-            kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC,
-            "gemm_qkv_hfq4g256_wmma_gfx12",
-        )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let f32x = gfx12_wmma_f32x_enabled(batch_size);
+        let (kname, ksrc) = if f32x {
+            (
+                "gemm_qkv_hfq4g256_wmma_gfx12_f32x",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_F32X_SRC,
+            )
+        } else {
+            (
+                "gemm_qkv_hfq4g256_wmma_gfx12",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC,
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
+        let x_input_ptr = if f32x {
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            x.buf.as_ptr()
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
         let mut av = a_v.buf.as_ptr();
-        let mut xp = x_f16_ptr;
+        let mut xp = x_input_ptr;
         let mut yq = y_q.buf.as_ptr();
         let mut yk = y_k.buf.as_ptr();
         let mut yv = y_v.buf.as_ptr();
@@ -8628,12 +8665,11 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k)
-            + batch_size * k * 2
+            + batch_size * k * if f32x { 4 } else { 2 }
             + batch_size * total_m * 4 * 2;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_wmma_gfx12", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkv_hfq4g256_wmma_gfx12",
+            kname,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -9876,6 +9912,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let f32x = gfx12_wmma_f32x_enabled(batch_size);
         // Adaptive-B batch-tile fast path (env HIPFIRE_GATE_UP_BT): B independent
         // accumulator chains hide the WMMA latency that caps the 1-acc kernel at ~19%
         // of peak. B = clamp(N/16, 1, 12), capped at 12 (B=16 spills VGPR). Byte-exact
@@ -9902,30 +9939,42 @@ impl Gpu {
         } else {
             1
         };
-        let (kname, ksrc): (&str, &str) = match bt_b {
-            12 => (
-                "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
-            ),
-            8 => (
-                "gemm_gate_up_hfq4g256_wmma_gfx12_bt8",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
-            ),
-            4 => (
-                "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
-            ),
-            _ => (
-                "gemm_gate_up_hfq4g256_wmma_gfx12",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC,
-            ),
+        let (kname, ksrc): (&str, &str) = if f32x {
+            (
+                "gemm_gate_up_hfq4g256_wmma_gfx12_f32x",
+                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_F32X_SRC,
+            )
+        } else {
+            match bt_b {
+                12 => (
+                    "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+                ),
+                8 => (
+                    "gemm_gate_up_hfq4g256_wmma_gfx12_bt8",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+                ),
+                4 => (
+                    "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+                ),
+                _ => (
+                    "gemm_gate_up_hfq4g256_wmma_gfx12",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC,
+                ),
+            }
         };
         self.ensure_kernel(kname, ksrc, kname)?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let x_input_ptr = if f32x {
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            x.buf.as_ptr()
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
-        let mut xp = x_f16_ptr;
+        let mut xp = x_input_ptr;
         let mut yg = y_gate.buf.as_ptr();
         let mut yu = y_up.buf.as_ptr();
         let mut g_m = gate_m as i32;
@@ -9951,7 +10000,7 @@ impl Gpu {
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
-            + batch_size * k * 2
+            + batch_size * k * if f32x { 4 } else { 2 }
             + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
@@ -10004,6 +10053,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let f32x = gfx12_wmma_f32x_enabled(batch_size);
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/qkvza).
         let bt_b: usize = if std::env::var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
@@ -10027,29 +10077,41 @@ impl Gpu {
         } else {
             1
         };
-        let (kname, ksrc): (&str, &str) = match bt_b {
-            12 => (
-                "gemm_hfq4g256_residual_wmma_gfx12_bt12",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
-            ),
-            8 => (
-                "gemm_hfq4g256_residual_wmma_gfx12_bt8",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
-            ),
-            4 => (
-                "gemm_hfq4g256_residual_wmma_gfx12_bt4",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
-            ),
-            _ => (
-                "gemm_hfq4g256_residual_wmma_gfx12",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC,
-            ),
+        let (kname, ksrc): (&str, &str) = if f32x {
+            (
+                "gemm_hfq4g256_residual_wmma_gfx12_f32x",
+                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_F32X_SRC,
+            )
+        } else {
+            match bt_b {
+                12 => (
+                    "gemm_hfq4g256_residual_wmma_gfx12_bt12",
+                    kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+                ),
+                8 => (
+                    "gemm_hfq4g256_residual_wmma_gfx12_bt8",
+                    kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+                ),
+                4 => (
+                    "gemm_hfq4g256_residual_wmma_gfx12_bt4",
+                    kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+                ),
+                _ => (
+                    "gemm_hfq4g256_residual_wmma_gfx12",
+                    kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC,
+                ),
+            }
         };
         self.ensure_kernel(kname, ksrc, kname)?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let x_input_ptr = if f32x {
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            x.buf.as_ptr()
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
 
         let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
+        let mut x_ptr = x_input_ptr;
         let mut y_ptr = y.buf.as_ptr();
         let mut m_val = m as i32;
         let mut k_val = k as i32;
@@ -10067,8 +10129,9 @@ impl Gpu {
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 16 * bt_b - 1) / (16 * bt_b);
 
-        let bytes =
-            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * if f32x { 4 } else { 2 }
+            + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
             kname,

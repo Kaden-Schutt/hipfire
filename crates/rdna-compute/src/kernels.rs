@@ -2123,6 +2123,11 @@ pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str =
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_F32X_SRC: &str = concat!(
+    "#define HIPFIRE_WMMA_X_F32 1\n",
+    "#define HIPFIRE_KERNEL_NAME gemm_hfq4g256_residual_wmma_gfx12_f32x\n",
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip")
+);
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
@@ -2232,6 +2237,11 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str =
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_F32X_SRC: &str = concat!(
+    "#define HIPFIRE_WMMA_X_F32 1\n",
+    "#define HIPFIRE_KERNEL_NAME gemm_gate_up_hfq4g256_wmma_gfx12_f32x\n",
+    include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip")
+);
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
@@ -2240,6 +2250,11 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_F32X_SRC: &str = concat!(
+    "#define HIPFIRE_WMMA_X_F32 1\n",
+    "#define HIPFIRE_KERNEL_NAME gemm_qkvza_hfq4g256_wmma_gfx12_f32x\n",
+    include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip")
+);
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip");
 // HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
@@ -2283,6 +2298,11 @@ pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str =
 // validated on R9700 in PR #56's channel-tests.
 pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_F32X_SRC: &str = concat!(
+    "#define HIPFIRE_WMMA_X_F32 1\n",
+    "#define HIPFIRE_KERNEL_NAME gemm_qkv_hfq4g256_wmma_gfx12_f32x\n",
+    include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip")
+);
 
 // Batched 3-way fused HFP4-G32 GEMM (FA preamble: Q + K + V). Sister of
 // GEMM_QKV_HFQ4G256_WMMA_SRC for the FP4 (E2M1 + UE8M0 g32 + FP16 row
