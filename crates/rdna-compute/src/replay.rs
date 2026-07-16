@@ -410,7 +410,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151"
             | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151"
-            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_scalar_header_gfx1151"
             | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer_gfx1151"
             | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151"
             | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_clustered_gfx1151"
@@ -699,7 +698,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         kernel,
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151"
             | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151"
-            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_scalar_header_gfx1151"
             | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer_gfx1151"
             | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151"
             | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_clustered_gfx1151"
@@ -2937,7 +2935,6 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
-        "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_scalar_header_gfx1151",
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
         "moe_down_combine_k8_batched",
         "moe_down_combine_k8_batched_vec4",
@@ -3070,13 +3067,6 @@ mod tests {
             "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(down), Some(48));
         assert_eq!(pointer_effects(down).map(|effects| effects.len()), Some(4));
-        let down_scalar =
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_scalar_header_gfx1151";
-        assert_eq!(expected_kernarg_bytes(down_scalar), Some(48));
-        assert_eq!(
-            pointer_effects(down_scalar).map(|effects| effects.len()),
-            Some(4)
-        );
         let lm_head = "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(lm_head), Some(32));
         assert_eq!(
