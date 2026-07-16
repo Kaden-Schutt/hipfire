@@ -2762,7 +2762,7 @@ impl Gpu {
             };
             self.ensure_kernel(module, source, function)?;
             (function, [32u32, 1, 1], total_m as u32)
-        } else if gfx1151_k2048_all_buffer {
+        } else if gfx1151_k2048_all_buffer && !gfx1151_k2048_pair_buffer {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151",
                 kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC,
