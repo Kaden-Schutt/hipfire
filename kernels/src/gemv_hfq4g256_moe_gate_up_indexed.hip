@@ -4,6 +4,11 @@
 
 #include <hip/hip_runtime.h>
 
+#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_X_BUFFER)
+using hipfire_gate_i32x4 = int __attribute__((ext_vector_type(4)));
+using hipfire_gate_f32x4 = float __attribute__((ext_vector_type(4)));
+#endif
+
 #ifndef HIPFIRE_MOE_GATE_UP_WG_WAVES
 #define HIPFIRE_MOE_GATE_UP_WG_WAVES 1
 #endif
@@ -115,6 +120,13 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     // One expert-wide SRD. Keep row/group displacement in scalar `soffset`
     // and only the lane's packed-weight byte displacement in `voffset`.
     const auto expert_rsrc = HIPFIRE_WEIGHT_RSRC(A);
+#endif
+#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_X_BUFFER)
+    const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
+    #define LOAD_X4(index) __builtin_bit_cast(hipfire_gate_f32x4, \
+        __builtin_amdgcn_raw_buffer_load_b128( \
+            x_rsrc, (unsigned int)(index) * 4u, 0, 0))
 #endif
 
     float gacc0 = 0.0f, gacc1 = 0.0f, gacc2 = 0.0f, gacc3 = 0.0f;
@@ -240,6 +252,16 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
 
         // Hoist full 32-wide x for this group-quad (4 groups × 8) via float4 pairs
         // before any weight load/DOG — same schedule as residual R15c2 / qkvza R17c2.
+#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_X_BUFFER)
+        const hipfire_gate_f32x4 xv0a = LOAD_X4(base0);
+        const hipfire_gate_f32x4 xv0b = LOAD_X4(base0 + 4);
+        const hipfire_gate_f32x4 xv1a = LOAD_X4(base0 + 256);
+        const hipfire_gate_f32x4 xv1b = LOAD_X4(base0 + 260);
+        const hipfire_gate_f32x4 xv2a = LOAD_X4(base0 + 512);
+        const hipfire_gate_f32x4 xv2b = LOAD_X4(base0 + 516);
+        const hipfire_gate_f32x4 xv3a = LOAD_X4(base0 + 768);
+        const hipfire_gate_f32x4 xv3b = LOAD_X4(base0 + 772);
+#else
         const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
         const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
         const float4 xv1a = *reinterpret_cast<const float4*>(x + base0 + 256);
@@ -248,6 +270,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         const float4 xv2b = *reinterpret_cast<const float4*>(x + base0 + 516);
         const float4 xv3a = *reinterpret_cast<const float4*>(x + base0 + 768);
         const float4 xv3b = *reinterpret_cast<const float4*>(x + base0 + 772);
+#endif
 
         // MEMORY phase: sequential gate weights, then sequential up weights.
         const char* gg0 = gate_ptr + g * 136;
@@ -389,6 +412,9 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     #undef LOAD_PACKED_U32
     #undef LOAD_UNIFORM_U32
     #undef DOG_X8
+#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_X_BUFFER)
+    #undef LOAD_X4
+#endif
 
     float gacc = (gacc0 + gacc1) + (gacc2 + gacc3);
     float uacc = (uacc0 + uacc1) + (uacc2 + uacc3);
