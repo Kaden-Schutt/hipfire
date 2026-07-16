@@ -1537,6 +1537,30 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// Two-group activation/weight schedule for the fused B=4 probe. This targets
+/// the occupancy band between the default four-group (95 VGPR on gfx1201) and
+/// the one-group low-register schedule without changing any arithmetic chain.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_PAIR_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_BATCHED 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_batched\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+/// One-group low-register schedule for the fused B=4 probe. Four independent
+/// accumulator chains remain intact, but activation/header live ranges are
+/// shortened to trade some MLP for additional resident waves.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_LOW_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_BATCHED 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_LOW_VGPR 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_batched\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// CDNA3 wave64-native batched indexed MoE gate_up. 2 rows per block.
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched_wave64.hip");

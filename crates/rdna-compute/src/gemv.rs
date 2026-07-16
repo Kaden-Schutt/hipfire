@@ -6983,23 +6983,39 @@ impl Gpu {
             )
         } else {
             use std::sync::OnceLock;
-            static BATCHED_FUSED: OnceLock<bool> = OnceLock::new();
-            let fused = self.arch_caps.is_rdna4()
-                && *BATCHED_FUSED.get_or_init(|| {
-                    std::env::var("HIPFIRE_MOE_GATE_UP_BATCHED_FUSED").as_deref() == Ok("1")
-                });
-            let (module, source, grid_div) = if fused {
-                (
+            static BATCHED_FUSED: OnceLock<String> = OnceLock::new();
+            let schedule = if self.arch_caps.is_rdna4() {
+                BATCHED_FUSED
+                    .get_or_init(|| {
+                        std::env::var("HIPFIRE_MOE_GATE_UP_BATCHED_FUSED")
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                    })
+                    .as_str()
+            } else {
+                ""
+            };
+            let (module, source, grid_div) = match schedule {
+                "1" | "fused" | "default" => (
                     "gemv_hfq4g256_moe_gate_up_indexed_batched_fused",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_SRC,
                     2,
-                )
-            } else {
-                (
+                ),
+                "pair" => (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched_fused_pair",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_PAIR_SRC,
+                    2,
+                ),
+                "low" => (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched_fused_low",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_LOW_SRC,
+                    2,
+                ),
+                _ => (
                     "gemv_hfq4g256_moe_gate_up_indexed_batched",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
                     1,
-                )
+                ),
             };
             self.ensure_kernel(
                 module,
