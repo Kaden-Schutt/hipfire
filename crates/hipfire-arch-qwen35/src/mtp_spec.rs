@@ -329,13 +329,15 @@ fn mtp_device_token_chain_eligible_for(
 }
 
 fn mtp_sampled_step_graph_eligible_for(
+    policy: MtpProposalGraphPolicy,
     use_exact_sparse_sampling: bool,
     use_full_vocab: bool,
     use_p_min: bool,
     embd_format: llama::EmbeddingFormat,
     kv_mode: crate::mtp_head::MtpKvMode,
 ) -> bool {
-    use_exact_sparse_sampling
+    policy != MtpProposalGraphPolicy::Off
+        && use_exact_sparse_sampling
         && !use_full_vocab
         && !use_p_min
         && kv_mode == crate::mtp_head::MtpKvMode::Q8
@@ -3637,8 +3639,10 @@ pub fn spec_step_mtp_compressed_serial(
             use_p_min,
             penalties_active,
         );
+    let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
     let use_sampled_chain_graph = !state.mtp_proposal_graph_disabled
         && mtp_sampled_step_graph_eligible_for(
+            proposal_graph_policy,
             exact_sparse_sampling,
             use_full_vocab,
             use_p_min,
@@ -3668,7 +3672,6 @@ pub fn spec_step_mtp_compressed_serial(
             "compressed MTP device-token chain requires GPU vocab_map"
         );
     }
-    let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
     if state.mtp_proposal_graph_sampling_dirty {
         destroy_mtp_proposal_graph(gpu, state);
         state.mtp_proposal_graph_sampling_dirty = false;
@@ -4869,6 +4872,7 @@ mod tests {
             true
         ));
         assert!(mtp_sampled_step_graph_eligible_for(
+            MtpProposalGraphPolicy::On,
             true,
             false,
             false,
@@ -4876,6 +4880,7 @@ mod tests {
             crate::mtp_head::MtpKvMode::Q8,
         ));
         assert!(!mtp_sampled_step_graph_eligible_for(
+            MtpProposalGraphPolicy::On,
             true,
             true,
             false,
@@ -4883,7 +4888,16 @@ mod tests {
             crate::mtp_head::MtpKvMode::Q8,
         ));
         assert!(!mtp_sampled_step_graph_eligible_for(
+            MtpProposalGraphPolicy::On,
             false,
+            false,
+            false,
+            llama::EmbeddingFormat::HFQ4G256,
+            crate::mtp_head::MtpKvMode::Q8,
+        ));
+        assert!(!mtp_sampled_step_graph_eligible_for(
+            MtpProposalGraphPolicy::Off,
+            true,
             false,
             false,
             llama::EmbeddingFormat::HFQ4G256,
