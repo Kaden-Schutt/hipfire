@@ -5353,6 +5353,72 @@ pub enum KvTarget<'a> {
 }
 
 impl KvCache {
+    /// Non-owning view of one lane in a lane-major Q8 cache allocation.
+    ///
+    /// `self` must have been allocated with total physical capacity
+    /// `lanes * lane_capacity`. The returned cache presents ordinary
+    /// single-sequence Q8 addressing, so existing prefill kernels can seed one
+    /// lane without copying weights or allocating a second cache. The view must
+    /// never be passed to [`KvCache::free_gpu`].
+    pub fn q8_lane_view(&self, lane: usize, lane_capacity: usize) -> HipResult<Self> {
+        if !self.quant_q8 || lane_capacity == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "q8_lane_view requires a Q8 cache and non-zero lane capacity",
+            ));
+        }
+        let lane_end = (lane + 1)
+            .checked_mul(lane_capacity)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view capacity overflow"))?;
+        if lane_end > self.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "q8_lane_view lane exceeds backing cache capacity",
+            ));
+        }
+        let blocks_per_pos = self.n_kv_heads * (self.head_dim / 32);
+        let bytes_per_pos = blocks_per_pos * 34;
+        let byte_offset = lane * lane_capacity * bytes_per_pos;
+        let lane_bytes = lane_capacity * bytes_per_pos;
+        let view = |t: &GpuTensor| {
+            if t.numel() <= 1 {
+                return t.shallow_clone();
+            }
+            let ptr =
+                unsafe { (t.buf.as_ptr() as *mut u8).add(byte_offset) as *mut std::ffi::c_void };
+            GpuTensor {
+                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, lane_bytes) },
+                shape: vec![(lane_bytes + 3) / 4],
+                dtype: DType::F32,
+            }
+        };
+        Ok(Self {
+            k_gpu: self.k_gpu.iter().map(view).collect(),
+            v_gpu: self.v_gpu.iter().map(view).collect(),
+            k_scales: Vec::new(),
+            v_scales: Vec::new(),
+            kv_dim: self.kv_dim,
+            max_seq: lane_capacity,
+            physical_cap: lane_capacity,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            quantized: true,
+            quant_q8: true,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            boundary_layers: self.boundary_layers,
+            givens_cos: None,
+            givens_sin: None,
+            quant_fwht: false,
+            v_mode: VMode::Q8,
+            layer_is_boundary: self.layer_is_boundary.clone(),
+            compact_offset: 0,
+        })
+    }
+
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
         kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]

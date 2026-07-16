@@ -99,6 +99,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
+    const int lane = blockIdx.z;
     if (h >= n_heads) return;
 #if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
     const int wave = threadIdx.x >> 5;
@@ -127,9 +128,10 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #define HIPFIRE_GDN_S_INDEX(r, lane) (((r) * 32) + (lane))
 #endif
 
-    signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
+    const size_t state_lane_base = (size_t)lane * n_heads * HD * HD;
+    signed char* sq_base = s_q8 + state_lane_base + h * HD * HD + row_start * HD;
     for (int r = 0; r < TILE_ROWS; r++) {
-        const float scale = s_scales[h * HD + row_start + r];
+        const float scale = s_scales[lane * n_heads * HD + h * HD + row_start + r];
         const signed char* src = sq_base + r * HD;
         S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(
             scale * (float)src[tid],
@@ -139,11 +141,12 @@ __global__ void HIPFIRE_GDN_KERNEL(
     }
 
     for (int t = 0; t < n_tokens; t++) {
-        const float* q_t = q + t * qk_stride + qk_head * HD;
-        const float* k_t = k + t * qk_stride + qk_head * HD;
-        const float* v_t = v + t * stride + h * HD;
-        float alpha = expf(gate[t * n_heads + h]);
-        float beta_v = beta[t * n_heads + h];
+        const int bt = lane * n_tokens + t;
+        const float* q_t = q + bt * qk_stride + qk_head * HD;
+        const float* k_t = k + bt * qk_stride + qk_head * HD;
+        const float* v_t = v + bt * stride + h * HD;
+        float alpha = expf(gate[bt * n_heads + h]);
+        float beta_v = beta[bt * n_heads + h];
 
 #if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
         const int wg_tid = threadIdx.x;
@@ -204,7 +207,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             }
         }
         if (tid == 0) {
-            *reinterpret_cast<float4*>(output + t * stride + h * HD + row_start) =
+            *reinterpret_cast<float4*>(output + bt * stride + h * HD + row_start) =
                 make_float4(out0, out1, out2, out3);
         }
 #elif TILE_ROWS == 8
@@ -239,7 +242,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
                 out_v += __shfl_down(out_v, o);
 #endif
             if (tid == 0)
-                output[t * stride + h * HD + row_start + r] = out_v;
+                output[bt * stride + h * HD + row_start + r] = out_v;
         }
 #else
 #error "unsupported HIPFIRE_GDN_TILE_ROWS"
@@ -258,7 +261,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
         float4 s = S_f4[HIPFIRE_GDN_S_INDEX(r, tid)];
         float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
-        __half* efr = use_ef ? (s_ef_residual + h * HD * HD + rr * HD) : nullptr;
+        __half* efr = use_ef ? (s_ef_residual + state_lane_base + h * HD * HD + rr * HD) : nullptr;
         if (use_ef) {
             s0 += __half2float(efr[tid]);
             s1 += __half2float(efr[tid+32]);
@@ -288,11 +291,12 @@ __global__ void HIPFIRE_GDN_KERNEL(
             dst[tid+32]   = (signed char)qf1;
             dst[tid+64]   = (signed char)qf2;
             dst[tid+96]   = (signed char)qf3;
-            if (tid == 0) s_scales[h * HD + rr] = scale;
+            if (tid == 0) s_scales[lane * n_heads * HD + h * HD + rr] = scale;
         } else {
             // Stochastic rounding.
             unsigned int rng = (unsigned int)(h * 1664525u + rr * 1013904223u
-                             + tid * 214013u + frame * 2531011u);
+                             + tid * 214013u
+                             + (frame + (unsigned int)(lane * n_tokens)) * 2531011u);
             #define STOCH_ROUND(val) ({ \
                 rng = rng * 1664525u + 1013904223u; \
                 float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
@@ -305,7 +309,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             #undef STOCH_ROUND
             if (tid == 0) {
                 float scale = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
-                s_scales[h * HD + rr] = scale;
+                s_scales[lane * n_heads * HD + h * HD + rr] = scale;
             }
         }
     }

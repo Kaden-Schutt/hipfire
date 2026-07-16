@@ -2546,6 +2546,77 @@ impl Gpu {
         // (and chunk-boundary) error — consistent with the per-token decode/replay.
         ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        self.gated_delta_net_q8_lanes(
+            q_batch,
+            k_batch,
+            v_batch,
+            gate_batch,
+            beta_batch,
+            s_q8,
+            s_scales,
+            output_batch,
+            n_tokens,
+            1,
+            n_heads,
+            head_dim,
+            ef_residual,
+        )
+    }
+
+    /// One-token recurrent update for several independent sequence lanes.
+    /// State tensors are lane-major; the kernel uses grid.z as the lane id.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_independent(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        batch_size: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.gated_delta_net_q8_lanes(
+            q_batch,
+            k_batch,
+            v_batch,
+            gate_batch,
+            beta_batch,
+            s_q8,
+            s_scales,
+            output_batch,
+            1,
+            batch_size,
+            n_heads,
+            head_dim,
+            ef_residual,
+        )
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_q8_lanes(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        lanes: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let use_fast = !dn_requant_per_token();
         let kernel_name = if use_fast {
@@ -2582,12 +2653,12 @@ impl Gpu {
         // single batched launch gets the same stochastic-rounding dither
         // seed it would have gotten from n_tokens sequential per-token
         // launches. The kernel indexes these as `frame + t` (t = 0..n-1).
-        let mut fr = reserve_gdn_requant_frames(n_tokens as u32) as i32;
+        let mut fr = reserve_gdn_requant_frames((n_tokens * lanes) as u32) as i32;
         let mut efp: *mut c_void = ef_residual
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         let mut rpt = dn_requant_per_token() as i32;
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim) * lanes;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "deltanet",
@@ -2613,7 +2684,7 @@ impl Gpu {
             ];
             self.launch_maybe_blob(
                 "gated_delta_net_q8_fast",
-                [n_heads as u32, n_tiles, 1],
+                [n_heads as u32, n_tiles, lanes as u32],
                 [32, 1, 1],
                 0,
                 &mut params,
@@ -2654,7 +2725,7 @@ impl Gpu {
             ];
             self.launch_maybe_blob(
                 "gated_delta_net_q8",
-                [n_heads as u32, n_tiles, 1],
+                [n_heads as u32, n_tiles, lanes as u32],
                 [32, 1, 1],
                 0,
                 &mut params,
@@ -3697,6 +3768,47 @@ impl Gpu {
         v_dim: usize,
         n_tokens: usize,
     ) -> HipResult<()> {
+        self.conv1d_silu_split_f32_lanes(
+            q_out, k_out, v_out, input, weight, state, k_dim, v_dim, n_tokens, 1,
+        )
+    }
+
+    /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].
+    /// Each row owns a distinct convolution ring; no token in one lane can
+    /// advance another lane's state.
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_silu_split_f32_independent(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.conv1d_silu_split_f32_lanes(
+            q_out, k_out, v_out, input, weight, state, k_dim, v_dim, 1, batch_size,
+        )
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_silu_split_f32_lanes(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+        lanes: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
             "conv1d_silu_split",
@@ -3726,12 +3838,12 @@ impl Gpu {
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
-        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens * lanes;
         let timer =
             crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
         let result = self.launch_maybe_blob(
             "conv1d_silu_split_f32",
-            [grid, 1, 1],
+            [grid, lanes as u32, 1],
             [block, 1, 1],
             0,
             &mut params,

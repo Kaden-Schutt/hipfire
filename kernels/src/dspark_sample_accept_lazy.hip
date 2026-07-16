@@ -43,7 +43,7 @@
 
 extern "C" __global__ void dspark_sample_accept_lazy_f32(
     const float* __restrict__ logits, // [n * vocab] resident target logits (read-only)
-    const unsigned int* __restrict__ draft, // [n] drafted block tokens (compare against draft[pos+1])
+    const unsigned int* __restrict__ draft, // optional [n]; nullptr samples all rows without accept-stop
     unsigned int* __restrict__ out,   // [n + 1]: sampled ids (u32::MAX after stop) + out[n]=new rng
     int n,
     int vocab_size,
@@ -246,7 +246,7 @@ extern "C" __global__ void dspark_sample_accept_lazy_f32(
             s_rng = rng_out;
             out[pos] = tok_out;
             // LAZY prefix stop: draft for position pos is draft[pos+1] (pos<n-1).
-            if (pos + 1 < n && draft[pos + 1] != tok_out) {
+            if (draft != nullptr && pos + 1 < n && draft[pos + 1] != tok_out) {
                 s_stop = pos;
             }
         }

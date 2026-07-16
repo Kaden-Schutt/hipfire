@@ -934,6 +934,62 @@ impl Gpu {
         rng_state: u32,
         cactus_delta: f32, // >0 → CACTUS acceptance boost (bench-only, deliberately lossy)
     ) -> HipResult<(Vec<u32>, u32)> {
+        self.sample_rows_impl(
+            logits_batch,
+            Some(draft),
+            out_buf,
+            n,
+            vocab_size,
+            temperature,
+            top_p,
+            top_k,
+            rng_state,
+            cactus_delta,
+        )
+    }
+
+    /// Sample every row of a resident `[batch, vocab]` logit matrix in one
+    /// launch and one compact D2H. RNG is threaded across rows in lane order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_rows_f32(
+        &mut self,
+        logits_batch: &GpuTensor,
+        out_buf: &GpuTensor,
+        batch_size: usize,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        rng_state: u32,
+    ) -> HipResult<(Vec<u32>, u32)> {
+        self.sample_rows_impl(
+            logits_batch,
+            None,
+            out_buf,
+            batch_size,
+            vocab_size,
+            temperature,
+            top_p,
+            top_k,
+            rng_state,
+            0.0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_rows_impl(
+        &mut self,
+        logits_batch: &GpuTensor,
+        draft: Option<&GpuTensor>,
+        out_buf: &GpuTensor,
+        n: usize,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        rng_state: u32,
+        cactus_delta: f32,
+    ) -> HipResult<(Vec<u32>, u32)> {
         self.bind_thread()?;
         self.ensure_kernel(
             "dspark_sample_accept_lazy_f32",
@@ -944,7 +1000,9 @@ impl Gpu {
         let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
 
         let mut lp = logits_batch.buf.as_ptr();
-        let mut dp = draft.buf.as_ptr();
+        let mut dp: *mut std::ffi::c_void = draft
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut op = out_buf.buf.as_ptr();
         let mut nn = n as i32;
         let mut vs = vocab_size as i32;
