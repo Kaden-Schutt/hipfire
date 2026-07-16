@@ -4911,7 +4911,6 @@ impl Gpu {
             });
         static GFX1151_RESIDUAL_RT_LOW: OnceLock<bool> = OnceLock::new();
         let gfx1151_rt_low = self.arch_caps.is_gfx1151()
-            && k == 2_048
             && *GFX1151_RESIDUAL_RT_LOW.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_RESIDUAL_RT_LOW").as_deref() == Ok("1")
             });
