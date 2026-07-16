@@ -1441,6 +1441,15 @@ pub const FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC: &str =
 /// variant scales by an on-device sigmoid gate (no D2H sync).
 pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
+/// Radiowave B=4 shared-expert down candidate. Extends the certified AR
+/// row-pair schedule over grid.y token slices and enables gfx12 buffer weight
+/// loads while preserving the batched public ABI and per-row reduction order.
+pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_BATCHED_ROWS2_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_SHARED_DOWN_BATCHED_ROWS2 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
