@@ -332,6 +332,41 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    if matches!(
+        kernel,
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_all_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_vgpr_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151"
+    ) {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+    if matches!(
+        kernel,
+        "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151"
+    ) {
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ]);
+    }
     if kernel == "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" {
         return Some(vec![
             read(0),
@@ -558,6 +593,13 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
+        "attention_flash_q8_0_tile" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            read(32),
+        ]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100" => {
             Some(vec![read(0), write(8), read(16), read(24), read(32), read(48)])
@@ -568,6 +610,31 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if matches!(
+        kernel,
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_all_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_vgpr_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151"
+    ) {
+        return Some(48);
+    }
+    if matches!(
+        kernel,
+        "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_all_buffer_slc_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_pair_buffer_gfx1151"
+            | "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151"
+    ) {
+        return Some(96);
+    }
     if kernel.starts_with("gated_delta_net_q8_compact2_") {
         return Some(96);
     }
@@ -640,7 +707,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rotate_with_rms_gfx1100" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
-        "fused_qkv_hfq4g256"
+        "attention_flash_q8_0_tile"
+        | "fused_qkv_hfq4g256"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
@@ -2596,6 +2664,21 @@ mod tests {
         ));
         assert!(!radiowave_vmem_only_consumer("fused_qkvza_hfq4g256"));
         assert!(!radiowave_vmem_only_consumer("unknown_kernel"));
+    }
+
+    #[test]
+    fn gfx1151_radiowave_symbols_keep_resource_contracts() {
+        let gate = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151";
+        let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
+        assert_eq!(expected_kernarg_bytes(gate), Some(48));
+        assert_eq!(pointer_effects(gate).map(|effects| effects.len()), Some(5));
+        assert_eq!(expected_kernarg_bytes(qkvza), Some(96));
+        assert_eq!(pointer_effects(qkvza).map(|effects| effects.len()), Some(9));
+        assert_eq!(expected_kernarg_bytes("attention_flash_q8_0_tile"), Some(80));
+        assert_eq!(
+            pointer_effects("attention_flash_q8_0_tile").map(|effects| effects.len()),
+            Some(5)
+        );
     }
 
     #[test]
