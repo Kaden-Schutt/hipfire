@@ -107,6 +107,20 @@ fn mtp_gpu_greedy_accept_enabled_from_env() -> bool {
     }
 }
 
+fn mtp_gpu_sample_enabled_from_env() -> bool {
+    // Opt-in while the MTP port of DFlash's C8 GPU-resident sampled-accept
+    // path is validated. Besides removing multi-megabyte D2H transfers, this
+    // is the fixed GPU sequence Redline can retain later. The legacy host
+    // sampler remains the default and exact control.
+    match std::env::var("HIPFIRE_MTP_GPU_SAMPLE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => false,
+    }
+}
+
 fn mtp_q8_verify_wmma_enabled_from_env_value(value: Option<&str>) -> bool {
     match value {
         None => true,
@@ -2313,10 +2327,15 @@ pub fn spec_step_mtp_compressed_serial(
     //     is small (~3 ms more across K=5) since trunk verify dominates.
     //     This is the architecture Unsloth/llama.cpp #22673 ship.
     //
-    // Mode is selected by whether the loaded head carries a compressed sidecar.
-    // Bundled .mq4-mtp files drop the sidecar; load_mtp_head_bundled returns
-    // a head with lm_head_draft: None.
-    let use_full_vocab = head.weights.lm_head_draft.is_none();
+    // Mode is normally selected by whether the loaded head carries a compressed
+    // sidecar. The opt-in GPU sampler temporarily uses the trunk full-vocab
+    // head even when a compressed sidecar exists: DFlash's resident C8 accept
+    // kernel consumes full-vocab draft rows. This is a correctness-first bridge
+    // to the fixed device sequence; a compressed-vocab scatter specialization
+    // can recover the smaller draft head after the route is certified.
+    let gpu_sample_requested =
+        mtp_gpu_sample_enabled_from_env() && !state.sampling.is_greedy() && state.p_min <= 0.0;
+    let use_full_vocab = head.weights.lm_head_draft.is_none() || gpu_sample_requested;
     let (vocab_map_opt, cvs): (Option<&Vec<u32>>, usize) = if use_full_vocab {
         (None, vocab)
     } else {
@@ -2363,10 +2382,6 @@ pub fn spec_step_mtp_compressed_serial(
     let dim_bytes = dim * 4;
     let mut candidates: Vec<u32> = Vec::with_capacity(max_n);
     let argmax_view = state.mtp_lm_argmax.sub_offset(0, 1);
-    // Full-vocab per-step logits scratch: first row of mtp_lm_logits is
-    // shape [vocab] which is exactly what we need per step. Allocated as
-    // [max_n * vocab] elsewhere so the storage is already there.
-    let full_vocab_logits_view = state.mtp_lm_logits.sub_offset(0, vocab);
 
     // p_min early-exit: when state.p_min > 0, each step uses
     // topk_logsumexp_batched (K=2) instead of argmax. We then check
@@ -2421,8 +2436,12 @@ pub fn spec_step_mtp_compressed_serial(
         (true, false) => DraftMode::Greedy,
     };
     let use_p_min = matches!(draft_mode, DraftMode::PMin { .. });
-    let use_sampling = matches!(draft_mode, DraftMode::Sampled | DraftMode::SampledPMin { .. });
+    let use_sampling = matches!(
+        draft_mode,
+        DraftMode::Sampled | DraftMode::SampledPMin { .. }
+    );
     let use_sampled_pmin = matches!(draft_mode, DraftMode::SampledPMin { .. });
+    let gpu_sample_active = gpu_sample_requested && use_sampling && !use_sampled_pmin;
     let log_p_min = match draft_mode {
         DraftMode::PMin { log_p_min } | DraftMode::SampledPMin { log_p_min } => log_p_min,
         _ => f32::NEG_INFINITY,
@@ -2447,14 +2466,19 @@ pub fn spec_step_mtp_compressed_serial(
     // Cached host buffer for per-step draft logits readback (sampling only).
     // Sized to whichever vocab the dispatch path uses (compressed cvs or
     // full 248K vocab). Allocated once outside the loop.
-    let draft_logits_host: Vec<f32> = if use_sampling {
+    let draft_logits_host: Vec<f32> = if use_sampling && !gpu_sample_active {
         let n = if use_full_vocab { vocab } else { cvs };
         vec![0.0; n]
     } else {
         Vec::new()
     };
-    let use_device_token_chain = mtp_device_token_chain_enabled_from_env()
-        && mtp_device_token_chain_eligible_for(trunk_weights.embd_format, use_sampling, use_p_min);
+    let use_device_token_chain = gpu_sample_active
+        || (mtp_device_token_chain_enabled_from_env()
+            && mtp_device_token_chain_eligible_for(
+                trunk_weights.embd_format,
+                use_sampling,
+                use_p_min,
+            ));
     if use_device_token_chain && !use_full_vocab {
         assert!(
             head.weights.lm_head_draft_vocab_map_gpu.is_some(),
@@ -2492,6 +2516,35 @@ pub fn spec_step_mtp_compressed_serial(
                 .memcpy_htod(&state.mtp_token_chain.buf, seed_bytes)?;
         }
     }
+
+    // DFlash C8-style resident sampling buffers. They stay live through
+    // target verify and the on-GPU accept kernel. The full-vocab probability
+    // rows replace the legacy D2H + host nucleus construction.
+    let mut gpu_draft_probs = if gpu_sample_active {
+        Some(gpu.alloc_tensor(&[max_n * vocab], DType::F32)?)
+    } else {
+        None
+    };
+    let mut gpu_draft_tau = if gpu_sample_active {
+        Some(gpu.alloc_tensor(&[max_n], DType::F32)?)
+    } else {
+        None
+    };
+    let mut gpu_draft_z = if gpu_sample_active {
+        Some(gpu.alloc_tensor(&[max_n], DType::F32)?)
+    } else {
+        None
+    };
+    let mut gpu_draft_tokens = if gpu_sample_active {
+        Some(gpu.alloc_tensor(&[max_n], DType::F32)?)
+    } else {
+        None
+    };
+    let mut gpu_draft_p_at_token = if gpu_sample_active {
+        Some(gpu.alloc_tensor(&[max_n], DType::F32)?)
+    } else {
+        None
+    };
 
     // ── 1. K serial discrete-token roundtrips ─────────────────────────────
     let mut proposal_graph_ran = false;
@@ -2544,6 +2597,9 @@ pub fn spec_step_mtp_compressed_serial(
 
     if !proposal_graph_ran {
         for k in 0..max_n {
+            let full_vocab_logits_view = state
+                .mtp_lm_logits
+                .sub_offset(if gpu_sample_active { k * vocab } else { 0 }, vocab);
             let next_tok = if use_device_token_chain {
                 0
             } else if k == 0 {
@@ -2676,7 +2732,49 @@ pub fn spec_step_mtp_compressed_serial(
             let argmax_vocab = cvs; // = full vocab in full-vocab mode, = compressed vocab in compressed mode
 
             let draft_idx: usize;
-            if use_sampling {
+            if gpu_sample_active {
+                let probs_row = gpu_draft_probs
+                    .as_ref()
+                    .unwrap()
+                    .sub_offset(k * vocab, vocab);
+                let tau_row = gpu_draft_tau.as_ref().unwrap().sub_offset(k, 1);
+                let z_row = gpu_draft_z.as_ref().unwrap().sub_offset(k, 1);
+                gpu.softmax_temp_topp_batched_into_f32(
+                    logits_for_argmax,
+                    &probs_row,
+                    &tau_row,
+                    &z_row,
+                    vocab,
+                    1,
+                    sampling.temp,
+                    sampling.top_p,
+                    sampling.top_k,
+                    sampling.min_p,
+                )?;
+                let token_row = gpu_draft_tokens.as_ref().unwrap().sub_offset(k, 1);
+                let prob_row = gpu_draft_p_at_token.as_ref().unwrap().sub_offset(k, 1);
+                gpu.batched_categorical_sample_f32(
+                    &probs_row,
+                    &tau_row,
+                    &z_row,
+                    &token_row,
+                    &prob_row,
+                    vocab,
+                    1,
+                    state.gpu_rng_state,
+                )?;
+                gpu.memcpy_dtod_at_auto(
+                    &state.mtp_token_chain.buf,
+                    (k + 1) * 4,
+                    &token_row.buf,
+                    0,
+                    4,
+                )?;
+                state.gpu_rng_state = state
+                    .gpu_rng_state
+                    .wrapping_mul(1_664_525)
+                    .wrapping_add(1_013_904_223);
+            } else if use_sampling {
                 // ── F5b: DFlash-convention sampled DRAFT (full-vocab only) ──
                 //
                 // Distribution-preserving spec-decode requires the draft to be
@@ -2883,8 +2981,8 @@ pub fn spec_step_mtp_compressed_serial(
     }
     let drafts_generated = if use_device_token_chain {
         debug_assert!(
-            !use_sampling && !use_p_min,
-            "device-token chain assumes an untruncated greedy chain"
+            gpu_sample_active || (!use_sampling && !use_p_min),
+            "device-token chain requires resident sampling or an untruncated greedy chain"
         );
         let candidate_view = state.mtp_token_chain.sub_offset(1, max_n);
         let mut candidate_host: Vec<i32> = vec![0; max_n];
@@ -3073,38 +3171,91 @@ pub fn spec_step_mtp_compressed_serial(
     let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
 
     if use_sampling {
-        // ── F5c: distribution-preserving sampled accept (full-vocab) ──
-        //
-        // Replaces the prior GPU-gather residual approximation (un-truncated
-        // p_target/p_draft accept ratio + sample_top_p bonus over raw verify
-        // logits) with the proven, coherence-validated DFlash convention
-        // (speculative.rs:3728-3855): INDEPENDENT per-side nuclei, accept
-        // `u*p_d <= p_t` over TRUNCATED probs, and a residual bonus drawn from
-        // (target_nucleus − draft_nucleus)₊. The old approximation gathered
-        // p_draft over the UN-truncated softmax while the draft was sampled from
-        // a nucleus — a mismatch that can silently ship a token attractor.
-        //
-        // Mode-agnostic: candidates[k] is the full trunk token id in BOTH full
-        // and compressed modes (compressed drafts remapped via vocab_map at
-        // proposal time), and draft_softmaxes are full-vocab width (compressed
-        // nuclei embedded above), so the accept rule needs no use_full_vocab gate.
-        hit_eos = mtp_sampled_accept(
-            gpu,
-            state,
-            &logits_view,
-            &draft_softmaxes,
-            &draft_probs,
-            &candidates,
-            drafts_generated,
-            vocab,
-            sampling.temp,
-            sampling.top_p,
-            sampling.top_k,
-            sampling.min_p,
-            eos_token_id,
-            &mut committed,
-            &mut accept_count,
-        )?;
+        if gpu_sample_active {
+            // Port of DFlash C8: keep both nuclei device-resident, execute the
+            // rejection chain on-GPU, and download only the 16-byte decision.
+            let target_probs = gpu.alloc_tensor(&[n_verify * vocab], DType::F32)?;
+            let target_tau = gpu.alloc_tensor(&[n_verify], DType::F32)?;
+            let target_z = gpu.alloc_tensor(&[n_verify], DType::F32)?;
+            gpu.softmax_temp_topp_batched_into_f32(
+                &logits_view,
+                &target_probs,
+                &target_tau,
+                &target_z,
+                vocab,
+                n_verify,
+                sampling.temp,
+                sampling.top_p,
+                sampling.top_k,
+                sampling.min_p,
+            )?;
+            let accept_out = gpu.alloc_tensor(&[4], DType::F32)?;
+            gpu.chain_accept_spec_f32(
+                &target_probs,
+                gpu_draft_probs.as_ref().unwrap(),
+                gpu_draft_tokens.as_ref().unwrap(),
+                gpu_draft_p_at_token.as_ref().unwrap(),
+                &target_tau,
+                &target_z,
+                gpu_draft_tau.as_ref().unwrap(),
+                gpu_draft_z.as_ref().unwrap(),
+                &accept_out,
+                drafts_generated,
+                vocab,
+                state.gpu_rng_state,
+                0.0,
+            )?;
+            let mut raw = [0_i32; 4];
+            {
+                let bytes: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, 16) };
+                gpu.hip.memcpy_dtoh(bytes, &accept_out.buf)?;
+            }
+            let raw_accept = (raw[0] as usize).min(drafts_generated);
+            if let Some(eos_at) = candidates[..raw_accept]
+                .iter()
+                .position(|&token| token == eos_token_id)
+            {
+                accept_count = eos_at + 1;
+                committed.extend_from_slice(&candidates[..accept_count]);
+                hit_eos = true;
+            } else {
+                accept_count = raw_accept;
+                committed.extend_from_slice(&candidates[..accept_count]);
+                let bonus = raw[1] as u32;
+                committed.push(bonus);
+                hit_eos = bonus == eos_token_id;
+            }
+            state.gpu_rng_state = raw[3] as u32;
+            let _ = gpu.free_tensor(accept_out);
+            let _ = gpu.free_tensor(target_probs);
+            let _ = gpu.free_tensor(target_tau);
+            let _ = gpu.free_tensor(target_z);
+        } else {
+            // ── F5c: distribution-preserving sampled accept (full-vocab) ──
+            //
+            // Replaces the prior GPU-gather residual approximation with the
+            // coherence-validated DFlash convention. Draft and target nuclei
+            // are constructed independently, then the host runs the residual
+            // accept and bonus draw. This remains the exact control path.
+            hit_eos = mtp_sampled_accept(
+                gpu,
+                state,
+                &logits_view,
+                &draft_softmaxes,
+                &draft_probs,
+                &candidates,
+                drafts_generated,
+                vocab,
+                sampling.temp,
+                sampling.top_p,
+                sampling.top_k,
+                sampling.min_p,
+                eos_token_id,
+                &mut committed,
+                &mut accept_count,
+            )?;
+        }
     } else {
         // ── Legacy greedy / argmax-match accept rule ─────────────────────
         let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
@@ -3155,6 +3306,22 @@ pub fn spec_step_mtp_compressed_serial(
         committed = accepted.committed;
         accept_count = accepted.accept_count;
         hit_eos = accepted.hit_eos;
+    }
+
+    if let Some(tensor) = gpu_draft_probs.take() {
+        let _ = gpu.free_tensor(tensor);
+    }
+    if let Some(tensor) = gpu_draft_tau.take() {
+        let _ = gpu.free_tensor(tensor);
+    }
+    if let Some(tensor) = gpu_draft_z.take() {
+        let _ = gpu.free_tensor(tensor);
+    }
+    if let Some(tensor) = gpu_draft_tokens.take() {
+        let _ = gpu.free_tensor(tensor);
+    }
+    if let Some(tensor) = gpu_draft_p_at_token.take() {
+        let _ = gpu.free_tensor(tensor);
     }
 
     let advance = committed.len();
