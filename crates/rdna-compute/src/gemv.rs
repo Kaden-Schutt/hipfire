@@ -5403,9 +5403,28 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        use std::sync::OnceLock;
+        static BATCHED_ROWS2: OnceLock<bool> = OnceLock::new();
+        let rows2 = self.arch_caps.is_rdna4()
+            && m == 2_048
+            && k == 512
+            && *BATCHED_ROWS2.get_or_init(|| {
+                std::env::var("HIPFIRE_SHARED_DOWN_BATCHED_ROWS2").as_deref() == Ok("1")
+            });
+        let (module, source) = if rows2 {
+            (
+                "gemv_hfq4g256_residual_sigmoid_batched_rows2_gfx12",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_BATCHED_ROWS2_GFX12_SRC,
+            )
+        } else {
+            (
+                "gemv_hfq4g256_residual_scaled",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
+            )
+        };
         self.ensure_kernel(
-            "gemv_hfq4g256_residual_scaled",
-            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
+            module,
+            source,
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
         )?;
         let a_ptr = a_raw.buf.as_ptr();
@@ -5431,7 +5450,11 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
-            [m as u32, batch_size as u32, 1],
+            [
+                (if rows2 { m.div_ceil(2) } else { m }) as u32,
+                batch_size as u32,
+                1,
+            ],
             [32, 1, 1],
             0,
             &mut params,

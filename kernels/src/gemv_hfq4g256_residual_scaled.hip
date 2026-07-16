@@ -11,6 +11,10 @@
     (*(const unsigned int*)(ptr))
 #endif
 
+#ifndef HIPFIRE_SHARED_DOWN_BATCHED_ROWS2
+#define HIPFIRE_SHARED_DOWN_BATCHED_ROWS2 0
+#endif
+
 // HFQ4-G256 GEMV with fused SCALED residual add: y[row] += scale * (A[row] · x).
 //
 // Two kernel variants — identical math, differ only in how the scale is
@@ -574,6 +578,120 @@ extern "C" __global__ void gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
     const float* __restrict__ c_batch,     // [N]
     int M, int K
 ) {
+#if HIPFIRE_SHARED_DOWN_BATCHED_ROWS2
+    // Batched form of the product AR row-pair schedule. Each token remains an
+    // independent grid.y slice, while one wave reuses that token's activation
+    // and sigmoid gate across two adjacent output rows. Per-row accumulation
+    // and reduction order are unchanged from the legacy batched body below.
+    const int row0 = blockIdx.x * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const bool have_row1 = row1 < M;
+    const int bid = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const float* __restrict__ x = x_batch + (long long)bid * K;
+    float* __restrict__ y = y_batch + (long long)bid * M;
+    const int groups_per_row = K / 256;
+    const long long row_stride = (long long)groups_per_row * 136;
+    const char* row_ptr0 = A + (long long)row0 * row_stride;
+    const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
+    const int boff = tid * 4;
+    const auto row_rsrc0 = HIPFIRE_WEIGHT_RSRC(row_ptr0);
+    const auto row_rsrc1 = HIPFIRE_WEIGHT_RSRC(row_ptr1);
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float bcc0 = 0.0f, bcc1 = 0.0f, bcc2 = 0.0f, bcc3 = 0.0f;
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+    #define LOAD_X8_BATCHED_R2(b) \
+        const float x0 = x[(b) + 0]; \
+        const float x1 = x[(b) + 1]; \
+        const float x2 = x[(b) + 2]; \
+        const float x3 = x[(b) + 3]; \
+        const float x4 = x[(b) + 4]; \
+        const float x5 = x[(b) + 5]; \
+        const float x6 = x[(b) + 6]; \
+        const float x7 = x[(b) + 7]
+
+    #define DOG_X8_BATCHED_R2(rsrc, gp, group_offset, a) do { \
+        float sc = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_PTR_U32((rsrc), (gp), (group_offset))); \
+        float zp = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_PTR_U32((rsrc), (gp) + 4, (group_offset) + 4)); \
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32( \
+            (rsrc), (gp) + 8 + boff, (group_offset) + 8 + boff); \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
+    } while (0)
+
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const int base0 = g * 256 + tid * 8;
+        { LOAD_X8_BATCHED_R2(base0);
+          DOG_X8_BATCHED_R2(row_rsrc0, row_ptr0 + g * 136, g * 136, acc0);
+          if (have_row1) DOG_X8_BATCHED_R2(row_rsrc1, row_ptr1 + g * 136, g * 136, bcc0); }
+        { LOAD_X8_BATCHED_R2(base0 + 256);
+          DOG_X8_BATCHED_R2(row_rsrc0, row_ptr0 + (g + 1) * 136, (g + 1) * 136, acc1);
+          if (have_row1) DOG_X8_BATCHED_R2(row_rsrc1, row_ptr1 + (g + 1) * 136, (g + 1) * 136, bcc1); }
+        { LOAD_X8_BATCHED_R2(base0 + 512);
+          DOG_X8_BATCHED_R2(row_rsrc0, row_ptr0 + (g + 2) * 136, (g + 2) * 136, acc2);
+          if (have_row1) DOG_X8_BATCHED_R2(row_rsrc1, row_ptr1 + (g + 2) * 136, (g + 2) * 136, bcc2); }
+        { LOAD_X8_BATCHED_R2(base0 + 768);
+          DOG_X8_BATCHED_R2(row_rsrc0, row_ptr0 + (g + 3) * 136, (g + 3) * 136, acc3);
+          if (have_row1) DOG_X8_BATCHED_R2(row_rsrc1, row_ptr1 + (g + 3) * 136, (g + 3) * 136, bcc3); }
+    }
+
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_BATCHED_R2(base);
+        DOG_X8_BATCHED_R2(row_rsrc0, row_ptr0 + g * 136, g * 136, acc0);
+        if (have_row1) DOG_X8_BATCHED_R2(row_rsrc1, row_ptr1 + g * 136, g * 136, bcc0);
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_BATCHED_R2(base);
+        DOG_X8_BATCHED_R2(row_rsrc0, row_ptr0 + g * 136, g * 136, acc1);
+        if (have_row1) DOG_X8_BATCHED_R2(row_rsrc1, row_ptr1 + g * 136, g * 136, bcc1);
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_BATCHED_R2(base);
+        DOG_X8_BATCHED_R2(row_rsrc0, row_ptr0 + g * 136, g * 136, acc2);
+        if (have_row1) DOG_X8_BATCHED_R2(row_rsrc1, row_ptr1 + g * 136, g * 136, bcc2);
+    }
+    #undef DOG_X8_BATCHED_R2
+    #undef LOAD_X8_BATCHED_R2
+
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    float bcc = (bcc0 + bcc1) + (bcc2 + bcc3);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        bcc += __shfl_down(bcc, offset);
+
+    if (tid == 0) {
+        const float gate = 1.0f / (1.0f + __expf(-c_batch[bid]));
+        if (have_row1) {
+            float2 yy = *reinterpret_cast<float2*>(y + row0);
+            yy.x += gate * acc;
+            yy.y += gate * bcc;
+            *reinterpret_cast<float2*>(y + row0) = yy;
+        } else {
+            y[row0] += gate * acc;
+        }
+    }
+#else
     const int row = blockIdx.x;
     if (row >= M) return;
     const int bid = blockIdx.y;
@@ -676,4 +794,5 @@ extern "C" __global__ void gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
         float gate = 1.0f / (1.0f + __expf(-c_batch[bid]));
         y_batch[(long long)bid * M + row] += gate * acc;
     }
+#endif
 }
