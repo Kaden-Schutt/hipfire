@@ -4780,6 +4780,17 @@ impl Gpu {
             && *GFX1151_LM_HEAD_DOT2.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_LM_HEAD_DOT2").as_deref() == Ok("1")
             });
+        static GFX1151_LM_HEAD_AOSOA4: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_aosoa4_requested = self.arch_caps.is_gfx1151()
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_AOSOA4.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_HFQ4_AOSOA4_LM_HEAD").as_deref() == Ok("1")
+            });
+        let lm_head_aosoa4_ptr = gfx1151_lm_head_aosoa4_requested
+            .then(|| crate::hfq4_soa::shadow_ptr(a_raw, m, k))
+            .flatten();
+        let gfx1151_lm_head_aosoa4 = lm_head_aosoa4_ptr.is_some();
         static GFX1151_LM_HEAD_R1_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_lm_head_r1_hybrid_buffer = self.arch_caps.is_gfx1151()
             && m == 248_320
@@ -4792,7 +4803,14 @@ impl Gpu {
             && self.flags.rdna3_hfq4_lm_head_k2048
             && m == 248_320
             && k == 2_048;
-        let func_name = if gfx1151_lm_head_dot2 {
+        let func_name = if gfx1151_lm_head_aosoa4 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_lm_head_aosoa4_gfx1151",
+                kernels::GEMV_HFQ4G256_LM_HEAD_AOSOA4_GFX1151_SRC,
+                "gemv_hfq4g256_lm_head_aosoa4_gfx1151",
+            )?;
+            "gemv_hfq4g256_lm_head_aosoa4_gfx1151"
+        } else if gfx1151_lm_head_dot2 {
             self.ensure_kernel(
                 "gemv_hfq4g256_lm_head_dot2_gfx1151",
                 kernels::GEMV_HFQ4G256_LM_HEAD_DOT2_GFX1151_SRC,
@@ -4820,7 +4838,7 @@ impl Gpu {
             "gemv_hfq4g256"
         };
 
-        let a_ptr = a_raw.buf.as_ptr();
+        let a_ptr = lm_head_aosoa4_ptr.unwrap_or_else(|| a_raw.buf.as_ptr());
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
         let m_val = m as i32;
@@ -4854,6 +4872,7 @@ impl Gpu {
         let rdna3 = self.arch_caps.is_rdna3_dgpu();
         let rows = self.arch_caps.gemv_rows_default();
         let use_multirow = rows > 1
+            && !gfx1151_lm_head_aosoa4
             && !gfx1151_lm_head_dot2
             && !gfx1151_lm_head_r1_hybrid_buffer;
         static GFX1151_LM_HEAD_BUFFER: OnceLock<bool> = OnceLock::new();
@@ -4903,7 +4922,8 @@ impl Gpu {
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
-        let use_wide = !gfx1151_lm_head_dot2
+        let use_wide = !gfx1151_lm_head_aosoa4
+            && !gfx1151_lm_head_dot2
             && !gfx1151_lm_head_r1_hybrid_buffer
             && !use_multirow
             && m >= 64

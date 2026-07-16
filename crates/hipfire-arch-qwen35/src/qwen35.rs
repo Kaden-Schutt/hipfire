@@ -1186,16 +1186,54 @@ fn load_norm_weight(
     dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
 }
 
+fn gfx1151_lm_head_hfq4_aosoa4_enabled(gpu: &Gpu, name: &str, quant_type: u8) -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    gpu.arch_caps.is_gfx1151()
+        && matches!(quant_type, 6 | 13)
+        && *ENABLED.get_or_init(|| {
+            std::env::var("HIPFIRE_GFX1151_HFQ4_AOSOA4_LM_HEAD").as_deref() == Ok("1")
+        })
+        && name.ends_with("lm_head.weight")
+}
+
+fn upload_hfq4g256_weight(
+    gpu: &Gpu,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    append_aosoa4_shadow: bool,
+) -> HipResult<GpuTensor> {
+    if append_aosoa4_shadow {
+        let staged = rdna_compute::hfq4_soa::append_shadow(data, m, k).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!(
+                    "gfx1151 HFQ4 AoSoA4 shadow rejected malformed shape/data: \
+                     M={m} K={k} bytes={}",
+                    data.len()
+                ),
+            )
+        })?;
+        // Preserve the tensor's logical AoS byte shape; DeviceBuffer::size()
+        // still exposes the larger owning allocation to the exact shadow gate.
+        gpu.upload_raw(&staged, &[data.len()])
+    } else {
+        gpu.upload_raw(data, &[data.len()])
+    }
+}
+
 fn load_weight_tensor_raw(
     gpu: &Gpu,
     quant_type: u8,
     data: &[u8],
     m: usize,
     k: usize,
+    append_aosoa4_shadow: bool,
 ) -> HipResult<WeightTensor> {
     match quant_type {
         6 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_hfq4g256_weight(gpu, data, m, k, append_aosoa4_shadow)?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ4G256,
@@ -1256,7 +1294,7 @@ fn load_weight_tensor_raw(
         }
         13 => {
             // MQ4-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_hfq4g256_weight(gpu, data, m, k, append_aosoa4_shadow)?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256,
@@ -1638,7 +1676,8 @@ pub(crate) fn load_weight_tensor(
         for candidate in candidates(name) {
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
+                let append_aosoa4 = gfx1151_lm_head_hfq4_aosoa4_enabled(gpu, &candidate, qt);
+                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k, append_aosoa4)?);
                 matched = Some(candidate);
                 break;
             }
@@ -1671,7 +1710,9 @@ pub(crate) fn load_weight_tensor(
             }
             found.unwrap_or_else(|| panic!("tensor not found: {name}"))
         };
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
+        let append_aosoa4 =
+            gfx1151_lm_head_hfq4_aosoa4_enabled(gpu, &matched_name, info.quant_type);
+        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k, append_aosoa4)?;
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
@@ -1722,7 +1763,7 @@ fn load_weight_tensor_keep(
     // count (= bytes.len() / rowstride); gather_rows derives it from shape[0].
     let (_new_shape, sub) = hipfire_reap::gather::gather_rows(&[orig_rows], &bytes, keep)
         .map_err(|e| HipError::new(0, &format!("qwen35: router row-gather '{name}': {e}")))?;
-    let mut wt = load_weight_tensor_raw(gpu, quant_type, &sub, m, k)?;
+    let mut wt = load_weight_tensor_raw(gpu, quant_type, &sub, m, k, false)?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         // Resolve the matched candidate name (metadata only) so the AWQ sidecar
         // is looked up under the same prefix the weight resolved to; fall back
@@ -3311,7 +3352,19 @@ impl WeightSource for HfqSource<'_> {
             |gpu| {
                 let (lm_info, lm_data) =
                     qwen35_tensor_data_vec(hfq, "lm_head.weight").expect("lm_head present");
-                load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
+                let append_aosoa4 = gfx1151_lm_head_hfq4_aosoa4_enabled(
+                    gpu,
+                    "lm_head.weight",
+                    lm_info.quant_type,
+                );
+                load_weight_tensor_raw(
+                    gpu,
+                    lm_info.quant_type,
+                    &lm_data,
+                    c.vocab_size,
+                    c.dim,
+                    append_aosoa4,
+                )
             },
             |gpu| {
                 let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")

@@ -13,6 +13,7 @@ pub mod feature_flags;
 pub mod gemm;
 pub mod gemv;
 pub mod graph;
+pub mod hfq4_soa;
 mod kernels;
 pub mod moe;
 pub mod norm;
