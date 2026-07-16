@@ -524,6 +524,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_residual_cpol_rt_low"
         | "gemv_hfq4g256_residual_cpol_slc"
         | "gemv_hfq4g256_residual_k2048"
+        | "gemv_hfq4g256_residual_wave64"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
         | "gemv_hfq4g256_multirow_r4"
@@ -664,6 +665,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_residual_cpol_rt_low"
         | "gemv_hfq4g256_residual_cpol_slc"
         | "gemv_hfq4g256_residual_k2048"
+        | "gemv_hfq4g256_residual_wave64"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
         | "gemv_hfq4g256_multirow_r4"
@@ -2680,6 +2682,14 @@ mod tests {
         assert_eq!(
             pointer_effects("attention_flash_q8_0_tile").map(|effects| effects.len()),
             Some(5)
+        );
+        assert_eq!(
+            expected_kernarg_bytes("gemv_hfq4g256_residual_wave64"),
+            Some(32)
+        );
+        assert_eq!(
+            pointer_effects("gemv_hfq4g256_residual_wave64").map(|effects| effects.len()),
+            Some(3)
         );
     }
 
