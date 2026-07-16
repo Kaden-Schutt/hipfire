@@ -1181,6 +1181,17 @@ pub const GEMV_HFQ4G256_LM_HEAD_R1_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256.hip")
 );
+/// gfx1151 LM-head structural experiment: inline F32->FP16 activation packing,
+/// packed FP16 HFQ dequant, and four independent v_dot2_f32_f16 operations per
+/// group. The distinct symbol/code object is required to keep gfx1100 and
+/// gfx12 retained tapes isolated from the gfx1151 numerical contract.
+pub const GEMV_HFQ4G256_LM_HEAD_DOT2_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_dot2.gfx1151.hip")
+);
 
 // ── RDNA2 (gfx1030) HFQ4-G256 variants ──
 // 5 kernel variants exploring the occupancy/unroll/cache tradeoff space.
