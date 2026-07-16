@@ -15,6 +15,7 @@
 //
 // Host admission is deliberately exact: K=5120 and gate_m=up_m=17408.
 // Twenty HFQ4-G256 groups means five complete quads and no tail machinery.
+// Set HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_PAIR=0 for the one-row control.
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void fused_gate_up_hfq4g256_pair_k5120_global_gfx1201(

@@ -18961,7 +18961,12 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && *GFX1201_27B_GATE_UP_PAIR.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_PAIR").as_deref() == Ok("1")
+                !matches!(
+                    std::env::var("HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_PAIR")
+                        .ok()
+                        .as_deref(),
+                    Some("0" | "off" | "false")
+                )
             });
         let (func_name, block, grid_x) = if gfx1201_27b_pair {
             let kernel = "fused_gate_up_hfq4g256_pair_k5120_global_gfx1201";
