@@ -44,6 +44,14 @@ enum Pm4Architecture {
     Gfx12,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gfx11EntryAcquirePolicy {
+    System,
+    Agent,
+    Vmem,
+    None,
+}
+
 impl Pm4Architecture {
     fn from_device(device: &GpuDevice) -> Result<Self, String> {
         let name = device.name().to_ascii_lowercase();
@@ -172,9 +180,18 @@ impl Pm4Commands {
         }
     }
 
-    fn acquire_system(&mut self, gfx12_gcr_trim: bool) {
+    fn acquire_entry(
+        &mut self,
+        gfx12_gcr_trim: bool,
+        gfx11_policy: Gfx11EntryAcquirePolicy,
+    ) {
         match self {
-            Self::Legacy { commands, .. } => commands.acquire_system(),
+            Self::Legacy { commands, .. } => match gfx11_policy {
+                Gfx11EntryAcquirePolicy::System => commands.acquire_system(),
+                Gfx11EntryAcquirePolicy::Agent => commands.acquire_inter_node_same_agent(),
+                Gfx11EntryAcquirePolicy::Vmem => commands.acquire_inter_node_vmem(),
+                Gfx11EntryAcquirePolicy::None => {}
+            },
             Self::Gfx12(commands) if gfx12_gcr_trim => commands.acquire_system_gfx12(),
             Self::Gfx12(commands) => commands.acquire_system(),
         }
@@ -1232,6 +1249,42 @@ fn gfx1151_cu_mask_from_value(
     Some(Some([low, high]))
 }
 
+fn gfx1151_entry_acquire_policy(
+    architecture: Pm4Architecture,
+    device_name: &str,
+) -> Gfx11EntryAcquirePolicy {
+    let value = std::env::var("HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE")
+        .unwrap_or_else(|_| "system".to_owned());
+    let policy = gfx1151_entry_acquire_policy_from_value(architecture, device_name, &value)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unknown HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE={value:?}; retaining system acquire"
+            );
+            Gfx11EntryAcquirePolicy::System
+        });
+    if policy != Gfx11EntryAcquirePolicy::System {
+        eprintln!("[redline] gfx1151 PM4 entry acquire policy={policy:?}");
+    }
+    policy
+}
+
+fn gfx1151_entry_acquire_policy_from_value(
+    architecture: Pm4Architecture,
+    device_name: &str,
+    value: &str,
+) -> Option<Gfx11EntryAcquirePolicy> {
+    if architecture != Pm4Architecture::Gfx11 || !device_name.eq_ignore_ascii_case("gfx1151") {
+        return Some(Gfx11EntryAcquirePolicy::System);
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "" | "system" | "legacy" => Some(Gfx11EntryAcquirePolicy::System),
+        "agent" | "same-agent" | "same_agent" => Some(Gfx11EntryAcquirePolicy::Agent),
+        "vmem" | "vector" => Some(Gfx11EntryAcquirePolicy::Vmem),
+        "none" | "raw" | "off" => Some(Gfx11EntryAcquirePolicy::None),
+        _ => None,
+    }
+}
+
 impl Pm4WaitPolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -2146,6 +2199,8 @@ impl ReplayController {
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
         let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
+        let entry_acquire_policy =
+            gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -2270,7 +2325,7 @@ impl ReplayController {
                 dispatch_interleave,
                 resource_limits_policy,
             );
-            commands.acquire_system(gfx12_gcr_trim);
+            commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
             let mut resource_frontier = ResourceFrontier::default();
             for index in 0..prefix {
                 if index != 0 {
@@ -2359,7 +2414,7 @@ impl ReplayController {
                                 dispatch_interleave,
                                 resource_limits_policy,
                             );
-                            commands.acquire_system(gfx12_gcr_trim);
+                            commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                             commands
                         })
                         .collect::<Vec<_>>();
@@ -2391,7 +2446,7 @@ impl ReplayController {
                     dispatch_interleave,
                     resource_limits_policy,
                 );
-                commands.acquire_system(gfx12_gcr_trim);
+                commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                 let mut resource_frontier = ResourceFrontier::default();
                 for (position, index) in phase.indices.iter().copied().enumerate() {
                     if position != 0 && !phase.parallel {
@@ -3214,6 +3269,50 @@ mod tests {
         );
         assert_eq!(
             gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "42"),
+            None
+        );
+    }
+
+    #[test]
+    fn gfx1151_entry_acquire_is_exact_arch_only() {
+        assert_eq!(
+            gfx1151_entry_acquire_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "agent",
+            ),
+            Some(Gfx11EntryAcquirePolicy::Agent)
+        );
+        assert_eq!(
+            gfx1151_entry_acquire_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "vmem",
+            ),
+            Some(Gfx11EntryAcquirePolicy::Vmem)
+        );
+        assert_eq!(
+            gfx1151_entry_acquire_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1100",
+                "none",
+            ),
+            Some(Gfx11EntryAcquirePolicy::System)
+        );
+        assert_eq!(
+            gfx1151_entry_acquire_policy_from_value(
+                Pm4Architecture::Gfx12,
+                "gfx1201",
+                "agent",
+            ),
+            Some(Gfx11EntryAcquirePolicy::System)
+        );
+        assert_eq!(
+            gfx1151_entry_acquire_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "invalid",
+            ),
             None
         );
     }
