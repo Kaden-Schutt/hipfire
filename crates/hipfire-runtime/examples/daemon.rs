@@ -3394,6 +3394,10 @@ fn main() {
                     .get("repeats")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(3) as usize;
+                let steady_state = msg
+                    .get("steady_state")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
@@ -3429,6 +3433,24 @@ fn main() {
                 }
                 let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
                 let profile_result = (|| -> Result<Vec<serde_json::Value>, String> {
+                    // Correctness-oriented prefix profiling resets and primes
+                    // every sample by default. A full dispatch-level bill of
+                    // debt needs hundreds of adjacent prefixes, where repeated
+                    // prefill dominates the requested PM4 measurement. The
+                    // explicit steady-state mode primes once and then keeps the
+                    // resident model/cache state warm. It is timing-only: exact
+                    // shadow remains a separate mandatory harness gate.
+                    if steady_state {
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
+                            frame_checkpoint,
+                        );
+                        let loaded = model.as_mut().expect("eligibility checked");
+                        let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                            unreachable!()
+                        };
+                        redline_reset_qwen(&mut gpu, bundle)?;
+                        redline_prime_qwen(&mut gpu, bundle, context)?;
+                    }
                     let mut rows = Vec::with_capacity(prefixes.len());
                     for prefix in prefixes {
                         let launch = gpu.replay.recorded_launches()[prefix - 1].clone();
@@ -3437,15 +3459,17 @@ fn main() {
                             .prepare_pm4_prefix(gpu.device_id as usize, prefix)?;
                         let mut samples = Vec::with_capacity(repeats);
                         for _ in 0..repeats {
-                            rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
-                                frame_checkpoint,
-                            );
                             let loaded = model.as_mut().expect("eligibility checked");
                             let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
                                 unreachable!()
                             };
-                            redline_reset_qwen(&mut gpu, bundle)?;
-                            redline_prime_qwen(&mut gpu, bundle, context)?;
+                            if !steady_state {
+                                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
+                                    frame_checkpoint,
+                                );
+                                redline_reset_qwen(&mut gpu, bundle)?;
+                                redline_prime_qwen(&mut gpu, bundle, context)?;
+                            }
                             qwen35::prepare_scratch_inputs(
                                 &mut gpu,
                                 &bundle.weights,
@@ -3488,6 +3512,7 @@ fn main() {
                                 "start": start,
                                 "step": step,
                                 "repeats": repeats,
+                                "steady_state": steady_state,
                                 "rows": rows,
                             })
                         );

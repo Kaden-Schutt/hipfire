@@ -151,6 +151,14 @@ def main():
         help="first cumulative dispatch prefix to profile (default: one step)",
     )
     parser.add_argument(
+        "--profile-prefix-steady-state",
+        action="store_true",
+        help=(
+            "prime the model once before retained-PM4 prefix timing instead of "
+            "resetting and re-prefilling before every sample; diagnostic timing only"
+        ),
+    )
+    parser.add_argument(
         "--pm4",
         action="store_true",
         help="lower --prefix to one retained PM4 indirect buffer",
@@ -282,6 +290,7 @@ def main():
                     "context_tokens": args.decode_context,
                     "step": args.profile_prefix_step,
                     "repeats": args.profile_prefix_repeats,
+                    "steady_state": args.profile_prefix_steady_state,
                     **(
                         {"start": args.profile_prefix_start}
                         if args.profile_prefix_start is not None
@@ -291,7 +300,8 @@ def main():
             )
             print(
                 f"pm4-prefix-profile: rows={len(report['pm4_prefix_profile']['rows'])} "
-                f"repeats={args.profile_prefix_repeats}",
+                f"repeats={args.profile_prefix_repeats} "
+                f"steady_state={args.profile_prefix_steady_state}",
                 flush=True,
             )
         if args.prefix is None:
