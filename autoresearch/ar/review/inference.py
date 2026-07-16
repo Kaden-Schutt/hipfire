@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import json
+import re
 import time
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -108,6 +109,8 @@ _GITHUB_CREDENTIAL_ENV_NAMES = frozenset({
     "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_API_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_ENTERPRISE_TOKEN",
     "GITHUB_OAUTH_TOKEN",
 })
+_GITHUB_TOKEN_PREFIXES = ("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_")
+_LEGACY_GITHUB_TOKEN = re.compile(r"[0-9a-f]{40}")
 
 
 def _json_depth(value: Any, depth: int = 0) -> int:
@@ -167,7 +170,7 @@ class ToollessReviewAdapter:
         transport: HttpTransport,
         environment: Mapping[str, str],
     ):
-        if not isinstance(configuration, ReviewConfiguration) or not isinstance(transport, BoundedHttpTransport):
+        if not isinstance(configuration, ReviewConfiguration) or type(transport) is not BoundedHttpTransport:
             raise ToollessInferenceError("protected review configuration and HTTP transport are required")
         self._policy = _provider(configuration, provider_id)
         if not isinstance(environment, Mapping) or any(
@@ -183,6 +186,8 @@ class ToollessReviewAdapter:
         credential = environment.get(self._policy.api_key_env)
         if not credential:
             raise ToollessInferenceError("configured provider API key is absent")
+        if credential.startswith(_GITHUB_TOKEN_PREFIXES) or _LEGACY_GITHUB_TOKEN.fullmatch(credential):
+            raise ToollessInferenceError("configured provider API key is a GitHub credential")
         self._transport = transport
         self._credential = credential
         self._requests = 0
@@ -380,6 +385,8 @@ class ToollessReviewAdapter:
                 timeout=self._policy.request_deadline_seconds,
                 max_response_bytes=self._policy.max_response_bytes,
             ))
+        except ToollessInferenceError:
+            raise
         except Exception as exc:
             raise ToollessInferenceError("provider HTTP request failed") from exc
         return self._parse_response(response, capsule, started)

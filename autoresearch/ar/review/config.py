@@ -80,8 +80,10 @@ class AuthenticatedConfigSource:
 
     @classmethod
     def _from_authenticated_boundary(
-        cls, repository: str, default_branch: str, commit_sha: str, config_digest: str, root: str | Path
+        cls, proof: object, repository: str, default_branch: str, commit_sha: str, config_digest: str, root: str | Path
     ) -> "AuthenticatedConfigSource":
+        if proof is not _SOURCE_PROOF:
+            raise ValueError("authenticated config source may only be issued by the GitHub boundary")
         source = cls(repository, default_branch, commit_sha, config_digest, _root_identity(root))
         object.__setattr__(source, "_proof", _SOURCE_PROOF)
         return source

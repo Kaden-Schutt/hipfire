@@ -1,5 +1,6 @@
 # Copyright (c) Kaden Schutt
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import base64
@@ -437,23 +438,55 @@ def test_authenticated_config_source_binds_branch_commit_and_policy_blobs(tmp_pa
         ".github/agentic-review/trusted-publishers.json",
     )
     contents = tuple((ROOT / path).read_bytes() for path in paths)
-    blob_ids = [f"{index + 1:040x}" for index in range(3)]
+    blob_ids = [hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() for content in contents]
     tree_entries = [
         {"path": path, "mode": "100644", "type": "blob", "sha": oid}
         for path, oid in zip(paths, blob_ids)
     ]
     responses = [
         result({"id": 8, "full_name": REPO, "default_branch": "main"}),
+        result({"ref": "refs/heads/main", "object": {"sha": "c" * 40, "type": "commit"}}),
         result({"sha": "c" * 40, "tree": {"sha": "t" * 40}}),
         result({"sha": "t" * 40, "tree": tree_entries, "truncated": False}),
         *(result({"sha": oid, "encoding": "base64", "content": base64.b64encode(content).decode(), "size": len(content)})
           for oid, content in zip(blob_ids, contents)),
     ]
     source = GitHubClient(FakeRunner(responses)).authenticated_config_source(
-        REPO, default_branch="main", commit_sha="c" * 40, repository_root=str(ROOT)
+        REPO, commit_sha="c" * 40, repository_root=str(ROOT)
     )
     assert source.authenticated
     assert source.config_digest == configuration_source_digest(*contents)
+
+
+def test_authenticated_config_source_rejects_stale_head_and_unverified_blob():
+    responses = [
+        result({"id": 8, "full_name": REPO, "default_branch": "main"}),
+        result({"ref": "refs/heads/main", "object": {"sha": "d" * 40, "type": "commit"}}),
+    ]
+    with pytest.raises(GitHubBoundaryError, match="live|head"):
+        GitHubClient(FakeRunner(responses)).authenticated_config_source(
+            REPO, commit_sha="c" * 40, repository_root=str(ROOT)
+        )
+
+    content = b"{}"
+    bad_oid = "0" * 40
+    entries = [{"path": ".github/agentic-review/providers.json", "mode": "100644", "type": "blob", "sha": bad_oid}]
+    responses = [
+        result({"id": 8, "full_name": REPO, "default_branch": "main"}),
+        result({"ref": "refs/heads/main", "object": {"sha": "c" * 40, "type": "commit"}}),
+        result({"sha": "c" * 40, "tree": {"sha": "t" * 40}}),
+        result({"sha": "t" * 40, "tree": entries + [
+            {"path": ".github/agentic-review/capabilities-v1.json", "mode": "100644", "type": "blob", "sha": bad_oid},
+            {"path": ".github/agentic-review/trusted-publishers.json", "mode": "100644", "type": "blob", "sha": bad_oid},
+        ], "truncated": False}),
+        result({"sha": bad_oid, "encoding": "base64", "content": base64.b64encode(content).decode(), "size": len(content)}),
+        result({"sha": bad_oid, "encoding": "base64", "content": base64.b64encode(content).decode(), "size": len(content)}),
+        result({"sha": bad_oid, "encoding": "base64", "content": base64.b64encode(content).decode(), "size": len(content)}),
+    ]
+    with pytest.raises(GitHubBoundaryError, match="object hash"):
+        GitHubClient(FakeRunner(responses)).authenticated_config_source(
+            REPO, commit_sha="c" * 40, repository_root=str(ROOT)
+        )
 
 
 def test_create_review_sends_exact_commit_id():

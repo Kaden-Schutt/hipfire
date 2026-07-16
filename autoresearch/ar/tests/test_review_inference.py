@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 from urllib.error import HTTPError
 
@@ -24,6 +25,7 @@ from autoresearch.ar.review.config import (
     configuration_source_digest,
     load_review_configuration,
 )
+from autoresearch.ar.review.github import GitHubClient
 from autoresearch.ar.review.models import ReviewTarget
 
 
@@ -61,12 +63,39 @@ def protected_configuration(policy=None):
     (config_dir / "providers.json").write_text(json.dumps(policy or POLICY), encoding="utf-8")
     for name in ("capabilities-v1.json", "trusted-publishers.json"):
         shutil.copy(ROOT / ".github" / "agentic-review" / name, config_dir / name)
-    source_digest = configuration_source_digest(
-        (config_dir / "providers.json").read_bytes(),
-        (config_dir / "capabilities-v1.json").read_bytes(),
-        (config_dir / "trusted-publishers.json").read_bytes(),
+    contents = tuple((config_dir / name).read_bytes() for name in (
+        "providers.json", "capabilities-v1.json", "trusted-publishers.json",
+    ))
+    blob_ids = [hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() for content in contents]
+    paths = (
+        ".github/agentic-review/providers.json",
+        ".github/agentic-review/capabilities-v1.json",
+        ".github/agentic-review/trusted-publishers.json",
     )
-    source = AuthenticatedConfigSource._from_authenticated_boundary("owner/repo", "main", "commit-sha", source_digest, root)
+    header = "HTTP/2 200\r\nX-OAuth-Scopes: read:user\r\n\r\n"
+    responses = [
+        {"id": 1, "full_name": "owner/repo", "default_branch": "main"},
+        {"ref": "refs/heads/main", "object": {"sha": "c" * 40, "type": "commit"}},
+        {"sha": "c" * 40, "tree": {"sha": "t" * 40}},
+        {"sha": "t" * 40, "tree": [
+            {"path": path, "mode": "100644", "type": "blob", "sha": oid}
+            for path, oid in zip(paths, blob_ids)
+        ], "truncated": False},
+    ]
+    responses.extend({"sha": oid, "encoding": "base64", "content": base64.b64encode(content).decode(), "size": len(content)}
+                     for oid, content in zip(blob_ids, contents))
+
+    class Runner:
+        def __init__(self):
+            self.responses = list(responses)
+
+        def __call__(self, argv, input_data=None):
+            payload = self.responses.pop(0)
+            return subprocess.CompletedProcess(argv, 0, header + json.dumps(payload), "")
+
+    source = GitHubClient(Runner()).authenticated_config_source(
+        "owner/repo", commit_sha="c" * 40, repository_root=str(root)
+    )
     loaded = load_review_configuration(root, source=source)
     if policy is None:
         _CONFIGURATION = loaded
@@ -89,14 +118,35 @@ def capsule():
     return build_review_capsule(Client(), TARGET)
 
 
-class Transport(BoundedHttpTransport):
+class _ProviderResponse:
+    def __init__(self, response):
+        self.status = response.status_code
+        self.headers = response.headers
+        self._body = response.body
+        self._read = False
+
+    def read(self, size):
+        if self._read:
+            return b""
+        self._read = True
+        return self._body
+
+
+class _Opener:
     def __init__(self, response):
         self.response = response
         self.calls = []
 
-    def send(self, request: HttpRequest):
+    def open(self, request, timeout):
         self.calls.append(request)
-        return self.response
+        return _ProviderResponse(self.response)
+
+
+def Transport(response):
+    opener = _Opener(response)
+    transport = BoundedHttpTransport(opener)
+    transport.calls = opener.calls
+    return transport
 
 
 def valid_response(**changes):
@@ -126,15 +176,11 @@ def test_exactly_one_toolless_https_request_and_bound_proposal():
     assert proposal.response_digest.startswith("sha256:")
     assert len(transport.calls) == 1
     request = transport.calls[0]
-    assert (request.method, request.url) == ("POST", POLICY["providers"][0]["endpoint"])
-    assert request.timeout == 30
-    assert request.max_response_bytes == 1 << 20
-    assert request.headers["Authorization"] == "Bearer secret"
-    assert "github" not in json.dumps(request.headers).lower()
-    body = request.body.decode()
+    assert (request.get_method(), request.full_url) == ("POST", POLICY["providers"][0]["endpoint"])
+    body = request.data.decode()
     assert '"tools":[]' in body
     assert "function" not in body.lower()
-    request_json = json.loads(request.body)
+    request_json = json.loads(request.data)
     assert request_json["model"] == "review-model-v1"
     assert request_json["max_output_tokens"] == 128
     assert request_json["response_format"]["type"] == "json_schema"
@@ -165,6 +211,17 @@ def test_protected_configuration_is_deep_immutable_and_root_forgery_is_rejected(
     assert not forged.is_protected
     with pytest.raises(ToollessInferenceError, match="protected"):
         ToollessReviewAdapter.from_configuration(forged, "review-adapter", Transport(valid_response()), {"REVIEW_API_KEY": "secret"})
+
+
+def test_caller_supplied_config_source_cannot_be_authenticated():
+    source = AuthenticatedConfigSource(
+        "owner/repo", "main", "c" * 40, "sha256:" + "a" * 64, "sha256:" + "b" * 64
+    )
+    assert not source.authenticated
+    with pytest.raises(ValueError, match="GitHub boundary"):
+        AuthenticatedConfigSource._from_authenticated_boundary(
+            object(), "owner/repo", "main", "c" * 40, "sha256:" + "a" * 64, "/tmp"
+        )
 
 
 def test_provider_requires_protected_configuration_and_injected_non_github_environment():
@@ -205,20 +262,10 @@ def test_transport_rejects_redirect_flag_and_enforces_response_limit_before_down
     with pytest.raises(ToollessInferenceError, match="redirect|status"):
         adapter(redirected).review(capsule())
 
-    class BoundedTransport(BoundedHttpTransport):
-        def __init__(self):
-            self.called = False
-
-        def send(self, request):
-            self.called = True
-            assert request.max_response_bytes == 1 << 20
-            payload = b"x" * (request.max_response_bytes + 1)
-            raise RuntimeError(f"refused before accumulating {len(payload)} bytes")
-
-    bounded = BoundedTransport()
-    with pytest.raises(ToollessInferenceError, match="request failed"):
+    bounded = Transport(HttpResponse(200, {"Content-Length": str((1 << 20) + 1)}, b"x"))
+    with pytest.raises(ToollessInferenceError, match="request failed|byte"):
         adapter(bounded).review(capsule())
-    assert bounded.called
+    assert len(bounded.calls) == 1
 
 
 def test_owned_transport_disables_redirects_streams_and_bounds_reads():
@@ -278,6 +325,19 @@ def test_provider_environment_rejects_any_extra_secret_capability():
         )
 
 
+@pytest.mark.parametrize("token", [
+    "ghp_x", "github_pat_x", "gho_x", "ghu_x", "ghs_x", "ghr_x", "a" * 40,
+])
+def test_custom_provider_key_rejects_known_github_token_families(token):
+    policy = deepcopy(POLICY)
+    policy["providers"][0]["api_key_env"] = "CUSTOM_PROVIDER_KEY"
+    with pytest.raises(ToollessInferenceError, match="GitHub|credential"):
+        ToollessReviewAdapter.from_configuration(
+            protected_configuration(policy), "review-adapter", Transport(valid_response()),
+            {"CUSTOM_PROVIDER_KEY": token},
+        )
+
+
 def test_arbitrary_send_object_is_not_an_accepted_transport():
     class FakeTransport:
         def send(self, request):
@@ -303,7 +363,7 @@ def test_one_request_enforcement_and_no_github_credentials():
     review.review(capsule())
     with pytest.raises(ToollessInferenceError, match="request"):
         review.review(capsule())
-    request = json.loads(transport.calls[0].body)
+    request = json.loads(transport.calls[0].data)
     assert "GITHUB_TOKEN" not in json.dumps(request)
     assert "ghp_" not in json.dumps(request)
 

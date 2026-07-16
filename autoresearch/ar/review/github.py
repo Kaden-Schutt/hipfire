@@ -22,6 +22,7 @@ from .canonical import canonical_digest, canonical_loads, metadata_digest
 from .config import (
     ReviewConfiguration,
     AuthenticatedConfigSource,
+    _SOURCE_PROOF,
     configuration_source_digest,
     validate_operator_credential_manifest,
 )
@@ -200,6 +201,7 @@ _ENDPOINTS = (
     ("DELETE", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels/[^/]+$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/collaborators/[^/]+/permission$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/commits/{_SHA}$"), False),
+    ("GET", re.compile(rf"/repos/{_REPO}/git/ref/heads/{_SHA}$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/trees/{_SHA}$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/git/blobs/{_SHA}$"), False),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/comments$"), False),
@@ -786,20 +788,36 @@ class GitHubClient:
             raise GitHubBoundaryError("GitHub commit or tree identity does not match request")
         return response
 
+    def get_branch_head(self, repository: str, branch: str) -> str:
+        repository = _repository(repository)
+        branch = _identifier(branch, "default branch")
+        response = self._request("GET", f"/repos/{repository}/git/ref/heads/{branch}")
+        data = self._require_mapping(response.data, "branch ref")
+        obj = self._require_mapping(data.get("object"), "branch ref object")
+        sha = obj.get("sha")
+        if obj.get("type") != "commit" or not isinstance(sha, str) or not sha.strip():
+            raise GitHubBoundaryError("GitHub branch ref is not a commit identity")
+        return sha
+
     def authenticated_config_source(
-        self, repository: str, *, default_branch: str, commit_sha: str, repository_root: str
+        self, repository: str, *, commit_sha: str, repository_root: str
     ) -> AuthenticatedConfigSource:
         """Authenticate the exact default-branch commit and its checked-in policies."""
         repository = _repository(repository)
-        default_branch = _identifier(default_branch, "default branch")
         commit_sha = _identifier(commit_sha, "config commit SHA")
         repository_data = self.get_repository(repository).data
-        if repository_data.get("default_branch") != default_branch:
-            raise GitHubBoundaryError("authenticated config source default branch does not match repository")
+        default_branch = repository_data.get("default_branch")
+        if not isinstance(default_branch, str) or not default_branch.strip():
+            raise GitHubBoundaryError("repository default branch is unavailable")
+        default_branch = _identifier(default_branch, "default branch")
+        if self.get_branch_head(repository, default_branch) != commit_sha:
+            raise GitHubBoundaryError("authenticated config source commit is not the live default-branch head")
         commit = self.get_commit(repository, commit_sha).data
         tree = self._require_mapping(commit.get("tree"), "config commit tree")
         tree_sha = _identifier(tree.get("sha"), "config tree SHA")
         tree_data = self.get_tree(repository, tree_sha, recursive=True).data
+        if tree_data.get("truncated") is not False:
+            raise GitHubBoundaryError("authenticated config tree is truncated or lacks an explicit marker")
         entries = {
             item["path"]: item
             for item in tree_data["tree"]
@@ -821,10 +839,14 @@ class GitHubClient:
                 raise GitHubBoundaryError("authenticated config source is missing a policy blob")
             blob = self.get_blob(repository, entry["sha"]).data
             try:
-                contents.append(base64.b64decode(blob["content"].encode("ascii"), validate=True))
+                content = base64.b64decode(blob["content"].encode("ascii"), validate=True)
+                if hashlib.sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content).hexdigest() != entry["sha"]:
+                    raise GitHubBoundaryError("authenticated config blob Git object hash does not match tree OID")
+                contents.append(content)
             except (KeyError, UnicodeEncodeError, binascii.Error) as exc:
                 raise GitHubBoundaryError("authenticated config source contains invalid blob encoding") from exc
         return AuthenticatedConfigSource._from_authenticated_boundary(
+            _SOURCE_PROOF,
             repository,
             default_branch,
             commit_sha,
