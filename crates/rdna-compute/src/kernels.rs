@@ -1809,6 +1809,14 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW2_CLUSTERED_GFX1
         )
     );
 
+/// gfx1151 K=512 eight-row schedule. One wave amortizes each activation load
+/// across eight output rows, targeting the APU's bandwidth ceiling without
+/// changing the routed-down ABI or any other architecture's code object.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW8_GFX1151_SRC: &str =
+    include_str!(
+        "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8.gfx1151.hip"
+    );
+
 /// Radiowave gfx1100 cache-policy probe for the atomic-free MoE down stream.
 /// Keep this replay-visible and opt-in until exact-shadow and product-level
 /// certification establish whether SLC helps this access pattern.
