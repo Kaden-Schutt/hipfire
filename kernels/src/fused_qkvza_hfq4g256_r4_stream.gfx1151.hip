@@ -21,7 +21,10 @@ using hipfire_qkvza_r4_f32x4 = float __attribute__((ext_vector_type(4)));
 // The host admits this kernel only when all four matrix row counts are
 // divisible by four, so a tile never crosses a matrix boundary and no partial
 // row path is required.
-__launch_bounds__(32, 16)
+// Four rows expose enough independent VMEM/VALU work that this tile can trade
+// one occupancy tier for the register holding the lane address instead of
+// spilling it. The shipping one-row gfx1151 kernel remains at 16 waves.
+__launch_bounds__(32, 12)
 extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151(
     const char*  __restrict__ A_qkv,
     const char*  __restrict__ A_z,
