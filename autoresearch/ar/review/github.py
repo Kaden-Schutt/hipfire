@@ -43,7 +43,10 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
             stream.close()
@@ -106,7 +109,10 @@ def _subprocess_runner(argv: Sequence[str], input_data: bytes | None = None) -> 
                 if len(buffer) + len(chunk) > limit:
                     raise GitHubBoundaryError(f"gh {name} exceeds the fixed size bound")
                 buffer.extend(chunk)
-        returncode = process.wait()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, _SUBPROCESS_TIMEOUT_SECONDS)
+        returncode = process.wait(timeout=remaining)
         return subprocess.CompletedProcess(argv, returncode, bytes(stdout), bytes(stderr))
     except (GitHubBoundaryError, subprocess.TimeoutExpired):
         _stop_process(process)
@@ -177,10 +183,11 @@ _ENDPOINTS = (
     ("GET", re.compile(rf"/repos/{_REPO}/pulls$"), True),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/comments$"), True),
-    ("GET", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/comments/[1-9][0-9]*$"), False),
+    ("GET", re.compile(rf"/repos/{_REPO}/issues/comments/[1-9][0-9]*$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews$"), True),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews/[1-9][0-9]*$"), False),
-    ("GET", re.compile(rf"/repos/{_REPO}/installation$"), False),
+    ("GET", re.compile(r"/installation$"), False),
+    ("GET", re.compile(r"/installation/repositories$"), False),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
     ("DELETE", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels/[^/]+$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/collaborators/[^/]+/permission$"), False),
@@ -488,12 +495,10 @@ class GitHubClient:
             raise GitHubBoundaryError("GitHub repository response has malformed identity")
         return response
 
-    def get_app_installation(self, repository: str) -> GitHubResponse:
-        repository = _repository(repository)
-        response = self._request("GET", f"/repos/{repository}/installation")
+    def get_installation(self) -> GitHubResponse:
+        response = self._request("GET", "/installation")
         data = self._require_mapping(response.data, "App installation")
-        self._require(data, ("id", "app_id", "account", "permissions"), "App installation")
-        account = self._require(self._require_mapping(data["account"], "App installation account"), ("login", "type"), "App installation account")
+        self._require(data, ("id", "app_id", "permissions"), "App installation")
         if (
             isinstance(data["id"], bool)
             or not isinstance(data["id"], int)
@@ -501,15 +506,28 @@ class GitHubClient:
             or isinstance(data["app_id"], bool)
             or not isinstance(data["app_id"], int)
             or data["app_id"] <= 0
-            or not isinstance(account["login"], str)
-            or not account["login"].strip()
-            or account["type"] not in {"User", "Bot", "Organization"}
             or not isinstance(data["permissions"], Mapping)
         ):
             raise GitHubBoundaryError("GitHub App installation identity is malformed")
         return response
 
-    def list_pull_requests(self, repository: str, *, pages: int = 1) -> GitHubResponse:
+    def list_installation_repositories(self) -> GitHubResponse:
+        response = self._request(
+            "GET", "/installation/repositories", query={"per_page": _PAGE_SIZE, "page": 1}
+        )
+        data = self._require_mapping(response.data, "installation repositories")
+        repositories = data.get("repositories")
+        if not isinstance(repositories, list):
+            raise GitHubBoundaryError("GitHub installation repositories response is malformed")
+        for repository in repositories:
+            item = self._require_mapping(repository, "installation repository")
+            if isinstance(item.get("id"), bool) or not isinstance(item.get("id"), int) or item["id"] <= 0:
+                raise GitHubBoundaryError("GitHub installation repository identity is malformed")
+        return response
+
+    def list_pull_requests(
+        self, repository: str, *, pages: int = 1, require_complete: bool = True
+    ) -> GitHubResponse:
         repository = _repository(repository)
         if isinstance(pages, bool) or not isinstance(pages, int) or not 0 < pages <= _MAX_PAGINATED_PAGES:
             raise GitHubBoundaryError("pages must be within the fixed positive bound")
@@ -525,11 +543,15 @@ class GitHubClient:
                 raise GitHubBoundaryError("GitHub pull request pagination exceeds the fixed item bound")
             data.extend(response.data)
             headers.update(response.headers)
-            if page == pages and _has_next_page(response.headers):
+            if require_complete and page == pages and _has_next_page(response.headers):
                 raise GitHubBoundaryError("GitHub pull request pagination exceeds the configured page bound")
         for item in data:
             self._validate_pull(self._require_mapping(item, "pull request"), expected_repository=repository)
         return GitHubResponse(data, headers, 200)
+
+    def sample_pull_requests(self, repository: str) -> GitHubResponse:
+        """Return one bounded probe page without claiming exhaustive discovery."""
+        return self.list_pull_requests(repository, pages=1, require_complete=False)
 
     @classmethod
     def _validate_pull(cls, data: Mapping[str, Any], *, expected_number: int | None = None, expected_repository: str | None = None) -> None:
@@ -569,11 +591,10 @@ class GitHubClient:
     def list_pull_reviews(self, repository: str, number: int) -> GitHubResponse:
         return self._list_records(repository, number, "pull reviews")
 
-    def get_issue_comment(self, repository: str, number: int, comment_id: int) -> GitHubResponse:
+    def get_issue_comment(self, repository: str, comment_id: int) -> GitHubResponse:
         repository = _repository(repository)
-        number = _positive_integer(number, "issue number")
         comment_id = _positive_integer(comment_id, "comment ID")
-        response = self._request("GET", f"/repos/{repository}/issues/{number}/comments/{comment_id}")
+        response = self._request("GET", f"/repos/{repository}/issues/comments/{comment_id}")
         self._validate_record_response(response, "issue comment", extra=("body",), expected_id=comment_id)
         return response
 
@@ -797,8 +818,8 @@ class GitHubClient:
             raise GitHubBoundaryError(f"GitHub {record_name} body is not a valid protocol payload") from exc
         return GitHubEnvelope(payload, record["node_id"], author["login"], record["created_at"], record["updated_at"], author["type"])
 
-    def comment_envelope(self, repository: str, number: int, comment_id: int) -> GitHubEnvelope:
-        response = self.get_issue_comment(repository, number, comment_id)
+    def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:
+        response = self.get_issue_comment(repository, comment_id)
         return self._envelope(response.data, record_name="issue comment")
 
     def review_envelope(self, repository: str, number: int, review_id: int) -> GitHubEnvelope:
@@ -866,17 +887,22 @@ def _app_identity(
     if len(apps) != 1:
         raise PreflightError("publisher requires exactly one trusted App binding for the repository")
     configured = apps[0]
-    response = client.get_app_installation(repository)
+    response = client.get_installation()
     scopes, accepted = _capability_signal(response, required=("metadata",))
     data = client._require_mapping(response.data, "App installation")
-    account = client._require_mapping(data["account"], "App installation account")
     if (
         data["id"] != configured["installation_id"]
         or data["app_id"] != configured["app_id"]
-        or account["login"] != configured["login"]
-        or account["type"] not in {"User", "Bot", "Organization"}
     ):
         raise PreflightError("GitHub App installation does not match the trusted binding")
+    repositories_response = client.list_installation_repositories()
+    _capability_signal(repositories_response, required=("metadata",))
+    repositories_data = client._require_mapping(repositories_response.data, "installation repositories")
+    if not any(
+        isinstance(item, Mapping) and item.get("id") == repository_id
+        for item in repositories_data["repositories"]
+    ):
+        raise PreflightError("GitHub App installation does not include the target repository")
     permissions = data["permissions"]
     for name in ("issues", "pull_requests"):
         value = permissions.get(name) if isinstance(permissions, Mapping) else None
@@ -914,8 +940,11 @@ def preflight_read_only(
     except ValueError as exc:
         raise PreflightError(str(exc)) from exc
     write_mode = mode in {"publisher", "dismissal"}
-    operator = None
-    if write_mode and operator_manifest is not None:
+    operator: Mapping[str, Any] | None = None
+    if write_mode and operator_manifest is None:
+        raise PreflightError("publisher and dismissal modes require an operator credential manifest")
+    if write_mode:
+        assert operator_manifest is not None
         try:
             validate_operator_credential_manifest(operator_manifest)
         except ValueError as exc:
@@ -927,7 +956,8 @@ def preflight_read_only(
         user_response = None
         user_data: Mapping[str, Any] | None = None
         scopes: tuple[str, ...] = ()
-        use_app_token = write_mode and (operator is None or operator["principal"]["type"] == "Bot")
+        operator_principal_type = operator["principal"]["type"] if operator is not None else ""
+        use_app_token = write_mode and operator_principal_type == "Bot"
         if not use_app_token:
             user_response = client.get_authenticated_user()
             scopes, _ = _capability_signal(user_response)
@@ -935,7 +965,7 @@ def preflight_read_only(
         repo_response = client.get_repository(repository)
         _capability_signal(repo_response, required=("metadata",))
         repository_data = client._require_mapping(repo_response.data, "repository")
-        pulls_response = client.list_pull_requests(repository)
+        pulls_response = client.sample_pull_requests(repository)
         _capability_signal(pulls_response, required=("pull_requests",))
         if user_data is not None:
             user_login = user_data["login"]

@@ -3,9 +3,11 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
+import autoresearch.ar.review.github as github
 from autoresearch.ar.review.canonical import canonical_digest
 from autoresearch.ar.review.github import (
     GitHubBoundaryError,
@@ -110,8 +112,22 @@ def installation(account_type="Bot"):
     return {
         "id": 2,
         "app_id": 1,
-        "account": {"login": "review-bot", "type": account_type},
+        "account": {"login": "repository-owner", "type": account_type},
         "permissions": {"metadata": "read", "issues": "write", "pull_requests": "write"},
+    }
+
+
+def installation_repositories():
+    return {"total_count": 1, "repositories": [repository()]}
+
+
+def app_manifest(operation="publish", *, login="review-bot", digest=None):
+    return {
+        "schema": "hipfire.agentic-review.operator-credentials",
+        "version": 1,
+        "principal": {"login": login, "type": "Bot"},
+        "allowed_operations": [operation],
+        "credential_attestation_digest": digest or "sha256:" + "a" * 64,
     }
 
 
@@ -189,6 +205,15 @@ def test_subprocess_runner_stops_streaming_process_at_output_bound():
         _subprocess_runner([sys.executable, "-c", producer])
 
 
+def test_subprocess_runner_terminates_child_when_streams_close_first(monkeypatch):
+    monkeypatch.setattr(github, "_SUBPROCESS_TIMEOUT_SECONDS", 0.05)
+    producer = "import sys, time; sys.stdout.close(); sys.stderr.close(); time.sleep(10)"
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _subprocess_runner([sys.executable, "-c", producer])
+    assert time.monotonic() - started < 2
+
+
 @pytest.mark.parametrize(
     "runner_result",
     [
@@ -242,17 +267,17 @@ def test_paginated_http_output_has_a_fixed_page_bound():
 def test_envelope_uses_exact_server_endpoint_and_rejects_edited_records():
     runner = FakeRunner([result(record())])
     client = GitHubClient(runner)
-    envelope = client.comment_envelope(REPO, 42, 11)
+    envelope = client.comment_envelope(REPO, 11)
     assert envelope.node_id == "IC_1"
     assert envelope.author == "review-bot"
     assert envelope.author_type == "Bot"
     assert envelope.created_at == envelope.updated_at
     assert envelope.payload["record_id"] == "logical"
-    assert "/issues/42/comments/11" in runner.calls[0][0][-1]
+    assert runner.calls[0][0][-1] == "/repos/owner/repo/issues/comments/11"
 
     edited = FakeRunner([result(record(updated_at="2026-01-01T00:01:00Z"))])
     with pytest.raises(GitHubBoundaryError, match="edited"):
-        GitHubClient(edited).comment_envelope(REPO, 42, 11)
+        GitHubClient(edited).comment_envelope(REPO, 11)
 
 
 @pytest.mark.parametrize("method", ["comment_envelope", "review_envelope"])
@@ -260,7 +285,10 @@ def test_envelope_rejects_a_record_with_a_different_server_id(method):
     payload = record() if method == "comment_envelope" else review_record()
     runner = FakeRunner([result(dict(payload, id=99))])
     with pytest.raises(GitHubBoundaryError, match="ID|id"):
-        getattr(GitHubClient(runner), method)(REPO, 42, 11 if method == "comment_envelope" else 7)
+        if method == "comment_envelope":
+            GitHubClient(runner).comment_envelope(REPO, 11)
+        else:
+            GitHubClient(runner).review_envelope(REPO, 42, 7)
 
 
 def test_envelope_factories_are_not_public_record_mapping_apis():
@@ -395,15 +423,17 @@ def preflight_responses(*, scopes="read:user, repo:status", accepted=None, probe
 def app_preflight_responses(*, link=None, account_type="Bot"):
     accepted = "metadata=read, pull_requests=write, issues=write"
     headers = {"X-Accepted-GitHub-Permissions": accepted}
+    pull_headers = dict(headers)
     if link is not None:
-        headers["Link"] = link
+        pull_headers["Link"] = link
     return [
         result(repository(), headers=headers),
-        result([pull()], headers=headers),
+        result([pull()], headers=pull_headers),
         result(pull(), headers=headers),
         result([record()], headers=headers),
         result([review_record()], headers=headers),
         result(installation(account_type), headers=headers),
+        result(installation_repositories(), headers=headers),
     ]
 
 
@@ -537,6 +567,9 @@ def test_publisher_preflight_accepts_matching_app_and_operator_manifest():
         GitHubClient(runner), REPO, mode="publisher", configuration=configuration, operator_manifest=manifest
     )
     assert all("--method" in call[0] and call[0][call[0].index("--method") + 1] == "GET" for call in runner.calls)
+    assert "/installation" in runner.calls[-2][0]
+    assert runner.calls[-1][0][-1].startswith("/installation/repositories?")
+    assert all("/repos/owner/repo/installation" not in call[0] for call in runner.calls)
 
 
 def test_dismissal_preflight_requires_dismissal_attestation():
@@ -581,7 +614,20 @@ def test_publisher_preflight_accepts_attested_human_fine_grained_pat():
     assert outcome.principal_type == "User"
 
 
-def test_app_publisher_preflight_does_not_call_user_endpoint():
+def test_app_publisher_preflight_requires_manifest_before_api_calls():
+    configuration = load_review_configuration(ROOT).with_trusted_publishers(
+        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [
+            {"app_id": 1, "login": "review-bot", "installation_id": 2, "repository_id": 8,
+             "credential_attestation_digest": "sha256:" + "a" * 64}
+        ]}
+    )
+    runner = FakeRunner(app_preflight_responses())
+    with pytest.raises(PreflightError, match="manifest|attest"):
+        preflight_read_only(GitHubClient(runner), REPO, mode="publisher", configuration=configuration)
+    assert runner.calls == []
+
+
+def test_app_publisher_preflight_with_attestation_avoids_user_and_repo_installation_endpoints():
     configuration = load_review_configuration(ROOT).with_trusted_publishers(
         {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [
             {"app_id": 1, "login": "review-bot", "installation_id": 2, "repository_id": 8,
@@ -591,9 +637,45 @@ def test_app_publisher_preflight_does_not_call_user_endpoint():
     runner = FakeRunner(app_preflight_responses())
     outcome = preflight_read_only(
         GitHubClient(runner), REPO, mode="publisher", configuration=configuration,
+        operator_manifest=app_manifest(),
     )
     assert outcome.login == "review-bot"
     assert all(call[0][-1] != "/user" for call in runner.calls)
+    assert "/installation" in runner.calls[-2][0]
+    assert runner.calls[-1][0][-1].startswith("/installation/repositories?")
+    assert all("/repos/owner/repo/installation" not in call[0] for call in runner.calls)
+
+
+@pytest.mark.parametrize("mode", ["publisher", "dismissal"])
+def test_write_preflight_requires_operator_manifest_for_configured_app(mode):
+    configuration = load_review_configuration(ROOT).with_trusted_publishers(
+        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [
+            {"app_id": 1, "login": "review-bot", "installation_id": 2, "repository_id": 8,
+             "credential_attestation_digest": "sha256:" + "a" * 64}
+        ]}
+    )
+    runner = FakeRunner([])
+    with pytest.raises(PreflightError, match="manifest|attest"):
+        preflight_read_only(GitHubClient(runner), REPO, mode=mode, configuration=configuration)
+    assert runner.calls == []
+
+
+def test_preflight_sample_accepts_next_link_without_claiming_exhaustive_discovery():
+    configuration = load_review_configuration(ROOT).with_trusted_publishers(
+        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [
+            {"app_id": 1, "login": "review-bot", "installation_id": 2, "repository_id": 8,
+             "credential_attestation_digest": "sha256:" + "a" * 64}
+        ]}
+    )
+    next_page = '<https://api.github.com/repos/owner/repo/pulls?page=2>; rel="next"'
+    outcome = preflight_read_only(
+        GitHubClient(FakeRunner(app_preflight_responses(link=next_page))),
+        REPO,
+        mode="publisher",
+        configuration=configuration,
+        operator_manifest=app_manifest(),
+    )
+    assert outcome.login == "review-bot"
 
 
 def test_app_installation_identity_is_not_restricted_to_bot_accounts():
@@ -608,6 +690,7 @@ def test_app_installation_identity_is_not_restricted_to_bot_accounts():
         REPO,
         mode="publisher",
         configuration=configuration,
+        operator_manifest=app_manifest(),
     )
     assert outcome.login == "review-bot"
 
