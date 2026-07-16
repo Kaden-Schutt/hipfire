@@ -3679,10 +3679,16 @@ async function serve(port: number, host: string) {
             ? Math.max(0, Number(body.presence_penalty) || 0)
             : sendView.presence_penalty;
           if (typeof pp === "number") genParams.presence_penalty = pp;
-          // top_k is now HONORED by the daemon (folded into the nucleus on AR +
-          // DFlash + MTP); min_p remains carried-but-inert.
-          if (typeof sendView.top_k === "number") genParams.top_k = sendView.top_k;
-          if (typeof sendView.min_p === "number") genParams.min_p = sendView.min_p;
+          // Request fields must win over the card just like temperature/top_p.
+          // This matters when OpenAI clients use a model path instead of a
+          // registry tag: `sendView` then has no card, but the explicit request
+          // still carries the complete sampling contract. Dropping top_k here
+          // silently turns sampled MTP into its full-vocabulary host fallback,
+          // disabling the resident sparse sampler and proposal graphs.
+          const tk = body.top_k ?? sendView.top_k;
+          if (typeof tk === "number") genParams.top_k = tk;
+          const mp = body.min_p ?? sendView.min_p;
+          if (typeof mp === "number") genParams.min_p = mp;
         }
         void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
         // Forward the resolved think budget by default ("med" = 2048). Sampled
