@@ -1911,9 +1911,15 @@ impl ReplayController {
         let gfx12_gcr_trim = std::env::var("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
-        let gfx11_vmem_acquire = std::env::var("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
-            .unwrap_or(false);
+        let gfx11_vmem_acquire =
+            match std::env::var("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE") {
+                Ok(value) => matches!(value.as_str(), "1" | "true" | "on"),
+                Err(_) => {
+                    device.name().eq_ignore_ascii_case("gfx1151")
+                        && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref()
+                            == Ok("1")
+                }
+            };
         let mut wait_audit = Pm4WaitAudit::default();
         let mut audit_frontier = ResourceFrontier::default();
         for index in 0..prefix {
