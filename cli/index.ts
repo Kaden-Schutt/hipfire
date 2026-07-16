@@ -1440,11 +1440,11 @@ function resolveNgramBlock(value: "auto" | boolean, modelTag: string | null | un
 // Qwen-XML-native (`<function=><parameter=>`); forcing JSON on it makes the
 // model drift back into XML close tags mid-call and drop JSON braces, which
 // corrupts code-writing tool calls. So default OFF and only turn it ON for
-// Hermes-format cards. Explicit `HIPFIRE_QWEN35_GRAMMAR` in the shell always
-// wins (handled by the caller). Keyed on the pre-warm/loaded model, so a
-// single-model serve gets the right mode; a mixed serve would need per-load
-// threading (mirrors the same limitation kv_mode notes for a live serve).
-function resolveToolGrammar(modelTag: string | null | undefined): boolean {
+// Hermes-format cards. The caller applies any explicit
+// `HIPFIRE_QWEN35_GRAMMAR` override without caching this decision globally:
+// one serve can load plain Qwen and Carnice in succession, so model-derived
+// policy must be resolved for every active/requested model.
+export function resolveToolGrammar(modelTag: string | null | undefined): boolean {
   if (!modelTag) return false;
   const card = REGISTRY[resolveModelTag(modelTag)] as
     | { desc?: string; default_tool_format?: string | null }
@@ -1458,6 +1458,16 @@ function resolveToolGrammar(modelTag: string | null | undefined): boolean {
   return /(^|[:/_-])(carnice|hermes)\b/i.test(modelTag);
 }
 
+// Explicit shell override wins; otherwise resolve from the model for this
+// request/load. Keeping this pure prevents a pre-warmed model's tool format
+// from bleeding into a different model loaded later by the same serve.
+export function resolveToolGrammarForModel(
+  modelTag: string | null | undefined,
+  envValue: string | undefined = process.env.HIPFIRE_QWEN35_GRAMMAR,
+): boolean {
+  return envValue === undefined ? resolveToolGrammar(modelTag) : envValue !== "0";
+}
+
 // Set all config-driven env vars in one place so every daemon-spawning
 // codepath picks up the user's current settings consistently.
 // Called before `new Engine().start()`. Optional `modelTag` enables
@@ -1465,13 +1475,10 @@ function resolveToolGrammar(modelTag: string | null | undefined): boolean {
 // dflash_ngram_block).
 function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg, modelTag);
-  // Tool-call grammar (Hermes JSON) — enable ONLY for Hermes-format models.
-  // qwen3.x is Qwen-XML-native; forcing JSON on it corrupts code-writing tool
-  // calls (XML-tag drift + dropped braces). A set shell env wins (explicit
-  // override / kill-switch); otherwise resolve from the model's registry card.
-  if (process.env.HIPFIRE_QWEN35_GRAMMAR === undefined) {
-    process.env.HIPFIRE_QWEN35_GRAMMAR = resolveToolGrammar(modelTag) ? "1" : "0";
-  }
+  // Do not materialize model-derived tool grammar into process.env here.
+  // The daemon resolves its default from every loaded model path, while the
+  // serve-side tools example calls resolveToolGrammarForModel per request.
+  // Only an explicit inherited shell env is process-global by user intent.
   // Only set HIPFIRE_ATTN_FLASH if the user hasn't already set it in their
   // shell (env overrides config). `auto` is the engine default — skip the
   // env var in that case so the engine's own default applies.
@@ -3492,15 +3499,15 @@ async function serve(port: number, host: string) {
           // OFF for them (the default for non-Hermes qwen — see resolveToolGrammar),
           // show the model its NATIVE XML call format instead of the legacy
           // Hermes JSON example. A JSON example fights the model's training and
-          // induces XML-tag drift / dropped braces mid-call. Keyed on the actual
-          // grammar env so the example always matches what the model will emit:
-          // grammar ON (Hermes-format models like carnice, or a user override)
-          // keeps the JSON example; non-qwen35 arches (cohere, etc.) are
-          // untouched. The <tools> schema block stays JSON either way — that is
-          // the function DEFINITION list, which Qwen's native template also
-          // renders as JSON; only the emitted CALL format differs.
+          // induces XML-tag drift / dropped braces mid-call. Resolve against
+          // the requested model on every request so a pre-warmed model cannot
+          // bleed its format into a later live reload. An explicit shell env
+          // remains a process-wide user override. Non-qwen35 arches (cohere,
+          // etc.) are untouched. The <tools> schema block stays JSON either
+          // way — that is the function DEFINITION list, which Qwen's native
+          // template also renders as JSON; only the emitted CALL format differs.
           const isQwen35 = currentArch === "qwen3_5" || currentArch === "qwen3_5_moe";
-          const grammarOn = process.env.HIPFIRE_QWEN35_GRAMMAR !== "0";
+          const grammarOn = resolveToolGrammarForModel(body.model || path);
           const useXmlToolFormat = isQwen35 && !grammarOn;
           const exampleCall = useXmlToolFormat
             ? "<tool_call>\n<function=example_function>\n<parameter=param>\nvalue\n</parameter>\n</function>\n</tool_call>"
