@@ -12,13 +12,42 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-/// Architecture-aware tile geometry for scalar Q8 decode attention.
+fn q8_flash_default_tile_size(
+    arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    gfx1151_radiowave_enabled: bool,
+) -> usize {
+    let gfx1151_radiowave_shape = arch == "gfx1151"
+        && gfx1151_radiowave_enabled
+        && n_heads == 16
+        && n_kv_heads == 2
+        && head_dim == 256
+        && max_seq == 2_048;
+    if arch == "gfx1100" || gfx1151_radiowave_shape {
+        32
+    } else {
+        128
+    }
+}
+
+/// Architecture- and shape-aware tile geometry for scalar Q8 decode attention.
 ///
 /// The kernel accepts the tile as a kernarg, so this does not fork codegen.
 /// Restricting the surface to powers of two keeps the partial-buffer layout
 /// and retained-grid contract straightforward. The gfx1100 default is the
-/// stationary winner at tg128; other architectures retain their prior value.
-pub fn q8_flash_tile_size(arch: &str) -> usize {
+/// stationary winner at tg128. The gfx1151 tile32 default is deliberately
+/// narrower: it is admitted only for the certified Qwen3.6 A3B Q8 replay
+/// shape, leaving every other gfx1151 workload on tile128.
+pub fn q8_flash_tile_size(
+    arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+) -> usize {
     static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
     OVERRIDE
         .get_or_init(|| {
@@ -27,7 +56,16 @@ pub fn q8_flash_tile_size(arch: &str) -> usize {
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|value| matches!(value, 32 | 64 | 128 | 256))
         })
-        .unwrap_or(if arch == "gfx1100" { 32 } else { 128 })
+        .unwrap_or_else(|| {
+            q8_flash_default_tile_size(
+                arch,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1"),
+            )
+        })
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -2012,7 +2050,13 @@ impl Gpu {
         output_gate: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let tile_size = q8_flash_tile_size(&self.arch);
+        let tile_size = q8_flash_tile_size(
+            &self.arch,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+        );
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;
@@ -10370,7 +10414,31 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests {
-    use super::replay_stable_tile_count;
+    use super::{q8_flash_default_tile_size, replay_stable_tile_count};
+
+    #[test]
+    fn gfx1151_tile32_default_is_exact_shape_and_admission_only() {
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048, true),
+            32
+        );
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048, false),
+            128
+        );
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 8_192, true),
+            128
+        );
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192, false),
+            32
+        );
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1200", 16, 2, 256, 2_048, true),
+            128
+        );
+    }
 
     #[test]
     fn q8_flash_uses_max_tiles_for_both_capture_backends() {
