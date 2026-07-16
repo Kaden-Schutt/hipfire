@@ -48,6 +48,39 @@
 #define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast
 #endif
 
+#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+// Preserve the shipping shfl_down reduction order while replacing its LDS
+// bpermutes with gfx11 VALU cross-lane operations. Only lane 0 is consumed.
+// row_shl:N gives lane i the value from lane i+N; after each addition the next
+// DPP therefore observes the same partial sums as offsets 16,8,4,2,1 in the
+// original tree.
+__device__ __forceinline__ float hipfire_gdn_reduce_sum_lane0_dpp(float value) {
+    int bits = __builtin_bit_cast(int, value);
+    const int other_half = __builtin_amdgcn_permlanex16(
+        bits, bits, 0, 0, false, false);
+    value += __builtin_bit_cast(float, other_half);
+
+    bits = __builtin_bit_cast(int, value);
+    value += __builtin_bit_cast(float,
+        __builtin_amdgcn_mov_dpp(bits, 0x108, 0xf, 0xf, true));
+    bits = __builtin_bit_cast(int, value);
+    value += __builtin_bit_cast(float,
+        __builtin_amdgcn_mov_dpp(bits, 0x104, 0xf, 0xf, true));
+    bits = __builtin_bit_cast(int, value);
+    value += __builtin_bit_cast(float,
+        __builtin_amdgcn_mov_dpp(bits, 0x102, 0xf, 0xf, true));
+    bits = __builtin_bit_cast(int, value);
+    value += __builtin_bit_cast(float,
+        __builtin_amdgcn_mov_dpp(bits, 0x101, 0xf, 0xf, true));
+    return value;
+}
+
+__device__ __forceinline__ float hipfire_gdn_read_lane0(float value) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(
+        __builtin_bit_cast(int, value)));
+}
+#endif
+
 extern "C" __launch_bounds__(HIPFIRE_GDN_BLOCK_SIZE, HIPFIRE_GDN_MIN_BLOCKS)
 __global__ void HIPFIRE_GDN_KERNEL(
     const float* __restrict__ q,
@@ -136,9 +169,13 @@ __global__ void HIPFIRE_GDN_KERNEL(
             float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
+#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+            kv = hipfire_gdn_read_lane0(hipfire_gdn_reduce_sum_lane0_dpp(kv));
+#else
             for (int o = 16; o > 0; o >>= 1)
                 kv += __shfl_down(kv, o);
             kv = __shfl(kv, 0);
+#endif
 
             const float v_row =
                 (r == 0) ? v_rows.x :
@@ -153,8 +190,12 @@ __global__ void HIPFIRE_GDN_KERNEL(
             S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(s0, s1, s2, s3);
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
+#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+            out_v = hipfire_gdn_reduce_sum_lane0_dpp(out_v);
+#else
             for (int o = 16; o > 0; o >>= 1)
                 out_v += __shfl_down(out_v, o);
+#endif
             if (tid == 0) {
                 if (r == 0) out0 = out_v;
                 else if (r == 1) out1 = out_v;
@@ -173,9 +214,13 @@ __global__ void HIPFIRE_GDN_KERNEL(
             float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
+#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+            kv = hipfire_gdn_read_lane0(hipfire_gdn_reduce_sum_lane0_dpp(kv));
+#else
             for (int o = 16; o > 0; o >>= 1)
                 kv += __shfl_down(kv, o);
             kv = __shfl(kv, 0);
+#endif
 
             const float v_row = v_t[row_start + r];
             float delta = (v_row - alpha * kv) * beta_v;
@@ -187,8 +232,12 @@ __global__ void HIPFIRE_GDN_KERNEL(
             S_f4[r * 32 + tid] = make_float4(s0, s1, s2, s3);
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
+#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+            out_v = hipfire_gdn_reduce_sum_lane0_dpp(out_v);
+#else
             for (int o = 16; o > 0; o >>= 1)
                 out_v += __shfl_down(out_v, o);
+#endif
             if (tid == 0)
                 output[t * stride + h * HD + row_start + r] = out_v;
         }

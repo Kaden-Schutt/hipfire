@@ -2393,7 +2393,16 @@ impl Gpu {
             && std::env::var("HIPFIRE_GFX1151_GDN_R8").as_deref() == Ok("1");
         let gfx1151_r4x2 = self.arch_caps.is_gfx1151()
             && std::env::var("HIPFIRE_GFX1151_GDN_R4X2").as_deref() == Ok("1");
-        let (kernel_name, kernel_src, n_tiles, block_size) = if gfx1151_r4x2 {
+        let gfx1151_dpp = self.arch_caps.is_gfx1151()
+            && std::env::var("HIPFIRE_GFX1151_GDN_DPP").as_deref() == Ok("1");
+        let (kernel_name, kernel_src, n_tiles, block_size) = if gfx1151_dpp {
+            (
+                "gated_delta_net_q8_compact2_dpp_gfx1151",
+                kernels::GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC,
+                128 / 4,
+                32,
+            )
+        } else if gfx1151_r4x2 {
             (
                 "gated_delta_net_q8_compact2_r4x2_gfx1151",
                 kernels::GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC,
