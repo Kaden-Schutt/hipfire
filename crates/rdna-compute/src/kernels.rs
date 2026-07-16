@@ -3634,6 +3634,14 @@ pub const FUSED_GATE_UP_HFQ4G256_GLOBAL_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
 );
+/// Exact dense Qwen3.5-27B paired-row candidate. One wave computes matching
+/// gate/up rows and reuses each K=5120 activation load across both matrices.
+pub const FUSED_GATE_UP_HFQ4G256_PAIR_K5120_GLOBAL_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_pair_k5120.gfx1201.hip")
+);
 /// gfx1201 dense decode specialization. The host admits this artifact only
 /// for K=1024, allowing LLVM to remove the generic quad loop and dead tail
 /// bodies while retaining the base kernel's exact load/FMA/reduction order.

@@ -18953,7 +18953,25 @@ impl Gpu {
         }
 
         let cdna_wave64 = self.arch_caps.is_wave64_native();
-        let (func_name, block, grid_x) = if cdna_wave64 {
+        use std::sync::OnceLock;
+        static GFX1201_27B_GATE_UP_PAIR: OnceLock<bool> = OnceLock::new();
+        let gfx1201_27b_pair = self.arch_caps.is_gfx1201()
+            && self.flags.gfx1201_hfq4_27b_global
+            && k == 5_120
+            && gate_m == 17_408
+            && up_m == 17_408
+            && *GFX1201_27B_GATE_UP_PAIR.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_PAIR").as_deref() == Ok("1")
+            });
+        let (func_name, block, grid_x) = if gfx1201_27b_pair {
+            let kernel = "fused_gate_up_hfq4g256_pair_k5120_global_gfx1201";
+            self.ensure_kernel(
+                kernel,
+                kernels::FUSED_GATE_UP_HFQ4G256_PAIR_K5120_GLOBAL_GFX1201_SRC,
+                kernel,
+            )?;
+            (kernel, [32u32, 1, 1], gate_m as u32)
+        } else if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
             // HIPFIRE_GFX942_GEMV_V2=0.
