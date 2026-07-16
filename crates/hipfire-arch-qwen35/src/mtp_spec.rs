@@ -242,6 +242,23 @@ fn mtp_device_token_chain_eligible_for(
         )
 }
 
+fn mtp_sampled_step_graph_eligible_for(
+    use_exact_sparse_sampling: bool,
+    use_full_vocab: bool,
+    use_p_min: bool,
+    embd_format: llama::EmbeddingFormat,
+    kv_mode: crate::mtp_head::MtpKvMode,
+) -> bool {
+    use_exact_sparse_sampling
+        && !use_full_vocab
+        && !use_p_min
+        && kv_mode == crate::mtp_head::MtpKvMode::Q8
+        && matches!(
+            embd_format,
+            llama::EmbeddingFormat::HFQ4G256 | llama::EmbeddingFormat::Q8_0
+        )
+}
+
 /// Reproducible xorshift64* RNG. Cheap, fast, no `rand` dep.
 #[derive(Copy, Clone, Debug)]
 pub struct MtpRng(u64);
@@ -768,6 +785,17 @@ pub struct MtpSpecState {
     mtp_proposal_graph_warmed: bool,
     mtp_proposal_graph_disabled: bool,
 
+    /// Per-step HIP graphs for sampled compressed MTP. Sampling remains
+    /// between graphs on the host, but each expensive MTP block + draft head
+    /// becomes one launch while the sampled token is uploaded into the next
+    /// device-token slot. This composes with Redline's retained trunk verify.
+    mtp_sampled_step_graphs: Vec<Graph>,
+    mtp_sampled_step_graph_execs: Vec<GraphExec>,
+    mtp_sampled_step_graph_blobs: Vec<Vec<u8>>,
+    mtp_sampled_step_graph_seq_cap: usize,
+    mtp_sampled_step_graph_warmed: bool,
+    mtp_sampled_step_graph_disabled: bool,
+
     /// Optional FastMTP-style compressed batched-logits output, shape
     /// `[max_n * compressed_vocab_size]`. Populated by
     /// [`spec_step_mtp_compressed`] when the head ships a sidecar.
@@ -994,6 +1022,12 @@ impl MtpSpecState {
             mtp_proposal_graph_seq_cap: 0,
             mtp_proposal_graph_warmed: false,
             mtp_proposal_graph_disabled: false,
+            mtp_sampled_step_graphs: Vec::new(),
+            mtp_sampled_step_graph_execs: Vec::new(),
+            mtp_sampled_step_graph_blobs: Vec::new(),
+            mtp_sampled_step_graph_seq_cap: 0,
+            mtp_sampled_step_graph_warmed: false,
+            mtp_sampled_step_graph_disabled: false,
             mtp_lm_logits_compressed: None,
             mtp_topk_idx,
             mtp_topk_logp,
@@ -1150,8 +1184,11 @@ impl MtpSpecState {
     /// bundle and calls `reset_recurrent`); this clears only head-local state.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
         destroy_mtp_proposal_graph(gpu, self);
+        destroy_mtp_sampled_step_graphs(gpu, self);
         self.mtp_proposal_graph_warmed = false;
         self.mtp_proposal_graph_seq_cap = 0;
+        self.mtp_sampled_step_graph_warmed = false;
+        self.mtp_sampled_step_graph_seq_cap = 0;
         self.mtp_kv.reset(gpu)?;
         self.sampling_history.clear();
         Ok(())
@@ -1178,6 +1215,13 @@ impl MtpSpecState {
             let _ = gpu.hip.graph_destroy(graph);
         }
         drop(self.mtp_proposal_graph_blobs);
+        for exec in self.mtp_sampled_step_graph_execs {
+            let _ = gpu.hip.graph_exec_destroy(exec);
+        }
+        for graph in self.mtp_sampled_step_graphs {
+            let _ = gpu.hip.graph_destroy(graph);
+        }
+        drop(self.mtp_sampled_step_graph_blobs);
         if let Some(lc) = self.mtp_lm_logits_compressed {
             let _ = gpu.free_tensor(lc);
         }
@@ -1403,6 +1447,72 @@ fn run_mtp_proposal_graph_body_q8(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_sampled_proposal_step_q8(
+    gpu: &mut Gpu,
+    target: &ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    max_n: usize,
+    dim: usize,
+    seq_cap: usize,
+    k: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(state.mtp_kv.kv_mode, crate::mtp_head::MtpKvMode::Q8);
+    let token_slot = state.mtp_token_chain.sub_offset(k, 1);
+    embed_device_token_into(
+        gpu,
+        &target.weights,
+        &state.mtp_token_embed,
+        &token_slot,
+        dim,
+    )?;
+
+    let pos_slot = state.mtp_positions.sub_offset(k, 1);
+    if k == 0 {
+        mtp_head::mtp_head_forward_block_only_with_pos_buf(
+            gpu,
+            head,
+            &state.mtp_scratch,
+            &mut state.mtp_kv,
+            0,
+            &state.prev_hidden,
+            Some(&state.mtp_token_embed),
+            &pos_slot.buf,
+            cur_pos + k,
+            seq_cap,
+            &target.weights,
+        )?;
+    } else {
+        let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+        mtp_head::mtp_head_forward_block_only_with_pos_buf(
+            gpu,
+            head,
+            &state.mtp_scratch,
+            &mut state.mtp_kv,
+            0,
+            &prev_row,
+            Some(&state.mtp_token_embed),
+            &pos_slot.buf,
+            cur_pos + k,
+            seq_cap,
+            &target.weights,
+        )?;
+    }
+    mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
+    if k + 1 < max_n {
+        gpu.memcpy_dtod_at_auto(
+            &state.mtp_t_outs.buf,
+            k * dim * 4,
+            &state.mtp_scratch.t_mtp_out.buf,
+            0,
+            dim * 4,
+        )?;
+    }
+    Ok(())
+}
+
 fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
     gpu.graphs.capture_blobs.clear();
     gpu.graphs.capture_mode = true;
@@ -1441,6 +1551,17 @@ fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) {
     }
     state.mtp_proposal_graph_blobs.clear();
     state.mtp_proposal_graph_seq_cap = 0;
+}
+
+fn destroy_mtp_sampled_step_graphs(gpu: &mut Gpu, state: &mut MtpSpecState) {
+    for exec in state.mtp_sampled_step_graph_execs.drain(..) {
+        let _ = gpu.hip.graph_exec_destroy(exec);
+    }
+    for graph in state.mtp_sampled_step_graphs.drain(..) {
+        let _ = gpu.hip.graph_destroy(graph);
+    }
+    state.mtp_sampled_step_graph_blobs.clear();
+    state.mtp_sampled_step_graph_seq_cap = 0;
 }
 
 fn greedy_trunk_spine_accept(
@@ -3206,6 +3327,14 @@ pub fn spec_step_mtp_compressed_serial(
             use_p_min,
             penalties_active,
         );
+    let use_sampled_step_graph = !state.mtp_sampled_step_graph_disabled
+        && mtp_sampled_step_graph_eligible_for(
+            exact_sparse_sampling,
+            use_full_vocab,
+            use_p_min,
+            trunk_weights.embd_format,
+            state.mtp_kv.kv_mode,
+        );
     if use_device_token_chain && !use_full_vocab {
         assert!(
             head.weights.lm_head_draft_vocab_map_gpu.is_some(),
@@ -3225,6 +3354,11 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         0
     };
+    let sampled_step_graph_seq_cap = if use_sampled_step_graph {
+        mtp_proposal_graph_seq_cap(cur_pos, max_n, state.mtp_kv.max_seq)
+    } else {
+        0
+    };
     if use_proposal_graph
         && state.mtp_proposal_graph_exec.is_some()
         && proposal_graph_seq_cap > state.mtp_proposal_graph_seq_cap
@@ -3232,7 +3366,14 @@ pub fn spec_step_mtp_compressed_serial(
         destroy_mtp_proposal_graph(gpu, state);
         state.mtp_proposal_graph_warmed = true;
     }
-    if use_device_token_chain {
+    if use_sampled_step_graph
+        && !state.mtp_sampled_step_graph_execs.is_empty()
+        && sampled_step_graph_seq_cap > state.mtp_sampled_step_graph_seq_cap
+    {
+        destroy_mtp_sampled_step_graphs(gpu, state);
+        state.mtp_sampled_step_graph_warmed = true;
+    }
+    if use_device_token_chain || use_sampled_step_graph {
         if use_proposal_graph {
             upload_mtp_proposal_graph_inputs(gpu, state, last_committed, cur_pos, max_n)?;
         } else {
@@ -3241,6 +3382,13 @@ pub fn spec_step_mtp_compressed_serial(
                 unsafe { std::slice::from_raw_parts(&seed_token as *const i32 as *const u8, 4) };
             gpu.hip
                 .memcpy_htod(&state.mtp_token_chain.buf, seed_bytes)?;
+            if use_sampled_step_graph {
+                let positions: Vec<i32> = (0..max_n).map(|k| (cur_pos + k) as i32).collect();
+                let pos_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(positions.as_ptr() as *const u8, max_n * 4)
+                };
+                gpu.hip.memcpy_htod(&state.mtp_positions.buf, pos_bytes)?;
+            }
         }
     }
 
@@ -3302,6 +3450,65 @@ pub fn spec_step_mtp_compressed_serial(
             } else {
                 candidates[k - 1]
             };
+            let sampled_step_graph_ran =
+                if use_sampled_step_graph && state.mtp_sampled_step_graph_execs.len() > k {
+                    let stream = gpu.active_stream.as_ref().unwrap();
+                    gpu.hip
+                        .graph_launch(&state.mtp_sampled_step_graph_execs[k], stream)?;
+                    true
+                } else if use_sampled_step_graph && state.mtp_sampled_step_graph_warmed {
+                    let capture_result: HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> = (|| {
+                        begin_mtp_proposal_graph_capture(gpu)?;
+                        if let Err(error) = run_mtp_sampled_proposal_step_q8(
+                            gpu,
+                            target,
+                            head,
+                            state,
+                            cur_pos,
+                            max_n,
+                            dim,
+                            sampled_step_graph_seq_cap,
+                            k,
+                        ) {
+                            abort_mtp_proposal_graph_capture(gpu);
+                            return Err(error);
+                        }
+                        end_mtp_proposal_graph_capture(gpu)
+                    })(
+                    );
+                    match capture_result {
+                        Ok((graph, exec, blobs)) => {
+                            state.mtp_sampled_step_graphs.push(graph);
+                            state.mtp_sampled_step_graph_execs.push(exec);
+                            state.mtp_sampled_step_graph_blobs.extend(blobs);
+                            state.mtp_sampled_step_graph_seq_cap = sampled_step_graph_seq_cap;
+                            if state.mtp_sampled_step_graph_execs.len() == max_n {
+                                eprintln!(
+                                    "[mtp-sampled-step-graph] captured K={} seq_cap={}",
+                                    max_n, sampled_step_graph_seq_cap
+                                );
+                            }
+                            let stream = gpu.active_stream.as_ref().unwrap();
+                            gpu.hip.graph_launch(
+                                state.mtp_sampled_step_graph_execs.last().unwrap(),
+                                stream,
+                            )?;
+                            true
+                        }
+                        Err(error) => {
+                            abort_mtp_proposal_graph_capture(gpu);
+                            destroy_mtp_sampled_step_graphs(gpu, state);
+                            state.mtp_sampled_step_graph_disabled = true;
+                            eprintln!(
+                                "[mtp-sampled-step-graph] disabled after capture failure: {error}"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+
             let next_token_embed = if use_device_token_chain {
                 let token_slot = state.mtp_token_chain.sub_offset(k, 1);
                 embed_device_token_into(
@@ -3320,7 +3527,22 @@ pub fn spec_step_mtp_compressed_serial(
             // block_only + rmsnorm + small GEMV against lm_head_draft in one
             // call. In full-vocab mode we run block_only here and do the
             // rmsnorm + trunk-lm_head GEMV manually below.
-            if use_full_vocab {
+            if sampled_step_graph_ran {
+                // The per-step graph already produced logits_compressed and,
+                // except on the last step, copied t_mtp_out into its stable row.
+            } else if use_sampled_step_graph {
+                run_mtp_sampled_proposal_step_q8(
+                    gpu,
+                    target,
+                    head,
+                    state,
+                    cur_pos,
+                    max_n,
+                    dim,
+                    sampled_step_graph_seq_cap,
+                    k,
+                )?;
+            } else if use_full_vocab {
                 if k == 0 {
                     mtp_head::mtp_head_forward_block_only(
                         gpu,
@@ -3497,6 +3719,17 @@ pub fn spec_step_mtp_compressed_serial(
                     None => draft_idx as u32,
                 };
                 candidates.push(token_id);
+                if use_sampled_step_graph && k + 1 < max_n {
+                    let token = token_id as i32;
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            &token as *const i32 as *const u8,
+                            std::mem::size_of::<i32>(),
+                        )
+                    };
+                    let next_slot = state.mtp_token_chain.sub_offset(k + 1, 1);
+                    gpu.hip.memcpy_htod(&next_slot.buf, bytes)?;
+                }
 
                 // SampledPMin: confidence-prune the K-chain. Keep this candidate;
                 // skip the remaining draft steps if the head was unsure here. A
@@ -3582,7 +3815,7 @@ pub fn spec_step_mtp_compressed_serial(
                 candidates.push(token_id);
             }
 
-            if k + 1 < max_n {
+            if k + 1 < max_n && !use_sampled_step_graph {
                 gpu.memcpy_dtod_at_auto(
                     &state.mtp_t_outs.buf,
                     k * dim_bytes,
@@ -3592,6 +3825,9 @@ pub fn spec_step_mtp_compressed_serial(
                 )?;
             }
         }
+    }
+    if use_sampled_step_graph && !state.mtp_sampled_step_graph_disabled {
+        state.mtp_sampled_step_graph_warmed = true;
     }
     let drafts_generated = if use_device_token_chain {
         debug_assert!(
@@ -4147,6 +4383,27 @@ mod tests {
             false,
             false,
             true
+        ));
+        assert!(mtp_sampled_step_graph_eligible_for(
+            true,
+            false,
+            false,
+            llama::EmbeddingFormat::HFQ4G256,
+            crate::mtp_head::MtpKvMode::Q8,
+        ));
+        assert!(!mtp_sampled_step_graph_eligible_for(
+            true,
+            true,
+            false,
+            llama::EmbeddingFormat::HFQ4G256,
+            crate::mtp_head::MtpKvMode::Q8,
+        ));
+        assert!(!mtp_sampled_step_graph_eligible_for(
+            false,
+            false,
+            false,
+            llama::EmbeddingFormat::HFQ4G256,
+            crate::mtp_head::MtpKvMode::Q8,
         ));
     }
 
