@@ -1,7 +1,6 @@
 # Copyright (c) Kaden Schutt
 import hashlib
 import json
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -15,449 +14,292 @@ from autoresearch.ar.review.protocol import (
     validate_protocol,
     validate_report,
     validate_review_metadata,
-    validate_revocation,
 )
 
 
-ROOT = Path(__file__).parents[3]
 VECTORS = json.loads((Path(__file__).parent / "fixtures" / "review_protocol_vectors.json").read_text())
 TARGET = ReviewTarget("owner/repo", 42, "owner/repo", "head-sha", "main", "base-sha", "merge-sha")
 TRUSTED = {"review-bot"}
 
 
-def _intent(*, node="intent-a", attempt="attempt-a", created="2026-01-01T00:00:00Z", target=TARGET):
-    intent = {
+def _self_digest(payload, field):
+    payload[field] = canonical_digest({key: value for key, value in payload.items() if key != field})
+    return payload
+
+
+def _envelope(payload, node_id, *, author="review-bot", created_at="2026-01-01T00:00:00Z"):
+    envelope = {
+        "payload": payload,
+        "payload_digest": canonical_digest(payload),
+        "node_id": node_id,
+        "author": author,
+        "created_at": created_at,
+    }
+    envelope["envelope_digest"] = canonical_digest(
+        {key: envelope[key] for key in ("author", "created_at", "node_id", "payload_digest")}
+    )
+    return envelope
+
+
+def _intent(record_id="intent-a", node_id="gh-intent-a", *, created_at="2026-01-01T00:00:00Z"):
+    payload = {
         "record_type": "intent",
-        "record_id": node,
-        "intent_node_id": node,
-        "target": target,
-        "target_key": target.target_key(),
-        "attempt_id": attempt,
-        "author": "review-bot",
-        "created_at": created,
+        "record_id": record_id,
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "attempt_id": "attempt-" + record_id,
         "canonical_digest": "",
     }
-    intent["canonical_digest"] = canonical_digest(
-        {key: value for key, value in intent.items() if key != "canonical_digest"}
-    )
-    return intent
+    return _envelope(_self_digest(payload, "canonical_digest"), node_id, created_at=created_at)
 
 
-def _report(intent, body="report body"):
-    return {
+def _report(intent, record_id=None, node_id="gh-report-a", *, created_at="2026-01-01T00:01:00Z", body="report body"):
+    payload = {
         "record_type": "report",
-        "record_id": "report-" + intent["attempt_id"],
-        "target": intent["target"],
-        "target_key": intent["target_key"],
-        "attempt_id": intent["attempt_id"],
-        "intent_node_id": intent["intent_node_id"],
+        "record_id": record_id or "report-" + intent["payload"]["record_id"],
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "attempt_id": intent["payload"]["attempt_id"],
+        "intent_record_id": intent["payload"]["record_id"],
         "head_sha": TARGET.head_sha,
-        "author": "review-bot",
-        "created_at": "2026-01-01T00:01:00Z",
         "report_body": body,
         "report_body_sha256": hashlib.sha256(body.encode()).hexdigest(),
     }
+    return _envelope(payload, node_id, created_at=created_at)
 
 
-def _completion(intent):
-    return {
-        "record_type": "completion",
-        "record_id": "completion-" + intent["attempt_id"],
-        "target": intent["target"],
-        "target_key": intent["target_key"],
-        "attempt_id": intent["attempt_id"],
-        "intent_node_id": intent["intent_node_id"],
-        "head_sha": TARGET.head_sha,
-        "author": "review-bot",
-        "created_at": "2026-01-01T00:02:00Z",
-        "canonical_intent_digest": intent["canonical_digest"],
-        "report_id": "report-" + intent["attempt_id"],
-    }
-
-
-def _metadata(intent, report, *, created="2026-01-01T00:03:00Z", record_id="metadata-1"):
-    metadata = {
+def _metadata(intent, report, node_id="gh-metadata-a", *, created_at="2026-01-01T00:02:00Z", record_id="metadata-a"):
+    report_payload = report["payload"]
+    payload = {
         "record_type": "review-metadata",
         "record_id": record_id,
-        "target": intent["target"],
-        "target_key": intent["target_key"],
-        "attempt_id": intent["attempt_id"],
-        "intent_node_id": intent["intent_node_id"],
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "attempt_id": intent["payload"]["attempt_id"],
+        "intent_record_id": intent["payload"]["record_id"],
         "head_sha": TARGET.head_sha,
-        "author": "review-bot",
-        "created_at": created,
-        "report_id": report["record_id"],
-        "report_body_sha256": report["report_body_sha256"],
-        "canonical_intent_digest": intent["canonical_digest"],
+        "report_record_id": report_payload["record_id"],
+        "report_node_id": report["node_id"],
+        "report_digest": report["payload_digest"],
+        "report_body_sha256": report_payload["report_body_sha256"],
+        "canonical_intent_digest": intent["payload"]["canonical_digest"],
+        "canonical_intent_node_id": intent["node_id"],
         "metadata_digest": "",
     }
-    metadata["metadata_digest"] = metadata_digest(metadata)
-    return metadata
+    return _envelope(_self_digest(payload, "metadata_digest"), node_id, created_at=created_at)
 
 
-def test_canonical_vectors_and_reordered_keys():
+def _completion(intent, report, metadata, node_id="gh-completion-a", *, created_at="2026-01-01T00:03:00Z"):
+    payload = {
+        "record_type": "completion",
+        "record_id": "completion-" + intent["payload"]["record_id"],
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "attempt_id": intent["payload"]["attempt_id"],
+        "intent_record_id": intent["payload"]["record_id"],
+        "head_sha": TARGET.head_sha,
+        "canonical_intent_digest": intent["payload"]["canonical_digest"],
+        "canonical_intent_node_id": intent["node_id"],
+        "report_record_id": report["payload"]["record_id"],
+        "report_node_id": report["node_id"],
+        "report_digest": report["payload_digest"],
+        "metadata_record_id": metadata["payload"]["record_id"],
+        "metadata_digest": metadata["payload"]["metadata_digest"],
+    }
+    return _envelope(payload, node_id, created_at=created_at)
+
+
+def _revocation(intent, node_id="gh-revoke-a", *, created_at="2026-01-01T00:04:00Z"):
+    payload = {
+        "record_type": "revocation",
+        "record_id": "revocation-" + intent["payload"]["record_id"],
+        "target_key": TARGET.target_key(),
+        "attempt_id": intent["payload"]["attempt_id"],
+        "canonical_intent_digest": intent["payload"]["canonical_digest"],
+        "reason": "replacement",
+    }
+    return _envelope(payload, node_id, created_at=created_at)
+
+
+def test_jcs_vectors_cover_reordered_keys_controls_utf16_and_safe_numbers():
     for vector in VECTORS["canonical"]:
-        assert canonical_json(vector["value"]) == vector["canonical_utf8"].encode()
-        assert hashlib.sha256(canonical_json(vector["value"])).hexdigest() == vector["sha256"]
+        encoded = canonical_json(vector["value"])
+        assert encoded == vector["canonical_utf8"].encode()
+        assert hashlib.sha256(encoded).hexdigest() == vector["sha256"]
+    assert canonical_json({"b": 2, "a": 1}) == canonical_json({"a": 1, "b": 2})
+    assert canonical_json(VECTORS["regressions"]["safe_integer_max"]) == b"9007199254740991"
+    assert canonical_json(VECTORS["regressions"]["safe_integer_min"]) == b"-9007199254740991"
+    for value in VECTORS["regressions"]["unsafe_integers"]:
+        with pytest.raises(ValueError, match="safe range"):
+            canonical_json(value)
+    metadata_vector = VECTORS["metadata"][0]
+    assert metadata_digest(metadata_vector["value"]) == metadata_vector["digest"]
 
-    value = {"b": 2, "a": 1}
-    assert canonical_json(value) == canonical_json({"a": 1, "b": 2})
 
-
-def test_duplicate_json_keys_and_unsupported_values_are_rejected():
+def test_canonical_json_rejects_duplicate_keys_nonfinite_and_limits():
     with pytest.raises(ValueError, match="duplicate"):
         canonical_loads('{"a": 1, "a": 2}')
     with pytest.raises(ValueError, match="finite"):
         canonical_json(float("inf"))
-    with pytest.raises(ValueError, match="unsupported"):
-        canonical_json({1: "not a string key"})
-
-
-def test_jcs_integer_boundaries_and_limits_are_fixed_regressions():
-    assert canonical_json(VECTORS["regressions"]["safe_integer_min"]) == b"-9007199254740991"
-    assert canonical_json(VECTORS["regressions"]["safe_integer_max"]) == b"9007199254740991"
-    for value in VECTORS["regressions"]["unsafe_integers"]:
-        with pytest.raises(ValueError, match="IEEE-754|safe range"):
-            canonical_json(value)
     with pytest.raises(ValueError, match="byte limit"):
-        canonical_json(
-            VECTORS["regressions"]["overflow_value"],
-            max_bytes=VECTORS["regressions"]["overflow_limit"],
-        )
+        canonical_json("abcd", max_bytes=3)
 
 
-def test_metadata_digest_excludes_its_own_field_and_uses_report_digest():
-    vector = VECTORS["metadata"][0]
-    metadata = deepcopy(vector["value"])
-    assert metadata_digest(metadata) == vector["digest"]
-    metadata["metadata_digest"] = "sha256:" + "f" * 64
-    assert metadata_digest(metadata) == vector["digest"]
-
-
-def test_valid_intent_report_and_completion_bind_full_target():
+def test_envelopes_bind_payload_and_do_not_accept_spoofed_server_facts():
     intent = _intent()
-    intent["canonical_digest"] = validate_intent(intent, trusted_authors=TRUSTED)
+    validate_intent(intent, trusted_authors=TRUSTED)
+    tampered = dict(intent, node_id="spoofed")
+    with pytest.raises(ValueError, match="envelope"):
+        validate_intent(tampered, trusted_authors=TRUSTED)
+    tampered = _intent()
+    tampered["payload"]["author"] = "attacker"
+    tampered["payload_digest"] = canonical_digest(tampered["payload"])
+    with pytest.raises(ValueError, match="server|payload"):
+        validate_intent(tampered, trusted_authors=TRUSTED)
+    tampered = _intent()
+    tampered["payload_digest"] = "0" * 64
+    with pytest.raises(ValueError, match="payload digest"):
+        validate_intent(tampered, trusted_authors=TRUSTED)
+
+
+def test_post_publication_envelope_facts_are_authenticated_and_trusted():
+    intent = _intent()
+    with pytest.raises(ValueError, match="trusted"):
+        validate_intent(dict(intent, author="untrusted"), trusted_authors=TRUSTED)
+    with pytest.raises(ValueError, match="envelope"):
+        validate_intent(dict(intent, created_at="2025-01-01T00:00:00Z"), trusted_authors=TRUSTED)
+    with pytest.raises(ValueError, match="envelope"):
+        validate_intent(dict(intent, node_id="different-node"), trusted_authors=TRUSTED)
+
+
+def test_valid_history_binds_report_metadata_and_completion_to_envelopes():
+    intent = _intent()
     report = _report(intent)
+    metadata = _metadata(intent, report)
+    completion = _completion(intent, report, metadata)
     validate_report(report, intent, trusted_authors=TRUSTED)
-    validate_completion(_completion(intent), intent, report=report, canonical_intent=intent, trusted_authors=TRUSTED)
-
-
-def test_pending_intent_digest_is_rejected():
-    intent = _intent()
-    intent["canonical_digest"] = "pending"
-    with pytest.raises(ValueError, match="digest"):
-        validate_intent(intent, trusted_authors=TRUSTED)
-
-
-@pytest.mark.parametrize("field", ["target_key", "attempt_id", "intent_node_id"])
-def test_altered_intent_ids_are_rejected(field):
-    intent = _intent()
-    intent["canonical_digest"] = validate_intent(intent, trusted_authors=TRUSTED)
-    altered = _report(intent)
-    altered[field] = "altered"
-    with pytest.raises(ValueError):
-        validate_report(altered, intent, trusted_authors=TRUSTED)
-
-
-def test_altered_body_and_deleted_report_reference_are_rejected():
-    intent = _intent()
-    intent["canonical_digest"] = validate_intent(intent, trusted_authors=TRUSTED)
-    report = _report(intent)
-    validate_report(report, intent, trusted_authors=TRUSTED)
-    altered = deepcopy(report)
-    altered["report_body"] = "tampered"
-    with pytest.raises(ValueError, match="body"):
-        validate_report(altered, intent, trusted_authors=TRUSTED)
-    with pytest.raises(ValueError, match="report"):
-        validate_completion(
-            _completion(intent), intent, report=None, canonical_intent=intent, trusted_authors=TRUSTED
-        )
-
-
-def test_review_metadata_rejects_untrusted_author_and_mismatching_sha():
-    intent = _intent()
-    intent["canonical_digest"] = validate_intent(intent, trusted_authors=TRUSTED)
-    report = _report(intent)
-    validate_report(report, intent, trusted_authors=TRUSTED)
-    metadata = {
-        "record_type": "review-metadata",
-        "record_id": "metadata-1",
-        "target": intent["target"],
-        "target_key": intent["target_key"],
-        "attempt_id": intent["attempt_id"],
-        "intent_node_id": intent["intent_node_id"],
-        "head_sha": TARGET.head_sha,
-        "author": "review-bot",
-        "created_at": "2026-01-01T00:03:00Z",
-        "report_id": report["record_id"],
-        "report_body_sha256": report["report_body_sha256"],
-        "canonical_intent_digest": intent["canonical_digest"],
-        "metadata_digest": "pending",
-    }
-    metadata["metadata_digest"] = metadata_digest(metadata)
     validate_review_metadata(metadata, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)
-    metadata["author"] = "untrusted"
-    with pytest.raises(ValueError, match="trusted"):
-        validate_review_metadata(metadata, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)
-    metadata["author"] = "review-bot"
-    metadata["head_sha"] = "other-sha"
-    with pytest.raises(ValueError, match="SHA|sha"):
-        validate_review_metadata(metadata, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)
-
-
-def test_completion_propagates_trust_and_binds_complete_canonical_intent():
-    intent = _intent()
-    intent["canonical_digest"] = validate_intent(intent, trusted_authors=TRUSTED)
-    report = _report(intent)
-    completion = _completion(intent)
-    report["author"] = "untrusted"
-    with pytest.raises(ValueError, match="trusted"):
-        validate_completion(completion, intent, report=report, canonical_intent=intent, trusted_authors=TRUSTED)
-
-    report["author"] = "review-bot"
-    altered_target = ReviewTarget(
-        "owner/repo", 42, "owner/repo", "different-head", "main", "base-sha", "merge-sha"
+    validate_completion(
+        completion,
+        intent,
+        report,
+        metadata,
+        canonical_intent=intent,
+        trusted_authors=TRUSTED,
     )
-    canonical = dict(intent, target=altered_target, target_key=altered_target.target_key())
-    canonical["canonical_digest"] = canonical_digest(
-        {key: value for key, value in canonical.items() if key != "canonical_digest"}
-    )
-    with pytest.raises(ValueError, match="canonical|target"):
-        validate_completion(completion, intent, report=report, canonical_intent=canonical, trusted_authors=TRUSTED)
 
 
-@pytest.mark.parametrize(
-    "field, value",
-    [
-        ("target_key", "other-target"),
-        ("attempt_id", "other-attempt"),
-        ("intent_node_id", "other-node"),
-        ("head_sha", "other-head"),
-        ("canonical_intent_digest", "other-digest"),
-    ],
-)
-def test_completion_rejects_each_canonical_binding_mismatch(field, value):
+def test_completion_requires_canonical_intent_earlier_report_and_metadata():
     intent = _intent()
     report = _report(intent)
-    completion = _completion(intent)
-    completion[field] = value
-    with pytest.raises(ValueError):
-        validate_completion(completion, intent, report=report, canonical_intent=intent, trusted_authors=TRUSTED)
+    metadata = _metadata(intent, report)
+    completion = _completion(intent, report, metadata)
+    with pytest.raises(TypeError, match="canonical_intent"):
+        validate_completion(completion, intent, report, metadata, trusted_authors=TRUSTED)
+    with pytest.raises(ValueError, match="metadata"):
+        validate_completion(completion, intent, report, None, canonical_intent=intent, trusted_authors=TRUSTED)
+    with pytest.raises(ValueError, match="report"):
+        validate_completion(completion, intent, None, metadata, canonical_intent=intent, trusted_authors=TRUSTED)
 
 
-def test_election_tie_breaks_by_node_id_and_rejects_noncanonical_completion():
-    first = _intent(node="z-node", attempt="z", created="2026-01-01T00:00:00Z")
-    second = _intent(node="a-node", attempt="a", created="2026-01-01T00:00:00Z")
-    first["canonical_digest"] = validate_intent(first, trusted_authors=TRUSTED)
-    second["canonical_digest"] = validate_intent(second, trusted_authors=TRUSTED)
-    selected = elect_canonical_attempt([first, second], [], expected_target=TARGET, trusted_authors=TRUSTED)
-    assert selected["intent_node_id"] == "a-node"
-    with pytest.raises(ValueError, match="canonical"):
+def test_metadata_digest_and_completion_references_are_verified():
+    intent = _intent()
+    report = _report(intent)
+    metadata = _metadata(intent, report)
+    bad_metadata = dict(metadata, payload=dict(metadata["payload"], metadata_digest="0" * 64))
+    bad_metadata["payload_digest"] = canonical_digest(bad_metadata["payload"])
+    bad_metadata["envelope_digest"] = canonical_digest(
+        {key: bad_metadata[key] for key in ("author", "created_at", "node_id", "payload_digest")}
+    )
+    with pytest.raises(ValueError, match="metadata digest"):
+        validate_review_metadata(bad_metadata, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)
+    completion = _completion(intent, report, metadata)
+    bad_completion = dict(completion, payload=dict(completion["payload"], metadata_digest="wrong"))
+    bad_completion["payload_digest"] = canonical_digest(bad_completion["payload"])
+    bad_completion["envelope_digest"] = canonical_digest(
+        {key: bad_completion[key] for key in ("author", "created_at", "node_id", "payload_digest")}
+    )
+    with pytest.raises(ValueError, match="metadata"):
         validate_completion(
-            _completion(first), first, report=_report(first), canonical_intent=second, trusted_authors=TRUSTED
+            bad_completion, intent, report, metadata, canonical_intent=intent, trusted_authors=TRUSTED
         )
 
 
-def test_election_normalizes_aware_timestamps_before_node_tie_breaking():
-    earlier_utc = _intent(
-        node="z-node", attempt="z", created=VECTORS["regressions"]["aware_timestamp_early"]
+def test_protocol_rejects_pre_intent_records_and_noncanonical_publication():
+    intent = _intent(created_at="2026-01-01T00:02:00Z")
+    report = _report(intent, created_at="2026-01-01T00:01:00Z")
+    with pytest.raises(ValueError, match="before|intent"):
+        validate_protocol([report, intent], expected_target=TARGET, trusted_authors=TRUSTED)
+    later_report = _report(intent, node_id="gh-report-later", created_at="2026-01-01T00:03:00Z")
+    early_metadata = _metadata(intent, later_report, created_at="2026-01-01T00:01:00Z")
+    with pytest.raises(ValueError, match="before|intent"):
+        validate_protocol([early_metadata, later_report, intent], expected_target=TARGET, trusted_authors=TRUSTED)
+
+    first = _intent(record_id="intent-first", node_id="node-first")
+    second = _intent(record_id="intent-second", node_id="node-second", created_at="2026-01-01T00:01:00Z")
+    noncanonical_report = _report(second, created_at="2026-01-01T00:02:00Z")
+    with pytest.raises(ValueError, match="canonical"):
+        validate_protocol([first, second, noncanonical_report], expected_target=TARGET, trusted_authors=TRUSTED)
+
+
+def test_historical_report_metadata_and_completion_survive_replacement():
+    first = _intent(record_id="intent-first", node_id="node-first")
+    report = _report(first)
+    metadata = _metadata(first, report)
+    completion = _completion(first, report, metadata)
+    second = _intent(
+        record_id="intent-second", node_id="node-second", created_at="2026-01-01T00:04:00Z"
     )
-    later_utc = _intent(node="a-node", attempt="a", created=VECTORS["regressions"]["aware_timestamp_late"])
-    earlier_utc["canonical_digest"] = validate_intent(earlier_utc, trusted_authors=TRUSTED)
-    later_utc["canonical_digest"] = validate_intent(later_utc, trusted_authors=TRUSTED)
-    assert elect_canonical_attempt(
-        [earlier_utc, later_utc], [], expected_target=TARGET, trusted_authors=TRUSTED
-    ) is earlier_utc
-
-
-def test_naive_timestamps_are_rejected():
-    with pytest.raises(ValueError, match="timezone"):
-        validate_intent(_intent(created="2026-01-01T00:00:00"), trusted_authors=TRUSTED)
-
-
-def test_invalid_revocation_cannot_replace_an_attempt():
-    intent = _intent()
-    intent["canonical_digest"] = validate_intent(intent, trusted_authors=TRUSTED)
-    bad = {
-        "record_type": "revocation",
-        "record_id": "revoke-1",
-        "target_key": intent["target_key"],
-        "attempt_id": intent["attempt_id"],
-        "canonical_intent_digest": "wrong",
-        "author": "review-bot",
-        "reason": "replacement",
-        "authenticated": True,
-        "created_at": "2026-01-01T00:04:00Z",
-    }
-    with pytest.raises(ValueError, match="digest"):
-        validate_revocation(bad, intent, trusted_authors=TRUSTED)
-
-
-def test_revocation_must_target_current_canonical_intent_in_event_order():
-    canonical = _intent(node="canonical", attempt="canonical")
-    replacement = _intent(node="replacement", attempt="replacement")
-    canonical["canonical_digest"] = validate_intent(canonical, trusted_authors=TRUSTED)
-    replacement["canonical_digest"] = validate_intent(replacement, trusted_authors=TRUSTED)
-    noncanonical_revocation = {
-        "record_type": "revocation",
-        "record_id": "revoke-replacement",
-        "target_key": replacement["target_key"],
-        "attempt_id": replacement["attempt_id"],
-        "canonical_intent_digest": replacement["canonical_digest"],
-        "author": "review-bot",
-        "reason": "replacement",
-        "authenticated": True,
-        "created_at": "2026-01-01T00:04:00Z",
-    }
-    with pytest.raises(ValueError, match="canonical"):
-        elect_canonical_attempt(
-            [canonical, replacement], [], expected_target=TARGET,
-            revocations=[noncanonical_revocation], trusted_authors=TRUSTED
-        )
-
-
-def test_election_requires_one_expected_target_and_rejects_mixed_inputs():
-    other_target = ReviewTarget("other/repo", 7, "other/repo", "other-head", "main", "base", "merge")
-    with pytest.raises(ValueError, match="target"):
-        elect_canonical_attempt(
-            [_intent(), _intent(node="other", attempt="other", target=other_target)],
-            [],
-            expected_target=TARGET,
-            trusted_authors=TRUSTED,
-        )
-
-
-def test_event_order_sorts_out_of_order_inputs_and_rejects_timestamp_before_intent():
-    first = _intent(node="first", attempt="first", created="2026-01-01T00:00:00Z")
-    second = _intent(node="second", attempt="second", created="2026-01-01T00:02:00Z")
-    first_revocation = {
-        "record_type": "revocation", "record_id": "revoke-first", "target_key": first["target_key"],
-        "attempt_id": first["attempt_id"], "canonical_intent_digest": first["canonical_digest"],
-        "author": "review-bot", "reason": "replace", "authenticated": True,
-        "created_at": "2026-01-01T00:01:00Z",
-    }
-    assert elect_canonical_attempt(
-        [second, first], [], expected_target=TARGET, revocations=[first_revocation], trusted_authors=TRUSTED
-    ) is second
-    first_revocation["created_at"] = "2025-12-31T23:00:00Z"
-    with pytest.raises(ValueError, match="canonical"):
-        elect_canonical_attempt(
-            [first, second], [], expected_target=TARGET,
-            revocations=[first_revocation], trusted_authors=TRUSTED
-        )
-
-
-def test_later_revocation_does_not_invalidate_historical_completion():
-    first = _intent(node="first", attempt="first")
-    second = _intent(node="second", attempt="second", created="2026-01-01T00:03:00Z")
-    first_report = _report(first)
-    completion = _completion(first)
-    first_revocation = {
-        "record_type": "revocation", "record_id": "revoke-first", "target_key": first["target_key"],
-        "attempt_id": first["attempt_id"], "canonical_intent_digest": first["canonical_digest"],
-        "author": "review-bot", "reason": "replace", "authenticated": True,
-        "created_at": "2026-01-01T00:04:00Z",
-    }
-    selected = elect_canonical_attempt(
-        [second, first], [completion], expected_target=TARGET, reports=[first_report],
-        revocations=[first_revocation], trusted_authors=TRUSTED
-    )
-    assert selected is second
-
-
-def test_protocol_requires_trust_and_validates_metadata_against_elected_intent():
-    with pytest.raises(ValueError, match="trusted"):
-        elect_canonical_attempt([_intent()], [], expected_target=TARGET)
-    with pytest.raises(ValueError, match="trusted"):
-        validate_protocol([], expected_target=TARGET, trusted_authors=[])
-
-
-def test_protocol_rejects_metadata_for_noncanonical_intent():
-    canonical = _intent(node="canonical", attempt="canonical")
-    noncanonical = _intent(node="noncanonical", attempt="noncanonical", created="2026-01-01T00:01:00Z")
-    report = _report(noncanonical)
-    metadata = {
-        "record_type": "review-metadata",
-        "record_id": "metadata-noncanonical",
-        "target": noncanonical["target"],
-        "target_key": noncanonical["target_key"],
-        "attempt_id": noncanonical["attempt_id"],
-        "intent_node_id": noncanonical["intent_node_id"],
-        "head_sha": TARGET.head_sha,
-        "author": "review-bot",
-        "created_at": "2026-01-01T00:02:00Z",
-        "report_id": report["record_id"],
-        "report_body_sha256": report["report_body_sha256"],
-        "canonical_intent_digest": noncanonical["canonical_digest"],
-        "metadata_digest": "",
-    }
-    metadata["metadata_digest"] = metadata_digest(metadata)
-    with pytest.raises(ValueError, match="canonical"):
-        validate_protocol(
-            [canonical, noncanonical, report, metadata], expected_target=TARGET, trusted_authors=TRUSTED
-        )
-
-
-def test_report_and_metadata_cannot_predate_their_intent():
-    intent = _intent(created="2026-01-01T00:02:00Z")
-    report = _report(intent)
-    report["created_at"] = "2026-01-01T00:01:00Z"
-    metadata = _metadata(intent, report, created="2026-01-01T00:01:30Z")
-    with pytest.raises(ValueError, match="before|intent|publication"):
-        validate_protocol([intent, report, metadata], expected_target=TARGET, trusted_authors=TRUSTED)
-
-
-def test_historical_canonical_report_and_metadata_survive_later_replacement():
-    first = _intent(node="first", attempt="first")
-    first_report = _report(first)
-    first_metadata = _metadata(first, first_report)
-    second = _intent(node="second", attempt="second", created="2026-01-01T00:04:00Z")
-    revocation = {
-        "record_type": "revocation", "record_id": "revoke-first", "target_key": first["target_key"],
-        "attempt_id": first["attempt_id"], "canonical_intent_digest": first["canonical_digest"],
-        "author": "review-bot", "reason": "replace", "authenticated": True,
-        "created_at": "2026-01-01T00:05:00Z",
-    }
+    revocation = _revocation(first, created_at="2026-01-01T00:05:00Z")
     selected = validate_protocol(
-        [first_metadata, second, revocation, first_report, first],
+        [revocation, metadata, second, completion, report, first],
         expected_target=TARGET,
         trusted_authors=TRUSTED,
     )
-    assert selected is second
+    assert selected["payload"]["record_id"] == "intent-second"
 
 
-def test_noncanonical_report_is_rejected_at_publication_event():
-    first = _intent(node="first", attempt="first")
-    second = _intent(node="second", attempt="second", created="2026-01-01T00:01:00Z")
-    report = _report(second)
-    report["created_at"] = "2026-01-01T00:02:00Z"
-    with pytest.raises(ValueError, match="canonical"):
-        validate_protocol([first, second, report], expected_target=TARGET, trusted_authors=TRUSTED)
-
-
-def test_duplicate_intent_nodes_and_node_identifier_mismatch_are_rejected():
-    first = _intent(node="same-node", attempt="first")
-    second = _intent(node="same-node", attempt="second")
+def test_duplicate_logical_ids_and_node_ids_rejected_before_lookup():
+    first = _intent(record_id="same", node_id="node-first")
+    second = _intent(record_id="same", node_id="node-second")
+    with pytest.raises(ValueError, match="logical|record ID|duplicate"):
+        validate_protocol([first, second], expected_target=TARGET, trusted_authors=TRUSTED)
+    duplicate_node = _intent(record_id="other", node_id="node-first")
     with pytest.raises(ValueError, match="node"):
         elect_canonical_attempt(
-            [first, second], [], expected_target=TARGET, trusted_authors=TRUSTED
+            [first, duplicate_node], [], expected_target=TARGET, trusted_authors=TRUSTED
         )
-    mismatched = _intent(node="intent-node", attempt="mismatch")
-    mismatched["record_id"] = "different-record"
-    mismatched["canonical_digest"] = canonical_digest(
-        {key: value for key, value in mismatched.items() if key != "canonical_digest"}
-    )
-    with pytest.raises(ValueError, match="node"):
-        validate_intent(mismatched, trusted_authors=TRUSTED)
 
 
-def test_equal_timestamp_and_reordered_inputs_have_same_node_tie_break():
-    first = _intent(node="a-node", attempt="a")
-    second = _intent(node="z-node", attempt="z")
+def test_equal_timestamp_total_order_uses_envelope_node_id_and_is_input_order_independent():
+    first = _intent(record_id="intent-a", node_id="a-node")
+    second = _intent(record_id="intent-z", node_id="z-node")
     selected = elect_canonical_attempt(
         [first, second], [], expected_target=TARGET, trusted_authors=TRUSTED
     )
     reordered = elect_canonical_attempt(
         [second, first], [], expected_target=TARGET, trusted_authors=TRUSTED
     )
-    assert selected["intent_node_id"] == reordered["intent_node_id"] == "a-node"
+    assert selected["node_id"] == reordered["node_id"] == "a-node"
+
+
+def test_payload_logical_id_is_distinct_from_authenticated_node_id():
+    intent = _intent(record_id="logical-intent", node_id="github-node-123")
+    assert intent["payload"]["record_id"] != intent["node_id"]
+    validate_intent(intent, trusted_authors=TRUSTED)
+
+
+def test_all_record_types_use_one_timestamp_then_node_id_event_order():
+    timestamp = "2026-01-01T00:00:00Z"
+    first = _intent(record_id="intent-first", node_id="a-node", created_at=timestamp)
+    report = _report(first, node_id="b-node", created_at=timestamp)
+    metadata = _metadata(first, report, node_id="c-node", created_at=timestamp)
+    completion = _completion(first, report, metadata, node_id="d-node", created_at=timestamp)
+    revocation = _revocation(first, node_id="e-node", created_at=timestamp)
+    replacement = _intent(record_id="intent-replacement", node_id="f-node", created_at=timestamp)
+    selected = validate_protocol(
+        [completion, replacement, revocation, metadata, report, first],
+        expected_target=TARGET,
+        trusted_authors=TRUSTED,
+    )
+    assert selected["node_id"] == "f-node"

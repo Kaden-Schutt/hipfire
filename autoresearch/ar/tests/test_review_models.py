@@ -24,6 +24,7 @@ from autoresearch.ar.review.models import (
     validate_provider_policy,
     validate_trusted_publishers_policy,
 )
+from autoresearch.ar.review.canonical import canonical_json
 
 
 ROOT = Path(__file__).parents[3]
@@ -130,8 +131,7 @@ def test_capability_digest_uses_documented_canonical_json():
     policy = load_capability_policy(POLICY_DIR / "capabilities-v1.json")
     capability = policy["capabilities"][0]
     without_digest = {key: value for key, value in capability.items() if key != "contract_digest"}
-    serialized = json.dumps(without_digest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    expected = "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    expected = "sha256:" + hashlib.sha256(canonical_json(without_digest)).hexdigest()
 
     assert capability_contract_digest(capability) == expected
 

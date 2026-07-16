@@ -286,9 +286,9 @@ class TrustedPublisher:
 def capability_contract_digest(capability: Mapping[str, Any]) -> str:
     """Return the digest of canonical JSON for the complete capability sans digest.
 
-    The serialization is UTF-8 JSON with lexicographically sorted keys,
-    compact separators, and ``ensure_ascii=True``.  ``contract_digest`` is
-    excluded; every other capability field is included.
+    The serialization is UTF-8 RFC 8785-compatible JSON with deterministic
+    key ordering and compact separators.  ``contract_digest`` is excluded;
+    every other capability field is included.
     """
     if not isinstance(capability, Mapping) or frozenset(capability) != _CAPABILITY_KEYS:
         raise ValueError("capability has unexpected or missing keys")

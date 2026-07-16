@@ -9,17 +9,26 @@
       "value": {"text": "café", "values": [true, null, -3]},
       "canonical_utf8": "{\"text\":\"café\",\"values\":[true,null,-3]}",
       "sha256": "13b3712cf60d89b3a47e42b72db671a4be0070e92874d762067d73bdd9e3621a"
+    },
+    {
+      "value": {"control\u0000": "line\n\"\\", "é": "é"},
+      "canonical_utf8": "{\"control\\u0000\":\"line\\n\\\"\\\\\",\"é\":\"é\"}",
+      "sha256": "048e6ddfe4314bb7916de29cf2b3e0630733973080d3b2388a31658c7e928b1a"
+    },
+    {
+      "value": {"\ue000": "bmp", "𐀀": "astral"},
+      "canonical_utf8": "{\"𐀀\":\"astral\",\"\ue000\":\"bmp\"}",
+      "sha256": "5e72745dd500f8b8d997ef851679707b89099da29d2aca4b93dfd85810ebaa20"
     }
   ],
   "metadata": [
     {
       "value": {
-        "author": "review-bot",
         "report_body_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "target_key": "target-1",
         "metadata_digest": "pending"
       },
-      "digest": "3114aa0dc947719f39ea74a4dda7b03ee272a72fb086a9160c6a052ab956cc63"
+      "digest": "55fdd8e2b046ba068ad1e5367d8b380d6674833b0607fdfdac1af13d6d879634"
     }
   ],
   "regressions": {
