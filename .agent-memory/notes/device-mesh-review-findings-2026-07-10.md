@@ -68,3 +68,23 @@ Status: **STALE — NOT APPLICABLE.**
 Per-flip dual-run is deleted post-flip; in prod all ar_generate callers pass tape:None.
 Relabeled harness comment truthfully + strengthened --self-check-parity to test both
 comparator directions. **FIXED @ 17fc1c4c.**
+
+## Physical PP contributor report (2026-07-14)
+
+`taniguchi-taku-softm` ran commit `4df035373669369484797abdd274f3f710c4c061` on two
+gfx1201 Radeon AI PRO R9700 GPUs (ROCm 7.2.4, RCCL 2.27.7.70204) and provided the first
+physical PP evidence for this branch. The report confirmed balanced Qwen35 PP allocation
+(2.638 GiB weights, 0.134 GiB KV, and 0.006 GiB DeltaNet state per device) and bidirectional
+peer access, but it did not close a physical gate:
+
+- The noncanonical `qwen3-0.6b.hf4` dense fixture reached correct emulated 155/156 placement
+  before an illegal-memory-access surfaced at logits download. Because `llama_store_pp` forces
+  emulation and no first failing HIP launch was captured, this is an unclassified gfx1201 issue,
+  not yet a confirmed device-mesh regression.
+- Qwen35 PP=1 versus physical PP=2 matched 58/100 greedy tokens and first diverged at token 58.
+  This remains a hard HW-004 parity failure. The report did not pin a prompt MD5 or explicitly
+  force deterministic mode, so it is evidence of failure rather than a localization result.
+
+The authoritative tracker records the follow-up under HW-003 and HW-004. The current queue is
+unchanged: classify the dense fault in the physical-validation stream, then reproduce Qwen35
+deterministically after GEN-001 with boundary, recurrent-state, copy, and stream-order evidence.

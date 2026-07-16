@@ -775,9 +775,8 @@ pub fn run_heads(
     // Reduced-vocab (d2t Some) forces the host path: each argmax is a DRAFT id
     // that must be d2t-remapped to a TARGET id before it can index the
     // full-target-vocab markov chain — the on-GPU chain kernel can't do that gather.
-    let chain_bufs: Option<(GpuTensor, GpuTensor)> = if markov_w1_device_embeddable(markov_w1)
-        && weights.d2t.is_none()
-    {
+    let chain_bufs: Option<(GpuTensor, GpuTensor)> =
+        if markov_w1_device_embeddable(markov_w1) && weights.d2t.is_none() {
         let chain = gpu
             .alloc_tensor(&[block + 1], DType::F32)
             .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
@@ -1087,6 +1086,39 @@ impl MtpDrafter for DsparkDrafter {
             crate::spec::SpecAdvance::Aborted => {
                 Err("DsparkDrafter::mtp_prefill: spec_advance aborted".into())
             }
+        }
+    }
+
+    fn mtp_prefill_abortable(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: Option<&dyn Fn() -> bool>,
+    ) -> Result<Option<u32>, String> {
+        if abort.is_some_and(|check| check()) {
+            return Ok(None);
+        }
+        if !cache_hit {
+            target.reset_recurrent(gpu);
+        }
+        if let Some(dev) = self.main_hidden_dev.take() {
+            let _ = gpu.free_tensor(dev);
+        }
+        self.ctx_positions.clear();
+        if let Some(c) = self.block_controller.as_mut() {
+            c.reset();
+        }
+        if fill_tokens.is_empty() {
+            return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
+        }
+        let no_abort = || false;
+        let abort = abort.unwrap_or(&no_abort);
+        match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
+            crate::spec::SpecAdvance::Ready { last_argmax } if !abort() => Ok(Some(last_argmax)),
+            crate::spec::SpecAdvance::Ready { .. } | crate::spec::SpecAdvance::Aborted => Ok(None),
         }
     }
 

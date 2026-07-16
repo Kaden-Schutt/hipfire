@@ -222,16 +222,15 @@ impl SpecTarget for Deepseek4Bundle {
     /// run the prompt through the trunk in a single pass.
     ///
     /// `reset` is always `false` here — the caller (`DsparkDrafter::mtp_prefill`)
-    /// calls `reset_recurrent` separately on cache miss. `abort` and `hidden_out`
-    /// are ignored for this arch (deepseek4 is not abort-capable in this path
-    /// and does not expose hidden states via `spec_advance`).
+    /// calls `reset_recurrent` separately on cache miss. The abort callback is
+    /// checked between prefill chunks and before/after the final head pass.
     fn spec_advance(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
         _reset: bool,
-        _abort: &dyn Fn() -> bool,
+        abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Lazily allocate the trunk-sized PBS.
@@ -242,22 +241,62 @@ impl SpecTarget for Deepseek4Bundle {
             );
         }
         // Take the PBS out of state to avoid a simultaneous immutable + mutable
-        // borrow of self.state (forward_prefill_batch_chunked takes &mut state).
+        // borrow of self.state (the chunked forward path takes &mut state).
         // Restore it afterward (it is always Some after the lazy alloc above).
         let pbs = self.state.dspark_verify_pbs.take().unwrap();
-        let result = forward::forward_prefill_batch_chunked(
+        let mut pos_cursor = start_pos;
+        let mut remaining = tokens;
+        let last_logits = loop {
+            if abort() {
+                self.state.dspark_verify_pbs = Some(pbs);
+                return Ok(SpecAdvance::Aborted);
+            }
+            let take = remaining.len().min(pbs.max_batch);
+            let chunk = &remaining[..take];
+            let chunk_result = forward::forward_prefill_batch_chunk(
             &self.config,
             &self.weights,
             &mut self.state,
             gpu,
-            tokens,
-            start_pos as u32,
             &pbs,
+                chunk,
+                pos_cursor as u32,
         );
+            if let Err(e) = chunk_result {
         self.state.dspark_verify_pbs = Some(pbs);
-        let last_logits =
-            result.map_err(|e| format!("Deepseek4Bundle::spec_advance prefill: {e}"))?;
+                return Err(format!("Deepseek4Bundle::spec_advance prefill: {e}"));
+            }
+            if take == remaining.len() {
+                if abort() {
+                    self.state.dspark_verify_pbs = Some(pbs);
+                    return Ok(SpecAdvance::Aborted);
+                }
+                let logits_result = forward::final_norm_and_head_last_batched(
+                    &self.config,
+                    &self.weights,
+                    &mut self.state,
+                    &pbs,
+                    gpu,
+                    take,
+                );
+                let logits = match logits_result {
+                    Ok(logits) => logits,
+                    Err(e) => {
+                        self.state.dspark_verify_pbs = Some(pbs);
+                        return Err(format!("Deepseek4Bundle::spec_advance head: {e}"));
+                    }
+                };
+                if abort() {
+                    self.state.dspark_verify_pbs = Some(pbs);
+                    return Ok(SpecAdvance::Aborted);
+                }
+                break logits;
+            }
+            pos_cursor += take;
+            remaining = &remaining[take..];
+        };
         let last_argmax = crate::spec_decode::logits_argmax(&last_logits) as u32;
+        self.state.dspark_verify_pbs = Some(pbs);
         Ok(SpecAdvance::Ready { last_argmax })
     }
 

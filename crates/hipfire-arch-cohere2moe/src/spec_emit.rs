@@ -146,6 +146,7 @@ impl<'a> Cohere2MoeEmit<'a> {
             }
             return EmitOutcome {
                 events: Vec::new(),
+                generation_advanced: false,
                 stop: Some(StopReason::Eos),
             };
         }
@@ -219,7 +220,11 @@ impl<'a> Cohere2MoeEmit<'a> {
             self.think_force_closed = true;
         }
 
-        EmitOutcome { events, stop: None }
+        EmitOutcome {
+            events,
+            generation_advanced: true,
+            stop: None,
+        }
     }
 }
 
@@ -255,6 +260,7 @@ impl<'a> SpecEmit for Cohere2MoeEmit<'a> {
             events,
             finish_reason,
             tool_calls,
+            finalized: None,
         }
     }
 }

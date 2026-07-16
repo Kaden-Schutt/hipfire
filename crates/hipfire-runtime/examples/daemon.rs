@@ -40,7 +40,10 @@ use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Mutex, OnceLock,
+};
 use std::time::Instant;
 
 use hipfire_hardware::DimKind;
@@ -50,7 +53,7 @@ use hipfire_loader::{
 };
 use hipfire_runtime::spec::{
     ClientEvent, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit, SpecTarget,
-    Speculator, StopReason,
+    SpecTargetGuard, Speculator, StopReason,
 };
 
 /// An explicitly invalid operator environment is a load error even when the
@@ -148,6 +151,39 @@ fn check_abort(req_id: &str) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Per-request cancellation latch. `check_abort` is intentionally one-shot so
+/// a stale abort cannot kill a later request, but speculative prefill calls it
+/// from several nested bounded loops. Once any layer observes cancellation the
+/// request must remain cancelled; otherwise an inner poll can consume the
+/// signal and the outer admission gate would incorrectly publish a seed.
+struct AbortLatch {
+    cancelled: AtomicBool,
+}
+
+impl AbortLatch {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn poll(&self, req_id: &str) -> bool {
+        if self.cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        if check_abort(req_id) {
+            self.cancelled.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -431,6 +467,40 @@ fn strip_think_for_fingerprint(s: &str) -> String {
         out.replace_range(idx..idx + "<|im_end|>".len(), "");
     }
     out
+}
+
+/// Publish one sealed Qwen assistant turn to the verbatim replay cache.
+///
+/// The sealed transcript is the only source for this write. In particular, a
+/// stop that cuts through a token has no replay boundary and must not be
+/// reconstructed from the visible text or the target's over-advanced state.
+fn cache_sealed_qwen_turn(
+    cache: &mut AsstTurnCache,
+    finalized: &hipfire_runtime::spec_transcript::FinalizedAssistantTurn,
+    target_reusable: bool,
+) -> Option<u64> {
+    if !target_reusable {
+        return None;
+    }
+    let cached_seq = finalized.replay_tokens()?.to_vec();
+    if cached_seq.is_empty() {
+        return None;
+    }
+    let stripped = strip_think_for_fingerprint(finalized.text());
+    let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+    let fp = asst_turn_fingerprint(&emit_text, finalized.tool_calls());
+    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
+            fp,
+            cached_seq.len(),
+            emit_text.len(),
+            finalized.tool_calls().len(),
+            emit_text.chars().take(60).collect::<String>(),
+        );
+    }
+    cache.insert(fp, cached_seq);
+    Some(fp)
 }
 
 /// Walk a [`serde_json::Value`] and produce a canonical-key
@@ -5803,6 +5873,7 @@ fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
     if let Some(b) = m.deepseek4_mut() {
         b.state.reset();
+        b.state.zero_decode_caches(gpu);
         gpu.invalidate_graph_state();
     }
     if let Some(b) = m.lfm2moe_mut() {
@@ -5952,12 +6023,12 @@ struct SpecRun {
     generated: usize,
     spec_cycles: usize,
     spec_accepted: usize,
-    /// Full client-visible stream from the emitter, used to decode user-visible
-    /// assistant text and its cache fingerprint.
-    streamed_tokens: Vec<u32>,
-    /// Full internal committed stream for assistant-turn cache replay. This may
-    /// contain cache-advanced forced tokens intentionally hidden after a stop.
-    cache_replay_tokens: Vec<u32>,
+    /// The emitter's consuming seal. Qwen's finalized turn is the sole source
+    /// for text, tools, diagnostics, and reusable replay.
+    finalized: Option<hipfire_runtime::spec_transcript::FinalizedAssistantTurn>,
+    /// Whether the target state ended exactly at the sealed replay boundary.
+    /// A partial/intra-token stop or hidden cache advance invalidates reuse.
+    target_reusable: bool,
     /// Newly-prefilled token count (the suffix actually fed through the model).
     prefill_tokens_len: usize,
     /// The terminal flush summary (tool-call count drives the wrapper's
@@ -5973,6 +6044,171 @@ enum SpecRunOutcome {
     ImmediateError(String),
     Failed(String),
     Aborted { generated: usize },
+}
+
+/// Production prefill admission.  The first-token seed is not published until
+/// both the speculator and the cancellation gate agree that the turn may
+/// continue.  This is deliberately before `SpecEmit::begin` and before any
+/// durable session/cache update.
+fn admit_spec_prefill(
+    result: Result<PrefillOutcome, String>,
+    cancelled: bool,
+) -> Result<u32, SpecRunOutcome> {
+    match result {
+        Ok(PrefillOutcome::Ready { first_token }) if !cancelled => Ok(first_token),
+        Ok(PrefillOutcome::Ready { .. }) | Ok(PrefillOutcome::Aborted) => {
+            Err(SpecRunOutcome::Aborted { generated: 0 })
+        }
+        Err(error) => Err(SpecRunOutcome::Failed(format!("prefill: {error}"))),
+    }
+}
+
+/// Final cancellation gate between native prefill completion and first-token
+/// admission to the emitter. This closes the race where cancellation arrives
+/// after the drafter returned its seed but before any wire-visible event.
+fn admit_spec_prefill_before_output(
+    result: Result<PrefillOutcome, String>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<u32, SpecRunOutcome> {
+    let first_token = admit_spec_prefill(result, false)?;
+    if cancelled() {
+        Err(SpecRunOutcome::Aborted { generated: 0 })
+    } else {
+        Ok(first_token)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpecTerminalEnvelope {
+    Error(String),
+    Aborted { generated: usize },
+    DoneAborted { generated: usize },
+    Done { generated: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecEmitDisposition {
+    Finish,
+    Discard,
+}
+
+fn spec_emit_disposition(outcome: &SpecRunOutcome) -> SpecEmitDisposition {
+    match outcome {
+        SpecRunOutcome::Ready(_) => SpecEmitDisposition::Finish,
+        SpecRunOutcome::ImmediateError(_)
+        | SpecRunOutcome::Failed(_)
+        | SpecRunOutcome::Aborted { .. } => SpecEmitDisposition::Discard,
+    }
+}
+
+fn settle_spec_emit<'a>(
+    emit: Box<dyn SpecEmit + 'a>,
+    disposition: SpecEmitDisposition,
+) -> Option<FinishSummary> {
+    match disposition {
+        SpecEmitDisposition::Finish => Some(emit.finish()),
+        SpecEmitDisposition::Discard => {
+            drop(emit);
+            None
+        }
+    }
+}
+
+fn settle_spec_emit_for_outcome<'a>(
+    emit: Box<dyn SpecEmit + 'a>,
+    outcome: &SpecRunOutcome,
+) -> Option<FinishSummary> {
+    settle_spec_emit(emit, spec_emit_disposition(outcome))
+}
+
+fn discard_spec_emit<'a>(emit: Box<dyn SpecEmit + 'a>, outcome: SpecRunOutcome) -> SpecRunOutcome {
+    let _ = settle_spec_emit_for_outcome(emit, &outcome);
+    outcome
+}
+
+/// Complete one production speculative caller lifecycle. This is deliberately
+/// the only boundary that may release the target guard, consume/discard the
+/// real emitter, reset request state, insert a reusable turn, or publish a
+/// terminal envelope. `generate_spec` is called by both Qwen and DeepSeek
+/// wrappers, so both routes use this exact ordering.
+///
+/// `guard` is `Some` for the prefill admission path, where the emitter is still
+/// live. The normal decode epilogue passes `None`/`None` because it has already
+/// consumed the emitter and released the guard while building `SpecRun`; the
+/// same function still owns reset/cache/envelope ordering there.
+fn finish_spec_caller_after_guard<'a>(
+    guard: Option<Box<dyn SpecTargetGuard + 'a>>,
+    emit: Option<Box<dyn SpecEmit + 'a>>,
+    outcome: SpecRunOutcome,
+    mut reset: impl FnMut(),
+    mut cache_insert: impl FnMut(&SpecRun),
+    mut envelope: impl FnMut(SpecTerminalEnvelope),
+) -> Option<SpecRun> {
+    // Drop first. Qwen's guard restores its moved bundle here; DeepSeek's
+    // in-place guard releases its borrow here. Canonical reset must never run
+    // while either production borrow is alive.
+    drop(guard);
+    match outcome {
+        SpecRunOutcome::Ready(run) => {
+            let mut run = run;
+            if let Some(emit) = emit {
+                let finish = emit.finish();
+                run.finalized = finish.finalized.clone();
+                run.finish = finish;
+            }
+            if !run.target_reusable {
+                reset();
+            }
+            cache_insert(&run);
+            envelope(SpecTerminalEnvelope::Done {
+                generated: run.generated,
+            });
+            Some(run)
+        }
+        SpecRunOutcome::ImmediateError(error) | SpecRunOutcome::Failed(error) => {
+            drop(emit);
+            reset();
+            envelope(SpecTerminalEnvelope::Error(error));
+            None
+        }
+        SpecRunOutcome::Aborted { generated } => {
+            drop(emit);
+            reset();
+            envelope(SpecTerminalEnvelope::Aborted { generated });
+            envelope(SpecTerminalEnvelope::DoneAborted { generated });
+            None
+        }
+    }
+}
+
+fn emit_spec_terminal_envelope(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    envelope: SpecTerminalEnvelope,
+) {
+    match envelope {
+        SpecTerminalEnvelope::Error(error) => emit_error_with_id(stdout, id, error),
+        SpecTerminalEnvelope::Aborted { .. } => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
+                id
+            );
+        }
+        SpecTerminalEnvelope::DoneAborted { generated } => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
+                id, generated
+            );
+            let _ = stdout.flush();
+        }
+        // Architecture-specific normal done envelopes are still emitted by
+        // the two wrappers after the returned SpecRun. The lifecycle seam
+        // emits this only to make normal ordering explicit to its collaborators
+        // and deterministic tests.
+        SpecTerminalEnvelope::Done { .. } => {}
+    }
 }
 
 #[cfg(test)]
@@ -6010,12 +6246,12 @@ fn observe_forced_seed(
     seed: u32,
     generated: &mut usize,
     max_tokens: usize,
-    observe: impl FnOnce(u32) -> bool,
+    observe: impl FnOnce(u32) -> hipfire_runtime::spec::EmitOutcome,
 ) -> bool {
     if *generated >= max_tokens {
         return false;
     }
-    if observe(seed) {
+    if observe(seed).generation_advanced {
         *generated += 1;
     }
     true
@@ -6029,10 +6265,6 @@ fn record_forced_batch(history: &mut Vec<u32>, tokens: &[u32]) {
 
 /// Copy the committed internal sequence for Qwen's verbatim assistant-turn
 /// cache, which must match the cached KV even when client replay stopped early.
-fn assistant_turn_cache_stream(committed_tokens: &[u32]) -> Vec<u32> {
-    committed_tokens.to_vec()
-}
-
 /// Render a committed forced continuation only through its first terminal token.
 /// The target and draft caches have already advanced over the full batch.
 fn replay_forced_tokens(
@@ -6045,6 +6277,35 @@ fn replay_forced_tokens(
         }
     }
     None
+}
+
+/// Publish or discard the CPU-side state for a sealed Qwen speculative turn.
+///
+/// A reusable seal is baked from the exact sealed token boundary. Any other
+/// seal leaves no reusable conversation prefix; the caller still performs the
+/// full model reset for GPU/recurrent state after the target guard is dropped.
+fn publish_sealed_qwen_state(
+    session: &mut hipfire_loader::SessionState,
+    prompt_tokens: &[u32],
+    position: usize,
+    finalized: Option<&hipfire_runtime::spec_transcript::FinalizedAssistantTurn>,
+    target_reusable: bool,
+) {
+    if target_reusable {
+        if let Some(turn) = finalized {
+            session.seq_pos = position;
+            session.conversation_tokens = {
+                let mut tokens =
+                    Vec::with_capacity(prompt_tokens.len() + turn.diagnostic_tokens().len());
+                tokens.extend_from_slice(prompt_tokens);
+                tokens.extend_from_slice(turn.diagnostic_tokens());
+                tokens
+            };
+        }
+    } else {
+        session.seq_pos = 0;
+        session.conversation_tokens.clear();
+    }
 }
 
 fn publish_eviction_position(
@@ -6353,52 +6614,16 @@ fn generate_dflash(
     };
     debug_assert_eq!(run.prefill_tokens_len, prefill_tokens_full);
 
-    // ── parse tool_calls + populate asst_turn_cache ──────────────
+    // ── consume the sealed assistant turn + populate asst_turn_cache ──────
     //
-    // The terminal `finish` flush (inside generate_spec) already rendered the
-    // `tool_calls` event. The asst-turn cache fingerprint below is daemon
-    // bookkeeping that needs its own parse + the decoded text, so it recomputes
-    // from the streamed tokens (mirrors the qwen35 non-dflash path so a
-    // dflash-emitted asst turn is reusable via verbatim token replay).
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let decoded_full = tokenizer.decode(&run.streamed_tokens);
-    let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
-
-    // Trim trailing `<|im_end|>` + newline from streamed_tokens so the
-    // cached body slots cleanly between the assistant_prefix and the
-    // im_end+nl trailer that `build_cached_history` re-adds on replay
-    // (mirrors qwen35 cache writer).
-    let nl_token = tokenizer.encode("\n");
-    let nl_set: std::collections::HashSet<u32> = nl_token.iter().copied().collect();
-    let mut cached_seq: Vec<u32> = run.cache_replay_tokens.clone();
-    while let Some(&last) = cached_seq.last() {
-        if nl_set.contains(&last) {
-            cached_seq.pop();
-        } else {
-            break;
-        }
-    }
-    if let Some(&last) = cached_seq.last() {
-        if im_end_token == Some(last) {
-            cached_seq.pop();
-        }
-    }
-    if !cached_seq.is_empty() {
-        let stripped = strip_think_for_fingerprint(&decoded_full);
-        let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-        let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-            eprintln!(
-                "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                fp,
-                cached_seq.len(),
-                emit_text.len(),
-                emit_tool_calls.len(),
-                emit_text.chars().take(60).collect::<String>(),
-            );
-        }
-        m.persist.asst_turn_cache.insert(fp, cached_seq);
-    }
+    // The emitter's seal is the only authority for text, tools, fingerprint,
+    // and replay. In particular, an intra-token stop has no replay boundary
+    // and must never be reconstructed from the visible stream.
+    let finalized = run
+        .finalized
+        .as_ref()
+        .expect("Qwen spec emitter must publish a finalized assistant turn");
+    let emit_tool_calls = finalized.tool_calls().to_vec();
 
     // ── done envelope (qwen35-flavoured) ─────────────────────────
     let tok_s = if run.total_s > 0.0 {
@@ -6495,6 +6720,12 @@ fn generate_spec(
     // drafters ignore it. The daemon's routing gate enforces that invariant.
     temp: f32,
 ) -> Option<SpecRun> {
+    // See the prefill-cancellation lifecycle call below: the emitter borrows
+    // the model tokenizer, while reset must run only after that emitter and the
+    // target guard are released.
+    let model_ptr = m as *mut LoadedModel;
+    let gpu_ptr = gpu as *mut rdna_compute::Gpu;
+    let qwen_cache_ptr = &mut m.persist.asst_turn_cache as *mut _;
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // Acquire the target via the RAII slot guard — it restores the bundle into
@@ -6627,7 +6858,10 @@ fn generate_spec(
         // start_pos == ckpt (the cache plan already set cache_hit=true).
         if let Some(ckpt) = resume_from {
             if let Err(e) = spec.rewind_to(gpu, slot, ckpt) {
-                break 'spec SpecRunOutcome::Failed(format!("spec rewind: {e}"));
+                break 'spec discard_spec_emit(
+                    emit,
+                    SpecRunOutcome::Failed(format!("spec rewind: {e}")),
+                );
             }
             m.session.seq_pos = ckpt;
             m.session.conversation_tokens.truncate(ckpt);
@@ -6658,7 +6892,8 @@ fn generate_spec(
         // self-resets target state and the full prompt is seeded. Client cancel is
         // surfaced as `PrefillOutcome::Aborted`.
         let id_for_abort = id.to_string();
-        let first_token = match spec.prefill(
+        let abort_latch = AbortLatch::new();
+        let prefill = spec.prefill(
             gpu,
             slot,
             &prompt_tokens,
@@ -6666,11 +6901,31 @@ fn generate_spec(
             prefill_start,
             cache_hit,
             resume_from,
-            &|| check_abort(&id_for_abort),
-        ) {
-            Ok(PrefillOutcome::Ready { first_token }) => first_token,
-            Ok(PrefillOutcome::Aborted) => break 'spec SpecRunOutcome::Aborted { generated: 0 },
-            Err(e) => break 'spec SpecRunOutcome::Failed(format!("prefill: {e}")),
+            &|| abort_latch.poll(&id_for_abort),
+        );
+        let first_token = match admit_spec_prefill_before_output(prefill, &|| {
+            abort_latch.is_cancelled() || abort_latch.poll(id)
+        }) {
+            Ok(first_token) => first_token,
+            Err(outcome) => {
+                // This is the shared production cancellation boundary for both
+                // Qwen and DeepSeek callers. Keep the real guard and emitter
+                // alive until the lifecycle seam has restored/discarded them;
+                // only then may canonical reset publish abort envelopes.
+                // The erased emitter borrows the model tokenizer, so retain
+                // reset as a raw-pointer hook. The lifecycle function drops
+                // both production borrows before invoking it; that ordering is
+                // the safety invariant this seam exists to enforce.
+                let _ = finish_spec_caller_after_guard(
+                    Some(guard),
+                    Some(emit),
+                    outcome,
+                    || unsafe { model_reset_context(&mut *model_ptr, &mut *gpu_ptr) },
+                    |_| {},
+                    |envelope| emit_spec_terminal_envelope(stdout, id, envelope),
+                );
+                return None;
+            }
         };
 
         let t_prefill = Instant::now();
@@ -6678,7 +6933,7 @@ fn generate_spec(
         // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
         // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
         // it stays in the loop and excludes any grammar-rejected token.
-        let mut emitted: Vec<u32> = vec![first_token];
+        let mut emitted: Vec<u32> = Vec::new();
         let mut position = prompt_tokens.len();
         let mut seed_token = first_token;
         // τ accounting, inlined from the unified `SpecStep` (the old `SpecStats`
@@ -6687,6 +6942,9 @@ fn generate_spec(
         let mut spec_cycles = 0usize;
         let mut spec_accepted = 0usize;
         let mut generated = 0usize;
+        // Logical target advancement excludes the prefill prediction itself;
+        // the first token is the seed for the first verify window.
+        let mut target_advanced = 0usize;
 
         // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
         // If the prompt already filled past budget+beta, compact once before
@@ -6698,15 +6956,27 @@ fn generate_spec(
             match maybe_evict_spec(gpu, m.eviction.as_ref(), slot, spec.as_mut(), position) {
                 Ok(position) => position,
                 Err(e) => {
-                    break 'spec SpecRunOutcome::Failed(format!("post-prefill eviction: {e}"));
+                    if abort_latch.poll(id) {
+                        break 'spec discard_spec_emit(
+                            emit,
+                            SpecRunOutcome::Aborted { generated: 0 },
+                        );
+                    }
+                    break 'spec discard_spec_emit(
+                        emit,
+                        SpecRunOutcome::Failed(format!("post-prefill eviction: {e}")),
+                    );
                 }
             }
         {
             let compact_offset = match slot.kv_cache_mut() {
                 Some(kv) => kv.compact_offset,
                 None => {
-                    break 'spec SpecRunOutcome::Failed(
+                    break 'spec discard_spec_emit(
+                        emit,
+                        SpecRunOutcome::Failed(
                         "post-prefill eviction: missing KvCache after compaction".into(),
+                        ),
                     );
                 }
             };
@@ -6715,6 +6985,14 @@ fn generate_spec(
                 position, new_physical, compact_offset,
             );
             position = new_physical;
+        }
+
+        // Eviction and its drafter mirror are GPU work performed after prefill.
+        // A cancellation observed by either that work or the prefill's nested
+        // chunk loop remains latched and must be settled before `begin` can
+        // publish even the first token.
+        if abort_latch.is_cancelled() || abort_latch.poll(id) {
+            break 'spec discard_spec_emit(emit, SpecRunOutcome::Aborted { generated: 0 });
         }
 
         // Emit the first token immediately so TTFT is the prefill time. `begin`
@@ -6731,8 +7009,9 @@ fn generate_spec(
         // Count the first token only when the emitter emitted it (see the same guard
         // in the accept loop). qwen35 always emits a `Committed`; the ds4 emitter
         // returns no events for an EOS-first prefill argmax, yielding an empty turn.
-        if !first_begin.events.is_empty() {
+        if first_begin.generation_advanced {
             generated += 1;
+            emitted.push(first_token);
         }
         let first_token_is_eos = first_begin.stop.is_some();
 
@@ -6748,10 +7027,10 @@ fn generate_spec(
             // `generate()` for rationale. Without this, a Pi cancel
             // mid-decode leaves the spec-decode loop running for max_tokens
             // worth of wasted work.
-            if check_abort(id) {
+            if abort_latch.poll(id) {
                 // The target and drafter have advanced past un-baked history. Leave
                 // the guard scope so the canonical model reset can recover both.
-                break 'spec SpecRunOutcome::Aborted { generated };
+                break 'spec discard_spec_emit(emit, SpecRunOutcome::Aborted { generated });
             }
             if position.saturating_add(block_size) >= ctx_capacity {
                 break;
@@ -6774,8 +7053,16 @@ fn generate_spec(
                 temp,
             ) {
                 Ok(s) => s,
-                Err(e) => break 'spec SpecRunOutcome::Failed(format!("spec_step: {e}")),
+                Err(e) => {
+                    break 'spec discard_spec_emit(
+                        emit,
+                        SpecRunOutcome::Failed(format!("spec_step: {e}")),
+                    );
+                }
             };
+            if abort_latch.poll(id) {
+                break 'spec discard_spec_emit(emit, SpecRunOutcome::Aborted { generated });
+            }
             spec_cycles += 1;
             spec_accepted += step.accepted;
             // `emit` is already the committed tail with the seed re-echo stripped.
@@ -6814,7 +7101,7 @@ fn generate_spec(
                 // terminator is neither counted into `generated` nor baked into
                 // `conversation_tokens` — byte-matching the bespoke ds4 loop (which
                 // broke on accepted-EOS before push/increment).
-                if !outcome.events.is_empty() {
+                if outcome.generation_advanced {
                     emitted.push(tok);
                     render_client_events(
                         stdout,
@@ -6851,6 +7138,7 @@ fn generate_spec(
             // Advance by the emitted-tail length (= accepted + 1), NOT by `accepted`
             // — the loop contract pinned by spec.rs's `emit_len_drives_advance`.
             position += step.emit.len();
+            target_advanced += step.emit.len();
             seed_token = step.next_seed;
 
             // Forced-token injection (cohere2moe generation guards; no-op for every
@@ -6862,15 +7150,21 @@ fn generate_spec(
                 match advance_forced_tokens(
                     &forced,
                     max_tokens.saturating_sub(generated),
-                    |tokens| spec.advance_forced(gpu, slot, tokens, position, &|| check_abort(id)),
+                    |tokens| {
+                        spec.advance_forced(gpu, slot, tokens, position, &|| abort_latch.poll(id))
+                    },
                 ) {
                     Ok(Some(seed)) => {
                         position += forced.len();
-                        record_forced_batch(&mut emitted, &forced);
+                        target_advanced += forced.len();
+                        // Only tokens explicitly admitted by the owner enter
+                        // the repeat context; target advancement alone is not
+                        // client-visible generation.
                         let forced_stop = replay_forced_tokens(&forced, |token| {
                             emit.set_generated_hint(generated);
                             let outcome = emit.observe(token);
-                            if !outcome.events.is_empty() {
+                            if outcome.generation_advanced {
+                                emitted.push(token);
                                 render_client_events(
                                     stdout,
                                     id,
@@ -6883,9 +7177,12 @@ fn generate_spec(
                         });
                         match forced_stop {
                             Some(StopReason::GrammarViolation) => {
-                                break 'spec SpecRunOutcome::Failed(
+                                break 'spec discard_spec_emit(
+                                    emit,
+                                    SpecRunOutcome::Failed(
                                     "speculative grammar violation during forced continuation"
                                         .into(),
+                                    ),
                                 );
                             }
                             Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
@@ -6899,9 +7196,7 @@ fn generate_spec(
                                     emit.set_generated_hint(seed_generated_hint);
                                     let outcome = emit.observe(token);
                                     seed_stop = outcome.stop;
-                                    if outcome.events.is_empty() {
-                                        false
-                                    } else {
+                                    if outcome.generation_advanced {
                                         emitted.push(token);
                                         render_client_events(
                                             stdout,
@@ -6909,13 +7204,16 @@ fn generate_spec(
                                             &outcome.events,
                                             t0.elapsed().as_millis() as u64,
                                         );
-                                        true
                                     }
+                                    outcome
                                 }) {
                                     match seed_stop {
                                         Some(StopReason::GrammarViolation) => {
-                                            break 'spec SpecRunOutcome::Failed(
+                                            break 'spec discard_spec_emit(
+                                                emit,
+                                                SpecRunOutcome::Failed(
                                                 "speculative grammar violation after forced continuation".into(),
+                                                ),
                                             );
                                         }
                                         Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
@@ -6933,10 +7231,13 @@ fn generate_spec(
                     // capped thinking turn ends before the close if it cannot fit.
                     Ok(None) => think_cap_hit = true,
                     Err(ForcedAdvance::Aborted) => {
-                        break 'spec SpecRunOutcome::Aborted { generated };
+                        break 'spec discard_spec_emit(emit, SpecRunOutcome::Aborted { generated });
                     }
                     Err(ForcedAdvance::Failed(e)) => {
-                        break 'spec SpecRunOutcome::Failed(format!("forced-token advance: {e}"));
+                        break 'spec discard_spec_emit(
+                            emit,
+                            SpecRunOutcome::Failed(format!("forced-token advance: {e}")),
+                        );
                     }
                 }
             }
@@ -6946,7 +7247,18 @@ fn generate_spec(
             if let Some(new_physical) =
                 match maybe_evict_spec(gpu, m.eviction.as_ref(), slot, spec.as_mut(), position) {
                     Ok(position) => position,
-                    Err(e) => break 'spec SpecRunOutcome::Failed(format!("eviction: {e}")),
+                    Err(e) => {
+                        if abort_latch.poll(id) {
+                            break 'spec discard_spec_emit(
+                                emit,
+                                SpecRunOutcome::Aborted { generated },
+                            );
+                        }
+                        break 'spec discard_spec_emit(
+                            emit,
+                            SpecRunOutcome::Failed(format!("eviction: {e}")),
+                        );
+                    }
                 }
             {
                 position = new_physical;
@@ -6956,29 +7268,17 @@ fn generate_spec(
             }
         }
 
-        // Snapshot the emitter's state needed by the post-loop bookkeeping before
-        // the terminal `finish` consumes it: the full streamed-token stream (for the
-        // asst-turn cache) and whether a committed token tripped the grammar matcher.
-        let streamed_tokens = emit.streamed_tokens().to_vec();
+        // Snapshot only state that is not part of the consuming seal.
         let grammar_violated = emit.grammar_violated();
-
-        m.session.seq_pos = position;
-        // Bake the FULL conversation (prefill + decode) into conversation_tokens
-        // so subsequent turns can compute LCP against it. Previously this stored
-        // only the decoded portion (`emitted`), making the next non-dflash turn
-        // full-reset because no system/user prefix was present.
-        m.session.conversation_tokens = {
-            let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
-            v.extend_from_slice(&prompt_tokens);
-            v.extend_from_slice(&emitted);
-            v
-        };
 
         if grammar_violated {
             eprintln!(
                 "[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn"
             );
-            break 'spec SpecRunOutcome::Failed("speculative grammar violation".into());
+            break 'spec discard_spec_emit(
+                emit,
+                SpecRunOutcome::Failed("speculative grammar violation".into()),
+            );
         }
 
         // Terminal `finish` flush — parses tool calls from the decoded text and
@@ -6987,16 +7287,35 @@ fn generate_spec(
         // differs per arch (qwen35: `dflash`/`tau`/`cycles` + ChatML token-replay
         // cache; ds4: `spec_k`/`spec_windows`/`spec_accept_pct`), so this core
         // returns a `SpecRun` summary instead of writing them itself.
-        let finish = emit.finish();
+        let finish = settle_spec_emit(emit, SpecEmitDisposition::Finish)
+            .expect("normal spec completion must finish its emitter");
         render_client_events(stdout, id, &finish.events, 0);
+
+        let target_reusable = finish
+            .finalized
+            .as_ref()
+            .and_then(|turn| turn.replay_tokens())
+            .map(|replay| {
+                // The first token is a prediction, not a token consumed by the
+                // target. Everything after it must line up with target advance.
+                target_advanced == replay.len().saturating_sub(1)
+            })
+            .unwrap_or(false);
+        publish_sealed_qwen_state(
+            &mut m.session,
+            &prompt_tokens,
+            position,
+            finish.finalized.as_ref(),
+            target_reusable,
+        );
 
         let t_end = Instant::now();
         SpecRunOutcome::Ready(SpecRun {
             generated,
             spec_cycles,
             spec_accepted,
-            streamed_tokens,
-            cache_replay_tokens: assistant_turn_cache_stream(&emitted),
+            finalized: finish.finalized.clone(),
+            target_reusable,
             prefill_tokens_len: prefill_tokens.len(),
             finish,
             prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
@@ -7008,53 +7327,44 @@ fn generate_spec(
     // The slot guard must restore its target bundle before the canonical reset
     // touches model state. No failure path below retains target/speculator borrows.
     drop(guard);
-    match outcome {
-        SpecRunOutcome::Ready(run) => Some(run),
-        SpecRunOutcome::ImmediateError(error) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
-                id, error
+    finish_spec_caller_after_guard(
+        None,
+        None,
+        outcome,
+        || model_reset_context(m, gpu),
+        |run| {
+            if matches!(arch_id, 5 | 6) {
+                let finalized = run
+                    .finalized
+                    .as_ref()
+                    .expect("Qwen spec emitter must publish a finalized assistant turn");
+                // The guard/emitter have already been released by the lifecycle
+                // seam. The raw pointer only avoids extending the tokenizer
+                // borrow across this callback; the callback runs synchronously.
+                unsafe {
+                    let _ = cache_sealed_qwen_turn(
+                        &mut *qwen_cache_ptr,
+                        finalized,
+                        run.target_reusable,
             );
-            let _ = stdout.flush();
-            None
-        }
-        SpecRunOutcome::Failed(error) => {
-            model_reset_context(m, gpu);
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
-                id, error
-            );
-            let _ = stdout.flush();
-            None
-        }
-        SpecRunOutcome::Aborted { generated } => {
-            model_reset_context(m, gpu);
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-                id
-            );
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
-                id, generated
-            );
-            let _ = stdout.flush();
-            None
         }
     }
+        },
+        |envelope| emit_spec_terminal_envelope(stdout, id, envelope),
+    )
 }
 
 #[cfg(test)]
 mod spec_recovery_tests {
     use super::{
-        advance_forced_tokens, assistant_turn_cache_stream, forced_advance_completed,
-        observe_forced_seed, publish_eviction_position, qwen35_recurrent_groups,
-        record_forced_batch, replay_forced_tokens,
+        abort_for_id, admit_spec_prefill_before_output, advance_forced_tokens,
+        forced_advance_completed, observe_forced_seed, publish_eviction_position,
+        qwen35_recurrent_groups, record_forced_batch, replay_forced_tokens, AbortLatch,
+        SpecRunOutcome,
     };
+    use hipfire_runtime::spec::PrefillOutcome;
     use hipfire_runtime::spec::SpecAdvance;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn does_not_publish_new_position_when_draft_mirror_fails() {
@@ -7067,6 +7377,34 @@ mod spec_recovery_tests {
     #[test]
     fn aborted_forced_advance_is_not_successful() {
         assert!(!forced_advance_completed(&SpecAdvance::Aborted));
+    }
+
+    #[test]
+    fn cancellation_latch_survives_one_shot_abort_consumption() {
+        let request_id = "abort-latch-spec-recovery-test";
+        *abort_for_id().lock().unwrap() = Some(request_id.to_string());
+        let latch = AbortLatch::new();
+
+        assert!(latch.poll(request_id));
+        // The global abort slot has been consumed, but nested production
+        // callers must still observe the terminal cancellation.
+        assert!(latch.poll(request_id));
+        assert!(latch.is_cancelled());
+        *abort_for_id().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn latched_prefill_cannot_admit_a_first_token_or_wire_event() {
+        let latch = AbortLatch::new();
+        latch.cancelled.store(true, Ordering::Release);
+        let admitted = admit_spec_prefill_before_output(
+            Ok(PrefillOutcome::Ready { first_token: 41 }),
+            &|| latch.is_cancelled(),
+        );
+        assert!(matches!(
+            admitted,
+            Err(SpecRunOutcome::Aborted { generated: 0 })
+        ));
     }
 
     #[test]
@@ -7108,7 +7446,10 @@ mod spec_recovery_tests {
         assert!(observe_forced_seed(99, &mut generated, 4, |token| {
             observed.push(token);
             emitted.push(token);
-            true
+            hipfire_runtime::spec::EmitOutcome {
+                generation_advanced: true,
+                ..Default::default()
+            }
         }));
         assert_eq!(observed, vec![99]);
         assert_eq!(emitted, vec![99]);
@@ -7117,7 +7458,7 @@ mod spec_recovery_tests {
         assert!(!observe_forced_seed(100, &mut generated, 4, |token| {
             observed.push(token);
             emitted.push(token);
-            true
+            hipfire_runtime::spec::EmitOutcome::default()
         }));
         assert_eq!(observed, vec![99]);
         assert_eq!(emitted, vec![99]);
@@ -7144,10 +7485,6 @@ mod spec_recovery_tests {
         let mut session_tokens = vec![1, 10];
         record_forced_batch(&mut session_tokens, &forced);
         assert_eq!(session_tokens, vec![1, 10, 41, 42, 43]);
-        assert_eq!(
-            assistant_turn_cache_stream(&session_tokens[1..]),
-            vec![10, 41, 42, 43]
-        );
     }
 
     #[test]
@@ -7159,6 +7496,530 @@ mod spec_recovery_tests {
             [1, 1, 1, 1]
         );
         assert_eq!(groups[3], &[4]);
+    }
+}
+
+#[cfg(test)]
+mod spec_emit_lifecycle_tests {
+    use super::{
+        admit_spec_prefill, admit_spec_prefill_before_output, finish_spec_caller_after_guard,
+        settle_spec_emit_for_outcome, spec_emit_disposition, SpecEmitDisposition, SpecRun,
+        SpecRunOutcome, SpecTerminalEnvelope,
+    };
+    use hipfire_runtime::spec::{
+        EmitOutcome, FinishSummary, PrefillOutcome, SpecEmit, SpecTargetGuard,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct FakeEmit {
+        finish_count: Arc<AtomicUsize>,
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl SpecEmit for FakeEmit {
+        fn begin(&mut self, _first_token: u32) -> EmitOutcome {
+            EmitOutcome::default()
+        }
+
+        fn observe(&mut self, _token: u32) -> EmitOutcome {
+            EmitOutcome::default()
+        }
+
+        fn finish(self: Box<Self>) -> FinishSummary {
+            self.finish_count.fetch_add(1, Ordering::SeqCst);
+            FinishSummary {
+                finish_reason: "stop",
+                ..FinishSummary::default()
+            }
+        }
+    }
+
+    impl Drop for FakeEmit {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn fake() -> (Box<dyn SpecEmit>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let finish_count = Arc::new(AtomicUsize::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        (
+            Box::new(FakeEmit {
+                finish_count: Arc::clone(&finish_count),
+                drop_count: Arc::clone(&drop_count),
+            }),
+            finish_count,
+            drop_count,
+        )
+    }
+
+    struct TraceGuard {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl SpecTargetGuard for TraceGuard {
+        fn slot(&mut self) -> Result<&mut dyn hipfire_runtime::spec::SpecTarget, String> {
+            Err("test guard slot is never entered".into())
+        }
+    }
+
+    impl Drop for TraceGuard {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TraceEmit {
+        finish_count: Arc<AtomicUsize>,
+        order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl SpecEmit for TraceEmit {
+        fn begin(&mut self, _first_token: u32) -> EmitOutcome {
+            EmitOutcome::default()
+        }
+
+        fn observe(&mut self, _token: u32) -> EmitOutcome {
+            EmitOutcome::default()
+        }
+
+        fn finish(self: Box<Self>) -> FinishSummary {
+            self.finish_count.fetch_add(1, Ordering::SeqCst);
+            self.order.lock().unwrap().push("Finish");
+            FinishSummary {
+                finish_reason: "stop",
+                ..FinishSummary::default()
+            }
+        }
+    }
+
+    fn ready_run(target_reusable: bool) -> SpecRun {
+        SpecRun {
+            generated: 1,
+            spec_cycles: 0,
+            spec_accepted: 0,
+            finalized: None,
+            target_reusable,
+            prefill_tokens_len: 1,
+            finish: FinishSummary::default(),
+            prefill_s: 0.0,
+            total_s: 0.0,
+            decode_s: 0.0,
+        }
+    }
+
+    #[test]
+    fn qwen_production_prefill_abort_resets_before_envelopes_and_allows_fresh_turn() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let finish_count = Arc::new(AtomicUsize::new(0));
+        let cache_inserts = Arc::new(AtomicUsize::new(0));
+        let prefills = Arc::new(AtomicUsize::new(0));
+        let fresh_state = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        for _ in 0..2 {
+            assert!(fresh_state.swap(false, Ordering::SeqCst));
+            prefills.fetch_add(1, Ordering::SeqCst);
+            let emit = Box::new(TraceEmit {
+                finish_count: Arc::clone(&finish_count),
+                order: Arc::clone(&events),
+            }) as Box<dyn SpecEmit>;
+            let guard = Box::new(TraceGuard {
+                drops: Arc::clone(&drops),
+            }) as Box<dyn SpecTargetGuard>;
+            let outcome = finish_spec_caller_after_guard(
+                Some(guard),
+                Some(emit),
+                SpecRunOutcome::Aborted { generated: 0 },
+                || {
+                    assert_eq!(
+                        drops.load(Ordering::SeqCst),
+                        prefills.load(Ordering::SeqCst),
+                        "guard must restore before Qwen reset"
+                    );
+                    fresh_state.store(true, Ordering::SeqCst);
+                    events.lock().unwrap().push("Reset");
+                },
+                |_| {
+                    cache_inserts.fetch_add(1, Ordering::SeqCst);
+                },
+                |envelope| {
+                    events.lock().unwrap().push(match envelope {
+                        SpecTerminalEnvelope::Aborted { .. } => "Aborted",
+                        SpecTerminalEnvelope::DoneAborted { .. } => "DoneAborted",
+                        _ => "unexpected",
+                    })
+                },
+            );
+            assert!(outcome.is_none());
+        }
+
+        assert_eq!(
+            &*events.lock().unwrap(),
+            &vec![
+                "Reset",
+                "Aborted",
+                "DoneAborted",
+                "Reset",
+                "Aborted",
+                "DoneAborted",
+            ]
+        );
+        assert_eq!(finish_count.load(Ordering::SeqCst), 0);
+        assert_eq!(cache_inserts.load(Ordering::SeqCst), 0);
+        assert_eq!(prefills.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn deepseek_production_abort_zeroes_decode_caches_before_envelopes() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let finish_count = Arc::new(AtomicUsize::new(0));
+        let qwen_cache_proxy = Arc::new(AtomicUsize::new(0));
+        let emit = Box::new(TraceEmit {
+            finish_count: Arc::clone(&finish_count),
+            order: Arc::clone(&events),
+        }) as Box<dyn SpecEmit>;
+        let guard = Box::new(TraceGuard {
+            drops: Arc::clone(&drops),
+        }) as Box<dyn SpecTargetGuard>;
+
+        let outcome = finish_spec_caller_after_guard(
+            Some(guard),
+            Some(emit),
+            SpecRunOutcome::Aborted { generated: 3 },
+            || {
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                events.lock().unwrap().push("zero_decode_caches");
+                events.lock().unwrap().push("reset");
+            },
+            |_| {
+                qwen_cache_proxy.fetch_add(1, Ordering::SeqCst);
+            },
+            |envelope| {
+                events.lock().unwrap().push(match envelope {
+                    SpecTerminalEnvelope::Aborted { .. } => "Aborted",
+                    SpecTerminalEnvelope::DoneAborted { .. } => "DoneAborted",
+                    _ => "unexpected",
+                })
+            },
+        );
+
+        assert!(outcome.is_none());
+        assert_eq!(
+            &*events.lock().unwrap(),
+            &vec!["zero_decode_caches", "reset", "Aborted", "DoneAborted"]
+        );
+        assert_eq!(finish_count.load(Ordering::SeqCst), 0);
+        assert_eq!(qwen_cache_proxy.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn production_lifecycle_control_finishes_caches_then_publishes_done() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let finish_count = Arc::new(AtomicUsize::new(0));
+        let emit = Box::new(TraceEmit {
+            finish_count: Arc::clone(&finish_count),
+            order: Arc::clone(&events),
+        }) as Box<dyn SpecEmit>;
+        let guard = Box::new(TraceGuard {
+            drops: Arc::new(AtomicUsize::new(0)),
+        }) as Box<dyn SpecTargetGuard>;
+
+        let result = finish_spec_caller_after_guard(
+            Some(guard),
+            Some(emit),
+            SpecRunOutcome::Ready(ready_run(true)),
+            || events.lock().unwrap().push("Reset"),
+            |_| events.lock().unwrap().push("Cache"),
+            |envelope| {
+                if matches!(envelope, SpecTerminalEnvelope::Done { .. }) {
+                    events.lock().unwrap().push("Done");
+                }
+            },
+        );
+
+        assert!(result.is_some());
+        assert_eq!(finish_count.load(Ordering::SeqCst), 1);
+        assert_eq!(&*events.lock().unwrap(), &vec!["Finish", "Cache", "Done"]);
+    }
+
+    #[test]
+    fn normal_completion_consumes_finish_once() {
+        let (emit, finish_count, drop_count) = fake();
+
+        let outcome = SpecRunOutcome::Ready(SpecRun {
+            generated: 0,
+            spec_cycles: 0,
+            spec_accepted: 0,
+            finalized: None,
+            target_reusable: false,
+            prefill_tokens_len: 0,
+            finish: FinishSummary::default(),
+            prefill_s: 0.0,
+            total_s: 0.0,
+            decode_s: 0.0,
+        });
+        assert_eq!(spec_emit_disposition(&outcome), SpecEmitDisposition::Finish);
+        assert!(settle_spec_emit_for_outcome(emit, &outcome).is_some());
+        assert_eq!(finish_count.load(Ordering::SeqCst), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn abort_error_and_grammar_failure_discard_without_finish_or_events() {
+        for outcome in [
+            SpecRunOutcome::Aborted { generated: 3 },
+            SpecRunOutcome::Failed("forward failed".into()),
+            SpecRunOutcome::Failed("speculative grammar violation".into()),
+        ] {
+            assert_eq!(
+                spec_emit_disposition(&outcome),
+                SpecEmitDisposition::Discard
+            );
+            let (emit, finish_count, drop_count) = fake();
+
+            assert!(settle_spec_emit_for_outcome(emit, &outcome).is_none());
+            assert_eq!(finish_count.load(Ordering::SeqCst), 0);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn normal_finish_precedes_terminal_done_without_cache_side_effect() {
+        let (emit, finish_count, _) = fake();
+        let outcome = SpecRunOutcome::Ready(SpecRun {
+            generated: 2,
+            spec_cycles: 1,
+            spec_accepted: 1,
+            finalized: None,
+            target_reusable: false,
+            prefill_tokens_len: 0,
+            finish: FinishSummary::default(),
+            prefill_s: 0.0,
+            total_s: 0.0,
+            decode_s: 0.0,
+        });
+        let mut lifecycle = Vec::new();
+
+        let _finish = settle_spec_emit_for_outcome(emit, &outcome).expect("normal finish");
+        assert_eq!(finish_count.load(Ordering::SeqCst), 1);
+        lifecycle.push("finish");
+        lifecycle.push("terminal");
+        lifecycle.push("done");
+
+        assert_eq!(lifecycle, vec!["finish", "terminal", "done"]);
+        assert!(
+            !lifecycle.contains(&"cache"),
+            "normal lifecycle test must not hide a cache insertion"
+        );
+    }
+
+    #[test]
+    fn generate_spec_prefill_cancellation_discards_seed_before_emission() {
+        let gated = admit_spec_prefill_before_output(
+            Ok(PrefillOutcome::Ready { first_token: 41 }),
+            &|| true,
+        );
+        assert!(matches!(
+            gated,
+            Err(SpecRunOutcome::Aborted { generated: 0 })
+        ));
+
+        let ready = admit_spec_prefill(Ok(PrefillOutcome::Ready { first_token: 41 }), true);
+        assert!(matches!(
+            &ready,
+            Err(SpecRunOutcome::Aborted { generated: 0 })
+        ));
+
+        let (emit, finish_count, drop_count) = fake();
+        let outcome = ready.unwrap_err();
+        assert!(settle_spec_emit_for_outcome(emit, &outcome).is_none());
+        assert_eq!(finish_count.load(Ordering::SeqCst), 0);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod qwen_sealed_turn_daemon_tests {
+    use super::{
+        admit_qwen35_pp_token, asst_turn_fingerprint, cache_sealed_qwen_turn, plan_prompt_cache,
+        publish_sealed_qwen_state,
+    };
+    use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
+    use hipfire_loader::{AsstTurnCache, SessionState};
+    use hipfire_runtime::eos_filter::EosFilter;
+    use hipfire_runtime::prompt_frame::{AssistantPrefix, Message, Role};
+    use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx, StopReason};
+    use hipfire_runtime::tokenizer::Tokenizer;
+
+    fn tokenizer() -> Tokenizer {
+        Tokenizer::from_hf_json(
+            r#"{
+                "model": {
+                    "vocab": {
+                        "safe": 0,
+                        "safe<st": 1,
+                        "op><tool_call>tail": 2,
+                        "<|im_start|>": 3,
+                        "<|im_end|>": 4,
+                        "user": 5,
+                        "assistant": 6,
+                        "\\n": 7,
+                        "next": 8,
+                        "<|endoftext|>": 9
+                    },
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 3, "content": "<|im_start|>", "special": true},
+                    {"id": 4, "content": "<|im_end|>", "special": true},
+                    {"id": 9, "content": "<|endoftext|>", "special": true}
+                ]
+            }"#,
+        )
+        .expect("daemon sealed-turn fixture tokenizer")
+    }
+
+    #[test]
+    fn two_turn_stop_quarantine_uses_sealed_cache_and_reset_paths() {
+        let tokenizer = tokenizer();
+        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+            tokenizer: &tokenizer,
+            eos: 9,
+            im_end: Some(4),
+            tools: None,
+            stop: vec!["<stop>".to_string()],
+            max_think: 0,
+            max_tokens: 32,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+
+        let mut events = emit.begin(1).events;
+        let stopped = emit.observe(2);
+        events.extend(stopped.events);
+        assert_eq!(stopped.stop, Some(StopReason::StopSequence));
+        let summary = emit.finish();
+        events.extend(summary.events);
+        let finalized = summary.finalized.expect("sealed Qwen turn");
+
+        assert_eq!(finalized.text(), "safe");
+        assert!(finalized.tool_calls().is_empty());
+        assert!(finalized.replay_tokens().is_none());
+        assert!(finalized.diagnostic_tokens().is_empty());
+        assert!(events.iter().all(|event| match event {
+            ClientEvent::Token(text) | ClientEvent::Reasoning(text) => {
+                !text.contains("tail") && !text.contains("<tool_call>")
+            }
+            ClientEvent::ToolCalls(_) => false,
+            ClientEvent::Committed { id, .. } => *id != 2,
+        }));
+
+        let safe_fp = asst_turn_fingerprint(finalized.text(), finalized.tool_calls());
+        let tail_fp = asst_turn_fingerprint("safe<stop><tool_call>tail", &[]);
+        assert_ne!(safe_fp, tail_fp);
+
+        let mut cache = AsstTurnCache::new_from_env();
+        assert_eq!(
+            cache_sealed_qwen_turn(&mut cache, &finalized, false),
+            None,
+            "an intra-token stop has no replay/cache boundary"
+        );
+        assert!(!cache.contains_key(&safe_fp));
+        assert!(!cache.contains_key(&tail_fp));
+
+        let mut session = SessionState::default();
+        session.seq_pos = 17;
+        session.conversation_tokens = vec![1, 2];
+        publish_sealed_qwen_state(&mut session, &[3, 6, 7], 19, Some(&finalized), false);
+        assert_eq!(session.seq_pos, 0);
+        assert!(session.conversation_tokens.is_empty());
+
+        let history = [Message {
+            role: Role::Assistant,
+            content: finalized.text().to_string(),
+            tool_calls: finalized.tool_calls().to_vec(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let turn2 = plan_prompt_cache(
+            &tokenizer,
+            &mut cache,
+            &session.conversation_tokens,
+            true,
+            None,
+            "next",
+            AssistantPrefix::Plain,
+            &history,
+            false,
+            &[],
+            false,
+        );
+        assert!(
+            !turn2.cache_hit,
+            "turn 2 must cold-start after the cut turn"
+        );
+        assert_eq!(turn2.start_pos, 0);
+        assert_eq!(turn2.cached_tokens, 0);
+        assert!(!turn2.rendered.contains(&2));
+        assert!(!tokenizer.decode(&turn2.rendered).contains("tail"));
+    }
+
+    #[test]
+    fn qwen35_pp_caller_path_resets_after_intra_token_stop() {
+        let tokenizer = tokenizer();
+        let mut turn =
+            hipfire_runtime::spec_transcript::OpenAssistantTurn::new([b"<stop>".as_slice()]);
+        let mut filter =
+            EosFilter::new(super::qwen35_pp_eos_filter_config(&["<stop>".to_string()]));
+
+        let first = admit_qwen35_pp_token(&mut turn, &mut filter, &tokenizer, 1, false);
+        assert!(!first.terminal);
+        let second = admit_qwen35_pp_token(&mut turn, &mut filter, &tokenizer, 2, false);
+        assert!(second.terminal);
+        assert!(matches!(
+            second.action,
+            hipfire_runtime::eos_filter::FilterAction::Stop { .. }
+        ));
+
+        let finalized = turn.seal();
+        assert_eq!(finalized.text(), "safe");
+        assert!(finalized.replay_tokens().is_none());
+        assert!(finalized.diagnostic_tokens().is_empty());
+
+        let mut session = SessionState::default();
+        session.seq_pos = 2;
+        session.conversation_tokens = vec![10, 1];
+        publish_sealed_qwen_state(&mut session, &[10], 2, Some(&finalized), false);
+        assert_eq!(session.seq_pos, 0);
+        assert!(session.conversation_tokens.is_empty());
+    }
+
+    #[test]
+    fn qwen35_pp_caller_path_retains_exact_token_aligned_stop() {
+        let tokenizer = tokenizer();
+        let mut turn =
+            hipfire_runtime::spec_transcript::OpenAssistantTurn::new([b"<stop>".as_slice()]);
+        let mut filter = EosFilter::new(super::qwen35_pp_eos_filter_config(&[]));
+        let first = admit_qwen35_pp_token(&mut turn, &mut filter, &tokenizer, 0, false);
+        assert!(!first.terminal);
+        let stop = admit_qwen35_pp_token(&mut turn, &mut filter, &tokenizer, 4, true);
+        assert!(stop.terminal);
+
+        let finalized = turn.seal();
+        assert_eq!(finalized.replay_tokens(), Some([0].as_slice()));
+        assert_eq!(finalized.diagnostic_tokens(), [0].as_slice());
+        let mut session = SessionState::default();
+        session.conversation_tokens = vec![10, 0];
+        publish_sealed_qwen_state(&mut session, &[10], 2, Some(&finalized), true);
+        assert_eq!(session.conversation_tokens, vec![10, 0]);
     }
 }
 
@@ -7642,8 +8503,17 @@ fn generate_multi(
 
     let mut generated = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
-    let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
+    let mut filter = EosFilter::new(qwen35_pp_eos_filter_config(stop));
+    let mut sealed_turn =
+        hipfire_runtime::spec_transcript::OpenAssistantTurn::new_with_reasoning_open(
+            stop.iter().map(|sequence| sequence.as_bytes()),
+            matches!(
+                assistant_prefix,
+                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+            ),
+        );
+    let mut target_advanced = 0usize;
+    let mut terminal_turn = false;
     let mut alert_fired = false;
     let mut think_count: usize = 0;
     let mut prev_in_think: bool = false;
@@ -7685,6 +8555,23 @@ fn generate_multi(
             let _ = stdout.flush();
             return;
         }
+        let semantic_stop = next_token == config.eos_token
+            || im_end_token == Some(next_token)
+            || tokenizer.is_terminator(next_token);
+        let admission = admit_qwen35_pp_token(
+            &mut sealed_turn,
+            &mut filter,
+            tokenizer,
+            next_token,
+            semantic_stop,
+        );
+        let filter_stopped = emit_qwen35_pp_filter_action(stdout, id, admission.action);
+        if admission.terminal || filter_stopped {
+            break;
+        }
+        if !admission.generation_advanced {
+            break;
+        }
         generated += 1;
         m.session.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
@@ -7695,19 +8582,6 @@ fn generate_multi(
             streamed_tokens.len() - 1,
             t0.elapsed().as_millis() as u64,
         );
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[bytes_fed_to_filter..];
-        bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-            let text = std::str::from_utf8(&text_bytes).unwrap();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"token","id":"{}","text":{}}}"#,
-                id,
-                serde_json::to_string(&text).unwrap_or_default()
-            );
-            let _ = stdout.flush();
-        }
 
         if let Err(e) = qwen35::forward_scratch_multi(
             gpus,
@@ -7732,30 +8606,7 @@ fn generate_multi(
             return;
         }
         m.session.seq_pos += 1;
-
-        if next_token == config.eos_token {
-            break;
-        }
-        if im_end_token == Some(next_token) {
-            break;
-        }
-        if tokenizer.is_terminator(next_token) {
-            break;
-        }
-
-        // hunt3 M-F: user stop-sequence match against the decoded output suffix
-        // (pp>1 multi-GPU path). Mirrors the AR generate() loop; matches the
-        // full decoded text so a stop string spanning a token boundary is
-        // caught. A plain break exits the `while generated < max_tokens` loop
-        // (this path's `done` event carries no finish_reason field, so there is
-        // no reason to resolve — terminating generation is the contract). Gated
-        // behind `!stop.is_empty()` so the common path pays nothing.
-        if !stop.is_empty() {
-            let decoded_suffix = tokenizer.decode(&streamed_tokens);
-            if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
-                break;
-            }
-        }
+        target_advanced += 1;
 
         // max_think_tokens / force-answer enforcement: same decoded-text scan
         // as pp=1, but all recurrent-state writes route through *_multi.
@@ -7828,7 +8679,26 @@ fn generate_multi(
                 let close_tokens = tokenizer.encode(&think_continuation());
                 let budget_left = max_tokens.saturating_sub(generated);
                 let take = close_tokens.len().min(budget_left);
+                let mut filter_stopped = false;
                 for &t in &close_tokens[..take] {
+                    let admission = admit_qwen35_pp_token(
+                        &mut sealed_turn,
+                        &mut filter,
+                        tokenizer,
+                        t,
+                        t == config.eos_token
+                            || im_end_token == Some(t)
+                            || tokenizer.is_terminator(t),
+                    );
+                    filter_stopped = emit_qwen35_pp_filter_action(stdout, id, admission.action);
+                    if admission.terminal || filter_stopped {
+                        terminal_turn = true;
+                        break;
+                    }
+                    if !admission.generation_advanced {
+                        terminal_turn = true;
+                        break;
+                    }
                     if let Err(e) = qwen35::forward_scratch_multi(
                         gpus,
                         weights,
@@ -7840,9 +8710,17 @@ fn generate_multi(
                         scratch_set,
                     ) {
                         eprintln!("[daemon] max_think close forward_scratch_multi: {}", e);
-                        break;
+                        reset_pp_uncommitted_state!();
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","id":"{}","message":"max_think close forward_scratch_multi: {}"}}"#,
+                            id, e
+                        );
+                        let _ = stdout.flush();
+                        return;
                     }
                     m.session.seq_pos += 1;
+                    target_advanced += 1;
                     m.session.conversation_tokens.push(t);
                     // hunt3 M-C: keep the grammar matcher in sync over force-closed
                     // </think> tokens, exactly as generate() does (~8591). Without
@@ -7859,24 +8737,17 @@ fn generate_multi(
                         streamed_tokens.len() - 1,
                         t0.elapsed().as_millis() as u64,
                     );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = &all_bytes[bytes_fed_to_filter..];
-                    bytes_fed_to_filter = all_bytes.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                        let text = std::str::from_utf8(&text_bytes).unwrap();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"token","id":"{}","text":{}}}"#,
-                            id,
-                            serde_json::to_string(&text).unwrap_or_default()
-                        );
-                        let _ = stdout.flush();
-                    }
                     generated += 1;
+                    if filter_stopped {
+                        break;
+                    }
                 }
                 think_count = 0;
                 prev_in_think = false;
                 if generated >= max_tokens {
+                    break;
+                }
+                if terminal_turn || filter_stopped {
                     break;
                 }
             }
@@ -7991,28 +8862,25 @@ fn generate_multi(
                 )
                 .saturating_add(nl.len());
             if nudge_len > 0 && need_kv <= m.meta.physical_cap {
+                let mut filter_stopped = false;
                 for &tok in &nudge_tokens[..nudge_len] {
-                    m.session.conversation_tokens.push(tok);
-                    streamed_tokens.push(tok);
-                    emit_committed_event(
-                        stdout,
-                        id,
+                    let admission = admit_qwen35_pp_token(
+                        &mut sealed_turn,
+                        &mut filter,
+                        tokenizer,
                         tok,
-                        streamed_tokens.len() - 1,
-                        t0.elapsed().as_millis() as u64,
+                        tok == config.eos_token
+                            || im_end_token == Some(tok)
+                            || tokenizer.is_terminator(tok),
                     );
-                    let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
-                    bytes_fed_to_filter = all_bytes2.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes2) {
-                        let t = std::str::from_utf8(&text_bytes).unwrap();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"token","id":"{}","text":{}}}"#,
-                            id,
-                            serde_json::to_string(&t).unwrap_or_default()
-                        );
-                        let _ = stdout.flush();
+                    filter_stopped = emit_qwen35_pp_filter_action(stdout, id, admission.action);
+                    if admission.terminal || filter_stopped {
+                        terminal_turn = true;
+                        break;
+                    }
+                    if !admission.generation_advanced {
+                        terminal_turn = true;
+                        break;
                     }
                     if let Err(e) = qwen35::forward_scratch_multi(
                         gpus,
@@ -8025,10 +8893,33 @@ fn generate_multi(
                         scratch_set,
                     ) {
                         eprintln!("[daemon] budget_alert forward_scratch_multi: {}", e);
-                        break;
+                        reset_pp_uncommitted_state!();
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","id":"{}","message":"budget_alert forward_scratch_multi: {}"}}"#,
+                            id, e
+                        );
+                        let _ = stdout.flush();
+                        return;
                     }
                     m.session.seq_pos += 1;
+                    target_advanced += 1;
+                    m.session.conversation_tokens.push(tok);
+                    streamed_tokens.push(tok);
+                    emit_committed_event(
+                        stdout,
+                        id,
+                        tok,
+                        streamed_tokens.len() - 1,
+                        t0.elapsed().as_millis() as u64,
+                    );
                     generated += 1;
+                    if filter_stopped {
+                        break;
+                    }
+                }
+                if terminal_turn || filter_stopped {
+                    break;
                 }
             } else if nudge_len < nudge_tokens.len() {
                 let _ = writeln!(
@@ -8116,7 +9007,9 @@ fn generate_multi(
         }
     }
 
-    // ChatML \n trailer so the next turn opens cleanly.
+    // ChatML \n trailer so the next turn opens cleanly. Keep this before the
+    // filter epilogue: a trailer failure is an error path and must discard
+    // the filter without flushing buffered output.
     if im_end_token == Some(*m.session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
             if let Err(e) = qwen35::forward_scratch_multi(
@@ -8130,11 +9023,53 @@ fn generate_multi(
                 scratch_set,
             ) {
                 eprintln!("[daemon] trailer forward_scratch_multi: {}", e);
-                break;
+                reset_pp_uncommitted_state!();
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"trailer forward_scratch_multi: {}"}}"#,
+                    id, e
+                );
+                let _ = stdout.flush();
+                return;
             }
             m.session.seq_pos += 1;
             m.session.conversation_tokens.push(t);
         }
+    }
+
+    // Local terminal epilogue for the arch-resident PP raw filter. Every
+    // normal loop exit (EOS, user stop, think/budget stop, or length) reaches
+    // this point exactly once; abort/error returns above drop the filter and
+    // therefore cannot render buffered bytes after the terminal event.
+    if let Some(text) = finish_qwen35_pp_filter(&mut filter) {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":{}}}"#,
+            id,
+            serde_json::to_string(&text).unwrap_or_default()
+        );
+        let _ = stdout.flush();
+    }
+
+    let finalized = sealed_turn.seal();
+    let target_reusable = finalized.replay_tokens().is_some()
+        && target_advanced == finalized.diagnostic_tokens().len();
+    let prompt_prefix = m.session.conversation_tokens[..ngram_scope_start].to_vec();
+    let final_position = m.session.seq_pos;
+    publish_sealed_qwen_state(
+        &mut m.session,
+        &prompt_prefix,
+        final_position,
+        Some(&finalized),
+        target_reusable,
+    );
+    if target_reusable {
+        let _ = cache_sealed_qwen_turn(&mut m.persist.asst_turn_cache, &finalized, true);
+    } else {
+        // The target may have accepted bytes which are not a whole-token
+        // replay boundary.  Do not approximate rollback by popping tokens;
+        // reset the PP recurrent/KV state before publishing the done frame.
+        reset_pp_uncommitted_state!();
     }
 
     let t_end = Instant::now();
@@ -8171,6 +9106,101 @@ fn generate_multi(
     let _ = stdout.flush();
 }
 
+fn qwen35_pp_eos_filter_config(stop: &[String]) -> EosFilterConfig {
+    EosFilterConfig {
+        stop_at: stop
+            .iter()
+            .filter(|sequence| !sequence.is_empty())
+            .map(|sequence| sequence.as_bytes().to_vec())
+            .collect(),
+        ..EosFilterConfig::default()
+    }
+}
+
+/// Render one Qwen35 PP filter action. A stop action owns the safe prefix and
+/// is terminal; callers must stop the decode loop after forwarding that token.
+fn emit_qwen35_pp_filter_action(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    action: FilterAction,
+) -> bool {
+    let stopped = matches!(&action, FilterAction::Stop { .. });
+    let bytes = match action {
+        FilterAction::Emit(bytes) => bytes,
+        FilterAction::Stop { emit } => emit,
+        FilterAction::Hold => return false,
+    };
+    if bytes.is_empty() {
+        return stopped;
+    }
+    let text = std::str::from_utf8(&bytes).expect("Qwen35 PP filter emits valid UTF-8");
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"token","id":"{}","text":{}}}"#,
+        id,
+        serde_json::to_string(text).unwrap_or_default()
+    );
+    let _ = stdout.flush();
+    stopped
+}
+
+#[derive(Debug)]
+struct Qwen35PpAdmission {
+    action: FilterAction,
+    terminal: bool,
+    generation_advanced: bool,
+}
+
+/// Admit a PP token before it becomes durable.  The target is only advanced
+/// after this returns non-terminal: a stop token is a prediction, not a token
+/// that belongs in the reusable KV/session prefix.
+fn admit_qwen35_pp_token(
+    turn: &mut hipfire_runtime::spec_transcript::OpenAssistantTurn,
+    filter: &mut EosFilter,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    token: u32,
+    semantic_stop: bool,
+) -> Qwen35PpAdmission {
+    if semantic_stop || turn.stopped() {
+        if semantic_stop {
+            turn.stop();
+        }
+        return Qwen35PpAdmission {
+            action: FilterAction::Hold,
+            terminal: true,
+            generation_advanced: false,
+        };
+    }
+
+    let raw = tokenizer.decode_bytes(&[token]);
+    let delta = turn.observe(token, &raw);
+    let action = filter.observe(&raw);
+    let filter_terminal = matches!(action, FilterAction::Stop { .. });
+    if filter_terminal && !turn.stopped() {
+        turn.stop();
+    }
+    let terminal = delta.stopped || filter_terminal;
+    Qwen35PpAdmission {
+        action,
+        terminal,
+        generation_advanced: !terminal,
+    }
+}
+
+/// Finish the Qwen35 PP raw output filter once and return only a valid,
+/// non-empty UTF-8 payload for the terminal token event. The caller invokes
+/// this only on the normal path; abort/error paths drop the filter untouched.
+fn finish_qwen35_pp_filter(filter: &mut EosFilter) -> Option<String> {
+    let bytes = filter.finish();
+    if bytes.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(&bytes)
+        .ok()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Generic auto-regressive decode driver (Inc 1, Task 1.4b-iii). Extracted
 /// verbatim-in-behavior from the qwen35 AR arm of `generate` (arch 5/6), but
@@ -8185,6 +9215,176 @@ fn generate_multi(
 /// still reads the real conversation buffer (it includes the post-loop ChatML
 /// trailer that `streamed_tokens` does not). Adaptive-KV stderr phase labels are
 /// unified in the hook (diagnostic only, not token-affecting).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArDecodeOutcome {
+    Complete,
+    Aborted,
+    Error(String),
+}
+
+/// Route a decode-loop terminal control to the lifecycle path that settles it.
+/// Normal controls share completion/trailer handling; cancellation and errors
+/// discard the parser without a trailer.
+fn route_ar_decode_outcome(normal_completion: bool, error: Option<String>) -> ArDecodeOutcome {
+    match error {
+        Some(error) => ArDecodeOutcome::Error(error),
+        None if normal_completion => ArDecodeOutcome::Complete,
+        None => ArDecodeOutcome::Aborted,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArSampledEos {
+    Stop,
+    CommitAndStop,
+    Forced(u32),
+    Error(String),
+}
+
+fn stream_stop(actions: &[hipfire_runtime::stream_parser::StreamAction]) -> bool {
+    actions
+        .iter()
+        .any(|action| matches!(action, hipfire_runtime::stream_parser::StreamAction::Stop))
+}
+
+fn decode_limit_reached(
+    max_tokens: usize,
+    generated: usize,
+    physical_cap: usize,
+    seq_pos: usize,
+    has_eviction: bool,
+) -> bool {
+    if generated >= max_tokens {
+        true
+    } else if !has_eviction && seq_pos >= physical_cap {
+        true
+    } else {
+        false
+    }
+}
+
+fn ar_sampled_eos(parser: &mut dyn hipfire_runtime::stream_parser::StreamParser) -> ArSampledEos {
+    match parser.on_eos() {
+        hipfire_runtime::stream_parser::EosDecision::Stop => ArSampledEos::Stop,
+        hipfire_runtime::stream_parser::EosDecision::CommitAndStop => ArSampledEos::CommitAndStop,
+        hipfire_runtime::stream_parser::EosDecision::Inject(tokens) => {
+            if tokens.is_empty() {
+                return ArSampledEos::Error(
+                    "sampled eos injection produced no forced token".into(),
+                );
+            }
+            for token in tokens {
+                parser.enqueue(token);
+            }
+            match parser.next_forced() {
+                Some(token) => ArSampledEos::Forced(token),
+                None => ArSampledEos::Error("sampled eos injection failed forced dequeue".into()),
+            }
+        }
+    }
+}
+
+fn grammar_mask_for_sample<'a>(
+    grammar_active: bool,
+    matcher: Option<&dyn hipfire_runtime::arch_dispatch::GrammarMatcher>,
+    grammar_vocab: &[String],
+    grammar_mask: &'a mut [bool],
+) -> Result<Option<&'a [bool]>, String> {
+    if !grammar_active {
+        return Ok(None);
+    }
+    let matcher = matcher.ok_or_else(|| "grammar matcher unavailable".to_string())?;
+    if matcher.is_free() {
+        return Ok(None);
+    }
+    matcher.token_mask(grammar_vocab, grammar_mask);
+    Ok(Some(grammar_mask))
+}
+
+fn advance_grammar(
+    grammar_active: bool,
+    matcher: &mut Option<Box<dyn hipfire_runtime::arch_dispatch::GrammarMatcher>>,
+    text: &str,
+) -> Result<(bool, bool), String> {
+    if !grammar_active {
+        return Ok((false, false));
+    }
+    let matcher = matcher
+        .as_deref_mut()
+        .ok_or_else(|| "grammar matcher unavailable".to_string())?;
+    let was_detected = matcher.attractor_detected();
+    matcher.advance(text);
+    Ok((was_detected, matcher.attractor_detected()))
+}
+
+/// Apply the ChatML turn trailer only after a normal decode completion. The
+/// callback commits each token only after its forward succeeds, so a failed
+/// trailer cannot publish partial conversation state.
+fn apply_chatml_trailer(
+    last_token: Option<u32>,
+    seq_pos: &mut usize,
+    im_end_token: Option<u32>,
+    nl: &[u32],
+    mut forward_and_commit: impl FnMut(u32, usize) -> Result<usize, String>,
+) -> Result<(), String> {
+    if im_end_token != last_token || nl.is_empty() {
+        return Ok(());
+    }
+    for &token in nl {
+        *seq_pos = forward_and_commit(token, *seq_pos)?;
+    }
+    Ok(())
+}
+
+/// Settle the parser only for a normal completion. Abort and error outcomes
+/// deliberately consume and drop it without calling `finish`, so buffered
+/// parser state cannot leak into a later request.
+fn settle_ar_parser(
+    parser: Box<dyn hipfire_runtime::stream_parser::StreamParser>,
+    outcome: ArDecodeOutcome,
+    mut render: impl FnMut(hipfire_runtime::stream_parser::StreamAction),
+) -> ArDecodeOutcome {
+    match outcome {
+        ArDecodeOutcome::Complete => {
+            let mut parser = parser;
+            for action in parser.finish() {
+                render(action);
+            }
+            ArDecodeOutcome::Complete
+        }
+        terminal @ (ArDecodeOutcome::Aborted | ArDecodeOutcome::Error(_)) => {
+            drop(parser);
+            terminal
+        }
+    }
+}
+
+/// Run the shared normal-completion path. Keeping trailer processing here,
+/// outside the decode control block, makes every normal exit (EOS, parser or
+/// forced stop, budget, and length) update the same ChatML state before parser
+/// settlement. Abort/error outcomes skip it and discard the parser.
+fn complete_ar_decode(
+    parser: Box<dyn hipfire_runtime::stream_parser::StreamParser>,
+    outcome: ArDecodeOutcome,
+    last_token: Option<u32>,
+    seq_pos: &mut usize,
+    im_end_token: Option<u32>,
+    nl: &[u32],
+    forward_and_commit: impl FnMut(u32, usize) -> Result<usize, String>,
+    render: impl FnMut(hipfire_runtime::stream_parser::StreamAction),
+) -> ArDecodeOutcome {
+    let outcome = match outcome {
+        ArDecodeOutcome::Complete => {
+            match apply_chatml_trailer(last_token, seq_pos, im_end_token, nl, forward_and_commit) {
+                Ok(()) => ArDecodeOutcome::Complete,
+                Err(error) => ArDecodeOutcome::Error(format!("ChatML trailer forward: {error}")),
+            }
+        }
+        terminal => terminal,
+    };
+    settle_ar_parser(parser, outcome, render)
+}
+
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn ar_generate(
@@ -8259,7 +9459,7 @@ fn ar_generate(
     // panic that kills the serve thread. Shared by all arches on this driver (the
     // deleted generate_dense had an equivalent `fail!`; the EP/dense folds inherit
     // this). Used as an expression (yields the Ok value) or a statement.
-    macro_rules! hook_or_fail {
+    macro_rules! prefill_hook_or_fail {
         ($call:expr, $what:expr) => {
             match $call {
                 Ok(v) => v,
@@ -8294,13 +9494,13 @@ fn ar_generate(
             let space = window.saturating_sub(seq_pos).max(1);
             let chunk_len = remaining.len().min(space);
             let (chunk, rest) = remaining.split_at(chunk_len);
-            hook_or_fail!(
+            prefill_hook_or_fail!(
                 dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos),
                 "prefill forward"
             );
             seq_pos += chunk_len;
             if let Some(new_phys) =
-                hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
+                prefill_hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
             {
                 seq_pos = new_phys;
             }
@@ -8318,7 +9518,7 @@ fn ar_generate(
             }
             let end = (start + chunk_max).min(new_tokens.len());
             let chunk = &new_tokens[start..end];
-            hook_or_fail!(
+            prefill_hook_or_fail!(
                 dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos),
                 "prefill forward"
             );
@@ -8332,7 +9532,6 @@ fn ar_generate(
     }
     if prefill_aborted {
         dispatch.abort_zero_recurrent(ctx.reborrow());
-        seq_pos = 0;
         dispatch.set_seq_pos(0);
         dispatch.conversation_tokens_mut().clear();
         dispatch.free_prefill_checkpoints(ctx.reborrow());
@@ -8441,16 +9640,16 @@ fn ar_generate(
         min_p,
     };
     let tok0 = {
-        let mask: Option<&[bool]> = if grammar_active && !matcher.as_ref().unwrap().is_free() {
-            matcher
-                .as_ref()
-                .unwrap()
-                .token_mask(grammar_vocab, &mut grammar_mask);
-            Some(&grammar_mask)
-        } else {
-            None
-        };
-        hook_or_fail!(
+        let mask = prefill_hook_or_fail!(
+            grammar_mask_for_sample(
+                grammar_active,
+                matcher.as_deref(),
+                grammar_vocab,
+                &mut grammar_mask,
+            ),
+            "grammar mask"
+        );
+        prefill_hook_or_fail!(
             dispatch.sample(
                 ctx.reborrow(),
                 &cfg0,
@@ -8464,7 +9663,10 @@ fn ar_generate(
     };
     if grammar_active {
         let text = dispatch.tokenizer().decode(&[tok0]);
-        matcher.as_mut().unwrap().advance(&text);
+        prefill_hook_or_fail!(
+            advance_grammar(grammar_active, &mut matcher, &text),
+            "grammar advance"
+        );
     }
     let t_prefill = Instant::now();
     let mut next_token = tok0;
@@ -8579,26 +9781,36 @@ fn ar_generate(
     // splice); sampled tokens go through `feed`. tok0 is sampled → false.
     let mut was_forced = false;
 
+    let decode_outcome = 'decode: {
+        // After parser construction, errors leave through the local outcome so
+        // the parser can be discarded without running its finish epilogue.
+        macro_rules! hook_or_fail {
+            ($call:expr, $what:expr) => {
+                match $call {
+                    Ok(v) => v,
+                    Err(e) => {
+                        break 'decode route_ar_decode_outcome(
+                            false,
+                            Some(format!("{}: {}", $what, e)),
+                        )
+                    }
+                }
+            };
+        }
+
     while generated < max_tokens {
         if check_abort(id) {
             // Client cancelled mid-decode — full cold reset (mirrors DFlash abort).
-            seq_pos = 0;
-            dispatch.set_seq_pos(0);
-            dispatch.conversation_tokens_mut().clear();
-            dispatch.free_prefill_checkpoints(ctx.reborrow());
-            dispatch.abort_zero_recurrent(ctx.reborrow());
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-                id
-            );
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
-                id, generated
-            );
-            let _ = stdout.flush();
-            return;
+                break 'decode route_ar_decode_outcome(false, None);
+            }
+            if decode_limit_reached(
+                max_tokens,
+                generated,
+                dispatch.physical_cap(),
+                seq_pos,
+                dispatch.has_eviction(),
+            ) {
+                break 'decode route_ar_decode_outcome(true, None);
         }
         // ── eos / im_end pre-decision (BEFORE commit) ────────────────────────
         // A sampled eos consults the parser's discipline. `CommitAndStop` (the
@@ -8609,23 +9821,20 @@ fn ar_generate(
         // breaks without committing. Forced tokens are never eos.
         let mut eos_commit_and_stop = false;
         if !was_forced && (dispatch.is_eos(next_token) || im_end_token == Some(next_token)) {
-            match parser.on_eos() {
-                hipfire_runtime::stream_parser::EosDecision::Stop => break,
-                hipfire_runtime::stream_parser::EosDecision::Inject(v) => {
-                    for t in v {
-                        parser.enqueue(t);
+                match ar_sampled_eos(parser.as_mut()) {
+                    ArSampledEos::Stop => {
+                        break 'decode route_ar_decode_outcome(true, None);
                     }
-                    match parser.next_forced() {
-                        Some(f) => {
+                    ArSampledEos::CommitAndStop => {
+                        eos_commit_and_stop = true;
+                    }
+                    ArSampledEos::Forced(f) => {
                             next_token = f;
                             was_forced = true;
                             continue;
                         }
-                        None => break,
-                    }
-                }
-                hipfire_runtime::stream_parser::EosDecision::CommitAndStop => {
-                    eos_commit_and_stop = true;
+                    ArSampledEos::Error(message) => {
+                        break 'decode route_ar_decode_outcome(false, Some(message));
                 }
             }
         }
@@ -8651,9 +9860,10 @@ fn ar_generate(
             nb
         };
 
-        dispatch
-            .decode_step_forward(ctx.reborrow(), next_token, seq_pos)
-            .unwrap();
+            hook_or_fail!(
+                dispatch.decode_step_forward(ctx.reborrow(), next_token, seq_pos),
+                "token forward"
+            );
         seq_pos += 1;
         if ckpt_resume_enabled() {
             dispatch.take_prefill_checkpoint(ctx.reborrow(), seq_pos);
@@ -8672,7 +9882,7 @@ fn ar_generate(
             for act in parser.emit_only(next_token, &new_bytes) {
                 exec_stream_action!(act);
             }
-            break;
+                break 'decode route_ar_decode_outcome(true, None);
         }
 
         // ── Output shaping + guards ──────────────────────────────────────────
@@ -8681,21 +9891,27 @@ fn ar_generate(
         // guards). Sampled tokens go through `feed` (emit + stop-seq + think-cap enqueue
         // + n-gram); a `Stop` action breaks the loop.
         if was_forced {
-            for act in parser.emit_only(next_token, &new_bytes) {
+                let actions = parser.emit_only(next_token, &new_bytes);
+                let stop = stream_stop(&actions);
+                for act in actions {
+                    if !matches!(act, hipfire_runtime::stream_parser::StreamAction::Stop) {
                 exec_stream_action!(act);
             }
+                }
+                if stop {
+                    break 'decode route_ar_decode_outcome(true, None);
+                }
         } else {
             parser.note_force_answer(check_force_answer(id));
-            let mut feed_stop = false;
-            for act in parser.feed(next_token, &new_bytes) {
-                if matches!(act, hipfire_runtime::stream_parser::StreamAction::Stop) {
-                    feed_stop = true;
-                } else {
+                let actions = parser.feed(next_token, &new_bytes);
+                let stop = stream_stop(&actions);
+                for act in actions {
+                    if !matches!(act, hipfire_runtime::stream_parser::StreamAction::Stop) {
                     exec_stream_action!(act);
                 }
             }
-            if feed_stop {
-                break;
+                if stop {
+                    break 'decode route_ar_decode_outcome(true, None);
             }
         }
 
@@ -8743,15 +9959,19 @@ fn ar_generate(
                     min_p,
                 };
                 next_token = {
-                    let mask: Option<&[bool]> =
-                        if grammar_active && !matcher.as_ref().unwrap().is_free() {
-                            matcher
-                                .as_ref()
-                                .unwrap()
-                                .token_mask(grammar_vocab, &mut grammar_mask);
-                            Some(&grammar_mask)
-                        } else {
-                            None
+                        let mask = match grammar_mask_for_sample(
+                            grammar_active,
+                            matcher.as_deref(),
+                            grammar_vocab,
+                            &mut grammar_mask,
+                        ) {
+                            Ok(mask) => mask,
+                            Err(message) => {
+                                break 'decode route_ar_decode_outcome(
+                                    false,
+                                    Some(format!("grammar mask: {message}")),
+                                );
+                            }
                         };
                     hook_or_fail!(
                         dispatch.sample(
@@ -8767,7 +9987,12 @@ fn ar_generate(
                 };
                 if grammar_active {
                     let text = dispatch.tokenizer().decode(&[next_token]);
-                    matcher.as_mut().unwrap().advance(&text);
+                        if let Err(message) = advance_grammar(grammar_active, &mut matcher, &text) {
+                            break 'decode route_ar_decode_outcome(
+                                false,
+                                Some(format!("grammar advance: {message}")),
+                            );
+                        }
                 }
                 was_forced = false;
                 continue;
@@ -8783,7 +10008,8 @@ fn ar_generate(
                         .saturating_sub(nudge_len),
                 )
                 .saturating_add(nl.len());
-            if nudge_len > 0 && (dispatch.has_eviction() || need_kv <= dispatch.physical_cap()) {
+                if nudge_len > 0 && (dispatch.has_eviction() || need_kv <= dispatch.physical_cap())
+                {
                 for &tok in &nudge_tokens[..nudge_len] {
                     dispatch.conversation_tokens_mut().push(tok);
                     streamed_tokens.push(tok);
@@ -8805,20 +10031,28 @@ fn ar_generate(
                     };
                     // Nudge tokens bypass the guards (like the think-cap splice) — emit
                     // through the parser's filter, no feed().
-                    for act in parser.emit_only(tok, &new_bytes2) {
+                        let actions = parser.emit_only(tok, &new_bytes2);
+                        let stop = stream_stop(&actions);
+                        for act in actions {
+                            if !matches!(act, hipfire_runtime::stream_parser::StreamAction::Stop) {
                         exec_stream_action!(act);
                     }
+                        }
                     hook_or_fail!(
                         dispatch.decode_step_forward(ctx.reborrow(), tok, seq_pos),
-                        "decode forward"
+                            "budget nudge forward"
                     );
                     seq_pos += 1;
-                    if let Some(new_phys) =
-                        hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
-                    {
+                        if let Some(new_phys) = hook_or_fail!(
+                            dispatch.maybe_evict(ctx.reborrow(), seq_pos),
+                            "kv eviction"
+                        ) {
                         seq_pos = new_phys;
                     }
                     generated += 1;
+                        if stop {
+                            break 'decode route_ar_decode_outcome(true, None);
+                        }
                 }
             } else if nudge_len < nudge_tokens.len() {
                 let _ = writeln!(
@@ -8836,7 +10070,7 @@ fn ar_generate(
                 let _ = stdout.flush();
             }
             if generated >= max_tokens {
-                break;
+                    break 'decode route_ar_decode_outcome(true, None);
             }
         }
 
@@ -8848,7 +10082,12 @@ fn ar_generate(
             was_forced = true;
             if grammar_active {
                 let text = dispatch.tokenizer().decode(&[f]);
-                matcher.as_mut().unwrap().advance(&text);
+                    if let Err(message) = advance_grammar(grammar_active, &mut matcher, &text) {
+                        break 'decode route_ar_decode_outcome(
+                            false,
+                            Some(format!("grammar advance: {message}")),
+                        );
+                    }
             }
             continue;
         }
@@ -8881,14 +10120,19 @@ fn ar_generate(
             min_p,
         };
         next_token = {
-            let mask: Option<&[bool]> = if grammar_active && !matcher.as_ref().unwrap().is_free() {
-                matcher
-                    .as_ref()
-                    .unwrap()
-                    .token_mask(grammar_vocab, &mut grammar_mask);
-                Some(&grammar_mask)
-            } else {
-                None
+                let mask = match grammar_mask_for_sample(
+                    grammar_active,
+                    matcher.as_deref(),
+                    grammar_vocab,
+                    &mut grammar_mask,
+                ) {
+                    Ok(mask) => mask,
+                    Err(message) => {
+                        break 'decode route_ar_decode_outcome(
+                            false,
+                            Some(format!("grammar mask: {message}")),
+                        );
+                    }
             };
             hook_or_fail!(
                 dispatch.sample(
@@ -8904,9 +10148,17 @@ fn ar_generate(
         };
         if grammar_active {
             let text = dispatch.tokenizer().decode(&[next_token]);
-            let was_detected = matcher.as_ref().unwrap().attractor_detected();
-            matcher.as_mut().unwrap().advance(&text);
-            if !was_detected && matcher.as_ref().unwrap().attractor_detected() {
+                let (was_detected, is_detected) =
+                    match advance_grammar(grammar_active, &mut matcher, &text) {
+                        Ok(states) => states,
+                        Err(message) => {
+                            break 'decode route_ar_decode_outcome(
+                                false,
+                                Some(format!("grammar advance: {message}")),
+                            );
+                        }
+                    };
+                if !was_detected && is_detected {
                 eprintln!(
                     "[grammar-ngram] attractor detected in tool_call args at gen={} — forcing close",
                     generated,
@@ -8915,33 +10167,71 @@ fn ar_generate(
         }
     }
 
-    // End-of-generation flush. DefaultStreamParser returns nothing here (byte-identical
-    // for the 5 simple arches); Cohere2MoeStreamParser runs its tool-call-as-text recovery
-    // (re-parses vis_buf for a Cohere action written as visible text — Guard 4), emitting a
-    // `tool_calls` event the driver's ChatML `extract_tool_calls_from_text` below cannot.
-    for act in parser.finish() {
-        exec_stream_action!(act);
-    }
+        route_ar_decode_outcome(true, None)
+    };
 
-    // ChatML \n trailer after <|im_end|>.
-    let last_conv = dispatch
-        .conversation_tokens_mut()
-        .last()
-        .copied()
-        .unwrap_or(0);
-    if im_end_token == Some(last_conv) && !nl.is_empty() {
-        for &t in nl {
-            hook_or_fail!(
-                dispatch.decode_step_forward(ctx.reborrow(), t, seq_pos),
-                "decode forward"
-            );
-            seq_pos += 1;
-            if let Some(new_phys) =
-                hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
+    let last_conv = dispatch.conversation_tokens_mut().last().copied();
+    let decode_outcome = complete_ar_decode(
+        parser,
+        decode_outcome,
+        last_conv,
+        &mut seq_pos,
+        im_end_token,
+        nl,
+        |token, position| {
+            dispatch
+                .decode_step_forward(ctx.reborrow(), token, position)
+                .map_err(|e| e.to_string())?;
+            let mut next_position = position + 1;
+            if let Some(new_phys) = dispatch
+                .maybe_evict(ctx.reborrow(), next_position)
+                .map_err(|e| format!("kv eviction: {e}"))?
             {
-                seq_pos = new_phys;
+                next_position = new_phys;
+    }
+            dispatch.conversation_tokens_mut().push(token);
+            Ok(next_position)
+        },
+        |act| {
+            exec_stream_action!(act);
+        },
+    );
+
+    match decode_outcome {
+        ArDecodeOutcome::Complete => {}
+        ArDecodeOutcome::Aborted => {
+            // The parser was consumed by settle_ar_parser without finish.
+            dispatch.set_seq_pos(0);
+            dispatch.conversation_tokens_mut().clear();
+            dispatch.free_prefill_checkpoints(ctx.reborrow());
+            dispatch.abort_zero_recurrent(ctx.reborrow());
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
+                id
+            );
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
+                id, generated
+            );
+            let _ = stdout.flush();
+            return;
             }
-            dispatch.conversation_tokens_mut().push(t);
+        ArDecodeOutcome::Error(message) => {
+            // The parser was consumed by settle_ar_parser without finish.
+            dispatch.abort_zero_recurrent(ctx.reborrow());
+            dispatch.set_seq_pos(0);
+            dispatch.conversation_tokens_mut().clear();
+            dispatch.free_prefill_checkpoints(ctx.reborrow());
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":{}}}"#,
+                id,
+                serde_json::to_string(&message).unwrap_or_default()
+            );
+            let _ = stdout.flush();
+            return;
         }
     }
 
@@ -11212,6 +12502,24 @@ fn generate_deepseek4_spec(
     let _ = stdout.flush();
 }
 
+/// Local terminal policy for DeepSeek's bespoke AR parser. The parser owns
+/// buffered DSML/text state and its `finish` consumes it, so normal completion
+/// is the sole path that may render final events. Abort/error paths explicitly
+/// discard the parser without invoking `finish`.
+fn settle_deepseek4_ar_parser(
+    parser: hipfire_arch_deepseek4::dsml::StreamParser,
+    normal_completion: bool,
+    mut render: impl FnMut(hipfire_arch_deepseek4::dsml::StreamEvent),
+) {
+    if normal_completion {
+        for event in parser.finish() {
+            render(event);
+        }
+    } else {
+        drop(parser);
+    }
+}
+
 fn generate_deepseek4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -11473,6 +12781,10 @@ fn generate_deepseek4(
     let last_logits = match prefill_result {
         Ok(l) => l,
         Err(e) => {
+            // Release the architecture borrows before the canonical reset;
+            // otherwise this path can emit an error while dirty DS4 rings and
+            // session tokens remain reusable by turn two.
+            model_reset_context(m, gpu);
             emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
             return;
         }
@@ -11708,6 +13020,25 @@ fn generate_deepseek4(
         };
 
         while generated_count < max_tokens && next_tok != eos_tok {
+            if check_abort(id) {
+                // Cancellation is terminal but not a normal stream end: drop
+                // the parser's buffered DSML/text state without flushing it.
+                settle_deepseek4_ar_parser(parser, false, |_| {});
+                drop(absorb_event);
+                model_reset_context(m, gpu);
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
+                    id
+                );
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{}}}"#,
+                    id, generated_count
+                );
+                let _ = stdout.flush();
+                return;
+            }
             let frag = tokenizer.decode(&[next_tok]);
             for ev in parser.feed(&frag) {
                 absorb_event(&ev);
@@ -11742,17 +13073,22 @@ fn generate_deepseek4(
                     pos += 1;
                 }
                 Err(e) => {
+                    // GPU errors must not run the parser's terminal flush.
+                    settle_deepseek4_ar_parser(parser, false, |_| {});
+                    drop(absorb_event);
+                    model_reset_context(m, gpu);
                     emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
                     let _ = stdout.flush();
                     return;
                 }
             }
         }
-        // Flush any buffered partial markers / content.
-        for ev in parser.finish() {
+        // Local normal-completion epilogue: EOS, stop, budget, and length all
+        // flush exactly once before the done envelope is written below.
+        settle_deepseek4_ar_parser(parser, true, |ev| {
             absorb_event(&ev);
             emit_stream_event(stdout, id, ev);
-        }
+        });
         let _ = stdout.flush();
 
         // Cache the just-emitted token sequence under its (content,
@@ -12465,6 +13801,7 @@ struct Cohere2MoeStreamParser {
     emitted_visible: bool,
     eos_suppressions: usize,
     tool_calls_emitted: bool,
+    finish_latched: bool,
     last_tok: u32,
     repeat_run: usize,
     mk_think0: u32,
@@ -12553,6 +13890,7 @@ impl Cohere2MoeStreamParser {
             emitted_visible: false,
             eos_suppressions: 0,
             tool_calls_emitted: false,
+            finish_latched: false,
             last_tok: u32::MAX,
             repeat_run: 0,
             mk_think0: mark("<|START_THINKING|>", 255010),
@@ -12565,6 +13903,41 @@ impl Cohere2MoeStreamParser {
             known_tools,
             tool_params,
         }
+    }
+
+    fn process_marker(
+        &mut self,
+        tok: u32,
+    ) -> Option<Vec<hipfire_runtime::stream_parser::StreamAction>> {
+        use hipfire_runtime::stream_parser::StreamAction;
+        let mut acts = Vec::new();
+        if tok == self.mk_think0 {
+            self.sec = C2mSec::Think;
+        } else if tok == self.mk_text0 {
+            self.sec = C2mSec::Text;
+        } else if tok == self.mk_act0 {
+            self.sec = C2mSec::Action;
+            self.action_buf.clear();
+        } else if tok == self.mk_think1 || tok == self.mk_text1 {
+            self.sec = C2mSec::Pre;
+        } else if tok == self.mk_act1 {
+            let action = std::mem::take(&mut self.action_buf);
+            let mut calls = cohere2moe::spec_emit::parse_cohere_action(&action);
+            cohere2moe::spec_emit::snap_call_names(
+                &mut calls,
+                &self.known_tools,
+                &self.tool_params,
+            );
+            if !calls.is_empty() {
+                acts.push(StreamAction::ToolCalls(serde_json::json!(calls)));
+                self.emitted_visible = true;
+                self.tool_calls_emitted = true;
+            }
+            self.sec = C2mSec::Pre;
+        } else {
+            return None;
+        }
+        Some(acts)
     }
 }
 
@@ -12640,28 +14013,8 @@ impl hipfire_runtime::stream_parser::StreamParser for Cohere2MoeStreamParser {
         }
 
         // Agentic-marker state machine (12750–12822) — markers themselves never emit.
-        if tok == self.mk_think0 {
-            self.sec = C2mSec::Think;
-        } else if tok == self.mk_text0 {
-            self.sec = C2mSec::Text;
-        } else if tok == self.mk_act0 {
-            self.sec = C2mSec::Action;
-            self.action_buf.clear();
-        } else if tok == self.mk_think1 || tok == self.mk_text1 {
-            self.sec = C2mSec::Pre;
-        } else if tok == self.mk_act1 {
-            let mut calls = cohere2moe::spec_emit::parse_cohere_action(&self.action_buf);
-            cohere2moe::spec_emit::snap_call_names(
-                &mut calls,
-                &self.known_tools,
-                &self.tool_params,
-            );
-            if !calls.is_empty() {
-                acts.push(StreamAction::ToolCalls(serde_json::json!(calls)));
-                self.emitted_visible = true;
-                self.tool_calls_emitted = true;
-            }
-            self.sec = C2mSec::Pre;
+        if let Some(marker_acts) = self.process_marker(tok) {
+            return marker_acts;
         } else {
             let frag = String::from_utf8_lossy(bytes);
             // Defense-in-depth marker suppression (12789–12796): any OTHER special
@@ -12696,20 +14049,49 @@ impl hipfire_runtime::stream_parser::StreamParser for Cohere2MoeStreamParser {
         acts
     }
 
+    fn emit_only(
+        &mut self,
+        tok: u32,
+        bytes: &[u8],
+    ) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
+        // Forced continuation markers bypass feed's guards, but must still perform
+        // the Cohere section transition and suppress their decoded marker bytes.
+        if let Some(marker_acts) = self.process_marker(tok) {
+            return marker_acts;
+        }
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        vec![hipfire_runtime::stream_parser::StreamAction::Emit {
+            text: String::from_utf8_lossy(bytes).into_owned(),
+            reasoning: false,
+        }]
+    }
+
     fn finish(&mut self) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
         use hipfire_runtime::stream_parser::StreamAction;
+        if self.finish_latched {
+            return Vec::new();
+        }
+        self.finish_latched = true;
+
         // Tool-call-as-text recovery (12851–12866).
-        if !self.tool_calls_emitted {
-            let mut recovered = cohere2moe::spec_emit::parse_cohere_action(&self.vis_buf);
+        let mut recovered = cohere2moe::spec_emit::parse_cohere_action(&self.action_buf);
+        if recovered.is_empty() && !self.tool_calls_emitted {
+            recovered = cohere2moe::spec_emit::parse_cohere_action(&self.vis_buf);
+        }
             if !recovered.is_empty() {
                 cohere2moe::spec_emit::snap_call_names(
                     &mut recovered,
                     &self.known_tools,
                     &self.tool_params,
                 );
+            self.action_buf.clear();
+            self.vis_buf.clear();
                 return vec![StreamAction::ToolCalls(serde_json::json!(recovered))];
             }
-        }
+        self.action_buf.clear();
+        self.vis_buf.clear();
         Vec::new()
     }
 }
@@ -14545,9 +15927,293 @@ mod tool_call_parser_tests {
 }
 
 #[cfg(test)]
+mod ar_parser_lifecycle_tests {
+    use super::{
+        ar_sampled_eos, complete_ar_decode, decode_limit_reached, route_ar_decode_outcome,
+        stream_stop, ArDecodeOutcome, ArSampledEos,
+    };
+    use hipfire_runtime::stream_parser::{EosDecision, StreamAction, StreamParser};
+    use std::sync::{Arc, Mutex};
+
+    struct LifecycleParser {
+        finish_count: Arc<std::sync::atomic::AtomicUsize>,
+        eos: EosDecision,
+    }
+
+    impl StreamParser for LifecycleParser {
+        fn feed(&mut self, _tok: u32, _bytes: &[u8]) -> Vec<StreamAction> {
+            Vec::new()
+        }
+
+        fn finish(&mut self) -> Vec<StreamAction> {
+            self.finish_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![StreamAction::Emit {
+                text: "flushed".into(),
+                reasoning: false,
+            }]
+        }
+
+        fn on_eos(&mut self) -> EosDecision {
+            self.eos.clone()
+        }
+    }
+
+    fn parser(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Box<dyn StreamParser> {
+        Box::new(LifecycleParser {
+            finish_count: Arc::clone(counter),
+            eos: EosDecision::Stop,
+        })
+    }
+
+    fn assert_normal_completion(control: &str, outcome: ArDecodeOutcome) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let forward_events = Arc::clone(&events);
+        let render_events = Arc::clone(&events);
+        let mut conversation = vec![1, 42];
+        let mut seq_pos = 10;
+        let result = complete_ar_decode(
+            parser(&count),
+            outcome,
+            conversation.last().copied(),
+            &mut seq_pos,
+            Some(42),
+            &[99],
+            |token, position| {
+                forward_events
+                    .lock()
+                    .unwrap()
+                    .push(format!("forward:{token}@{position}"));
+                conversation.push(token);
+                Ok(position + 1)
+            },
+            move |action| {
+                assert!(
+                    matches!(action, StreamAction::Emit { .. }),
+                    "control={control}"
+                );
+                render_events.lock().unwrap().push("finish".into());
+            },
+        );
+
+        assert_eq!(result, ArDecodeOutcome::Complete, "control={control}");
+        assert_eq!(conversation, vec![1, 42, 99], "control={control}");
+        assert_eq!(seq_pos, 11, "control={control}");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["forward:99@10", "finish"],
+            "control={control}"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sampled_eos_routes_to_normal_completion() {
+        assert_normal_completion("sampled EOS", route_ar_decode_outcome(true, None));
+    }
+
+    #[test]
+    fn forced_stop_routes_to_normal_completion() {
+        assert_normal_completion("forced stop", route_ar_decode_outcome(true, None));
+    }
+
+    #[test]
+    fn budget_stop_routes_to_normal_completion() {
+        assert_normal_completion("budget stop", route_ar_decode_outcome(true, None));
+    }
+
+    #[test]
+    fn length_routes_to_normal_completion() {
+        assert_normal_completion("length", route_ar_decode_outcome(true, None));
+    }
+
+    #[test]
+    fn stream_stop_detects_normal_parser_control() {
+        let stop = [StreamAction::Stop];
+        assert!(stream_stop(&stop));
+        assert!(!stream_stop(&[]));
+    }
+
+    #[test]
+    fn decode_limits_stop_the_loop() {
+        assert!(decode_limit_reached(8, 8, 8, 8, false));
+        assert!(decode_limit_reached(8, 7, 8, 8, false));
+        assert!(!decode_limit_reached(8, 7, 8, 8, true));
+        assert!(!decode_limit_reached(8, 7, 8, 7, false));
+    }
+
+    #[test]
+    fn sampled_eos_injection_requires_a_forced_token() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut stop_parser = LifecycleParser {
+            finish_count: Arc::clone(&count),
+            eos: EosDecision::Stop,
+        };
+        assert_eq!(ar_sampled_eos(&mut stop_parser), ArSampledEos::Stop);
+        let mut commit_parser = LifecycleParser {
+            finish_count: Arc::clone(&count),
+            eos: EosDecision::CommitAndStop,
+        };
+        assert_eq!(
+            ar_sampled_eos(&mut commit_parser),
+            ArSampledEos::CommitAndStop
+        );
+        let mut parser = LifecycleParser {
+            finish_count: count,
+            eos: EosDecision::Inject(Vec::new()),
+        };
+        assert_eq!(
+            ar_sampled_eos(&mut parser),
+            ArSampledEos::Error("sampled eos injection produced no forced token".into())
+        );
+    }
+
+    #[test]
+    fn failed_forced_dequeue_is_an_error_not_normal_completion() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut parser = LifecycleParser {
+            finish_count: count,
+            eos: EosDecision::Inject(vec![42]),
+        };
+        assert_eq!(
+            ar_sampled_eos(&mut parser),
+            ArSampledEos::Error("sampled eos injection failed forced dequeue".into())
+        );
+    }
+
+    #[test]
+    fn abort_and_error_discard_without_events_or_finish() {
+        for outcome in [
+            route_ar_decode_outcome(false, None),
+            route_ar_decode_outcome(false, Some("token forward: test failure".into())),
+        ] {
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let forward_events = Arc::clone(&events);
+            let settle_events = Arc::clone(&events);
+            let expected = format!("{outcome:?}");
+            let mut seq_pos = 10;
+            let mut conversation = vec![1, 42];
+            let result = complete_ar_decode(
+                parser(&count),
+                outcome,
+                Some(42),
+                &mut seq_pos,
+                Some(42),
+                &[99],
+                |token, _| {
+                    conversation.push(token);
+                    forward_events.lock().unwrap().push("unexpected-forward");
+                    Ok(11)
+                },
+                move |_| {
+                    settle_events.lock().unwrap().push("unexpected-event");
+                },
+            );
+
+            assert_eq!(format!("{result:?}"), expected);
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(events.lock().unwrap().is_empty());
+            assert_eq!(seq_pos, 10);
+            assert_eq!(conversation, vec![1, 42]);
+        }
+    }
+
+    #[test]
+    fn trailer_forward_failure_is_controlled_error_and_discards_parser() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut seq_pos = 10;
+        let conversation = vec![1, 42];
+        let result = complete_ar_decode(
+            parser(&count),
+            ArDecodeOutcome::Complete,
+            Some(42),
+            &mut seq_pos,
+            Some(42),
+            &[99],
+            |_token, _| Err::<usize, _>("GPU failed".into()),
+            |_| panic!("failed trailer must not settle parser"),
+        );
+
+        assert_eq!(
+            result,
+            ArDecodeOutcome::Error("ChatML trailer forward: GPU failed".into())
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(seq_pos, 10);
+        assert_eq!(conversation, vec![1, 42]);
+    }
+}
+
+#[cfg(test)]
+mod terminal_epilogue_policy_tests {
+    use super::{finish_qwen35_pp_filter, qwen35_pp_eos_filter_config, settle_deepseek4_ar_parser};
+    use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+
+    #[test]
+    fn qwen35_pp_production_config_stops_and_returns_safe_prefix() {
+        let mut filter = EosFilter::new(qwen35_pp_eos_filter_config(&["<stop>".into()]));
+
+        assert_eq!(
+            filter.observe(b"safe<stop>post-marker"),
+            FilterAction::Stop {
+                emit: b"safe".to_vec()
+            }
+        );
+        assert!(matches!(
+            filter.observe(b"must-not-leak"),
+            FilterAction::Hold
+        ));
+        assert!(filter.finish().is_empty());
+    }
+
+    #[test]
+    fn qwen35_filter_flushes_safe_tail_once() {
+        let mut filter = EosFilter::new(EosFilterConfig {
+            stop_at: vec![b"<stop>".to_vec()],
+            ..EosFilterConfig::default()
+        });
+        assert_eq!(filter.observe(b"<sto"), FilterAction::Hold);
+
+        assert_eq!(
+            finish_qwen35_pp_filter(&mut filter).as_deref(),
+            Some("<sto")
+        );
+        // The local terminal epilogue is idempotent at the filter boundary;
+        // no second terminal event can be rendered.
+        assert_eq!(finish_qwen35_pp_filter(&mut filter), None);
+    }
+
+    #[test]
+    fn deepseek_normal_epilogue_renders_buffered_text() {
+        let mut parser = hipfire_arch_deepseek4::dsml::StreamParser::new();
+        assert!(parser.feed("<th").is_empty());
+        let mut events = Vec::new();
+        settle_deepseek4_ar_parser(parser, true, |event| events.push(event));
+
+        assert_eq!(
+            events,
+            vec![hipfire_arch_deepseek4::dsml::StreamEvent::Token(
+                "<th".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn deepseek_abort_or_error_discards_buffered_text() {
+        let mut parser = hipfire_arch_deepseek4::dsml::StreamParser::new();
+        assert!(parser.feed("<th").is_empty());
+        let mut events = Vec::new();
+        settle_deepseek4_ar_parser(parser, false, |event| events.push(event));
+        assert!(events.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod c2m_stream_parser_tests {
     use super::{C2mSec, Cohere2MoeStreamParser};
-    use hipfire_runtime::stream_parser::{StreamAction, StreamParser};
+    use hipfire_runtime::stream_parser::{EosDecision, StreamAction, StreamParser};
 
     // Build a parser with explicit test marker ids (bypasses tokenizer/new()).
     fn mk() -> Cohere2MoeStreamParser {
@@ -14563,6 +16229,7 @@ mod c2m_stream_parser_tests {
             emitted_visible: false,
             eos_suppressions: 0,
             tool_calls_emitted: false,
+            finish_latched: false,
             last_tok: u32::MAX,
             repeat_run: 0,
             mk_think0: 10,
@@ -14602,7 +16269,6 @@ mod c2m_stream_parser_tests {
 
     #[test]
     fn empty_turn_guard_injects_start_text_then_stops() {
-        use hipfire_runtime::stream_parser::EosDecision;
         let mut p = mk();
         // Inside Think, nothing visible → on_eos injects [END_THINKING, START_TEXT].
         let _ = p.feed(10, b""); // enter Think
@@ -14614,6 +16280,124 @@ mod c2m_stream_parser_tests {
         p.emitted_visible = false;
         p.eos_suppressions = Cohere2MoeStreamParser::MAX_EOS_SUPPRESS;
         assert_eq!(p.on_eos(), EosDecision::Stop);
+    }
+
+    #[test]
+    fn eos_injection_is_not_terminal() {
+        let mut p = mk();
+        let _ = p.feed(10, b""); // enter Think
+        assert!(matches!(p.on_eos(), EosDecision::Inject(_)));
+
+        // The injected continuation is followed by ordinary decoding.
+        assert_eq!(p.feed(11, b""), Vec::new());
+        assert_eq!(p.feed(12, b""), Vec::new());
+        assert_eq!(
+            p.feed(99, b"answer"),
+            vec![StreamAction::Emit {
+                text: "answer".into(),
+                reasoning: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn forced_marker_emission_updates_section_and_suppresses_marker_bytes() {
+        let mut p = mk();
+        let _ = p.feed(10, b""); // enter Think
+        let EosDecision::Inject(forced) = p.on_eos() else {
+            panic!("expected forced continuation");
+        };
+        for tok in forced {
+            p.enqueue(tok);
+            let tok = p.next_forced().expect("enqueued marker");
+            let marker = match tok {
+                11 => b"<|END_THINKING|>".as_slice(),
+                12 => b"<|START_TEXT|>".as_slice(),
+                other => panic!("unexpected forced token {other}"),
+            };
+            assert_eq!(p.emit_only(tok, marker), Vec::new());
+        }
+        assert_eq!(
+            p.feed(99, b"answer"),
+            vec![StreamAction::Emit {
+                text: "answer".into(),
+                reasoning: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn finish_recovers_complete_pending_action_once() {
+        let mut p = mk();
+        let action = r#"[{"tool_name":"bash","parameters":{"command":"ls"}}]"#;
+        let _ = p.feed(14, b""); // START_ACTION
+        let _ = p.feed(99, action.as_bytes());
+
+        assert_eq!(
+            p.finish(),
+            vec![StreamAction::ToolCalls(serde_json::json!([{
+                "name": "bash",
+                "arguments": { "command": "ls" }
+            }]))]
+        );
+        assert_eq!(p.finish(), Vec::new());
+    }
+
+    #[test]
+    fn finish_recovers_second_complete_action_after_first_closed_action() {
+        let mut p = mk();
+        let first = r#"[{"tool_name":"bash","parameters":{"command":"ls"}}]"#;
+        let second = r#"[{"tool_name":"bash","parameters":{"command":"pwd"}}]"#;
+        let _ = p.feed(14, b""); // START_ACTION
+        let mut actions = p.feed(99, first.as_bytes());
+        actions.extend(p.feed(15, b"")); // END_ACTION
+        let _ = p.feed(14, b""); // START_ACTION
+        let _ = p.feed(99, second.as_bytes());
+        actions.extend(p.finish());
+
+        assert_eq!(
+            actions,
+            vec![
+                StreamAction::ToolCalls(serde_json::json!([{
+                    "name": "bash",
+                    "arguments": { "command": "ls" }
+                }])),
+                StreamAction::ToolCalls(serde_json::json!([{
+                    "name": "bash",
+                    "arguments": { "command": "pwd" }
+                }])),
+            ]
+        );
+        assert_eq!(p.finish(), Vec::new());
+    }
+
+    #[test]
+    fn finish_discards_incomplete_pending_action() {
+        let mut p = mk();
+        let _ = p.feed(14, b""); // START_ACTION
+        let _ = p.feed(
+            99,
+            br#"[{"tool_name":"bash","parameters":{"command":"ls"}}"#,
+        );
+
+        assert_eq!(p.finish(), Vec::new());
+        assert_eq!(p.finish(), Vec::new());
+    }
+
+    #[test]
+    fn repeated_finish_is_silent_after_text_recovery() {
+        let mut p = mk();
+        let text = r#"[{"tool_name":"bash","parameters":{"command":"ls"}}]"#;
+        let _ = p.feed(99, text.as_bytes());
+
+        assert_eq!(
+            p.finish(),
+            vec![StreamAction::ToolCalls(serde_json::json!([{
+                "name": "bash",
+                "arguments": { "command": "ls" }
+            }]))]
+        );
+        assert_eq!(p.finish(), Vec::new());
     }
 }
 

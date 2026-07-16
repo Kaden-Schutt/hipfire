@@ -1047,8 +1047,8 @@ impl Carrier for MinimaxCarrier {
         &self,
         ctx: SpecEmitCtx<'a>,
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
-        // Shared ChatML emitter (same one qwen2 reuses): MiniMax-M2 is ChatML
-        // (`<|im_end|>`), so the generic think/tool-call/EOS scanning applies.
+        // Preserve the generic emitter behavior here.  Carrier-specific
+        // literal terminators are not part of the loader protocol.
         Ok(Qwen35Emit::from_ctx(ctx))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
@@ -1147,8 +1147,8 @@ impl Carrier for Lfm2MoeCarrier {
         &self,
         ctx: SpecEmitCtx<'a>,
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
-        // Shared ChatML emitter (same one qwen2/minimax reuse): LFM2.5 is ChatML
-        // (`<|im_end|>`), no bespoke marker state machine.
+        // Preserve the generic emitter behavior; carrier-owned literal marker
+        // arrays are not part of the loader protocol.
         Ok(Qwen35Emit::from_ctx(ctx))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {

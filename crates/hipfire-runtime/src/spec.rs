@@ -764,6 +764,29 @@ pub trait MtpDrafter {
         cache_hit: bool,
     ) -> Result<u32, String>;
 
+    /// Abort-aware prefill entry point. Existing drafters keep their original
+    /// API and behavior through this default; drafters with interruptible
+    /// target work override it to pass the callback into that work.
+    fn mtp_prefill_abortable(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: Option<&dyn Fn() -> bool>,
+    ) -> Result<Option<u32>, String> {
+        if abort.is_some_and(|check| check()) {
+            return Ok(None);
+        }
+        let first_token = self.mtp_prefill(gpu, target, fill_tokens, start_pos, cache_hit)?;
+        if abort.is_some_and(|check| check()) {
+            Ok(None)
+        } else {
+            Ok(Some(first_token))
+        }
+    }
+
     /// One acceptance window: seed at absolute `position`; draft `k`, verify,
     /// greedily accept the longest matching prefix + bonus. `grammar` is the
     /// IN-STEP grammar (deepseek4 masks draft+verify logits with it; qwen35
@@ -865,8 +888,11 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         prefill_start: usize,
         cache_hit: bool,
         _resume_from: Option<usize>,
-        _abort: &dyn Fn() -> bool,
+        abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        if abort() {
+            return Ok(PrefillOutcome::Aborted);
+        }
         // Cache hit ⇒ warm suffix prefill from `prefill_start`; miss ⇒ full
         // prefill from 0 (the drafter resets recurrent + MTP cache on miss).
         let (fill_tokens, start_pos): (&[u32], usize) = if cache_hit {
@@ -874,10 +900,18 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         } else {
             (prompt_tokens, 0)
         };
-        let first_token = self
-            .arch
-            .mtp_prefill(gpu, target, fill_tokens, start_pos, cache_hit)?;
-        Ok(PrefillOutcome::Ready { first_token })
+        let first_token = self.arch.mtp_prefill_abortable(
+            gpu,
+            target,
+            fill_tokens,
+            start_pos,
+            cache_hit,
+            Some(abort),
+        )?;
+        match first_token {
+            Some(first_token) => Ok(PrefillOutcome::Ready { first_token }),
+            None => Ok(PrefillOutcome::Aborted),
+        }
     }
 
     fn step(
@@ -998,6 +1032,10 @@ pub enum StopReason {
 pub struct EmitOutcome {
     /// Events to render this step, in order.
     pub events: Vec<ClientEvent>,
+    /// Whether this outcome admitted a client-visible generation token.  This
+    /// is deliberately explicit: diagnostics/events are not a generation
+    /// counter (terminal and held tokens may have either).
+    pub generation_advanced: bool,
     /// If set, generation stops after this step's events.
     pub stop: Option<StopReason>,
 }
@@ -1026,6 +1064,10 @@ pub struct FinishSummary {
     pub finish_reason: &'static str,
     /// Number of tool calls parsed this turn (for the `done` envelope).
     pub tool_calls: usize,
+    /// The sealed transcript, when this emitter owns one.  Qwen's ChatML
+    /// emitter is the current cache/replay authority; other emitters retain
+    /// their legacy terminal summaries until they adopt the same owner.
+    pub finalized: Option<crate::spec_transcript::FinalizedAssistantTurn>,
 }
 
 /// Model-independent context for constructing a turn's [`SpecEmit`].
@@ -1098,13 +1140,6 @@ pub trait SpecEmit {
     /// returns its erased matcher.
     fn grammar(&mut self) -> Option<&mut dyn SpecGrammar> {
         None
-    }
-
-    /// The full committed-token stream (incl. the first token), for the decode
-    /// loop's post-turn bookkeeping (the qwen35 asst-turn cache store). Default
-    /// empty for emitters whose wrapper does no token-replay cache.
-    fn streamed_tokens(&self) -> &[u32] {
-        &[]
     }
 
     /// Whether a committed token tripped the grammar matcher — the decode loop
@@ -1510,6 +1545,7 @@ mod tests {
                 ClientEvent::Committed { id: 42, idx: 7 },
                 ClientEvent::Token("hi".to_string()),
             ],
+            generation_advanced: true,
             stop: Some(StopReason::Eos),
         };
         assert_eq!(o.events.len(), 2);
@@ -1521,5 +1557,22 @@ mod tests {
             ClientEvent::Committed { id: 42, idx: 7 }
         ));
         assert!(matches!(&o.events[1], ClientEvent::Token(t) if t == "hi"));
+    }
+
+    #[test]
+    fn spec_summary_struct_literals_remain_source_compatible() {
+        let outcome = EmitOutcome {
+            events: Vec::new(),
+            generation_advanced: false,
+            stop: None,
+        };
+        let summary = FinishSummary {
+            events: Vec::new(),
+            finish_reason: "stop",
+            tool_calls: 0,
+            finalized: None,
+        };
+        assert!(outcome.events.is_empty());
+        assert!(summary.events.is_empty());
     }
 }

@@ -30,7 +30,9 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ## Current Status
 
-**Foundation implemented; refactor incomplete.** `COR-004` is complete; no task is currently marked `in progress`. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, and god-struct foundation are substantial and tested. Physical topology evidence and the integration gaps tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+**Foundation implemented; refactor incomplete.** `COR-004` and `COR-003` are complete; no task is currently marked `in progress`. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, and COR-003 terminal lifecycle work are substantial and tested. Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+
+Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) confirmed balanced Qwen35 PP allocation and peer access, but did not close either physical PP gate: dense LLaMA forward hit an unclassified illegal access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded follow-up are recorded under HW-003 and HW-004; neither changes the current execution queue or relaxes exact-parity requirements.
 
 ## Execution Priority
 
@@ -39,13 +41,11 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 
 1. `COR-002` — implement the total reset contract now that `COR-004` resolved the
    ownership boundary.
-2. `COR-003` — finalize pending parser output exactly once at every terminal
-   path.
-3. `STEP-001` — adopt Step/manifest for DeltaNet with single-device parity.
-4. `PAR-001` — publish and enforce the model-family PP/TP/EP support matrix.
-5. `COMP-001` — decide and enforce the TP x EP scope boundary.
-6. `COR-005` — make generic LLaMA/Qwen3 spec-target loading transactional.
-7. `COR-006` — align eviction physical-cap metadata with KV allocation.
+2. `STEP-001` — adopt Step/manifest for DeltaNet with single-device parity.
+3. `PAR-001` — publish and enforce the model-family PP/TP/EP support matrix.
+4. `COMP-001` — decide and enforce the TP x EP scope boundary.
+5. `COR-005` — make generic LLaMA/Qwen3 spec-target loading transactional.
+6. `COR-006` — align eviction physical-cap metadata with KV allocation.
 
 After those ownership, execution, and support decisions, schedule their
 dependent work by the dependency graph. Hardware tasks remain blocked until
@@ -90,9 +90,9 @@ them toward completion.
 - **Dependencies:** None
 - **Goal:** Prove dense pipeline placement and boundary transfer on physically separate devices.
 - **Acceptance criteria:** Using `qwen3-0.6b-llama.mq4` in `llama_store_pp`, PP=2 must preserve the established single-device oracle of `max |delta| = 0` across logits; the 28 layers must remain banded 14/14 with embed on stage 0 and output norm/lm_head on stage 1; allocation inspection must show no stage-owned weight page on the wrong GPU; four load/forward/unload cycles must return each GPU to within 64 MiB of its post-first-unload baseline with no monotonic growth across cycles 2-4.
-- **Validation:** Run `llama_store_pp` on two distinct devices, capture the 311-tensor placement inventory, logit delta, boundary-copy path, per-device peak VRAM, and per-cycle post-unload VRAM; then run the dense PP serving smoke with a pinned prompt MD5 and compare its committed-token hash to single-device generation.
+- **Validation:** Before treating the reported gfx1201 failure as a device-mesh defect, classify it with the canonical `qwen3-0.6b-llama.mq4` artifact on this branch and upstream/master across PP=1, emulated PP=2, and a physical PP=2-capable harness. Record model and binary SHA-256 values, topology, ROCm/driver versions, and the first failing HIP launch after synchronization (kernel, stage/device, launch dimensions, tensor shape/dtype, and HIP error); a later logits-download error is insufficient. `llama_store_pp` alone cannot prove physical execution when it forces emulation. Then run the acceptance validation on two distinct devices: capture the 311-tensor placement inventory, zero logit delta, an explicit boundary-copy trace, per-device peak VRAM, and per-cycle post-unload VRAM; run the dense PP serving smoke with a pinned prompt MD5 and compare its committed-token hash to single-device generation.
 - **Hardware:** At least two mutually peer-accessible supported AMD GPUs; a homogeneous pair is preferred for the first proof.
-- **Evidence:** Pending
+- **Evidence:** External report from `taniguchi-taku-softm`, 2026-07-14, at `4df035373669369484797abdd274f3f710c4c061`: two gfx1201 R9700s, ROCm 7.2.4, RCCL 2.27.7.70204, bidirectional P2P. Noncanonical `qwen3-0.6b.hf4` SHA-256 `7760b19dfb940f8b33078eb524602b4f2b5e6825c6e10c466e6e99bcfc133838` produced correct 155/156 emulated placement but an illegal-memory-access surfaced at logits download. This is preliminary classification evidence only: the canonical artifact was unavailable and no first failing launch or physical dense-PP forward was captured.
 
 ### HW-004 Physical Qwen35 PP Validation
 
@@ -100,9 +100,9 @@ them toward completion.
 - **Dependencies:** GEN-001
 - **Goal:** Prove Qwen35 arch-resident pipeline execution and teardown on physically separate devices.
 - **Acceptance criteria:** Before the physical run, pin the Qwen35 model SHA-256 and prompt-file MD5 and capture single-device committed-token hashes for cold generation and a two-turn recurrent-reset fixture; PP=2 on distinct GPUs must match both hashes, place every hybrid attention/recurrent weight and state allocation on its assigned stage, use the peer boundary path, and return each GPU to within 64 MiB of its post-first-unload baseline after four cycles with no monotonic growth across cycles 2-4.
-- **Validation:** Run Qwen35 single-device oracle capture followed by PP=2 deterministic cold, two-turn reset, placement, boundary-transfer, and four-cycle load/unload tests; record artifact/prompt digests, topology, exact commands, hashes, allocation inventory, and VRAM traces.
+- **Validation:** After GEN-001, first reproduce on physical hardware with deterministic mode explicitly enabled and the pinned model, binary, and prompt hashes recorded. Compare PP=1, emulated PP=2, and physical PP=2 for cold and two-turn reset fixtures. If parity differs, capture the first numerical difference: top-k logits and margins, boundary-residual checksum, recurrent/conv-state checksums, copy byte counts and source/destination devices, and stream/event ordering. Then run Qwen35 single-device oracle capture followed by PP=2 deterministic cold, two-turn reset, placement, explicit boundary-transfer, and four-cycle load/unload tests; record artifact/prompt digests, topology, exact commands, hashes, allocation inventory, and VRAM traces.
 - **Hardware:** At least two mutually peer-accessible supported AMD GPUs with enough aggregate VRAM for the pinned Qwen35 fixture.
-- **Evidence:** Pending
+- **Evidence:** External report from `taniguchi-taku-softm`, 2026-07-14, at `4df035373669369484797abdd274f3f710c4c061`: physical PP=2 on two gfx1201 R9700s for `qwen3.5-9b.mq4` SHA-256 `ba83acf5bfd5d4e334b0afc26d779734e31623bb7f74e807c3581dfecb3128ad` allocated 2.638 GiB of weights, 0.134 GiB of KV, and 0.006 GiB of DeltaNet state per card; peer access was verified. PP=1 and PP=2 greedy output matched 58/100 tokens and first diverged at index 58. This is a hard parity failure, not accepted numerical variance; the run did not record a prompt MD5 or explicitly force deterministic mode, so it does not localize the cause or satisfy HW-004.
 
 ### HW-005 Physical TP Teardown Validation
 
@@ -137,13 +137,13 @@ them toward completion.
 
 ### COR-003 Finalize Parser On Pending EOS
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Ensure EOS and request termination always finalize buffered parser output exactly once.
-- **Acceptance criteria:** Every stop mode invokes parser finalization when bytes, reasoning markers, tool-call fragments, or forced tokens remain pending; injected EOS semantics remain pre-commit where required; no output is duplicated, dropped, or leaked across turns.
-- **Validation:** Add focused parser tests for pending UTF-8, reasoning, tool-call, injected-EOS, stop-sequence, budget, and abort cases; rerun architecture byte-parity and parser/coherence gates.
+- **Acceptance criteria:** Terminal `StopQuarantine`/`EosFilter` and `StreamParser` finalization are idempotent; Cohere recovery, generic AR/spec normal-versus-discard policy, sealed Qwen speculative turn authority/cache/reset behavior, Qwen PP sealed-boundary/reset behavior, DeepSeek AR discard reset/cache zeroing, and native Qwen/DeepSeek/DSpark MTP in-flight cancellation all preserve the no-late-output and no-cross-turn-residue contract. Injected EOS remains pre-commit where required.
+- **Validation:** `nix develop --command cargo test --workspace --locked` passed on 2026-07-16 (CPU; GPU tests ignored as applicable); `nix develop --command ./scripts/coherence-gate-dflash.sh` passed with no hard or soft warnings; `nix develop --command ./scripts/serve-multiturn-gate.sh` passed; and `git diff --check` passed.
 - **Hardware:** None for unit tests; a supported AMD GPU for end-to-end parity gates.
-- **Evidence:** Pending
+- **Evidence:** Current implementation includes terminal stop/finalization, sealed speculative-turn ownership, architecture discard/reset paths, and native Qwen/DeepSeek/DSpark MTP cancellation with production-owned lifecycle tests. Fresh evidence on 2026-07-16: `nix develop --command cargo test --workspace --locked` passed (CPU; GPU tests ignored as applicable); `nix develop --command ./scripts/coherence-gate-dflash.sh` passed with no hard or soft warnings, report `/tmp/coherence-dflash-20260716-110721.md`; `nix develop --command ./scripts/serve-multiturn-gate.sh` passed, report `/tmp/serve-multiturn-20260716-110919.md`; and `git diff --check` passed. COR-003 is complete. Remaining architecture migrations and separate physical PP/TP/EP hardware tasks remain tracked independently.
 
 ### COR-004 Decide Eviction Ownership
 
@@ -247,7 +247,7 @@ them toward completion.
 - **Acceptance criteria:** Native Qwen MTP loads only when compatible weights are present; uses configured `mtp_mode` and `mtp_k`; commits only accepted target tokens; falls back explicitly to AR when disabled or unavailable; its adapter implements the COR-002 contract for all MTP scratch/state; quality and performance reporting uses fixed fixtures.
 - **Validation:** Run MTP-off/auto/on selection tests, deterministic acceptance/accounting tests, AR fallback, COR-002 reset conformance, unload loops, coherence gate, and fixed-prompt performance measurements with prompt and binary hashes.
 - **Hardware:** A supported AMD GPU with a Qwen model containing native MTP weights.
-- **Evidence:** Pending
+- **Evidence:** Native Qwen MTP in-flight cancellation and production-owned lifecycle tests are implemented as part of COR-003. The 2026-07-16 workspace, DFlash coherence, and multi-turn serving evidence passed; the exact reports are recorded under COR-003. Broader SPEC-002 MTP selection, fixed-fixture quality/performance, and unload coverage remain task scope. Transactional target loading is not part of this completion claim and remains deferred to `SPEC-003`.
 
 ### SPEC-003 Transactional Qwen MTP Loading And Allocation Safety
 
@@ -368,6 +368,28 @@ them toward completion.
 - **Validation:** Execute and archive every row in the Final Validation Matrix, rerun tracker schema and documentation-link checks, inspect the final branch diff and PR checks/reviews, and attach the physical PP/TP/EP reports with artifact/prompt digests and per-cycle VRAM.
 - **Hardware:** The union of hardware required by HW-001 through HW-005 and each supported model-family validation cell.
 - **Evidence:** Pending
+
+## Terminal lifecycle migration matrix
+
+COR-003 establishes the terminal lifecycle contract; this matrix is mandatory
+for every remaining and future architecture. COR-003 completion does not close
+the architecture migrations listed here or the separate physical PP/TP/EP
+tasks (`HW-001` through `HW-005`). A row is not production-ready
+until its normal-finalization and discard/reset evidence exists for the named
+driver. `VL-001` and `VL-002` are the downstream multimodal adopters. Generic
+AR/spec adoption belongs to `SPEC-001`; native Qwen MTP uses `SPEC-002` (its
+in-flight cancellation is implemented), while transactional Qwen target
+loading remains deferred to `SPEC-003`.
+
+| Architecture | Driver entry point / owner | Normal finalization | Abort/error discard/reset | Forced/injected EOS | Cache/cross-turn isolation | Required focused evidence | Unsupported/refused mode |
+|---|---|---|---|---|---|---|---|
+| DeepSeek4 | `ArchDispatch` DeepSeek4 AR/MTP adapters; `GEN-002`, `SPEC-001` | Bespoke AR and native MTP emit pending output exactly once on normal completion. | DeepSeek AR discard resets request state and zeros decode cache; native MTP cancellation restores guards/PBS and resets before terminal envelope. | Carrier/model EOS remains distinct from user stop and does not finalize early. | No discarded turn enters assistant cache; reset prevents decode-cache or turn residue. | Production-owned cancellation/reset tests, DeepSeek AR normal/discard tests, MTP coherence and real multi-turn hardware gate. | Qwen-style DFlash is not a DeepSeek4 mode; unsupported combinations must refuse explicitly. |
+| MiniMax | MiniMax `ArchDispatch`/Step adapter; `STEP-002`, `STEP-004` | Shared lifecycle finalizes parser/emitter once after normal AR completion. | Abort/error drops pending output, resets request-owned state, and emits no late event. | Carrier EOS injection must remain non-terminal until the actual terminal outcome. | Multi-turn cache and parser state must be request-local and reset on discard. | MiniMax tool/stream, abort, reset, unload, and Tokyo-then-Germany multi-turn fixtures; EP evidence remains `HW-002`. | Unmigrated speculative/MTP or unsupported parallel cells refuse rather than silently fall back. |
+| LFM2 | LFM2 architecture adapter and `ArchDispatch`; `PAR-001`, `STEP-004` | Shared generic AR finalization once the dense LFM2 loader/forward path is admitted. | Discard/reset must clear parser and request state even when the current model is refused. | No forced EOS may turn an unsupported or incomplete LFM2 path into a successful terminal response. | No cache reuse across refused, aborted, or reset requests. | Dense LFM2 support/refusal tests, parser terminal-policy tests, and a fixed multi-turn fixture after loader support lands. | Current dense LFM2 path is unsupported/refused; no speculative mode is admitted until an explicit support decision. |
+| Qwen35 | Qwen35 `ArchDispatch`/AR, PP, and native MTP adapters; `GEN-001`, `SPEC-001`, `SPEC-002` | Generic AR/spec and Qwen PP use the sealed boundary and finalize exactly once; native MTP cancellation is implemented. | Sealed Qwen turns discard beyond the boundary, reset/cache-invalidate as required; MTP cancellation restores guards and resets before abort/error. | Injected EOS remains pre-commit; carrier framing and user stops remain separate. | Only the sealed turn may feed replay/fingerprint/cache; uncacheable cuts force reset/cold next turn. | Qwen AR/spec parser and sealed-turn tests, PP reset tests, native MTP lifecycle tests, coherence and physical multi-turn gate. | `SPEC-003` transactional target loading is deferred; unsupported Qwen MTP load paths must reject `on` and remain AR-only in `auto`/`off`. |
+| Qwen35-VL | Qwen35-VL image prefill owner plus shared post-prefill AR lifecycle; `VL-001` (future speculation depends on `SPEC-001`) | Vision prefill remains architecture-owned; shared post-prefill AR finalizes once. | Abort/error discards parser and image/request state, then resets before the terminal envelope. | Image/carrier framing and injected EOS must not bypass the shared terminal policy. | Image state, parser state, and any cache are request-local; different-image turns cannot reuse discarded state. | Canonical image-plus-text, different-image isolation, abort/reset, text-only parity, and physical VL fixture. | VL target/draft/native-MTP speculation is refused until a model-specific quality fixture and follow-up exist. |
+| dots.ocr | dots.ocr vision/prompt-framing owner plus shared post-prefill AR/n-gram lifecycle; `VL-002` (shared spec adoption through `SPEC-001`) | Custom image framing and prefill finish, then shared AR/n-gram output finalizes once. | Discard/reset clears parser and image state; no OCR/tool output follows abort/error. | Custom framing remains distinct from injected EOS and must not finalize twice. | Image state and OCR/cache state are request-local across repeated images and turns. | Canonical `dots_ocr_smoke_001_vllm.json`/demo-image F1, AR/n-gram parity, repeated-image isolation, abort/reset, unload, and physical gate. | Target/draft and native-MTP VL speculation is explicitly refused pending a dots.ocr quality oracle. |
+| Future architecture onboarding | New architecture owner with `ArchDispatch`; adopt `GEN-*`, `SPEC-*`, `VL-*`, and `STEP-004` as applicable | Implement the shared normal-completion epilogue before claiming support. | Implement explicit discard/reset before any parser, cache, or GPU state is published. | Declare carrier/model EOS versus user stop and test injected EOS as pre-commit where applicable. | Name every cache/state owner; prove no discarded or prior-turn state crosses the boundary. | Add focused terminal lifecycle tests, deterministic parity, refusal tests, and required model/coherence/multi-turn hardware evidence before adding a support cell. | Every unsupported axis, speculative mode, or loader path must return a documented refusal; no silent fallback. |
 
 ## Final Validation Matrix
 
