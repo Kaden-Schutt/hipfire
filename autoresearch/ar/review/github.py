@@ -5,14 +5,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
 import json
 import re
 import subprocess
 from typing import Any, Protocol
 from urllib.parse import quote
 
+from .canonical import canonical_digest, canonical_loads, metadata_digest
 from .config import ReviewConfiguration, validate_operator_credential_manifest
-from .models import GitHubEnvelope, validate_trusted_publishers_policy
+from .models import GitHubEnvelope, IntentPayload, validate_trusted_publishers_policy
 
 
 class GitHubBoundaryError(RuntimeError):
@@ -28,7 +30,7 @@ class Runner(Protocol):
 
 
 def _subprocess_runner(argv: Sequence[str], input_data: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(argv, input=input_data, capture_output=True, check=False)
+    return subprocess.run(argv, input=input_data, capture_output=True, check=False, timeout=30)
 
 
 @dataclass(frozen=True)
@@ -53,11 +55,37 @@ class PreflightResult:
     scopes: tuple[str, ...]
 
 
-_REPO = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
-_SHA = r"[A-Za-z0-9_.:-]+"
+_REPO_SEGMENT = r"(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9_.-]*"
+_REPO = rf"{_REPO_SEGMENT}/{_REPO_SEGMENT}"
+_SHA = r"[A-Za-z0-9][A-Za-z0-9_.:-]*"
+_LOGIN = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
 _MAX_PAGINATED_PAGES = 16
 _MAX_PAGINATED_ITEMS = 4096
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+_MAX_STDERR_BYTES = 1 << 20
+_MAX_REQUEST_BYTES = 1 << 20
+_PAGE_SIZE = 100
+_PULL_PAGE_SIZE = 1
+_PROTOCOL_RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
+_PROTOCOL_FIELDS = {
+    "intent": {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"},
+    "report": {
+        "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id",
+        "head_sha", "canonical_intent_node_id", "canonical_intent_digest", "report_body", "report_body_sha256",
+    },
+    "review-metadata": {
+        "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
+        "report_record_id", "report_node_id", "report_digest", "report_body_sha256", "canonical_intent_digest",
+        "canonical_intent_node_id", "metadata_digest",
+    },
+    "completion": {
+        "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
+        "canonical_intent_digest", "canonical_intent_node_id", "report_record_id", "report_node_id", "report_digest",
+        "metadata_record_id", "metadata_digest",
+    },
+    "revocation": {"schema", "record_type", "record_id", "target_key", "attempt_id", "canonical_intent_digest", "reason"},
+}
+_ACCEPTED_PERMISSION_RE = re.compile(r"([A-Za-z0-9_-]+)\s*=\s*(read|write|admin)")
 _ENDPOINTS = (
     ("GET", re.compile(rf"/user$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}$"), False),
@@ -77,6 +105,65 @@ _ENDPOINTS = (
 _LIST_PATHS = {pattern.pattern for _, pattern, paginated in _ENDPOINTS if paginated}
 _PRINCIPAL_TYPES = {"User", "Bot", "Organization"}
 _PERMISSIONS = ("admin", "maintain", "push", "triage", "pull")
+
+
+def _repository(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(_REPO, value) is None:
+        raise GitHubBoundaryError("repository identifier is unsafe")
+    return value
+
+
+def _positive_integer(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise GitHubBoundaryError(f"{name} must be a positive integer")
+    return value
+
+
+def _identifier(value: str, name: str, pattern: str = _SHA) -> str:
+    if not isinstance(value, str) or re.fullmatch(pattern, value) is None or value in {".", ".."}:
+        raise GitHubBoundaryError(f"{name} identifier is unsafe")
+    return value
+
+
+def _login(value: str) -> str:
+    return _identifier(value, "login", _LOGIN)
+
+
+def _label(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(ord(char) < 0x20 or char in "/\\?#%" for char in value)
+    ):
+        raise GitHubBoundaryError("label identifier is unsafe")
+    return value
+
+
+def _safe_path(path: str) -> bool:
+    return not any(segment in {".", ".."} for segment in path.split("/")) and not any(
+        char in path for char in "\x00\r\n?#\\@"
+    )
+
+
+def _validate_protocol_payload(payload: Mapping[str, Any]) -> None:
+    record_type = payload.get("record_type")
+    if payload.get("schema") != "agentic-review/v1" or record_type not in _PROTOCOL_RECORD_TYPES:
+        raise ValueError("protocol body has an invalid schema or record type")
+    if set(payload) != _PROTOCOL_FIELDS[record_type]:
+        raise ValueError("protocol body has unexpected or missing fields")
+    if not isinstance(payload.get("record_id"), str) or not payload["record_id"].strip():
+        raise ValueError("protocol body has no record identity")
+    if record_type == "intent":
+        IntentPayload.from_mapping(payload)
+    elif record_type == "report":
+        body = payload["report_body"]
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest() if isinstance(body, str) else ""
+        if payload["report_body_sha256"] not in {digest, "sha256:" + digest}:
+            raise ValueError("protocol report body digest does not match")
+    elif record_type == "review-metadata" and payload["metadata_digest"] != metadata_digest(payload):
+        raise ValueError("protocol metadata digest does not match")
+    else:
+        canonical_digest(payload)
 
 
 def _decode_output(raw: str | bytes) -> tuple[list[tuple[int, dict[str, str], Any]], bool]:
@@ -128,10 +215,13 @@ def _decode_output(raw: str | bytes) -> tuple[list[tuple[int, dict[str, str], An
                 raise GitHubBoundaryError("invalid GitHub response header")
             name, value = line.split(":", 1)
             headers[name.strip().lower()] = value.strip()
-        try:
-            value, consumed = decoder.raw_decode(text[offset:])
-        except (ValueError, json.JSONDecodeError) as exc:
-            raise GitHubBoundaryError("GitHub response contains invalid JSON") from exc
+        if not text[offset:].strip():
+            value, consumed = None, len(text) - offset
+        else:
+            try:
+                value, consumed = decoder.raw_decode(text[offset:])
+            except (ValueError, json.JSONDecodeError) as exc:
+                raise GitHubBoundaryError("GitHub response contains invalid JSON") from exc
         pages.append((status, headers, value))
         if len(pages) > _MAX_PAGINATED_PAGES:
             raise GitHubBoundaryError("GitHub pagination exceeds the fixed page bound")
@@ -143,11 +233,21 @@ def _decode_output(raw: str | bytes) -> tuple[list[tuple[int, dict[str, str], An
 
 def _as_result(result: Any) -> tuple[int, str, str]:
     if isinstance(result, subprocess.CompletedProcess):
-        return int(result.returncode), result.stdout or "", result.stderr or ""
+        return _as_result((result.returncode, result.stdout or "", result.stderr or ""))
     if isinstance(result, Mapping):
-        return int(result.get("returncode", 0)), result.get("stdout", ""), result.get("stderr", "")
+        return _as_result((result.get("returncode", 0), result.get("stdout", ""), result.get("stderr", "")))
     if isinstance(result, tuple) and len(result) == 3:
-        return int(result[0]), result[1], result[2]
+        returncode = result[0]
+        if isinstance(returncode, bool) or not isinstance(returncode, int):
+            raise GitHubBoundaryError("runner returned an invalid exit status")
+        stdout, stderr = result[1], result[2]
+        for value, limit, name in ((stdout, _MAX_RESPONSE_BYTES, "stdout"), (stderr, _MAX_STDERR_BYTES, "stderr")):
+            if not isinstance(value, (str, bytes)):
+                raise GitHubBoundaryError(f"runner returned invalid {name}")
+            size = len(value) if isinstance(value, bytes) else len(value.encode())
+            if size > limit:
+                raise GitHubBoundaryError(f"gh {name} exceeds the fixed size bound")
+        return returncode, stdout, stderr
     raise GitHubBoundaryError("runner returned an unsupported result")
 
 
@@ -157,7 +257,9 @@ class GitHubClient:
         self._gh_binary = gh_binary
 
     def _allowed(self, method: str, path: str) -> bool:
-        return any(method == allowed_method and pattern.fullmatch(path) for allowed_method, pattern, _ in _ENDPOINTS)
+        return _safe_path(path) and any(
+            method == allowed_method and pattern.fullmatch(path) for allowed_method, pattern, _ in _ENDPOINTS
+        )
 
     def _request(
         self,
@@ -166,28 +268,43 @@ class GitHubClient:
         *,
         query: Mapping[str, str | int] | None = None,
         fields: Mapping[str, str] | None = None,
+        json_body: Any | None = None,
         paginate: bool = False,
     ) -> GitHubResponse:
         if not self._allowed(method, path):
             raise GitHubBoundaryError("GitHub path or method is not allowlisted")
-        expected_paginated = any(
-            method == allowed_method and pattern.fullmatch(path) and is_paginated
-            for allowed_method, pattern, is_paginated in _ENDPOINTS
-        )
-        if paginate != expected_paginated:
-            raise GitHubBoundaryError("unexpected pagination for endpoint")
+        if paginate:
+            raise GitHubBoundaryError("unbounded pagination is disabled; use bounded page requests")
         argv = [self._gh_binary, "api"]
         if paginate:
             argv.append("--paginate")
         argv.extend(["--include", "--method", method])
         request_path = path
         if query:
-            request_path += "?" + "&".join(f"{quote(str(key))}={quote(str(value))}" for key, value in query.items())
+            if not isinstance(query, Mapping) or any(
+                not isinstance(key, str) or not key or not isinstance(value, (str, int)) or isinstance(value, bool)
+                for key, value in query.items()
+            ):
+                raise GitHubBoundaryError("query parameters are malformed")
+            request_path += "?" + "&".join(
+                f"{quote(key, safe='')}={quote(str(value), safe='')}" for key, value in query.items()
+            )
         argv.append(request_path)
-        for key, value in (fields or {}).items():
-            argv.extend(["--field", f"{key}={value}"])
+        input_data: bytes | None = None
+        if fields is not None:
+            raise GitHubBoundaryError("field encoding is disabled for untrusted API values")
+        if json_body is not None:
+            argv.extend(["--input", "-"])
+            try:
+                input_data = json.dumps(json_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+            except (TypeError, UnicodeError, ValueError) as exc:
+                raise GitHubBoundaryError("mutation body is not strict JSON") from exc
+            if len(input_data) > _MAX_REQUEST_BYTES:
+                raise GitHubBoundaryError("mutation body exceeds the fixed size bound")
         try:
-            result = self._runner(argv)
+            result = self._runner(argv, input_data)
+        except subprocess.TimeoutExpired as exc:
+            raise GitHubBoundaryError("gh subprocess timed out") from exc
         except Exception as exc:
             raise GitHubBoundaryError("gh subprocess failed") from exc
         returncode, stdout, stderr = _as_result(result)
@@ -229,8 +346,7 @@ class GitHubClient:
 
     def get_authenticated_user(self) -> GitHubResponse:
         response = self._request("GET", "/user")
-        if "x-oauth-scopes" not in response.headers:
-            raise GitHubBoundaryError("visible OAuth scope header is required")
+        _capability_signal(response)
         data = self._require_mapping(response.data, "user")
         if "type" not in data or not data["type"]:
             raise GitHubBoundaryError("GitHub user principal type is missing")
@@ -248,6 +364,7 @@ class GitHubClient:
         return response
 
     def get_repository(self, repository: str) -> GitHubResponse:
+        repository = _repository(repository)
         response = self._request("GET", f"/repos/{repository}")
         data = self._require_mapping(response.data, "repository")
         self._require(data, ("id", "full_name"), "repository")
@@ -257,64 +374,100 @@ class GitHubClient:
             or data["id"] <= 0
             or not isinstance(data["full_name"], str)
             or not data["full_name"].strip()
+            or data["full_name"] != repository
         ):
             raise GitHubBoundaryError("GitHub repository response has malformed identity")
         return response
 
     def list_pull_requests(self, repository: str, *, pages: int = 1) -> GitHubResponse:
+        repository = _repository(repository)
         if isinstance(pages, bool) or not isinstance(pages, int) or not 0 < pages <= _MAX_PAGINATED_PAGES:
             raise GitHubBoundaryError("pages must be within the fixed positive bound")
         responses = []
         for page in range(1, pages + 1):
-            responses.append(self._request("GET", f"/repos/{repository}/pulls", query={"per_page": 1, "page": page}, paginate=True))
+            responses.append(self._request("GET", f"/repos/{repository}/pulls", query={"per_page": _PULL_PAGE_SIZE, "page": page}))
         data = []
         headers = {}
         for response in responses:
             if not isinstance(response.data, list):
                 raise GitHubBoundaryError("pull request response is not a list")
+            if len(data) + len(response.data) > _MAX_PAGINATED_ITEMS:
+                raise GitHubBoundaryError("GitHub pull request pagination exceeds the fixed item bound")
             data.extend(response.data)
             headers.update(response.headers)
         for item in data:
-            self._validate_pull(self._require_mapping(item, "pull request"))
+            self._validate_pull(self._require_mapping(item, "pull request"), expected_repository=repository)
         return GitHubResponse(data, headers, 200)
 
     @classmethod
-    def _validate_pull(cls, data: Mapping[str, Any]) -> None:
+    def _validate_pull(cls, data: Mapping[str, Any], *, expected_number: int | None = None, expected_repository: str | None = None) -> None:
         cls._require(data, ("number", "node_id", "head", "base"), "pull request")
+        if (
+            isinstance(data["number"], bool)
+            or not isinstance(data["number"], int)
+            or data["number"] <= 0
+            or (expected_number is not None and data["number"] != expected_number)
+            or not isinstance(data["node_id"], str)
+            or not data["node_id"].strip()
+        ):
+            raise GitHubBoundaryError("GitHub pull request number or node ID does not match")
         head = cls._require(cls._require_mapping(data["head"], "pull request head"), ("repo", "sha"), "pull request head")
         base = cls._require(cls._require_mapping(data["base"], "pull request base"), ("ref", "sha"), "pull request base")
-        cls._require(cls._require_mapping(head["repo"], "head repository"), ("full_name",), "head repository")
+        head_repo = cls._require(cls._require_mapping(head["repo"], "head repository"), ("full_name",), "head repository")
         cls._require(base, ("ref", "sha"), "pull request base")
+        for value, name in ((head_repo["full_name"], "head repository"), (head["sha"], "head SHA"), (base["ref"], "base ref"), (base["sha"], "base SHA")):
+            if not isinstance(value, str) or not value.strip():
+                raise GitHubBoundaryError(f"GitHub pull request {name} is malformed")
+        if expected_repository is not None:
+            base_repo = data.get("base", {}).get("repo")
+            if isinstance(base_repo, Mapping) and base_repo.get("full_name") != expected_repository:
+                raise GitHubBoundaryError("GitHub pull request repository does not match")
 
     def get_pull_request(self, repository: str, number: int) -> GitHubResponse:
+        repository = _repository(repository)
+        number = _positive_integer(number, "pull request number")
         response = self._request("GET", f"/repos/{repository}/pulls/{number}")
         data = self._require_mapping(response.data, "pull request")
-        self._validate_pull(data)
+        self._validate_pull(data, expected_number=number, expected_repository=repository)
         return response
 
     def list_issue_comments(self, repository: str, number: int) -> GitHubResponse:
-        return self._list_records("/repos/{}/issues/{}/comments".format(repository, number), "issue comments")
+        return self._list_records(repository, number, "issue comments")
 
     def list_pull_reviews(self, repository: str, number: int) -> GitHubResponse:
-        return self._list_records("/repos/{}/pulls/{}/reviews".format(repository, number), "pull reviews")
+        return self._list_records(repository, number, "pull reviews")
 
-    def _list_records(self, path: str, name: str) -> GitHubResponse:
-        response = self._request("GET", path, query={"per_page": 1}, paginate=True)
-        if not isinstance(response.data, list):
-            raise GitHubBoundaryError(f"GitHub {name} response is not a list")
-        for item in response.data:
-            record = self._require_mapping(item, name)
-            extra = ("body",) if name == "issue comments" else ("state", "commit_id")
-            self._validate_api_record(record, name, extra=extra)
-            author = self._require(self._require_mapping(record["user"], f"{name} author"), ("login", "type"), f"{name} author")
-            if (
-                not isinstance(author["login"], str)
-                or not author["login"].strip()
-                or not isinstance(author["type"], str)
-                or author["type"] not in _PRINCIPAL_TYPES
-            ):
-                raise GitHubBoundaryError(f"GitHub {name} author has an unsupported principal type")
-        return response
+    def _list_records(self, repository: str, number: int, name: str) -> GitHubResponse:
+        repository = _repository(repository)
+        number = _positive_integer(number, "issue or pull request number")
+        path = f"/repos/{repository}/issues/{number}/comments" if name == "issue comments" else f"/repos/{repository}/pulls/{number}/reviews"
+        records: list[Any] = []
+        headers: dict[str, str] = {}
+        for page in range(1, _MAX_PAGINATED_PAGES + 1):
+            response = self._request("GET", path, query={"per_page": _PAGE_SIZE, "page": page})
+            headers.update(response.headers)
+            if not isinstance(response.data, list):
+                raise GitHubBoundaryError(f"GitHub {name} response is not a list")
+            if len(records) + len(response.data) > _MAX_PAGINATED_ITEMS:
+                raise GitHubBoundaryError(f"GitHub {name} pagination exceeds the fixed item bound")
+            for item in response.data:
+                record = self._require_mapping(item, name)
+                extra = ("body",) if name == "issue comments" else ("state", "commit_id")
+                self._validate_api_record(record, name, extra=extra)
+                author = self._require(self._require_mapping(record["user"], f"{name} author"), ("login", "type"), f"{name} author")
+                if (
+                    not isinstance(author["login"], str)
+                    or not author["login"].strip()
+                    or not isinstance(author["type"], str)
+                    or author["type"] not in _PRINCIPAL_TYPES
+                ):
+                    raise GitHubBoundaryError(f"GitHub {name} author has an unsupported principal type")
+                records.append(record)
+            if len(records) > _MAX_PAGINATED_ITEMS or len(response.data) < _PAGE_SIZE:
+                break
+        else:
+            raise GitHubBoundaryError(f"GitHub {name} pagination reached its fixed page bound")
+        return GitHubResponse(records, headers, 200)
 
     @staticmethod
     def _validate_api_record(
@@ -332,16 +485,22 @@ class GitHubClient:
             raise GitHubBoundaryError(f"GitHub {name} response has malformed server fields")
 
     def collaborator_effective_permission(self, repository: str, login: str) -> EffectivePermission:
+        repository = _repository(repository)
+        login = _login(login)
         response = self._request("GET", f"/repos/{repository}/collaborators/{quote(login, safe='')}/permission")
+        _capability_signal(response, required=("metadata",))
         data = self._require_mapping(response.data, "collaborator permission")
         self._require(data, ("user", "permissions"), "collaborator permission")
         principal = self._require(self._require_mapping(data["user"], "collaborator"), ("login", "type"), "collaborator")
+        if principal.get("login") != login:
+            raise GitHubBoundaryError("collaborator response login does not match requested login")
         if not isinstance(principal["type"], str) or principal["type"] not in _PRINCIPAL_TYPES:
             raise GitHubBoundaryError("collaborator has an unsupported principal type")
         permissions = self._require_mapping(data["permissions"], "permissions")
-        permission = next((name for name in _PERMISSIONS if permissions.get(name) is True), None)
+        permission_map = {"admin": "admin", "maintain": "write", "push": "write", "triage": "read", "pull": "read"}
+        permission = next((permission_map[name] for name in _PERMISSIONS if permissions.get(name) is True), None)
         if permission is None:
-            role_map = {"read": "pull", "write": "push", "maintain": "maintain", "triage": "triage", "admin": "admin"}
+            role_map = {"read": "read", "write": "write", "push": "write", "maintain": "write", "triage": "read", "pull": "read", "admin": "admin"}
             role = data.get("role_name")
             permission = role_map.get(role) if isinstance(role, str) else None
         if permission is None:
@@ -349,50 +508,105 @@ class GitHubClient:
         return EffectivePermission(principal["login"], principal["type"], permission)
 
     def get_tree(self, repository: str, tree_sha: str, *, recursive: bool = False) -> GitHubResponse:
+        repository = _repository(repository)
+        tree_sha = _identifier(tree_sha, "tree SHA")
         query = {"recursive": "1"} if recursive else None
         response = self._request("GET", f"/repos/{repository}/git/trees/{tree_sha}", query=query)
         data = self._require_mapping(response.data, "tree")
         self._require(data, ("sha", "tree"), "tree")
+        if data["sha"] != tree_sha or not isinstance(data["tree"], list):
+            raise GitHubBoundaryError("GitHub tree sha or entries do not match request")
+        for entry in data["tree"]:
+            item = self._require_mapping(entry, "tree entry")
+            self._require(item, ("path", "mode", "type", "sha"), "tree entry")
+            if any(not isinstance(item[field], str) or not item[field].strip() for field in ("path", "mode", "type", "sha")):
+                raise GitHubBoundaryError("GitHub tree entry is malformed")
         return response
 
     def get_blob(self, repository: str, blob_sha: str) -> GitHubResponse:
+        repository = _repository(repository)
+        blob_sha = _identifier(blob_sha, "blob SHA")
         response = self._request("GET", f"/repos/{repository}/git/blobs/{blob_sha}")
-        self._require(self._require_mapping(response.data, "blob"), ("sha", "content", "encoding"), "blob")
+        data = self._require_mapping(response.data, "blob")
+        self._require(data, ("sha", "content", "encoding"), "blob")
+        if data["sha"] != blob_sha or not isinstance(data["content"], str) or data["encoding"] != "base64":
+            raise GitHubBoundaryError("GitHub blob sha identity or encoding does not match request")
         return response
 
     def add_labels(self, repository: str, number: int, labels: Sequence[str]) -> GitHubResponse:
-        if not labels or any(not isinstance(label, str) or not label for label in labels):
+        repository = _repository(repository)
+        number = _positive_integer(number, "issue number")
+        if not labels or any(_label(label) != label for label in labels):
             raise GitHubBoundaryError("labels must be non-empty strings")
-        return self._request("POST", f"/repos/{repository}/issues/{number}/labels", fields={"labels": json.dumps(list(labels))})
+        response = self._request("POST", f"/repos/{repository}/issues/{number}/labels", json_body={"labels": list(labels)})
+        self._validate_mutation_list(response, "labels")
+        return response
 
     def remove_label(self, repository: str, number: int, label: str) -> GitHubResponse:
-        if not label:
-            raise GitHubBoundaryError("label must be non-empty")
-        return self._request("DELETE", f"/repos/{repository}/issues/{number}/labels/{quote(label, safe='')}")
+        repository = _repository(repository)
+        number = _positive_integer(number, "issue number")
+        label = _label(label)
+        response = self._request("DELETE", f"/repos/{repository}/issues/{number}/labels/{quote(label, safe='')}")
+        if response.status_code not in {200, 204}:
+            raise GitHubBoundaryError("unexpected label deletion response")
+        return response
 
     def create_issue_comment(self, repository: str, number: int, body: str) -> GitHubResponse:
-        if not body:
+        repository = _repository(repository)
+        number = _positive_integer(number, "issue number")
+        if not isinstance(body, str) or not body:
             raise GitHubBoundaryError("comment body must be non-empty")
-        return self._request("POST", f"/repos/{repository}/issues/{number}/comments", fields={"body": body})
+        response = self._request("POST", f"/repos/{repository}/issues/{number}/comments", json_body={"body": body})
+        self._validate_mutation_object(response, "comment")
+        return response
 
     def create_pull_request_review(self, repository: str, number: int, *, body: str, event: str, commit_id: str) -> GitHubResponse:
-        if not commit_id or not body or event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}:
+        repository = _repository(repository)
+        number = _positive_integer(number, "pull request number")
+        commit_id = _identifier(commit_id, "commit")
+        if not isinstance(body, str) or not body or event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}:
             raise GitHubBoundaryError("review body, event, and exact commit_id are required")
-        return self._request(
+        response = self._request(
             "POST", f"/repos/{repository}/pulls/{number}/reviews",
-            fields={"body": body, "event": event, "commit_id": commit_id},
+            json_body={"body": body, "event": event, "commit_id": commit_id},
         )
+        self._validate_mutation_object(response, "review")
+        return response
 
     def dismiss_workflow_review(self, repository: str, number: int, review_id: int, *, message: str) -> GitHubResponse:
-        if not message:
+        repository = _repository(repository)
+        number = _positive_integer(number, "pull request number")
+        review_id = _positive_integer(review_id, "review ID")
+        if not isinstance(message, str) or not message:
             raise GitHubBoundaryError("dismissal message must be non-empty")
-        return self._request(
-            "PUT", f"/repos/{repository}/pulls/{number}/reviews/{review_id}/dismissals", fields={"message": message}
+        response = self._request(
+            "PUT", f"/repos/{repository}/pulls/{number}/reviews/{review_id}/dismissals", json_body={"message": message}
         )
+        self._validate_mutation_object(response, "dismissal")
+        return response
 
-    def _envelope(
-        self, record: Mapping[str, Any], payload: Mapping[str, Any], *, record_name: str = "authenticated GitHub record"
-    ) -> GitHubEnvelope:
+    @staticmethod
+    def _validate_mutation_object(response: GitHubResponse, name: str) -> None:
+        data = GitHubClient._require_mapping(response.data, name)
+        if "id" not in data or "node_id" not in data:
+            raise GitHubBoundaryError(f"GitHub {name} response is missing id fields")
+        if (
+            isinstance(data["id"], bool)
+            or not isinstance(data["id"], int)
+            or data["id"] <= 0
+            or not isinstance(data["node_id"], str)
+            or not data["node_id"].strip()
+        ):
+            raise GitHubBoundaryError(f"GitHub {name} response has malformed id fields")
+
+    @staticmethod
+    def _validate_mutation_list(response: GitHubResponse, name: str) -> None:
+        if not isinstance(response.data, list):
+            raise GitHubBoundaryError(f"GitHub {name} response is not a list")
+        for item in response.data:
+            GitHubClient._validate_mutation_object(GitHubResponse(item, response.headers, response.status_code), name)
+
+    def _envelope(self, record: Mapping[str, Any], *, record_name: str = "authenticated GitHub record") -> GitHubEnvelope:
         try:
             author = record["user"]
             extra = ("body",) if record_name == "issue comment" else ("state", "commit_id")
@@ -407,45 +621,79 @@ class GitHubClient:
             or author["type"] not in _PRINCIPAL_TYPES
         ):
             raise GitHubBoundaryError("authenticated author has unsupported principal type")
-        if not isinstance(payload, Mapping):
-            raise GitHubBoundaryError("GitHub envelope payload must be an object")
         if record["updated_at"] != record["created_at"]:
             raise GitHubBoundaryError("edited GitHub record is not admissible")
+        body = record["body"]
+        if not isinstance(body, str) or not body.strip():
+            raise GitHubBoundaryError(f"GitHub {record_name} body is missing")
+        try:
+            payload = canonical_loads(body)
+            if not isinstance(payload, Mapping):
+                raise ValueError("protocol body must be an object")
+            _validate_protocol_payload(payload)
+        except (TypeError, ValueError) as exc:
+            raise GitHubBoundaryError(f"GitHub {record_name} body is not a valid protocol payload") from exc
         return GitHubEnvelope(payload, record["node_id"], author["login"], record["created_at"], record["updated_at"], author["type"])
 
-    def comment_envelope(self, repository: str, number: int, payload: Mapping[str, Any]) -> GitHubEnvelope:
+    def comment_envelope(self, repository: str, number: int) -> GitHubEnvelope:
         response = self.list_issue_comments(repository, number)
         if len(response.data) != 1:
             raise GitHubBoundaryError("comment envelope requires exactly one bounded response")
-        return self.envelope_from_comment(response.data[0], payload)
+        return self.envelope_from_comment(response.data[0])
 
-    def review_envelope(self, repository: str, number: int, review_id: int, payload: Mapping[str, Any]) -> GitHubEnvelope:
+    def review_envelope(self, repository: str, number: int, review_id: int) -> GitHubEnvelope:
+        review_id = _positive_integer(review_id, "review ID")
         response = self.list_pull_reviews(repository, number)
         matches = [item for item in response.data if item.get("id") == review_id]
         if len(matches) != 1:
             raise GitHubBoundaryError("review envelope was not found in authenticated reviews")
-        return self.envelope_from_review(matches[0], payload)
+        return self.envelope_from_review(matches[0])
 
-    def envelope_from_comment(self, record: Mapping[str, Any], payload: Mapping[str, Any]) -> GitHubEnvelope:
+    def envelope_from_comment(self, record: Mapping[str, Any]) -> GitHubEnvelope:
         """Build an envelope only from a complete authenticated comment object."""
-        return self._envelope(record, payload, record_name="issue comment")
+        return self._envelope(record, record_name="issue comment")
 
-    def envelope_from_review(self, record: Mapping[str, Any], payload: Mapping[str, Any]) -> GitHubEnvelope:
+    def envelope_from_review(self, record: Mapping[str, Any]) -> GitHubEnvelope:
         """Build an envelope only from a complete authenticated review object."""
-        return self._envelope(record, payload, record_name="pull request review")
+        return self._envelope(record, record_name="pull request review")
+
+
+def _capability_signal(
+    response: GitHubResponse, *, required: Sequence[str] = ()
+) -> tuple[tuple[str, ...], Mapping[str, str]]:
+    raw_scopes = response.headers.get("x-oauth-scopes")
+    scopes: tuple[str, ...] = ()
+    if raw_scopes is not None:
+        if not isinstance(raw_scopes, str) or not raw_scopes.strip():
+            raise PreflightError("OAuth scope header is malformed")
+        pieces = tuple(scope.strip() for scope in raw_scopes.split(","))
+        if any(not scope or re.fullmatch(r"[A-Za-z0-9:_-]+", scope) is None for scope in pieces):
+            raise PreflightError("OAuth scope header is malformed")
+        scopes = pieces
+        if "repo" in scopes:
+            raise PreflightError("classic repo OAuth scope is not permitted")
+    raw_permissions = response.headers.get("x-accepted-github-permissions")
+    accepted: dict[str, str] = {}
+    if raw_permissions is not None:
+        if not isinstance(raw_permissions, str) or not raw_permissions.strip():
+            raise PreflightError("GitHub permission header is malformed")
+        for item in re.split(r"[,;]", raw_permissions):
+            match = _ACCEPTED_PERMISSION_RE.fullmatch(item.strip())
+            if match is None:
+                raise PreflightError("GitHub permission header is malformed")
+            accepted[match.group(1)] = match.group(2)
+    if not scopes and not accepted:
+        raise PreflightError("no usable GitHub capability signal (scope or permission header) is visible")
+    rank = {"read": 1, "write": 2, "admin": 3}
+    if accepted:
+        missing = [permission for permission in required if permission not in accepted or rank[accepted[permission]] < rank["read"]]
+        if missing:
+            raise PreflightError(f"required GitHub permission is absent: {', '.join(missing)}")
+    return scopes, accepted
 
 
 def _scope_header(response: GitHubResponse) -> tuple[str, ...]:
-    raw = response.headers.get("x-oauth-scopes")
-    if not isinstance(raw, str) or not raw.strip():
-        raise PreflightError("visible X-OAuth-Scopes header is required")
-    pieces = tuple(scope.strip() for scope in raw.split(","))
-    if any(not scope or re.fullmatch(r"[A-Za-z0-9:_-]+", scope) is None for scope in pieces):
-        raise PreflightError("OAuth scope header is malformed")
-    scopes = tuple(pieces)
-    if "repo" in scopes:
-        raise PreflightError("classic repo OAuth scope is not permitted")
-    return scopes
+    return _capability_signal(response)[0]
 
 
 def preflight_read_only(
@@ -457,7 +705,7 @@ def preflight_read_only(
     operator_manifest: Mapping[str, Any] | None = None,
     pull_number: int | None = None,
 ) -> PreflightResult:
-    if mode not in {"discovery", "controller", "publisher"}:
+    if mode not in {"discovery", "controller", "publisher", "dismissal"}:
         raise PreflightError("unsupported preflight mode")
     trusted = configuration.trusted_publishers
     try:
@@ -466,13 +714,13 @@ def preflight_read_only(
         raise PreflightError(str(exc)) from exc
     try:
         user_response = client.get_authenticated_user()
-        scopes = _scope_header(user_response)
+        scopes, _ = _capability_signal(user_response)
         user_data = client._require_mapping(user_response.data, "user")
         repo_response = client.get_repository(repository)
-        _scope_header(repo_response)
+        _capability_signal(repo_response, required=("metadata",))
         repository_data = client._require_mapping(repo_response.data, "repository")
         pulls_response = client.list_pull_requests(repository)
-        _scope_header(pulls_response)
+        _capability_signal(pulls_response, required=("pull_requests",))
         user_login = user_data["login"]
         principal_type = user_data["type"]
         if (
@@ -491,22 +739,34 @@ def preflight_read_only(
             or repository_data.get("full_name") != repository
         ):
             raise PreflightError("repository identity is malformed")
-        if pull_number is not None:
-            if isinstance(pull_number, bool) or not isinstance(pull_number, int) or pull_number <= 0:
-                raise PreflightError("pull number must be positive")
-            pull_response = client.get_pull_request(repository, pull_number)
-            _scope_header(pull_response)
-            comments_response = client.list_issue_comments(repository, pull_number)
-            _scope_header(comments_response)
-            reviews_response = client.list_pull_reviews(repository, pull_number)
-            _scope_header(reviews_response)
-        if mode in {"controller", "publisher"}:
+        open_pulls = pulls_response.data
+        if not open_pulls:
+            raise PreflightError("no open pull request is available for the selected preflight")
+        probe_number = pull_number if pull_number is not None else open_pulls[0]["number"]
+        probe_number = _positive_integer(probe_number, "pull request number")
+        pull_response = client.get_pull_request(repository, probe_number)
+        _capability_signal(pull_response, required=("pull_requests",))
+        pull_data = pull_response.data
+        if mode in {"discovery", "publisher", "dismissal"}:
+            comments_response = client.list_issue_comments(repository, probe_number)
+            _capability_signal(comments_response, required=("issues",))
+            reviews_response = client.list_pull_reviews(repository, probe_number)
+            _capability_signal(reviews_response, required=("pull_requests",))
+        if mode == "controller":
+            tree_response = client.get_tree(repository, pull_data["base"]["sha"], recursive=True)
+            _capability_signal(tree_response, required=("contents",))
+            blob_entries = [entry for entry in tree_response.data["tree"] if entry["type"] == "blob"]
+            if not blob_entries:
+                raise PreflightError("probe pull request tree has no blob entry")
+            blob_response = client.get_blob(repository, blob_entries[0]["sha"])
+            _capability_signal(blob_response, required=("contents",))
+        if mode in {"discovery", "controller", "publisher", "dismissal"}:
             permission = client.collaborator_effective_permission(repository, user_login)
             if permission.principal_type != principal_type:
                 raise PreflightError("effective permission principal type mismatch")
             # Permission is a read probe only; publisher mutation authority is
             # deliberately not inferred from it.
-        if mode == "publisher":
+        if mode in {"publisher", "dismissal"}:
             if operator_manifest is None:
                 raise PreflightError("publisher mode requires operator credential manifest")
             validate_operator_credential_manifest(operator_manifest)
@@ -515,9 +775,15 @@ def preflight_read_only(
                 principal_type != "Bot"
                 or manifest_principal["login"] != user_login
                 or manifest_principal["type"] != principal_type
-                or "publish" not in operator_manifest["allowed_operations"]
+                or (
+                    (mode == "publisher" and "publish" not in operator_manifest["allowed_operations"])
+                    or (
+                        mode == "dismissal"
+                        and "dismiss-workflow-review" not in operator_manifest["allowed_operations"]
+                    )
+                )
             ):
-                raise PreflightError("operator manifest does not match the authenticated publisher")
+                raise PreflightError("operator manifest does not attest to the requested operation")
             apps = trusted["apps"]
             if not any(
                 app["login"] == user_login

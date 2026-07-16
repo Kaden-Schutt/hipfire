@@ -5,6 +5,7 @@ import subprocess
 
 import pytest
 
+from autoresearch.ar.review.canonical import canonical_digest
 from autoresearch.ar.review.github import (
     GitHubBoundaryError,
     GitHubClient,
@@ -12,6 +13,7 @@ from autoresearch.ar.review.github import (
     preflight_read_only,
 )
 from autoresearch.ar.review.config import load_operator_credential_manifest, load_review_configuration
+from autoresearch.ar.review.models import ReviewTarget
 
 
 ROOT = Path(__file__).parents[3]
@@ -54,27 +56,87 @@ def pull(number=42):
     }
 
 
+def body_payload(record_id="logical"):
+    target = ReviewTarget(REPO, 42, REPO, "head-sha", "main", "base-sha", "merge-sha")
+    payload = {
+        "schema": "agentic-review/v1",
+        "record_type": "intent",
+        "record_id": record_id,
+        "target": {
+            "repository": REPO,
+            "number": 42,
+            "head_repository": REPO,
+            "head_sha": "head-sha",
+            "base_ref": "main",
+            "base_sha": "base-sha",
+            "merge_base_sha": "merge-sha",
+        },
+        "target_key": target.target_key(),
+        "attempt_id": "attempt-1",
+    }
+    payload["canonical_digest"] = canonical_digest(
+        {key: value for key, value in payload.items() if key != "canonical_digest"}
+    )
+    return payload
+
+
 def record(node_id="IC_1", *, updated_at="2026-01-01T00:00:00Z"):
+    payload = body_payload()
     return {
         "id": 11,
         "node_id": node_id,
         "user": {"login": "review-bot", "type": "Bot"},
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": updated_at,
-        "body": "{\"schema\": \"agentic-review/v1\"}",
+        "body": json.dumps(payload, separators=(",", ":")),
     }
+
+
+def review_record():
+    return dict(record("PRR_1"), id=7, state="APPROVED", commit_id="head-sha")
+
+
+def permission(login="review-bot", role="pull"):
+    return {"user": user(login=login), "permissions": {}, "role_name": role}
+
+
+def tree():
+    return {"sha": "base-sha", "tree": [{"path": "README.md", "mode": "100644", "type": "blob", "sha": "blob-sha"}]}
+
+
+def blob():
+    return {"sha": "blob-sha", "encoding": "base64", "content": "cmVhZG1lCg=="}
 
 
 def test_path_and_method_allowlist_rejects_before_subprocess():
     runner = FakeRunner([])
     client = GitHubClient(runner)
 
+    assert not hasattr(client, "request")
     with pytest.raises(GitHubBoundaryError):
         client._request("GET", "/repos/owner/repo/hooks")
     with pytest.raises(GitHubBoundaryError):
         client._request("PATCH", "/user")
     with pytest.raises(GitHubBoundaryError):
         client.get_tree(REPO, "tree?recursive=1")
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda client: client.get_repository("owner/../repo"),
+        lambda client: client.get_repository("owner/repo?bad"),
+        lambda client: client.get_tree(REPO, "../tree"),
+        lambda client: client.get_blob(REPO, "blob?bad"),
+        lambda client: client.collaborator_effective_permission(REPO, "bad/login"),
+        lambda client: client.remove_label(REPO, 42, "../label"),
+    ],
+)
+def test_unsafe_endpoint_identifiers_are_rejected_before_subprocess(call):
+    runner = FakeRunner([])
+    with pytest.raises(GitHubBoundaryError):
+        call(GitHubClient(runner))
     assert runner.calls == []
 
 
@@ -94,6 +156,32 @@ def test_runner_failures_and_headers_fail_closed(response, message):
         GitHubClient(FakeRunner([response])).get_authenticated_user()
 
 
+def test_runner_timeout_and_output_bounds_fail_closed():
+    class TimeoutRunner:
+        def __call__(self, argv, input_data=None):
+            raise subprocess.TimeoutExpired(argv, 30)
+
+    with pytest.raises(GitHubBoundaryError, match="timed out"):
+        GitHubClient(TimeoutRunner()).get_authenticated_user()
+    huge = subprocess.CompletedProcess(["gh"], 0, "x" * (16 * 1024 * 1024 + 1), "")
+    with pytest.raises(GitHubBoundaryError, match="stdout|size"):
+        GitHubClient(FakeRunner([huge])).get_authenticated_user()
+
+
+@pytest.mark.parametrize(
+    "runner_result",
+    [
+        ("0", "{}", ""),
+        (0, 1, ""),
+        (0, "{}", 1),
+        (0, "{}", "x" * (1 << 20) + "x"),
+    ],
+)
+def test_malformed_runner_results_fail_closed(runner_result):
+    with pytest.raises(GitHubBoundaryError):
+        GitHubClient(FakeRunner([runner_result])).get_authenticated_user()
+
+
 def test_paginated_pull_requests_are_flattened_and_bounded():
     runner = FakeRunner([result([pull(1)]), result([pull(2)])])
     client = GitHubClient(runner)
@@ -102,7 +190,7 @@ def test_paginated_pull_requests_are_flattened_and_bounded():
     # The second page is consumed by the client's pagination callback.
     pulls = client.list_pull_requests(REPO, pages=2)
     assert [item["number"] for item in pulls.data] == [1, 2]
-    assert all("--paginate" in call[0] for call in runner.calls)
+    assert all("--paginate" not in call[0] for call in runner.calls)
     assert all("per_page=1" in " ".join(call[0]) for call in runner.calls)
 
 
@@ -121,7 +209,7 @@ def test_paginated_http_output_has_a_fixed_page_bound():
 def test_envelope_uses_server_fields_and_rejects_edited_records():
     runner = FakeRunner([result([record()])])
     client = GitHubClient(runner)
-    envelope = client.comment_envelope(REPO, 42, {"record_id": "logical", "record_type": "intent"})
+    envelope = client.comment_envelope(REPO, 42)
     assert envelope.node_id == "IC_1"
     assert envelope.author == "review-bot"
     assert envelope.author_type == "Bot"
@@ -130,20 +218,35 @@ def test_envelope_uses_server_fields_and_rejects_edited_records():
 
     edited = FakeRunner([result([record(updated_at="2026-01-01T00:01:00Z")])])
     with pytest.raises(GitHubBoundaryError, match="edited"):
-        GitHubClient(edited).comment_envelope(REPO, 42, {"record_id": "logical"})
+        GitHubClient(edited).comment_envelope(REPO, 42)
 
 
 def test_envelope_builder_requires_the_api_record_shape():
     incomplete = dict(record())
     del incomplete["id"]
     with pytest.raises(GitHubBoundaryError, match="comment"):
-        GitHubClient(FakeRunner([])).envelope_from_comment(incomplete, {"record_id": "logical"})
+        GitHubClient(FakeRunner([])).envelope_from_comment(incomplete)
+
+
+def test_envelope_binds_strict_body_payload_and_rejects_digest_mismatch_or_caller_payload():
+    api_record = record()
+    payload = json.loads(api_record["body"])
+    envelope = GitHubClient(FakeRunner([])).envelope_from_comment(api_record)
+    assert envelope.payload == payload
+    with pytest.raises(TypeError):
+        GitHubClient(FakeRunner([])).envelope_from_comment(api_record, payload)
+    bad = dict(api_record, body=json.dumps(dict(payload, canonical_digest="0" * 64)))
+    with pytest.raises(GitHubBoundaryError, match="digest|body"):
+        GitHubClient(FakeRunner([])).envelope_from_comment(bad)
+    malformed = dict(api_record, body='{"record_id":"logical","record_id":"other"}')
+    with pytest.raises(GitHubBoundaryError, match="JSON|body"):
+        GitHubClient(FakeRunner([])).envelope_from_comment(malformed)
 
 
 def test_review_envelope_is_constructed_from_authenticated_review():
     review = dict(record("PRR_1"), id=7, state="APPROVED", commit_id="head-sha")
     envelope = GitHubClient(FakeRunner([result([review])])).review_envelope(
-        REPO, 42, 7, {"record_id": "logical", "record_type": "review-metadata"}
+        REPO, 42, 7
     )
     assert envelope.node_id == "PRR_1"
     assert envelope.author_type == "Bot"
@@ -154,17 +257,66 @@ def test_effective_permission_is_normalized():
     permission = GitHubClient(FakeRunner([response])).collaborator_effective_permission(REPO, "review-bot")
     assert permission.login == "review-bot"
     assert permission.principal_type == "Bot"
-    assert permission.permission == "pull"
+    assert permission.permission == "read"
+
+
+@pytest.mark.parametrize("role, expected", [("push", "write"), ("maintain", "write"), ("triage", "read"), ("pull", "read")])
+def test_effective_permission_roles_are_normalized(role, expected):
+    response = result({"user": user(), "permissions": {}, "role_name": role})
+    assert GitHubClient(FakeRunner([response])).collaborator_effective_permission(REPO, "review-bot").permission == expected
+
+
+def test_effective_permission_verifies_requested_login():
+    response = result({"user": user(login="other"), "permissions": {"pull": True}})
+    with pytest.raises(GitHubBoundaryError, match="login"):
+        GitHubClient(FakeRunner([response])).collaborator_effective_permission(REPO, "review-bot")
+
+
+def test_pull_tree_and_blob_responses_are_bound_to_requested_ids():
+    with pytest.raises(GitHubBoundaryError, match="number"):
+        GitHubClient(FakeRunner([result(pull(41))])).get_pull_request(REPO, 42)
+    with pytest.raises(GitHubBoundaryError, match="sha"):
+        GitHubClient(FakeRunner([result(dict(tree(), sha="other-sha"))])).get_tree(REPO, "base-sha")
+    with pytest.raises(GitHubBoundaryError, match="sha"):
+        GitHubClient(FakeRunner([result(dict(blob(), sha="other-sha"))])).get_blob(REPO, "blob-sha")
 
 
 def test_create_review_sends_exact_commit_id():
     runner = FakeRunner([result({"id": 17, "node_id": "PRR_17"})])
     GitHubClient(runner).create_pull_request_review(
-        REPO, 42, body="review", event="COMMENT", commit_id="exact-head-sha"
+        REPO, 42, body="@file", event="COMMENT", commit_id="exact-head-sha"
     )
-    argv, _ = runner.calls[0]
-    assert "commit_id=exact-head-sha" in argv
-    assert "event=COMMENT" in argv
+    argv, input_data = runner.calls[0]
+    assert "--field" not in argv
+    assert "--input" in argv and "-" in argv
+    assert json.loads(input_data) == {"body": "@file", "event": "COMMENT", "commit_id": "exact-head-sha"}
+
+
+def test_mutation_labels_are_json_and_at_file_is_not_a_file_reference():
+    runner = FakeRunner([result([{"id": 1, "node_id": "L_1", "name": "@file"}])])
+    GitHubClient(runner).add_labels(REPO, 42, ["@file"])
+    argv, input_data = runner.calls[0]
+    assert "--field" not in argv
+    assert json.loads(input_data) == {"labels": ["@file"]}
+
+
+@pytest.mark.parametrize("method", ["create_issue_comment", "create_pull_request_review"])
+def test_mutation_response_ids_are_required(method):
+    runner = FakeRunner([result({"body": "ok"})])
+    with pytest.raises(GitHubBoundaryError, match="id"):
+        if method == "create_issue_comment":
+            GitHubClient(runner).create_issue_comment(REPO, 42, "comment")
+        else:
+            GitHubClient(runner).create_pull_request_review(
+                REPO, 42, body="comment", event="COMMENT", commit_id="head-sha"
+            )
+
+
+def test_mutation_body_has_a_fixed_input_bound():
+    runner = FakeRunner([])
+    with pytest.raises(GitHubBoundaryError, match="body|size|bound"):
+        GitHubClient(runner).create_issue_comment(REPO, 42, "x" * ((1 << 20) + 1))
+    assert runner.calls == []
 
 
 def test_config_loader_rejects_absolute_and_traversal_overrides(tmp_path):
@@ -195,9 +347,19 @@ def test_config_loader_uses_task_one_validators():
     assert configuration.providers["providers"] == []
 
 
-def preflight_responses(*, scopes="read:user, repo:status", trust_ok=True):
+def preflight_responses(*, scopes="read:user, repo:status", accepted=None, probe=True, tree_probe=False):
     headers = {"X-OAuth-Scopes": scopes}
-    return [result(user(), headers=headers), result(repository(), headers=headers), result([pull()], headers=headers)]
+    if accepted is not None:
+        headers = {"X-Accepted-GitHub-Permissions": accepted}
+    responses = [result(user(), headers=headers), result(repository(), headers=headers), result([pull()], headers=headers)]
+    if probe:
+        responses.append(result(pull(), headers=headers))
+        if tree_probe:
+            responses.extend([result(tree(), headers=headers), result(blob(), headers=headers)])
+        else:
+            responses.extend([result([record()], headers=headers), result([review_record()], headers=headers)])
+        responses.append(result(permission(), headers=headers))
+    return responses
 
 
 def test_preflight_probes_only_read_endpoints_with_bounded_pages_and_explicit_principal():
@@ -213,10 +375,11 @@ def test_preflight_probes_only_read_endpoints_with_bounded_pages_and_explicit_pr
     )
     outcome = preflight_read_only(GitHubClient(runner), REPO, mode="discovery", configuration=configuration)
     assert outcome.principal_type == "Bot"
-    assert len(runner.calls) == 3
+    assert len(runner.calls) == 7
     assert "--method" in runner.calls[0][0]
     assert "per_page=1" in " ".join(runner.calls[2][0])
     assert all(call[0][1] == "api" for call in runner.calls)
+    assert all(call[0][call[0].index("--method") + 1] == "GET" for call in runner.calls)
 
 
 def test_preflight_rejects_classic_repo_scope_and_empty_trust():
@@ -228,7 +391,7 @@ def test_preflight_rejects_classic_repo_scope_and_empty_trust():
     )
     with pytest.raises(PreflightError, match="classic|scope"):
         preflight_read_only(
-            GitHubClient(FakeRunner(preflight_responses(scopes="repo, read:user"))),
+            GitHubClient(FakeRunner(preflight_responses(scopes="repo, read:user", probe=False))),
             REPO,
             mode="discovery",
             configuration=configuration,
@@ -239,7 +402,7 @@ def test_preflight_rejects_malformed_scope_header():
     configuration = load_review_configuration(ROOT)
     with pytest.raises(PreflightError, match="scope"):
         preflight_read_only(
-            GitHubClient(FakeRunner(preflight_responses(scopes="read:user,,repo:status"))),
+            GitHubClient(FakeRunner(preflight_responses(scopes="read:user,,repo:status", probe=False))),
             REPO,
             mode="discovery",
             configuration=configuration,
@@ -259,9 +422,7 @@ def test_read_only_preflight_accepts_task_one_empty_apps():
 
 def test_controller_preflight_uses_effective_permission_without_static_apps():
     configuration = load_review_configuration(ROOT)
-    runner = FakeRunner(preflight_responses() + [
-        result({"user": user(), "permissions": {"pull": True, "push": False}})
-    ])
+    runner = FakeRunner(preflight_responses(tree_probe=True))
     outcome = preflight_read_only(
         GitHubClient(runner),
         REPO,
@@ -269,7 +430,7 @@ def test_controller_preflight_uses_effective_permission_without_static_apps():
         configuration=configuration,
     )
     assert outcome.login == "review-bot"
-    assert len(runner.calls) == 4
+    assert len(runner.calls) == 7
 
 
 def test_publisher_preflight_requires_matching_app_and_operator_manifest():
@@ -288,7 +449,7 @@ def test_publisher_preflight_requires_matching_app_and_operator_manifest():
     }
     with pytest.raises(PreflightError, match="matching|App"):
         preflight_read_only(
-            GitHubClient(FakeRunner(preflight_responses() + [result({"user": user(), "permissions": {"push": True}})])),
+            GitHubClient(FakeRunner(preflight_responses())),
             REPO,
             mode="publisher",
             configuration=configuration,
@@ -310,13 +471,36 @@ def test_publisher_preflight_accepts_matching_app_and_operator_manifest():
         "allowed_operations": ["publish"],
         "credential_attestation_digest": "sha256:" + "a" * 64,
     }
-    runner = FakeRunner(preflight_responses() + [
-        result({"user": user(), "permissions": {"push": True}})
-    ])
+    runner = FakeRunner(preflight_responses())
     preflight_read_only(
         GitHubClient(runner), REPO, mode="publisher", configuration=configuration, operator_manifest=manifest
     )
     assert all("--method" in call[0] and call[0][call[0].index("--method") + 1] == "GET" for call in runner.calls)
+
+
+def test_dismissal_preflight_requires_dismissal_attestation():
+    configuration = load_review_configuration(ROOT).with_trusted_publishers(
+        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [
+            {"app_id": 1, "login": "review-bot", "installation_id": 2, "repository_id": 8,
+             "credential_attestation_digest": "sha256:" + "a" * 64}
+        ]}
+    )
+    manifest = {
+        "schema": "hipfire.agentic-review.operator-credentials",
+        "version": 1,
+        "principal": {"login": "review-bot", "type": "Bot"},
+        "allowed_operations": ["dismiss-workflow-review"],
+        "credential_attestation_digest": "sha256:" + "a" * 64,
+    }
+    preflight_read_only(
+        GitHubClient(FakeRunner(preflight_responses())), REPO, mode="dismissal",
+        configuration=configuration, operator_manifest=manifest,
+    )
+    with pytest.raises(PreflightError, match="operation|dismiss"):
+        preflight_read_only(
+            GitHubClient(FakeRunner(preflight_responses())), REPO, mode="dismissal",
+            configuration=configuration, operator_manifest={**manifest, "allowed_operations": ["publish"]},
+        )
 
 
 @pytest.mark.parametrize("bad_user", [{"id": 1, "login": "bot"}, {"id": 1, "login": "bot", "type": "Robot"}])
@@ -344,5 +528,29 @@ def test_preflight_rejects_incomplete_page_and_bad_repository():
     with pytest.raises(PreflightError, match="page|pull"):
         preflight_read_only(
             GitHubClient(FakeRunner([result(user()), result(repository()), result({})])),
+            REPO, mode="discovery", configuration=configuration,
+        )
+
+
+def test_preflight_has_explicit_no_open_pr_behavior():
+    configuration = load_review_configuration(ROOT)
+    with pytest.raises(PreflightError, match="open|pull request"):
+        preflight_read_only(
+            GitHubClient(FakeRunner(preflight_responses(probe=False)[:2] + [result([])])),
+            REPO, mode="discovery", configuration=configuration,
+        )
+
+
+def test_preflight_accepts_fine_grained_permission_headers_and_requires_needed_permission():
+    configuration = load_review_configuration(ROOT)
+    accepted = "metadata=read, pull_requests=read, issues=read, contents=read"
+    outcome = preflight_read_only(
+        GitHubClient(FakeRunner(preflight_responses(accepted=accepted))),
+        REPO, mode="discovery", configuration=configuration,
+    )
+    assert outcome.scopes == ()
+    with pytest.raises(PreflightError, match="permission"):
+        preflight_read_only(
+            GitHubClient(FakeRunner(preflight_responses(accepted="metadata=read"))),
             REPO, mode="discovery", configuration=configuration,
         )
