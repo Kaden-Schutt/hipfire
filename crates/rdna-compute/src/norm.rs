@@ -2389,33 +2389,44 @@ impl Gpu {
         ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (kernel_name, kernel_src) =
-            match std::env::var("HIPFIRE_GDN_COMPACT2_SHAPE").ok().as_deref() {
-                Some("b2") => (
-                    "gated_delta_net_q8_compact2_b2",
-                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
-                ),
-                Some("b4") => (
-                    "gated_delta_net_q8_compact2_b4",
-                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B4_SRC,
-                ),
-                Some("b8") => (
-                    "gated_delta_net_q8_compact2_b8",
-                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B8_SRC,
-                ),
-                Some("b12") => (
-                    "gated_delta_net_q8_compact2_b12",
-                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B12_SRC,
-                ),
-                Some("b16") => (
-                    "gated_delta_net_q8_compact2_b16",
-                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B16_SRC,
-                ),
-                _ => (
-                    "gated_delta_net_q8_compact2_b2",
-                    kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
-                ),
-            };
+        let gfx1151_r8 = self.arch_caps.is_gfx1151()
+            && std::env::var("HIPFIRE_GFX1151_GDN_R8").as_deref() == Ok("1");
+        let (kernel_name, kernel_src, n_tiles) = if gfx1151_r8 {
+            (
+                "gated_delta_net_q8_compact2_r8_gfx1151",
+                kernels::GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC,
+                128 / 8,
+            )
+        } else {
+            let (kernel_name, kernel_src) =
+                match std::env::var("HIPFIRE_GDN_COMPACT2_SHAPE").ok().as_deref() {
+                    Some("b2") => (
+                        "gated_delta_net_q8_compact2_b2",
+                        kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
+                    ),
+                    Some("b4") => (
+                        "gated_delta_net_q8_compact2_b4",
+                        kernels::GATED_DELTA_NET_Q8_COMPACT2_B4_SRC,
+                    ),
+                    Some("b8") => (
+                        "gated_delta_net_q8_compact2_b8",
+                        kernels::GATED_DELTA_NET_Q8_COMPACT2_B8_SRC,
+                    ),
+                    Some("b12") => (
+                        "gated_delta_net_q8_compact2_b12",
+                        kernels::GATED_DELTA_NET_Q8_COMPACT2_B12_SRC,
+                    ),
+                    Some("b16") => (
+                        "gated_delta_net_q8_compact2_b16",
+                        kernels::GATED_DELTA_NET_Q8_COMPACT2_B16_SRC,
+                    ),
+                    _ => (
+                        "gated_delta_net_q8_compact2_b2",
+                        kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
+                    ),
+                };
+            (kernel_name, kernel_src, 128 / 4)
+        };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
 
         let qp = q.buf.as_ptr();
@@ -2433,7 +2444,6 @@ impl Gpu {
         let efp: *mut c_void = ef_residual
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
-        let n_tiles = (128 / 4) as u32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
@@ -2453,7 +2463,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", kernel_name, bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
-            [n_heads as u32, n_tiles, 1],
+            [n_heads as u32, n_tiles as u32, 1],
             [32, 1, 1],
             0,
             &mut params,

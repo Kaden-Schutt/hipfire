@@ -21,7 +21,12 @@
 #include <hip/hip_fp16.h>
 
 #define HD 128
-#define TILE_ROWS 4
+
+#ifndef HIPFIRE_GDN_TILE_ROWS
+#define HIPFIRE_GDN_TILE_ROWS 4
+#endif
+
+#define TILE_ROWS HIPFIRE_GDN_TILE_ROWS
 
 #ifndef HIPFIRE_GDN_QK_HEAD_DIV
 #define HIPFIRE_GDN_QK_HEAD_DIV 1
@@ -63,7 +68,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
 
     // Packed layout: S_f4[r * 32 + tid] = {S[r][tid], S[r][tid+32],
     // S[r][tid+64], S[r][tid+96]} — same 4*128 floats as the scalar tile.
-    __shared__ float4 S_f4[TILE_ROWS * 32];  // 4 KiB
+    __shared__ float4 S_f4[TILE_ROWS * 32];
 
     signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
     for (int r = 0; r < TILE_ROWS; r++) {
@@ -85,8 +90,8 @@ __global__ void HIPFIRE_GDN_KERNEL(
 
         float k0 = k_t[tid], k1 = k_t[tid+32], k2 = k_t[tid+64], k3 = k_t[tid+96];
         float q0 = q_t[tid], q1 = q_t[tid+32], q2 = q_t[tid+64], q3 = q_t[tid+96];
+#if TILE_ROWS == 4
         const float4 v_rows = *reinterpret_cast<const float4*>(v_t + row_start);
-
         float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
         for (int r = 0; r < TILE_ROWS; r++) {
             int row = row_start + r;
@@ -124,6 +129,60 @@ __global__ void HIPFIRE_GDN_KERNEL(
             *reinterpret_cast<float4*>(output + t * stride + h * HD + row_start) =
                 make_float4(out0, out1, out2, out3);
         }
+#elif TILE_ROWS == 8
+        const float4 v_rows0 = *reinterpret_cast<const float4*>(v_t + row_start);
+        const float4 v_rows1 = *reinterpret_cast<const float4*>(v_t + row_start + 4);
+        float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+        float out4 = 0.0f, out5 = 0.0f, out6 = 0.0f, out7 = 0.0f;
+#pragma unroll
+        for (int r = 0; r < TILE_ROWS; r++) {
+            float4 s = S_f4[r * 32 + tid];
+            float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
+
+            float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
+            for (int o = 16; o > 0; o >>= 1)
+                kv += __shfl_down(kv, o);
+            kv = __shfl(kv, 0);
+
+            const float v_row =
+                (r == 0) ? v_rows0.x :
+                (r == 1) ? v_rows0.y :
+                (r == 2) ? v_rows0.z :
+                (r == 3) ? v_rows0.w :
+                (r == 4) ? v_rows1.x :
+                (r == 5) ? v_rows1.y :
+                (r == 6) ? v_rows1.z : v_rows1.w;
+            float delta = (v_row - alpha * kv) * beta_v;
+
+            s0 = alpha * s0 + k0 * delta;
+            s1 = alpha * s1 + k1 * delta;
+            s2 = alpha * s2 + k2 * delta;
+            s3 = alpha * s3 + k3 * delta;
+            S_f4[r * 32 + tid] = make_float4(s0, s1, s2, s3);
+
+            float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
+            for (int o = 16; o > 0; o >>= 1)
+                out_v += __shfl_down(out_v, o);
+            if (tid == 0) {
+                if (r == 0) out0 = out_v;
+                else if (r == 1) out1 = out_v;
+                else if (r == 2) out2 = out_v;
+                else if (r == 3) out3 = out_v;
+                else if (r == 4) out4 = out_v;
+                else if (r == 5) out5 = out_v;
+                else if (r == 6) out6 = out_v;
+                else out7 = out_v;
+            }
+        }
+        if (tid == 0) {
+            *reinterpret_cast<float4*>(output + t * stride + h * HD + row_start) =
+                make_float4(out0, out1, out2, out3);
+            *reinterpret_cast<float4*>(output + t * stride + h * HD + row_start + 4) =
+                make_float4(out4, out5, out6, out7);
+        }
+#else
+#error "unsupported HIPFIRE_GDN_TILE_ROWS"
+#endif
     }
 
     // Requant FP32 → Q8 — OUTSIDE the token loop.
