@@ -2524,6 +2524,8 @@ impl Gpu {
             && k == 2_048
             && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA").as_deref()
+                        == Ok("1")
             });
         static QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_r2 = rdna3_k2048

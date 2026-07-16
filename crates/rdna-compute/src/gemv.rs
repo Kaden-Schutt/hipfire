@@ -5276,6 +5276,8 @@ impl Gpu {
             && k == 512
             && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_SIGMOID").as_deref()
+                        == Ok("1")
             });
         static SIGMOID_K512: OnceLock<bool> = OnceLock::new();
         static SIGMOID_HOIST_X16: OnceLock<bool> = OnceLock::new();
@@ -6521,6 +6523,8 @@ impl Gpu {
                 && k == 2_048
                 && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
                     std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+                        || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP").as_deref()
+                            == Ok("1")
                 });
             if pair_vgpr {
                 self.ensure_kernel(
@@ -7208,6 +7212,7 @@ impl Gpu {
         let gfx1151_buffer = self.arch_caps.is_gfx1151()
             && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_DOWN").as_deref() == Ok("1")
             });
         let (module_name, source, func_name) = if cpol_slc {
             (
