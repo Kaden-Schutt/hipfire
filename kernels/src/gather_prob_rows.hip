@@ -43,3 +43,15 @@ extern "C" __global__ void max_value_f32(
     }
     if (tid == 0) out[0] = scratch[0];
 }
+
+// Replay-visible replacement for hipMemcpyDtoD inside a retained kernel
+// sequence. Redline records kernel launches, not HIP memcpy commands; using a
+// plain grid-stride copy here keeps GDN innovation-tape writes in the PM4 IB.
+extern "C" __global__ void copy_f32_replayable(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int n
+) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) dst[i] = src[i];
+}

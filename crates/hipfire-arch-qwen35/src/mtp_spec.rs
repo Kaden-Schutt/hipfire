@@ -36,6 +36,7 @@ use crate::speculative::{apply_topp_trunc, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
+use rdna_compute::replay::{ReplayBackendRequest, ReplayState};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -2466,6 +2467,173 @@ fn map_draft_penalty_history(
 //   3 compressed lm_head GEMVs:  3 × 84 MB  = 252 MB MQ4  (this path)
 //   Saved: ~1.65 GB BW per cycle → ~21-27 ms per cycle on gfx1100.
 //
+#[allow(clippy::too_many_arguments)]
+fn enqueue_mtp_trunk_verify(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut qwen35::DeltaNetState,
+    scratch: &qwen35::Qwen35Scratch,
+    state: &mut MtpSpecState,
+    verify_tokens: &[u32],
+    cur_pos: usize,
+    tape_captured: bool,
+    captured_safe: bool,
+) -> HipResult<()> {
+    let n_verify = verify_tokens.len();
+    let vocab = config.vocab_size;
+    let dim = config.dim;
+
+    if captured_safe {
+        debug_assert!(tape_captured);
+        qwen35::upload_prefill_batch_inputs(gpu, &state.trunk_pbs, verify_tokens, cur_pos)?;
+        qwen35::forward_prefill_batch_single_chunk_captured_opts(
+            gpu,
+            weights,
+            config,
+            verify_tokens,
+            cur_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            &state.trunk_pbs,
+            None,
+            Some(&state.verify_hidden),
+            Some(&mut state.trunk_gdn_tape),
+            None,
+            false,
+        )?;
+    } else {
+        let verify_tape = tape_captured.then_some(&mut state.trunk_gdn_tape);
+        qwen35::forward_prefill_batch_with_pbs_opts(
+            gpu,
+            weights,
+            config,
+            verify_tokens,
+            cur_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            Some(&state.verify_hidden),
+            verify_tape,
+            None,
+            Some(&state.trunk_pbs),
+            None,
+            None,
+            false,
+        )?;
+    }
+
+    let w_out = &weights.output;
+    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+    match w_out.gpu_dtype {
+        DType::Q8_0 => {
+            if mtp_q8_verify_wmma_enabled_from_env() {
+                gpu.gemm_q8_0_batched_chunked(
+                    &w_out.buf,
+                    &state.verify_hidden,
+                    &logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            } else {
+                gpu.gemm_q8_0_batched(
+                    &w_out.buf,
+                    &state.verify_hidden,
+                    &logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            }
+        }
+        DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(
+            &w_out.buf,
+            &state.verify_hidden,
+            &logits_view,
+            w_out.m,
+            w_out.k,
+            n_verify,
+        )?,
+        DType::MQ4G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &state.verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq4g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ3G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &state.verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq3g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::HFQ6G256 => gpu.gemm_hfq6g256_batched_lmhead(
+            &w_out.buf,
+            &state.verify_hidden,
+            &logits_view,
+            w_out.m,
+            w_out.k,
+            n_verify,
+        )?,
+        DType::MQ6G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &state.verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        _ => {
+            for i in 0..n_verify {
+                let row = state.verify_hidden.sub_offset(i * dim, dim);
+                let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
+                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // Task 10 plain serial measured 39.68 tok/s τ=3.08; this path projects
 // ~50-58 tok/s at the same τ (gate is 60). A trained sidecar (hiptrx
 // trunk-argmax distillation) lifting τ from 3.08 → 3.5+ should clear.
@@ -3115,137 +3283,80 @@ pub fn spec_step_mtp_compressed_serial(
         gpu.arch.as_str(),
         /* moe_router_logits_present — dense trunk: arm never matched */ true,
     );
-    let verify_tape: Option<&mut GdnTape> = if tape_captured {
-        Some(&mut state.trunk_gdn_tape)
+    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+    // Redline retains only the fixed-width trunk verify + lm_head. Sampling
+    // penalties and accept/reject remain outside the blob because their token
+    // histories and row counts change each cycle. Adaptive-short cycles run
+    // direct; a K+1 command stream is never reused for a smaller verify batch.
+    let redline_verify_eligible = tape_captured
+        && n_verify == state.max_n + 1
+        && gpu.replay.request() == ReplayBackendRequest::Auto
+        && gpu.replay.uses_pm4_transport();
+    gpu.replay.set_forward_eligible(redline_verify_eligible);
+
+    let replayed = if redline_verify_eligible && gpu.replay.should_route_pm4() {
+        qwen35::upload_prefill_batch_inputs(gpu, &state.trunk_pbs, &verify_tokens, cur_pos)?;
+        unsafe { gpu.replay.replay_pm4(cur_pos) }.map_err(|reason| {
+            gpu.replay
+                .poison(format!("MTP verify PM4 replay failed: {reason}"));
+            hip_bridge::HipError::new(0, &reason)
+        })?;
+        true
     } else {
-        None
+        false
     };
 
-    qwen35::forward_prefill_batch_with_pbs_opts(
-        gpu,
-        trunk_weights,
-        &target.config,
-        &verify_tokens,
-        cur_pos,
-        &mut target.kv_cache,
-        &mut target.dn_state,
-        &target.scratch,
-        None,
-        Some(&state.verify_hidden),
-        verify_tape,
-        None,
-        Some(&state.trunk_pbs),
-        None,  // mask_override
-        None,  // max_layer
-        false, // MTP computes all verify logits from verify_hidden below
-    )?;
+    if !replayed {
+        let capture_started = redline_verify_eligible && gpu.replay.state() == ReplayState::Armed;
+        if capture_started {
+            gpu.replay
+                .begin_capture()
+                .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+        }
 
-    let w_out = &trunk_weights.output;
-    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    match w_out.gpu_dtype {
-        DType::Q8_0 => {
-            if mtp_q8_verify_wmma_enabled_from_env() {
-                gpu.gemm_q8_0_batched_chunked(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            } else {
-                gpu.gemm_q8_0_batched(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
+        let enqueue = enqueue_mtp_trunk_verify(
+            gpu,
+            trunk_weights,
+            &target.config,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            state,
+            &verify_tokens,
+            cur_pos,
+            tape_captured,
+            capture_started,
+        );
+        if let Err(error) = enqueue {
+            if capture_started {
+                gpu.replay.poison(format!(
+                    "MTP verify capture failed while dispatching: {error:?}"
+                ));
             }
+            return Err(error);
         }
-        DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ4G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ3G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ6G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        _ => {
-            for i in 0..n_verify {
-                let row = state.verify_hidden.sub_offset(i * dim, dim);
-                let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
+
+        if capture_started {
+            gpu.hip.device_synchronize()?;
+            if let Err(reason) = gpu.replay.finish_capture() {
+                gpu.replay
+                    .poison(format!("MTP verify capture close failed: {reason}"));
+            } else {
+                let launches = gpu.replay.recorded_launches().len();
+                match gpu
+                    .replay
+                    .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                {
+                    Ok((dispatches, dwords, queue_id)) => eprintln!(
+                        "[redline-mtp] retained K={} verify: dispatches={} pm4_dwords={} queue={}",
+                        state.max_n, dispatches, dwords, queue_id
+                    ),
+                    Err(reason) => {
+                        gpu.replay
+                            .poison(format!("MTP verify PM4 prepare failed: {reason}"));
+                        eprintln!("[redline-mtp] falling back to HIP: {reason}");
+                    }
+                }
             }
         }
     }

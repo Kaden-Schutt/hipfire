@@ -126,6 +126,51 @@ impl Gpu {
         )
     }
 
+    /// Copy an F32 tensor view with a launch that Redline can retain. Ordinary
+    /// HIP execution keeps using the lower-overhead D2D memcpy; only an active
+    /// Redline recording substitutes the kernel.
+    pub fn copy_f32_replayable(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.replay.is_recording() {
+            return self.memcpy_dtod_auto(&dst.buf, &src.buf, n * std::mem::size_of::<f32>());
+        }
+
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gather_prob_rows",
+            kernels::GATHER_PROB_ROWS_SRC,
+            "copy_f32_replayable",
+        )?;
+        let src_ptr = src.buf.as_ptr();
+        let dst_ptr = dst.buf.as_ptr();
+        let count = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &src_ptr as *const _ as *mut c_void,
+            &dst_ptr as *const _ as *mut c_void,
+            &count as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (n as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "copy_f32_replayable",
+            [grid.max(1), 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(src_ptr);
+                blob.push_ptr(dst_ptr);
+                blob.push_i32(count);
+                blob
+            },
+        )
+    }
+
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
         &mut self,

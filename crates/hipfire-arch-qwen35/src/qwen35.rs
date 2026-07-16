@@ -8399,14 +8399,14 @@ fn forward_prefill_chunk(
                 }
                 _ => true, // LA layers don't gate this check
             });
-    // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
-    // at capture time. `max_ctx_len = start_pos + n` grows per cycle, so the
+    // Under hipGraph or Redline capture, scalar kernargs get BAKED into the
+    // retained launch. `max_ctx_len = start_pos + n` grows per cycle, so the
     // captured value would be stale on replay — the attention kernel would
     // allocate too-small LDS for `scores[]` and over-read. Bake the physical
     // cap instead (LDS sized for the worst case). The kernel still iterates
     // over the actual `positions[b] + 1` per-row seq_len from a device buffer,
     // so correctness is preserved; only the LDS allocation is over-provisioned.
-    let max_ctx_len = if gpu.graphs.capture_mode {
+    let max_ctx_len = if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         kv_cache.physical_cap
     } else {
         start_pos + n
@@ -8692,27 +8692,18 @@ fn forward_prefill_chunk(
                     let off_a = tape_offset * alpha_row_bytes;
                     let copy_qkv = n * qkv_row_bytes;
                     let copy_a = n * alpha_row_bytes;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.qkv_bufs[delta_layer_idx].buf,
-                        off_qkv,
-                        &pbs.dn_qkv_batch.buf,
-                        0,
-                        copy_qkv,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.alpha_bufs[delta_layer_idx].buf,
-                        off_a,
-                        &pbs.dn_alpha_batch.buf,
-                        0,
-                        copy_a,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.beta_bufs[delta_layer_idx].buf,
-                        off_a,
-                        &pbs.dn_beta_batch.buf,
-                        0,
-                        copy_a,
-                    )?;
+                    let qkv_dst =
+                        tape.qkv_bufs[delta_layer_idx].sub_offset(off_qkv / 4, copy_qkv / 4);
+                    let qkv_src = pbs.dn_qkv_batch.sub_offset(0, copy_qkv / 4);
+                    gpu.copy_f32_replayable(&qkv_src, &qkv_dst, copy_qkv / 4)?;
+                    let alpha_dst =
+                        tape.alpha_bufs[delta_layer_idx].sub_offset(off_a / 4, copy_a / 4);
+                    let alpha_src = pbs.dn_alpha_batch.sub_offset(0, copy_a / 4);
+                    gpu.copy_f32_replayable(&alpha_src, &alpha_dst, copy_a / 4)?;
+                    let beta_dst =
+                        tape.beta_bufs[delta_layer_idx].sub_offset(off_a / 4, copy_a / 4);
+                    let beta_src = pbs.dn_beta_batch.sub_offset(0, copy_a / 4);
+                    gpu.copy_f32_replayable(&beta_src, &beta_dst, copy_a / 4)?;
                 }
 
                 // Tree-aware dispatch gate: when the caller provides
@@ -10511,27 +10502,18 @@ fn forward_prefill_chunk(
                     let off_a = tape_offset * alpha_row_bytes;
                     let copy_qkv = n * qkv_row_bytes;
                     let copy_a = n * alpha_row_bytes;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.qkv_bufs[delta_layer_idx].buf,
-                        off_qkv,
-                        &pbs.dn_qkv_batch.buf,
-                        0,
-                        copy_qkv,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.alpha_bufs[delta_layer_idx].buf,
-                        off_a,
-                        &pbs.dn_alpha_batch.buf,
-                        0,
-                        copy_a,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.beta_bufs[delta_layer_idx].buf,
-                        off_a,
-                        &pbs.dn_beta_batch.buf,
-                        0,
-                        copy_a,
-                    )?;
+                    let qkv_dst =
+                        tape.qkv_bufs[delta_layer_idx].sub_offset(off_qkv / 4, copy_qkv / 4);
+                    let qkv_src = pbs.dn_qkv_batch.sub_offset(0, copy_qkv / 4);
+                    gpu.copy_f32_replayable(&qkv_src, &qkv_dst, copy_qkv / 4)?;
+                    let alpha_dst =
+                        tape.alpha_bufs[delta_layer_idx].sub_offset(off_a / 4, copy_a / 4);
+                    let alpha_src = pbs.dn_alpha_batch.sub_offset(0, copy_a / 4);
+                    gpu.copy_f32_replayable(&alpha_src, &alpha_dst, copy_a / 4)?;
+                    let beta_dst =
+                        tape.beta_bufs[delta_layer_idx].sub_offset(off_a / 4, copy_a / 4);
+                    let beta_src = pbs.dn_beta_batch.sub_offset(0, copy_a / 4);
+                    gpu.copy_f32_replayable(&beta_src, &beta_dst, copy_a / 4)?;
                 }
                 // Same tree-aware dispatch gate as dense LA branch above.
                 let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
