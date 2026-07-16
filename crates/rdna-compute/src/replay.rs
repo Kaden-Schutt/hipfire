@@ -373,6 +373,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_low_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_pair_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151"
@@ -669,6 +671,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_low_gfx1151"
+            | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_pair_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151"
@@ -2985,6 +2989,10 @@ mod tests {
         let gate = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151";
         let gate_hybrid =
             "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
+        let gate_hybrid_low =
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_low_gfx1151";
+        let gate_hybrid_pair =
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_pair_gfx1151";
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(gate), Some(48));
         assert_eq!(pointer_effects(gate).map(|effects| effects.len()), Some(5));
@@ -2993,6 +3001,13 @@ mod tests {
             pointer_effects(gate_hybrid).map(|effects| effects.len()),
             Some(5)
         );
+        for gate_variant in [gate_hybrid_low, gate_hybrid_pair] {
+            assert_eq!(expected_kernarg_bytes(gate_variant), Some(48));
+            assert_eq!(
+                pointer_effects(gate_variant).map(|effects| effects.len()),
+                Some(5)
+            );
+        }
         assert_eq!(expected_kernarg_bytes(qkvza), Some(96));
         assert_eq!(pointer_effects(qkvza).map(|effects| effects.len()), Some(9));
         for (symbol, kernarg_bytes, pointer_count) in [
