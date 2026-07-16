@@ -517,14 +517,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
         "gemm_gate_up_hfq4g256_wmma_gfx12"
-        | "gemm_gate_up_hfq4g256_wmma_gfx12_f32x"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt8"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt12" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
-        "gemm_qkvza_hfq4g256_wmma_gfx12"
-        | "gemm_qkvza_hfq4g256_wmma_gfx12_f32x" => Some(vec![
+        "gemm_qkvza_hfq4g256_wmma_gfx12" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -535,7 +533,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(56),
             write(64),
         ]),
-        "gemm_qkv_hfq4g256_wmma_gfx12" | "gemm_qkv_hfq4g256_wmma_gfx12_f32x" => Some(vec![
+        "gemm_qkv_hfq4g256_wmma_gfx12" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -544,8 +542,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(40),
             write(48),
         ]),
-        "gemm_hfq4g256_residual_wmma_gfx12"
-        | "gemm_hfq4g256_residual_wmma_gfx12_f32x" => {
+        "gemm_hfq4g256_residual_wmma_gfx12" => {
             Some(vec![read(0), read(8), write(16)])
         }
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
@@ -678,7 +675,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "deinterleave_f32_batched"
         | "gemm_hfq4g256"
         | "gemm_hfq4g256_residual_wmma_gfx12"
-        | "gemm_hfq4g256_residual_wmma_gfx12_f32x"
         | "kv_cache_write_q8_0_batched" => Some(36),
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
@@ -713,7 +709,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => Some(64),
         "gemm_gate_up_hfq4g256_wmma_gfx12"
-        | "gemm_gate_up_hfq4g256_wmma_gfx12_f32x"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt8"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt12"
@@ -723,7 +718,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100" => Some(64),
-        "gemm_qkv_hfq4g256_wmma_gfx12" | "gemm_qkv_hfq4g256_wmma_gfx12_f32x" => Some(76),
+        "gemm_qkv_hfq4g256_wmma_gfx12" => Some(76),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "fused_qkv_hfq4g256" | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => {
@@ -738,8 +733,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
         | "gated_delta_net_q8_fast" => Some(96),
-        "gemm_qkvza_hfq4g256_wmma_gfx12"
-        | "gemm_qkvza_hfq4g256_wmma_gfx12_f32x" => Some(96),
+        "gemm_qkvza_hfq4g256_wmma_gfx12" => Some(96),
         "attention_flash_q8_0_tile_batched" => Some(112),
         _ => None,
     }
@@ -2950,16 +2944,12 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
         "gemm_gate_up_hfq4g256_wmma_gfx12",
-        "gemm_gate_up_hfq4g256_wmma_gfx12_f32x",
         "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
         "gemm_gate_up_hfq4g256_wmma_gfx12_bt8",
         "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
         "gemm_qkvza_hfq4g256_wmma_gfx12",
-        "gemm_qkvza_hfq4g256_wmma_gfx12_f32x",
         "gemm_qkv_hfq4g256_wmma_gfx12",
-        "gemm_qkv_hfq4g256_wmma_gfx12_f32x",
         "gemm_hfq4g256_residual_wmma_gfx12",
-        "gemm_hfq4g256_residual_wmma_gfx12_f32x",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
