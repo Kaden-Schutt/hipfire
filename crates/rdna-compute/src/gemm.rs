@@ -2519,6 +2519,12 @@ impl Gpu {
         let rdna3_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_qkvza_k2048
             && k == 2_048;
+        static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+            });
         static QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_r2 = rdna3_k2048
             && *QKVZA_R2.get_or_init(|| {
@@ -2601,6 +2607,17 @@ impl Gpu {
             )?;
             (
                 "fused_qkvza_hfq4g256_k2048",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if gfx1151_k2048_buffer {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_k2048_buffer_gfx1151",
+                kernels::FUSED_QKVZA_HFQ4G256_K2048_BUFFER_GFX1151_SRC,
+                "fused_qkvza_hfq4g256_k2048_buffer_gfx1151",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_k2048_buffer_gfx1151",
                 [32u32, 1, 1],
                 total_m as u32,
             )

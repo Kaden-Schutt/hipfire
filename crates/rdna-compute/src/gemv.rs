@@ -4901,6 +4901,11 @@ impl Gpu {
             && self.flags.rdna3_hfq4_residual_k2048
             && k == 2_048;
         use std::sync::OnceLock;
+        static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
+        let gfx1151_buffer = self.arch_caps.is_gfx1151()
+            && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+            });
         static RESIDUAL_CPOL: OnceLock<Option<String>> = OnceLock::new();
         let cpol = RESIDUAL_CPOL
             .get_or_init(|| std::env::var("HIPFIRE_RESIDUAL_CPOL").ok())
@@ -4940,6 +4945,12 @@ impl Gpu {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC,
                 "gemv_hfq4g256_residual_stage_x32_gfx1100",
+                "gemv_hfq4g256_residual",
+            )
+        } else if gfx1151_buffer {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_BUFFER_GFX1151_SRC,
+                "gemv_hfq4g256_residual_buffer_gfx1151",
                 "gemv_hfq4g256_residual",
             )
         } else {
@@ -5256,6 +5267,13 @@ impl Gpu {
         let rdna3_buffer = self.arch_caps.is_rdna3_dgpu()
             && self.flags.rdna3_hfq4_sigmoid_buffer;
         use std::sync::OnceLock;
+        static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k512_buffer = self.arch_caps.is_gfx1151()
+            && m == 2_048
+            && k == 512
+            && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+            });
         static SIGMOID_K512: OnceLock<bool> = OnceLock::new();
         static SIGMOID_HOIST_X16: OnceLock<bool> = OnceLock::new();
         let rdna3_hoist_x16 = self.arch_caps.is_gfx1100()
@@ -5298,6 +5316,11 @@ impl Gpu {
             (
                 "gemv_hfq4g256_residual_sigmoid_buffer_gfx1100",
                 kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC,
+            )
+        } else if gfx1151_k512_buffer {
+            (
+                "gemv_hfq4g256_residual_sigmoid_k512_buffer_gfx1151",
+                kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_BUFFER_GFX1151_SRC,
             )
         } else {
             (
@@ -6490,6 +6513,12 @@ impl Gpu {
             let fixed_k2048 = self.arch_caps.is_gfx1100()
                 && self.flags.rdna3_hfq4_moe_gate_up_k2048
                 && k == 2_048;
+            static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
+            let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
+                && k == 2_048
+                && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+                });
             if pair_vgpr {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_pair_slc",
@@ -6592,6 +6621,21 @@ impl Gpu {
                 )?;
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+                    [32u32, 1, 1],
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
+                )
+            } else if gfx1151_k2048_buffer {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_BUFFER_GFX1151_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151",
                     [32u32, 1, 1],
                     if tight_grid {
                         (m as u32) >> 1
@@ -7157,11 +7201,22 @@ impl Gpu {
             && *DOWN_CPOL_SLC.get_or_init(|| {
                 std::env::var("HIPFIRE_MOE_DOWN_CPOL").as_deref() == Ok("slc")
             });
+        static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
+        let gfx1151_buffer = self.arch_caps.is_gfx1151()
+            && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+            });
         let (module_name, source, func_name) = if cpol_slc {
             (
                 "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc_gfx1100",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC,
                 "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
+            )
+        } else if gfx1151_buffer {
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_BUFFER_GFX1151_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151",
             )
         } else {
             (

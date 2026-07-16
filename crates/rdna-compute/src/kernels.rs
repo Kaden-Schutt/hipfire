@@ -1192,6 +1192,16 @@ pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
+/// Radiowave gfx1151 probe: preserve the generic dual-row arithmetic while
+/// lowering the weight stream to temporal raw-buffer loads. gfx1151 is not in
+/// the gfx1100 dGPU admission set, so this remains inert unless the exact-arch
+/// runtime selector chooses it.
+pub const GEMV_HFQ4G256_RESIDUAL_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
@@ -1288,6 +1298,16 @@ pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC: &str = concat!(
 /// K=512 (two HFQ4 groups), so the compiler can remove the empty quad loop and
 /// all dynamic tail predicates while retaining the public kernarg ABI.
 pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_SIGMOID_K512 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip")
+);
+/// Exact gfx1151 shared-down candidate. Fixing K=512 removes the empty quad
+/// loop and dynamic tails while temporal raw-buffer loads preserve the K4
+/// target's native cache policy instead of inheriting gfx1100's SLC tuning.
+pub const GEMV_HFQ4G256_RESIDUAL_SIGMOID_K512_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
     "#define HIPFIRE_RDNA3_SIGMOID_K512 1\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
@@ -1391,6 +1411,17 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str = concat!(
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
     "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+/// Exact gfx1151 A3B candidate: expose K=2048 to LLVM and use temporal
+/// raw-buffer weight loads without importing gfx1100 cache or scheduling
+/// policy.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
@@ -1548,6 +1579,17 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
 );
+/// Exact gfx1151 temporal-buffer candidate for the K=512 routed down stream.
+/// The kernel ABI, four-row mapping, reduction tree, and launch geometry stay
+/// unchanged; only weight addressing is lowered differently.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_BUFFER_GFX1151_SRC: &str =
+    concat!(
+        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+        "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151\n",
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+    );
 
 /// Radiowave gfx1100 cache-policy probe for the atomic-free MoE down stream.
 /// Keep this replay-visible and opt-in until exact-shadow and product-level
@@ -2553,6 +2595,18 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
 // row counts. Works on every RDNA generation — see the kernel header.
 pub const FUSED_QKVZA_HFQ4G256_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
+/// Exact gfx1151 A3B candidate: preserve the generic one-row schedule while
+/// making K=2048 constant and lowering weights through temporal raw-buffer
+/// loads. This deliberately does not inherit gfx1100's R2 or SLC policy.
+pub const FUSED_QKVZA_HFQ4G256_K2048_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_k2048_buffer_gfx1151\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
