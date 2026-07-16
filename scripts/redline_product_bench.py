@@ -218,6 +218,10 @@ class Daemon:
                 HIPFIRE_QWEN_MTP="1",
                 HIPFIRE_MTP_K=str(mtp_k),
                 HIPFIRE_MTP_P_MIN=str(mtp_p_min),
+                # Fingerprint committed IDs, not visible tokenizer chunks.
+                # One MTP cycle can commit several IDs while EosFilter emits
+                # fewer text events.
+                HIPFIRE_EMIT_TOKEN_IDS="1",
                 # Keep HipGraph out of the MTP comparison. The auto arm will
                 # become the retained-PM4 arm as MTP tape support lands.
                 HIPFIRE_MTP_PROPOSAL_GRAPH="0",
@@ -470,7 +474,12 @@ def main():
         default=str(DEFAULT_MTP_PROMPT),
         help="byte-pinned plain-text prompt used by mtp-greedy",
     )
-    parser.add_argument("--mtp-k", type=int, default=5)
+    parser.add_argument(
+        "--mtp-k",
+        type=int,
+        default=3,
+        help="MTP draft depth; 3 matches the user-facing serve default",
+    )
     parser.add_argument("--mtp-p-min", type=float, default=0.0)
     parser.add_argument(
         "--warmups",
