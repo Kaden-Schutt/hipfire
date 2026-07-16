@@ -41,6 +41,53 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::time::Instant;
 
+#[derive(Default)]
+struct MtpPhaseTraceStats {
+    cycles: u64,
+    proposal_ms: f64,
+    verify_accept_ms: f64,
+    rollback_ms: f64,
+    full_accepts: u64,
+}
+
+fn mtp_phase_trace_enabled_from_env() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_MTP_PHASE_TRACE").ok().as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+fn record_mtp_phase_trace(
+    proposal_ms: f64,
+    verify_accept_ms: f64,
+    rollback_ms: f64,
+    full_accept: bool,
+) {
+    static STATS: std::sync::OnceLock<std::sync::Mutex<MtpPhaseTraceStats>> =
+        std::sync::OnceLock::new();
+    let mut stats = STATS
+        .get_or_init(|| std::sync::Mutex::new(MtpPhaseTraceStats::default()))
+        .lock()
+        .unwrap();
+    stats.cycles += 1;
+    stats.proposal_ms += proposal_ms;
+    stats.verify_accept_ms += verify_accept_ms;
+    stats.rollback_ms += rollback_ms;
+    stats.full_accepts += u64::from(full_accept);
+    if stats.cycles % 64 == 0 {
+        let n = stats.cycles as f64;
+        eprintln!(
+            "[mtp-phase] cycles={} proposal={:.3}ms verify_accept={:.3}ms rollback={:.3}ms total={:.3}ms full_accept={:.1}%",
+            stats.cycles,
+            stats.proposal_ms / n,
+            stats.verify_accept_ms / n,
+            stats.rollback_ms / n,
+            (stats.proposal_ms + stats.verify_accept_ms + stats.rollback_ms) / n,
+            100.0 * stats.full_accepts as f64 / n,
+        );
+    }
+}
+
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
 
 /// Sampling configuration matching the Unsloth-recommended MTP defaults
@@ -3428,6 +3475,15 @@ pub fn spec_step_mtp_compressed_serial(
             .save_from_async_on(&target.dn_state, gpu, snap_stream)?;
     }
 
+    // Opt-in diagnostic only: phase boundaries synchronize the device so the
+    // reported wall times represent completed GPU work. This intentionally
+    // perturbs throughput and must never be enabled for benchmark numbers.
+    let phase_trace = mtp_phase_trace_enabled_from_env();
+    if phase_trace {
+        gpu.hip.device_synchronize()?;
+    }
+    let proposal_started = Instant::now();
+
     let dim_bytes = dim * 4;
     let mut candidates: Vec<u32> = Vec::with_capacity(max_n);
     let argmax_view = state.mtp_lm_argmax.sub_offset(0, 1);
@@ -4169,6 +4225,14 @@ pub fn spec_step_mtp_compressed_serial(
         candidates.len()
     };
 
+    let proposal_ms = if phase_trace {
+        gpu.hip.device_synchronize()?;
+        proposal_started.elapsed().as_secs_f64() * 1e3
+    } else {
+        0.0
+    };
+    let verify_accept_started = Instant::now();
+
     // ── 2. Trunk verify ───────────────────────────────────────────────────
     let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
     verify_tokens.push(last_committed);
@@ -4472,6 +4536,14 @@ pub fn spec_step_mtp_compressed_serial(
     let prev_hidden_row = advance - 1;
     state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
 
+    let verify_accept_ms = if phase_trace {
+        gpu.hip.device_synchronize()?;
+        verify_accept_started.elapsed().as_secs_f64() * 1e3
+    } else {
+        0.0
+    };
+    let rollback_started = Instant::now();
+
     // ── 3. KV / DN rollback (or skip on full accept) ──────────────────────
     //
     // Rollback is REDUNDANT when advance == drafts_generated + 1 (full
@@ -4545,6 +4617,16 @@ pub fn spec_step_mtp_compressed_serial(
                 )?;
             }
         }
+    }
+
+    if phase_trace {
+        gpu.hip.device_synchronize()?;
+        record_mtp_phase_trace(
+            proposal_ms,
+            verify_accept_ms,
+            rollback_started.elapsed().as_secs_f64() * 1e3,
+            full_accept_no_eos,
+        );
     }
 
     state.extend_sampling_history(&committed);
