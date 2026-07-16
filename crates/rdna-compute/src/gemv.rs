@@ -6795,12 +6795,6 @@ impl Gpu {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER").as_deref()
                         == Ok("1")
                 });
-            static GFX1151_GATE_UP_RELAXED_OCCUPANCY: OnceLock<bool> = OnceLock::new();
-            let gfx1151_relaxed_occupancy = self.arch_caps.is_gfx1151()
-                && *GFX1151_GATE_UP_RELAXED_OCCUPANCY.get_or_init(|| {
-                    std::env::var("HIPFIRE_GFX1151_GATE_UP_RELAXED_OCCUPANCY").as_deref()
-                        == Ok("1")
-                });
             if gfx1151_hybrid_buffer {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_k2048_hybrid_gfx1151",
@@ -7006,21 +7000,6 @@ impl Gpu {
                 )?;
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_buffer_gfx1151",
-                    [32u32, 1, 1],
-                    if tight_grid {
-                        (m as u32) >> 1
-                    } else {
-                        m as u32
-                    },
-                )
-            } else if gfx1151_relaxed_occupancy {
-                self.ensure_kernel(
-                    "gemv_hfq4g256_moe_gate_up_indexed_relaxed_gfx1151",
-                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_RELAXED_GFX1151_SRC,
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed",
-                )?;
-                (
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed",
                     [32u32, 1, 1],
                     if tight_grid {
                         (m as u32) >> 1
