@@ -303,6 +303,19 @@ fn mtp_snapshot_overlap_enabled_from_env() -> bool {
     }
 }
 
+fn mtp_rollback_overlap_enabled_from_env() -> bool {
+    // Default off until the cross-cycle maintenance-stream path has been
+    // validated across architectures. Proposal work touches only MTP-local
+    // state, so it may overlap the prior cycle's trunk DN restore/replay; the
+    // next trunk snapshot and verify explicitly join the maintenance stream.
+    matches!(
+        std::env::var("HIPFIRE_MTP_ROLLBACK_OVERLAP")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
 fn mtp_gpu_greedy_accept_enabled_from_env() -> bool {
     // Default on for greedy device-token-chain MTP: candidates and verify
     // argmaxes are already on-device, so the prefix accept + bonus selection
@@ -926,11 +939,13 @@ pub struct MtpSpecState {
     /// Trunk DN snapshot for rollback before replay.
     pub trunk_snap: DeltaNetSnapshot,
 
-    /// Side stream used to overlap `trunk_snap.save_from` with the MTP
-    /// proposal loop. The event orders the side-stream copy after any
-    /// prior-cycle main-stream work that may still be updating DN state.
+    /// Trunk-maintenance stream. It can overlap `trunk_snap.save_from` with
+    /// the current proposal, or defer a partial-accept rollback so it overlaps
+    /// the next proposal. Events preserve the main-stream ownership boundary.
     pub trunk_snap_stream: Option<Stream>,
     pub trunk_snap_start_event: Option<Event>,
+    pub trunk_rollback_done_event: Option<Event>,
+    pub trunk_rollback_pending: bool,
 
     /// Persistent batch scratch for the trunk's batched verify forward.
     /// Sized to `max_n + 1` so verify always fits in one chunk.
@@ -1153,14 +1168,22 @@ impl MtpSpecState {
         let trunk_snap = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
         // Snapshot overlap resources are construction-time only; set the env
         // before creating MtpSpecState when comparing the opt-in path.
-        let (trunk_snap_stream, trunk_snap_start_event) = if mtp_snapshot_overlap_enabled_from_env()
-        {
-            (
-                Some(gpu.hip.stream_create()?),
-                Some(gpu.hip.event_create()?),
-            )
+        let snapshot_overlap = mtp_snapshot_overlap_enabled_from_env();
+        let rollback_overlap = mtp_rollback_overlap_enabled_from_env();
+        let trunk_snap_stream = if snapshot_overlap || rollback_overlap {
+            Some(gpu.hip.stream_create()?)
         } else {
-            (None, None)
+            None
+        };
+        let trunk_snap_start_event = if snapshot_overlap || rollback_overlap {
+            Some(gpu.hip.event_create()?)
+        } else {
+            None
+        };
+        let trunk_rollback_done_event = if rollback_overlap {
+            Some(gpu.hip.event_create()?)
+        } else {
+            None
         };
         let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, &target.config, max_n + 1)?;
         let trunk_gdn_tape = GdnTape::new_for_config(gpu, &target.config, max_n + 1)?;
@@ -1221,6 +1244,8 @@ impl MtpSpecState {
             trunk_snap,
             trunk_snap_stream,
             trunk_snap_start_event,
+            trunk_rollback_done_event,
+            trunk_rollback_pending: false,
             trunk_pbs,
             trunk_gdn_tape,
             mtp_scratch,
@@ -1405,6 +1430,11 @@ impl MtpSpecState {
     /// The trunk's KV + DeltaNet reset is the daemon's concern (it owns the
     /// bundle and calls `reset_recurrent`); this clears only head-local state.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        if self.trunk_rollback_pending {
+            gpu.hip
+                .stream_synchronize(self.trunk_snap_stream.as_ref().unwrap())?;
+            self.trunk_rollback_pending = false;
+        }
         destroy_mtp_proposal_graph(gpu, self);
         destroy_mtp_sampled_step_graphs(gpu, self);
         self.mtp_proposal_graph_warmed = false;
@@ -1419,6 +1449,11 @@ impl MtpSpecState {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        if self.trunk_rollback_pending {
+            let _ = gpu
+                .hip
+                .stream_synchronize(self.trunk_snap_stream.as_ref().unwrap());
+        }
         let _ = gpu.free_tensor(self.prev_hidden);
         let _ = gpu.free_tensor(self.verify_hidden);
         let _ = gpu.free_tensor(self.verify_logits);
@@ -1471,6 +1506,9 @@ impl MtpSpecState {
         // use free_gpu to release the GPU allocations rather than bare drop.
         self.trunk_snap.free_gpu(gpu);
         if let Some(event) = self.trunk_snap_start_event {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(event) = self.trunk_rollback_done_event {
             let _ = gpu.hip.event_destroy(event);
         }
         if let Some(stream) = self.trunk_snap_stream {
@@ -3606,7 +3644,16 @@ pub fn spec_step_mtp_compressed_serial(
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
-    let overlap_trunk_snap = mtp_snapshot_overlap_enabled_from_env()
+    // Phase tracing synchronizes every boundary and therefore intentionally
+    // disables the cross-cycle overlap experiment.
+    let phase_trace = mtp_phase_trace_enabled_from_env();
+    let overlap_trunk_rollback = !phase_trace
+        && mtp_rollback_overlap_enabled_from_env()
+        && state.trunk_snap_stream.is_some()
+        && state.trunk_snap_start_event.is_some()
+        && state.trunk_rollback_done_event.is_some();
+    let overlap_trunk_snap = !overlap_trunk_rollback
+        && mtp_snapshot_overlap_enabled_from_env()
         && state.trunk_snap_stream.is_some()
         && state.trunk_snap_start_event.is_some();
     if overlap_trunk_snap {
@@ -3625,7 +3672,6 @@ pub fn spec_step_mtp_compressed_serial(
     // Opt-in diagnostic only: phase boundaries synchronize the device so the
     // reported wall times represent completed GPU work. This intentionally
     // perturbs throughput and must never be enabled for benchmark numbers.
-    let phase_trace = mtp_phase_trace_enabled_from_env();
     if phase_trace {
         gpu.hip.device_synchronize()?;
     }
@@ -4394,7 +4440,27 @@ pub fn spec_step_mtp_compressed_serial(
     verify_tokens.extend_from_slice(&candidates);
     let n_verify = verify_tokens.len();
 
-    if overlap_trunk_snap {
+    if overlap_trunk_rollback {
+        // A prior partial-accept rollback may still be running on the trunk
+        // maintenance stream. The proposal above is MTP-local and can safely
+        // overlap it. Join only now, immediately before the next snapshot and
+        // trunk verify consume the repaired recurrent state.
+        if state.trunk_rollback_pending {
+            gpu.hip.stream_wait_event(
+                gpu.active_stream.as_ref().unwrap(),
+                state.trunk_rollback_done_event.as_ref().unwrap(),
+            )?;
+            state.trunk_rollback_pending = false;
+        }
+        // Keep the snapshot on the main stream after the join. This avoids a
+        // host synchronization: later verifier kernels are naturally ordered
+        // behind these copies on the same stream.
+        state.trunk_snap.save_from_async_on(
+            &target.dn_state,
+            gpu,
+            gpu.active_stream.as_ref().unwrap(),
+        )?;
+    } else if overlap_trunk_snap {
         gpu.hip
             .stream_synchronize(state.trunk_snap_stream.as_ref().unwrap())?;
     } else {
@@ -4764,7 +4830,53 @@ pub fn spec_step_mtp_compressed_serial(
     // before the EOS-bearing token was committed).
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
     let replay_skipped = full_accept_no_eos;
-    if !full_accept_no_eos {
+    if !full_accept_no_eos && overlap_trunk_rollback && tape_captured {
+        // Queue restore + GDN-only replay on the maintenance stream and return
+        // without waiting. The next cycle may run its MTP-local proposal in
+        // parallel, then joins this event before touching trunk state.
+        let start_event = state.trunk_snap_start_event.as_ref().unwrap();
+        gpu.hip
+            .event_record(start_event, gpu.active_stream.as_ref())?;
+
+        let main_stream = gpu.active_stream.take().unwrap();
+        let maintenance_stream = state.trunk_snap_stream.take().unwrap();
+        gpu.active_stream = Some(maintenance_stream);
+
+        let rollback_result = (|| -> HipResult<()> {
+            {
+                let stream = gpu.active_stream.as_ref().unwrap();
+                gpu.hip.stream_wait_event(stream, start_event)?;
+                state
+                    .trunk_snap
+                    .restore_to_async_on(&mut target.dn_state, gpu, stream)?;
+            }
+            state.trunk_gdn_tape.replay_gdn(
+                gpu,
+                trunk_weights,
+                &target.config,
+                &mut target.dn_state,
+                advance,
+            )?;
+            gpu.hip.event_record(
+                state.trunk_rollback_done_event.as_ref().unwrap(),
+                gpu.active_stream.as_ref(),
+            )?;
+            Ok(())
+        })();
+
+        state.trunk_snap_stream = gpu.active_stream.take();
+        gpu.active_stream = Some(main_stream);
+        rollback_result?;
+        state.trunk_rollback_pending = true;
+
+        // EOS is a terminal boundary: leave the externally-owned trunk state
+        // fully repaired even though there will be no next proposal to hide it.
+        if hit_eos {
+            gpu.hip
+                .stream_synchronize(state.trunk_snap_stream.as_ref().unwrap())?;
+            state.trunk_rollback_pending = false;
+        }
+    } else if !full_accept_no_eos {
         state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
         if tape_captured {
             // The batched verify populated the tape this cycle — cheap GDN-only replay.
