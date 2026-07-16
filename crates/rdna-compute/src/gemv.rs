@@ -7577,6 +7577,15 @@ impl Gpu {
             && *GFX1151_DOWN_HYBRID_BUFFER.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_DOWN_HYBRID_BUFFER").as_deref() == Ok("1")
             });
+        static GFX1151_DOWN_K512_M2048: OnceLock<bool> = OnceLock::new();
+        let gfx1151_k512_m2048 = self.arch_caps.is_gfx1151()
+            && m == 2048
+            && k == 512
+            && k_top == 8
+            && batch_size == 1
+            && *GFX1151_DOWN_K512_M2048.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_DOWN_K512_M2048").as_deref() == Ok("1")
+            });
         static GFX1151_DOWN_ROW1_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_row1_buffer = self.arch_caps.is_gfx1151()
             && k == 512
@@ -7619,6 +7628,12 @@ impl Gpu {
                 "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_HYBRID_BUFFER_GFX1151_SRC,
                 "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151",
+            )
+        } else if gfx1151_k512_m2048 {
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_k512_m2048_gfx1151",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_K512_M2048_GFX1151_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_k512_m2048_gfx1151",
             )
         } else if gfx1151_row2_clustered {
             (
