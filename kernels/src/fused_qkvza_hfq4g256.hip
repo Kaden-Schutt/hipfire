@@ -4,6 +4,11 @@
 
 #include <hip/hip_runtime.h>
 
+#if defined(HIPFIRE_RDNA3_QKVZA_X_BUFFER)
+using hipfire_qkvza_i32x4 = int __attribute__((ext_vector_type(4)));
+using hipfire_qkvza_f32x4 = float __attribute__((ext_vector_type(4)));
+#endif
+
 // 4-way fused HFQ4-G256 GEMV for the Qwen3.5 DeltaNet linear-attention
 // layer preamble. One kernel launch performs all four projections from a
 // single shared x_rot input:
@@ -136,6 +141,10 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
     const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
 #endif
+#if defined(HIPFIRE_RDNA3_QKVZA_X_BUFFER)
+    const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
+#endif
 
     // Four accumulators for the 4x group unroll. Tail groups go back into
     // acc[gi] to preserve the 4-way interleaving the combine step assumes
@@ -240,7 +249,38 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         DOG_LDS(pk2, sc2, zp2, g + 2, acc2);
         DOG_LDS(pk3, sc3, zp3, g + 3, acc3);
         #undef DOG_LDS
-#elif defined(__gfx1200__) || defined(__gfx1201__) || defined(HIPFIRE_RDNA3_QKVZA_HOIST_X32)
+#elif defined(__gfx1200__) || defined(__gfx1201__) || \
+      defined(HIPFIRE_RDNA3_QKVZA_HOIST_X32) || \
+      defined(HIPFIRE_RDNA3_QKVZA_X_BUFFER)
+#if defined(HIPFIRE_RDNA3_QKVZA_X_BUFFER)
+        // Radiowave gfx1151 cache lowering: keep the hot activation stream on
+        // the same temporal VMEM path as weights. Aligned B128 requests retain
+        // the existing float4 source grouping and FMA order.
+        const hipfire_qkvza_f32x4 xv0a = __builtin_bit_cast(
+            hipfire_qkvza_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 0) * 4, 0, 0));
+        const hipfire_qkvza_f32x4 xv0b = __builtin_bit_cast(
+            hipfire_qkvza_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 4) * 4, 0, 0));
+        const hipfire_qkvza_f32x4 xv1a = __builtin_bit_cast(
+            hipfire_qkvza_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 256) * 4, 0, 0));
+        const hipfire_qkvza_f32x4 xv1b = __builtin_bit_cast(
+            hipfire_qkvza_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 260) * 4, 0, 0));
+        const hipfire_qkvza_f32x4 xv2a = __builtin_bit_cast(
+            hipfire_qkvza_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 512) * 4, 0, 0));
+        const hipfire_qkvza_f32x4 xv2b = __builtin_bit_cast(
+            hipfire_qkvza_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 516) * 4, 0, 0));
+        const hipfire_qkvza_f32x4 xv3a = __builtin_bit_cast(
+            hipfire_qkvza_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 768) * 4, 0, 0));
+        const hipfire_qkvza_f32x4 xv3b = __builtin_bit_cast(
+            hipfire_qkvza_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 772) * 4, 0, 0));
+#else
         const float4 xv0a = *reinterpret_cast<const float4*>(x + base);
         const float4 xv0b = *reinterpret_cast<const float4*>(x + base + 4);
         const float4 xv1a = *reinterpret_cast<const float4*>(x + base + 256);
@@ -249,6 +289,7 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         const float4 xv2b = *reinterpret_cast<const float4*>(x + base + 516);
         const float4 xv3a = *reinterpret_cast<const float4*>(x + base + 768);
         const float4 xv3b = *reinterpret_cast<const float4*>(x + base + 772);
+#endif
         #define DOG_V(pk, sc, zp, a, x0, x1, x2, x3, x4, x5, x6, x7) \
             (a) += (sc * (float)((pk) & 0xFu)        + zp) * (x0) \
                  + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
