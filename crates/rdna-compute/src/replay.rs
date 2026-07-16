@@ -392,6 +392,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]);
     }
     match kernel {
+        "convert_f32_to_f16" => Some(vec![read(0), write(8)]),
         "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -488,7 +489,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_multirow_r4"
         | "gemv_hfq4g256_multirow_r8" => Some(vec![read(0), read(8), write(16)]),
         "softmax_f32" => Some(vec![write(0)]),
-        "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
+        "moe_topk_renorm_k8" | "moe_topk_renorm_k8_batched" => {
+            Some(vec![read(0), write(8), write(16)])
+        }
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched" => {
@@ -505,6 +508,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => {
+            Some(vec![read(0), read(8), read(16), write(24), write(32)])
+        }
+        "gemm_gate_up_hfq4g256_wmma_gfx12"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt8"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt12" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
@@ -590,7 +599,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     match kernel {
         "softmax_f32" => Some(16),
-        "fused_qk_l2_norm_scale_f32"
+        "convert_f32_to_f16"
+        | "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
@@ -607,6 +617,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "moe_down_combine_k8_batched"
         | "moe_down_combine_k8_batched_vec4"
         | "moe_topk_renorm_k8"
+        | "moe_topk_renorm_k8_batched"
         | "rmsnorm_f32"
         | "rmsnorm_reduce_gfx1100"
         | "sigmoid_mul_f32" => Some(32),
@@ -639,7 +650,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rope_partial_halfsplit_f32" => Some(48),
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => Some(64),
-        "conv1d_silu_split_f32"
+        "gemm_gate_up_hfq4g256_wmma_gfx12"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt8"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt12"
+        | "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "qwen35_fa_prep_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
@@ -789,8 +804,29 @@ impl ResourceFrontier {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Pm4PhasePlan {
-    indices: Vec<usize>,
-    parallel: bool,
+    lanes: Vec<Vec<usize>>,
+}
+
+impl Pm4PhasePlan {
+    fn serial(indices: Vec<usize>) -> Self {
+        Self {
+            lanes: vec![indices],
+        }
+    }
+
+    fn independent(indices: Vec<usize>) -> Self {
+        Self {
+            lanes: indices.into_iter().map(|index| vec![index]).collect(),
+        }
+    }
+
+    fn is_parallel(&self) -> bool {
+        self.lanes.len() > 1
+    }
+
+    fn launch_count(&self) -> usize {
+        self.lanes.iter().map(Vec::len).sum()
+    }
 }
 
 fn launches_are_independent(left: &RecordedHipLaunch, right: &RecordedHipLaunch) -> bool {
@@ -843,12 +879,151 @@ fn pm4_phase_plan(
         if parallel {
             parallel_phases += 1;
         }
-        if !parallel && phases.last().is_some_and(|phase| !phase.parallel) {
-            phases.last_mut().unwrap().indices.extend(indices);
+        if !parallel && phases.last().is_some_and(|phase| !phase.is_parallel()) {
+            phases.last_mut().unwrap().lanes[0].extend(indices);
+        } else if parallel {
+            phases.push(Pm4PhasePlan::independent(indices));
         } else {
-            phases.push(Pm4PhasePlan { parallel, indices });
+            phases.push(Pm4PhasePlan::serial(indices));
         }
     }
+    phases
+}
+
+/// Find connected components of the allocation-wide conflict graph for one
+/// candidate interval. Every launch in different components is independent of
+/// every launch in the other component, so each component is an ordered lane
+/// that can execute behind one fork and one terminal join. Unknown ABIs fail
+/// closed and reject the complete interval.
+fn pm4_resource_lanes(
+    recorded: &[RecordedHipLaunch],
+    start: usize,
+    end: usize,
+) -> Option<Vec<Vec<usize>>> {
+    if start >= end
+        || end > recorded.len()
+        || recorded[start..end]
+            .iter()
+            .any(|launch| launch.accesses.is_none())
+    {
+        return None;
+    }
+    let count = end - start;
+    let mut parent = (0..count).collect::<Vec<_>>();
+
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            let next = parent[index];
+            parent[index] = parent[next];
+            index = next;
+        }
+        index
+    }
+
+    for left in 0..count {
+        for right in left + 1..count {
+            if launches_are_independent(&recorded[start + left], &recorded[start + right]) {
+                continue;
+            }
+            let left_root = root(&mut parent, left);
+            let right_root = root(&mut parent, right);
+            if left_root != right_root {
+                parent[right_root] = left_root;
+            }
+        }
+    }
+
+    let mut components = BTreeMap::<usize, Vec<usize>>::new();
+    for relative in 0..count {
+        let component = root(&mut parent, relative);
+        components
+            .entry(component)
+            .or_default()
+            .push(start + relative);
+    }
+    let mut lanes = components.into_values().collect::<Vec<_>>();
+    lanes.sort_by_key(|lane| lane[0]);
+    Some(lanes)
+}
+
+/// Build coarse ordered lanes from resource effects instead of adjacent
+/// antichains. The bounded window prevents an experimental planner from
+/// speculating across a large portion of the tape, while the component proof
+/// guarantees there are no cross-lane read/write or write/write conflicts.
+fn pm4_coarse_phase_plan(
+    recorded: &[RecordedHipLaunch],
+    min_parallel_width: usize,
+    min_parallel_workgroups: u64,
+    max_parallel_phases: usize,
+    max_window: usize,
+) -> Vec<Pm4PhasePlan> {
+    const MIN_COARSE_LAUNCHES: usize = 4;
+    let min_parallel_width = min_parallel_width.max(2);
+    let max_window = max_window.max(MIN_COARSE_LAUNCHES);
+    let mut phases = Vec::<Pm4PhasePlan>::new();
+    let mut serial = Vec::<usize>::new();
+    let mut cursor = 0_usize;
+    let mut parallel_phases = 0_usize;
+
+    let flush_serial = |phases: &mut Vec<Pm4PhasePlan>, serial: &mut Vec<usize>| {
+        if serial.is_empty() {
+            return;
+        }
+        if phases.last().is_some_and(|phase| !phase.is_parallel()) {
+            phases.last_mut().unwrap().lanes[0].append(serial);
+        } else {
+            phases.push(Pm4PhasePlan::serial(std::mem::take(serial)));
+        }
+    };
+
+    while cursor < recorded.len() {
+        if parallel_phases == max_parallel_phases {
+            serial.extend(cursor..recorded.len());
+            break;
+        }
+
+        let mut candidate = None::<(usize, usize, Vec<Vec<usize>>)>;
+        for start in cursor..recorded.len() {
+            if recorded[start].accesses.is_none() {
+                continue;
+            }
+            let end_limit = recorded.len().min(start.saturating_add(max_window));
+            let mut best = None::<(usize, Vec<Vec<usize>>)>;
+            for end in start + MIN_COARSE_LAUNCHES..=end_limit {
+                let Some(lanes) = pm4_resource_lanes(recorded, start, end) else {
+                    break;
+                };
+                if lanes.len() < min_parallel_width {
+                    continue;
+                }
+                let workgroups = (start..end).fold(0_u64, |total, index| {
+                    let launch_workgroups =
+                        recorded[index].grid.iter().fold(1_u64, |product, axis| {
+                            product.saturating_mul(u64::from(*axis))
+                        });
+                    total.saturating_add(launch_workgroups)
+                });
+                if workgroups >= min_parallel_workgroups {
+                    best = Some((end, lanes));
+                }
+            }
+            if let Some((end, lanes)) = best {
+                candidate = Some((start, end, lanes));
+                break;
+            }
+        }
+
+        let Some((start, end, lanes)) = candidate else {
+            serial.extend(cursor..recorded.len());
+            break;
+        };
+        serial.extend(cursor..start);
+        flush_serial(&mut phases, &mut serial);
+        phases.push(Pm4PhasePlan { lanes });
+        parallel_phases += 1;
+        cursor = end;
+    }
+    flush_serial(&mut phases, &mut serial);
     phases
 }
 
@@ -860,6 +1035,23 @@ fn pm4_min_parallel_width_from_env() -> usize {
             "WARNING: HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WIDTH={value:?}: expected integer >= 2; using 2"
         );
         2
+    })
+}
+
+fn pm4_coarse_lanes_from_env() -> bool {
+    std::env::var("HIPFIRE_REPLAY_PM4_COARSE_LANES")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
+}
+
+fn pm4_coarse_max_window_from_env() -> usize {
+    let value =
+        std::env::var("HIPFIRE_REPLAY_PM4_COARSE_MAX_WINDOW").unwrap_or_else(|_| "16".to_owned());
+    value.parse::<usize>().ok().filter(|window| *window >= 4).unwrap_or_else(|| {
+        eprintln!(
+            "WARNING: HIPFIRE_REPLAY_PM4_COARSE_MAX_WINDOW={value:?}: expected integer >= 4; using 16"
+        );
+        16
     })
 }
 
@@ -2086,54 +2278,105 @@ impl ReplayController {
             let min_parallel_workgroups = pm4_min_parallel_workgroups_from_env();
             let max_parallel_phases = pm4_max_parallel_phases_from_env();
             let native_phase_sync = pm4_native_phase_sync_from_env();
-            let plans = pm4_phase_plan(
-                &self.recorded[..prefix],
-                min_parallel_width,
-                min_parallel_workgroups,
-                max_parallel_phases,
-            );
-            let parallel_phases = plans.iter().filter(|phase| phase.parallel).count();
+            let coarse_lanes = pm4_coarse_lanes_from_env();
+            let plans = if coarse_lanes {
+                pm4_coarse_phase_plan(
+                    &self.recorded[..prefix],
+                    min_parallel_width,
+                    min_parallel_workgroups,
+                    max_parallel_phases,
+                    pm4_coarse_max_window_from_env(),
+                )
+            } else {
+                pm4_phase_plan(
+                    &self.recorded[..prefix],
+                    min_parallel_width,
+                    min_parallel_workgroups,
+                    max_parallel_phases,
+                )
+            };
+            let parallel_phases = plans.iter().filter(|phase| phase.is_parallel()).count();
             let max_width = plans
                 .iter()
-                .map(|phase| phase.indices.len())
+                .map(|phase| phase.lanes.len())
+                .max()
+                .unwrap_or(1);
+            let max_phase_launches = plans
+                .iter()
+                .map(Pm4PhasePlan::launch_count)
                 .max()
                 .unwrap_or(1);
             let parallel_launches = plans
                 .iter()
-                .filter(|phase| phase.parallel)
-                .map(|phase| phase.indices.len())
+                .filter(|phase| phase.is_parallel())
+                .map(Pm4PhasePlan::launch_count)
                 .sum::<usize>();
             let mut phase_commands = Vec::<Vec<Pm4Commands>>::with_capacity(plans.len());
             let mut command_dwords = 0_u32;
             let mut max_queue_count = 1_usize;
 
             for phase in &plans {
-                let lane_count = if phase.parallel {
+                let lane_count = if phase.is_parallel() {
                     self.pm4_queue_policy
-                        .resolve(device.name(), phase.indices.len())
+                        .resolve(device.name(), phase.lanes.len())
                 } else {
                     1
                 };
                 if lane_count > 1 {
-                    let mut lanes = (0..lane_count)
-                        .map(|_| {
-                            let mut commands =
-                                Pm4Commands::new(pm4_architecture, self.pm4_register_policy);
-                            commands.acquire_system(gfx12_gcr_trim);
-                            commands
-                        })
-                        .collect::<Vec<_>>();
-                    for (position, index) in phase.indices.iter().copied().enumerate() {
-                        lanes[position % lane_count]
-                            .dispatch(
-                                &kernels[index],
-                                geometries[index],
-                                self.recorded[index].shared_mem,
-                                kernargs[index].address(),
-                            )
-                            .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
+                    let mut physical_lanes = vec![Vec::<usize>::new(); lane_count];
+                    for (position, logical_lane) in phase.lanes.iter().enumerate() {
+                        physical_lanes[position % lane_count].extend(logical_lane);
                     }
-                    for commands in &mut lanes {
+                    let mut lanes = Vec::<Pm4Commands>::with_capacity(lane_count);
+                    for indices in physical_lanes {
+                        let mut commands =
+                            Pm4Commands::new(pm4_architecture, self.pm4_register_policy);
+                        commands.acquire_system(gfx12_gcr_trim);
+                        let mut resource_frontier = ResourceFrontier::default();
+                        for (position, index) in indices.iter().copied().enumerate() {
+                            if position != 0 {
+                                let previous_index = indices[position - 1];
+                                let previous_launch = &self.recorded[previous_index];
+                                let current_launch = &self.recorded[index];
+                                let previous = previous_launch.kernel.as_str();
+                                let current = current_launch.kernel.as_str();
+                                let allowlist_independent = independent_sibling(previous, current);
+                                let resources_independent =
+                                    resource_frontier.independent(current_launch);
+                                let independent = match self.pm4_wait_policy {
+                                    Pm4WaitPolicy::Allowlist | Pm4WaitPolicy::ResourceAudit => {
+                                        allowlist_independent
+                                    }
+                                    Pm4WaitPolicy::Resource => resources_independent,
+                                };
+                                if !independent {
+                                    commands.wait_compute_idle();
+                                }
+                                resource_frontier.advance(current_launch, resources_independent);
+                                if (!independent && commands.requires_dependency_acquire())
+                                    || self
+                                        .pm4_mid_acquire_policy
+                                        .acquire_between(previous, current)
+                                {
+                                    commands.acquire_inter_node(
+                                        gfx12_gcr_trim,
+                                        gfx11_vmem_acquire && radiowave_vmem_only_consumer(current),
+                                    );
+                                }
+                            } else {
+                                resource_frontier.advance(&self.recorded[index], false);
+                            }
+                            commands
+                                .dispatch(
+                                    &kernels[index],
+                                    geometries[index],
+                                    self.recorded[index].shared_mem,
+                                    kernargs[index].address(),
+                                )
+                                .map_err(|error| {
+                                    format!("{}: {error}", self.recorded[index].kernel)
+                                })?;
+                        }
                         commands.wait_compute_idle();
                         if terminal_acquire {
                             commands.acquire_system(false);
@@ -2141,6 +2384,7 @@ impl ReplayController {
                         command_dwords = command_dwords
                             .checked_add(commands.len_dwords())
                             .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
+                        lanes.push(commands);
                     }
                     max_queue_count = max_queue_count.max(lanes.len());
                     phase_commands.push(lanes);
@@ -2150,9 +2394,10 @@ impl ReplayController {
                 let mut commands = Pm4Commands::new(pm4_architecture, self.pm4_register_policy);
                 commands.acquire_system(gfx12_gcr_trim);
                 let mut resource_frontier = ResourceFrontier::default();
-                for (position, index) in phase.indices.iter().copied().enumerate() {
-                    if position != 0 && !phase.parallel {
-                        let previous_index = phase.indices[position - 1];
+                let indices = &phase.lanes[0];
+                for (position, index) in indices.iter().copied().enumerate() {
+                    if position != 0 {
+                        let previous_index = indices[position - 1];
                         let previous_launch = &self.recorded[previous_index];
                         let current_launch = &self.recorded[index];
                         let previous = previous_launch.kernel.as_str();
@@ -2210,16 +2455,18 @@ impl ReplayController {
             )?;
             debug_assert_eq!(graph.queue_count(), max_queue_count);
             eprintln!(
-                "[redline] PM4 phase plan architecture={} queues={} phases={} parallel_phases={} parallel_launches={} max_width={} min_parallel_width={} min_parallel_workgroups={} max_parallel_phases={} sync={}",
+                "[redline] PM4 phase plan architecture={} queues={} phases={} parallel_phases={} parallel_launches={} max_width={} max_phase_launches={} min_parallel_width={} min_parallel_workgroups={} max_parallel_phases={} planner={} sync={}",
                 device.name(),
                 graph.queue_count(),
                 graph.phase_count(),
                 parallel_phases,
                 parallel_launches,
                 max_width,
+                max_phase_launches,
                 min_parallel_width,
                 min_parallel_workgroups,
                 max_parallel_phases,
+                if coarse_lanes { "coarse" } else { "adjacent" },
                 if native_phase_sync { "native" } else { "aql" },
             );
             (PreparedPm4Graph::Phased(graph), command_dwords)
@@ -2610,8 +2857,10 @@ mod tests {
         "gemv_hfq4g256",
         "gemv_hfq4g256_k2048",
         "gemv_hfq4g256_wide",
+        "convert_f32_to_f16",
         "softmax_f32",
         "moe_topk_renorm_k8",
+        "moe_topk_renorm_k8_batched",
         "moe_router_softmax_topk_k8_wave64",
         "moe_router_softmax_topk_k8_wave64_exact",
         "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate",
@@ -2626,6 +2875,12 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
+        "gemm_gate_up_hfq4g256_wmma_gfx12",
+        "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
+        "gemm_gate_up_hfq4g256_wmma_gfx12_bt8",
+        "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
@@ -3011,14 +3266,8 @@ mod tests {
         assert_eq!(
             pm4_phase_plan(&recorded, 2, 0, usize::MAX),
             vec![
-                Pm4PhasePlan {
-                    indices: vec![0, 1],
-                    parallel: true,
-                },
-                Pm4PhasePlan {
-                    indices: vec![2, 3, 4],
-                    parallel: false,
-                },
+                Pm4PhasePlan::independent(vec![0, 1]),
+                Pm4PhasePlan::serial(vec![2, 3, 4]),
             ]
         );
 
@@ -3028,15 +3277,114 @@ mod tests {
         assert_eq!(
             pm4_phase_plan(&two_parallel_phases, 2, 0, 1),
             vec![
-                Pm4PhasePlan {
-                    indices: vec![0, 1],
-                    parallel: true,
-                },
-                Pm4PhasePlan {
-                    indices: vec![2, 3],
-                    parallel: false,
-                },
+                Pm4PhasePlan::independent(vec![0, 1]),
+                Pm4PhasePlan::serial(vec![2, 3]),
             ]
+        );
+    }
+
+    #[test]
+    fn pm4_coarse_planner_keeps_dependent_chains_in_order_behind_one_join() {
+        let access = |base: u64, mode: RecordedAccessMode| RecordedResourceAccess {
+            allocation_base: base,
+            allocation_bytes: 0x100,
+            access_base: base,
+            mode,
+        };
+        let launch = |kernel: &str, accesses: Vec<RecordedResourceAccess>| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: Some(accesses),
+        };
+        let recorded = vec![
+            launch(
+                "prefix",
+                vec![
+                    access(0x1000, RecordedAccessMode::Write),
+                    access(0x2000, RecordedAccessMode::Write),
+                ],
+            ),
+            launch(
+                "shared_gate",
+                vec![access(0x1000, RecordedAccessMode::Write)],
+            ),
+            launch(
+                "shared_silu",
+                vec![
+                    access(0x1000, RecordedAccessMode::Read),
+                    access(0x1100, RecordedAccessMode::Write),
+                ],
+            ),
+            launch("router", vec![access(0x2000, RecordedAccessMode::Write)]),
+            launch(
+                "routed_gate",
+                vec![
+                    access(0x2000, RecordedAccessMode::Read),
+                    access(0x2100, RecordedAccessMode::Write),
+                ],
+            ),
+            launch(
+                "join",
+                vec![
+                    access(0x1100, RecordedAccessMode::Read),
+                    access(0x2100, RecordedAccessMode::Read),
+                    access(0x3000, RecordedAccessMode::Write),
+                ],
+            ),
+        ];
+
+        assert_eq!(
+            pm4_resource_lanes(&recorded, 1, 5),
+            Some(vec![vec![1, 2], vec![3, 4]])
+        );
+        assert_eq!(
+            pm4_coarse_phase_plan(&recorded, 2, 0, usize::MAX, 16),
+            vec![
+                Pm4PhasePlan::serial(vec![0]),
+                Pm4PhasePlan {
+                    lanes: vec![vec![1, 2], vec![3, 4]],
+                },
+                Pm4PhasePlan::serial(vec![5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn pm4_coarse_planner_rejects_unknown_abi_intervals() {
+        let read = |kernel: &str, base: u64| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: Some(vec![RecordedResourceAccess {
+                allocation_base: base,
+                allocation_bytes: 0x100,
+                access_base: base,
+                mode: RecordedAccessMode::Read,
+            }]),
+        };
+        let recorded = vec![
+            read("read_a", 0x1000),
+            read("read_b", 0x2000),
+            RecordedHipLaunch {
+                accesses: None,
+                ..read("unknown", 0x3000)
+            },
+            read("read_c", 0x4000),
+        ];
+
+        assert_eq!(pm4_resource_lanes(&recorded, 0, 4), None);
+        assert_eq!(
+            pm4_coarse_phase_plan(&recorded, 2, 0, usize::MAX, 16),
+            vec![Pm4PhasePlan::serial(vec![0, 1, 2, 3])]
         );
     }
 
@@ -3059,10 +3407,7 @@ mod tests {
         };
         assert_eq!(
             pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 0, usize::MAX,),
-            vec![Pm4PhasePlan {
-                indices: vec![0, 1],
-                parallel: true,
-            }]
+            vec![Pm4PhasePlan::independent(vec![0, 1])]
         );
         assert_eq!(
             pm4_phase_plan(
@@ -3080,24 +3425,15 @@ mod tests {
                 0,
                 usize::MAX,
             ),
-            vec![Pm4PhasePlan {
-                indices: vec![0, 1],
-                parallel: false,
-            }]
+            vec![Pm4PhasePlan::serial(vec![0, 1])]
         );
         assert_eq!(
             pm4_phase_plan(&[read("read_a"), read("read_a_again")], 3, 0, usize::MAX,),
-            vec![Pm4PhasePlan {
-                indices: vec![0, 1],
-                parallel: false,
-            }]
+            vec![Pm4PhasePlan::serial(vec![0, 1])]
         );
         assert_eq!(
             pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 3, usize::MAX,),
-            vec![Pm4PhasePlan {
-                indices: vec![0, 1],
-                parallel: false,
-            }]
+            vec![Pm4PhasePlan::serial(vec![0, 1])]
         );
     }
 
