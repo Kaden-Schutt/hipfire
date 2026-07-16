@@ -351,6 +351,17 @@ def test_protocol_body_recursion_failure_is_a_bounded_boundary_error():
         GitHubClient(FakeRunner([result(hostile)])).comment_envelope(REPO, 11)
 
 
+@pytest.mark.parametrize("include_http_headers", [False, True])
+def test_api_json_recursion_failure_is_a_bounded_boundary_error(include_http_headers):
+    nested = "[" * 10000 + "0" + "]" * 10000
+    payload = nested
+    if include_http_headers:
+        payload = "HTTP/2 200\r\nX-OAuth-Scopes: read:user\r\n\r\n" + payload
+    response = subprocess.CompletedProcess(["gh"], 0, payload, "")
+    with pytest.raises(GitHubBoundaryError, match="JSON|recursion|depth"):
+        GitHubClient(FakeRunner([response]))._request("GET", "/user")
+
+
 def test_effective_permission_is_normalized():
     response = result({"user": user(), "permissions": {"pull": True, "push": False, "admin": False}})
     permission = GitHubClient(FakeRunner([response])).collaborator_effective_permission(REPO, "review-bot")

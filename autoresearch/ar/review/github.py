@@ -278,7 +278,7 @@ def _decode_output(raw: str | bytes) -> tuple[list[tuple[int, dict[str, str], An
     if not text.lstrip().startswith("HTTP/"):
         try:
             return [(200, {}, json.loads(text, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value))))], False
-        except (ValueError, json.JSONDecodeError) as exc:
+        except (ValueError, json.JSONDecodeError, RecursionError) as exc:
             raise GitHubBoundaryError("gh returned invalid JSON") from exc
     decoder = json.JSONDecoder(parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
     offset = 0
@@ -315,7 +315,7 @@ def _decode_output(raw: str | bytes) -> tuple[list[tuple[int, dict[str, str], An
         else:
             try:
                 value, consumed = decoder.raw_decode(text[offset:])
-            except (ValueError, json.JSONDecodeError) as exc:
+            except (ValueError, json.JSONDecodeError, RecursionError) as exc:
                 raise GitHubBoundaryError("GitHub response contains invalid JSON") from exc
         pages.append((status, headers, value))
         if len(pages) > _MAX_PAGINATED_PAGES:
