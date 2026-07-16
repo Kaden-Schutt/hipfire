@@ -397,6 +397,62 @@ pub fn softmax_prob_at_temp(logits: &[f32], idx: usize, temp: f32) -> f32 {
 
 // ─── Public state ────────────────────────────────────────────────────────
 
+/// Fixed-pointer scratch for the resident sampled-MTP proposal and accept
+/// sequence. Allocated once with the generation state so allocator traffic is
+/// absent from each speculative cycle and the sequence is replay-capturable.
+struct MtpResidentSampleScratch {
+    draft_probs: GpuTensor,
+    draft_probs_compact: Option<GpuTensor>,
+    draft_tau: GpuTensor,
+    draft_z: GpuTensor,
+    draft_tokens: GpuTensor,
+    draft_p_at_token: GpuTensor,
+    target_probs: GpuTensor,
+    target_tau: GpuTensor,
+    target_z: GpuTensor,
+    accept_out: GpuTensor,
+}
+
+impl MtpResidentSampleScratch {
+    fn new(
+        gpu: &mut Gpu,
+        max_n: usize,
+        vocab: usize,
+        compressed_vocab: Option<usize>,
+    ) -> HipResult<Self> {
+        Ok(Self {
+            draft_probs: gpu.alloc_tensor(&[max_n * vocab], DType::F32)?,
+            draft_probs_compact: match compressed_vocab {
+                Some(cvs) => Some(gpu.alloc_tensor(&[max_n * cvs], DType::F32)?),
+                None => None,
+            },
+            draft_tau: gpu.alloc_tensor(&[max_n], DType::F32)?,
+            draft_z: gpu.alloc_tensor(&[max_n], DType::F32)?,
+            draft_tokens: gpu.alloc_tensor(&[max_n], DType::F32)?,
+            draft_p_at_token: gpu.alloc_tensor(&[max_n], DType::F32)?,
+            target_probs: gpu.alloc_tensor(&[(max_n + 1) * vocab], DType::F32)?,
+            target_tau: gpu.alloc_tensor(&[max_n + 1], DType::F32)?,
+            target_z: gpu.alloc_tensor(&[max_n + 1], DType::F32)?,
+            accept_out: gpu.alloc_tensor(&[4], DType::F32)?,
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.draft_probs);
+        if let Some(tensor) = self.draft_probs_compact {
+            let _ = gpu.free_tensor(tensor);
+        }
+        let _ = gpu.free_tensor(self.draft_tau);
+        let _ = gpu.free_tensor(self.draft_z);
+        let _ = gpu.free_tensor(self.draft_tokens);
+        let _ = gpu.free_tensor(self.draft_p_at_token);
+        let _ = gpu.free_tensor(self.target_probs);
+        let _ = gpu.free_tensor(self.target_tau);
+        let _ = gpu.free_tensor(self.target_z);
+        let _ = gpu.free_tensor(self.accept_out);
+    }
+}
+
 /// All persistent buffers needed by [`spec_step_mtp`]. Allocate once per
 /// generation; reuse across cycles. Frees at end of generation via
 /// [`MtpSpecState::free_gpu`].
@@ -533,6 +589,10 @@ pub struct MtpSpecState {
     /// Batched output buf for the K-candidate p_target gather. Shape `[max_n]`
     /// F32. D2H'd after `softmax_prob_gather_batched_f32(n_rows=drafts_generated)`.
     pub mtp_gather_prob_verify: GpuTensor,
+    /// Fixed-pointer probability and decision buffers for opt-in resident
+    /// sampled MTP. None unless HIPFIRE_MTP_GPU_SAMPLE was enabled before
+    /// constructing this generation state.
+    mtp_resident_sample: Option<MtpResidentSampleScratch>,
     /// On-device rng state for `gpu.sample_top_p`. Threaded through both
     /// draft and bonus sampling calls within a cycle and across cycles.
     /// Reseeded by [`Self::set_sampling`].
@@ -646,6 +706,16 @@ impl MtpSpecState {
         let mtp_gather_prob_draft = gpu.alloc_tensor(&[1], DType::F32)?;
         let mtp_gather_idx_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
         let mtp_gather_prob_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_resident_sample = if mtp_gpu_sample_enabled_from_env() {
+            Some(MtpResidentSampleScratch::new(
+                gpu,
+                max_n,
+                vocab,
+                head.weights.compressed_vocab_size,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             prev_hidden,
@@ -683,6 +753,7 @@ impl MtpSpecState {
             mtp_gather_prob_draft,
             mtp_gather_idx_verify,
             mtp_gather_prob_verify,
+            mtp_resident_sample,
             gpu_rng_state: 42,
             max_n,
             p_min: default_mtp_p_min(gpu.arch.as_str()),
@@ -831,6 +902,9 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_gather_prob_draft);
         let _ = gpu.free_tensor(self.mtp_gather_idx_verify);
         let _ = gpu.free_tensor(self.mtp_gather_prob_verify);
+        if let Some(scratch) = self.mtp_resident_sample {
+            scratch.free_gpu(gpu);
+        }
         // DeltaNetSnapshot holds DeviceBuffers which have no Drop impl —
         // use free_gpu to release the GPU allocations rather than bare drop.
         self.trunk_snap.free_gpu(gpu);
@@ -2331,8 +2405,9 @@ pub fn spec_step_mtp_compressed_serial(
     // The GPU sampler preserves that choice: compact distributions are sampled
     // directly, then scattered through the sidecar vocab map into the full-vocab
     // storage consumed by the lossless residual accept kernel.
-    let gpu_sample_requested =
-        mtp_gpu_sample_enabled_from_env() && !state.sampling.is_greedy() && state.p_min <= 0.0;
+    let gpu_sample_requested = state.mtp_resident_sample.is_some()
+        && !state.sampling.is_greedy()
+        && state.p_min <= 0.0;
     let use_full_vocab = head.weights.lm_head_draft.is_none();
     let (vocab_map_opt, cvs): (Option<&Vec<u32>>, usize) = if use_full_vocab {
         (None, vocab)
@@ -2515,41 +2590,18 @@ pub fn spec_step_mtp_compressed_serial(
         }
     }
 
-    // DFlash C8-style resident sampling buffers. They stay live through
-    // target verify and the on-GPU accept kernel. The full-vocab probability
-    // rows replace the legacy D2H + host nucleus construction.
-    let mut gpu_draft_probs = if gpu_sample_active {
-        // Compact draft rows are scattered into this buffer. Start zeroed so
-        // tokens absent from the sidecar correctly retain zero draft mass.
-        Some(gpu.zeros(&[max_n * vocab], DType::F32)?)
-    } else {
-        None
-    };
-    let mut gpu_draft_probs_compact = if gpu_sample_active && !use_full_vocab {
-        Some(gpu.alloc_tensor(&[max_n * cvs], DType::F32)?)
-    } else {
-        None
-    };
-    let mut gpu_draft_tau = if gpu_sample_active {
-        Some(gpu.alloc_tensor(&[max_n], DType::F32)?)
-    } else {
-        None
-    };
-    let mut gpu_draft_z = if gpu_sample_active {
-        Some(gpu.alloc_tensor(&[max_n], DType::F32)?)
-    } else {
-        None
-    };
-    let mut gpu_draft_tokens = if gpu_sample_active {
-        Some(gpu.alloc_tensor(&[max_n], DType::F32)?)
-    } else {
-        None
-    };
-    let mut gpu_draft_p_at_token = if gpu_sample_active {
-        Some(gpu.alloc_tensor(&[max_n], DType::F32)?)
-    } else {
-        None
-    };
+    // Compact rows scatter into persistent full-vocab storage. Clear it once
+    // per cycle so tokens absent from the sidecar have exactly zero draft mass.
+    if gpu_sample_active && !use_full_vocab {
+        let scratch = state.mtp_resident_sample.as_ref().unwrap();
+        let stream = gpu.active_stream.as_ref().unwrap();
+        gpu.hip.memset_async(
+            &scratch.draft_probs.buf,
+            0,
+            scratch.draft_probs.byte_size(),
+            stream,
+        )?;
+    }
 
     // ── 1. K serial discrete-token roundtrips ─────────────────────────────
     let mut proposal_graph_ran = false;
@@ -2739,18 +2791,25 @@ pub fn spec_step_mtp_compressed_serial(
             let draft_idx: usize;
             if gpu_sample_active {
                 let probs_row = if use_full_vocab {
-                    gpu_draft_probs
+                    state
+                        .mtp_resident_sample
                         .as_ref()
                         .unwrap()
+                        .draft_probs
                         .sub_offset(k * vocab, vocab)
                 } else {
-                    gpu_draft_probs_compact
+                    state
+                        .mtp_resident_sample
+                        .as_ref()
+                        .unwrap()
+                        .draft_probs_compact
                         .as_ref()
                         .unwrap()
                         .sub_offset(k * cvs, cvs)
                 };
-                let tau_row = gpu_draft_tau.as_ref().unwrap().sub_offset(k, 1);
-                let z_row = gpu_draft_z.as_ref().unwrap().sub_offset(k, 1);
+                let resident = state.mtp_resident_sample.as_ref().unwrap();
+                let tau_row = resident.draft_tau.sub_offset(k, 1);
+                let z_row = resident.draft_z.sub_offset(k, 1);
                 gpu.softmax_temp_topp_batched_into_f32(
                     logits_for_argmax,
                     &probs_row,
@@ -2763,8 +2822,8 @@ pub fn spec_step_mtp_compressed_serial(
                     sampling.top_k,
                     sampling.min_p,
                 )?;
-                let token_row = gpu_draft_tokens.as_ref().unwrap().sub_offset(k, 1);
-                let prob_row = gpu_draft_p_at_token.as_ref().unwrap().sub_offset(k, 1);
+                let token_row = resident.draft_tokens.sub_offset(k, 1);
+                let prob_row = resident.draft_p_at_token.sub_offset(k, 1);
                 gpu.batched_categorical_sample_f32(
                     &probs_row,
                     &tau_row,
@@ -2784,9 +2843,8 @@ pub fn spec_step_mtp_compressed_serial(
                         4,
                     )?;
                 } else {
-                    let full_probs_row = gpu_draft_probs
-                        .as_ref()
-                        .unwrap()
+                    let full_probs_row = resident
+                        .draft_probs
                         .sub_offset(k * vocab, vocab);
                     gpu.scatter_vocab_probs_token_chain_f32(
                         &probs_row,
@@ -3205,9 +3263,10 @@ pub fn spec_step_mtp_compressed_serial(
         if gpu_sample_active {
             // Port of DFlash C8: keep both nuclei device-resident, execute the
             // rejection chain on-GPU, and download only the 16-byte decision.
-            let target_probs = gpu.alloc_tensor(&[n_verify * vocab], DType::F32)?;
-            let target_tau = gpu.alloc_tensor(&[n_verify], DType::F32)?;
-            let target_z = gpu.alloc_tensor(&[n_verify], DType::F32)?;
+            let resident = state.mtp_resident_sample.as_ref().unwrap();
+            let target_probs = resident.target_probs.sub_offset(0, n_verify * vocab);
+            let target_tau = resident.target_tau.sub_offset(0, n_verify);
+            let target_z = resident.target_z.sub_offset(0, n_verify);
             gpu.softmax_temp_topp_batched_into_f32(
                 &logits_view,
                 &target_probs,
@@ -3220,17 +3279,16 @@ pub fn spec_step_mtp_compressed_serial(
                 sampling.top_k,
                 sampling.min_p,
             )?;
-            let accept_out = gpu.alloc_tensor(&[4], DType::F32)?;
             gpu.chain_accept_spec_f32(
                 &target_probs,
-                gpu_draft_probs.as_ref().unwrap(),
+                &resident.draft_probs,
                 &state.mtp_token_chain.sub_offset(1, drafts_generated),
-                gpu_draft_p_at_token.as_ref().unwrap(),
+                &resident.draft_p_at_token,
                 &target_tau,
                 &target_z,
-                gpu_draft_tau.as_ref().unwrap(),
-                gpu_draft_z.as_ref().unwrap(),
-                &accept_out,
+                &resident.draft_tau,
+                &resident.draft_z,
+                &resident.accept_out,
                 drafts_generated,
                 vocab,
                 state.gpu_rng_state,
@@ -3240,7 +3298,7 @@ pub fn spec_step_mtp_compressed_serial(
             {
                 let bytes: &mut [u8] =
                     unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, 16) };
-                gpu.hip.memcpy_dtoh(bytes, &accept_out.buf)?;
+                gpu.hip.memcpy_dtoh(bytes, &resident.accept_out.buf)?;
             }
             let raw_accept = (raw[0] as usize).min(drafts_generated);
             if let Some(eos_at) = candidates[..raw_accept]
@@ -3258,10 +3316,6 @@ pub fn spec_step_mtp_compressed_serial(
                 hit_eos = bonus == eos_token_id;
             }
             state.gpu_rng_state = raw[3] as u32;
-            let _ = gpu.free_tensor(accept_out);
-            let _ = gpu.free_tensor(target_probs);
-            let _ = gpu.free_tensor(target_tau);
-            let _ = gpu.free_tensor(target_z);
         } else {
             // ── F5c: distribution-preserving sampled accept (full-vocab) ──
             //
@@ -3337,25 +3391,6 @@ pub fn spec_step_mtp_compressed_serial(
         committed = accepted.committed;
         accept_count = accepted.accept_count;
         hit_eos = accepted.hit_eos;
-    }
-
-    if let Some(tensor) = gpu_draft_probs.take() {
-        let _ = gpu.free_tensor(tensor);
-    }
-    if let Some(tensor) = gpu_draft_probs_compact.take() {
-        let _ = gpu.free_tensor(tensor);
-    }
-    if let Some(tensor) = gpu_draft_tau.take() {
-        let _ = gpu.free_tensor(tensor);
-    }
-    if let Some(tensor) = gpu_draft_z.take() {
-        let _ = gpu.free_tensor(tensor);
-    }
-    if let Some(tensor) = gpu_draft_tokens.take() {
-        let _ = gpu.free_tensor(tensor);
-    }
-    if let Some(tensor) = gpu_draft_p_at_token.take() {
-        let _ = gpu.free_tensor(tensor);
     }
 
     let advance = committed.len();
