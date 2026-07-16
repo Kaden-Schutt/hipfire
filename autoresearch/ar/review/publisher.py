@@ -64,6 +64,10 @@ class _CanonicalChanged(RuntimeError):
     pass
 
 
+class _UnsafeLabelSnapshot(RuntimeError):
+    pass
+
+
 _SCHEMA = "agentic-review/v1"
 _LABEL = "needs-review"
 _MAX_RECONCILIATION_ROUNDS = 4
@@ -320,14 +324,24 @@ class ReviewPublisher:
         *,
         attempt_id: str | None = None,
         intent_node: str | None = None,
+        before_mutation: Callable[[GitHubEnvelope, _History], None] | None = None,
+        return_snapshot: bool = False,
     ) -> Any:
+        canonical: GitHubEnvelope | None = None
+        history: _History | None = None
         if attempt_id is not None:
-            self._canonical(target, attempt_id, intent_node)
+            canonical, history = self._canonical(target, attempt_id, intent_node)
         self._assert_target(target)
+        if canonical is not None and history is not None and before_mutation is not None:
+            before_mutation(canonical, history)
         value = operation()
         self._assert_target(target)
         if attempt_id is not None:
             self._canonical(target, attempt_id, intent_node)
+        if return_snapshot:
+            if canonical is None or history is None:
+                raise PublisherError("mutation snapshot was not authenticated")
+            return value, canonical, history
         return value
 
     def _intent_payload(self, target: ReviewTarget, attempt_id: str) -> dict[str, Any]:
@@ -503,24 +517,47 @@ class ReviewPublisher:
         self._reconcile_workflow_reviews(
             target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
         )
-        if self._label_present(target):
+        for _ in range(_MAX_RECONCILIATION_ROUNDS):
+            if not self._label_present(target):
+                return
             _, canonical = self._reconcile_workflow_reviews(
                 target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
             )
-            self._mutate(
-                target,
-                lambda: self._client.remove_label(target.repository, target.number, _LABEL),
-                attempt_id=attempt_id,
-                intent_node=canonical.node_id,
-            )
+            try:
+                _, canonical, _ = self._mutate(
+                    target,
+                    lambda: self._client.remove_label(target.repository, target.number, _LABEL),
+                    attempt_id=attempt_id,
+                    intent_node=canonical.node_id,
+                    before_mutation=lambda elected, history: self._validate_label_snapshot(
+                        elected, history, target, keep_node, keep_is_review,
+                    ),
+                    return_snapshot=True,
+                )
+            except _UnsafeLabelSnapshot:
+                self._reconcile_workflow_reviews(
+                    target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
+                )
+                continue
             try:
                 self._assert_target(target)
                 self._reconcile_workflow_reviews(
                     target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
                 )
+                return
             except Exception:
                 self._reapply_label(target, attempt_id)
                 raise
+        raise PublisherError("label removal reconciliation did not stabilize")
+
+    def _validate_label_snapshot(
+        self, canonical: GitHubEnvelope, history: _History, target: ReviewTarget,
+        keep_node: str, keep_is_review: bool,
+    ) -> None:
+        if keep_is_review:
+            self._validate_keep_review(history, target, keep_node)
+        if self._workflow_review_ids(history, target, keep_node):
+            raise _UnsafeLabelSnapshot("stale workflow review appeared before label removal")
 
     def _recover(self, target: ReviewTarget, attempt_id: str, status: str, reason: str) -> PublishResult:
         try:

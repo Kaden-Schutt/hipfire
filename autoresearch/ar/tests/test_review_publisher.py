@@ -102,6 +102,8 @@ class FakeGitHub:
         self.invalidate_keep_on_labels = False
         self.arm_stale_on_canonical = False
         self.arm_keep_invalidation_on_canonical = False
+        self.arm_stale_on_mutate_canonical = False
+        self.arm_keep_invalidation_on_mutate_canonical = False
         self.history_reads = 0
         self.inject_stale_on_history_read: int | None = None
         self.invalidate_keep_on_history_read: int | None = None
@@ -247,6 +249,12 @@ class FakeGitHub:
         if record_type == "completion" and self.arm_keep_invalidation_on_canonical:
             self.transient_keep_on_history_read = self.history_reads + 2
             self.arm_keep_invalidation_on_canonical = False
+        if record_type == "completion" and self.arm_stale_on_mutate_canonical:
+            self.inject_stale_on_history_read = self.history_reads + 5
+            self.arm_stale_on_mutate_canonical = False
+        if record_type == "completion" and self.arm_keep_invalidation_on_mutate_canonical:
+            self.invalidate_keep_on_history_read = self.history_reads + 5
+            self.arm_keep_invalidation_on_mutate_canonical = False
         if record_type == "completion" and self.inject_review_on_completion and self.reviews:
             stale = deepcopy(self.reviews[0])
             stale["id"] = 901
@@ -763,4 +771,26 @@ def test_keep_review_change_from_canonical_election_snapshot_fails_closed():
     result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
 
     assert result.status in {"error", "incomplete"}
+    assert "needs-review" in client.labels
+
+
+def test_pre_delete_canonical_snapshot_stale_review_is_dismissed_before_delete():
+    client = FakeGitHub()
+    client.arm_stale_on_mutate_canonical = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "complete", result.reason
+    assert ("dismiss", 905) in client.calls
+    assert client.calls.index(("dismiss", 905)) < client.calls.index(("remove_label", "needs-review"))
+
+
+def test_pre_delete_canonical_snapshot_keep_review_invalidation_never_deletes_label():
+    client = FakeGitHub()
+    client.arm_keep_invalidation_on_mutate_canonical = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status in {"error", "incomplete"}
+    assert client.removed_labels == []
     assert "needs-review" in client.labels
