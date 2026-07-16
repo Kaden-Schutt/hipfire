@@ -31,6 +31,7 @@ from .protocol import (
     validate_review_metadata,
     validate_revocation,
 )
+from .publisher import PublishResult, PublisherError, ReviewPublisher, publish_review, render_report
 
 __all__ = [
     "AttemptIntentConfig",
@@ -62,4 +63,9 @@ __all__ = [
     "validate_report",
     "validate_review_metadata",
     "validate_revocation",
+    "PublishResult",
+    "PublisherError",
+    "ReviewPublisher",
+    "publish_review",
+    "render_report",
 ]

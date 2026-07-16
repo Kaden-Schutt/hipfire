@@ -1,0 +1,328 @@
+# Copyright (c) Kaden Schutt
+"""Contract tests for the authenticated, SHA-bound review publisher."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+import hashlib
+import json
+
+import pytest
+
+from autoresearch.ar.review.canonical import canonical_digest
+from autoresearch.ar.review.config import AuthenticatedConfigSource, ReviewConfiguration
+from autoresearch.ar.review.github import GitHubResponse
+from autoresearch.ar.review.models import Finding, GitHubEnvelope, ReviewProposal, ReviewTarget
+from autoresearch.ar.review.publisher import ReviewPublisher
+
+
+REPO = "owner/repo"
+TARGET = ReviewTarget(REPO, 42, REPO, "head-sha", "main", "base-sha", "merge-sha")
+TRUSTED = "review-bot"
+OPERATOR = {
+    "schema": "hipfire.agentic-review.operator-credentials",
+    "version": 1,
+    "repository": REPO,
+    "principal": {"login": TRUSTED, "type": "Bot"},
+    "allowed_operations": ["publish", "dismiss-workflow-review"],
+    "write_permissions": {"issues": "write", "pull_requests": "write"},
+    "credential_attestation_digest": "sha256:" + "a" * 64,
+}
+
+
+def _configuration() -> ReviewConfiguration:
+    source = AuthenticatedConfigSource._from_authenticated_boundary(
+        __import__("autoresearch.ar.review.config", fromlist=["_SOURCE_PROOF"])._SOURCE_PROOF,
+        REPO,
+        "main",
+        "config-sha",
+        "sha256:" + "b" * 64,
+        ".",
+    )
+    configuration = ReviewConfiguration(
+        {},
+        {},
+        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": []},
+        source,
+    )
+    object.__setattr__(configuration, "_loaded_from_protected_paths", True)
+    object.__setattr__(configuration, "_loaded_source_digest", source.config_digest)
+    object.__setattr__(configuration, "_loaded_root_identity", source.root_identity)
+    return configuration
+
+
+def _proposal(verdict: str = "clean", response_digest: str = "sha256:" + "c" * 64) -> ReviewProposal:
+    findings = () if verdict == "clean" else (
+        Finding("src/main.py", (3, 4), "error", "Use **the checked value** <instead>.") ,
+    )
+    values = {
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "capsule_digest": "sha256:" + "a" * 64,
+        "adapter_id": "adapter",
+        "adapter_version": "1",
+        "model": "model",
+        "response_digest": response_digest,
+        "verdict": verdict,
+        "findings": findings,
+    }
+    return ReviewProposal(
+        TARGET,
+        values["capsule_digest"],
+        "sha256:" + canonical_digest(values),
+        verdict,
+        findings,
+        "adapter",
+        "1",
+        "model",
+        values["response_digest"],
+    )
+
+
+class FakeGitHub:
+    def __init__(self) -> None:
+        self.pull = self._pull(TARGET)
+        self.comments: list[dict] = []
+        self.reviews: list[dict] = []
+        self.calls: list[tuple[str, object]] = []
+        self.next_id = 1
+        self.fail: set[str] = set()
+        self.removed_labels: list[str] = []
+        self.mutate_head_after: str | None = None
+        self.deleted_comment_ids: set[int] = set()
+        self.edited_comment_ids: set[int] = set()
+
+    @staticmethod
+    def _pull(target: ReviewTarget) -> dict:
+        return {
+            "id": 1,
+            "node_id": "PR_1",
+            "number": target.number,
+            "head": {"repo": {"full_name": target.head_repository}, "sha": target.head_sha},
+            "base": {"ref": target.base_ref, "sha": target.base_sha},
+            "merge_base_sha": target.merge_base_sha,
+        }
+
+    def get_pull_request(self, repository: str, number: int) -> GitHubResponse:
+        self.calls.append(("get_target", self.pull["head"]["sha"]))
+        return GitHubResponse(self.pull, {}, 200)
+
+    def revalidate_config_source(self, source) -> None:
+        self.calls.append(("config", source.commit_sha))
+
+    def list_issue_comments(self, repository: str, number: int) -> GitHubResponse:
+        self.calls.append(("list_comments", None))
+        return GitHubResponse([comment for comment in self.comments if comment["id"] not in self.deleted_comment_ids], {}, 200)
+
+    def list_pull_reviews(self, repository: str, number: int) -> GitHubResponse:
+        self.calls.append(("list_reviews", None))
+        return GitHubResponse(self.reviews, {}, 200)
+
+    def _envelope(self, record: dict, kind: str) -> GitHubEnvelope:
+        if record["id"] in self.deleted_comment_ids:
+            raise RuntimeError("record deleted")
+        updated = record["updated_at"] if "updated_at" in record else record["submitted_at"]
+        if record["id"] in self.edited_comment_ids:
+            updated = "2026-01-01T00:09:00Z"
+        published = record["created_at"] if "created_at" in record else record["submitted_at"]
+        return GitHubEnvelope(
+            json.loads(record["body"]), record["node_id"], TRUSTED, published, updated, "Bot"
+        )
+
+    def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:
+        return self._envelope(next(item for item in self.comments if item["id"] == comment_id), "comment")
+
+    def review_envelope(self, repository: str, number: int, review_id: int) -> GitHubEnvelope:
+        return self._envelope(next(item for item in self.reviews if item["id"] == review_id), "review")
+
+    def create_issue_comment(self, repository: str, number: int, body: str) -> GitHubResponse:
+        record_type = json.loads(body)["record_type"]
+        self.calls.append(("create_comment", record_type))
+        if "comment" in self.fail or record_type in self.fail:
+            raise RuntimeError("comment creation failed")
+        now = f"2026-01-01T00:{len(self.comments) + 1:02d}:00Z"
+        record = {
+            "id": self.next_id, "node_id": f"C_{self.next_id}", "user": {"login": TRUSTED, "type": "Bot"},
+            "created_at": now, "updated_at": now, "body": body,
+        }
+        self.next_id += 1
+        self.comments.append(record)
+        return GitHubResponse(record, {}, 201)
+
+    def create_pull_request_review(self, repository: str, number: int, *, body: str, event: str, commit_id: str) -> GitHubResponse:
+        self.calls.append(("create_review", (event, commit_id)))
+        if "review" in self.fail:
+            raise RuntimeError("review creation failed")
+        now = f"2026-01-01T00:{len(self.comments) + len(self.reviews) + 1:02d}:00Z"
+        record = {
+            "id": self.next_id, "node_id": f"R_{self.next_id}", "user": {"login": TRUSTED, "type": "Bot"},
+            "submitted_at": now, "body": body, "state": event, "commit_id": commit_id,
+        }
+        self.next_id += 1
+        self.reviews.append(record)
+        return GitHubResponse(record, {}, 201)
+
+    def add_labels(self, repository: str, number: int, labels) -> GitHubResponse:
+        self.calls.append(("add_label", tuple(labels)))
+        return GitHubResponse([], {}, 200)
+
+    def remove_label(self, repository: str, number: int, label: str) -> GitHubResponse:
+        self.calls.append(("remove_label", label))
+        if "remove_label" in self.fail:
+            raise RuntimeError("label removal failed")
+        self.removed_labels.append(label)
+        return GitHubResponse({}, {}, 204)
+
+    def dismiss_workflow_review(self, repository: str, number: int, review_id: int, *, message: str) -> GitHubResponse:
+        self.calls.append(("dismiss", review_id))
+        if "dismiss" in self.fail:
+            raise RuntimeError("dismissal failed")
+        for review in self.reviews:
+            if review["id"] == review_id:
+                review["state"] = "DISMISSED"
+        return GitHubResponse({"id": review_id, "node_id": f"D_{review_id}"}, {}, 200)
+
+
+def _publisher(client: FakeGitHub) -> ReviewPublisher:
+    return ReviewPublisher(client, configuration=_configuration(), operator_credential=OPERATOR)
+
+
+def test_clean_lifecycle_publishes_report_and_completion_without_approval():
+    client = FakeGitHub()
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "complete", result.reason
+    assert [call for call in client.calls if call[0] == "create_review"] == []
+    assert ("remove_label", "needs-review") in client.calls
+    assert [call[1] for call in client.calls if call[0] == "create_comment"] == [
+        "intent", "report", "review-metadata", "completion"
+    ]
+    report = next(json.loads(item["body"]) for item in client.comments if json.loads(item["body"])["record_type"] == "report")
+    assert "**the checked value**" not in report["report_body"]
+    assert "<instead>" not in report["report_body"]
+
+
+def test_changes_requested_uses_exact_reviewed_head_and_never_approves():
+    client = FakeGitHub()
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "complete", result.reason
+    reviews = [call[1] for call in client.calls if call[0] == "create_review"]
+    assert reviews == [("REQUEST_CHANGES", TARGET.head_sha)]
+    assert all(event != "APPROVE" for event, _ in reviews)
+
+
+def test_race_after_mutation_reapplies_label_and_marks_stale():
+    client = FakeGitHub()
+    original = client.get_pull_request
+    count = 0
+
+    def advancing(repository, number):
+        nonlocal count
+        count += 1
+        response = original(repository, number)
+        if count == 4:
+            client.pull = client._pull(replace(TARGET, head_sha="new-head"))
+        return response
+
+    client.get_pull_request = advancing
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "stale"
+    assert ("add_label", ("needs-review",)) in client.calls
+    assert not any(call[0] == "remove_label" for call in client.calls)
+
+
+def test_report_creation_failure_is_incomplete_and_retry_resumes_intent():
+    client = FakeGitHub()
+    client.fail.add("report")
+    first = _publisher(client).publish(_proposal(), TARGET)
+    assert first.status == "incomplete"
+    client.fail.remove("report")
+    second = _publisher(client).publish(_proposal(), TARGET)
+    assert second.status == "complete"
+    assert [call[1] for call in client.calls if call[0] == "create_comment"].count("intent") == 1
+
+
+def test_duplicate_intent_is_a_no_mutation_state():
+    client = FakeGitHub()
+    client.comments.append({
+        "id": 1, "node_id": "C_1", "user": {"login": TRUSTED, "type": "Bot"},
+        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        "body": json.dumps({
+            "schema": "agentic-review/v1", "record_type": "intent", "record_id": "other",
+            "target": {"repository": REPO, "number": 42, "head_repository": REPO, "head_sha": "head-sha", "base_ref": "main", "base_sha": "base-sha", "merge_base_sha": "merge-sha"}, "target_key": TARGET.target_key(), "attempt_id": "different",
+            "canonical_digest": "",
+        }),
+    })
+    payload = json.loads(client.comments[0]["body"])
+    payload["canonical_digest"] = canonical_digest({key: value for key, value in payload.items() if key != "canonical_digest"})
+    client.comments[0]["body"] = json.dumps(payload, default=lambda value: value.__dict__)
+    before = len(client.calls)
+
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "duplicate"
+    assert len(client.calls) == before + 4  # config, target, and the two bounded history reads
+
+
+def test_workflow_review_dismissal_preserves_human_review():
+    client = FakeGitHub()
+    client.reviews.extend([
+        {"id": 20, "node_id": "human", "user": {"login": "alice", "type": "User"}, "submitted_at": "2026-01-01T00:00:00Z", "body": "human", "state": "CHANGES_REQUESTED", "commit_id": TARGET.head_sha},
+    ])
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert result.status == "complete", result.reason
+    assert ("dismiss", 20) not in client.calls
+
+
+def test_revoked_workflow_review_is_dismissed_but_human_review_is_not():
+    client = FakeGitHub()
+    client.fail.add("completion")
+    old = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert old.status == "incomplete", old.reason
+    client.fail.remove("completion")
+    old_intent = next(item for item in client.comments if json.loads(item["body"])["record_type"] == "intent")
+    intent_payload = json.loads(old_intent["body"])
+    revocation = {
+        "schema": "agentic-review/v1", "record_type": "revocation", "record_id": "revoke-old",
+        "target_key": TARGET.target_key(), "attempt_id": intent_payload["attempt_id"],
+        "canonical_intent_digest": intent_payload["canonical_digest"], "reason": "replacement",
+    }
+    client.comments.append({
+        "id": 99, "node_id": "C_99", "user": {"login": TRUSTED, "type": "Bot"},
+        "created_at": "2026-01-01T00:03:30Z", "updated_at": "2026-01-01T00:03:30Z",
+        "body": json.dumps(revocation),
+    })
+    client.reviews.append({
+        "id": 100, "node_id": "human-100", "user": {"login": "alice", "type": "User"},
+        "submitted_at": "2026-01-01T00:03:31Z", "body": "human", "state": "APPROVED", "commit_id": TARGET.head_sha,
+    })
+
+    result = _publisher(client).publish(
+        _proposal("changes-requested", response_digest="sha256:" + "d" * 64), TARGET
+    )
+
+    assert result.status == "complete", result.reason
+    assert ("dismiss", 3) in client.calls
+    assert ("dismiss", 100) not in client.calls
+
+
+def test_failed_final_mutation_never_removes_needs_review():
+    client = FakeGitHub()
+    client.fail.add("remove_label")
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert result.status == "incomplete"
+    assert ("add_label", ("needs-review",)) in client.calls
+    assert client.removed_labels == []
+
+
+def test_edited_report_is_not_resumed_and_stale_target_keeps_label():
+    client = FakeGitHub()
+    first = _publisher(client).publish(_proposal(), TARGET)
+    assert first.status == "complete"
+    report_id = next(item["id"] for item in client.comments if json.loads(item["body"])["record_type"] == "report")
+    client.edited_comment_ids.add(report_id)
+    result = _publisher(client).publish(_proposal(), TARGET)
+    assert result.status in {"error", "incomplete", "duplicate"}
+    assert ("remove_label", "needs-review") not in client.calls[-5:]
