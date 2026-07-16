@@ -649,6 +649,30 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
 }
 
+fn captured_gdn_frame_count(launch: &RecordedHipLaunch) -> Result<u32, String> {
+    let bytes: [u8; 4] = launch
+        .kernarg
+        .get(64..68)
+        .ok_or_else(|| {
+            format!(
+                "{}: captured GDN kernarg is too short for n_tokens",
+                launch.kernel
+            )
+        })?
+        .try_into()
+        .expect("four-byte GDN token count slice");
+    let count = i32::from_ne_bytes(bytes);
+    u32::try_from(count)
+        .ok()
+        .filter(|count| *count != 0)
+        .ok_or_else(|| {
+            format!(
+                "{}: captured GDN n_tokens must be positive, got {count}",
+                launch.kernel
+            )
+        })
+}
+
 fn recorded_resource_accesses(
     hip: &HipRuntime,
     kernel: &str,
@@ -1264,7 +1288,7 @@ pub struct AqlContractProbe {
 
 pub struct PreparedLinearAqlReplay {
     graph: SingleQueueBatchGraph,
-    dynamic_gdn_frames: Vec<usize>,
+    dynamic_gdn_frames: Vec<(usize, u32)>,
 }
 
 impl PreparedLinearAqlReplay {
@@ -1273,8 +1297,8 @@ impl PreparedLinearAqlReplay {
     /// Every pointer captured in the immutable explicit kernarg prefixes must
     /// still refer to the same live Hipfire allocation and model instance.
     pub unsafe fn replay_and_wait(&mut self) -> Result<GpuBatchTiming, String> {
-        for dispatch in &self.dynamic_gdn_frames {
-            let frame = crate::norm::reserve_gdn_requant_frames(1);
+        for (dispatch, count) in &self.dynamic_gdn_frames {
+            let frame = crate::norm::reserve_gdn_requant_frames(*count);
             self.graph
                 .patch_kernarg_u32(*dispatch, 76, frame)
                 .map_err(|error| error.to_string())?;
@@ -1356,7 +1380,7 @@ pub struct PreparedPm4Replay {
     // programmed into the immutable indirect buffer.
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
-    dynamic_gdn_frames: Vec<usize>,
+    dynamic_gdn_frames: Vec<(usize, u32)>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3])>,
     dispatch_count: usize,
     command_dwords: u32,
@@ -1371,8 +1395,8 @@ impl PreparedPm4Replay {
         &mut self,
         position: usize,
     ) -> Result<GpuMultiQueueTiming, String> {
-        for dispatch in &self.dynamic_gdn_frames {
-            let frame = crate::norm::reserve_gdn_requant_frames(1);
+        for (dispatch, count) in &self.dynamic_gdn_frames {
+            let frame = crate::norm::reserve_gdn_requant_frames(*count);
             let bytes = self.kernargs[*dispatch].as_mut_bytes();
             bytes
                 .get_mut(76..80)
@@ -1753,7 +1777,10 @@ impl ReplayController {
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
                     ));
                 }
-                dynamic_gdn_frames.push(dispatches.len());
+                dynamic_gdn_frames.push((
+                    dispatches.len(),
+                    captured_gdn_frame_count(launch)?,
+                ));
             }
             dispatches.push(dispatch);
         }
@@ -1909,7 +1936,10 @@ impl ReplayController {
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
                     ));
                 }
-                dynamic_gdn_frames.push(kernargs.len());
+                dynamic_gdn_frames.push((
+                    kernargs.len(),
+                    captured_gdn_frame_count(launch)?,
+                ));
             }
             if let Some(binding) = launch.grid_binding {
                 dynamic_grids.push((kernargs.len(), binding, launch.grid));
@@ -2607,6 +2637,23 @@ mod tests {
             "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         ));
         assert!(!radiowave_vmem_only_consumer("unknown_kernel"));
+    }
+
+    #[test]
+    fn retained_gdn_reserves_the_captured_batch_width() {
+        let mut kernarg = vec![0_u8; 96];
+        kernarg[64..68].copy_from_slice(&4_i32.to_ne_bytes());
+        let launch = RecordedHipLaunch {
+            kernel: "gated_delta_net_q8_fast".to_owned(),
+            artifact: None,
+            grid: [32, 32, 1],
+            block: [32, 1, 1],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg,
+            accesses: None,
+        };
+        assert_eq!(captured_gdn_frame_count(&launch).unwrap(), 4);
     }
 
     #[test]
