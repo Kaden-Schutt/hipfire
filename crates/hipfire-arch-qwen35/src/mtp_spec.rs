@@ -3296,11 +3296,16 @@ pub fn spec_step_mtp_compressed_serial(
 
     let replayed = if redline_verify_eligible && gpu.replay.should_route_pm4() {
         qwen35::upload_prefill_batch_inputs(gpu, &state.trunk_pbs, &verify_tokens, cur_pos)?;
-        unsafe { gpu.replay.replay_pm4(cur_pos) }.map_err(|reason| {
-            gpu.replay
-                .poison(format!("MTP verify PM4 replay failed: {reason}"));
-            hip_bridge::HipError::new(0, &reason)
-        })?;
+        if std::env::var_os("HIPFIRE_MTP_REPLAY_HIP_PREFIX").is_some() {
+            let launches = gpu.replay.recorded_launches().len();
+            gpu.replay_recorded_hip_prefix(launches)?;
+        } else {
+            unsafe { gpu.replay.replay_pm4(cur_pos) }.map_err(|reason| {
+                gpu.replay
+                    .poison(format!("MTP verify PM4 replay failed: {reason}"));
+                hip_bridge::HipError::new(0, &reason)
+            })?;
+        }
         true
     } else {
         false
