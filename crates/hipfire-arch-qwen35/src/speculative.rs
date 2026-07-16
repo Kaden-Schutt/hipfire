@@ -950,33 +950,6 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
-    /// Async copy backup -> live state on `stream`.
-    ///
-    /// This is the rollback-side companion to [`Self::save_from_async_on`].
-    /// The caller must order the stream after the verify that consumed the
-    /// live state, and must join it before any later trunk forward reads the
-    /// restored state.
-    pub fn restore_to_async_on(
-        &self,
-        state: &mut DeltaNetState,
-        gpu: &Gpu,
-        stream: &Stream,
-    ) -> HipResult<()> {
-        for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip
-                .memcpy_dtod_async_at(&dst.buf, 0, src, 0, src.size(), stream)?;
-        }
-        for (src, dst) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip
-                .memcpy_dtod_async_at(&dst.buf, 0, src, 0, src.size(), stream)?;
-        }
-        for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip
-                .memcpy_dtod_async_at(&dst.buf, 0, src, 0, src.size(), stream)?;
-        }
-        Ok(())
-    }
-
     /// Free the backup GPU buffers, consuming the snapshot. `DeviceBuffer` has
     /// no `Drop`, so a bare `Vec::clear()`/`truncate()` on a checkpoint ring
     /// orphans this device memory — the source of the per-reset GPU-memory leak
@@ -1264,14 +1237,14 @@ impl GdnTape {
                 )?;
             } else {
                 let bytes = n_steps * k_dim * 4;
-                gpu.memcpy_dtod_at_auto(
+                gpu.hip.memcpy_dtod_at(
                     &self.q_scratch.buf,
                     0,
                     &self.q_raw_scratch.buf,
                     0,
                     bytes,
                 )?;
-                gpu.memcpy_dtod_at_auto(
+                gpu.hip.memcpy_dtod_at(
                     &self.k_scratch.buf,
                     0,
                     &self.k_raw_scratch.buf,
