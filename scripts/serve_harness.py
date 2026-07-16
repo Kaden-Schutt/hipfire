@@ -187,6 +187,18 @@ def spawn_serve(cfg, home, log):
             pass
     conf = {"max_seq": cfg.get("max_seq", 32768), "dflash_mode": "off", "mtp_mode": cfg["mtp"],
             "ngram_mode": "off", "max_tokens": 16384, "thinking_budget": cfg["thinking_budget"]}
+    # The CLI intentionally projects config.mtp_k back into HIPFIRE_MTP_K
+    # before spawning the daemon. Preserve an explicit harness sweep value in
+    # that config field; otherwise the CLI's default K=3 silently clobbers it.
+    mtp_k_env = os.environ.get("HIPFIRE_MTP_K")
+    if mtp_k_env is not None:
+        try:
+            mtp_k = int(mtp_k_env)
+        except ValueError as exc:
+            raise ValueError(f"HIPFIRE_MTP_K must be an integer, got {mtp_k_env!r}") from exc
+        if not 1 <= mtp_k <= 10:
+            raise ValueError(f"HIPFIRE_MTP_K must be in [1, 10], got {mtp_k}")
+        conf["mtp_k"] = mtp_k
     json.dump(conf, open(os.path.join(home, ".hipfire", "config.json"), "w"))
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
