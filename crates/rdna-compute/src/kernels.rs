@@ -1478,6 +1478,16 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// gfx1151 Radiowave scheduling probe for the shipping gate/up source. The
+/// relaxed-occupancy policy is isolated here so the gfx1100 and gfx12 builds
+/// that share the HIP body cannot inherit a gfx1151 compiler decision.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_RELAXED_GFX1151_SRC: &str = concat!(
+    "// HIPFIRE_COMPILER_FLAGS: -mllvm -amdgpu-schedule-relaxed-occupancy\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// Exact gfx1100 A3B decode specialization: K=2048 fixes the group count at
 /// eight while preserving the base gate/up load, FMA, and reduction order.
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1100_SRC: &str = concat!(
