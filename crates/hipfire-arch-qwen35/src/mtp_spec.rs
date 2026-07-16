@@ -1862,18 +1862,42 @@ pub fn prefill_trunk_and_mtp_cache(
 
         let t_mtp_fill = Instant::now();
         for (i, &token) in prompt_tokens.iter().enumerate() {
-            let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
-            mtp_head::mtp_head_forward_block_only(
-                gpu,
-                head,
-                &state.mtp_scratch,
-                &mut state.mtp_kv,
-                token,
-                &hidden_row,
-                None,
-                start_pos + i,
-                &target.weights,
-            )?;
+            // Match the decode-cycle contract: the token written at position p
+            // is paired with the trunk hidden from p-1.  Using hidden[p] here
+            // poisons the private MTP KV row at every retained turn boundary:
+            // the final deferred-token bake writes that row once, then a cached
+            // request attends to it without overwriting it.
+            //
+            // On a strict cached extension (start_pos > 0), prev_hidden is the
+            // resident hidden at start_pos-1.  Within this batch, row i-1 is the
+            // predecessor.  Position zero has no predecessor, so retain the
+            // historical row-zero bootstrap for that single row only.
+            if i == 0 && start_pos > 0 {
+                mtp_head::mtp_head_forward_block_only(
+                    gpu,
+                    head,
+                    &state.mtp_scratch,
+                    &mut state.mtp_kv,
+                    token,
+                    &state.prev_hidden,
+                    None,
+                    start_pos,
+                    &target.weights,
+                )?;
+            } else {
+                let predecessor = prompt_hidden.sub_offset(i.saturating_sub(1) * dim, dim);
+                mtp_head::mtp_head_forward_block_only(
+                    gpu,
+                    head,
+                    &state.mtp_scratch,
+                    &mut state.mtp_kv,
+                    token,
+                    &predecessor,
+                    None,
+                    start_pos + i,
+                    &target.weights,
+                )?;
+            }
         }
 
         let last = prompt_tokens.len() - 1;
