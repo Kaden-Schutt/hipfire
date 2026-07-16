@@ -474,7 +474,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(80),
         ]);
     }
-    if kernel == "conv1d_silu_split_qknorm_b256_scalar_prep" {
+    if matches!(
+        kernel,
+        "conv1d_silu_split_qknorm_b256_scalar_prep"
+            | "conv1d_silu_split_qknorm_b256_scalar_prep_gfx1151"
+    ) {
         return Some(vec![
             write(0),
             write(8),
@@ -732,7 +736,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     if kernel.starts_with("gated_delta_net_q8_compact2_") {
         return Some(96);
     }
-    if kernel == "conv1d_silu_split_qknorm_b256_scalar_prep" {
+    if matches!(
+        kernel,
+        "conv1d_silu_split_qknorm_b256_scalar_prep"
+            | "conv1d_silu_split_qknorm_b256_scalar_prep_gfx1151"
+    ) {
         return Some(112);
     }
     if kernel.starts_with("conv1d_silu_split_qknorm_") {
@@ -2941,6 +2949,7 @@ mod tests {
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "conv1d_silu_split_qknorm_b256_scalar_prep",
+        "conv1d_silu_split_qknorm_b256_scalar_prep_gfx1151",
         "fused_qk_l2_norm_scale_f32",
         "repeat_interleave_qk_f32",
         "gated_delta_net_q8_fast",

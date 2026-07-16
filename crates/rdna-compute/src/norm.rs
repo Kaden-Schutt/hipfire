@@ -3567,13 +3567,13 @@ impl Gpu {
         result
     }
 
-    /// gfx1100 decode experiment: use one extra workgroup in the existing
-    /// conv/QK-normalization launch to prepare the independent DeltaNet beta
+    /// Exact gfx1100/gfx1151 decode experiment: use one extra workgroup in the
+    /// existing conv/QK-normalization launch to prepare the independent DeltaNet beta
     /// and alpha scalars. This removes the standalone scalar launch without
     /// enlarging the hot QKVZA projection kernel.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
-    pub fn conv1d_silu_split_qknorm_scalar_prep_gfx1100(
+    pub fn conv1d_silu_split_qknorm_scalar_prep_gfx11_exact(
         &mut self,
         q_out: &GpuTensor,
         k_out: &GpuTensor,
@@ -3594,20 +3594,29 @@ impl Gpu {
         n_v_heads: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_gfx1100() || head_dim != 128 || n_v_heads > 256 {
+        if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1151())
+            || head_dim != 128
+            || n_v_heads > 256
+        {
             return Err(hip_bridge::HipError::new(
                 0,
-                "conv scalar-prep fusion requires gfx1100, head_dim=128, n_v_heads<=256",
+                "conv scalar-prep fusion requires exact gfx1100/gfx1151, head_dim=128, n_v_heads<=256",
             ));
         }
 
-        const KERNEL: &str = "conv1d_silu_split_qknorm_b256_scalar_prep";
+        let (kernel, source) = if self.arch_caps.is_gfx1151() {
+            (
+                "conv1d_silu_split_qknorm_b256_scalar_prep_gfx1151",
+                kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_GFX1151_SRC,
+            )
+        } else {
+            (
+                "conv1d_silu_split_qknorm_b256_scalar_prep",
+                kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC,
+            )
+        };
         const BLOCK: u32 = 256;
-        self.ensure_kernel(
-            KERNEL,
-            kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC,
-            KERNEL,
-        )?;
+        self.ensure_kernel(kernel, source, kernel)?;
 
         let qp = q_out.buf.as_ptr();
         let kp = k_out.buf.as_ptr();
@@ -3651,8 +3660,8 @@ impl Gpu {
         let grid = qk_blocks + v_blocks + 1;
         let bytes = crate::profile::conv1d_silu_bytes(2 * k_dim + v_dim)
             + n_v_heads * 4 * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
-        let result = self.launch_maybe_blob(KERNEL, [grid, 1, 1], [BLOCK, 1, 1], 0, &mut params, || {
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", kernel, bytes);
+        let result = self.launch_maybe_blob(kernel, [grid, 1, 1], [BLOCK, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(qp);
             b.push_ptr(kp);

@@ -14053,7 +14053,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 }
                 if conv_qknorm_enabled(gpu, config, self.dn_state.quant) {
                     if conv_scalar_prep {
-                        gpu.conv1d_silu_split_qknorm_scalar_prep_gfx1100(
+                        gpu.conv1d_silu_split_qknorm_scalar_prep_gfx11_exact(
                             &s.dn_q_raw,
                             &s.dn_k_raw,
                             &s.dn_v,
@@ -14466,7 +14466,7 @@ fn conv_scalar_prep_enabled(
     });
     let shape = std::env::var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
         && n_v_heads <= 256
         && shape.as_deref().is_none_or(|v| v == "b256")
         && conv_qknorm_enabled(gpu, config, quant)
