@@ -4863,6 +4863,18 @@ impl Gpu {
             && *GFX1151_LM_HEAD_ALL_BUFFER.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER").as_deref() == Ok("1")
             });
+        static GFX1151_LM_HEAD_CPOL: OnceLock<Option<String>> = OnceLock::new();
+        let gfx1151_lm_head_cpol = if self.arch_caps.is_gfx1151()
+            && rows == 2
+            && m == 248_320
+            && k == 2_048
+        {
+            GFX1151_LM_HEAD_CPOL
+                .get_or_init(|| std::env::var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok())
+                .as_deref()
+        } else {
+            None
+        };
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
@@ -4880,7 +4892,22 @@ impl Gpu {
                 8 => ("gemv_hfq4g256_multirow_r8", 8u32),
                 _ => unreachable!(),
             };
-            let (mr_name, mr_src) = if gfx1151_lm_head_all_buffer {
+            let (mr_name, mr_src) = if gfx1151_lm_head_cpol == Some("glc") {
+                (
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_glc",
+                    kernels::GEMV_HFQ4G256_MULTIROW_HYBRID_GLC_GFX1151_SRC,
+                )
+            } else if gfx1151_lm_head_cpol == Some("slc") {
+                (
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_slc",
+                    kernels::GEMV_HFQ4G256_MULTIROW_HYBRID_SLC_GFX1151_SRC,
+                )
+            } else if gfx1151_lm_head_cpol == Some("dlc") {
+                (
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_dlc",
+                    kernels::GEMV_HFQ4G256_MULTIROW_HYBRID_DLC_GFX1151_SRC,
+                )
+            } else if gfx1151_lm_head_all_buffer {
                 (
                     "gemv_hfq4g256_multirow_gfx1151_all_buffer",
                     kernels::GEMV_HFQ4G256_MULTIROW_ALL_BUFFER_GFX1151_SRC,

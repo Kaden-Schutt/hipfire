@@ -2828,6 +2828,34 @@ pub const GEMV_HFQ4G256_MULTIROW_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
 );
+/// gfx1151 streaming LM-head probes. The 270 MB output matrix is consumed
+/// once per token, so keep its lane-divergent packed weights on raw-buffer
+/// VMEM while testing whether GLC/SLC/DLC prevents the stream from displacing
+/// higher-reuse decode state. Uniform headers remain on the scalar path.
+pub const GEMV_HFQ4G256_MULTIROW_HYBRID_GLC_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 1\n",
+    "#define HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
+);
+pub const GEMV_HFQ4G256_MULTIROW_HYBRID_SLC_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
+);
+pub const GEMV_HFQ4G256_MULTIROW_HYBRID_DLC_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 4\n",
+    "#define HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
+);
 /// Full gfx1151 LM-head specialization: fixed K removes tail machinery,
 /// uniform headers remain scalar, packed words use temporal buffer VMEM, and
 /// aligned activation vectors form an explicit B128 clause.
