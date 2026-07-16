@@ -368,6 +368,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(64),
         ]);
     }
+    if matches!(
+        kernel,
+        "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_clustered_gfx1151"
+    ) {
+        return Some(vec![read(0), read(8), read(16), write(24)]);
+    }
     if kernel == "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" {
         return Some(vec![
             read(0),
@@ -637,6 +647,16 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_qkvza_hfq4g256_k2048_x_buffer_gfx1151"
     ) {
         return Some(96);
+    }
+    if matches!(
+        kernel,
+        "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151"
+            | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_clustered_gfx1151"
+    ) {
+        return Some(48);
     }
     if kernel.starts_with("gated_delta_net_q8_compact2_") {
         return Some(96);
@@ -2691,6 +2711,10 @@ mod tests {
             pointer_effects("gemv_hfq4g256_residual_wave64").map(|effects| effects.len()),
             Some(3)
         );
+        let down =
+            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151";
+        assert_eq!(expected_kernarg_bytes(down), Some(48));
+        assert_eq!(pointer_effects(down).map(|effects| effects.len()), Some(4));
     }
 
     #[test]
