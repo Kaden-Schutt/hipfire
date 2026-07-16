@@ -190,6 +190,7 @@ def validate_report(
     envelope: Mapping[str, Any],
     intent_envelope: Mapping[str, Any],
     *,
+    canonical_intent: Mapping[str, Any],
     trusted_authors: Iterable[str] | None = None,
 ) -> str:
     trusted = _trust_policy(trusted_authors)
@@ -198,13 +199,16 @@ def validate_report(
     validate_intent(intent_envelope, trusted_authors=trusted)
     required = {
         "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
-        "report_body", "report_body_sha256",
+        "canonical_intent_node_id", "canonical_intent_digest", "report_body", "report_body_sha256",
     }
     if set(payload) != required or payload["record_type"] != "report":
         raise ValueError("invalid report payload")
     target = _same_binding(payload, intent)
     if payload["head_sha"] != target.head_sha:
         raise ValueError("report head SHA does not match target")
+    validate_intent(canonical_intent, trusted_authors=trusted)
+    canonical_payload = dict(_payload(canonical_intent), _node_id=canonical_intent["node_id"])
+    _canonical_binding(payload, canonical_payload, "canonical_intent_digest")
     if not _before(intent_envelope, envelope):
         raise ValueError("report was published before its intent")
     body = payload["report_body"]
@@ -239,7 +243,12 @@ def validate_review_metadata(
     target = _same_binding(payload, intent)
     if payload["head_sha"] != target.head_sha:
         raise ValueError("review metadata head SHA does not match target")
-    validate_report(report_envelope, intent_envelope, trusted_authors=trusted)
+    validate_report(
+        report_envelope,
+        intent_envelope,
+        canonical_intent=canonical_intent,
+        trusted_authors=trusted,
+    )
     if not _before(intent_envelope, envelope) or not _before(report_envelope, envelope):
         raise ValueError("review metadata was published before its dependency")
     if payload["report_record_id"] != report.get("record_id"):
@@ -380,6 +389,7 @@ def elect_canonical_attempt(
     records = [*intents, *reports, *review_metadata, *completions, *revocations]
     _unique_records(records)
     intent_by_id: dict[str, Mapping[str, Any]] = {}
+    attempt_ids: set[str] = set()
     events = []
     for envelope in intents:
         payload = _payload(envelope)
@@ -388,6 +398,10 @@ def elect_canonical_attempt(
         logical_id = _record_id(envelope)
         if logical_id in intent_by_id:
             raise ValueError("duplicate intent logical record ID")
+        attempt_id = _text(payload.get("attempt_id"), "attempt_id")
+        if attempt_id in attempt_ids:
+            raise ValueError("duplicate intent attempt ID")
+        attempt_ids.add(attempt_id)
         intent_by_id[logical_id] = envelope
         events.append((_event_key(envelope), 0, "intent", envelope))
     for envelope in reports:
@@ -427,7 +441,7 @@ def elect_canonical_attempt(
         if payload.get("target_key") != current_payload.get("target_key") or payload.get("attempt_id") != current_payload.get("attempt_id"):
             raise ValueError(f"{event_type} does not target the current canonical intent")
         if event_type == "report":
-            validate_report(envelope, intent, trusted_authors=trusted)
+            validate_report(envelope, intent, canonical_intent=current, trusted_authors=trusted)
             published_reports[_record_id(envelope)] = envelope
         elif event_type == "review-metadata":
             report = published_reports.get(payload.get("report_record_id"))

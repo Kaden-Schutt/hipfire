@@ -41,6 +41,14 @@ def _envelope(payload, node_id, *, author="review-bot", created_at="2026-01-01T0
     return envelope
 
 
+def _refresh_envelope(envelope):
+    envelope["payload_digest"] = canonical_digest(envelope["payload"])
+    envelope["envelope_digest"] = canonical_digest(
+        {key: envelope[key] for key in ("author", "created_at", "node_id", "payload_digest")}
+    )
+    return envelope
+
+
 def _intent(record_id="intent-a", node_id="gh-intent-a", *, created_at="2026-01-01T00:00:00Z"):
     payload = {
         "record_type": "intent",
@@ -61,6 +69,8 @@ def _report(intent, record_id=None, node_id="gh-report-a", *, created_at="2026-0
         "target_key": TARGET.target_key(),
         "attempt_id": intent["payload"]["attempt_id"],
         "intent_record_id": intent["payload"]["record_id"],
+        "canonical_intent_node_id": intent["node_id"],
+        "canonical_intent_digest": intent["payload"]["canonical_digest"],
         "head_sha": TARGET.head_sha,
         "report_body": body,
         "report_body_sha256": hashlib.sha256(body.encode()).hexdigest(),
@@ -177,7 +187,7 @@ def test_valid_history_binds_report_metadata_and_completion_to_envelopes():
     report = _report(intent)
     metadata = _metadata(intent, report)
     completion = _completion(intent, report, metadata)
-    validate_report(report, intent, trusted_authors=TRUSTED)
+    validate_report(report, intent, canonical_intent=intent, trusted_authors=TRUSTED)
     validate_review_metadata(metadata, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)
     validate_completion(
         completion,
@@ -264,6 +274,19 @@ def test_duplicate_logical_ids_and_node_ids_rejected_before_lookup():
     second = _intent(record_id="same", node_id="node-second")
     with pytest.raises(ValueError, match="logical|record ID|duplicate"):
         validate_protocol([first, second], expected_target=TARGET, trusted_authors=TRUSTED)
+    duplicate_attempt = _intent(record_id="different", node_id="node-different")
+    duplicate_attempt["payload"]["attempt_id"] = first["payload"]["attempt_id"]
+    duplicate_attempt["payload"]["canonical_digest"] = canonical_digest(
+        {key: value for key, value in duplicate_attempt["payload"].items() if key != "canonical_digest"}
+    )
+    duplicate_attempt["payload_digest"] = canonical_digest(duplicate_attempt["payload"])
+    duplicate_attempt["envelope_digest"] = canonical_digest(
+        {key: duplicate_attempt[key] for key in ("author", "created_at", "node_id", "payload_digest")}
+    )
+    with pytest.raises(ValueError, match="attempt"):
+        elect_canonical_attempt(
+            [first, duplicate_attempt], [], expected_target=TARGET, trusted_authors=TRUSTED
+        )
     duplicate_node = _intent(record_id="other", node_id="node-first")
     with pytest.raises(ValueError, match="node"):
         elect_canonical_attempt(
@@ -287,6 +310,95 @@ def test_payload_logical_id_is_distinct_from_authenticated_node_id():
     intent = _intent(record_id="logical-intent", node_id="github-node-123")
     assert intent["payload"]["record_id"] != intent["node_id"]
     validate_intent(intent, trusted_authors=TRUSTED)
+
+
+def test_exact_and_invalid_intent_payload_digests_are_checked():
+    intent = _intent()
+    assert validate_intent(intent, trusted_authors=TRUSTED) == intent["payload"]["canonical_digest"]
+    invalid = _refresh_envelope(dict(intent, payload=dict(intent["payload"], canonical_digest="wrong")))
+    with pytest.raises(ValueError, match="intent canonical digest"):
+        validate_intent(invalid, trusted_authors=TRUSTED)
+
+
+def test_report_body_ids_and_head_sha_are_bound_to_canonical_intent():
+    intent = _intent()
+    report = _report(intent)
+    validate_report(report, intent, canonical_intent=intent, trusted_authors=TRUSTED)
+    altered_body = _refresh_envelope(dict(report, payload=dict(report["payload"], report_body="altered")))
+    with pytest.raises(ValueError, match="body"):
+        validate_report(altered_body, intent, canonical_intent=intent, trusted_authors=TRUSTED)
+    for field, value in (
+        ("intent_record_id", "other-intent"),
+        ("attempt_id", "other-attempt"),
+        ("target_key", "other-target"),
+        ("head_sha", "other-head"),
+        ("canonical_intent_node_id", "other-node"),
+        ("canonical_intent_digest", "other-digest"),
+    ):
+        altered = _refresh_envelope(dict(report, payload=dict(report["payload"], **{field: value})))
+        with pytest.raises(ValueError):
+            validate_report(altered, intent, canonical_intent=intent, trusted_authors=TRUSTED)
+
+
+def test_completion_canonical_target_attempt_and_intent_bindings_are_field_exact():
+    intent = _intent()
+    report = _report(intent)
+    metadata = _metadata(intent, report)
+    completion = _completion(intent, report, metadata)
+    for field, value in (
+        ("target_key", "other-target"),
+        ("attempt_id", "other-attempt"),
+        ("intent_record_id", "other-intent"),
+        ("canonical_intent_node_id", "other-node"),
+        ("canonical_intent_digest", "other-digest"),
+        ("head_sha", "other-head"),
+    ):
+        altered = _refresh_envelope(dict(completion, payload=dict(completion["payload"], **{field: value})))
+        with pytest.raises(ValueError):
+            validate_completion(
+                altered, intent, report, metadata, canonical_intent=intent, trusted_authors=TRUSTED
+            )
+
+
+def test_aware_offset_ordering_and_naive_timestamps_are_checked():
+    earlier_utc = _intent(record_id="z", node_id="z-node", created_at="2026-01-01T00:30:00+02:00")
+    later_utc = _intent(record_id="a", node_id="a-node", created_at="2025-12-31T23:00:00Z")
+    assert elect_canonical_attempt(
+        [later_utc, earlier_utc], [], expected_target=TARGET, trusted_authors=TRUSTED
+    ) is earlier_utc
+    naive = _intent(created_at="2026-01-01T00:00:00")
+    with pytest.raises(ValueError, match="timezone"):
+        validate_intent(naive, trusted_authors=TRUSTED)
+
+
+def test_invalid_and_noncanonical_revocations_are_rejected():
+    first = _intent(record_id="first", node_id="first-node")
+    second = _intent(record_id="second", node_id="second-node", created_at="2026-01-01T00:01:00Z")
+    invalid = _revocation(first)
+    invalid = _refresh_envelope(dict(invalid, payload=dict(invalid["payload"], canonical_intent_digest="wrong")))
+    with pytest.raises(ValueError, match="canonical|digest"):
+        elect_canonical_attempt(
+            [first, second], [], expected_target=TARGET, revocations=[invalid], trusted_authors=TRUSTED
+        )
+    noncanonical = _revocation(second)
+    with pytest.raises(ValueError, match="canonical"):
+        elect_canonical_attempt(
+            [first, second], [], expected_target=TARGET, revocations=[noncanonical], trusted_authors=TRUSTED
+        )
+
+
+def test_report_metadata_completion_all_propagate_envelope_trust():
+    intent = _intent()
+    report = _report(intent)
+    metadata = _metadata(intent, report)
+    completion = _completion(intent, report, metadata)
+    for record, validator in (
+        (dict(report, author="untrusted"), lambda item: validate_report(item, intent, canonical_intent=intent, trusted_authors=TRUSTED)),
+        (dict(metadata, author="untrusted"), lambda item: validate_review_metadata(item, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)),
+        (dict(completion, author="untrusted"), lambda item: validate_completion(item, intent, report, metadata, canonical_intent=intent, trusted_authors=TRUSTED)),
+    ):
+        with pytest.raises(ValueError, match="trusted"):
+            validator(record)
 
 
 def test_all_record_types_use_one_timestamp_then_node_id_event_order():
