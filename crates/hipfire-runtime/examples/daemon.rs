@@ -6753,6 +6753,16 @@ fn generate_qwen35_mtp(
     };
     state.push_sampling_history(seed_token);
 
+    // The retained MTP verifier's kernargs are immutable and therefore belong
+    // to one request-local allocation epoch. Prompt prefill allocates and frees
+    // temporary hidden/PBS buffers; carrying the prior request's PM4 bindings
+    // across that churn eventually dereferences an unmapped allocation even
+    // though the persistent MTP state itself is reused. Re-arm only once per
+    // request, after prefill and seed sampling have quiesced. The first verify
+    // cycle records fresh bindings; every remaining cycle still uses retained
+    // PM4, so this does not turn the hot loop back into ordinary HIP dispatch.
+    gpu.replay.rearm_binding_epoch();
+
     // ── Decode loop ─────────────────────────────────────────────────────
     let t_prefill = Instant::now();
     let mut emitted: Vec<u32> = vec![seed_token];

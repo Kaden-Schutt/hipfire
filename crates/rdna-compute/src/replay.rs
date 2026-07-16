@@ -1647,6 +1647,29 @@ impl ReplayController {
         Ok(())
     }
 
+    /// Start a new retained-binding epoch without changing the selected backend.
+    ///
+    /// A prepared PM4/AQL plan owns immutable kernargs whose pointer values are
+    /// valid only for the allocation epoch in which they were captured. A
+    /// caller that performs temporary allocation/free churn between retained
+    /// replay sessions must re-arm after that churn has quiesced, even when the
+    /// model's long-lived weights and state objects themselves are unchanged.
+    /// The next eligible forward records and prepares a fresh plan.
+    ///
+    /// Returns `true` when a non-HIP controller was re-armed. Sticky fallback
+    /// remains sticky: a failed controller is not silently retried here.
+    pub fn rearm_binding_epoch(&mut self) -> bool {
+        if self.request == ReplayBackendRequest::Hip || self.state == ReplayState::Fallback {
+            return false;
+        }
+        self.recorded.clear();
+        self.prepared = None;
+        self.prepared_pm4 = None;
+        self.state = ReplayState::Armed;
+        self.forward_eligible = true;
+        true
+    }
+
     pub fn fallback_reason(&self) -> Option<&str> {
         self.fallback_reason.as_deref()
     }
@@ -3171,5 +3194,23 @@ mod tests {
 
         controller.set_forward_eligible(false);
         assert!(!controller.should_route_aql());
+    }
+
+    #[test]
+    fn binding_epoch_rearm_drops_recording_and_preserves_backend() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.record_hip_launch("epoch_old", None, [1; 3], [32, 1, 1], 0, &[1]);
+        assert_eq!(controller.recorded_launches().len(), 1);
+        controller.state = ReplayState::Ready;
+
+        assert!(controller.rearm_binding_epoch());
+        assert_eq!(controller.request(), ReplayBackendRequest::Auto);
+        assert_eq!(controller.state(), ReplayState::Armed);
+        assert!(controller.recorded_launches().is_empty());
+        assert!(controller.forward_eligible);
+
+        let mut hip = ReplayController::new(ReplayBackendRequest::Hip);
+        assert!(!hip.rearm_binding_epoch());
+        assert_eq!(hip.state(), ReplayState::Hip);
     }
 }
