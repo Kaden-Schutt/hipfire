@@ -17,10 +17,11 @@ use std::sync::Arc;
 
 use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
-    load_symbols, BatchFencePolicy, Executable, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
-    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
-    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch,
-    Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
+    Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
+    GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
+    PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph,
+    SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,7 +138,11 @@ fn create_phased_pm4_graph(
 }
 
 impl Pm4Commands {
-    fn new(architecture: Pm4Architecture, policy: Pm4RegisterPolicy) -> Self {
+    fn new(
+        architecture: Pm4Architecture,
+        policy: Pm4RegisterPolicy,
+        dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
+    ) -> Self {
         match architecture {
             Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
                 let commands = match policy {
@@ -145,7 +150,8 @@ impl Pm4Commands {
                     Pm4RegisterPolicy::Static | Pm4RegisterPolicy::Stateful => {
                         Gfx10Pm4CommandBuffer::new_stateful()
                     }
-                };
+                }
+                .with_dispatch_initiator_policy(dispatch_initiator_policy);
                 Self::Legacy {
                     architecture,
                     commands,
@@ -1039,6 +1045,44 @@ impl Pm4RegisterPolicy {
             );
             Self::Legacy
         })
+    }
+}
+
+fn gfx10_dispatch_initiator_policy(
+    architecture: Pm4Architecture,
+    device_name: &str,
+) -> Gfx10DispatchInitiatorPolicy {
+    let value =
+        std::env::var("HIPFIRE_GFX1151_PM4_INITIATOR").unwrap_or_else(|_| "legacy".to_owned());
+    let policy = gfx10_dispatch_initiator_policy_from_value(architecture, device_name, &value)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unknown HIPFIRE_GFX1151_PM4_INITIATOR={value:?}; retaining legacy initiator"
+            );
+            Gfx10DispatchInitiatorPolicy::Legacy
+        });
+    if policy != Gfx10DispatchInitiatorPolicy::Legacy {
+        eprintln!("[redline] gfx1151 PM4 dispatch initiator policy={policy:?}");
+    }
+    policy
+}
+
+fn gfx10_dispatch_initiator_policy_from_value(
+    architecture: Pm4Architecture,
+    device_name: &str,
+    value: &str,
+) -> Option<Gfx10DispatchInitiatorPolicy> {
+    if architecture != Pm4Architecture::Gfx11 || !device_name.eq_ignore_ascii_case("gfx1151") {
+        return Some(Gfx10DispatchInitiatorPolicy::Legacy);
+    }
+
+    match value.to_ascii_lowercase().as_str() {
+        "" | "legacy" | "ordered-append" | "ordered_append" => {
+            Some(Gfx10DispatchInitiatorPolicy::Legacy)
+        }
+        "order" | "order-mode" | "order_mode" => Some(Gfx10DispatchInitiatorPolicy::OrderMode),
+        "radv" | "order-tunnel" | "order_tunnel" => Some(Gfx10DispatchInitiatorPolicy::Radv),
+        _ => None,
     }
 }
 
@@ -1950,6 +1994,8 @@ impl ReplayController {
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
+        let dispatch_initiator_policy =
+            gfx10_dispatch_initiator_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -2064,7 +2110,11 @@ impl ReplayController {
             1
         };
         let (graph, command_dwords) = if queue_limit == 1 {
-            let mut commands = Pm4Commands::new(pm4_architecture, self.pm4_register_policy);
+            let mut commands = Pm4Commands::new(
+                pm4_architecture,
+                self.pm4_register_policy,
+                dispatch_initiator_policy,
+            );
             commands.acquire_system(gfx12_gcr_trim);
             let mut resource_frontier = ResourceFrontier::default();
             for index in 0..prefix {
@@ -2147,8 +2197,11 @@ impl ReplayController {
                 if lane_count > 1 {
                     let mut lanes = (0..lane_count)
                         .map(|_| {
-                            let mut commands =
-                                Pm4Commands::new(pm4_architecture, self.pm4_register_policy);
+                            let mut commands = Pm4Commands::new(
+                                pm4_architecture,
+                                self.pm4_register_policy,
+                                dispatch_initiator_policy,
+                            );
                             commands.acquire_system(gfx12_gcr_trim);
                             commands
                         })
@@ -2174,7 +2227,11 @@ impl ReplayController {
                     continue;
                 }
 
-                let mut commands = Pm4Commands::new(pm4_architecture, self.pm4_register_policy);
+                let mut commands = Pm4Commands::new(
+                    pm4_architecture,
+                    self.pm4_register_policy,
+                    dispatch_initiator_policy,
+                );
                 commands.acquire_system(gfx12_gcr_trim);
                 let mut resource_frontier = ResourceFrontier::default();
                 for (position, index) in phase.indices.iter().copied().enumerate() {
@@ -2845,6 +2902,50 @@ mod tests {
             "gated_delta_net_q8_compact2_b2"
         ));
         assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
+    }
+
+    #[test]
+    fn gfx1151_dispatch_initiator_policy_is_exact_arch_only() {
+        assert_eq!(
+            gfx10_dispatch_initiator_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "order",
+            ),
+            Some(Gfx10DispatchInitiatorPolicy::OrderMode)
+        );
+        assert_eq!(
+            gfx10_dispatch_initiator_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "radv",
+            ),
+            Some(Gfx10DispatchInitiatorPolicy::Radv)
+        );
+        assert_eq!(
+            gfx10_dispatch_initiator_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1100",
+                "radv",
+            ),
+            Some(Gfx10DispatchInitiatorPolicy::Legacy)
+        );
+        assert_eq!(
+            gfx10_dispatch_initiator_policy_from_value(
+                Pm4Architecture::Gfx10,
+                "gfx1030",
+                "radv",
+            ),
+            Some(Gfx10DispatchInitiatorPolicy::Legacy)
+        );
+        assert_eq!(
+            gfx10_dispatch_initiator_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "invalid",
+            ),
+            None
+        );
     }
 
     #[test]

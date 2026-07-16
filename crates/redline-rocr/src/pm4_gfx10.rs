@@ -98,11 +98,43 @@ impl Gfx10KernelImage {
     }
 }
 
+/// `COMPUTE_DISPATCH_INITIATOR` policy for the shared GFX10/GFX11 register map.
+///
+/// `Legacy` preserves Redline's first validated encoding. The other policies
+/// expose the architected `ORDER_MODE` and RADV-like `TUNNEL_ENABLE` bits as
+/// explicit experiment arms instead of silently changing every legacy tape.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Gfx10DispatchInitiatorPolicy {
+    #[default]
+    Legacy,
+    OrderMode,
+    Radv,
+}
+
+impl Gfx10DispatchInitiatorPolicy {
+    fn bits(self, wave32: bool) -> u32 {
+        const COMPUTE_SHADER_EN: u32 = 1 << 0;
+        const FORCE_START_AT_000: u32 = 1 << 2;
+        const ORDERED_APPEND_ENBL: u32 = 1 << 3;
+        const ORDER_MODE: u32 = 1 << 6;
+        const TUNNEL_ENABLE: u32 = 1 << 13;
+        const CS_W32_EN: u32 = 1 << 15;
+
+        let policy = match self {
+            Self::Legacy => ORDERED_APPEND_ENBL,
+            Self::OrderMode => ORDER_MODE,
+            Self::Radv => ORDER_MODE | TUNNEL_ENABLE,
+        };
+        COMPUTE_SHADER_EN | FORCE_START_AT_000 | policy | if wave32 { CS_W32_EN } else { 0 }
+    }
+}
+
 /// Retained GFX10/GFX11 PM4 words suitable for one vendor-AQL indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Gfx10Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
+    dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
 }
 
 /// GFX11 uses the same legacy compute-register map as GFX10. The replay API
@@ -120,7 +152,14 @@ impl Gfx10Pm4CommandBuffer {
         Self {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
+            dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
         }
+    }
+
+    /// Select the initiator bits used by subsequently encoded dispatches.
+    pub fn with_dispatch_initiator_policy(mut self, policy: Gfx10DispatchInitiatorPolicy) -> Self {
+        self.dispatch_initiator_policy = policy;
+        self
     }
 
     /// Invalidate agent caches at the ROCr/AQL-to-PM4 ownership boundary.
@@ -374,9 +413,7 @@ impl Gfx10Pm4CommandBuffer {
             self.set_sh_regs(COMPUTE_USER_DATA_0, user_sgprs);
         }
 
-        let wave_mode = if image.wave32 { 1 << 15 } else { 0 };
-        // COMPUTE_SHADER_EN | FORCE_START_AT_000 | ORDER_MODE, plus W32.
-        let initiator = (1 << 0) | (1 << 2) | (1 << 3) | wave_mode;
+        let initiator = self.dispatch_initiator_policy.bits(image.wave32);
         self.dwords.push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
         self.dwords.extend_from_slice(&workgroups);
         self.dwords.push(initiator);
@@ -591,6 +628,30 @@ mod tests {
             &commands.dwords()[dispatch + 1..dispatch + 5],
             &[1, 1, 1, 0x800d]
         );
+    }
+
+    #[test]
+    fn gfx11_dispatch_initiator_experiment_arms_use_architected_bits() {
+        let geometry = LaunchGeometry::new([256, 1, 1], [256, 1, 1]).unwrap();
+        let dispatch_word = |policy| {
+            let mut commands = Gfx10Pm4CommandBuffer::new().with_dispatch_initiator_policy(policy);
+            commands
+                .dispatch_image(&image(0x409), geometry, 0, &[0, 0, 0, 0, 4, 5])
+                .unwrap();
+            let dispatch = commands
+                .dwords()
+                .iter()
+                .position(|word| *word == packet3(PACKET3_DISPATCH_DIRECT, 4, true))
+                .unwrap();
+            commands.dwords()[dispatch + 4]
+        };
+
+        assert_eq!(dispatch_word(Gfx10DispatchInitiatorPolicy::Legacy), 0x800d);
+        assert_eq!(
+            dispatch_word(Gfx10DispatchInitiatorPolicy::OrderMode),
+            0x8045
+        );
+        assert_eq!(dispatch_word(Gfx10DispatchInitiatorPolicy::Radv), 0xa045);
     }
 
     #[test]

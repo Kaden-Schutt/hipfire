@@ -38,7 +38,8 @@ pub use packet::{
 };
 pub use pm4::{Gfx12Pm4CommandBuffer, Pm4BuildError};
 pub use pm4_gfx10::{
-    Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer, Gfx11Pm4CommandBuffer,
+    Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer,
+    Gfx11Pm4CommandBuffer,
 };
 pub use runtime::DEFAULT_WAIT_TIMEOUT;
 pub use runtime::{
