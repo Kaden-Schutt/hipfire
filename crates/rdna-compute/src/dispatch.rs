@@ -1459,18 +1459,57 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
-        self.scratch.ensure_fp16_x(
-            &self.hip,
-            &mut self.compiler,
-            &mut self.modules,
-            &mut self.functions,
-            self.active_stream.as_ref(),
-            &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
-            x,
-            n_elems,
-        )
+        self.ensure_kernel(
+            "convert_f32_to_f16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
+            "convert_f32_to_f16",
+        )?;
+
+        let src_ptr = x.buf.as_ptr();
+        let needed = n_elems * 2;
+        if self.scratch.fp16_x_scratch_bytes < needed {
+            self.scratch.fp16_x_scratch = Some(self.hip.malloc(needed)?);
+            self.scratch.fp16_x_scratch_bytes = needed;
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        }
+
+        // A retained launch sequence must contain every conversion even when
+        // consecutive layers reuse the same source pointer: the pointer is
+        // stable, but its contents change between layers and between replays.
+        // This is the same rule hipGraph capture already applies.
+        let must_convert = self.graphs.capture_mode
+            || self.replay.is_recording()
+            || self.scratch.fp16_x_source_ptr != src_ptr;
+        if must_convert {
+            let out_ptr = self.scratch.fp16_x_scratch.as_ref().unwrap().as_ptr();
+            let n_val = n_elems as i32;
+            let mut src_arg = src_ptr;
+            let mut dst_arg = out_ptr;
+            let mut n_arg = n_val;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut src_arg as *mut _ as *mut c_void,
+                &mut dst_arg as *mut _ as *mut c_void,
+                &mut n_arg as *mut _ as *mut c_void,
+            ];
+            let grid = n_elems.div_ceil(256) as u32;
+            self.launch_maybe_blob(
+                "convert_f32_to_f16",
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut blob = hip_bridge::KernargBlob::new();
+                    blob.push_ptr(src_ptr);
+                    blob.push_ptr(out_ptr);
+                    blob.push_i32(n_val);
+                    blob
+                },
+            )?;
+            self.scratch.fp16_x_source_ptr = src_ptr;
+        }
+
+        Ok(self.scratch.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Ensure the deterministic-ksplit partials scratch is at least `n_bytes`.
@@ -1486,18 +1525,46 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
-        self.scratch.convert_fp16_x_uncached(
-            &self.hip,
-            &mut self.compiler,
-            &mut self.modules,
-            &mut self.functions,
-            self.active_stream.as_ref(),
-            &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
-            x,
-            n_elems,
-        )
+        self.ensure_kernel(
+            "convert_f32_to_f16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
+            "convert_f32_to_f16",
+        )?;
+
+        let needed = n_elems * 2;
+        if self.scratch.fp16_x_scratch_bytes < needed {
+            self.scratch.fp16_x_scratch = Some(self.hip.malloc(needed)?);
+            self.scratch.fp16_x_scratch_bytes = needed;
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        }
+
+        let src_ptr = x.buf.as_ptr();
+        let out_ptr = self.scratch.fp16_x_scratch.as_ref().unwrap().as_ptr();
+        let n_val = n_elems as i32;
+        let mut src_arg = src_ptr;
+        let mut dst_arg = out_ptr;
+        let mut n_arg = n_val;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut src_arg as *mut _ as *mut c_void,
+            &mut dst_arg as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+        ];
+        let grid = n_elems.div_ceil(256) as u32;
+        self.launch_maybe_blob(
+            "convert_f32_to_f16",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(src_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(n_val);
+                blob
+            },
+        )?;
+        Ok(out_ptr)
     }
 
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
