@@ -105,9 +105,21 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     float ccc0 = 0.0f, ccc1 = 0.0f;
     float dcc0 = 0.0f, dcc1 = 0.0f;
 
+    #if HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER
+    // gfx1151 hybrid cache lowering: scale/zero-point are wave-uniform, so
+    // preserve their scalar/global path. Only the lane-divergent packed nibbles
+    // use temporal buffer VMEM. This avoids turning uniform headers into 64
+    // redundant vector loads while retaining the lean packed-weight address.
+    #define HIPFIRE_MOE_DOWN_LOAD_SC(rsrc, gp, weight_offset) (*(const unsigned int*)(gp))
+    #define HIPFIRE_MOE_DOWN_LOAD_ZP(rsrc, gp, weight_offset) (*(const unsigned int*)((gp) + 4))
+    #else
+    #define HIPFIRE_MOE_DOWN_LOAD_SC(rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, gp, weight_offset)
+    #define HIPFIRE_MOE_DOWN_LOAD_ZP(rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 4, (weight_offset) + 4)
+    #endif
+
     #define DOG_X8(gp, rsrc, weight_offset, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
-        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, gp, weight_offset)); \
-        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 4, (weight_offset) + 4)); \
+        float sc = __builtin_bit_cast(float, HIPFIRE_MOE_DOWN_LOAD_SC(rsrc, gp, weight_offset)); \
+        float zp = __builtin_bit_cast(float, HIPFIRE_MOE_DOWN_LOAD_ZP(rsrc, gp, weight_offset)); \
         unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
@@ -146,6 +158,8 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     DOG_X8(row_ptr3 + 1 * 136, row_rsrc3, 1 * 136, dcc1,
            xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
     #undef DOG_X8
+    #undef HIPFIRE_MOE_DOWN_LOAD_SC
+    #undef HIPFIRE_MOE_DOWN_LOAD_ZP
 
     // groups==2: only slots 0/1 live; (a0+a1) ≡ baseline (a0+a1)+(a2+a3) with a2=a3=0.
     float acc = acc0 + acc1;

@@ -1702,6 +1702,19 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_BUFFER_GFX1151_SRC:
         include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
         include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
     );
+/// gfx1151 hybrid routed-down candidate. Preserve wave-uniform scale and
+/// zero-point headers on scalar/global loads while lowering only the
+/// lane-divergent packed weights to temporal buffer VMEM.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_HYBRID_BUFFER_GFX1151_SRC: &str =
+    concat!(
+        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+        "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+        "#define HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER 1\n",
+        "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151\n",
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+    );
 /// gfx1151 one-row routed-down schedule with temporal buffer VMEM for routing
 /// tables, expert pointers, and weights.
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW1_BUFFER_GFX1151_SRC: &str =
