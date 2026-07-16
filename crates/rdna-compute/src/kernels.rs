@@ -2825,6 +2825,15 @@ pub const GEMV_HFQ4G256_MULTIROW_ALL_BUFFER_GFX1151_SRC: &str = concat!(
 );
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
+/// Exact gfx1151 residual R2 candidate. The body is shared source, but the
+/// exported symbols and JIT module are gfx1151-specific so neither the code
+/// object cache nor a retained replay tape can alias the gfx1100 artifact.
+pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_RESIDUAL_MULTIROW_R2_KERNEL gemv_hfq4g256_residual_multirow_r2_gfx1151\n",
+    "#define HIPFIRE_RESIDUAL_MULTIROW_R4_KERNEL gemv_hfq4g256_residual_multirow_r4_gfx1151\n",
+    "#define HIPFIRE_RESIDUAL_MULTIROW_R8_KERNEL gemv_hfq4g256_residual_multirow_r8_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip")
+);
 
 // 4-way fused HFQ4-G256 projection for Qwen3.5 DeltaNet LA preamble:
 // wqkv + wz + w_beta + w_alpha in a single launch. Same 4x-unroll inner

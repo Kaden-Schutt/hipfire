@@ -5081,6 +5081,13 @@ impl Gpu {
             && *GFX1151_RESIDUAL_TIGHT_GRID.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_RESIDUAL_TIGHT_GRID").as_deref() == Ok("1")
             });
+        static GFX1151_RESIDUAL_MULTIROW_R2: OnceLock<bool> = OnceLock::new();
+        let gfx1151_multirow_r2 = self.arch_caps.is_gfx1151()
+            && m == 2_048
+            && k == 2_048
+            && *GFX1151_RESIDUAL_MULTIROW_R2.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_RESIDUAL_MULTIROW_R2").as_deref() == Ok("1")
+            });
         let cdna3 = self.arch_caps.is_wave64_native() || gfx1151_wave64;
 
         // RDNA3 multi-row override path. Same selector as the non-residual
@@ -5090,12 +5097,14 @@ impl Gpu {
         // kernel to the default path if/when the non-residual multi-row wins
         // scale to justify residual too.)
         let rdna3 = self.arch_caps.is_rdna3_dgpu();
-        let rows = if rdna3 {
+        let rows = if gfx1151_multirow_r2 {
+            2
+        } else if rdna3 {
             self.flags.gemv_rows.unwrap_or(1)
         } else {
             1
         };
-        let use_multirow = rdna3 && rows > 1;
+        let use_multirow = (rdna3 && rows > 1) || gfx1151_multirow_r2;
 
         // Bandwidth: weight + x + y_read (for residual) + y_write.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
@@ -5187,17 +5196,25 @@ impl Gpu {
                 })
             }
         } else if use_multirow {
-            let (func_name, grid_div) = match rows {
-                2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
-                4 => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
-                8 => ("gemv_hfq4g256_residual_multirow_r8", 8u32),
+            let (func_name, grid_div) = match (gfx1151_multirow_r2, rows) {
+                (true, 2) => ("gemv_hfq4g256_residual_multirow_r2_gfx1151", 2u32),
+                (false, 2) => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
+                (false, 4) => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
+                (false, 8) => ("gemv_hfq4g256_residual_multirow_r8", 8u32),
                 _ => unreachable!(),
             };
-            self.ensure_kernel(
-                "gemv_hfq4g256_residual_multirow_rdna3",
-                kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC,
-                func_name,
-            )?;
+            let (module, source) = if gfx1151_multirow_r2 {
+                (
+                    "gemv_hfq4g256_residual_multirow_gfx1151",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1151_SRC,
+                )
+            } else {
+                (
+                    "gemv_hfq4g256_residual_multirow_rdna3",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC,
+                )
+            };
+            self.ensure_kernel(module, source, func_name)?;
             let grid = ((m as u32) + grid_div - 1) / grid_div;
             self.launch_maybe_blob(func_name, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
