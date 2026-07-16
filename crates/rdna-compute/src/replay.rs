@@ -18,10 +18,10 @@ use std::sync::Arc;
 use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
-    Gfx10Pm4CommandBuffer, Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, GpuBatchTiming,
-    GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
-    LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch, Runtime,
-    SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
+    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy,
+    KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy,
+    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +143,7 @@ impl Pm4Commands {
         policy: Pm4RegisterPolicy,
         dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
         dispatch_interleave: Option<Gfx11DispatchInterleave>,
+        resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
     ) -> Self {
         match architecture {
             Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
@@ -153,7 +154,8 @@ impl Pm4Commands {
                     }
                 }
                 .with_dispatch_initiator_policy(dispatch_initiator_policy)
-                .with_dispatch_interleave(dispatch_interleave);
+                .with_dispatch_interleave(dispatch_interleave)
+                .with_resource_limits_policy(resource_limits_policy);
                 Self::Legacy {
                     architecture,
                     commands,
@@ -1130,6 +1132,45 @@ fn gfx1151_dispatch_interleave_from_value(
     }
 }
 
+fn gfx1151_resource_limits_policy(
+    architecture: Pm4Architecture,
+    device_name: &str,
+) -> Gfx11ComputeResourceLimitsPolicy {
+    let value = std::env::var("HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS")
+        .unwrap_or_else(|_| "legacy".to_owned());
+    let policy = gfx1151_resource_limits_policy_from_value(architecture, device_name, &value)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unknown HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS={value:?}; retaining zero resource limits"
+            );
+            Gfx11ComputeResourceLimitsPolicy::Legacy
+        });
+    if policy != Gfx11ComputeResourceLimitsPolicy::Legacy {
+        eprintln!("[redline] gfx1151 PM4 resource-limits policy={policy:?}");
+    }
+    policy
+}
+
+fn gfx1151_resource_limits_policy_from_value(
+    architecture: Pm4Architecture,
+    device_name: &str,
+    value: &str,
+) -> Option<Gfx11ComputeResourceLimitsPolicy> {
+    if architecture != Pm4Architecture::Gfx11 || !device_name.eq_ignore_ascii_case("gfx1151") {
+        return Some(Gfx11ComputeResourceLimitsPolicy::Legacy);
+    }
+
+    match value.to_ascii_lowercase().as_str() {
+        "" | "legacy" | "zero" | "off" => Some(Gfx11ComputeResourceLimitsPolicy::Legacy),
+        // The certified gfx1151 host exposes 40 CUs over 2 SEs. Its 20 CUs/SE
+        // are divisible by four, so Mesa's FORCE_SIMD_DIST guard is false.
+        "radv" | "simd-dest" | "simd_dest" => Some(Gfx11ComputeResourceLimitsPolicy::Radv {
+            force_simd_dist_for_single_wave: false,
+        }),
+        _ => None,
+    }
+}
+
 impl Pm4WaitPolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -2041,6 +2082,8 @@ impl ReplayController {
         let dispatch_initiator_policy =
             gfx10_dispatch_initiator_policy(pm4_architecture, device.name());
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
+        let resource_limits_policy =
+            gfx1151_resource_limits_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -2160,6 +2203,7 @@ impl ReplayController {
                 self.pm4_register_policy,
                 dispatch_initiator_policy,
                 dispatch_interleave,
+                resource_limits_policy,
             );
             commands.acquire_system(gfx12_gcr_trim);
             let mut resource_frontier = ResourceFrontier::default();
@@ -2248,6 +2292,7 @@ impl ReplayController {
                                 self.pm4_register_policy,
                                 dispatch_initiator_policy,
                                 dispatch_interleave,
+                                resource_limits_policy,
                             );
                             commands.acquire_system(gfx12_gcr_trim);
                             commands
@@ -2279,6 +2324,7 @@ impl ReplayController {
                     self.pm4_register_policy,
                     dispatch_initiator_policy,
                     dispatch_interleave,
+                    resource_limits_policy,
                 );
                 commands.acquire_system(gfx12_gcr_trim);
                 let mut resource_frontier = ResourceFrontier::default();
@@ -3024,6 +3070,45 @@ mod tests {
         );
         assert_eq!(
             gfx1151_dispatch_interleave_from_value(Pm4Architecture::Gfx11, "gfx1151", "32"),
+            None
+        );
+    }
+
+    #[test]
+    fn gfx1151_resource_limits_policy_is_exact_arch_only() {
+        let radv = Gfx11ComputeResourceLimitsPolicy::Radv {
+            force_simd_dist_for_single_wave: false,
+        };
+        assert_eq!(
+            gfx1151_resource_limits_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "radv",
+            ),
+            Some(radv)
+        );
+        assert_eq!(
+            gfx1151_resource_limits_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1100",
+                "radv",
+            ),
+            Some(Gfx11ComputeResourceLimitsPolicy::Legacy)
+        );
+        assert_eq!(
+            gfx1151_resource_limits_policy_from_value(
+                Pm4Architecture::Gfx12,
+                "gfx1201",
+                "radv",
+            ),
+            Some(Gfx11ComputeResourceLimitsPolicy::Legacy)
+        );
+        assert_eq!(
+            gfx1151_resource_limits_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "invalid",
+            ),
             None
         );
     }

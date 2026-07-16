@@ -156,12 +156,56 @@ impl Gfx11DispatchInterleave {
     }
 }
 
+/// Per-dispatch `COMPUTE_RESOURCE_LIMITS` distribution policy.
+///
+/// Both policies leave the occupancy and threadgroup caps at zero. `Radv`
+/// mirrors Mesa's topology-independent `SIMD_DEST_CNTL` rule and optionally
+/// enables `FORCE_SIMD_DIST` for one-wave workgroups when the caller has
+/// established that the target has a non-multiple-of-four CU count per SE.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Gfx11ComputeResourceLimitsPolicy {
+    #[default]
+    Legacy,
+    Radv {
+        force_simd_dist_for_single_wave: bool,
+    },
+}
+
+impl Gfx11ComputeResourceLimitsPolicy {
+    fn bits(self, workgroup: [u16; 3], wave32: bool) -> u32 {
+        const SIMD_DEST_CNTL: u32 = 1 << 22;
+        const FORCE_SIMD_DIST: u32 = 1 << 23;
+
+        let Self::Radv {
+            force_simd_dist_for_single_wave,
+        } = self
+        else {
+            return 0;
+        };
+        let threads = workgroup.into_iter().map(u64::from).product::<u64>();
+        let wave_size = if wave32 { 32 } else { 64 };
+        let waves_per_threadgroup = threads.div_ceil(wave_size);
+        let simd_dest = if waves_per_threadgroup.is_multiple_of(4) {
+            SIMD_DEST_CNTL
+        } else {
+            0
+        };
+        let force_simd = if force_simd_dist_for_single_wave && waves_per_threadgroup == 1 {
+            FORCE_SIMD_DIST
+        } else {
+            0
+        };
+        simd_dest | force_simd
+    }
+}
+
 /// Retained GFX10/GFX11 PM4 words suitable for one vendor-AQL indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Gfx10Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
     dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
+    resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
 }
 
 /// GFX11 uses the same legacy compute-register map as GFX10. The replay API
@@ -180,12 +224,23 @@ impl Gfx10Pm4CommandBuffer {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
+            resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         }
     }
 
     /// Select the initiator bits used by subsequently encoded dispatches.
     pub fn with_dispatch_initiator_policy(mut self, policy: Gfx10DispatchInitiatorPolicy) -> Self {
         self.dispatch_initiator_policy = policy;
+        self
+    }
+
+    /// Select the resource-distribution bits used by subsequently encoded
+    /// dispatches. Occupancy limits remain unlimited for every policy.
+    pub fn with_resource_limits_policy(
+        mut self,
+        policy: Gfx11ComputeResourceLimitsPolicy,
+    ) -> Self {
+        self.resource_limits_policy = policy;
         self
     }
 
@@ -447,7 +502,10 @@ impl Gfx10Pm4CommandBuffer {
                 u32::from(geometry.workgroup[2]),
             ],
         );
-        self.set_sh_regs(COMPUTE_RESOURCE_LIMITS, &[0]);
+        let resource_limits = self
+            .resource_limits_policy
+            .bits(geometry.workgroup, image.wave32);
+        self.set_sh_regs(COMPUTE_RESOURCE_LIMITS, &[resource_limits]);
         if !user_sgprs.is_empty() {
             self.set_sh_regs(COMPUTE_USER_DATA_0, user_sgprs);
         }
@@ -716,6 +774,36 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn gfx11_radv_resource_limits_follow_waves_per_threadgroup() {
+        let resource_word = |block: u16, wave32: bool, force_single_wave: bool| {
+            let geometry = LaunchGeometry::new([u32::from(block), 1, 1], [block, 1, 1]).unwrap();
+            let mut kernel = image(0x409);
+            kernel.wave32 = wave32;
+            let mut commands = Gfx10Pm4CommandBuffer::new().with_resource_limits_policy(
+                Gfx11ComputeResourceLimitsPolicy::Radv {
+                    force_simd_dist_for_single_wave: force_single_wave,
+                },
+            );
+            commands
+                .dispatch_image(&kernel, geometry, 0, &[0, 0, 0, 0, 4, 5])
+                .unwrap();
+            let register = commands
+                .dwords()
+                .windows(2)
+                .position(|words| words[1] == COMPUTE_RESOURCE_LIMITS)
+                .unwrap();
+            commands.dwords()[register + 2]
+        };
+
+        assert_eq!(resource_word(32, true, false), 0);
+        assert_eq!(resource_word(64, true, false), 0);
+        assert_eq!(resource_word(128, true, false), 1 << 22);
+        assert_eq!(resource_word(256, true, false), 1 << 22);
+        assert_eq!(resource_word(64, false, true), 1 << 23);
+        assert_eq!(resource_word(256, false, false), 1 << 22);
     }
 
     #[test]
