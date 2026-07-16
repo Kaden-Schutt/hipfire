@@ -1560,6 +1560,19 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_K2048_SRC: &str = conc
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// gfx12 B4 compact routed schedule. Route metadata is produced explicitly by
+/// `moe_scatter_fused_k8(block_m=1)`, so every original slot is computed once
+/// while adjacent workgroups consume the same expert's weights.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_COMPACT_B4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_BATCHED 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_COMPACT_B4 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_compact_b4_gfx12\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// Two-group activation/weight schedule for the fused B=4 probe. This targets
 /// the occupancy band between the default four-group (95 VGPR on gfx1201) and
 /// the one-group low-register schedule without changing any arithmetic chain.
@@ -1604,6 +1617,16 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 /// Observed lift: 387 → ~900 GiB/s on R9700/gfx1201 (no K_TOP-way atomic
 /// contention per output cell).
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
+
+/// gfx12 B4 compact routed down schedule. Uses the same stable sorted metadata
+/// as compact gate/up and writes back to each original expanded slot.
+pub const GEMV_HFQ4G256_MOE_DOWN_COMPACT_B4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_DOWN_COMPACT_B4 1\n",
+    "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_compact_b4_gfx12\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")

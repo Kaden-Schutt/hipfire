@@ -8,6 +8,10 @@
 #define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded
 #endif
 
+#ifndef HIPFIRE_MOE_DOWN_COMPACT_B4
+#define HIPFIRE_MOE_DOWN_COMPACT_B4 0
+#endif
+
 // Atomic-free variant of `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched`.
 //
 // Same per-(token, krank) GEMV compute. Instead of `atomicAdd(scale * acc)`
@@ -46,6 +50,10 @@ __launch_bounds__(32, 16)
 extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int*   __restrict__ topk_indices,              // [N × K_TOP]
+#if HIPFIRE_MOE_DOWN_COMPACT_B4
+    const int*   __restrict__ sorted_slot_index,          // [N × K_TOP]
+    const int*   __restrict__ sorted_expert_ids,           // [N × K_TOP]
+#endif
     const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
     float*       __restrict__ expert_outputs,            // [N × K_TOP × M]
 #if HIPFIRE_MOE_DOWN_LAST_COMBINE
@@ -62,12 +70,22 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     const bool have_row1 = row1 < M;
     const bool have_row2 = row2 < M;
     const bool have_row3 = row3 < M;
+#if HIPFIRE_MOE_DOWN_COMPACT_B4
+    const int sorted_pos = blockIdx.y;
+    const int flat_slot = sorted_slot_index[sorted_pos];
+    if (flat_slot < 0) return;
+    const int expert_id = sorted_expert_ids[sorted_pos];
+    if (expert_id < 0) return;
+    const int bid = flat_slot / K_TOP;
+    const int krank = flat_slot - bid * K_TOP;
+#else
     const int krank = blockIdx.y;
     const int bid = blockIdx.z;
+    const int expert_id = topk_indices[bid * K_TOP + krank];
+#endif
     const int tid = threadIdx.x;
 
     const int routing_base = bid * K_TOP;
-    const int expert_id = topk_indices[routing_base + krank];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =
