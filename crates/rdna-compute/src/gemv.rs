@@ -6634,13 +6634,19 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         use std::sync::OnceLock;
+        static GFX1151_GATE_UP_PAIRED_WAVES: OnceLock<bool> = OnceLock::new();
+        let gfx1151_paired_waves = self.arch_caps.is_gfx1151()
+            && k == 2_048
+            && *GFX1151_GATE_UP_PAIRED_WAVES.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIRED_WAVES").as_deref() == Ok("1")
+            });
         static GFX1151_GATE_UP_SPLIT: OnceLock<bool> = OnceLock::new();
         let gfx1151_split = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_GATE_UP_SPLIT.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_GATE_UP_SPLIT").as_deref() == Ok("1")
             });
-        if gfx1151_split {
+        if !gfx1151_paired_waves && gfx1151_split {
             return self.gemv_hfq4g256_moe_gate_up_k8_indexed_split_gfx1151(
                 expert_ptrs,
                 topk_indices,
@@ -6653,7 +6659,8 @@ impl Gpu {
             );
         }
         static GFX1151_GATE_UP_WAVE64: OnceLock<bool> = OnceLock::new();
-        let gfx1151_wave64 = self.arch_caps.is_gfx1151()
+        let gfx1151_wave64 = !gfx1151_paired_waves
+            && self.arch_caps.is_gfx1151()
             && *GFX1151_GATE_UP_WAVE64.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_GATE_UP_WAVE64").as_deref() == Ok("1")
             });
@@ -6813,7 +6820,16 @@ impl Gpu {
                     std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER").as_deref()
                         == Ok("1")
                 });
-            if gfx1151_hybrid_buffer {
+            if gfx1151_paired_waves {
+                const PAIRED: &str =
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151";
+                self.ensure_kernel(
+                    PAIRED,
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_PAIRED_WAVES_K2048_GFX1151_SRC,
+                    PAIRED,
+                )?;
+                (PAIRED, [64u32, 1, 1], (m as u32) >> 1)
+            } else if gfx1151_hybrid_buffer {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_k2048_hybrid_gfx1151",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_HYBRID_GFX1151_SRC,

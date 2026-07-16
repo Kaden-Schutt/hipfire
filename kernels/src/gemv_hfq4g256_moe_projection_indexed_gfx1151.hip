@@ -10,12 +10,30 @@ using hipfire_projection_f32x4 = float __attribute__((ext_vector_type(4)));
 #error "HIPFIRE_MOE_PROJECTION_KERNEL must name the gate-only or up-only entry point"
 #endif
 
+#ifndef HIPFIRE_MOE_PAIRED_WAVES
+#define HIPFIRE_MOE_PAIRED_WAVES 0
+#endif
+
+#if !HIPFIRE_MOE_PAIRED_WAVES
 #ifndef HIPFIRE_MOE_PROJECTION
 #error "HIPFIRE_MOE_PROJECTION must be 0 (gate) or 1 (up)"
 #endif
 
 #if HIPFIRE_MOE_PROJECTION != 0 && HIPFIRE_MOE_PROJECTION != 1
 #error "HIPFIRE_MOE_PROJECTION must be 0 (gate) or 1 (up)"
+#endif
+#endif
+
+#if HIPFIRE_MOE_PAIRED_WAVES
+#define HIPFIRE_MOE_PROJECTION_BLOCK 64
+#define HIPFIRE_MOE_PROJECTION_MIN_BLOCKS 8
+#define HIPFIRE_MOE_PROJECTION_OUTPUT_ARGS \
+    float* __restrict__ y_gate, \
+    float* __restrict__ y_up,
+#else
+#define HIPFIRE_MOE_PROJECTION_BLOCK 32
+#define HIPFIRE_MOE_PROJECTION_MIN_BLOCKS 16
+#define HIPFIRE_MOE_PROJECTION_OUTPUT_ARGS float* __restrict__ y,
 #endif
 
 // gfx1151 structural decode kernel for the fixed MQ4R A3B K=2048 route.
@@ -30,12 +48,12 @@ using hipfire_projection_f32x4 = float __attribute__((ext_vector_type(4)));
 // kernel: four accumulator chains consume groups 0/4, 1/5, 2/6, and 3/7;
 // those chains are combined as (a0+a1)+(a2+a3), then reduced wave32 in the
 // same order. Only the unrelated projection has left the live range.
-__launch_bounds__(32, 16)
+__launch_bounds__(HIPFIRE_MOE_PROJECTION_BLOCK, HIPFIRE_MOE_PROJECTION_MIN_BLOCKS)
 extern "C" __global__ void HIPFIRE_MOE_PROJECTION_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs,
     const int* __restrict__ topk_indices,
     const float* __restrict__ x,
-    float* __restrict__ y,
+    HIPFIRE_MOE_PROJECTION_OUTPUT_ARGS
     int M,
     int K
 ) {
@@ -46,7 +64,15 @@ extern "C" __global__ void HIPFIRE_MOE_PROJECTION_KERNEL(
     const int mi = M >> 1;
     const int row = blockIdx.x;
     const int krank = blockIdx.y;
+#if HIPFIRE_MOE_PAIRED_WAVES
+    const int projection = threadIdx.x >> 5;
+    const int tid = threadIdx.x & 31;
+    float* __restrict__ out = projection == 0 ? y_gate : y_up;
+#else
+    constexpr int projection = HIPFIRE_MOE_PROJECTION;
     const int tid = threadIdx.x;
+    float* __restrict__ out = y;
+#endif
     if (row >= mi) return;
 
     const int expert_id = topk_indices[krank];
@@ -57,7 +83,7 @@ extern "C" __global__ void HIPFIRE_MOE_PROJECTION_KERNEL(
     constexpr unsigned int group_bytes = 136;
     constexpr unsigned int row_bytes = groups_per_row * group_bytes;
     const unsigned int projection_row =
-        (unsigned int)row + (unsigned int)HIPFIRE_MOE_PROJECTION * (unsigned int)mi;
+        (unsigned int)row + (unsigned int)projection * (unsigned int)mi;
     const unsigned int row_offset = projection_row * row_bytes;
     const int boff = tid * 4;
 
@@ -136,6 +162,10 @@ extern "C" __global__ void HIPFIRE_MOE_PROJECTION_KERNEL(
         acc += __shfl_down(acc, offset);
     }
     if (tid == 0) {
-        y[krank * mi + row] = acc;
+        out[krank * mi + row] = acc;
     }
 }
+
+#undef HIPFIRE_MOE_PROJECTION_OUTPUT_ARGS
+#undef HIPFIRE_MOE_PROJECTION_MIN_BLOCKS
+#undef HIPFIRE_MOE_PROJECTION_BLOCK

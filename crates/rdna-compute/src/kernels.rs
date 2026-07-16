@@ -1524,6 +1524,20 @@ pub const GEMV_HFQ4G256_MOE_UP_INDEXED_K2048_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_projection_indexed_gfx1151.hip")
 );
 
+/// gfx1151 paired-wave producer: one 64-thread workgroup owns one output row,
+/// with wave 0 streaming gate weights and wave 1 streaming up weights. This
+/// preserves the low-register per-projection schedule without adding replay
+/// nodes or a cross-queue join.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_PAIRED_WAVES_K2048_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_PROJECTION_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151\n",
+    "#define HIPFIRE_MOE_PAIRED_WAVES 1\n",
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_projection_indexed_gfx1151.hip")
+);
+
 /// gfx1151 occupancy probe: one-group-at-a-time activation/header live range,
 /// fixed K=2048, and ordinary global loads. Kept separate from gfx1100's
 /// admitted buffer/cache policy so one ISA cannot silently tune the other.
