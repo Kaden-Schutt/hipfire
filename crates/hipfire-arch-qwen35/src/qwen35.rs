@@ -10597,18 +10597,24 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 }
-                gpu.fused_qk_l2_norm_scale_f32_batched(
-                    &pbs.dn_q_raw_batch,
-                    &pbs.dn_k_raw_batch,
-                    config.linear_num_key_heads,
-                    hd,
-                    1.0 / (hd as f32).sqrt(),
-                    config.norm_eps,
-                    n,
-                )?;
-                if config.linear_num_key_heads < n_v_heads {
+                // The dense LA branch above already uses this fused norm +
+                // repeat kernel. Keep the MTP B=4 rollout gated while its
+                // retained-PM4 benefit and sampled quality are certified.
+                static FUSED_MTP_QK_INTERLEAVE: std::sync::OnceLock<bool> =
+                    std::sync::OnceLock::new();
+                let fused_mtp_qk_interleave = *FUSED_MTP_QK_INTERLEAVE.get_or_init(|| {
+                    std::env::var("HIPFIRE_MTP_FUSED_QK_INTERLEAVE")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                });
+                if fused_mtp_qk_interleave
+                    && gpu.arch_caps.is_gfx1201()
+                    && n == 4
+                    && config.linear_num_key_heads < n_v_heads
+                {
                     let ratio = n_v_heads / config.linear_num_key_heads;
-                    gpu.repeat_interleave_qk_f32_batched(
+                    gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
                         &pbs.dn_q_raw_batch,
                         &pbs.dn_k_raw_batch,
                         &pbs.dn_q_batch,
@@ -10616,19 +10622,44 @@ fn forward_prefill_chunk(
                         config.linear_num_key_heads,
                         ratio,
                         hd,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
                         n,
                     )?;
                 } else {
-                    gpu.memcpy_dtod_auto(
-                        &pbs.dn_q_batch.buf,
-                        &pbs.dn_q_raw_batch.buf,
-                        n * k_dim * 4,
+                    gpu.fused_qk_l2_norm_scale_f32_batched(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        config.linear_num_key_heads,
+                        hd,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
+                        n,
                     )?;
-                    gpu.memcpy_dtod_auto(
-                        &pbs.dn_k_batch.buf,
-                        &pbs.dn_k_raw_batch.buf,
-                        n * k_dim * 4,
-                    )?;
+                    if config.linear_num_key_heads < n_v_heads {
+                        let ratio = n_v_heads / config.linear_num_key_heads;
+                        gpu.repeat_interleave_qk_f32_batched(
+                            &pbs.dn_q_raw_batch,
+                            &pbs.dn_k_raw_batch,
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            config.linear_num_key_heads,
+                            ratio,
+                            hd,
+                            n,
+                        )?;
+                    } else {
+                        gpu.memcpy_dtod_auto(
+                            &pbs.dn_q_batch.buf,
+                            &pbs.dn_q_raw_batch.buf,
+                            n * k_dim * 4,
+                        )?;
+                        gpu.memcpy_dtod_auto(
+                            &pbs.dn_k_batch.buf,
+                            &pbs.dn_k_raw_batch.buf,
+                            n * k_dim * 4,
+                        )?;
+                    }
                 }
                 // DIAG: dump GDN inputs (batched, MoE branch)
                 if layer_idx == 0 {
