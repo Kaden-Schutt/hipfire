@@ -4,6 +4,8 @@
 from dataclasses import dataclass
 import hashlib
 import json
+import math
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -120,7 +122,12 @@ class ProviderPolicy:
             ("max_tokens", self.max_tokens),
         ):
             _require_positive_integer(name, value)
-        if isinstance(self.max_cost_usd, bool) or not isinstance(self.max_cost_usd, (int, float)) or self.max_cost_usd <= 0:
+        if (
+            isinstance(self.max_cost_usd, bool)
+            or not isinstance(self.max_cost_usd, (int, float))
+            or not math.isfinite(self.max_cost_usd)
+            or self.max_cost_usd <= 0
+        ):
             raise ValueError("max_cost_usd must be positive")
 
 
@@ -170,7 +177,9 @@ def validate_capability_policy(policy: Mapping[str, Any]) -> None:
             raise ValueError("capability parameters must be an empty object")
         if any(field not in capability for field in required_fields):
             raise ValueError("capability is missing a required contract field")
-        if not isinstance(capability["contract_digest"], str) or not capability["contract_digest"].startswith("sha256:"):
+        if not isinstance(capability["contract_digest"], str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", capability["contract_digest"]
+        ) is None:
             raise ValueError("capability contract digest must be sha256-prefixed")
         for field in ("allowed_suite_revisions", "required_checks", "artifacts"):
             if not isinstance(capability[field], list) or not capability[field]:

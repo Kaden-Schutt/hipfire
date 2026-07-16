@@ -67,6 +67,23 @@ def test_empty_capability_policy_is_rejected():
         )
 
 
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "sha256:" + "a" * 63,
+        "sha256:" + "a" * 65,
+        "sha256:" + "A" * 64,
+        "sha256:" + "g" * 64,
+    ],
+)
+def test_capability_policy_rejects_invalid_contract_digests(digest):
+    policy = json.loads((POLICY_DIR / "capabilities-v1.json").read_text())
+    policy["capabilities"][0]["contract_digest"] = digest
+
+    with pytest.raises(ValueError, match="digest"):
+        validate_capability_policy(policy)
+
+
 def test_capability_policy_shape():
     policy = json.loads((POLICY_DIR / "capabilities-v1.json").read_text())
 
@@ -104,6 +121,12 @@ def test_provider_policy_shape_has_bounded_env_based_configuration():
         limits = provider["limits"]
         assert all(isinstance(limits[key], (int, float)) and limits[key] > 0 for key in limits)
         assert {"max_requests", "max_response_bytes", "max_tokens", "max_cost_usd"} <= limits.keys()
+
+
+@pytest.mark.parametrize("cost", [float("nan"), float("inf"), float("-inf")])
+def test_provider_policy_rejects_nonfinite_cost(cost):
+    with pytest.raises(ValueError, match="max_cost_usd"):
+        ProviderPolicy("default", "ENDPOINT", "API_KEY", "MODEL", 1, 1, 1, cost)
 
 
 def test_trusted_publisher_policy_shape():
