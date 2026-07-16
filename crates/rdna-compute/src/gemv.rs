@@ -4779,6 +4779,7 @@ impl Gpu {
             && k == 2_048
             && *GFX1151_LM_HEAD_R1_HYBRID_BUFFER.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_LM_HEAD_R1_HYBRID_BUFFER").as_deref() == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
             });
         let use_lm_head_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_lm_head_k2048
