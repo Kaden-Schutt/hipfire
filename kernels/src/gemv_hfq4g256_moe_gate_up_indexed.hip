@@ -127,6 +127,18 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     #define LOAD_X4(index) __builtin_bit_cast(hipfire_gate_f32x4, \
         __builtin_amdgcn_raw_buffer_load_b128( \
             x_rsrc, (unsigned int)(index) * 4u, 0, 0))
+    #define DECLARE_PAIR_X(base) \
+        const hipfire_gate_f32x4 x0a = LOAD_X4(base); \
+        const hipfire_gate_f32x4 x0b = LOAD_X4((base) + 4); \
+        const hipfire_gate_f32x4 x1a = LOAD_X4((base) + 256); \
+        const hipfire_gate_f32x4 x1b = LOAD_X4((base) + 260); \
+        asm volatile("" : : "v"(x0a), "v"(x0b), "v"(x1a), "v"(x1b) : "memory")
+#else
+    #define DECLARE_PAIR_X(base) \
+        const float4 x0a = *reinterpret_cast<const float4*>(x + (base)); \
+        const float4 x0b = *reinterpret_cast<const float4*>(x + (base) + 4); \
+        const float4 x1a = *reinterpret_cast<const float4*>(x + (base) + 256); \
+        const float4 x1b = *reinterpret_cast<const float4*>(x + (base) + 260)
 #endif
 
     float gacc0 = 0.0f, gacc1 = 0.0f, gacc2 = 0.0f, gacc3 = 0.0f;
@@ -201,10 +213,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     #define PROCESS_PAIR(group_index, chain0, chain1) do { \
         const int group = (group_index); \
         const int base = group * 256 + tid * 8; \
-        const float4 x0a = *reinterpret_cast<const float4*>(x + base); \
-        const float4 x0b = *reinterpret_cast<const float4*>(x + base + 4); \
-        const float4 x1a = *reinterpret_cast<const float4*>(x + base + 256); \
-        const float4 x1b = *reinterpret_cast<const float4*>(x + base + 260); \
+        DECLARE_PAIR_X(base); \
         const char* gg0 = gate_ptr + group * 136; \
         const char* gg1 = gg0 + 136; \
         const unsigned int gate_base = \
@@ -420,6 +429,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     #undef LOAD_PACKED_U32
     #undef LOAD_UNIFORM_U32
     #undef DOG_X8
+    #undef DECLARE_PAIR_X
 #if defined(HIPFIRE_RDNA3_MOE_GATE_UP_X_BUFFER)
     #undef LOAD_X4
 #endif

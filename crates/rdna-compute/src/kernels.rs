@@ -1492,6 +1492,22 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_PAIR_BUFFER_GFX1151_SRC: &str 
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
+
+/// gfx1151 Radiowave pair schedule with all decode inputs on temporal VMEM.
+/// Two groups stay live to preserve useful memory-level parallelism while the
+/// activation vectors form a four-request B128 clause before both weight
+/// streams.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_PAIR_ALL_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 1\n",
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_X_BUFFER 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_all_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
 /// Exact gfx1151 A3B candidate: expose K=2048 to LLVM and use temporal
 /// raw-buffer weight loads without importing gfx1100 cache or scheduling
 /// policy.
