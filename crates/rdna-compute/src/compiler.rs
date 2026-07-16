@@ -7,7 +7,7 @@
 
 use hip_bridge::HipResult;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +90,10 @@ pub struct KernelCompiler {
     precompiled_dir: Option<PathBuf>,
     has_hipcc: bool,
     pub extra_flags: String,
+    /// Exact gfx1151 JIT module names compiled in CU mode. This is an
+    /// experiment boundary for per-code-object admission; other arches and
+    /// unlisted modules retain their existing WGP-mode code objects.
+    gfx1151_cumode_modules: HashSet<String>,
     /// Toolchain fingerprint (hipcc --version first line). Folded into the cache
     /// hash so blobs built by a different compiler/ROCm don't get reused across
     /// builds sharing one `.hipfire_kernels` dir (the "invalid device image" trap).
@@ -199,6 +203,27 @@ impl KernelCompiler {
             })
             .unwrap_or_default();
 
+        let gfx1151_cumode_modules = if arch == "gfx1151" {
+            std::env::var("HIPFIRE_GFX1151_CUMODE_MODULES")
+                .unwrap_or_default()
+                .split(|character: char| {
+                    character == ',' || character == ';' || character.is_whitespace()
+                })
+                .filter(|module| !module.is_empty())
+                .map(str::to_owned)
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        if !gfx1151_cumode_modules.is_empty() {
+            let mut modules = gfx1151_cumode_modules.iter().cloned().collect::<Vec<_>>();
+            modules.sort();
+            eprintln!(
+                "  gfx1151 CU-mode modules: {}",
+                modules.join(",")
+            );
+        }
+
         Ok(Self {
             cache_dir,
             arch: arch.to_string(),
@@ -206,6 +231,7 @@ impl KernelCompiler {
             precompiled_dir,
             has_hipcc,
             extra_flags,
+            gfx1151_cumode_modules,
             toolchain_id,
         })
     }
@@ -227,11 +253,24 @@ impl KernelCompiler {
         self.compiled.entry(func_name.to_string()).or_insert(path);
     }
 
-    fn cache_hash(&self, source: &str) -> String {
+    fn module_flags(&self, name: &str) -> Vec<String> {
+        if self.arch == "gfx1151" && self.gfx1151_cumode_modules.contains(name) {
+            vec!["-mcumode".to_owned()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn cache_hash(&self, name: &str, source: &str) -> String {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
         self.arch.hash(&mut hasher);
         self.extra_flags.hash(&mut hasher);
+        let module_flags = self.module_flags(name);
+        if !module_flags.is_empty() {
+            "module-flags-v1".hash(&mut hasher);
+            module_flags.hash(&mut hasher);
+        }
         self.toolchain_id.hash(&mut hasher);
         KERNEL_CACHE_ABI.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
@@ -248,7 +287,8 @@ impl KernelCompiler {
         // both pre-compiled and runtime paths). Flags and toolchain matter: identical
         // source compiled with different hipcc flags / ROCm versions yields a different
         // .hsaco, and reusing the wrong one surfaces as "device kernel image is invalid".
-        let src_hash = self.cache_hash(source);
+        let module_flags = self.module_flags(name);
+        let src_hash = self.cache_hash(name, source);
 
         // Try pre-compiled .hsaco first, validating with a .hash sidecar file.
         // If hash is missing/mismatched AND hipcc is available, prefer recompilation.
@@ -294,6 +334,7 @@ impl KernelCompiler {
                 name,
                 source,
                 &self.extra_flags,
+                &module_flags,
             )?;
             let _ = std::fs::write(&hash_path, &src_hash);
         }
@@ -411,6 +452,7 @@ impl KernelCompiler {
         name: &str,
         source: &str,
         extra_flags: &str,
+        module_flags: &[String],
     ) -> HipResult<()> {
         std::fs::write(src_path, source).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to write kernel source: {e}"))
@@ -449,11 +491,19 @@ impl KernelCompiler {
         for flag in extra.split_whitespace() {
             args.push(flag.to_string());
         }
+        for flag in module_flags {
+            args.push(flag.clone());
+        }
         for flag in &per_kernel {
             args.push(flag.clone());
         }
-        if !per_kernel.is_empty() {
-            eprintln!("  {name}: per-kernel flags: {}", per_kernel.join(" "));
+        if !module_flags.is_empty() || !per_kernel.is_empty() {
+            let flags = module_flags
+                .iter()
+                .chain(per_kernel.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            eprintln!("  {name}: per-kernel flags: {}", flags.join(" "));
         }
         args.push("-o".into());
         args.push(obj_path.to_str().unwrap().into());
@@ -478,14 +528,23 @@ impl KernelCompiler {
     /// Kernels already compiled or cached are skipped.
     pub fn compile_batch(&mut self, kernels: &[(&str, &str)]) -> HipResult<()> {
         // Partition into already-done vs needs-work
-        let mut to_compile: Vec<(String, String, String, PathBuf, PathBuf, PathBuf)> = Vec::new();
+        let mut to_compile: Vec<(
+            String,
+            String,
+            String,
+            PathBuf,
+            PathBuf,
+            PathBuf,
+            Vec<String>,
+        )> = Vec::new();
 
         for &(name, source) in kernels {
             if self.compiled.contains_key(name) {
                 continue;
             }
 
-            let src_hash = self.cache_hash(source);
+            let module_flags = self.module_flags(name);
+            let src_hash = self.cache_hash(name, source);
 
             // Check precompiled with valid hash
             if let Some(ref dir) = self.precompiled_dir {
@@ -541,6 +600,7 @@ impl KernelCompiler {
                 src_path,
                 obj_path,
                 hash_path,
+                module_flags,
             ));
         }
 
@@ -561,7 +621,7 @@ impl KernelCompiler {
         // Spawn hipcc in parallel threads
         let results: Vec<_> = to_compile
             .into_iter()
-            .map(|(name, source, src_hash, src_path, obj_path, hash_path)| {
+            .map(|(name, source, src_hash, src_path, obj_path, hash_path, module_flags)| {
                 let arch = arch.clone();
                 let precompiled_dir = precompiled_dir.clone();
                 let extra_flags = self.extra_flags.clone();
@@ -574,6 +634,7 @@ impl KernelCompiler {
                         &name,
                         &source,
                         &extra_flags,
+                        &module_flags,
                     );
                     if result.is_ok() {
                         let _ = std::fs::write(&hash_path, &src_hash);
@@ -625,6 +686,7 @@ mod tests {
             precompiled_dir: None,
             has_hipcc: false,
             extra_flags: extra_flags.to_string(),
+            gfx1151_cumode_modules: HashSet::new(),
             toolchain_id: toolchain_id.to_string(),
         }
     }
@@ -632,10 +694,10 @@ mod tests {
     #[test]
     fn cache_hash_includes_flags_and_toolchain() {
         let source = "__global__ void kernel() {}";
-        let base = test_compiler("", "hipcc 7.2").cache_hash(source);
+        let base = test_compiler("", "hipcc 7.2").cache_hash("kernel", source);
         let flags_changed = test_compiler("-mllvm -amdgpu-enable-flat-scratch=false", "hipcc 7.2")
-            .cache_hash(source);
-        let toolchain_changed = test_compiler("", "hipcc 7.3").cache_hash(source);
+            .cache_hash("kernel", source);
+        let toolchain_changed = test_compiler("", "hipcc 7.3").cache_hash("kernel", source);
 
         assert_ne!(
             base, flags_changed,
@@ -645,5 +707,29 @@ mod tests {
             base, toolchain_changed,
             "cache key must change when hipcc toolchain changes"
         );
+    }
+
+    #[test]
+    fn gfx1151_cumode_is_module_exact_and_cache_keyed() {
+        let source = "__global__ void kernel() {}";
+        let control = test_compiler("", "hipcc 7.2");
+        let mut candidate = test_compiler("", "hipcc 7.2");
+        candidate
+            .gfx1151_cumode_modules
+            .insert("selected".to_owned());
+
+        assert_eq!(candidate.module_flags("selected"), vec!["-mcumode"]);
+        assert!(candidate.module_flags("other").is_empty());
+        assert_ne!(
+            control.cache_hash("selected", source),
+            candidate.cache_hash("selected", source)
+        );
+        assert_eq!(
+            control.cache_hash("other", source),
+            candidate.cache_hash("other", source)
+        );
+
+        candidate.arch = "gfx1100".to_owned();
+        assert!(candidate.module_flags("selected").is_empty());
     }
 }
