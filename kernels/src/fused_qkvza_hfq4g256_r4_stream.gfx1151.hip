@@ -55,14 +55,18 @@ extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151(
     }
 
     constexpr long long row_stride = 8LL * 136;
-    const char* row_ptr0 = A + (long long)(row + 0) * row_stride;
-    const char* row_ptr1 = A + (long long)(row + 1) * row_stride;
-    const char* row_ptr2 = A + (long long)(row + 2) * row_stride;
-    const char* row_ptr3 = A + (long long)(row + 3) * row_stride;
-    const auto row_rsrc0 = HIPFIRE_WEIGHT_RSRC(row_ptr0);
-    const auto row_rsrc1 = HIPFIRE_WEIGHT_RSRC(row_ptr1);
-    const auto row_rsrc2 = HIPFIRE_WEIGHT_RSRC(row_ptr2);
-    const auto row_rsrc3 = HIPFIRE_WEIGHT_RSRC(row_ptr3);
+    const unsigned int row_off0 = (unsigned int)((long long)(row + 0) * row_stride);
+    const unsigned int row_off1 = (unsigned int)((long long)(row + 1) * row_stride);
+    const unsigned int row_off2 = (unsigned int)((long long)(row + 2) * row_stride);
+    const unsigned int row_off3 = (unsigned int)((long long)(row + 3) * row_stride);
+    const char* row_ptr0 = A + row_off0;
+    const char* row_ptr1 = A + row_off1;
+    const char* row_ptr2 = A + row_off2;
+    const char* row_ptr3 = A + row_off3;
+    // One matrix resource plus four wave-uniform scalar offsets replaces four
+    // complete descriptors.  This keeps row selection on SALU and trims the
+    // long-lived address state that pushed the first R4 form into scratch.
+    const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
     const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
         const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
     const int boff = tid * 4;
@@ -99,10 +103,10 @@ extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151(
             const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp0_; \
         const hipfire_qkvza_r4_u32x2 h1_ = *( \
             const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp1_; \
-        const unsigned int pk0_ = HIPFIRE_WEIGHT_LOAD_U32( \
-            row_rsrc0, goff_ + 8 + boff); \
-        const unsigned int pk1_ = HIPFIRE_WEIGHT_LOAD_U32( \
-            row_rsrc1, goff_ + 8 + boff); \
+        const unsigned int pk0_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
+            weight_rsrc, goff_ + 8 + boff, row_off0); \
+        const unsigned int pk1_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
+            weight_rsrc, goff_ + 8 + boff, row_off1); \
         HIPFIRE_QKVZA_R4_DOG(pk0_, __builtin_bit_cast(float, h0_.x), \
             __builtin_bit_cast(float, h0_.y), acc0, xa_, xb_); \
         HIPFIRE_QKVZA_R4_DOG(pk1_, __builtin_bit_cast(float, h1_.x), \
@@ -114,10 +118,10 @@ extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151(
             const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp2_; \
         const hipfire_qkvza_r4_u32x2 h3_ = *( \
             const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp3_; \
-        const unsigned int pk2_ = HIPFIRE_WEIGHT_LOAD_U32( \
-            row_rsrc2, goff_ + 8 + boff); \
-        const unsigned int pk3_ = HIPFIRE_WEIGHT_LOAD_U32( \
-            row_rsrc3, goff_ + 8 + boff); \
+        const unsigned int pk2_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
+            weight_rsrc, goff_ + 8 + boff, row_off2); \
+        const unsigned int pk3_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
+            weight_rsrc, goff_ + 8 + boff, row_off3); \
         HIPFIRE_QKVZA_R4_DOG(pk2_, __builtin_bit_cast(float, h2_.x), \
             __builtin_bit_cast(float, h2_.y), acc2, xa_, xb_); \
         HIPFIRE_QKVZA_R4_DOG(pk3_, __builtin_bit_cast(float, h3_.x), \
