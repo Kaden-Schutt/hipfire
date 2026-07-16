@@ -2366,8 +2366,14 @@ impl Gpu {
             return self.fused_qkv_hfq4g256_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k);
         }
 
+        static GFX1151_QKVZA_WAVE64: OnceLock<bool> = OnceLock::new();
+        let gfx1151_wave64 = self.arch_caps.is_gfx1151()
+            && *GFX1151_QKVZA_WAVE64.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1151_QKVZA_WAVE64").as_deref() == Ok("1")
+            });
         let cdna_wave64 = self.arch_caps.is_wave64_native()
-            || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
+            || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
+            || gfx1151_wave64;
         let (func_name, block, grid_x) = if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
