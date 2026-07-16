@@ -3348,8 +3348,10 @@ pub fn gemv_hfq4g256_for_arch(
             // HFQ4 GEMV kernel selection, leaking `RDNA2 GEMV variant: v1 ...`
             // into the user's terminal (stderr interleaves with the token
             // stream). It is only useful when explicitly tuning the variant, so
-            // gate it on the selector env var being set.
-            if std::env::var("HIPFIRE_RDNA2_VARIANT").is_ok() {
+            // gate it on the already-resolved selector being explicitly set.
+            // Keep env access centralized in FeatureFlags instead of re-reading
+            // process state from this pure arch-selection helper.
+            if rdna2_variant.is_some() {
                 eprintln!("  RDNA2 GEMV variant: v{variant} ({name})");
             }
             match variant {
