@@ -2398,7 +2398,20 @@ impl Gpu {
             && q_m == 12_288
             && k_m == 1_024
             && v_m == 1_024;
-        let (func_name, block, grid_x) = if gfx1201_27b_global {
+        static GFX1201_27B_QKV_R2: OnceLock<bool> = OnceLock::new();
+        let gfx1201_27b_r2 = gfx1201_27b_global
+            && *GFX1201_27B_QKV_R2.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_QKV_R2").as_deref() == Ok("1")
+            });
+        let (func_name, block, grid_x) = if gfx1201_27b_r2 {
+            let kernel = "fused_qkv_hfq4g256_r2_k5120_global_gfx1201";
+            self.ensure_kernel(
+                kernel,
+                kernels::FUSED_QKV_HFQ4G256_R2_K5120_GLOBAL_GFX1201_SRC,
+                kernel,
+            )?;
+            (kernel, [32u32, 1, 1], ((q_m + k_m + v_m) as u32).div_ceil(2))
+        } else if gfx1201_27b_global {
             let kernel = "fused_qkv_hfq4g256_global_gfx1201";
             self.ensure_kernel(
                 kernel,
