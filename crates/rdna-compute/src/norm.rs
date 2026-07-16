@@ -88,6 +88,55 @@ pub fn gdn_chunk_size() -> usize {
 }
 
 impl Gpu {
+    /// Copy a naturally aligned byte range through the compute queue. This is
+    /// slower than SDMA for bulk transfers, but unlike `hipMemcpyDtoD` it is a
+    /// normal recorded dispatch and can live inside a retained PM4 sequence.
+    pub fn copy_u32_range(
+        &mut self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            dst_offset % 4 == 0 && src_offset % 4 == 0 && size % 4 == 0,
+            "copy_u32_range requires naturally aligned offsets and length"
+        );
+        self.ensure_kernel("copy_u32_range", kernels::COPY_U32_RANGE_SRC, "copy_u32_range")?;
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dst.as_ptr();
+        let src_words = (src_offset / 4) as i32;
+        let dst_words = (dst_offset / 4) as i32;
+        let words = (size / 4) as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &src_ptr as *const _ as *mut c_void,
+            &dst_ptr as *const _ as *mut c_void,
+            &src_words as *const _ as *mut c_void,
+            &dst_words as *const _ as *mut c_void,
+            &words as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (words as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "copy_u32_range",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(src_ptr);
+                b.push_ptr(dst_ptr);
+                b.push_i32(src_words);
+                b.push_i32(dst_words);
+                b.push_i32(words);
+                b
+            },
+        )
+    }
+
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
         &mut self,

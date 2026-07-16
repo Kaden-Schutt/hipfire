@@ -36,6 +36,7 @@ use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
+use rdna_compute::replay::{ReplayController, ReplayState};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
@@ -119,6 +120,22 @@ fn mtp_gpu_sample_enabled_from_env() -> bool {
         ),
         Err(_) => false,
     }
+}
+
+fn mtp_redline_enabled_from_env() -> bool {
+    std::env::var("HIPFIRE_MTP_REDLINE")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+fn mtp_gpu_rng_next(seed: u32) -> u32 {
+    seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223)
 }
 
 fn mtp_q8_verify_wmma_enabled_from_env_value(value: Option<&str>) -> bool {
@@ -593,6 +610,11 @@ pub struct MtpSpecState {
     /// sampled MTP. None unless HIPFIRE_MTP_GPU_SAMPLE was enabled before
     /// constructing this generation state.
     mtp_resident_sample: Option<MtpResidentSampleScratch>,
+    /// Isolated retained proposal tape. It never shares capture state with the
+    /// trunk's plain-AR controller because every pointer here is generation-
+    /// state-owned and the proposal has its own dynamic position contract.
+    mtp_proposal_replay: ReplayController,
+    mtp_proposal_replay_seq_cap: usize,
     /// On-device rng state for `gpu.sample_top_p`. Threaded through both
     /// draft and bonus sampling calls within a cycle and across cycles.
     /// Reseeded by [`Self::set_sampling`].
@@ -716,6 +738,7 @@ impl MtpSpecState {
         } else {
             None
         };
+        let mtp_proposal_replay = ReplayController::new_external_from(&gpu.replay);
 
         Ok(Self {
             prev_hidden,
@@ -754,6 +777,8 @@ impl MtpSpecState {
             mtp_gather_idx_verify,
             mtp_gather_prob_verify,
             mtp_resident_sample,
+            mtp_proposal_replay,
+            mtp_proposal_replay_seq_cap: 0,
             gpu_rng_state: 42,
             max_n,
             p_min: default_mtp_p_min(gpu.arch.as_str()),
@@ -788,6 +813,11 @@ impl MtpSpecState {
         // GPU rng uses u32; mix the lower + upper halves so different seeds
         // produce different on-device streams.
         self.gpu_rng_state = ((seed >> 32) as u32) ^ (seed as u32) | 1;
+        // Sampling scalars are explicit kernargs in the retained proposal.
+        // A new request may change them, so force a fresh capture rather than
+        // replaying a tape whose temp/top-k/top-p/min-p were baked previously.
+        let _ = self.mtp_proposal_replay.reset_external_capture();
+        self.mtp_proposal_replay_seq_cap = 0;
     }
 
     /// Set the draft-confidence threshold for compressed-serial K-chain
@@ -1107,6 +1137,244 @@ fn run_mtp_proposal_graph_body_q8(
         }
     }
     Ok(())
+}
+
+/// Sampled proposal body expressed entirely as compute dispatches so Redline
+/// can retain it. The seed token and absolute positions live in fixed device
+/// buffers refreshed before entry. Compact draft probabilities are scattered
+/// into persistent full-vocab rows for the unchanged residual-accept path.
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_sampled_proposal_body_q8(
+    gpu: &mut Gpu,
+    target: &ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    max_n: usize,
+    dim: usize,
+    vocab: usize,
+    cvs: usize,
+    seq_cap: usize,
+    sampling: MtpSamplingConfig,
+) -> HipResult<()> {
+    debug_assert_eq!(state.mtp_kv.kv_mode, crate::mtp_head::MtpKvMode::Q8);
+    let dim_bytes = dim * 4;
+    let logits_c = state
+        .mtp_scratch
+        .logits_compressed
+        .as_ref()
+        .expect("sampled Redline proposal requires compressed logits scratch");
+    let vocab_map_gpu = head
+        .weights
+        .lm_head_draft_vocab_map_gpu
+        .as_ref()
+        .expect("sampled Redline proposal requires GPU vocab_map");
+
+    for k in 0..max_n {
+        let token_slot = state.mtp_token_chain.sub_offset(k, 1);
+        embed_device_token_into(
+            gpu,
+            &target.weights,
+            &state.mtp_token_embed,
+            &token_slot,
+            dim,
+        )?;
+
+        let pos_slot = state.mtp_positions.sub_offset(k, 1);
+        if k == 0 {
+            mtp_head::mtp_head_forward_block_only_with_pos_buf(
+                gpu,
+                head,
+                &state.mtp_scratch,
+                &mut state.mtp_kv,
+                0,
+                &state.prev_hidden,
+                Some(&state.mtp_token_embed),
+                &pos_slot.buf,
+                cur_pos + k,
+                seq_cap,
+                &target.weights,
+            )?;
+        } else {
+            let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+            mtp_head::mtp_head_forward_block_only_with_pos_buf(
+                gpu,
+                head,
+                &state.mtp_scratch,
+                &mut state.mtp_kv,
+                0,
+                &prev_row,
+                Some(&state.mtp_token_embed),
+                &pos_slot.buf,
+                cur_pos + k,
+                seq_cap,
+                &target.weights,
+            )?;
+        }
+        mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
+
+        let resident = state.mtp_resident_sample.as_ref().unwrap();
+        let probs_row = resident
+            .draft_probs_compact
+            .as_ref()
+            .unwrap()
+            .sub_offset(k * cvs, cvs);
+        let tau_row = resident.draft_tau.sub_offset(k, 1);
+        let z_row = resident.draft_z.sub_offset(k, 1);
+        gpu.softmax_temp_topp_batched_into_f32(
+            logits_c,
+            &probs_row,
+            &tau_row,
+            &z_row,
+            cvs,
+            1,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        )?;
+        let token_row = resident.draft_tokens.sub_offset(k, 1);
+        let prob_row = resident.draft_p_at_token.sub_offset(k, 1);
+        gpu.batched_categorical_sample_f32(
+            &probs_row,
+            &tau_row,
+            &z_row,
+            &token_row,
+            &prob_row,
+            cvs,
+            1,
+            state.gpu_rng_state,
+        )?;
+        let full_probs_row = resident.draft_probs.sub_offset(k * vocab, vocab);
+        gpu.scatter_vocab_probs_token_chain_f32(
+            &probs_row,
+            &full_probs_row,
+            vocab_map_gpu,
+            &token_row,
+            &state.mtp_token_chain,
+            cvs,
+            k + 1,
+        )?;
+        state.gpu_rng_state = mtp_gpu_rng_next(state.gpu_rng_state);
+
+        if k + 1 < max_n {
+            gpu.copy_u32_range(
+                &state.mtp_t_outs.buf,
+                k * dim_bytes,
+                &state.mtp_scratch.t_mtp_out.buf,
+                0,
+                dim_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Run or capture the fixed sampled proposal sequence. `true` means proposal
+/// outputs were produced (directly during capture or by retained PM4 replay),
+/// so the legacy per-dispatch proposal loop must be skipped.
+#[allow(clippy::too_many_arguments)]
+fn try_run_mtp_sampled_proposal_redline(
+    gpu: &mut Gpu,
+    target: &ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    max_n: usize,
+    dim: usize,
+    vocab: usize,
+    cvs: usize,
+    sampling: MtpSamplingConfig,
+) -> HipResult<bool> {
+    if !mtp_redline_enabled_from_env()
+        || state.mtp_resident_sample.is_none()
+        || state.mtp_kv.kv_mode != crate::mtp_head::MtpKvMode::Q8
+        || !state.mtp_proposal_replay.is_enabled()
+        || !state.mtp_proposal_replay.uses_pm4_transport()
+    {
+        return Ok(false);
+    }
+
+    let required_cap = mtp_proposal_graph_seq_cap(cur_pos, max_n, state.mtp_kv.max_seq);
+    if state.mtp_proposal_replay_seq_cap != 0
+        && required_cap > state.mtp_proposal_replay_seq_cap
+    {
+        state
+            .mtp_proposal_replay
+            .reset_external_capture()
+            .map_err(|e| hip_bridge::HipError::new(0, e))?;
+        state.mtp_proposal_replay_seq_cap = 0;
+    }
+    let seq_cap = state.mtp_proposal_replay_seq_cap.max(required_cap);
+
+    // Model calls now see the generation-owned controller. The plain-AR
+    // process/model controller remains untouched in `state` until this
+    // explicitly delimited sequence completes.
+    std::mem::swap(&mut gpu.replay, &mut state.mtp_proposal_replay);
+    let result = (|| -> HipResult<bool> {
+        if gpu.replay.should_route_pm4() {
+            let mut seed = state.gpu_rng_state;
+            let mut seeds = Vec::with_capacity(max_n);
+            for _ in 0..max_n {
+                seeds.push(seed);
+                seed = mtp_gpu_rng_next(seed);
+            }
+            gpu.replay
+                .patch_pm4_kernel_u32("batched_categorical_sample_f32", 28, &seeds)
+                .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            // SAFETY: every captured weight, scratch, token, and position
+            // allocation belongs to this live MtpSpecState at the same address.
+            unsafe {
+                gpu.replay
+                    .replay_pm4(cur_pos)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            }
+            state.gpu_rng_state = seed;
+            return Ok(true);
+        }
+
+        if gpu.replay.state() != ReplayState::Armed {
+            return Ok(false);
+        }
+        gpu.replay
+            .begin_capture()
+            .map_err(|e| hip_bridge::HipError::new(0, e))?;
+        run_mtp_sampled_proposal_body_q8(
+            gpu, target, head, state, cur_pos, max_n, dim, vocab, cvs, seq_cap, sampling,
+        )?;
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        }
+        let summary = gpu
+            .replay
+            .finish_capture()
+            .map_err(|e| hip_bridge::HipError::new(0, e))?;
+        let device_ordinal = usize::try_from(gpu.device_id)
+            .map_err(|_| hip_bridge::HipError::new(0, "negative HIP device ordinal"))?;
+        match gpu
+            .replay
+            .prepare_pm4_prefix(device_ordinal, summary.launch_count)
+        {
+            Ok((dispatches, dwords, queue)) => {
+                eprintln!(
+                    "[mtp-redline] retained sampled proposal dispatches={} dwords={} queue={} seq_cap={}",
+                    dispatches, dwords, queue, seq_cap
+                );
+                state.mtp_proposal_replay_seq_cap = seq_cap;
+            }
+            Err(error) => {
+                gpu.replay.poison(format!(
+                    "sampled MTP proposal PM4 preparation failed: {error}"
+                ));
+                eprintln!("[mtp-redline] disabled after PM4 preparation failure: {error}");
+            }
+        }
+        // Capture executed the body directly, so this cycle is complete even
+        // if lowering failed and the controller fell back for later cycles.
+        Ok(true)
+    })();
+    std::mem::swap(&mut gpu.replay, &mut state.mtp_proposal_replay);
+    result
 }
 
 fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
@@ -2559,7 +2827,12 @@ pub fn spec_step_mtp_compressed_serial(
         );
     }
     let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
-    let use_proposal_graph = !state.mtp_proposal_graph_disabled
+    let use_redline_proposal = gpu_sample_active
+        && !use_full_vocab
+        && mtp_redline_enabled_from_env()
+        && state.mtp_kv.kv_mode == crate::mtp_head::MtpKvMode::Q8;
+    let use_proposal_graph = !gpu_sample_active
+        && !state.mtp_proposal_graph_disabled
         && mtp_proposal_graph_eligible_for(
             proposal_graph_policy,
             use_device_token_chain,
@@ -2579,7 +2852,7 @@ pub fn spec_step_mtp_compressed_serial(
         state.mtp_proposal_graph_warmed = true;
     }
     if use_device_token_chain {
-        if use_proposal_graph {
+        if use_proposal_graph || use_redline_proposal {
             upload_mtp_proposal_graph_inputs(gpu, state, last_committed, cur_pos, max_n)?;
         } else {
             let seed_token = last_committed as i32;
@@ -2604,7 +2877,22 @@ pub fn spec_step_mtp_compressed_serial(
     }
 
     // ── 1. K serial discrete-token roundtrips ─────────────────────────────
-    let mut proposal_graph_ran = false;
+    let mut proposal_graph_ran = if use_redline_proposal {
+        try_run_mtp_sampled_proposal_redline(
+            gpu,
+            target,
+            head,
+            state,
+            cur_pos,
+            max_n,
+            dim,
+            vocab,
+            cvs,
+            sampling,
+        )?
+    } else {
+        false
+    };
     if use_proposal_graph {
         if let Some(exec) = state.mtp_proposal_graph_exec.as_ref() {
             let stream = gpu.active_stream.as_ref().unwrap();
@@ -2859,10 +3147,7 @@ pub fn spec_step_mtp_compressed_serial(
                         k + 1,
                     )?;
                 }
-                state.gpu_rng_state = state
-                    .gpu_rng_state
-                    .wrapping_mul(1_664_525)
-                    .wrapping_add(1_013_904_223);
+                state.gpu_rng_state = mtp_gpu_rng_next(state.gpu_rng_state);
             } else if use_sampling {
                 // ── F5b: DFlash-convention sampled DRAFT (full-vocab only) ──
                 //

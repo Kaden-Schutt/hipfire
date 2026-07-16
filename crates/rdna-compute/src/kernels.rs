@@ -2905,6 +2905,9 @@ pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 /// Element-wise in-place add: a[i] += b[i]
 pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace.hip");
 
+/// Compute-queue copy for fixed-pointer retained sequences.
+pub const COPY_U32_RANGE_SRC: &str = include_str!("../../../kernels/src/copy_u32_range.hip");
+
 /// Scaled in-place add: y[i] += c * x[i] — one kernel for both
 /// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)
 /// variants. Used in the MoE FFN accumulator to fuse the old

@@ -392,6 +392,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]);
     }
     match kernel {
+        "copy_u32_range" => Some(vec![read(0), write(8)]),
         "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -576,6 +577,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         return Some(32);
     }
     match kernel {
+        "copy_u32_range" => Some(32),
         "softmax_f32" => Some(16),
         "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
@@ -1338,6 +1340,7 @@ pub struct PreparedPm4Replay {
     // programmed into the immutable indirect buffer.
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
+    kernel_names: Vec<String>,
     dynamic_gdn_frames: Vec<usize>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3])>,
     dispatch_count: usize,
@@ -1345,6 +1348,42 @@ pub struct PreparedPm4Replay {
 }
 
 impl PreparedPm4Replay {
+    fn patch_kernel_u32(
+        &mut self,
+        kernel: &str,
+        offset: usize,
+        values: &[u32],
+    ) -> Result<(), String> {
+        let dispatches = self
+            .kernel_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| (name == kernel).then_some(index))
+            .collect::<Vec<_>>();
+        if dispatches.len() != values.len() {
+            return Err(format!(
+                "retained kernel {kernel:?} occurs {} times, patch supplied {} values",
+                dispatches.len(),
+                values.len()
+            ));
+        }
+        for (dispatch, value) in dispatches.into_iter().zip(values.iter().copied()) {
+            let end = offset
+                .checked_add(4)
+                .ok_or_else(|| "retained kernarg patch offset overflow".to_owned())?;
+            let slot = self.kernargs[dispatch]
+                .as_mut_bytes()
+                .get_mut(offset..end)
+                .ok_or_else(|| {
+                    format!(
+                        "retained {kernel:?} kernarg patch {offset}..{end} is out of bounds"
+                    )
+                })?;
+            slot.copy_from_slice(&value.to_ne_bytes());
+        }
+        Ok(())
+    }
+
     /// # Safety
     ///
     /// Every pointer captured in the immutable explicit kernarg prefixes must
@@ -1435,6 +1474,7 @@ pub struct ReplayController {
     prepared_pm4: Option<PreparedPm4Replay>,
     auto_lifecycle: bool,
     forward_eligible: bool,
+    external_sequence: bool,
 }
 
 impl ReplayController {
@@ -1479,6 +1519,7 @@ impl ReplayController {
             prepared_pm4: None,
             auto_lifecycle: false,
             forward_eligible: true,
+            external_sequence: false,
         }
     }
 
@@ -1487,6 +1528,23 @@ impl ReplayController {
         if request != ReplayBackendRequest::Hip {
             controller.state = ReplayState::Armed;
         }
+        controller
+    }
+
+    /// Build an isolated controller for an explicitly delimited engine-owned
+    /// sequence. Internal model calls cannot revoke its eligibility, and its
+    /// PM4 tape remains single-queue until the sequence has its own dependency
+    /// audit and multi-queue certification.
+    pub fn new_external_from(parent: &Self) -> Self {
+        let mut controller = Self::new_armed(parent.request);
+        controller.transport = parent.transport;
+        controller.pm4_mid_acquire_policy = parent.pm4_mid_acquire_policy;
+        controller.pm4_wait_policy = parent.pm4_wait_policy;
+        controller.pm4_register_policy = parent.pm4_register_policy;
+        controller.auto_lifecycle = false;
+        controller.forward_eligible = true;
+        controller.external_sequence = true;
+        controller.pm4_queue_policy = QueuePolicy::One;
         controller
     }
 
@@ -1548,6 +1606,7 @@ impl ReplayController {
         self.prepared_pm4 = None;
         self.auto_lifecycle = auto_lifecycle;
         self.forward_eligible = true;
+        self.external_sequence = false;
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -1587,7 +1646,31 @@ impl ReplayController {
     /// forward. Speculative/MTP re-seed and verify calls must neither populate
     /// the plain-AR capture nor route its prepared replay.
     pub fn set_forward_eligible(&mut self, eligible: bool) {
-        self.forward_eligible = eligible;
+        if !self.external_sequence {
+            self.forward_eligible = eligible;
+        }
+    }
+
+    pub fn is_external_sequence(&self) -> bool {
+        self.external_sequence
+    }
+
+    pub fn reset_external_capture(&mut self) -> Result<(), &'static str> {
+        if !self.external_sequence {
+            return Err("replay controller does not own an external sequence");
+        }
+        self.recorded.clear();
+        self.certified_speedups.clear();
+        self.fallback_reason = None;
+        self.prepared = None;
+        self.prepared_pm4 = None;
+        self.forward_eligible = true;
+        self.state = if self.request == ReplayBackendRequest::Hip {
+            ReplayState::Hip
+        } else {
+            ReplayState::Armed
+        };
+        Ok(())
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -2132,6 +2215,12 @@ impl ReplayController {
             graph,
             _kernels: kernels,
             kernargs,
+            kernel_names: self
+                .recorded
+                .iter()
+                .take(prefix)
+                .map(|launch| launch.kernel.clone())
+                .collect(),
             dynamic_gdn_frames,
             dynamic_grids,
             dispatch_count: prefix,
@@ -2168,6 +2257,21 @@ impl ReplayController {
             .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
         // SAFETY: forwarded from the model owner.
         unsafe { prepared.replay_and_wait(position) }
+    }
+
+    /// Patch one u32 field in every retained dispatch matching `kernel`, in
+    /// capture order. Used by explicit sequences whose RNG seed is dynamic but
+    /// whose pointers and launch geometry remain fixed.
+    pub fn patch_pm4_kernel_u32(
+        &mut self,
+        kernel: &str,
+        offset: usize,
+        values: &[u32],
+    ) -> Result<(), String> {
+        self.prepared_pm4
+            .as_mut()
+            .ok_or_else(|| "no prepared PM4 replay".to_owned())?
+            .patch_kernel_u32(kernel, offset, values)
     }
 
     /// Start one explicitly delimited prefill or decode capture. This clears
@@ -3009,6 +3113,30 @@ mod tests {
         assert_eq!(controller.state(), ReplayState::Hip);
         assert_eq!(controller.transport_name(), "aql");
         assert!(!controller.is_enabled());
+    }
+
+    #[test]
+    fn external_sequence_inherits_route_but_owns_capture_lifecycle() {
+        let mut parent = ReplayController::new(ReplayBackendRequest::Hip);
+        parent.apply_model_default(true, ReplayTransport::Pm4Ib);
+        let mut external = ReplayController::new_external_from(&parent);
+
+        assert_eq!(external.request(), ReplayBackendRequest::Auto);
+        assert_eq!(external.transport_name(), "pm4");
+        assert_eq!(external.pm4_queue_policy(), QueuePolicy::One);
+        assert!(external.is_external_sequence());
+
+        // Nested model calls may mark plain AR ineligible; an explicit
+        // engine-owned sequence must remain recordable.
+        external.set_forward_eligible(false);
+        external.begin_capture().unwrap();
+        assert!(external.is_recording());
+        external.record_hip_launch("k", None, [1; 3], [32, 1, 1], 0, &[]);
+        assert_eq!(external.recorded_launches().len(), 1);
+
+        external.reset_external_capture().unwrap();
+        assert_eq!(external.state(), ReplayState::Armed);
+        assert!(external.recorded_launches().is_empty());
     }
 
     #[test]

@@ -69,6 +69,21 @@ use hipfire_runtime::llama::{
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
+fn mtp_copy_dtod(
+    gpu: &mut Gpu,
+    dst: &DeviceBuffer,
+    dst_offset: usize,
+    src: &DeviceBuffer,
+    src_offset: usize,
+    size: usize,
+) -> HipResult<()> {
+    if gpu.replay.is_external_sequence() {
+        gpu.copy_u32_range(dst, dst_offset, src, src_offset, size)
+    } else {
+        gpu.memcpy_dtod_at_auto(dst, dst_offset, src, src_offset, size)
+    }
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1476,7 +1491,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         // Lossy-recursion path: feed the caller's pre-computed activation
         // directly into the e_norm input slot. Aliasing-safe (separate
         // backing buffers — caller passes the previous step's t_mtp_out).
-        gpu.memcpy_dtod_at_auto(&scratch.tok_embd.buf, 0, &embed.buf, 0, dim_bytes)?;
+        mtp_copy_dtod(gpu, &scratch.tok_embd.buf, 0, &embed.buf, 0, dim_bytes)?;
     } else {
         embed_lookup_into(gpu, trunk_weights, &scratch.tok_embd, next_token, n_embd)?;
     }
@@ -1491,8 +1506,9 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     gpu.rmsnorm_f32(prev_hidden, &w.hnorm, &scratch.h_norm, cfg.rms_norm_eps)?;
 
     // ── 3. concat = [e_norm | h_norm], then cur = eh_proj @ concat ───────
-    gpu.memcpy_dtod_at_auto(&scratch.concat.buf, 0, &scratch.e_norm.buf, 0, dim_bytes)?;
-    gpu.memcpy_dtod_at_auto(
+    mtp_copy_dtod(gpu, &scratch.concat.buf, 0, &scratch.e_norm.buf, 0, dim_bytes)?;
+    mtp_copy_dtod(
+        gpu,
         &scratch.concat.buf,
         dim_bytes,
         &scratch.h_norm.buf,
@@ -1503,7 +1519,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
 
     // Save inpSA for the attention residual (cur is about to be norm'd
     // out-of-place into scratch.tmp).
-    gpu.memcpy_dtod_at_auto(&scratch.residual.buf, 0, &scratch.cur.buf, 0, dim_bytes)?;
+    mtp_copy_dtod(gpu, &scratch.residual.buf, 0, &scratch.cur.buf, 0, dim_bytes)?;
 
     // ── 4. Pre-attn norm + Q/K/V projections ─────────────────────────────
     gpu.rmsnorm_f32(&scratch.cur, &w.attn_norm, &scratch.tmp, cfg.rms_norm_eps)?;
@@ -1643,7 +1659,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
             gpu.add_inplace_f32(&scratch.ffn_out, &scratch.o)?;
         }
         Qwen35MtpFfnWeights::Moe(ffn) => {
-            gpu.memcpy_dtod_at_auto(&scratch.ffn_out.buf, 0, &scratch.o.buf, 0, dim_bytes)?;
+            mtp_copy_dtod(gpu, &scratch.ffn_out.buf, 0, &scratch.o.buf, 0, dim_bytes)?;
             mtp_moe_ffn_decode(gpu, ffn, &scratch.tmp, &scratch.ffn_out, cfg, scratch)?;
         }
     }
@@ -1651,7 +1667,8 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
 
     // Snapshot for callers that want to chain into n+2 prediction OR feed
     // into the batched `mtp_head_apply_lm_head_batched` end-of-chain reduce.
-    gpu.memcpy_dtod_at_auto(
+    mtp_copy_dtod(
+        gpu,
         &scratch.t_mtp_out.buf,
         0,
         &scratch.ffn_out.buf,
