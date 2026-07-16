@@ -7410,6 +7410,39 @@ fn run_fused_qkvza_key(
 /// per-token launch replaced by its N-batched equivalent. Byte-exact
 /// except for atomicAdd nondeterminism in the routed-down accumulation
 /// (same as the single-token indexed kernel it replaces).
+fn trace_batched_moe_routes(
+    gpu: &Gpu,
+    topk_indices: &GpuTensor,
+    layer_idx: usize,
+    n: usize,
+    k_top: usize,
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_MOE_BATCH_ROUTE_TRACE").ok().as_deref(),
+            Some("1" | "true" | "on" | "yes")
+        )
+    }) {
+        return;
+    }
+    let Ok(raw) = gpu.download_f32(topk_indices) else {
+        return;
+    };
+    let slots = n * k_top;
+    let mut experts = std::collections::BTreeSet::new();
+    for value in raw.iter().take(slots) {
+        experts.insert(value.to_bits() as i32);
+    }
+    let live_tiles = experts.len();
+    eprintln!(
+        "[moe-batch-routes] layer={layer_idx} batch={n} slots={slots} unique_experts={} padded_slots={} padding={:.2}x",
+        live_tiles,
+        live_tiles * 16,
+        live_tiles as f64 * 16.0 / slots.max(1) as f64,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prefill_moe_ffn_body_batched(
     gpu: &mut Gpu,
@@ -7420,6 +7453,7 @@ fn prefill_moe_ffn_body_batched(
     n: usize,
     ctx: &DispatchCtx,
     model_has_mq6_moe: bool,
+    layer_idx: usize,
     // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
     // into this zeroed `[n × dim]` partial instead of `pbs.x_batch` (the EP
     // driver all-reduce-sums it across ranks and adds into x_batch). The shared
@@ -7782,6 +7816,7 @@ fn prefill_moe_ffn_body_batched(
         config.norm_topk_prob,
         n,
     )?;
+    trace_batched_moe_routes(gpu, topk_indices, layer_idx, n, k_top);
 
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
     //
@@ -10874,6 +10909,7 @@ fn forward_prefill_chunk(
                     n,
                     &ctx,
                     weights.moe_has_mq6,
+                    layer_idx,
                     routed_out,
                 )?;
 
@@ -11395,6 +11431,7 @@ fn forward_prefill_chunk(
                     n,
                     &ctx,
                     weights.moe_has_mq6,
+                    layer_idx,
                     routed_out,
                 )?;
 
