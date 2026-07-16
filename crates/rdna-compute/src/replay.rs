@@ -1568,7 +1568,12 @@ impl ReplayController {
     pub fn new_external_from(parent: &Self) -> Self {
         let mut controller = Self::new_armed(parent.request);
         controller.transport = parent.transport;
-        controller.pm4_mid_acquire_policy = parent.pm4_mid_acquire_policy;
+        // Explicit engine-owned sequences may repeatedly cross from a HIP
+        // stream into retained execution while carrying mutable RMW state.
+        // Keep their internal PM4 visibility at the conservative contract;
+        // the parent plain-AR controller retains its independently certified
+        // acquire policy.
+        controller.pm4_mid_acquire_policy = Pm4MidAcquirePolicy::Conservative;
         controller.pm4_wait_policy = parent.pm4_wait_policy;
         controller.pm4_register_policy = parent.pm4_register_policy;
         controller.auto_lifecycle = false;
@@ -1868,32 +1873,40 @@ impl ReplayController {
                 device.queue_size_range()
             ));
         }
-        let mut headers = vec![HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL; dispatches.len()];
-        headers[0] = HeaderPolicy::BATCH_BOUNDARY_FIRST_SERIAL;
-        for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
-            if launch.kernel == "repeat_interleave_qk_f32" {
-                headers[index] = HeaderPolicy::RECORDED_DISPATCH;
-                if index + 1 < headers.len() {
-                    headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+        let headers = if self.external_sequence {
+            // Mutable explicit sequences are correctness-first until they
+            // receive their own per-boundary visibility proof.
+            vec![HeaderPolicy::RECORDED_DISPATCH; dispatches.len()]
+        } else {
+            let mut headers =
+                vec![HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL; dispatches.len()];
+            headers[0] = HeaderPolicy::BATCH_BOUNDARY_FIRST_SERIAL;
+            for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
+                if launch.kernel == "repeat_interleave_qk_f32" {
+                    headers[index] = HeaderPolicy::RECORDED_DISPATCH;
+                    if index + 1 < headers.len() {
+                        headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+                    }
+                } else if matches!(
+                    launch.kernel.as_str(),
+                    "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
+                ) {
+                    headers[index] = if launch.kernel == "mq_rotate_x" {
+                        HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
+                    } else {
+                        HeaderPolicy::RECORDED_DISPATCH
+                    };
                 }
-            } else if matches!(
-                launch.kernel.as_str(),
-                "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
-            ) {
-                headers[index] = if launch.kernel == "mq_rotate_x" {
-                    HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
-                } else {
-                    HeaderPolicy::RECORDED_DISPATCH
-                };
             }
-        }
-        for index in 1..headers.len() {
-            let previous = self.recorded[index - 1].kernel.as_str();
-            let current = self.recorded[index].kernel.as_str();
-            if independent_sibling(previous, current) {
-                headers[index] = HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT;
+            for index in 1..headers.len() {
+                let previous = self.recorded[index - 1].kernel.as_str();
+                let current = self.recorded[index].kernel.as_str();
+                if independent_sibling(previous, current) {
+                    headers[index] = HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT;
+                }
             }
-        }
+            headers
+        };
         let graph = if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,
@@ -3204,6 +3217,10 @@ mod tests {
         assert_eq!(external.request(), ReplayBackendRequest::Auto);
         assert_eq!(external.transport_name(), "pm4");
         assert_eq!(external.pm4_queue_policy(), QueuePolicy::One);
+        assert_eq!(
+            external.pm4_mid_acquire_policy,
+            Pm4MidAcquirePolicy::Conservative
+        );
         assert!(external.is_external_sequence());
 
         // Nested model calls may mark plain AR ineligible; an explicit
