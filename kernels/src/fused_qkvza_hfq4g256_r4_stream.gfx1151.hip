@@ -21,10 +21,7 @@ using hipfire_qkvza_r4_f32x4 = float __attribute__((ext_vector_type(4)));
 // The host admits this kernel only when all four matrix row counts are
 // divisible by four, so a tile never crosses a matrix boundary and no partial
 // row path is required.
-// Four rows expose enough independent VMEM/VALU work that this tile can trade
-// one occupancy tier for the register holding the lane address instead of
-// spilling it. The shipping one-row gfx1151 kernel remains at 16 waves.
-__launch_bounds__(32, 12)
+__launch_bounds__(32, 16)
 extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151(
     const char*  __restrict__ A_qkv,
     const char*  __restrict__ A_z,
@@ -100,35 +97,45 @@ extern "C" __global__ void fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151(
             hipfire_qkvza_r4_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
                 x_rsrc, xbyte_ + 16, 0, 0)); \
         const int goff_ = g_ * 136; \
-        const char* gp0_ = row_ptr0 + goff_; \
-        const char* gp1_ = row_ptr1 + goff_; \
-        const hipfire_qkvza_r4_u32x2 h0_ = *( \
-            const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp0_; \
-        const hipfire_qkvza_r4_u32x2 h1_ = *( \
-            const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp1_; \
-        const unsigned int pk0_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
-            weight_rsrc, goff_ + 8 + boff, row_off0); \
-        const unsigned int pk1_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
-            weight_rsrc, goff_ + 8 + boff, row_off1); \
-        HIPFIRE_QKVZA_R4_DOG(pk0_, __builtin_bit_cast(float, h0_.x), \
-            __builtin_bit_cast(float, h0_.y), acc0, xa_, xb_); \
-        HIPFIRE_QKVZA_R4_DOG(pk1_, __builtin_bit_cast(float, h1_.x), \
-            __builtin_bit_cast(float, h1_.y), acc1, xa_, xb_); \
+        { \
+            const char* gp0_ = row_ptr0 + goff_; \
+            const hipfire_qkvza_r4_u32x2 h0_ = *( \
+                const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp0_; \
+            const unsigned int pk0_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
+                weight_rsrc, goff_ + 8 + boff, row_off0); \
+            HIPFIRE_QKVZA_R4_DOG(pk0_, __builtin_bit_cast(float, h0_.x), \
+                __builtin_bit_cast(float, h0_.y), acc0, xa_, xb_); \
+        } \
         asm volatile("" ::: "memory"); \
-        const char* gp2_ = row_ptr2 + goff_; \
-        const char* gp3_ = row_ptr3 + goff_; \
-        const hipfire_qkvza_r4_u32x2 h2_ = *( \
-            const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp2_; \
-        const hipfire_qkvza_r4_u32x2 h3_ = *( \
-            const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp3_; \
-        const unsigned int pk2_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
-            weight_rsrc, goff_ + 8 + boff, row_off2); \
-        const unsigned int pk3_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
-            weight_rsrc, goff_ + 8 + boff, row_off3); \
-        HIPFIRE_QKVZA_R4_DOG(pk2_, __builtin_bit_cast(float, h2_.x), \
-            __builtin_bit_cast(float, h2_.y), acc2, xa_, xb_); \
-        HIPFIRE_QKVZA_R4_DOG(pk3_, __builtin_bit_cast(float, h3_.x), \
-            __builtin_bit_cast(float, h3_.y), acc3, xa_, xb_); \
+        { \
+            const char* gp1_ = row_ptr1 + goff_; \
+            const hipfire_qkvza_r4_u32x2 h1_ = *( \
+                const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp1_; \
+            const unsigned int pk1_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
+                weight_rsrc, goff_ + 8 + boff, row_off1); \
+            HIPFIRE_QKVZA_R4_DOG(pk1_, __builtin_bit_cast(float, h1_.x), \
+                __builtin_bit_cast(float, h1_.y), acc1, xa_, xb_); \
+        } \
+        asm volatile("" ::: "memory"); \
+        { \
+            const char* gp2_ = row_ptr2 + goff_; \
+            const hipfire_qkvza_r4_u32x2 h2_ = *( \
+                const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp2_; \
+            const unsigned int pk2_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
+                weight_rsrc, goff_ + 8 + boff, row_off2); \
+            HIPFIRE_QKVZA_R4_DOG(pk2_, __builtin_bit_cast(float, h2_.x), \
+                __builtin_bit_cast(float, h2_.y), acc2, xa_, xb_); \
+        } \
+        asm volatile("" ::: "memory"); \
+        { \
+            const char* gp3_ = row_ptr3 + goff_; \
+            const hipfire_qkvza_r4_u32x2 h3_ = *( \
+                const hipfire_qkvza_r4_u32x2 __attribute__((address_space(4)))*)gp3_; \
+            const unsigned int pk3_ = HIPFIRE_WEIGHT_LOAD_SPLIT_U32( \
+                weight_rsrc, goff_ + 8 + boff, row_off3); \
+            HIPFIRE_QKVZA_R4_DOG(pk3_, __builtin_bit_cast(float, h3_.x), \
+                __builtin_bit_cast(float, h3_.y), acc3, xa_, xb_); \
+        } \
         asm volatile("" ::: "memory"); \
     } while (0)
 
