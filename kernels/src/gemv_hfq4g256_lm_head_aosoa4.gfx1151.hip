@@ -5,7 +5,6 @@
 #include <hip/hip_runtime.h>
 
 using hipfire_hfq4_u32x4 = unsigned int __attribute__((ext_vector_type(4)));
-using hipfire_hfq4_u32x8 = unsigned int __attribute__((ext_vector_type(8)));
 
 // Fixed-shape gfx1151 MQ4/HFQ4 LM head over an exact AoSoA4 shadow:
 //
@@ -16,7 +15,7 @@ using hipfire_hfq4_u32x8 = unsigned int __attribute__((ext_vector_type(8)));
 // four-accumulator ownership, combine, and wave reduction are identical to
 // gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151.
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256_lm_head_aosoa4_gfx1151(
+extern "C" __global__ void gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -38,9 +37,11 @@ extern "C" __global__ void gemv_hfq4g256_lm_head_aosoa4_gfx1151(
 
     #pragma clang loop unroll(disable)
     for (int q = 0; q < 2; q++) {
-        const hipfire_hfq4_u32x8 h =
-            *(const hipfire_hfq4_u32x8 __attribute__((address_space(4)))*)
-                (row_headers + q * 32);
+        const unsigned int* h =
+            reinterpret_cast<const unsigned int*>(row_headers + q * 32);
+        // Keep the incumbent's proven uniform scalar-load form. A single
+        // address-space(4) u32x8 load was rejected after ISA inspection showed
+        // LLVM incorrectly reusing h[0] for every scale/zero operand.
         const float sc0 = __builtin_bit_cast(float, h[0]);
         const float zp0 = __builtin_bit_cast(float, h[1]);
         const float sc1 = __builtin_bit_cast(float, h[2]);

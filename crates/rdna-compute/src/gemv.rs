@@ -4805,11 +4805,11 @@ impl Gpu {
             && k == 2_048;
         let func_name = if gfx1151_lm_head_aosoa4 {
             self.ensure_kernel(
-                "gemv_hfq4g256_lm_head_aosoa4_gfx1151",
+                "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151",
                 kernels::GEMV_HFQ4G256_LM_HEAD_AOSOA4_GFX1151_SRC,
-                "gemv_hfq4g256_lm_head_aosoa4_gfx1151",
+                "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151",
             )?;
-            "gemv_hfq4g256_lm_head_aosoa4_gfx1151"
+            "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151"
         } else if gfx1151_lm_head_dot2 {
             self.ensure_kernel(
                 "gemv_hfq4g256_lm_head_dot2_gfx1151",

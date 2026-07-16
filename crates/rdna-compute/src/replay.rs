@@ -298,6 +298,7 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
             | "gated_norm_mq_rotate_gfx1100"
             | "gated_norm_mq_rotate_gfx1151"
             | "gemv_hfq4g256_lm_head_aosoa4_gfx1151"
+            | "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151"
             | "gemv_hfq4g256_residual_rt_low_gfx1151"
             | "moe_router_softmax_topk_k8_wave64_exact"
             | "moe_topk_renorm_k8"
@@ -603,6 +604,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_lm_head_aosoa4_gfx1151"
+        | "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
         | "gemv_hfq4g256_residual_cpol_rt"
@@ -779,6 +781,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_lm_head_aosoa4_gfx1151"
+        | "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
         | "gemv_hfq4g256_residual_cpol_rt"
@@ -3241,6 +3244,13 @@ mod tests {
             Some(3)
         );
         assert!(radiowave_vmem_only_consumer(lm_head_aosoa4));
+        let lm_head_aosoa4_scalar = "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151";
+        assert_eq!(expected_kernarg_bytes(lm_head_aosoa4_scalar), Some(32));
+        assert_eq!(
+            pointer_effects(lm_head_aosoa4_scalar).map(|effects| effects.len()),
+            Some(3)
+        );
+        assert!(radiowave_vmem_only_consumer(lm_head_aosoa4_scalar));
     }
 
     #[test]
