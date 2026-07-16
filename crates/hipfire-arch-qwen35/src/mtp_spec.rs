@@ -2327,15 +2327,13 @@ pub fn spec_step_mtp_compressed_serial(
     //     is small (~3 ms more across K=5) since trunk verify dominates.
     //     This is the architecture Unsloth/llama.cpp #22673 ship.
     //
-    // Mode is normally selected by whether the loaded head carries a compressed
-    // sidecar. The opt-in GPU sampler temporarily uses the trunk full-vocab
-    // head even when a compressed sidecar exists: DFlash's resident C8 accept
-    // kernel consumes full-vocab draft rows. This is a correctness-first bridge
-    // to the fixed device sequence; a compressed-vocab scatter specialization
-    // can recover the smaller draft head after the route is certified.
+    // Mode is selected by whether the loaded head carries a compressed sidecar.
+    // The GPU sampler preserves that choice: compact distributions are sampled
+    // directly, then scattered through the sidecar vocab map into the full-vocab
+    // storage consumed by the lossless residual accept kernel.
     let gpu_sample_requested =
         mtp_gpu_sample_enabled_from_env() && !state.sampling.is_greedy() && state.p_min <= 0.0;
-    let use_full_vocab = head.weights.lm_head_draft.is_none() || gpu_sample_requested;
+    let use_full_vocab = head.weights.lm_head_draft.is_none();
     let (vocab_map_opt, cvs): (Option<&Vec<u32>>, usize) = if use_full_vocab {
         (None, vocab)
     } else {
@@ -2521,7 +2519,14 @@ pub fn spec_step_mtp_compressed_serial(
     // target verify and the on-GPU accept kernel. The full-vocab probability
     // rows replace the legacy D2H + host nucleus construction.
     let mut gpu_draft_probs = if gpu_sample_active {
-        Some(gpu.alloc_tensor(&[max_n * vocab], DType::F32)?)
+        // Compact draft rows are scattered into this buffer. Start zeroed so
+        // tokens absent from the sidecar correctly retain zero draft mass.
+        Some(gpu.zeros(&[max_n * vocab], DType::F32)?)
+    } else {
+        None
+    };
+    let mut gpu_draft_probs_compact = if gpu_sample_active && !use_full_vocab {
+        Some(gpu.alloc_tensor(&[max_n * cvs], DType::F32)?)
     } else {
         None
     };
@@ -2733,10 +2738,17 @@ pub fn spec_step_mtp_compressed_serial(
 
             let draft_idx: usize;
             if gpu_sample_active {
-                let probs_row = gpu_draft_probs
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(k * vocab, vocab);
+                let probs_row = if use_full_vocab {
+                    gpu_draft_probs
+                        .as_ref()
+                        .unwrap()
+                        .sub_offset(k * vocab, vocab)
+                } else {
+                    gpu_draft_probs_compact
+                        .as_ref()
+                        .unwrap()
+                        .sub_offset(k * cvs, cvs)
+                };
                 let tau_row = gpu_draft_tau.as_ref().unwrap().sub_offset(k, 1);
                 let z_row = gpu_draft_z.as_ref().unwrap().sub_offset(k, 1);
                 gpu.softmax_temp_topp_batched_into_f32(
@@ -2744,7 +2756,7 @@ pub fn spec_step_mtp_compressed_serial(
                     &probs_row,
                     &tau_row,
                     &z_row,
-                    vocab,
+                    argmax_vocab,
                     1,
                     sampling.temp,
                     sampling.top_p,
@@ -2759,17 +2771,36 @@ pub fn spec_step_mtp_compressed_serial(
                     &z_row,
                     &token_row,
                     &prob_row,
-                    vocab,
+                    argmax_vocab,
                     1,
                     state.gpu_rng_state,
                 )?;
-                gpu.memcpy_dtod_at_auto(
-                    &state.mtp_token_chain.buf,
-                    (k + 1) * 4,
-                    &token_row.buf,
-                    0,
-                    4,
-                )?;
+                if use_full_vocab {
+                    gpu.memcpy_dtod_at_auto(
+                        &state.mtp_token_chain.buf,
+                        (k + 1) * 4,
+                        &token_row.buf,
+                        0,
+                        4,
+                    )?;
+                } else {
+                    let full_probs_row = gpu_draft_probs
+                        .as_ref()
+                        .unwrap()
+                        .sub_offset(k * vocab, vocab);
+                    gpu.scatter_vocab_probs_token_chain_f32(
+                        &probs_row,
+                        &full_probs_row,
+                        head.weights
+                            .lm_head_draft_vocab_map_gpu
+                            .as_ref()
+                            .expect("resident compressed sampler requires GPU vocab_map"),
+                        &token_row,
+                        &state.mtp_token_chain,
+                        cvs,
+                        k + 1,
+                    )?;
+                }
                 state.gpu_rng_state = state
                     .gpu_rng_state
                     .wrapping_mul(1_664_525)
@@ -3193,7 +3224,7 @@ pub fn spec_step_mtp_compressed_serial(
             gpu.chain_accept_spec_f32(
                 &target_probs,
                 gpu_draft_probs.as_ref().unwrap(),
-                gpu_draft_tokens.as_ref().unwrap(),
+                &state.mtp_token_chain.sub_offset(1, drafts_generated),
                 gpu_draft_p_at_token.as_ref().unwrap(),
                 &target_tau,
                 &target_z,
@@ -3309,6 +3340,9 @@ pub fn spec_step_mtp_compressed_serial(
     }
 
     if let Some(tensor) = gpu_draft_probs.take() {
+        let _ = gpu.free_tensor(tensor);
+    }
+    if let Some(tensor) = gpu_draft_probs_compact.take() {
         let _ = gpu.free_tensor(tensor);
     }
     if let Some(tensor) = gpu_draft_tau.take() {

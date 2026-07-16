@@ -1277,6 +1277,65 @@ impl Gpu {
         )
     }
 
+    /// Embed one compressed draft distribution into a zero-filled full-vocab
+    /// row and remap the sampled compact index into the device token chain.
+    /// The full row is consumed by `chain_accept_spec_f32` on rejection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter_vocab_probs_token_chain_f32(
+        &mut self,
+        compact_probs: &GpuTensor,
+        full_probs: &GpuTensor,
+        vocab_map: &GpuTensor,
+        sampled_compact_token: &GpuTensor,
+        token_chain: &GpuTensor,
+        compact_vocab: usize,
+        dst_slot: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "scatter_vocab_probs_token_chain",
+            kernels::SCATTER_VOCAB_PROBS_TOKEN_CHAIN_SRC,
+            "scatter_vocab_probs_token_chain_f32",
+        )?;
+
+        let cp = compact_probs.buf.as_ptr();
+        let fp = full_probs.buf.as_ptr();
+        let vm = vocab_map.buf.as_ptr();
+        let st = sampled_compact_token.buf.as_ptr();
+        let tc = token_chain.buf.as_ptr();
+        let cv = compact_vocab as i32;
+        let ds = dst_slot as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &fp as *const _ as *mut c_void,
+            &vm as *const _ as *mut c_void,
+            &st as *const _ as *mut c_void,
+            &tc as *const _ as *mut c_void,
+            &cv as *const _ as *mut c_void,
+            &ds as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (compact_vocab as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "scatter_vocab_probs_token_chain_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(fp);
+                b.push_ptr(vm);
+                b.push_ptr(st);
+                b.push_ptr(tc);
+                b.push_i32(cv);
+                b.push_i32(ds);
+                b
+            },
+        )
+    }
+
     /// C8 Kernel 1: on-GPU chain rejection-sampling accept loop.
     ///
     /// Runs the entire spec-decode accept chain (Chen & Leviathan 2023,

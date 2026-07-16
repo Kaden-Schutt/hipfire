@@ -3852,6 +3852,11 @@ pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 pub const BATCHED_CATEGORICAL_SAMPLE_SRC: &str =
     include_str!("../../../kernels/src/batched_categorical_sample.hip");
 
+/// Scatter a compressed draft probability row into full-vocabulary storage
+/// and remap its sampled index into a resident MTP token chain.
+pub const SCATTER_VOCAB_PROBS_TOKEN_CHAIN_SRC: &str =
+    include_str!("../../../kernels/src/scatter_vocab_probs_token_chain.hip");
+
 /// C8 Kernel 1: on-GPU chain rejection-sampling accept.
 /// Fused accept loop for the chain spec-decode temp>0 path.  Takes
 /// tgt_probs[b*vocab], dft_probs[b*vocab], draft_tokens[b], draft_p_at_token[b],
