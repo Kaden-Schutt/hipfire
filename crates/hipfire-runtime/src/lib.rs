@@ -60,3 +60,5 @@ pub mod prompt_frame;
 pub mod tokenizer;
 pub mod tool_call;
 pub mod weight_backend;
+
+pub use crate::arch::{maybe_screen_mmq, screen_weight_tensor, MmqScreenable};

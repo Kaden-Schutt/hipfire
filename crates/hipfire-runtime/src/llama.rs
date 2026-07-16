@@ -5,6 +5,7 @@
 //! LLaMA model implementation using RDNA GPU compute.
 //! Supports loading from GGUF files and running inference.
 
+use crate::arch::{screen_weight_tensor, MmqScreenable};
 use crate::gguf::{GgmlType, GgufFile, TensorInfo};
 use crate::kv_mode::KvMode;
 use crate::multi_gpu::Gpus;
@@ -724,6 +725,27 @@ impl LlamaWeights {
             let _ = gpu.free_tensor(l.w_up.buf);
             let _ = gpu.free_tensor(l.w_down.buf);
         }
+    }
+}
+
+impl MmqScreenable for LlamaWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut safe, mut unsafe_count) = (0usize, 0usize);
+        screen_weight_tensor(&self.output, gpu, &mut safe, &mut unsafe_count);
+        for layer in &self.layers {
+            for weight in [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ] {
+                screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+            }
+        }
+        (safe, unsafe_count)
     }
 }
 
