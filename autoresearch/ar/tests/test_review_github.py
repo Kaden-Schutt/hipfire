@@ -104,8 +104,8 @@ def record(node_id="IC_1", *, updated_at="2026-01-01T00:00:00Z", author_login="r
     }
 
 
-def review_record(*, submitted_at="2026-01-01T00:00:00Z"):
-    review = dict(record("PRR_1"), id=7, state="APPROVED", commit_id="head-sha")
+def review_record(*, submitted_at="2026-01-01T00:00:00Z", state="APPROVED"):
+    review = dict(record("PRR_1"), id=7, state=state, commit_id="head-sha")
     review.pop("created_at")
     review.pop("updated_at")
     review["submitted_at"] = submitted_at
@@ -344,6 +344,20 @@ def test_review_envelope_rejects_missing_or_invalid_submitted_timestamp(submitte
         GitHubClient(FakeRunner([result(review)])).review_envelope(REPO, 42, 7)
 
 
+def test_pull_review_listing_accepts_pending_review_without_submitted_timestamp():
+    pending = review_record(state="PENDING")
+    pending.pop("submitted_at")
+    response = GitHubClient(FakeRunner([result([pending])])).list_pull_reviews(REPO, 42)
+    assert response.data[0]["state"] == "PENDING"
+
+
+def test_pending_pull_review_is_rejected_when_building_authenticated_envelope():
+    pending = review_record(state="PENDING")
+    pending.pop("submitted_at")
+    with pytest.raises(GitHubBoundaryError, match="timestamp|submitted"):
+        GitHubClient(FakeRunner([result(pending)])).review_envelope(REPO, 42, 7)
+
+
 def test_protocol_body_recursion_failure_is_a_bounded_boundary_error():
     nested = "[" * 2000 + "]" * 2000
     hostile = dict(record(), body=nested)
@@ -565,7 +579,7 @@ def test_preflight_probes_only_read_endpoints_with_bounded_pages_and_explicit_pr
         operator_manifest=discovery_manifest(),
     )
     assert outcome.principal_type == "User"
-    assert len(runner.calls) == 6
+    assert len(runner.calls) == 7
     assert "--method" in runner.calls[0][0]
     assert "per_page=1" in " ".join(runner.calls[2][0])
     assert all(call[0][1] == "api" for call in runner.calls)
@@ -786,6 +800,17 @@ def test_publisher_preflight_does_not_claim_get_permission_proves_write_authorit
     )
     assert outcome.login == "reviewer"
     assert all("collaborators" not in call[0][-1] for call in runner.calls)
+
+
+def test_discovery_preflight_probes_effective_permission_and_rejects_inaccessible_response():
+    configuration = load_review_configuration(ROOT)
+    responses = preflight_responses(principal_type="User")
+    responses[-1] = result({}, returncode=1, stderr="forbidden")
+    with pytest.raises(PreflightError, match="exit|forbidden|permission"):
+        preflight_read_only(
+            GitHubClient(FakeRunner(responses)), REPO, mode="discovery",
+            configuration=configuration, operator_manifest=discovery_manifest(),
+        )
 
 
 def test_publisher_preflight_rejects_manifest_repository_mismatch():

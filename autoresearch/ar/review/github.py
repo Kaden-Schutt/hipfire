@@ -632,17 +632,19 @@ class GitHubClient:
         response = self._request("GET", f"/repos/{repository}/pulls/{number}/reviews/{review_id}")
         self._validate_record_response(
             response, "pull review", record_kind="review",
-            extra=("state", "commit_id", "body"), expected_id=review_id
+            extra=("state", "commit_id", "body"), expected_id=review_id, require_timestamp=False,
         )
         return response
 
     @classmethod
     def _validate_record_response(
         cls, response: GitHubResponse, name: str, *, record_kind: str,
-        extra: Sequence[str], expected_id: int | None = None
+        extra: Sequence[str], expected_id: int | None = None, require_timestamp: bool = True,
     ) -> None:
         record = cls._require_mapping(response.data, name)
-        cls._validate_api_record(record, name, record_kind=record_kind, extra=extra)
+        cls._validate_api_record(
+            record, name, record_kind=record_kind, extra=extra, require_timestamp=require_timestamp
+        )
         if expected_id is not None and record["id"] != expected_id:
             raise GitHubBoundaryError(f"GitHub {name} response ID does not match requested ID")
         author = cls._require(cls._require_mapping(record["user"], f"{name} author"), ("login", "type"), f"{name} author")
@@ -678,7 +680,7 @@ class GitHubClient:
                     record_kind, extra = "review", ("state", "commit_id")
                 self._validate_record_response(
                     GitHubResponse(record, response.headers, response.status_code), name,
-                    record_kind=record_kind, extra=extra,
+                    record_kind=record_kind, extra=extra, require_timestamp=False,
                 )
                 records.append(record)
             if len(records) > _MAX_PAGINATED_ITEMS or not has_next:
@@ -689,7 +691,8 @@ class GitHubClient:
 
     @staticmethod
     def _validate_api_record(
-        record: Mapping[str, Any], name: str, *, record_kind: str, extra: Sequence[str] = ()
+        record: Mapping[str, Any], name: str, *, record_kind: str, extra: Sequence[str] = (),
+        require_timestamp: bool = True,
     ) -> None:
         timestamps = ("created_at", "updated_at") if record_kind == "comment" else ("submitted_at",)
         GitHubClient._require(record, ("id", "node_id", "user", *extra), name)
@@ -702,6 +705,8 @@ class GitHubClient:
         ):
             raise GitHubBoundaryError(f"GitHub {name} response has malformed server fields")
         for field in timestamps:
+            if record_kind == "review" and not require_timestamp and record.get(field) in (None, ""):
+                continue
             if field not in record or record[field] in (None, ""):
                 raise GitHubBoundaryError(f"GitHub {name} response has a missing {field} timestamp")
             try:
@@ -1058,7 +1063,11 @@ def preflight_read_only(
                 raise PreflightError("probe pull request tree has no blob entry")
             blob_response = client.get_blob(repository, blob_entries[0]["sha"])
             _capability_signal(blob_response, required=("contents",))
-        if not write_mode:
+        if mode == "discovery" and user_data is not None:
+            permission = client.collaborator_effective_permission(repository, user_login)
+            if permission.principal_type != principal_type:
+                raise PreflightError("effective permission principal type mismatch")
+        elif not write_mode:
             permission = client.collaborator_effective_permission(repository, user_login)
             if permission.principal_type != principal_type:
                 raise PreflightError("effective permission principal type mismatch")
