@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 from typing import Any
 
@@ -60,13 +60,16 @@ def _text(record: Mapping[str, Any], field: str) -> str:
     return value
 
 
-def _time(record: Mapping[str, Any]) -> str:
+def _time(record: Mapping[str, Any]) -> datetime:
     value = _text(record, "created_at")
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        timestamp = datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise ValueError("created_at must be an ISO-8601 timestamp") from exc
-    return value
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("created_at must include a timezone")
+    return timestamp.astimezone(timezone.utc)
 
 
 def _trusted(record: Mapping[str, Any], trusted_authors: Iterable[str] | None) -> None:
@@ -115,7 +118,7 @@ def validate_intent(intent: Mapping[str, Any], *, trusted_authors: Iterable[str]
     _time(intent)
     _trusted(intent, trusted_authors)
     digest = _intent_digest(intent)
-    if intent["canonical_digest"] not in {"pending", digest}:
+    if intent["canonical_digest"] != digest:
         raise ValueError("intent canonical digest does not match record")
     return digest
 
@@ -163,13 +166,23 @@ def validate_completion(
     target = _same_binding(completion, intent)
     if completion["head_sha"] != target.head_sha:
         raise ValueError("completion head SHA does not match target")
-    if canonical_intent is not None and completion["intent_node_id"] != canonical_intent.get("intent_node_id"):
-        raise ValueError("completion is not for the canonical intent")
+    if canonical_intent is not None:
+        validate_intent(canonical_intent, trusted_authors=trusted_authors)
+        canonical_target = _target(canonical_intent["target"])
+        if (
+            target != canonical_target
+            or completion["target_key"] != canonical_intent.get("target_key")
+            or completion["attempt_id"] != canonical_intent.get("attempt_id")
+            or completion["intent_node_id"] != canonical_intent.get("intent_node_id")
+            or completion["head_sha"] != canonical_target.head_sha
+            or completion["canonical_intent_digest"] != canonical_intent.get("canonical_digest")
+        ):
+            raise ValueError("completion is not bound to the canonical intent")
     if completion["canonical_intent_digest"] != _intent_digest(intent):
         raise ValueError("completion canonical intent digest does not match")
     if report is None:
         raise ValueError("completion references a deleted or missing report")
-    validate_report(report, intent)
+    validate_report(report, intent, trusted_authors=trusted_authors)
     if completion["report_id"] != report.get("record_id"):
         raise ValueError("completion report reference does not match report")
     _text(completion, "record_id")
@@ -219,12 +232,13 @@ def validate_revocation(
     }
     if not isinstance(revocation, Mapping) or set(revocation) != required or revocation.get("record_type") != "revocation":
         raise ValueError("invalid revocation record")
+    canonical_digest = validate_intent(intent, trusted_authors=trusted_authors)
     target = _target(intent["target"])
     if revocation["target_key"] != target.target_key() or revocation["target_key"] != intent.get("target_key"):
         raise ValueError("revocation target key does not match")
     if revocation["attempt_id"] != intent.get("attempt_id"):
         raise ValueError("revocation attempt ID does not match")
-    if revocation["canonical_intent_digest"] != _intent_digest(intent):
+    if revocation["canonical_intent_digest"] != canonical_digest:
         raise ValueError("revocation canonical intent digest does not match")
     if revocation["authenticated"] is not True:
         raise ValueError("revocation is not authenticated")
@@ -258,22 +272,23 @@ def elect_canonical_attempt(
     trusted_authors: Iterable[str] | None = None,
 ) -> Mapping[str, Any]:
     valid = []
-    revoked: set[tuple[str, str]] = set()
-    consumed_revocations: set[int] = set()
     for intent in intents:
         digest = validate_intent(intent, trusted_authors=trusted_authors)
-        for index, revocation in enumerate(revocations):
-            if (
-                revocation.get("target_key") == intent.get("target_key")
-                and revocation.get("attempt_id") == intent.get("attempt_id")
-            ):
-                validate_revocation(revocation, intent, trusted_authors=trusted_authors)
-                consumed_revocations.add(index)
-                revoked.add((intent["target_key"], intent["attempt_id"]))
-        if (intent["target_key"], intent["attempt_id"]) not in revoked:
-            valid.append((intent["created_at"], intent["intent_node_id"], intent, digest))
-    if len(consumed_revocations) != len(revocations):
-        raise ValueError("revocation references an unknown intent")
+        valid.append((_time(intent), intent["intent_node_id"], intent, digest))
+    active = list(valid)
+    for revocation in revocations:
+        if not active:
+            raise ValueError("revocation has no current canonical intent")
+        current = min(active, key=lambda item: (item[0], item[1]))[2]
+        if (
+            revocation.get("target_key") != current.get("target_key")
+            or revocation.get("attempt_id") != current.get("attempt_id")
+            or revocation.get("canonical_intent_digest") != current.get("canonical_digest")
+        ):
+            raise ValueError("revocation does not target the current canonical intent")
+        validate_revocation(revocation, current, trusted_authors=trusted_authors)
+        active = [item for item in active if item[2] is not current]
+    valid = active
     if not valid:
         raise ValueError("no valid non-revoked intent")
     valid.sort(key=lambda item: (item[0], item[1]))

@@ -13,6 +13,7 @@ from typing import Any
 
 
 DEFAULT_MAX_BYTES = 1 << 20
+MAX_SAFE_INTEGER = (2**53) - 1
 _NUMBER_RE = re.compile(r"^(?P<sign>-?)(?P<mantissa>\d+(?:\.\d+)?)(?:[eE](?P<exp>[+-]?\d+))?$")
 
 
@@ -84,6 +85,8 @@ def _encode(value: Any) -> bytes:
     if value is False:
         return b"false"
     if isinstance(value, int) and not isinstance(value, bool):
+        if not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
+            raise ValueError("integer is outside the IEEE-754 safe range")
         return str(value).encode("ascii")
     if isinstance(value, float):
         return _float(value).encode("ascii")

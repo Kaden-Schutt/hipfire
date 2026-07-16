@@ -21,5 +21,14 @@
       },
       "digest": "3114aa0dc947719f39ea74a4dda7b03ee272a72fb086a9160c6a052ab956cc63"
     }
-  ]
+  ],
+  "regressions": {
+    "safe_integer_min": -9007199254740991,
+    "safe_integer_max": 9007199254740991,
+    "unsafe_integers": [9007199254740992, 1152921504606846976],
+    "overflow_value": "abcd",
+    "overflow_limit": 3,
+    "aware_timestamp_early": "2026-01-01T00:30:00+02:00",
+    "aware_timestamp_late": "2025-12-31T23:00:00Z"
+  }
 }
