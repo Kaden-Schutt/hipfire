@@ -25,30 +25,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
 
     let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
     let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-
-    // ── MMQ screening ────────────────────────────────────────
-    if ctx.gpu.mmq_screen.enabled
-        && matches!(
-            ctx.gpu.arch.as_str(),
-            "gfx906"
-                | "gfx1100"
-                | "gfx1101"
-                | "gfx1102"
-                | "gfx1103"
-                | "gfx1150"
-                | "gfx1151"
-                | "gfx1152"
-        )
-    {
-        let t0 = std::time::Instant::now();
-        let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, ctx.gpu);
-        let elapsed = t0.elapsed();
-        eprintln!(
-            "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
-            ctx.gpu.mmq_screen.threshold,
-            elapsed.as_secs_f64() * 1000.0,
-        );
-    }
+    hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
     // ── KV mode ──────────────────────────────────────────────
     let kv_mode = ctx
@@ -193,46 +170,6 @@ fn state_quant_label(q: StateQuant) -> &'static str {
         StateQuant::Q8 => "Q8",
         StateQuant::Q4 => "Q4",
     }
-}
-
-// ─── Helper: MMQ screening (inline from hipfire-loader) ───────────
-
-fn screen_weights_qwen35(weights: &Qwen35Weights, gpu: &mut rdna_compute::Gpu) -> (usize, usize) {
-    use crate::qwen35::LayerWeights;
-    let mut n_safe = 0usize;
-    let mut n_unsafe = 0usize;
-    for layer in &weights.layers {
-        let wts: Vec<&hipfire_runtime::llama::WeightTensor> = match layer {
-            LayerWeights::DeltaNet(l) => {
-                vec![
-                    &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.w_gate, &l.w_up, &l.wo,
-                ]
-            }
-            LayerWeights::FullAttn(l) => {
-                vec![&l.wq, &l.wk, &l.wv, &l.w_gate, &l.w_up, &l.wo]
-            }
-            LayerWeights::DeltaNetMoe(l) => {
-                vec![&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.wo]
-            }
-            LayerWeights::FullAttnMoe(l) => {
-                vec![&l.wq, &l.wk, &l.wv, &l.wo]
-            }
-        };
-        for wt in wts {
-            if !matches!(
-                wt.gpu_dtype,
-                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
-            ) {
-                continue;
-            }
-            if gpu.mmq_screen_weight(&wt.buf, wt.m, wt.k) {
-                n_safe += 1;
-            } else {
-                n_unsafe += 1;
-            }
-        }
-    }
-    (n_safe, n_unsafe)
 }
 
 // ─── Helper: parameter count + tiny-model warning ─────────────────

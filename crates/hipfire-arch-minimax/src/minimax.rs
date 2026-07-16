@@ -13,6 +13,7 @@
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
@@ -417,6 +418,21 @@ pub struct MiniMaxWeights {
     pub final_norm: GpuTensor, // model.norm.weight
     pub lm_head: WeightTensor, // lm_head.weight
     pub layers: Vec<MiniMaxLayerWeights>,
+}
+
+impl MmqScreenable for MiniMaxWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut safe, mut unsafe_count) = (0usize, 0usize);
+        screen_weight_tensor(&self.lm_head, gpu, &mut safe, &mut unsafe_count);
+        // Routed experts use packed/indirect storage. Screen the resident
+        // attention projections and dense router tensors here.
+        for layer in &self.layers {
+            for weight in [&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.router] {
+                screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+            }
+        }
+        (safe, unsafe_count)
+    }
 }
 
 impl MiniMaxWeights {

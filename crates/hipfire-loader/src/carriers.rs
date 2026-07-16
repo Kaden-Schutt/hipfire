@@ -414,6 +414,7 @@ impl Carrier for Qwen35Carrier {
                     &paro_layout,
                 )
                 .map_err(|e| format!("load_weights: {e:?}"))?;
+                hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
                 let is_kv_layer: Vec<bool> = config
                     .layer_types
                     .iter()
@@ -545,6 +546,7 @@ impl Carrier for LlamaCarrier {
                 let weights =
                     hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
                         .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+                hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
                 let mode = resolve_kv_mode(
                     ctx,
                     &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
@@ -844,6 +846,7 @@ impl Carrier for DotsOcrCarrier {
                 (config, weights)
             }
         };
+        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
         let state = hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(
             ctx.gpu,
             &config.text,
@@ -1105,6 +1108,7 @@ impl Carrier for MinimaxCarrier {
                 (config, weights)
             }
         };
+        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
         // ── single shared tail (byte-identical to the previous per-arm tails) ──
         let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
@@ -1200,6 +1204,7 @@ impl Carrier for Lfm2MoeCarrier {
                 (config, weights)
             }
         };
+        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
         let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
             .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;

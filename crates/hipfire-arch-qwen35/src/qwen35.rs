@@ -32,6 +32,7 @@ use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, resolve_lm_head,
     reupload_f16_as_f32, HfqBackend, ParoBackend,
 };
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
@@ -836,6 +837,71 @@ impl Qwen35Weights {
                 }
             }
         }
+    }
+}
+
+impl MmqScreenable for Qwen35Weights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut safe, mut unsafe_count) = (0usize, 0usize);
+        screen_weight_tensor(&self.output, gpu, &mut safe, &mut unsafe_count);
+        for layer in &self.layers {
+            match layer {
+                LayerWeights::DeltaNet(weights) => {
+                    for weight in [
+                        &weights.wqkv,
+                        &weights.wz,
+                        &weights.w_alpha,
+                        &weights.w_beta,
+                        &weights.wo,
+                        &weights.w_gate,
+                        &weights.w_up,
+                        &weights.w_down,
+                    ] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+                LayerWeights::FullAttn(weights) => {
+                    for weight in [
+                        &weights.wq,
+                        &weights.wk,
+                        &weights.wv,
+                        &weights.wo,
+                        &weights.w_gate,
+                        &weights.w_up,
+                        &weights.w_down,
+                    ] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+                // Routed and shared experts live outside ordinary WeightTensor
+                // storage in paged/EP modes. Screen the resident attention and
+                // dense router weights here; expert screening is separate work.
+                LayerWeights::DeltaNetMoe(weights) => {
+                    for weight in [
+                        &weights.wqkv,
+                        &weights.wz,
+                        &weights.w_alpha,
+                        &weights.w_beta,
+                        &weights.wo,
+                        &weights.ffn.router,
+                    ] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+                LayerWeights::FullAttnMoe(weights) => {
+                    for weight in [
+                        &weights.wq,
+                        &weights.wk,
+                        &weights.wv,
+                        &weights.wo,
+                        &weights.ffn.router,
+                    ] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+            }
+        }
+        (safe, unsafe_count)
     }
 }
 
