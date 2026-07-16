@@ -365,7 +365,7 @@ const fn write(offset: usize) -> PointerEffect {
     }
 }
 
-/// Pointer fields and memory effects for kernels admitted to Qwen AR replay.
+/// Pointer fields and memory effects for kernels admitted to Qwen replay.
 ///
 /// A non-const kernel pointer is conservatively classified as `Write`, which
 /// also covers read-modify-write effects. Unknown kernels fail closed and keep
@@ -515,6 +515,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]);
     }
     match kernel {
+        "copy_f32_replayable" => Some(vec![read(0), write(8)]),
+        "zero_f32_replayable" => Some(vec![write(0)]),
+        "embedding_q8_batched" => Some(vec![read(0), write(8), read(16)]),
         "convert_f32_to_f16" => Some(vec![read(0), write(8)]),
         "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
@@ -607,6 +610,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             Some(vec![read(0), read(8), read(16), write(24)])
         }
         "gemm_hfq4g256_lmhead_wmma_gfx12"
+        | "gemm_hfq4g256"
         | "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
@@ -645,6 +649,29 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
+        "gemm_qkvza_hfq4g256_wmma_gfx12" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ]),
+        "gemm_qkv_hfq4g256_wmma_gfx12" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+            write(48),
+        ]),
+        "gemm_hfq4g256_residual_wmma_gfx12" => {
+            Some(vec![read(0), read(8), write(16)])
+        }
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc" => {
             Some(vec![read(0), read(8), read(16), write(24)])
@@ -680,12 +707,30 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(48),
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
+        "deinterleave_f32_batched" => Some(vec![read(0), write(8), write(16)]),
         "rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
         "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
+        "rope_partial_halfsplit_batched_f32" => {
+            Some(vec![write(0), write(8), read(16)])
+        }
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
         }
         "kv_cache_write_q8_0" => Some(vec![write(0), read(8), read(16)]),
+        "kv_cache_write_q8_0_batched" => Some(vec![write(0), read(8), read(16)]),
+        "attention_flash_q8_0_tile_batched" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            read(32),
+            read(40),
+            read(48),
+            read(56),
+        ]),
+        "attention_flash_asym_reduce_batched" => {
+            Some(vec![read(0), write(8), read(16)])
+        }
         "attention_flash_fwht3_tile" => Some(vec![
             read(0),
             read(8),
@@ -785,7 +830,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         return Some(32);
     }
     match kernel {
+        "zero_f32_replayable" => Some(12),
         "softmax_f32" => Some(16),
+        "copy_f32_replayable" => Some(20),
+        "embedding_q8_batched" => Some(28),
         "convert_f32_to_f16"
         | "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
@@ -814,6 +862,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rmsnorm_f32"
         | "rmsnorm_reduce_gfx1100"
         | "sigmoid_mul_f32" => Some(32),
+        "deinterleave_f32_batched"
+        | "gemm_hfq4g256"
+        | "gemm_hfq4g256_residual_wmma_gfx12"
+        | "kv_cache_write_q8_0_batched" => Some(36),
         "attention_flash_q8_0_reduce"
         | "gemm_hfq4g256_lmhead_wmma_gfx12"
         | "fused_rmsnorm_mq_rotate"
@@ -844,7 +896,16 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "repeat_interleave_qk_f32"
         | "repeat_interleave_qk_f32_batched"
         | "rope_partial_halfsplit_f32" => Some(48),
-        "conv1d_silu_split_f32"
+        "attention_flash_asym_reduce_batched" | "rope_partial_halfsplit_batched_f32" => {
+            Some(52)
+        }
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => Some(64),
+        "gemm_gate_up_hfq4g256_wmma_gfx12"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt8"
+        | "gemm_gate_up_hfq4g256_wmma_gfx12_bt12"
+        | "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
         | "qwen35_fa_prep_gfx1100"
@@ -853,6 +914,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100" => Some(64),
+        "gemm_qkv_hfq4g256_wmma_gfx12" => Some(76),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
@@ -868,6 +930,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
         | "gated_delta_net_q8_fast" => Some(96),
+        "gemm_qkvza_hfq4g256_wmma_gfx12" => Some(96),
+        "attention_flash_q8_0_tile_batched" => Some(112),
         _ => None,
     }
 }
@@ -3207,6 +3271,9 @@ mod tests {
 
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "convert_f32_to_f16",
+        "copy_f32_replayable",
+        "zero_f32_replayable",
+        "embedding_q8_batched",
         "fused_rmsnorm_mq_rotate",
         "fused_rmsnorm_mq_rotate_vecsum",
         "fused_rmsnorm_mq_rotate_vecsum_sign_const",
@@ -3247,6 +3314,7 @@ mod tests {
         "gemv_hfq4g256",
         "gemv_hfq4g256_k2048",
         "gemv_hfq4g256_wide",
+        "gemm_hfq4g256",
         "softmax_f32",
         "moe_softmax_topk_renorm_k8_batched",
         "moe_topk_renorm_k8",
@@ -3267,6 +3335,15 @@ mod tests {
         "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
         "gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
+        "gemm_gate_up_hfq4g256_wmma_gfx12",
+        "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
+        "gemm_gate_up_hfq4g256_wmma_gfx12_bt8",
+        "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
+        "gemm_qkvza_hfq4g256_wmma_gfx12",
+        "gemm_qkv_hfq4g256_wmma_gfx12",
+        "gemm_hfq4g256_residual_wmma_gfx12",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151",
@@ -3277,13 +3354,18 @@ mod tests {
         "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
         "fused_qkv_hfq4g256",
         "deinterleave_f32",
+        "deinterleave_f32_batched",
         "rmsnorm_f32",
         "rope_partial_halfsplit_f32",
+        "rope_partial_halfsplit_batched_f32",
         "kv_cache_write_asym_k_fwht3",
         "kv_cache_write_q8_0",
+        "kv_cache_write_q8_0_batched",
         "kv_cache_write_q8_0_pair",
         "attention_flash_fwht3_tile",
         "attention_flash_q8_0_reduce",
+        "attention_flash_q8_0_tile_batched",
+        "attention_flash_asym_reduce_batched",
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
         "sigmoid_mul_f32",
