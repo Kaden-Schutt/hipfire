@@ -100,6 +100,16 @@ pub const FUSED_QKV_MQ4G256_LLOYD_SRC: &str =
     include_str!("../../../kernels/src/fused_qkv_mq4g256_lloyd.hip");
 pub const FUSED_QKV_MQ4G256_LLOYD_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/fused_qkv_mq4g256_lloyd.gfx1100.hip");
+pub const FUSED_QKV_MQ4G256_LLOYD_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4g256_lloyd_qwen2_bias\n",
+    include_str!("../../../kernels/src/fused_qkv_mq4g256_lloyd.hip")
+);
+pub const FUSED_QKV_MQ4G256_LLOYD_GFX1100_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4g256_lloyd_qwen2_bias\n",
+    include_str!("../../../kernels/src/fused_qkv_mq4g256_lloyd.gfx1100.hip")
+);
 /// DIAGNOSTIC ONLY — broken K4 multi-accumulator MQ4-Lloyd kernel kept for
 /// the open-question investigation of why MQ3-Lloyd's multi-acc works but
 /// MQ4-Lloyd's doesn't. NOT used in the production dispatch path; reachable
@@ -523,6 +533,28 @@ pub fn fused_qkv_mq4g256_lloyd_for_arch(
         _ => (FUSED_QKV_MQ4G256_LLOYD_SRC, "fused_qkv_mq4g256_lloyd"),
     }
 }
+
+pub fn fused_qkv_mq4g256_lloyd_qwen2_bias_for_arch(
+    caps: &ArchCaps,
+    force_baseline: bool,
+) -> (&'static str, &'static str) {
+    if force_baseline {
+        return (
+            FUSED_QKV_MQ4G256_LLOYD_QWEN2_BIAS_SRC,
+            "fused_qkv_mq4g256_lloyd_qwen2_bias",
+        );
+    }
+    match caps.arch() {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => (
+            FUSED_QKV_MQ4G256_LLOYD_GFX1100_QWEN2_BIAS_SRC,
+            "fused_qkv_mq4g256_lloyd_rdna3_qwen2_bias",
+        ),
+        _ => (
+            FUSED_QKV_MQ4G256_LLOYD_QWEN2_BIAS_SRC,
+            "fused_qkv_mq4g256_lloyd_qwen2_bias",
+        ),
+    }
+}
 /// gfx1100 (RDNA3) variant: K4 unroll + LDS-resident codebook lookup.
 pub const GEMV_MQ3G256_LLOYD_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd.gfx1100.hip");
@@ -742,6 +774,16 @@ pub const FUSED_QKV_MQ3G256_LLOYD_SRC: &str =
     include_str!("../../../kernels/src/fused_qkv_mq3g256_lloyd.hip");
 pub const FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/fused_qkv_mq3g256_lloyd.gfx1100.hip");
+pub const FUSED_QKV_MQ3G256_LLOYD_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq3g256_lloyd_qwen2_bias\n",
+    include_str!("../../../kernels/src/fused_qkv_mq3g256_lloyd.hip")
+);
+pub const FUSED_QKV_MQ3G256_LLOYD_GFX1100_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq3g256_lloyd_qwen2_bias\n",
+    include_str!("../../../kernels/src/fused_qkv_mq3g256_lloyd.gfx1100.hip")
+);
 
 /// Returns the MQ3G256-Lloyd GEMV kernel source AND module name for the given
 /// arch. gfx1100/1101/1102 (RDNA3) gets the K4-unrolled + LDS-codebook variant
@@ -868,6 +910,28 @@ pub fn fused_qkv_mq3g256_lloyd_for_arch(
             "fused_qkv_mq3g256_lloyd_rdna3",
         ),
         _ => (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd"),
+    }
+}
+
+pub fn fused_qkv_mq3g256_lloyd_qwen2_bias_for_arch(
+    caps: &ArchCaps,
+    force_baseline: bool,
+) -> (&'static str, &'static str) {
+    if force_baseline {
+        return (
+            FUSED_QKV_MQ3G256_LLOYD_QWEN2_BIAS_SRC,
+            "fused_qkv_mq3g256_lloyd_qwen2_bias",
+        );
+    }
+    match caps.arch() {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => (
+            FUSED_QKV_MQ3G256_LLOYD_GFX1100_QWEN2_BIAS_SRC,
+            "fused_qkv_mq3g256_lloyd_rdna3_qwen2_bias",
+        ),
+        _ => (
+            FUSED_QKV_MQ3G256_LLOYD_QWEN2_BIAS_SRC,
+            "fused_qkv_mq3g256_lloyd_qwen2_bias",
+        ),
     }
 }
 
@@ -1362,6 +1426,11 @@ pub const FUSED_GATE_UP_HFQ4G256_V2_GFX942_SRC: &str =
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256_v2.gfx942.hip");
 pub const FUSED_QKV_HFQ4G256_V2_GFX942_SRC: &str =
     include_str!("../../../kernels/src/fused_qkv_hfq4g256_v2.gfx942.hip");
+pub const FUSED_QKV_HFQ4G256_V2_GFX942_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256_v2_gfx942_qwen2_bias\n",
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256_v2.gfx942.hip")
+);
 pub const FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC: &str =
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256_v2.gfx942.hip");
 
@@ -3261,6 +3330,13 @@ pub const FUSED_QKV_HFQ4G256_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
 );
+pub const FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+);
 
 /// gfx1151 fixed-K FullAttention projection with Radiowave temporal buffer
 /// lowering for weights and aligned activation vectors.
@@ -3300,10 +3376,21 @@ pub const FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
 );
 
+// Per-row 3-way fused HFQ6/MQ6-G256 preamble (qwen2-family decode). Authored
+// from gemv_hfq6g256's row body + qkv routing + optional bias epilogue.
+pub const FUSED_QKV_HFQ6G256_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkv_hfq6g256.hip");
+
 // CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
 // block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
 pub const FUSED_QKV_HFQ4G256_WAVE64_SRC: &str = concat!(
     "// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n",
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256_wave64.hip")
+);
+pub const FUSED_QKV_HFQ4G256_WAVE64_QWEN2_BIAS_SRC: &str = concat!(
+    "// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n",
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256_wave64_qwen2_bias\n",
     include_str!("../../../kernels/src/fused_qkv_hfq4g256_wave64.hip")
 );
 // gfx906 dp4a-port — see fused_gate_up_hfq4g256_wave64_dp4a.hip for the
@@ -3453,6 +3540,11 @@ pub const HFQ4G256_DEQUANTIZE_TO_F16_SRC: &str =
 /// Grid = (q_m + k_m + v_m) blocks. Each block determines which matrix by blockIdx range.
 /// All three projections read the same input x (cached). Saves 2 kernel launches per layer.
 pub const FUSED_QKV_Q4K_SRC: &str = include_str!("../../../kernels/src/fused_qkv_q4k.hip");
+pub const FUSED_QKV_Q4K_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_q4k_qwen2_bias\n",
+    include_str!("../../../kernels/src/fused_qkv_q4k.hip")
+);
 
 /// Fused Gate+Up Q4_K: two GEMVs in one kernel launch for FFN gate and up projections.
 /// Grid = (gate_m + up_m) blocks. Saves 1 kernel launch per layer.
@@ -3614,6 +3706,11 @@ pub const FUSED_QKVZA_Q8_0_SRC: &str = include_str!("../../../kernels/src/fused_
 /// fused_qkv_hfq4g256 but with Q8_0 dequant. Grid=[q_m+k_m+v_m], block=[32].
 /// Bit-exact with three sequential gemv_q8_0 calls.
 pub const FUSED_QKV_Q8_0_SRC: &str = include_str!("../../../kernels/src/fused_qkv_q8_0.hip");
+pub const FUSED_QKV_Q8_0_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_q8_0_qwen2_bias\n",
+    include_str!("../../../kernels/src/fused_qkv_q8_0.hip")
+);
 
 /// Wave64-native counterpart to FUSED_GATE_UP_HFQ4G256_SRC for CDNA1/3.
 /// block=[64,1,1] with 2 rows per block (one per warp); grid halves from
@@ -5197,6 +5294,30 @@ mod dispatch_tests {
         #[cfg(feature = "deltanet")]
         assert!(QWEN35_FA_PREP_GFX1151_SRC
             .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151"));
+    }
+
+    #[test]
+    fn qwen2_bias_symbols_are_isolated_from_existing_qkv_modules() {
+        assert!(!FUSED_QKV_HFQ4G256_SRC.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
+        assert!(FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC
+            .contains("fused_qkv_hfq4g256_qwen2_bias"));
+        assert!(FUSED_QKV_Q4K_QWEN2_BIAS_SRC.contains("fused_qkv_q4k_qwen2_bias"));
+        assert!(FUSED_QKV_Q8_0_QWEN2_BIAS_SRC.contains("fused_qkv_q8_0_qwen2_bias"));
+
+        for arch in ["gfx1030", "gfx1100", "gfx1151", "gfx1201"] {
+            let caps = make_caps(arch);
+            let (_, old_mq4) = fused_qkv_mq4g256_lloyd_for_arch(&caps, false);
+            let (mq4_src, bias_mq4) =
+                fused_qkv_mq4g256_lloyd_qwen2_bias_for_arch(&caps, false);
+            assert_ne!(old_mq4, bias_mq4);
+            assert!(mq4_src.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
+
+            let (_, old_mq3) = fused_qkv_mq3g256_lloyd_for_arch(&caps, false);
+            let (mq3_src, bias_mq3) =
+                fused_qkv_mq3g256_lloyd_qwen2_bias_for_arch(&caps, false);
+            assert_ne!(old_mq3, bias_mq3);
+            assert!(mq3_src.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
+        }
     }
 
     // ── MQ4G256-Lloyd family ─────────────────────────────────────

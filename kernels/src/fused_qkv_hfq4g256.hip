@@ -13,6 +13,23 @@ using hipfire_qkv_f32x4 = float __attribute__((ext_vector_type(4)));
 #define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256
 #endif
 
+#if defined(HIPFIRE_QKV_WITH_BIAS)
+#define HIPFIRE_QKV_BIAS_ARGS \
+    , const float* __restrict__ bias_q \
+    , const float* __restrict__ bias_k \
+    , const float* __restrict__ bias_v
+#define HIPFIRE_QKV_BIAS_DECL const float* bias;
+#define HIPFIRE_QKV_BIAS_Q bias = bias_q;
+#define HIPFIRE_QKV_BIAS_K bias = bias_k;
+#define HIPFIRE_QKV_BIAS_V bias = bias_v;
+#else
+#define HIPFIRE_QKV_BIAS_ARGS
+#define HIPFIRE_QKV_BIAS_DECL
+#define HIPFIRE_QKV_BIAS_Q
+#define HIPFIRE_QKV_BIAS_K
+#define HIPFIRE_QKV_BIAS_V
+#endif
+
 // 3-way fused HFQ4-G256 GEMV for the Qwen3.5 FullAttention layer preamble.
 // One kernel launch performs all three projections from a single shared
 // x_rot input:
@@ -41,7 +58,7 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
     float*       __restrict__ y_k,
     float*       __restrict__ y_v,
     int q_m, int k_m, int v_m,
-    int K
+    int K HIPFIRE_QKV_BIAS_ARGS
 ) {
     const int gid = blockIdx.x;
     const int total_m = q_m + k_m + v_m;
@@ -51,12 +68,13 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
     const char* A;
     float* y;
     int row;
+    HIPFIRE_QKV_BIAS_DECL
     if (gid < q_m) {
-        A = A_q; y = y_q; row = gid;
+        A = A_q; y = y_q; row = gid; HIPFIRE_QKV_BIAS_Q
     } else if (gid < q_m + k_m) {
-        A = A_k; y = y_k; row = gid - q_m;
+        A = A_k; y = y_k; row = gid - q_m; HIPFIRE_QKV_BIAS_K
     } else {
-        A = A_v; y = y_v; row = gid - q_m - k_m;
+        A = A_v; y = y_v; row = gid - q_m - k_m; HIPFIRE_QKV_BIAS_V
     }
 
     const int tid = threadIdx.x;
@@ -204,5 +222,9 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
+#if defined(HIPFIRE_QKV_WITH_BIAS)
+    if (tid == 0) y[row] = acc + (bias ? bias[row] : 0.0f);
+#else
     if (tid == 0) y[row] = acc;
+#endif
 }

@@ -8,7 +8,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
-use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
+use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -605,6 +605,21 @@ pub fn execute_steps(
     let mut i = 0;
     while i < steps.len() {
         if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
+            // ── QKV bias fold (HIPFIRE_FUSE_QKV_BIAS) ────────────────────────
+            // When the flag is on, the matched window is a per-row 3-way QKV
+            // decode key whose kernel supports the fold, and the 3 steps right
+            // after the window are `BiasAdd` on the q/k/v outputs in order, fold
+            // the bias into the kernel's lane-0 store and skip those 3 steps.
+            // The fold is `acc + bias[row]` (fp32, same operand order as the
+            // separate `bias_add`) → byte-identical to the unfused path.
+            if ctx.flags.fuse_qkv_bias && len == QKV3.len() && qkv_bias_fold_supported(key, ctx) {
+                if let Some(biases) = match_trailing_qkv_bias(&steps[i..], len) {
+                    launch_fused_qkv_with_bias(gpu, ctx, key, &steps[i..i + len], biases)?;
+                    i += len + 3;
+                    continue;
+                }
+            }
+            // ─────────────────────────────────────────────────────────────────
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else {
@@ -613,6 +628,107 @@ pub fn execute_steps(
         }
     }
     Ok(())
+}
+
+/// Keys whose 3-way QKV **decode** dispatch arm folds the optional Q/K/V bias
+/// into the kernel (a `_with_bias` kernel variant exists and is wired in
+/// `dispatch_fused_qkv`). The fold is additionally guarded off on dp4a archs
+/// (gfx906), whose fused-QKV kernel has no bias parameters — there the 3
+/// `BiasAdd` steps run separately as before (handover pitfall #4). Keys NOT
+/// listed here keep the unfused path: their `BiasAdd` steps are never consumed,
+/// so the result is unchanged.
+fn qkv_bias_fold_supported(key: KernelKey, ctx: &DispatchCtx) -> bool {
+    if ctx.arch.gemv_dp4a_enabled() {
+        return false;
+    }
+    // All per-row 3-way QKV decode keys whose `gpu.fused_qkv_*_with_bias`
+    // variant is wired and GPU-parity-validated (no-bias==0, with-bias==bias;
+    // see examples/test_fused_qkv_bias_parity.rs). HFQ4G256 additionally has the
+    // full three-way model byte-identity proof (see the Phase-1 commit).
+    matches!(
+        key,
+        KernelKey::FusedQkvHfq4G256
+            | KernelKey::FusedQkvMq4G256Lloyd
+            | KernelKey::FusedQkvMq3G256Lloyd
+            | KernelKey::FusedQkvQ4K
+            | KernelKey::FusedQkvQ8_0
+            // HFQ6/MQ6: the fold switches decode GEMM→per-row (Family B). The
+            // dispatch arm keeps the GEMM unless bias is present, so this only
+            // changes decode when the fold actually fires.
+            | KernelKey::FusedQkvHfq6G256
+    )
+}
+
+/// If `steps[len..len+3]` are three `BiasAdd` ops whose `x` targets are exactly
+/// the q/k/v GEMV outputs of the fused window (`steps[1..4]`), return the three
+/// bias tensors `[bias_q, bias_k, bias_v]`. Otherwise `None` (no fold). The
+/// ptr-identity check guarantees we only fold the qwen2 `attention_bias` adds
+/// that immediately follow this exact QKV window, never an unrelated `BiasAdd`.
+fn match_trailing_qkv_bias<'a>(steps: &'a [Step<'a>], len: usize) -> Option<[&'a GpuTensor; 3]> {
+    if len + 3 > steps.len() {
+        return None;
+    }
+    let (
+        Step::BiasAdd {
+            x: bx_q, bias: bq, ..
+        },
+        Step::BiasAdd {
+            x: bx_k, bias: bk, ..
+        },
+        Step::BiasAdd {
+            x: bx_v, bias: bv, ..
+        },
+    ) = (&steps[len], &steps[len + 1], &steps[len + 2])
+    else {
+        return None;
+    };
+    let (_, out_q) = gemv_weight_out(&steps[1]);
+    let (_, out_k) = gemv_weight_out(&steps[2]);
+    let (_, out_v) = gemv_weight_out(&steps[3]);
+    if std::ptr::eq(*bx_q as *const GpuTensor, out_q as *const GpuTensor)
+        && std::ptr::eq(*bx_k as *const GpuTensor, out_k as *const GpuTensor)
+        && std::ptr::eq(*bx_v as *const GpuTensor, out_v as *const GpuTensor)
+    {
+        Some([bq, bk, bv])
+    } else {
+        None
+    }
+}
+
+/// Launch a Qwen2 3-way QKV window through bias-specific kernel symbols.
+/// Qwen3+ continues through [`launch_fused`] and the original Redline ABI.
+fn launch_fused_qkv_with_bias<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    key: KernelKey,
+    steps: &[Step<'a>],
+    bias: [&'a GpuTensor; 3],
+) -> Result<(), DispatchError> {
+    // Opt-in diagnostic (HIPFIRE_FUSE_QKV_BIAS_DEBUG=1): confirm the fold fires.
+    // Flag is resolved once at init — no per-launch env lock on the hot path.
+    if ctx.flags.fuse_qkv_bias_debug {
+        eprintln!("[qkv-bias-fold] fired ({:?})", key);
+    }
+    // Step 0 is RmsnormAutomatic — run it to fill the activated buffer.
+    launch_op(gpu, ctx, &steps[0])?;
+    let activated = rmsnorm_out(&steps[0]);
+    let (wq, q) = gemv_weight_out(&steps[1]);
+    let (wk, k) = gemv_weight_out(&steps[2]);
+    let (wv, v) = gemv_weight_out(&steps[3]);
+    let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);
+    fused_qkv.run_with_qwen2_bias(
+        ctx,
+        gpu,
+        &FusedQkvBiasParams {
+            kind: key,
+            weights: [wq.buf, wk.buf, wv.buf],
+            x: activated,
+            outputs: [q, k, v],
+            m: [wq.m, wk.m, wv.m],
+            k: wq.k,
+            bias,
+        },
+    )
 }
 
 /// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
