@@ -153,6 +153,8 @@ def validate_intent(intent: Mapping[str, Any], *, trusted_authors: Iterable[str]
         raise ValueError("intent target_key does not match target")
     _text(intent, "record_id")
     _text(intent, "intent_node_id")
+    if intent["record_id"] != intent["intent_node_id"]:
+        raise ValueError("intent node ID must match immutable record ID")
     _text(intent, "attempt_id")
     _time(intent)
     _trusted(intent, trusted)
@@ -319,33 +321,80 @@ def elect_canonical_attempt(
     expected_target: ReviewTarget,
     revocations: Sequence[Mapping[str, Any]] = (),
     reports: Sequence[Mapping[str, Any]] = (),
+    review_metadata: Sequence[Mapping[str, Any]] = (),
     trusted_authors: Iterable[str] | None = None,
 ) -> Mapping[str, Any]:
     trusted = _trust_policy(trusted_authors)
     expected = _expected_target(expected_target)
     validated_intents: dict[str, Mapping[str, Any]] = {}
     events = []
+    intent_nodes: set[str] = set()
     for intent in intents:
         validate_intent(intent, trusted_authors=trusted)
         _require_expected_target(intent, expected)
         attempt_id = intent["attempt_id"]
         if attempt_id in validated_intents:
             raise ValueError("intent attempt IDs must be unique")
+        node_id = intent["intent_node_id"]
+        if node_id in intent_nodes:
+            raise ValueError("intent node IDs must be unique")
+        intent_nodes.add(node_id)
         validated_intents[attempt_id] = intent
-        events.append((_time(intent), intent["intent_node_id"], 0, "intent", intent))
+        events.append((_time(intent), node_id, 0, "intent", intent))
 
     for revocation in revocations:
         events.append((_time(revocation), _text(revocation, "record_id"), 2, "revocation", revocation))
 
-    report_by_id = {report.get("record_id"): report for report in reports}
+    for report in reports:
+        events.append((_time(report), _text(report, "intent_node_id"), 1, "report", report))
+
     for completion in completions:
-        events.append((_time(completion), _text(completion, "intent_node_id"), 1, "completion", completion))
+        events.append((_time(completion), _text(completion, "intent_node_id"), 3, "completion", completion))
+
+    for metadata in review_metadata:
+        events.append((_time(metadata), _text(metadata, "intent_node_id"), 2, "review-metadata", metadata))
 
     events.sort(key=lambda event: (event[0], event[1], event[2]))
     active: list[tuple[datetime, str, Mapping[str, Any]]] = []
+    published_reports: dict[str, Mapping[str, Any]] = {}
     for _, _, _, event_type, record in events:
         if event_type == "intent":
             active.append((_time(record), record["intent_node_id"], record))
+            continue
+        if event_type in {"report", "completion", "review-metadata"}:
+            intent = validated_intents.get(record.get("attempt_id"))
+            if intent is None or not active:
+                raise ValueError(f"{event_type} is before its intent or references an unknown attempt")
+            _require_expected_target(record, expected)
+            current = min(active, key=lambda item: (item[0], item[1]))[2]
+            if event_type == "report":
+                if record.get("target_key") != current.get("target_key") or record.get("attempt_id") != current.get("attempt_id"):
+                    raise ValueError("report does not target the current canonical intent")
+                validate_report(record, intent, trusted_authors=trusted)
+                report_id = _text(record, "record_id")
+                if report_id in published_reports:
+                    raise ValueError("report IDs must be unique")
+                published_reports[report_id] = record
+                continue
+            if event_type == "completion":
+                validate_completion(
+                    record,
+                    intent,
+                    report=published_reports.get(record.get("report_id")),
+                    canonical_intent=current,
+                    trusted_authors=trusted,
+                )
+                continue
+            report = published_reports.get(record.get("report_id"))
+            if report is None:
+                raise ValueError("review metadata is before its referenced report")
+            validate_review_metadata(
+                record,
+                intent,
+                report,
+                canonical_intent=current,
+                trusted_authors=trusted,
+            )
             continue
         if event_type == "revocation":
             if not active:
@@ -360,18 +409,6 @@ def elect_canonical_attempt(
             validate_revocation(record, current, trusted_authors=trusted)
             active = [item for item in active if item[2] is not current]
             continue
-
-        intent = validated_intents.get(record.get("attempt_id"))
-        if intent is None or not active:
-            raise ValueError("completion is for an unknown or noncanonical intent")
-        current = min(active, key=lambda item: (item[0], item[1]))[2]
-        validate_completion(
-            record,
-            intent,
-            report=report_by_id.get(record.get("report_id")),
-            canonical_intent=current,
-            trusted_authors=trusted,
-        )
 
     if not active:
         raise ValueError("no valid non-revoked intent")
@@ -395,33 +432,14 @@ def validate_protocol(
     intents = grouped["intent"]
     for intent in intents:
         validate_intent(intent, trusted_authors=trusted)
-    intent_by_attempt = {intent.get("attempt_id"): intent for intent in intents}
     reports = grouped["report"]
-    report_by_id = {report.get("record_id"): report for report in reports}
-    for report in reports:
-        intent = intent_by_attempt.get(report.get("attempt_id"))
-        if intent is None:
-            raise ValueError("report references an unknown intent")
-        _require_expected_target(report, expected)
-        validate_report(report, intent, trusted_authors=trusted)
     selected = elect_canonical_attempt(
         intents,
         grouped["completion"],
         expected_target=expected,
         revocations=grouped["revocation"],
         reports=reports,
+        review_metadata=grouped["review-metadata"],
         trusted_authors=trusted,
     )
-    for metadata in grouped["review-metadata"]:
-        intent = intent_by_attempt.get(metadata.get("attempt_id"))
-        report = report_by_id.get(metadata.get("report_id"))
-        if intent is None or report is None:
-            raise ValueError("review metadata references a deleted report or unknown intent")
-        validate_review_metadata(
-            metadata,
-            intent,
-            report,
-            canonical_intent=selected,
-            trusted_authors=trusted,
-        )
     return selected

@@ -75,6 +75,26 @@ def _completion(intent):
     }
 
 
+def _metadata(intent, report, *, created="2026-01-01T00:03:00Z", record_id="metadata-1"):
+    metadata = {
+        "record_type": "review-metadata",
+        "record_id": record_id,
+        "target": intent["target"],
+        "target_key": intent["target_key"],
+        "attempt_id": intent["attempt_id"],
+        "intent_node_id": intent["intent_node_id"],
+        "head_sha": TARGET.head_sha,
+        "author": "review-bot",
+        "created_at": created,
+        "report_id": report["record_id"],
+        "report_body_sha256": report["report_body_sha256"],
+        "canonical_intent_digest": intent["canonical_digest"],
+        "metadata_digest": "",
+    }
+    metadata["metadata_digest"] = metadata_digest(metadata)
+    return metadata
+
+
 def test_canonical_vectors_and_reordered_keys():
     for vector in VECTORS["canonical"]:
         assert canonical_json(vector["value"]) == vector["canonical_utf8"].encode()
@@ -376,3 +396,68 @@ def test_protocol_rejects_metadata_for_noncanonical_intent():
         validate_protocol(
             [canonical, noncanonical, report, metadata], expected_target=TARGET, trusted_authors=TRUSTED
         )
+
+
+def test_report_and_metadata_cannot_predate_their_intent():
+    intent = _intent(created="2026-01-01T00:02:00Z")
+    report = _report(intent)
+    report["created_at"] = "2026-01-01T00:01:00Z"
+    metadata = _metadata(intent, report, created="2026-01-01T00:01:30Z")
+    with pytest.raises(ValueError, match="before|intent|publication"):
+        validate_protocol([intent, report, metadata], expected_target=TARGET, trusted_authors=TRUSTED)
+
+
+def test_historical_canonical_report_and_metadata_survive_later_replacement():
+    first = _intent(node="first", attempt="first")
+    first_report = _report(first)
+    first_metadata = _metadata(first, first_report)
+    second = _intent(node="second", attempt="second", created="2026-01-01T00:04:00Z")
+    revocation = {
+        "record_type": "revocation", "record_id": "revoke-first", "target_key": first["target_key"],
+        "attempt_id": first["attempt_id"], "canonical_intent_digest": first["canonical_digest"],
+        "author": "review-bot", "reason": "replace", "authenticated": True,
+        "created_at": "2026-01-01T00:05:00Z",
+    }
+    selected = validate_protocol(
+        [first_metadata, second, revocation, first_report, first],
+        expected_target=TARGET,
+        trusted_authors=TRUSTED,
+    )
+    assert selected is second
+
+
+def test_noncanonical_report_is_rejected_at_publication_event():
+    first = _intent(node="first", attempt="first")
+    second = _intent(node="second", attempt="second", created="2026-01-01T00:01:00Z")
+    report = _report(second)
+    report["created_at"] = "2026-01-01T00:02:00Z"
+    with pytest.raises(ValueError, match="canonical"):
+        validate_protocol([first, second, report], expected_target=TARGET, trusted_authors=TRUSTED)
+
+
+def test_duplicate_intent_nodes_and_node_identifier_mismatch_are_rejected():
+    first = _intent(node="same-node", attempt="first")
+    second = _intent(node="same-node", attempt="second")
+    with pytest.raises(ValueError, match="node"):
+        elect_canonical_attempt(
+            [first, second], [], expected_target=TARGET, trusted_authors=TRUSTED
+        )
+    mismatched = _intent(node="intent-node", attempt="mismatch")
+    mismatched["record_id"] = "different-record"
+    mismatched["canonical_digest"] = canonical_digest(
+        {key: value for key, value in mismatched.items() if key != "canonical_digest"}
+    )
+    with pytest.raises(ValueError, match="node"):
+        validate_intent(mismatched, trusted_authors=TRUSTED)
+
+
+def test_equal_timestamp_and_reordered_inputs_have_same_node_tie_break():
+    first = _intent(node="a-node", attempt="a")
+    second = _intent(node="z-node", attempt="z")
+    selected = elect_canonical_attempt(
+        [first, second], [], expected_target=TARGET, trusted_authors=TRUSTED
+    )
+    reordered = elect_canonical_attempt(
+        [second, first], [], expected_target=TARGET, trusted_authors=TRUSTED
+    )
+    assert selected["intent_node_id"] == reordered["intent_node_id"] == "a-node"
