@@ -3871,6 +3871,11 @@ pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_b
 pub const ARGMAX_TOKEN_CHAIN_SRC: &str =
     include_str!("../../../kernels/src/argmax_token_chain.hip");
 
+/// Device-resident exact top-20 sampling and speculative-history penalties for
+/// the sampled MTP proposal chain.
+pub const MTP_SAMPLE_TOPK20_SRC: &str =
+    include_str!("../../../kernels/src/mtp_sample_topk20.hip");
+
 /// Device-side greedy MTP accept prefix scan over verify argmaxes and draft
 /// candidates. Writes compact `[accept_count, bonus_or_minus_one]` result.
 pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_accept.hip");

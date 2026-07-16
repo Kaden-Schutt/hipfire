@@ -47,7 +47,7 @@ use std::time::Instant;
 /// (temp=1.0, top_p=0.95, top_k=20, min_p=0.0 for Qwen3.5/3.6 thinking
 /// mode). `temp == 0.0` disables sampling and the spec-step falls back
 /// to greedy argmax-match.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct MtpSamplingConfig {
     pub temp: f32,
     pub top_k: usize, // 0 = disabled (no top-K cutoff)
@@ -613,15 +613,33 @@ fn exact_sparse_distributions_gpu(
     gpu.hip.memcpy_dtoh(index_bytes, &idx_view.buf)?;
     let log_probabilities = gpu.download_f32(&logp_view)?;
 
-    Ok((0..rows)
+    Ok(sparse_distributions_from_topk_host(
+        &indices,
+        &log_probabilities,
+        rows,
+        k,
+        cfg,
+    ))
+}
+
+fn sparse_distributions_from_topk_host(
+    indices: &[i32],
+    values: &[f32],
+    rows: usize,
+    k: usize,
+    cfg: &MtpSamplingConfig,
+) -> Vec<SparseDistribution> {
+    debug_assert_eq!(indices.len(), rows * k);
+    debug_assert_eq!(values.len(), rows * k);
+    (0..rows)
         .map(|row| {
             sparse_distribution_from_topk(
                 &indices[row * k..(row + 1) * k],
-                &log_probabilities[row * k..(row + 1) * k],
+                &values[row * k..(row + 1) * k],
                 cfg,
             )
         })
-        .collect())
+        .collect()
 }
 
 fn sample_sparse_residual(
@@ -784,6 +802,10 @@ pub struct MtpSpecState {
     mtp_proposal_graph_seq_cap: usize,
     mtp_proposal_graph_warmed: bool,
     mtp_proposal_graph_disabled: bool,
+    /// A captured sampled-chain graph embeds the request's scalar sampling
+    /// controls. Mark it stale when those controls change; the next spec cycle
+    /// destroys and rebuilds it before launch.
+    mtp_proposal_graph_sampling_dirty: bool,
 
     /// Per-step HIP graphs for sampled compressed MTP. Sampling remains
     /// between graphs on the host, but each expensive MTP block + draft head
@@ -1023,6 +1045,7 @@ impl MtpSpecState {
             mtp_proposal_graph_seq_cap: 0,
             mtp_proposal_graph_warmed: false,
             mtp_proposal_graph_disabled: false,
+            mtp_proposal_graph_sampling_dirty: false,
             mtp_sampled_step_graphs: Vec::new(),
             mtp_sampled_step_graph_execs: Vec::new(),
             mtp_sampled_step_graph_blobs: Vec::new(),
@@ -1096,6 +1119,9 @@ impl MtpSpecState {
             "set_sampling: frequency_penalty must be finite and >= 0.0, got {}",
             cfg.frequency_penalty
         );
+        if self.sampling != cfg {
+            self.mtp_proposal_graph_sampling_dirty = true;
+        }
         self.sampling = cfg;
         self.rng = MtpRng::new(seed);
         self.sampling_history.clear();
@@ -1189,6 +1215,7 @@ impl MtpSpecState {
         destroy_mtp_sampled_step_graphs(gpu, self);
         self.mtp_proposal_graph_warmed = false;
         self.mtp_proposal_graph_seq_cap = 0;
+        self.mtp_proposal_graph_sampling_dirty = false;
         self.mtp_sampled_step_graph_warmed = false;
         self.mtp_sampled_step_graph_seq_cap = 0;
         self.mtp_sampled_step_graph_reported = false;
@@ -1355,6 +1382,57 @@ fn upload_mtp_proposal_graph_inputs(
     gpu.hip.memcpy_htod(&state.mtp_positions.buf, pos_bytes)
 }
 
+fn upload_mtp_sampled_chain_inputs(
+    gpu: &mut Gpu,
+    state: &MtpSpecState,
+    last_committed: u32,
+    cur_pos: usize,
+    max_n: usize,
+    uniforms: &[f32],
+) -> HipResult<()> {
+    upload_mtp_proposal_graph_inputs(gpu, state, last_committed, cur_pos, max_n)?;
+    debug_assert_eq!(uniforms.len(), max_n);
+    let uniform_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            uniforms.as_ptr() as *const u8,
+            uniforms.len() * std::mem::size_of::<f32>(),
+        )
+    };
+    // Exact sparse sampling does not use the legacy per-row tau tensor. Reuse
+    // its stable allocation as the graph's per-cycle uniform input.
+    gpu.hip
+        .memcpy_htod(&state.mtp_sample_draft_tau.buf, uniform_bytes)?;
+
+    let mapped = map_draft_penalty_history(
+        &state.sampling_history,
+        &[],
+        state.mtp_vocab_inverse.as_ref(),
+    );
+    let capacity = state.mtp_sample_repeat_buf.numel();
+    let window = state.sampling.repeat_window.min(capacity).min(mapped.len());
+    let recent = &mapped[mapped.len().saturating_sub(window)..];
+    if !recent.is_empty() {
+        let history_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                recent.as_ptr() as *const u8,
+                recent.len() * std::mem::size_of::<u32>(),
+            )
+        };
+        gpu.hip
+            .memcpy_htod(&state.mtp_sample_repeat_buf.buf, history_bytes)?;
+    }
+    let base_len = recent.len() as i32;
+    let len_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            &base_len as *const i32 as *const u8,
+            std::mem::size_of::<i32>(),
+        )
+    };
+    // The exact sparse path does not use the legacy two-word sample result.
+    // Slot zero is a stable device scalar read by the captured penalty nodes.
+    gpu.hip.memcpy_htod(&state.mtp_sample_result.buf, len_bytes)
+}
+
 fn mtp_proposal_graph_seq_cap(cur_pos: usize, max_n: usize, kv_max_seq: usize) -> usize {
     let needed = cur_pos + max_n;
     needed.next_power_of_two().max(256).min(kv_max_seq)
@@ -1435,6 +1513,115 @@ fn run_mtp_proposal_graph_body_q8(
             Some(vocab_map_gpu),
             cvs,
             k + 1,
+        )?;
+
+        if k + 1 < max_n {
+            gpu.memcpy_dtod_at_auto(
+                &state.mtp_t_outs.buf,
+                k * dim_bytes,
+                &state.mtp_scratch.t_mtp_out.buf,
+                0,
+                dim_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_sampled_chain_graph_body_q8(
+    gpu: &mut Gpu,
+    target: &ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    max_n: usize,
+    dim: usize,
+    cvs: usize,
+    seq_cap: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(state.mtp_kv.kv_mode, crate::mtp_head::MtpKvMode::Q8);
+    let sampling = state.sampling;
+    debug_assert!(sampling.temp > 0.0 && (1..=MTP_EXACT_GPU_TOPK_MAX).contains(&sampling.top_k));
+    let dim_bytes = dim * std::mem::size_of::<f32>();
+    let logits_c = state
+        .mtp_scratch
+        .logits_compressed
+        .as_ref()
+        .expect("sampled proposal graph requires compressed logits scratch");
+    let vocab_map_gpu = head
+        .weights
+        .lm_head_draft_vocab_map_gpu
+        .as_ref()
+        .expect("sampled proposal graph requires GPU vocab_map");
+
+    for k in 0..max_n {
+        let token_slot = state.mtp_token_chain.sub_offset(k, 1);
+        embed_device_token_into(
+            gpu,
+            &target.weights,
+            &state.mtp_token_embed,
+            &token_slot,
+            dim,
+        )?;
+
+        let pos_slot = state.mtp_positions.sub_offset(k, 1);
+        let prev_hidden = if k == 0 {
+            &state.prev_hidden
+        } else {
+            &state.mtp_t_outs.sub_offset((k - 1) * dim, dim)
+        };
+        mtp_head::mtp_head_forward_block_only_with_pos_buf(
+            gpu,
+            head,
+            &state.mtp_scratch,
+            &mut state.mtp_kv,
+            0,
+            prev_hidden,
+            Some(&state.mtp_token_embed),
+            &pos_slot.buf,
+            cur_pos + k,
+            seq_cap,
+            &target.weights,
+        )?;
+        mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
+
+        if sampling.penalties_active() {
+            gpu.apply_mtp_chain_penalties_f32(
+                logits_c,
+                &state.mtp_sample_repeat_buf,
+                &state.mtp_sample_result,
+                &state.mtp_sample_draft_indices,
+                k,
+                cvs,
+                sampling.repeat_window,
+                sampling.repeat_penalty,
+                sampling.presence_penalty,
+                sampling.frequency_penalty,
+            )?;
+        }
+
+        let top_idx = state
+            .mtp_sample_sparse_idx
+            .sub_offset(k * sampling.top_k, sampling.top_k);
+        let top_values = state
+            .mtp_sample_sparse_logp
+            .sub_offset(k * sampling.top_k, sampling.top_k);
+        gpu.topk20_batched_f32(logits_c, &top_idx, &top_values, cvs, sampling.top_k, 1)?;
+        gpu.sample_mtp_topk20_token_chain_f32(
+            &top_idx,
+            &top_values,
+            sampling.top_k,
+            sampling.temp,
+            sampling.top_p,
+            sampling.min_p,
+            &state.mtp_sample_draft_tau,
+            k,
+            &state.mtp_sample_draft_indices,
+            &state.mtp_sample_draft_prob_at_token,
+            &state.mtp_token_chain,
+            k + 1,
+            Some(vocab_map_gpu),
         )?;
 
         if k + 1 < max_n {
@@ -3330,7 +3517,7 @@ pub fn spec_step_mtp_compressed_serial(
             use_p_min,
             penalties_active,
         );
-    let use_sampled_step_graph = !state.mtp_sampled_step_graph_disabled
+    let use_sampled_chain_graph = !state.mtp_proposal_graph_disabled
         && mtp_sampled_step_graph_eligible_for(
             exact_sparse_sampling,
             use_full_vocab,
@@ -3340,8 +3527,8 @@ pub fn spec_step_mtp_compressed_serial(
         );
     if use_sampling && !state.mtp_sampled_step_graph_reported {
         eprintln!(
-            "[mtp-sampled-step-graph] eligible={} exact_sparse={} full_vocab={} p_min={} embd={:?} kv={:?} cvs={}",
-            use_sampled_step_graph,
+            "[mtp-sampled-chain-graph] eligible={} exact_sparse={} full_vocab={} p_min={} embd={:?} kv={:?} cvs={}",
+            use_sampled_chain_graph,
             exact_sparse_sampling,
             use_full_vocab,
             p_min,
@@ -3351,6 +3538,10 @@ pub fn spec_step_mtp_compressed_serial(
         );
         state.mtp_sampled_step_graph_reported = true;
     }
+    // The old per-step graphs stopped at logits and still fenced through the
+    // host sampler K times. The chain graph below includes exact top-20
+    // sampling and feeds its token directly into the next step.
+    let use_sampled_step_graph = false;
     if use_device_token_chain && !use_full_vocab {
         assert!(
             head.weights.lm_head_draft_vocab_map_gpu.is_some(),
@@ -3358,13 +3549,18 @@ pub fn spec_step_mtp_compressed_serial(
         );
     }
     let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
-    let use_proposal_graph = !state.mtp_proposal_graph_disabled
-        && mtp_proposal_graph_eligible_for(
-            proposal_graph_policy,
-            use_device_token_chain,
-            use_full_vocab,
-            state.mtp_kv.kv_mode,
-        );
+    if state.mtp_proposal_graph_sampling_dirty {
+        destroy_mtp_proposal_graph(gpu, state);
+        state.mtp_proposal_graph_sampling_dirty = false;
+    }
+    let use_proposal_graph = use_sampled_chain_graph
+        || (!state.mtp_proposal_graph_disabled
+            && mtp_proposal_graph_eligible_for(
+                proposal_graph_policy,
+                use_device_token_chain,
+                use_full_vocab,
+                state.mtp_kv.kv_mode,
+            ));
     let proposal_graph_seq_cap = if use_proposal_graph {
         mtp_proposal_graph_seq_cap(cur_pos, max_n, state.mtp_kv.max_seq)
     } else {
@@ -3389,8 +3585,22 @@ pub fn spec_step_mtp_compressed_serial(
         destroy_mtp_sampled_step_graphs(gpu, state);
         state.mtp_sampled_step_graph_warmed = true;
     }
-    if use_device_token_chain || use_sampled_step_graph {
-        if use_proposal_graph {
+    let sampled_uniforms: Vec<f32> = if use_sampled_chain_graph {
+        (0..max_n).map(|_| state.rng.next_uniform_f32()).collect()
+    } else {
+        Vec::new()
+    };
+    if use_device_token_chain || use_sampled_step_graph || use_sampled_chain_graph {
+        if use_sampled_chain_graph {
+            upload_mtp_sampled_chain_inputs(
+                gpu,
+                state,
+                last_committed,
+                cur_pos,
+                max_n,
+                &sampled_uniforms,
+            )?;
+        } else if use_proposal_graph {
             upload_mtp_proposal_graph_inputs(gpu, state, last_committed, cur_pos, max_n)?;
         } else {
             let seed_token = last_committed as i32;
@@ -3418,17 +3628,32 @@ pub fn spec_step_mtp_compressed_serial(
         } else if state.mtp_proposal_graph_warmed {
             let capture_result: HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> = (|| {
                 begin_mtp_proposal_graph_capture(gpu)?;
-                if let Err(e) = run_mtp_proposal_graph_body_q8(
-                    gpu,
-                    target,
-                    head,
-                    state,
-                    cur_pos,
-                    max_n,
-                    dim,
-                    cvs,
-                    proposal_graph_seq_cap,
-                ) {
+                let body = if use_sampled_chain_graph {
+                    run_mtp_sampled_chain_graph_body_q8(
+                        gpu,
+                        target,
+                        head,
+                        state,
+                        cur_pos,
+                        max_n,
+                        dim,
+                        cvs,
+                        proposal_graph_seq_cap,
+                    )
+                } else {
+                    run_mtp_proposal_graph_body_q8(
+                        gpu,
+                        target,
+                        head,
+                        state,
+                        cur_pos,
+                        max_n,
+                        dim,
+                        cvs,
+                        proposal_graph_seq_cap,
+                    )
+                };
+                if let Err(e) = body {
                     abort_mtp_proposal_graph_capture(gpu);
                     return Err(e);
                 }
@@ -3444,8 +3669,19 @@ pub fn spec_step_mtp_compressed_serial(
                     gpu.hip
                         .graph_launch(state.mtp_proposal_graph_exec.as_ref().unwrap(), stream)?;
                     proposal_graph_ran = true;
+                    if use_sampled_chain_graph {
+                        eprintln!(
+                            "[mtp-sampled-chain-graph] captured K={} seq_cap={}",
+                            max_n, proposal_graph_seq_cap
+                        );
+                    }
                 }
-                Err(e) if proposal_graph_policy == MtpProposalGraphPolicy::On => return Err(e),
+                Err(e)
+                    if use_sampled_chain_graph
+                        || proposal_graph_policy == MtpProposalGraphPolicy::On =>
+                {
+                    return Err(e)
+                }
                 Err(e) => {
                     abort_mtp_proposal_graph_capture(gpu);
                     state.mtp_proposal_graph_disabled = true;
@@ -3454,7 +3690,52 @@ pub fn spec_step_mtp_compressed_serial(
             }
         } else {
             state.mtp_proposal_graph_warmed = true;
+            if use_sampled_chain_graph {
+                run_mtp_sampled_chain_graph_body_q8(
+                    gpu,
+                    target,
+                    head,
+                    state,
+                    cur_pos,
+                    max_n,
+                    dim,
+                    cvs,
+                    proposal_graph_seq_cap,
+                )?;
+                proposal_graph_ran = true;
+            }
         }
+    }
+
+    if proposal_graph_ran && use_sampled_chain_graph {
+        let k = sampling.top_k;
+        let rows = max_n;
+        let idx_view = state.mtp_sample_sparse_idx.sub_offset(0, rows * k);
+        let values_view = state.mtp_sample_sparse_logp.sub_offset(0, rows * k);
+        let mut indices = vec![0i32; rows * k];
+        let index_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                indices.as_mut_ptr() as *mut u8,
+                indices.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        gpu.hip.memcpy_dtoh(index_bytes, &idx_view.buf)?;
+        let values = gpu.download_f32(&values_view)?;
+        sparse_draft_rows =
+            sparse_distributions_from_topk_host(&indices, &values, rows, k, &sampling);
+
+        let token_view = state.mtp_token_chain.sub_offset(1, rows);
+        let mut token_host = vec![0i32; rows];
+        let token_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                token_host.as_mut_ptr() as *mut u8,
+                token_host.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        gpu.hip.memcpy_dtoh(token_bytes, &token_view.buf)?;
+        candidates.extend(token_host.into_iter().map(|token| token as u32));
+        draft_taus.resize(rows, 0.0);
+        draft_zs.resize(rows, 1.0);
     }
 
     if !proposal_graph_ran {

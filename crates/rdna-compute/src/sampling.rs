@@ -1176,6 +1176,139 @@ extern "C" __global__ void mtp_topk20_finalize(
         Ok(())
     }
 
+    /// Apply sampling penalties using a device-resident speculative prefix.
+    ///
+    /// `base_tokens` contains the already-compressed committed history and
+    /// `draft_indices[0..draft_prefix]` contains candidates emitted by earlier
+    /// nodes in the same MTP proposal graph. `base_len` is a one-element i32
+    /// device buffer so a captured graph can consume a different history size
+    /// every cycle without rebuilding its kernel arguments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_mtp_chain_penalties_f32(
+        &mut self,
+        logits: &GpuTensor,
+        base_tokens: &GpuTensor,
+        base_len: &GpuTensor,
+        draft_indices: &GpuTensor,
+        draft_prefix: usize,
+        vocab_size: usize,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNCTION: &str = "mtp_apply_chain_penalties_f32";
+        self.ensure_kernel(
+            "mtp_sample_topk20",
+            kernels::MTP_SAMPLE_TOPK20_SRC,
+            FUNCTION,
+        )?;
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut base_ptr = base_tokens.buf.as_ptr();
+        let mut base_len_ptr = base_len.buf.as_ptr();
+        let mut draft_ptr = draft_indices.buf.as_ptr();
+        let mut prefix = draft_prefix as i32;
+        let mut vocab = vocab_size as i32;
+        let mut window = repeat_window as i32;
+        let mut repeat = repeat_penalty;
+        let mut presence = presence_penalty;
+        let mut frequency = frequency_penalty;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut c_void,
+            &mut base_ptr as *mut _ as *mut c_void,
+            &mut base_len_ptr as *mut _ as *mut c_void,
+            &mut draft_ptr as *mut _ as *mut c_void,
+            &mut prefix as *mut _ as *mut c_void,
+            &mut vocab as *mut _ as *mut c_void,
+            &mut window as *mut _ as *mut c_void,
+            &mut repeat as *mut _ as *mut c_void,
+            &mut presence as *mut _ as *mut c_void,
+            &mut frequency as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions[FUNCTION],
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Sample an exact top-20 support on-device and write both the compressed
+    /// draft index and mapped full token into a captured MTP token chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_mtp_topk20_token_chain_f32(
+        &mut self,
+        top_indices: &GpuTensor,
+        top_values: &GpuTensor,
+        top_k: usize,
+        temperature: f32,
+        top_p: f32,
+        min_p: f32,
+        uniforms: &GpuTensor,
+        uniform_slot: usize,
+        draft_indices: &GpuTensor,
+        draft_probabilities: &GpuTensor,
+        token_chain: &GpuTensor,
+        token_slot: usize,
+        vocab_map: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!((1..=20).contains(&top_k));
+        const FUNCTION: &str = "mtp_sample_topk20_token_chain_f32";
+        self.ensure_kernel(
+            "mtp_sample_topk20",
+            kernels::MTP_SAMPLE_TOPK20_SRC,
+            FUNCTION,
+        )?;
+
+        let mut top_idx_ptr = top_indices.buf.as_ptr();
+        let mut top_val_ptr = top_values.buf.as_ptr();
+        let mut kk = top_k as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut mp = min_p;
+        let mut uniform_ptr = uniforms.buf.as_ptr();
+        let mut us = uniform_slot as i32;
+        let mut draft_idx_ptr = draft_indices.buf.as_ptr();
+        let mut draft_prob_ptr = draft_probabilities.buf.as_ptr();
+        let mut chain_ptr = token_chain.buf.as_ptr();
+        let mut ts = token_slot as i32;
+        let mut map_ptr = vocab_map
+            .map(|tensor| tensor.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut::<c_void>());
+        let mut params: Vec<*mut c_void> = vec![
+            &mut top_idx_ptr as *mut _ as *mut c_void,
+            &mut top_val_ptr as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+            &mut temp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut uniform_ptr as *mut _ as *mut c_void,
+            &mut us as *mut _ as *mut c_void,
+            &mut draft_idx_ptr as *mut _ as *mut c_void,
+            &mut draft_prob_ptr as *mut _ as *mut c_void,
+            &mut chain_ptr as *mut _ as *mut c_void,
+            &mut ts as *mut _ as *mut c_void,
+            &mut map_ptr as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions[FUNCTION],
+                [1, 1, 1],
+                [1, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn argmax_token_chain_f32(
         &mut self,
         data: &GpuTensor,
