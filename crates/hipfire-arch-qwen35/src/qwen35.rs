@@ -10608,33 +10608,7 @@ fn forward_prefill_chunk(
                         .as_deref()
                         == Some("1")
                 });
-                static MTP_COMPACT_GDN: std::sync::OnceLock<bool> =
-                    std::sync::OnceLock::new();
-                let mtp_compact_gdn = *MTP_COMPACT_GDN.get_or_init(|| {
-                    std::env::var("HIPFIRE_MTP_COMPACT_GDN")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                }) && gpu.arch_caps.is_gfx1201()
-                    && n == 4
-                    && dn_state.quant == StateQuant::Q8
-                    && config.linear_num_key_heads * 2 == n_v_heads
-                    && tree_parents.is_none();
-                if mtp_compact_gdn {
-                    // Normalize compact Q/K in place and let the recurrent
-                    // kernel map state head h to Q/K head h/2. This is the
-                    // same topology used by the retained AR fast path and
-                    // avoids materializing the duplicated head tensors.
-                    gpu.fused_qk_l2_norm_scale_f32_batched(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        config.linear_num_key_heads,
-                        hd,
-                        1.0 / (hd as f32).sqrt(),
-                        config.norm_eps,
-                        n,
-                    )?;
-                } else if fused_mtp_qk_interleave
+                if fused_mtp_qk_interleave
                     && gpu.arch_caps.is_gfx1201()
                     && n == 4
                     && config.linear_num_key_heads < n_v_heads
@@ -10802,39 +10776,20 @@ fn forward_prefill_chunk(
                                 )?
                             }
                         }
-                        StateQuant::Q8 => {
-                            if mtp_compact_gdn {
-                                gpu.gated_delta_net_q8_compact2(
-                                    &pbs.dn_q_raw_batch,
-                                    &pbs.dn_k_raw_batch,
-                                    &pbs.dn_v_batch,
-                                    &pbs.dn_alpha_batch,
-                                    &pbs.dn_beta_batch,
-                                    &dn_state.s_matrices[delta_layer_idx],
-                                    &dn_state.s_scales[delta_layer_idx],
-                                    &pbs.dn_attn_out_batch,
-                                    n,
-                                    n_v_heads,
-                                    config.linear_value_head_dim,
-                                    dn_state.ef_residual(delta_layer_idx),
-                                )?
-                            } else {
-                                gpu.gated_delta_net_q8_batch_seq(
-                                    &pbs.dn_q_batch,
-                                    &pbs.dn_k_batch,
-                                    &pbs.dn_v_batch,
-                                    &pbs.dn_alpha_batch,
-                                    &pbs.dn_beta_batch,
-                                    &dn_state.s_matrices[delta_layer_idx],
-                                    &dn_state.s_scales[delta_layer_idx],
-                                    &pbs.dn_attn_out_batch,
-                                    n,
-                                    n_v_heads,
-                                    config.linear_value_head_dim,
-                                    dn_state.ef_residual(delta_layer_idx),
-                                )?
-                            }
-                        }
+                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
+                        )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
                             &pbs.dn_k_batch,
