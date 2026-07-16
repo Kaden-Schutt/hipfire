@@ -8,7 +8,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
-use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
+use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -695,9 +695,8 @@ fn match_trailing_qkv_bias<'a>(steps: &'a [Step<'a>], len: usize) -> Option<[&'a
     }
 }
 
-/// Launch a 3-way QKV fused window with the Q/K/V bias folded into the kernel.
-/// Mirrors the QKV arm of [`launch_fused`] but sets `FusedQkvParams.bias`. Only
-/// reached for keys accepted by [`qkv_bias_fold_supported`].
+/// Launch a Qwen2 3-way QKV window through bias-specific kernel symbols.
+/// Qwen3+ continues through [`launch_fused`] and the original Redline ABI.
 fn launch_fused_qkv_with_bias<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -717,19 +716,17 @@ fn launch_fused_qkv_with_bias<'a>(
     let (wk, k) = gemv_weight_out(&steps[2]);
     let (wv, v) = gemv_weight_out(&steps[3]);
     let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);
-    fused_qkv.run(
+    fused_qkv.run_with_qwen2_bias(
         ctx,
         gpu,
-        &FusedQkvParams {
+        &FusedQkvBiasParams {
             kind: key,
-            weights: &[wq.buf, wk.buf, wv.buf],
+            weights: [wq.buf, wk.buf, wv.buf],
             x: activated,
-            outputs: &[q, k, v],
-            m: &[wq.m, wk.m, wv.m],
+            outputs: [q, k, v],
+            m: [wq.m, wk.m, wv.m],
             k: wq.k,
-            rot_scratch: &[],
-            batch_size: None,
-            bias: Some(bias),
+            bias,
         },
     )
 }
@@ -1003,7 +1000,6 @@ fn launch_fused(
                     k: wq.k,
                     rot_scratch: &[],
                     batch_size: None,
-                    bias: None,
                 },
             )
         }
@@ -1028,7 +1024,6 @@ fn launch_fused(
                     k: wg.k,
                     rot_scratch: &[],
                     batch_size: None,
-                    bias: None,
                 },
             )
         }
@@ -1055,7 +1050,6 @@ fn launch_fused(
                     k: wqkv.k,
                     rot_scratch: &[],
                     batch_size: None,
-                    bias: None,
                 },
             )
         }
@@ -1114,7 +1108,6 @@ fn launch_fused(
                     k,
                     rot_scratch: &rot_aliases,
                     batch_size: None,
-                    bias: None,
                 },
             )
         }
@@ -1155,7 +1148,6 @@ fn launch_fused(
                     k,
                     rot_scratch: &rot_aliases,
                     batch_size: None,
-                    bias: None,
                 },
             )
         }
@@ -1195,7 +1187,6 @@ fn launch_fused(
                     k: kk,
                     rot_scratch: &rot_aliases,
                     batch_size: None,
-                    bias: None,
                 },
             )
         }

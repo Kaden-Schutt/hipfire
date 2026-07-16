@@ -2361,8 +2361,7 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // Null bias = byte-identical to the historical (pre-fold) path.
-        self.fused_qkv_hfq4g256_with_bias(
+        self.fused_qkv_hfq4g256_impl(
             a_q,
             a_k,
             a_v,
@@ -2374,19 +2373,12 @@ impl Gpu {
             k_m,
             v_m,
             k,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            None,
         )
     }
 
-    /// Variant of [`Self::fused_qkv_hfq4g256`] that optionally folds the Q/K/V
-    /// `bias_add` into the kernel's lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`).
-    /// Non-null f32 device pointers `bias_q/k/v` are added inside the kernel;
-    /// passing null for all three is byte-identical to the unfused path
-    /// (fp32 store→load→add of the separate `bias_add` == the fused fp32 add,
-    /// same operand order). Called from `execute_steps` when the fold fires on
-    /// a per-row decode arch.
+    /// Qwen2-only bias-fold entry. It uses a distinct kernel symbol and kernarg
+    /// ABI; [`Self::fused_qkv_hfq4g256`] remains unchanged for Qwen3+/Redline.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_qkv_hfq4g256_with_bias(
         &mut self,
@@ -2405,15 +2397,41 @@ impl Gpu {
         bias_k_ptr: *mut c_void,
         bias_v_ptr: *mut c_void,
     ) -> HipResult<()> {
+        self.fused_qkv_hfq4g256_impl(
+            a_q,
+            a_k,
+            a_v,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            q_m,
+            k_m,
+            v_m,
+            k,
+            Some((bias_q_ptr, bias_k_ptr, bias_v_ptr)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fused_qkv_hfq4g256_impl(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        bias: Option<(*mut c_void, *mut c_void, *mut c_void)>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch_caps.gemv_dp4a_enabled() {
-            // The gfx906 dp4a kernel has no bias parameters. The fold is guarded
-            // off for dp4a archs in `execute_steps` (bias applied separately), so
-            // bias must be null here; assert that invariant defensively.
-            debug_assert!(
-                bias_q_ptr.is_null() && bias_k_ptr.is_null() && bias_v_ptr.is_null(),
-                "fused_qkv_hfq4g256_with_bias: bias must be null on the dp4a path"
-            );
+            debug_assert!(bias.is_none(), "Qwen2 bias fold is disabled on dp4a");
             return self.fused_qkv_hfq4g256_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k);
         }
 
@@ -2443,7 +2461,43 @@ impl Gpu {
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
             || gfx1151_wave64;
-        let (func_name, block, grid_x) = if gfx1151_x_buffer {
+        let (func_name, block, grid_x) = if bias.is_some() && cdna_wave64 {
+            let total = (q_m + k_m + v_m) as u32;
+            if self.arch_caps.is_cdna3() && self.flags.gfx942_gemv_v2.unwrap_or(true) {
+                self.ensure_kernel(
+                    "fused_qkv_hfq4g256_v2_gfx942_qwen2_bias",
+                    kernels::FUSED_QKV_HFQ4G256_V2_GFX942_QWEN2_BIAS_SRC,
+                    "fused_qkv_hfq4g256_v2_gfx942_qwen2_bias",
+                )?;
+                (
+                    "fused_qkv_hfq4g256_v2_gfx942_qwen2_bias",
+                    [128u32, 1, 1],
+                    (total + 3) / 4,
+                )
+            } else {
+                self.ensure_kernel(
+                    "fused_qkv_hfq4g256_wave64_qwen2_bias",
+                    kernels::FUSED_QKV_HFQ4G256_WAVE64_QWEN2_BIAS_SRC,
+                    "fused_qkv_hfq4g256_wave64_qwen2_bias",
+                )?;
+                (
+                    "fused_qkv_hfq4g256_wave64_qwen2_bias",
+                    [64u32, 1, 1],
+                    (total + 1) / 2,
+                )
+            }
+        } else if bias.is_some() {
+            self.ensure_kernel(
+                "fused_qkv_hfq4g256_qwen2_bias",
+                kernels::FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC,
+                "fused_qkv_hfq4g256_qwen2_bias",
+            )?;
+            (
+                "fused_qkv_hfq4g256_qwen2_bias",
+                [32u32, 1, 1],
+                (q_m + k_m + v_m) as u32,
+            )
+        } else if gfx1151_x_buffer {
             self.ensure_kernel(
                 "fused_qkv_hfq4g256_k2048_x_buffer_gfx1151",
                 kernels::FUSED_QKV_HFQ4G256_K2048_X_BUFFER_GFX1151_SRC,
@@ -2521,33 +2575,27 @@ impl Gpu {
         let k_m_val = k_m as i32;
         let v_m_val = v_m as i32;
         let k_val = k as i32;
-        // Nullable bias pointers — null is a kernel no-op (byte-identical).
-        let bq = bias_q_ptr;
-        let bk = bias_k_ptr;
-        let bv = bias_v_ptr;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &aq as *const _ as *mut c_void,
-            &ak as *const _ as *mut c_void,
-            &av as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yq as *const _ as *mut c_void,
-            &yk as *const _ as *mut c_void,
-            &yv as *const _ as *mut c_void,
-            &q_m_val as *const _ as *mut c_void,
-            &k_m_val as *const _ as *mut c_void,
-            &v_m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &bq as *const _ as *mut c_void,
-            &bk as *const _ as *mut c_void,
-            &bv as *const _ as *mut c_void,
-        ];
-
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfq4g256", bytes);
-        let result =
+        let result = if let Some((bq, bk, bv)) = bias {
+            let mut params: Vec<*mut c_void> = vec![
+                &aq as *const _ as *mut c_void,
+                &ak as *const _ as *mut c_void,
+                &av as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &yq as *const _ as *mut c_void,
+                &yk as *const _ as *mut c_void,
+                &yv as *const _ as *mut c_void,
+                &q_m_val as *const _ as *mut c_void,
+                &k_m_val as *const _ as *mut c_void,
+                &v_m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &bq as *const _ as *mut c_void,
+                &bk as *const _ as *mut c_void,
+                &bv as *const _ as *mut c_void,
+            ];
             self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(aq);
@@ -2565,7 +2613,37 @@ impl Gpu {
                 b.push_ptr(bk);
                 b.push_ptr(bv);
                 b
-            });
+            })
+        } else {
+            let mut params: Vec<*mut c_void> = vec![
+                &aq as *const _ as *mut c_void,
+                &ak as *const _ as *mut c_void,
+                &av as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &yq as *const _ as *mut c_void,
+                &yk as *const _ as *mut c_void,
+                &yv as *const _ as *mut c_void,
+                &q_m_val as *const _ as *mut c_void,
+                &k_m_val as *const _ as *mut c_void,
+                &v_m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_val);
+                b.push_i32(k_m_val);
+                b.push_i32(v_m_val);
+                b.push_i32(k_val);
+                b
+            })
+        };
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18043,23 +18121,39 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // Null bias = byte-identical to the historical (pre-fold) path.
-        self.fused_qkv_q4k_with_bias(
-            wq,
-            wk,
-            wv,
-            x,
-            yq,
-            yk,
-            yv,
-            q_m,
-            k_m,
-            v_m,
-            k,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+        self.bind_thread()?;
+        self.ensure_kernel("fused_qkv_q4k", kernels::FUSED_QKV_Q4K_SRC, "fused_qkv_q4k")?;
+        let func = &self.functions["fused_qkv_q4k"];
+
+        let mut aq = wq.buf.as_ptr();
+        let mut ak = wk.buf.as_ptr();
+        let mut av = wv.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yqp = yq.buf.as_ptr();
+        let mut ykp = yk.buf.as_ptr();
+        let mut yvp = yv.buf.as_ptr();
+        let mut qm = q_m as i32;
+        let mut km = k_m as i32;
+        let mut vm = v_m as i32;
+        let mut kk = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yqp as *mut _ as *mut c_void,
+            &mut ykp as *mut _ as *mut c_void,
+            &mut yvp as *mut _ as *mut c_void,
+            &mut qm as *mut _ as *mut c_void,
+            &mut km as *mut _ as *mut c_void,
+            &mut vm as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        let grid = (q_m + k_m + v_m) as u32;
+        unsafe {
+            self.hip
+                .launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, None, &mut params)
+        }
     }
 
     /// `fused_qkv_q4k` with an optional Q/K/V bias folded into the kernel's
@@ -18084,8 +18178,12 @@ impl Gpu {
         bias_v_ptr: *mut c_void,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("fused_qkv_q4k", kernels::FUSED_QKV_Q4K_SRC, "fused_qkv_q4k")?;
-        let func = &self.functions["fused_qkv_q4k"];
+        self.ensure_kernel(
+            "fused_qkv_q4k_qwen2_bias",
+            kernels::FUSED_QKV_Q4K_QWEN2_BIAS_SRC,
+            "fused_qkv_q4k_qwen2_bias",
+        )?;
+        let func = &self.functions["fused_qkv_q4k_qwen2_bias"];
 
         let mut aq = wq.buf.as_ptr();
         let mut ak = wk.buf.as_ptr();
@@ -19403,22 +19501,59 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // Null bias = byte-identical to the historical (pre-fold) path.
-        self.fused_qkv_q8_0_with_bias(
-            a_q,
-            a_k,
-            a_v,
-            x,
-            y_q,
-            y_k,
-            y_v,
-            q_m,
-            k_m,
-            v_m,
-            k,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_qkv_q8_0",
+            kernels::FUSED_QKV_Q8_0_SRC,
+            "fused_qkv_q8_0",
+        )?;
+
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_i = q_m as i32;
+        let k_m_i = k_m as i32;
+        let v_m_i = v_m as i32;
+        let k_i = k as i32;
+        let total = (q_m + k_m + v_m) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &k_m_i as *const _ as *mut c_void,
+            &v_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "fused_qkv_q8_0",
+            [total, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_i);
+                b.push_i32(k_m_i);
+                b.push_i32(v_m_i);
+                b.push_i32(k_i);
+                b
+            },
         )
     }
 
@@ -19445,9 +19580,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "fused_qkv_q8_0",
-            kernels::FUSED_QKV_Q8_0_SRC,
-            "fused_qkv_q8_0",
+            "fused_qkv_q8_0_qwen2_bias",
+            kernels::FUSED_QKV_Q8_0_QWEN2_BIAS_SRC,
+            "fused_qkv_q8_0_qwen2_bias",
         )?;
 
         let aq = a_q.buf.as_ptr();
@@ -19484,7 +19619,7 @@ impl Gpu {
         ];
 
         self.launch_maybe_blob(
-            "fused_qkv_q8_0",
+            "fused_qkv_q8_0_qwen2_bias",
             [total, 1, 1],
             [32, 1, 1],
             0,

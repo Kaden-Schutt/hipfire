@@ -1431,23 +1431,69 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // Null bias = byte-identical to the historical (pre-fold) path.
-        self.fused_qkv_mq4g256_lloyd_with_bias(
-            a_q,
-            a_k,
-            a_v,
-            x,
-            y_q,
-            y_k,
-            y_v,
-            q_m,
-            k_m,
-            v_m,
-            k,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+        self.bind_thread()?;
+        let (src, module) = kernels::fused_qkv_mq4g256_lloyd_for_arch(
+            &self.arch_caps,
+            self.flags.lloyd_force_baseline,
+        );
+        self.ensure_kernel(module, src, "fused_qkv_mq4g256_lloyd")?;
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_i = q_m as i32;
+        let k_m_i = k_m as i32;
+        let v_m_i = v_m as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &k_m_i as *const _ as *mut c_void,
+            &v_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let total = (q_m + k_m + v_m) as u32;
+        let bytes = crate::profile::gemv_mq4g256_lloyd_bytes(q_m, k)
+            + crate::profile::gemv_mq4g256_lloyd_bytes(k_m, k)
+            + crate::profile::gemv_mq4g256_lloyd_bytes(v_m, k)
+            - 2 * (k * 4);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_mq4g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_qkv_mq4g256_lloyd",
+            [total, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_i);
+                b.push_i32(k_m_i);
+                b.push_i32(v_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// `fused_qkv_mq4g256_lloyd` with an optional Q/K/V bias folded into the
@@ -1474,11 +1520,11 @@ impl Gpu {
         bias_v_ptr: *mut c_void,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkv_mq4g256_lloyd_for_arch(
+        let (src, module) = kernels::fused_qkv_mq4g256_lloyd_qwen2_bias_for_arch(
             &self.arch_caps,
             self.flags.lloyd_force_baseline,
         );
-        self.ensure_kernel(module, src, "fused_qkv_mq4g256_lloyd")?;
+        self.ensure_kernel(module, src, "fused_qkv_mq4g256_lloyd_qwen2_bias")?;
         let aq = a_q.buf.as_ptr();
         let ak = a_k.buf.as_ptr();
         let av = a_v.buf.as_ptr();
@@ -1517,7 +1563,7 @@ impl Gpu {
         let timer =
             crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_mq4g256_lloyd", bytes);
         let result = self.launch_maybe_blob(
-            "fused_qkv_mq4g256_lloyd",
+            "fused_qkv_mq4g256_lloyd_qwen2_bias",
             [total, 1, 1],
             [32, 1, 1],
             0,
@@ -1807,23 +1853,69 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // Null bias = byte-identical to the historical (pre-fold) path.
-        self.fused_qkv_mq3g256_lloyd_with_bias(
-            a_q,
-            a_k,
-            a_v,
-            x,
-            y_q,
-            y_k,
-            y_v,
-            q_m,
-            k_m,
-            v_m,
-            k,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+        self.bind_thread()?;
+        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(
+            &self.arch_caps,
+            self.flags.lloyd_force_baseline,
+        );
+        self.ensure_kernel(module, src, "fused_qkv_mq3g256_lloyd")?;
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_i = q_m as i32;
+        let k_m_i = k_m as i32;
+        let v_m_i = v_m as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &k_m_i as *const _ as *mut c_void,
+            &v_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let total = (q_m + k_m + v_m) as u32;
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(q_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(k_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(v_m, k)
+            - 2 * (k * 4);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_mq3g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_qkv_mq3g256_lloyd",
+            [total, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_i);
+                b.push_i32(k_m_i);
+                b.push_i32(v_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// `fused_qkv_mq3g256_lloyd` with an optional Q/K/V bias folded into the
@@ -1849,11 +1941,11 @@ impl Gpu {
         bias_v_ptr: *mut c_void,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(
+        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_qwen2_bias_for_arch(
             &self.arch_caps,
             self.flags.lloyd_force_baseline,
         );
-        self.ensure_kernel(module, src, "fused_qkv_mq3g256_lloyd")?;
+        self.ensure_kernel(module, src, "fused_qkv_mq3g256_lloyd_qwen2_bias")?;
         let aq = a_q.buf.as_ptr();
         let ak = a_k.buf.as_ptr();
         let av = a_v.buf.as_ptr();
@@ -1893,7 +1985,7 @@ impl Gpu {
         let timer =
             crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_mq3g256_lloyd", bytes);
         let result = self.launch_maybe_blob(
-            "fused_qkv_mq3g256_lloyd",
+            "fused_qkv_mq3g256_lloyd_qwen2_bias",
             [total, 1, 1],
             [32, 1, 1],
             0,
