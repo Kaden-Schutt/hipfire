@@ -41,35 +41,3 @@ extern "C" __global__ void fused_sigmoid_alpha_gate_f32(
              : ((biased < -20.0f) ? expf(biased) : logf(1.0f + expf(biased)));
     alpha_b[i] = sp * (-expf(a_log[i]));
 }
-
-// MTP verifier variant: publish the post-transform alpha/beta values directly
-// into the rollback tape. This removes two copy dispatches per LA layer while
-// retaining the ordinary live outputs for the verifier's GDN consumer.
-extern "C" __global__ void fused_sigmoid_alpha_gate_f32_tape(
-    float* __restrict__ beta,
-    float* __restrict__ alpha,
-    const float* __restrict__ dt_bias,
-    const float* __restrict__ a_log,
-    float* __restrict__ alpha_tape,
-    float* __restrict__ beta_tape,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
-    const long long batch_off = (long long)blockIdx.y * n;
-    float* beta_b = beta + batch_off;
-    float* alpha_b = alpha + batch_off;
-
-    const float beta_v = 1.0f / (1.0f + expf(-beta_b[i]));
-    beta_b[i] = beta_v;
-
-    float biased = alpha_b[i] + dt_bias[i];
-    float sp = (biased > 20.0f) ? biased
-             : ((biased < -20.0f) ? expf(biased) : logf(1.0f + expf(biased)));
-    const float alpha_v = sp * (-expf(a_log[i]));
-    alpha_b[i] = alpha_v;
-
-    alpha_tape[batch_off + i] = alpha_v;
-    beta_tape[batch_off + i] = beta_v;
-}

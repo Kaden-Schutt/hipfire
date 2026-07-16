@@ -10541,16 +10541,14 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 }
-                static MTP_GATE_TAPE_FUSION: std::sync::OnceLock<bool> =
-                    std::sync::OnceLock::new();
-                let mtp_gate_tape_fusion = *MTP_GATE_TAPE_FUSION.get_or_init(|| {
-                    std::env::var("HIPFIRE_MTP_GATE_TAPE_FUSION")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                }) && gpu.arch_caps.is_gfx1201()
-                    && n == 4
-                    && gdn_tape.is_some();
+                gpu.fused_sigmoid_alpha_gate_f32_batched(
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
+                    n,
+                )?;
                 if let Some(tape) = gdn_tape.as_ref() {
                     let qkv_row_bytes = tape.qkv_dim * 4;
                     let alpha_row_bytes = n_v_heads * 4;
@@ -10564,42 +10562,12 @@ fn forward_prefill_chunk(
                     gpu.copy_f32_replayable(&qkv_src, &qkv_dst, copy_qkv / 4)?;
                     let alpha_dst =
                         tape.alpha_bufs[delta_layer_idx].sub_offset(off_a / 4, copy_a / 4);
+                    let alpha_src = pbs.dn_alpha_batch.sub_offset(0, copy_a / 4);
+                    gpu.copy_f32_replayable(&alpha_src, &alpha_dst, copy_a / 4)?;
                     let beta_dst =
                         tape.beta_bufs[delta_layer_idx].sub_offset(off_a / 4, copy_a / 4);
-                    if mtp_gate_tape_fusion {
-                        gpu.fused_sigmoid_alpha_gate_f32_batched_tape(
-                            &pbs.dn_beta_batch,
-                            &pbs.dn_alpha_batch,
-                            &layer.dt_bias,
-                            &layer.a_log,
-                            &alpha_dst,
-                            &beta_dst,
-                            n_v_heads,
-                            n,
-                        )?;
-                    } else {
-                        gpu.fused_sigmoid_alpha_gate_f32_batched(
-                            &pbs.dn_beta_batch,
-                            &pbs.dn_alpha_batch,
-                            &layer.dt_bias,
-                            &layer.a_log,
-                            n_v_heads,
-                            n,
-                        )?;
-                        let alpha_src = pbs.dn_alpha_batch.sub_offset(0, copy_a / 4);
-                        gpu.copy_f32_replayable(&alpha_src, &alpha_dst, copy_a / 4)?;
-                        let beta_src = pbs.dn_beta_batch.sub_offset(0, copy_a / 4);
-                        gpu.copy_f32_replayable(&beta_src, &beta_dst, copy_a / 4)?;
-                    }
-                } else {
-                    gpu.fused_sigmoid_alpha_gate_f32_batched(
-                        &pbs.dn_beta_batch,
-                        &pbs.dn_alpha_batch,
-                        &layer.dt_bias,
-                        &layer.a_log,
-                        n_v_heads,
-                        n,
-                    )?;
+                    let beta_src = pbs.dn_beta_batch.sub_offset(0, copy_a / 4);
+                    gpu.copy_f32_replayable(&beta_src, &beta_dst, copy_a / 4)?;
                 }
                 // Same tree-aware dispatch gate as dense LA branch above.
                 let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);

@@ -391,16 +391,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(40),
         ]);
     }
-    if kernel == "fused_sigmoid_alpha_gate_f32_tape" {
-        return Some(vec![
-            write(0),
-            write(8),
-            read(16),
-            read(24),
-            write(32),
-            write(40),
-        ]);
-    }
     match kernel {
         "copy_f32_replayable" => Some(vec![read(0), write(8)]),
         "zero_f32_replayable" => Some(vec![write(0)]),
@@ -648,9 +638,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     if kernel == "fused_qkvza_hfq4g256_k2048_scalar_prep" {
         return Some(112);
-    }
-    if kernel == "fused_sigmoid_alpha_gate_f32_tape" {
-        return Some(52);
     }
     if kernel == "moe_router_softmax_topk_k8_wave64"
         || kernel == "moe_router_softmax_topk_k8_wave64_exact"
