@@ -1049,19 +1049,18 @@ impl Gpu {
         result
     }
 
-    /// Exact per-row top-K + log-sum-exp for sampled decode with K <= 20.
+    /// Exact top-K values and indices for sampled decode with K <= 20.
     ///
-    /// This is deliberately a separate kernel from
-    /// [`Self::topk_logsumexp_batched_f32`]. Raising that kernel's compile-time
-    /// `MAX_K` would increase its register/LDS footprint for every existing
-    /// K<=8 caller. Sampled MTP needs the production top_k=20 policy, so it
-    /// gets a dedicated variant and downloads only 20 `(token, logp)` pairs
-    /// per row instead of a full vocabulary-sized probability row.
-    pub fn topk20_logsumexp_batched_f32(
+    /// This reuses the AR sampler's parallel fast-21 reduction: 128 workgroups
+    /// select sorted local supports and a final workgroup merges their heads.
+    /// Rows are stream-ordered and read back together, so a sampled-MTP verify
+    /// transfers only 20 `(token, value)` pairs per row without the serial
+    /// 256x20 merge used by the older DDTree-oriented reducer.
+    pub fn topk20_batched_f32(
         &mut self,
-        logits: &GpuTensor,   // [B × vocab] f32
-        top_idx: &GpuTensor,  // [B × K] i32 (stored in an f32-typed allocation)
-        top_logp: &GpuTensor, // [B × K] f32
+        logits: &GpuTensor,     // [B × vocab] f32
+        top_idx: &GpuTensor,    // [B × K] i32 (stored in an f32-typed allocation)
+        top_values: &GpuTensor, // [B × K] f32
         vocab: usize,
         k: usize,
         b: usize,
@@ -1069,52 +1068,112 @@ impl Gpu {
         self.bind_thread()?;
         assert!(
             k >= 1 && k <= 20,
-            "topk20_logsumexp_batched: K={} must be in [1,20]",
+            "topk20_batched: K={} must be in [1,20]",
             k
         );
 
-        // Keep one source of truth for the selection/reduction algorithm while
-        // compiling this larger-footprint variant under its own module and
-        // entry-point names. minBlocks=1 avoids forcing a register budget that
-        // is impossible to pair with this variant's ~41 KiB dynamic LDS.
-        let source = kernels::TOPK_LOGSUMEXP_BATCHED_SRC
-            .replace("#define MAX_K 8", "#define MAX_K 20")
-            .replace("__launch_bounds__(256, 4)", "__launch_bounds__(256, 1)")
-            .replace(
-                "topk_logsumexp_batched_f32(",
-                "topk20_logsumexp_batched_f32(",
+        const N_BLOCKS: u32 = 128;
+        const REDUCE_K: usize = 21;
+        const PARTIAL_BLOCK: u32 = 256;
+        const FINALIZE_BLOCK: u32 = 128;
+        const FN_PARTIAL: &str = "mtp_topk20_partial";
+        const FN_FINALIZE: &str = "mtp_topk20_finalize";
+        if !self.functions.contains_key(FN_PARTIAL) || !self.functions.contains_key(FN_FINALIZE) {
+            let mut source = kernels::SAMPLE_TOP_P_PARALLEL_SRC
+                .replace(
+                    "#define TOP_K 64",
+                    "#define TOP_K 21\n#define SAMPLE_FAST_STABLE 1",
+                )
+                .replace("sample_apply_repeat_penalty", "mtp_topk20_penalty_unused")
+                .replace("sample_topk_partial", FN_PARTIAL)
+                .replace("sample_topk_finalize", "mtp_topk20_sample_finalize_unused");
+            source.push_str(
+                r#"
+extern "C" __global__ void mtp_topk20_finalize(
+    const float* __restrict__ partial_val,
+    const int*   __restrict__ partial_idx,
+    int n_cand,
+    int*   __restrict__ out_idx,
+    float* __restrict__ out_val,
+    int K
+) {
+    extern __shared__ char smem[];
+    __shared__ float merged_val[TOP_K];
+    __shared__ int   merged_idx[TOP_K];
+    block_merge_sorted_topk(
+        smem, partial_val, partial_idx, n_cand, merged_val, merged_idx);
+    __syncthreads();
+    if ((int)threadIdx.x < K) {
+        out_idx[threadIdx.x] = merged_idx[threadIdx.x];
+        out_val[threadIdx.x] = merged_val[threadIdx.x];
+    }
+}
+"#,
             );
-        self.ensure_kernel(
-            "topk20_logsumexp_batched",
-            &source,
-            "topk20_logsumexp_batched_f32",
-        )?;
-        let func = &self.functions["topk20_logsumexp_batched_f32"];
-        let mut lp = logits.buf.as_ptr();
-        let mut ti = top_idx.buf.as_ptr();
-        let mut tl = top_logp.buf.as_ptr();
-        let mut vs = vocab as i32;
-        let mut kk = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut lp as *mut _ as *mut c_void,
-            &mut ti as *mut _ as *mut c_void,
-            &mut tl as *mut _ as *mut c_void,
-            &mut vs as *mut _ as *mut c_void,
-            &mut kk as *mut _ as *mut c_void,
-        ];
-        const MAX_K: u32 = 20;
-        let nth: u32 = 256;
-        let lds = ((32 + nth * MAX_K * 2) * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [b as u32, 1, 1],
-                [nth, 1, 1],
-                lds,
-                self.stream_ref(),
-                &mut params,
-            )
+            self.ensure_kernel("mtp_topk20_parallel", &source, FN_PARTIAL)?;
+            self.ensure_kernel("mtp_topk20_parallel", &source, FN_FINALIZE)?;
         }
+
+        let n_cand = N_BLOCKS as usize * REDUCE_K;
+        let row_bytes = n_cand * std::mem::size_of::<f32>();
+        let partial_base = self
+            .scratch
+            .ensure_sample_partials(&self.hip, b * row_bytes * 2)?;
+        let all_idx_base = unsafe { (partial_base as *mut u8).add(b * row_bytes) };
+
+        for row in 0..b {
+            let logits_row = logits.sub_offset(row * vocab, vocab);
+            let idx_row = top_idx.sub_offset(row * k, k);
+            let values_row = top_values.sub_offset(row * k, k);
+            let mut logits_ptr = logits_row.buf.as_ptr();
+            let mut partial_val_ptr =
+                unsafe { (partial_base as *mut u8).add(row * row_bytes) as *mut c_void };
+            let mut partial_idx_ptr = unsafe { all_idx_base.add(row * row_bytes) as *mut c_void };
+            let mut vs = vocab as i32;
+            let mut nb = N_BLOCKS as i32;
+            let mut ncand = n_cand as i32;
+            let mut out_idx_ptr = idx_row.buf.as_ptr();
+            let mut out_val_ptr = values_row.buf.as_ptr();
+            let mut kk = k as i32;
+
+            let mut partial_params: Vec<*mut c_void> = vec![
+                &mut logits_ptr as *mut _ as *mut c_void,
+                &mut vs as *mut _ as *mut c_void,
+                &mut nb as *mut _ as *mut c_void,
+                &mut partial_val_ptr as *mut _ as *mut c_void,
+                &mut partial_idx_ptr as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    &self.functions[FN_PARTIAL],
+                    [N_BLOCKS, 1, 1],
+                    [PARTIAL_BLOCK, 1, 1],
+                    PARTIAL_BLOCK * 4 * 2,
+                    self.stream_ref(),
+                    &mut partial_params,
+                )?;
+            }
+
+            let mut finalize_params: Vec<*mut c_void> = vec![
+                &mut partial_val_ptr as *mut _ as *mut c_void,
+                &mut partial_idx_ptr as *mut _ as *mut c_void,
+                &mut ncand as *mut _ as *mut c_void,
+                &mut out_idx_ptr as *mut _ as *mut c_void,
+                &mut out_val_ptr as *mut _ as *mut c_void,
+                &mut kk as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    &self.functions[FN_FINALIZE],
+                    [1, 1, 1],
+                    [FINALIZE_BLOCK, 1, 1],
+                    FINALIZE_BLOCK * 4 * 3,
+                    self.stream_ref(),
+                    &mut finalize_params,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub fn argmax_token_chain_f32(

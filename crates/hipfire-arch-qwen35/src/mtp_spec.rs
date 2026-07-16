@@ -584,7 +584,7 @@ fn exact_sparse_distributions_gpu(
     let k = cfg.top_k.min(vocab);
     let idx_view = top_idx.sub_offset(0, rows * k);
     let logp_view = top_logp.sub_offset(0, rows * k);
-    gpu.topk20_logsumexp_batched_f32(logits, &idx_view, &logp_view, vocab, k, rows)?;
+    gpu.topk20_batched_f32(logits, &idx_view, &logp_view, vocab, k, rows)?;
 
     let mut indices = vec![0i32; rows * k];
     let index_bytes: &mut [u8] = unsafe {
