@@ -442,6 +442,15 @@ def test_branch_head_allows_safe_slash_refs_and_rejects_dot_segments():
     assert runner.calls == []
 
 
+def test_branch_head_accepts_git_plus_and_rejects_invalid_ref_constructs():
+    runner = FakeRunner([result({"ref": "refs/heads/release+stable", "object": {"sha": "c" * 40, "type": "commit"}})])
+    assert GitHubClient(runner).get_branch_head(REPO, "release+stable") == "c" * 40
+    assert runner.calls[0][0][-1].endswith("/git/ref/heads/release%2Bstable")
+    for branch in ("release..stable", "release@{stable}", "release~stable", "release:stable", "release/.lock", "/release", "release/"):
+        with pytest.raises(GitHubBoundaryError):
+            GitHubClient(FakeRunner([])).get_branch_head(REPO, branch)
+
+
 def test_authenticated_config_source_binds_branch_commit_and_policy_blobs(tmp_path):
     paths = (
         ".github/agentic-review/providers.json",

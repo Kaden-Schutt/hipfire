@@ -16,7 +16,7 @@ from .models import ReviewTarget
 
 
 MAX_PATH_BYTES = 4096
-MAX_CHANGED_PATHS = 4096
+MAX_CHANGED_PATHS = 3000
 MAX_TREE_ENTRIES = 65536
 MAX_TOTAL_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BLOB_BYTES = 2 * 1024 * 1024
@@ -243,7 +243,8 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
         or base_tree.get(path, {}).get("mode") != head_tree.get(path, {}).get("mode")
         or base_tree.get(path, {}).get("type") != head_tree.get(path, {}).get("type")
     )
-    if len(changed_paths) > MAX_CHANGED_PATHS:
+    changed_path_cap_hit = len(changed_paths) > MAX_CHANGED_PATHS
+    if changed_path_cap_hit:
         reasons.append("changed path count exceeds item cap")
         changed_paths = changed_paths[:MAX_CHANGED_PATHS]
     manifest: list[ReviewManifestEntry] = []
@@ -252,6 +253,18 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
     for path in changed_paths:
         base = base_tree.get(path)
         head = head_tree.get(path)
+        if changed_path_cap_hit:
+            manifest.append(ReviewManifestEntry(
+                path,
+                base.get("mode") if base else None,
+                head.get("mode") if head else None,
+                base.get("sha") if base and base.get("type") == "blob" else None,
+                head.get("sha") if head and head.get("type") == "blob" else None,
+                None,
+                None,
+            ))
+            files.append(ReviewFile(path, None, None))
+            continue
         if (base and base.get("type") != "blob") or (head and head.get("type") != "blob"):
             entries = [entry for entry in (base, head) if entry is not None]
             if any(entry.get("type") == "commit" or entry.get("mode") == "160000" for entry in entries):
@@ -302,6 +315,8 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
             head_size,
         ))
         files.append(ReviewFile(path, base_source, head_source))
+        if total_bytes > MAX_TOTAL_SOURCE_BYTES:
+            break
     manifest.sort(key=lambda item: item.path)
     files.sort(key=lambda item: item.path)
     complete = not reasons and len(manifest) == len(changed_paths)
@@ -330,13 +345,25 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
         # leak canonical_json's size exception at this trust boundary.
         values = {
             **values,
-            "manifest": (),
+            "manifest": tuple(values["manifest"]),
             "files": (),
             "complete": False,
-            "coverage": ("canonical byte cap prevented full capsule coverage",),
-            "rejections": ("canonical capsule byte limit exceeded",),
+            "coverage": ("canonical byte cap prevented full file coverage",),
+            "rejections": tuple(sorted(set((*values["rejections"], "canonical capsule byte limit exceeded")))),
         }
-        digest = "sha256:" + canonical_digest(
-            {"schema": "agentic-review/review-capsule-v1", **values}, max_bytes=MAX_CANONICAL_BYTES
-        )
+        while True:
+            try:
+                digest = "sha256:" + canonical_digest(
+                    {"schema": "agentic-review/review-capsule-v1", **values}, max_bytes=MAX_CANONICAL_BYTES
+                )
+                break
+            except ValueError:
+                manifest = values["manifest"]
+                if not manifest:
+                    values = {**values, "coverage": ("canonical byte cap prevented file manifest coverage",)}
+                    digest = "sha256:" + canonical_digest(
+                        {"schema": "agentic-review/review-capsule-v1", **values}, max_bytes=MAX_CANONICAL_BYTES
+                    )
+                    break
+                values = {**values, "manifest": manifest[:-1]}
     return ReviewCapsule(digest=digest, **values)

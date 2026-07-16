@@ -158,7 +158,7 @@ class PreflightResult:
 _REPO_SEGMENT = r"(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9_.-]*"
 _REPO = rf"{_REPO_SEGMENT}/{_REPO_SEGMENT}"
 _SHA = r"[A-Za-z0-9][A-Za-z0-9_.:-]*"
-_BRANCH_SEGMENT = r"(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9_.-]*"
+_BRANCH_SEGMENT = r"[A-Za-z0-9._+!$&'(),;=@%~-]+"
 _BRANCH_PATH = rf"{_BRANCH_SEGMENT}(?:/{_BRANCH_SEGMENT})*"
 _LOGIN = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
 _MAX_PAGINATED_PAGES = 16
@@ -238,7 +238,15 @@ def _login(value: str) -> str:
 
 
 def _branch(value: str) -> str:
-    if not isinstance(value, str) or re.fullmatch(_BRANCH_PATH, value) is None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[^/]+(?:/[^/]+)*", value) is None
+        or any(ord(char) < 0x20 or ord(char) == 0x7F or char.isspace() for char in value)
+        or any(char in "~^:?*[\\" for char in value)
+        or ".." in value
+        or "@{" in value
+        or any(segment in {".", ".."} or segment.endswith(".") or segment.endswith(".lock") for segment in value.split("/"))
+    ):
         raise GitHubBoundaryError("branch identifier is unsafe")
     return value
 

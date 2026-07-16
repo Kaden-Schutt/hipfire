@@ -62,11 +62,18 @@ class BoundedHttpTransport:
         self._requests += 1
         if request.method != "POST" or not request.url.startswith("https://") or request.max_response_bytes <= 0:
             raise ToollessInferenceError("HTTP request contract is invalid")
+        deadline = time.monotonic() + request.timeout
+
+        def check_deadline() -> None:
+            if time.monotonic() > deadline:
+                raise ToollessInferenceError("provider request exceeded deadline")
+
         try:
             response = self._opener.open(
                 Request(request.url, data=request.body, headers=dict(request.headers), method=request.method),
                 timeout=request.timeout,
             )
+            check_deadline()
             if 300 <= int(response.status) < 400:
                 raise ToollessInferenceError("HTTP redirects are forbidden")
             headers = {str(key).casefold(): str(value) for key, value in response.headers.items()}
@@ -77,7 +84,9 @@ class BoundedHttpTransport:
                 raise ToollessInferenceError("provider response exceeds byte limit")
             body = bytearray()
             while True:
+                check_deadline()
                 chunk = response.read(min(64 * 1024, request.max_response_bytes - len(body) + 1))
+                check_deadline()
                 if not chunk:
                     break
                 body.extend(chunk)

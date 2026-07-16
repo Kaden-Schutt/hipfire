@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 from urllib.error import HTTPError
 
 import pytest
@@ -336,6 +337,24 @@ def test_owned_transport_disables_redirects_streams_and_bounds_reads():
     streaming = Transport(HttpResponse(200, {"Content-Type": "text/event-stream"}, b"data"))
     with pytest.raises(ToollessInferenceError, match="stream"):
         streaming.send(request)
+
+
+def test_owned_transport_deadline_covers_slow_response_reads(monkeypatch):
+    class SlowResponse:
+        status = 200
+        headers = {"Content-Length": "1"}
+
+        def read(self, size):
+            time.sleep(0.03)
+            return b"x"
+
+    class SlowOpener:
+        def open(self, request, timeout):
+            return SlowResponse()
+
+    monkeypatch.setattr(inference_module, "build_opener", lambda handler: SlowOpener())
+    with pytest.raises(ToollessInferenceError, match="deadline|timed out"):
+        BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.005, 8))
 
 
 @pytest.mark.parametrize("environment_name", ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_API_TOKEN", "GH_ENTERPRISE_TOKEN"])

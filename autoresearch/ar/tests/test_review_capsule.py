@@ -288,3 +288,44 @@ def test_capsule_rejects_oversized_paths_before_blob_fetch():
     assert not capsule.complete
     assert any("path" in reason for reason in capsule.rejections)
     assert client.blob_calls == []
+
+
+def test_changed_file_cap_stops_before_any_blob_retrieval():
+    old_oid = git_blob_oid(b"old\n")
+    new_oid = git_blob_oid(b"new\n")
+    paths = [f"file-{index}.py" for index in range(4096)]
+    client = FakeGitHub(
+        {
+            "merge-tree": tree("merge-tree", [
+                {"path": path, "mode": "100644", "type": "blob", "sha": old_oid} for path in paths
+            ]),
+            "head-tree": tree("head-tree", [
+                {"path": path, "mode": "100644", "type": "blob", "sha": new_oid} for path in paths
+            ]),
+        },
+        {old_oid: blob(old_oid, b"old\n"), new_oid: blob(new_oid, b"new\n")},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert len(capsule.manifest) == 3000
+    assert client.blob_calls == []
+    assert any("count" in reason or "cap" in reason for reason in capsule.rejections)
+
+
+def test_total_source_byte_overflow_stops_remaining_blob_retrieval(monkeypatch):
+    monkeypatch.setattr("autoresearch.ar.review.capsule.MAX_TOTAL_SOURCE_BYTES", 5)
+    payloads = [b"one\n", b"two\n", b"three\n"]
+    oids = [git_blob_oid(payload) for payload in payloads]
+    paths = [f"file-{index}.py" for index in range(3)]
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
+            {"path": path, "mode": "100644", "type": "blob", "sha": oid}
+            for path, oid in zip(paths, oids)
+        ])},
+        {oid: blob(oid, payload) for oid, payload in zip(oids, payloads)},
+    )
+    capsule = build_review_capsule(client, TARGET)
+    assert not capsule.complete
+    assert len(client.blob_calls) == 2
+    assert client.blob_calls[-1][1] == oids[1]
+    assert any("total source bytes" in reason for reason in capsule.rejections)
