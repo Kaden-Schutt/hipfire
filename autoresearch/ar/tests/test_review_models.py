@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 from autoresearch.ar.review.models import (
-    AttemptIntent,
+    AttemptIntentConfig,
     Finding,
     GitHubEnvelope,
+    IntentPayload,
     ProviderPolicy,
     ReviewProposal,
     ReviewTarget,
@@ -25,7 +26,7 @@ from autoresearch.ar.review.models import (
     validate_provider_policy,
     validate_trusted_publishers_policy,
 )
-from autoresearch.ar.review.canonical import canonical_json
+from autoresearch.ar.review.canonical import canonical_digest, canonical_json
 
 
 ROOT = Path(__file__).parents[3]
@@ -64,7 +65,8 @@ def test_contracts_are_frozen():
     assert all(
         getattr(cls, "__dataclass_params__").frozen
         for cls in (
-            AttemptIntent,
+            AttemptIntentConfig,
+            IntentPayload,
             Finding,
             ReviewProposal,
             ValidationRequest,
@@ -352,13 +354,27 @@ def test_trusted_publishers_rejects_generic_app_entry():
 
 
 def test_review_contracts_bind_required_identity_and_target_fields():
-    intent = AttemptIntent(TARGET, "attempt-1", "capability", "suite-v1")
+    intent = AttemptIntentConfig(TARGET, "attempt-1", "capability", "suite-v1")
     assert intent.target == TARGET
     assert set(intent.__dataclass_fields__) == {
         "target", "attempt_id", "capability_id", "suite_revision", "provider_id"
     }
     envelope = GitHubEnvelope({"record_id": "logical-intent"}, "gh-node", "review-bot", "2026-01-01T00:00:00Z")
     assert envelope.node_id == "gh-node"
+
+
+def test_intent_payload_model_matches_protocol_shape():
+    values = {
+        "schema": "agentic-review/v1",
+        "record_type": "intent",
+        "record_id": "logical-intent",
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "attempt_id": "attempt-1",
+    }
+    values["canonical_digest"] = canonical_digest(values)
+    payload = IntentPayload(**values)
+    assert payload.to_mapping()["record_id"] == "logical-intent"
 
     finding = Finding("src/main.py", (1, 2), "warning", "nonblocking")
     proposal = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))

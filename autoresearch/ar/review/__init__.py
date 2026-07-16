@@ -2,9 +2,10 @@
 """Immutable contracts for the repository-owned agentic review workflow."""
 
 from .models import (
-    AttemptIntent,
+    AttemptIntentConfig,
     Finding,
     GitHubEnvelope,
+    IntentPayload,
     ProviderPolicy,
     ReviewProposal,
     ReviewTarget,
@@ -32,9 +33,10 @@ from .protocol import (
 )
 
 __all__ = [
-    "AttemptIntent",
+    "AttemptIntentConfig",
     "Finding",
     "GitHubEnvelope",
+    "IntentPayload",
     "ProviderPolicy",
     "ReviewProposal",
     "ReviewTarget",

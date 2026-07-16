@@ -8,12 +8,14 @@ import json
 import math
 from pathlib import Path
 import re
+from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlparse
 
-from .canonical import canonical_json
+from .canonical import canonical_digest, canonical_json
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_RAW_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _VERDICTS = frozenset({"clean", "changes-requested", "incomplete"})
 ACTIONABLE_SEVERITIES = frozenset({"error"})
 NONBLOCKING_SEVERITIES = frozenset({"warning", "info"})
@@ -133,6 +135,7 @@ class GitHubEnvelope(Mapping[str, Any]):
     def __post_init__(self) -> None:
         if not isinstance(self.payload, Mapping):
             raise ValueError("payload must be a mapping")
+        object.__setattr__(self, "payload", _freeze_payload(self.payload))
         _require_text("node_id", self.node_id)
         _require_text("author", self.author)
         _require_text("created_at", self.created_at)
@@ -149,8 +152,18 @@ class GitHubEnvelope(Mapping[str, Any]):
         return 4
 
 
+def _freeze_payload(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_payload(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_payload(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        raise ValueError("payload must not contain sets")
+    return value
+
+
 @dataclass(frozen=True)
-class AttemptIntent:
+class AttemptIntentConfig:
     target: ReviewTarget
     attempt_id: str
     capability_id: str
@@ -167,6 +180,53 @@ class AttemptIntent:
             ("provider_id", self.provider_id),
         ):
             _require_text(name, value)
+
+
+@dataclass(frozen=True)
+class IntentPayload:
+    """Exact immutable model for the protocol's pre-publication intent payload."""
+
+    schema: str
+    record_type: str
+    record_id: str
+    target: ReviewTarget
+    target_key: str
+    attempt_id: str
+    canonical_digest: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "agentic-review/v1":
+            raise ValueError("intent payload schema must be agentic-review/v1")
+        if self.record_type != "intent":
+            raise ValueError("intent payload record_type must be intent")
+        _require_text("record_id", self.record_id)
+        _require_text("attempt_id", self.attempt_id)
+        if not isinstance(self.target, ReviewTarget):
+            raise ValueError("target must be a ReviewTarget")
+        if self.target_key != self.target.target_key():
+            raise ValueError("intent payload target_key does not match target")
+        if _RAW_SHA256_RE.fullmatch(self.canonical_digest) is None or self.canonical_digest != canonical_digest(
+            {key: value for key, value in self.to_mapping().items() if key != "canonical_digest"}
+        ):
+            raise ValueError("canonical_digest must exactly match the intent payload")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "record_type": self.record_type,
+            "record_id": self.record_id,
+            "target": self.target,
+            "target_key": self.target_key,
+            "attempt_id": self.attempt_id,
+            "canonical_digest": self.canonical_digest,
+        }
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "IntentPayload":
+        expected = {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"}
+        if not isinstance(payload, Mapping) or set(payload) != expected:
+            raise ValueError("invalid intent payload shape")
+        return cls(**payload)
 
 
 @dataclass(frozen=True)

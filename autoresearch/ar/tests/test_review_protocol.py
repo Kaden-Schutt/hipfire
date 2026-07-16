@@ -24,6 +24,7 @@ from autoresearch.ar.review.protocol import (
 VECTORS = json.loads((Path(__file__).parent / "fixtures" / "review_protocol_vectors.json").read_text())
 TARGET = ReviewTarget("owner/repo", 42, "owner/repo", "head-sha", "main", "base-sha", "merge-sha")
 TRUSTED = {"review-bot"}
+SCHEMA = "agentic-review/v1"
 
 
 def _self_digest(payload, field):
@@ -58,6 +59,7 @@ def _intent(
     target=TARGET,
 ):
     payload = {
+        "schema": SCHEMA,
         "record_type": "intent",
         "record_id": record_id,
         "target": target,
@@ -70,6 +72,7 @@ def _intent(
 
 def _report(intent, record_id=None, node_id="gh-report-a", *, created_at="2026-01-01T00:01:00Z", body="report body"):
     payload = {
+        "schema": SCHEMA,
         "record_type": "report",
         "record_id": record_id or "report-" + intent["payload"]["record_id"],
         "target": TARGET,
@@ -88,6 +91,7 @@ def _report(intent, record_id=None, node_id="gh-report-a", *, created_at="2026-0
 def _metadata(intent, report, node_id="gh-metadata-a", *, created_at="2026-01-01T00:02:00Z", record_id="metadata-a"):
     report_payload = report["payload"]
     payload = {
+        "schema": SCHEMA,
         "record_type": "review-metadata",
         "record_id": record_id,
         "target": TARGET,
@@ -108,6 +112,7 @@ def _metadata(intent, report, node_id="gh-metadata-a", *, created_at="2026-01-01
 
 def _completion(intent, report, metadata, node_id="gh-completion-a", *, created_at="2026-01-01T00:03:00Z"):
     payload = {
+        "schema": SCHEMA,
         "record_type": "completion",
         "record_id": "completion-" + intent["payload"]["record_id"],
         "target": TARGET,
@@ -128,6 +133,7 @@ def _completion(intent, report, metadata, node_id="gh-completion-a", *, created_
 
 def _revocation(intent, node_id="gh-revoke-a", *, created_at="2026-01-01T00:04:00Z"):
     payload = {
+        "schema": SCHEMA,
         "record_type": "revocation",
         "record_id": "revocation-" + intent["payload"]["record_id"],
         "target_key": TARGET.target_key(),
@@ -210,6 +216,51 @@ def test_envelopes_bind_payload_and_do_not_accept_spoofed_server_facts():
     tampered = _intent()
     with pytest.raises(ValueError, match="typed GitHubEnvelope"):
         validate_intent(dict(tampered), trusted_authors=TRUSTED)
+
+
+def test_github_envelope_snapshots_nested_payloads_without_aliasing():
+    original = {
+        "schema": SCHEMA,
+        "record_type": "intent",
+        "record_id": "nested-intent",
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "attempt_id": "nested-attempt",
+        "canonical_digest": "digest",
+        "nested": {"items": [1, {"value": "stable"}]},
+    }
+    envelope = GitHubEnvelope(original, "gh-nested", "review-bot", "2026-01-01T00:00:00Z")
+    original["nested"]["items"].append(2)
+    original["target"] = ReviewTarget("other/repo", 1, "other/repo", "other", "main", "base", "merge")
+    assert envelope.payload["nested"]["items"] == (1, {"value": "stable"})
+    validate_append_only([envelope], previous=[envelope])
+
+
+@pytest.mark.parametrize("record_index", range(5))
+@pytest.mark.parametrize("schema", [None, "agentic-review/v2"])
+def test_every_protocol_record_requires_exact_schema_version(record_index, schema):
+    intent = _intent()
+    report = _report(intent)
+    metadata = _metadata(intent, report)
+    completion = _completion(intent, report, metadata)
+    revocation = _revocation(intent)
+    records = [intent, report, metadata, completion, revocation]
+    payload = dict(records[record_index].payload)
+    if schema is None:
+        del payload["schema"]
+    else:
+        payload["schema"] = schema
+    bad = replace(records[record_index], payload=payload)
+    records[record_index] = bad
+    validators = [
+        lambda: validate_intent(bad, trusted_authors=TRUSTED),
+        lambda: validate_report(bad, intent, canonical_intent=intent, trusted_authors=TRUSTED),
+        lambda: validate_review_metadata(bad, intent, report, canonical_intent=intent, trusted_authors=TRUSTED),
+        lambda: validate_completion(bad, intent, report, metadata, canonical_intent=intent, trusted_authors=TRUSTED),
+        lambda: validate_revocation(bad, intent, trusted_authors=TRUSTED),
+    ]
+    with pytest.raises(ValueError, match="schema"):
+        validators[record_index]()
 
 
 def test_post_publication_envelope_facts_are_authenticated_and_trusted():
@@ -308,10 +359,11 @@ def test_duplicate_logical_ids_and_node_ids_rejected_before_lookup():
     with pytest.raises(ValueError, match="logical|record ID|duplicate"):
         validate_protocol([first, second], expected_target=TARGET, trusted_authors=TRUSTED)
     duplicate_attempt = _intent(record_id="different", node_id="node-different")
-    duplicate_attempt["payload"]["attempt_id"] = first["payload"]["attempt_id"]
-    duplicate_attempt["payload"]["canonical_digest"] = canonical_digest(
-        {key: value for key, value in duplicate_attempt["payload"].items() if key != "canonical_digest"}
+    duplicate_payload = dict(duplicate_attempt.payload, attempt_id=first.payload["attempt_id"])
+    duplicate_payload["canonical_digest"] = canonical_digest(
+        {key: value for key, value in duplicate_payload.items() if key != "canonical_digest"}
     )
+    duplicate_attempt = replace(duplicate_attempt, payload=duplicate_payload)
     with pytest.raises(ValueError, match="attempt"):
         elect_canonical_attempt(
             [first, duplicate_attempt], [], expected_target=TARGET, trusted_authors=TRUSTED
@@ -509,10 +561,8 @@ def test_completion_rejects_report_and_metadata_reference_mismatches(field, valu
     intent = _intent()
     report = _report(intent)
     metadata = _metadata(intent, report)
-    completion = _refresh_envelope(dict(_completion(intent, report, metadata), payload={}))
-    completion["payload"].update(_completion(intent, report, metadata)["payload"])
-    completion["payload"][field] = value
-    _refresh_envelope(completion)
+    base_completion = _completion(intent, report, metadata)
+    completion = replace(base_completion, payload=dict(base_completion.payload, **{field: value}))
     with pytest.raises(ValueError, match="report|metadata"):
         validate_completion(
             completion,

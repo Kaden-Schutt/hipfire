@@ -18,6 +18,7 @@ from .models import GitHubEnvelope, ReviewTarget
 
 
 _RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
+_SCHEMA = "agentic-review/v1"
 _SERVER_FIELDS = {"node_id", "author", "created_at", "payload_digest", "intent_node_id"}
 _TARGET_KEYS = {
     "repository", "number", "head_repository", "head_sha", "base_ref", "base_sha", "merge_base_sha"
@@ -100,6 +101,8 @@ def _payload(envelope: Mapping[str, Any]) -> Mapping[str, Any]:
     _text(payload.get("record_id"), "logical record ID")
     if payload.get("record_type") not in _RECORD_TYPES:
         raise ValueError("unknown review record type")
+    if payload.get("schema") != _SCHEMA:
+        raise ValueError("record schema must be agentic-review/v1")
     return payload
 
 
@@ -173,7 +176,7 @@ def validate_intent(
 ) -> str:
     trusted = _trust_policy(trusted_authors)
     payload = _validate_envelope(envelope, trusted)
-    required = {"record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"}
+    required = {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"}
     if set(payload) != required or payload["record_type"] != "intent":
         raise ValueError("invalid intent payload")
     target = _target(payload["target"])
@@ -197,7 +200,7 @@ def validate_report(
     intent = _payload(intent_envelope)
     validate_intent(intent_envelope, trusted_authors=trusted)
     required = {
-        "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
+        "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
         "canonical_intent_node_id", "canonical_intent_digest", "report_body", "report_body_sha256",
     }
     if set(payload) != required or payload["record_type"] != "report":
@@ -233,7 +236,7 @@ def validate_review_metadata(
     report = _payload(report_envelope)
     validate_intent(intent_envelope, trusted_authors=trusted)
     required = {
-        "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
+        "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
         "report_record_id", "report_node_id", "report_digest", "report_body_sha256",
         "canonical_intent_digest", "canonical_intent_node_id", "metadata_digest",
     }
@@ -281,7 +284,7 @@ def validate_completion(
     payload = _validate_envelope(envelope, trusted)
     intent = _payload(intent_envelope)
     required = {
-        "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
+        "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
         "canonical_intent_digest", "canonical_intent_node_id", "report_record_id", "report_node_id",
         "report_digest", "metadata_record_id", "metadata_digest",
     }
@@ -330,7 +333,7 @@ def validate_revocation(
     payload = _validate_envelope(envelope, trusted)
     intent = _payload(intent_envelope)
     validate_intent(intent_envelope, trusted_authors=trusted)
-    required = {"record_type", "record_id", "target_key", "attempt_id", "canonical_intent_digest", "reason"}
+    required = {"schema", "record_type", "record_id", "target_key", "attempt_id", "canonical_intent_digest", "reason"}
     if set(payload) != required or payload["record_type"] != "revocation":
         raise ValueError("invalid revocation payload")
     if payload["target_key"] != intent.get("target_key") or payload["attempt_id"] != intent.get("attempt_id"):
