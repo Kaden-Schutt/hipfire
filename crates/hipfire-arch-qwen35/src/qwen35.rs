@@ -10849,16 +10849,43 @@ fn forward_prefill_chunk(
                         );
                     }
                 }
-                gpu.gated_norm_f32_batched(
-                    &pbs.dn_attn_out_batch,
-                    &pbs.dn_z_batch,
-                    &layer.norm_weight,
-                    &pbs.dn_normed_batch,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                    config.norm_eps,
-                    n,
-                )?;
+                static MTP_GATED_NORM_ROTATE: std::sync::OnceLock<bool> =
+                    std::sync::OnceLock::new();
+                let mtp_gated_norm_rotate = *MTP_GATED_NORM_ROTATE.get_or_init(|| {
+                    std::env::var("HIPFIRE_MTP_GATED_NORM_ROTATE")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                }) && gpu.arch_caps.is_gfx1201()
+                    && n == 4
+                    && n_v_heads == 32
+                    && config.linear_value_head_dim == 128
+                    && layer.wo.k == n_v_heads * config.linear_value_head_dim
+                    && layer.wo.gpu_dtype == DType::MQ4G256
+                    && layer.wo.awq_scale.is_none();
+                if mtp_gated_norm_rotate {
+                    gpu.gated_norm_rotate_mq_batched_gfx12(
+                        &pbs.dn_attn_out_batch,
+                        &pbs.dn_z_batch,
+                        &layer.norm_weight,
+                        &pbs.dn_normed_rot_batch,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                        config.norm_eps,
+                        n,
+                    )?;
+                } else {
+                    gpu.gated_norm_f32_batched(
+                        &pbs.dn_attn_out_batch,
+                        &pbs.dn_z_batch,
+                        &layer.norm_weight,
+                        &pbs.dn_normed_batch,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                        config.norm_eps,
+                        n,
+                    )?;
+                }
                 // wo + residual. Q8 wo lands un-rotated (Q8 weights were
                 // quantized against un-rotated activations); MQ4/MQ6 wo
                 // require FWHT(awq_scale-adjusted) rotation. Mirrors the
@@ -10870,7 +10897,9 @@ fn forward_prefill_chunk(
                 let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
-                let dn_wo_input = if dn_wo_is_q8 {
+                let dn_wo_input = if mtp_gated_norm_rotate {
+                    &pbs.dn_normed_rot_batch
+                } else if dn_wo_is_q8 {
                     &pbs.dn_normed_batch
                 } else if dn_wo_is_paro {
                     // PARO wo: rotate dn_normed by wo's own Givens tables
