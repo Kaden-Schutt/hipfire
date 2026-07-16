@@ -87,6 +87,11 @@ pub struct FeatureFlags {
     /// Compile the gfx1100 A3B MoE gate/up GEMV with its eight K groups fixed
     /// at compile time. Opt-in until exact shadow and tg128 gates promote it.
     pub rdna3_hfq4_moe_gate_up_k2048: bool,
+    /// Use ordinary global weight loads for the exact dense Qwen3.5-27B HFQ4
+    /// decode shapes on gfx1201. The 15 GB trunk streams beyond useful L2
+    /// reuse; model-level PM4 certification promoted this over gfx12 RT-buffer
+    /// loads. Set `HIPFIRE_GFX1201_HFQ4_27B_GLOBAL=0` for the RT control.
+    pub gfx1201_hfq4_27b_global: bool,
     pub mmq_override: Option<bool>,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
@@ -370,6 +375,8 @@ impl FeatureFlags {
             )
             .as_deref()
                 == Ok("1"),
+            gfx1201_hfq4_27b_global: parse_bool("HIPFIRE_GFX1201_HFQ4_27B_GLOBAL")
+                .unwrap_or(arch == "gfx1201"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
@@ -620,6 +627,7 @@ impl FeatureFlags {
             rdna3_hfq4_sigmoid_rows4: false,
             rdna3_hfq4_lm_head_k2048: false,
             rdna3_hfq4_moe_gate_up_k2048: false,
+            gfx1201_hfq4_27b_global: false,
             mmq_override: None,
             mmq_min_batch: None,
             fp16_disabled: false,

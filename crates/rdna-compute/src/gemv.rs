@@ -5068,7 +5068,17 @@ impl Gpu {
         } else {
             None
         };
-        let (src, module, func_name) = if gfx1151_k4096 {
+        let gfx1201_27b_global = self.arch_caps.is_gfx1201()
+            && self.flags.gfx1201_hfq4_27b_global
+            && m == 5_120
+            && matches!(k, 6_144 | 17_408);
+        let (src, module, func_name) = if gfx1201_27b_global {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_GLOBAL_GFX1201_SRC,
+                "gemv_hfq4g256_residual_global_gfx1201",
+                "gemv_hfq4g256_residual_global_gfx1201",
+            )
+        } else if gfx1151_k4096 {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_K4096_GFX1151_SRC,
                 "gemv_hfq4g256_residual_k4096_gfx1151",

@@ -370,7 +370,9 @@ const fn write(offset: usize) -> PointerEffect {
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     if matches!(
         kernel,
-        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
+        "fused_gate_up_hfq4g256"
+            | "fused_gate_up_hfq4g256_global_gfx1201"
+            | "fused_gate_up_hfq4g256_k1024_gfx1201"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -529,6 +531,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(40),
         ]),
         "fused_qkvza_hfq4g256"
+        | "fused_qkvza_hfq4g256_global_gfx1201"
         | "fused_qkvza_hfq4g256_k2048"
         | "fused_qkvza_hfq4g256_k2048_r2"
         | "fused_qkvza_hfq4g256_k2048_cpol_slc"
@@ -589,6 +592,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
+        | "gemv_hfq4g256_residual_global_gfx1201"
         | "gemv_hfq4g256_residual_cpol_rt"
         | "gemv_hfq4g256_residual_cpol_rt_low"
         | "gemv_hfq4g256_residual_cpol_slc"
@@ -643,7 +647,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             write(48),
         ]),
-        "fused_qkv_hfq4g256" => Some(vec![
+        "fused_qkv_hfq4g256" | "fused_qkv_hfq4g256_global_gfx1201" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -688,7 +692,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     if matches!(
         kernel,
-        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
+        "fused_gate_up_hfq4g256"
+            | "fused_gate_up_hfq4g256_global_gfx1201"
+            | "fused_gate_up_hfq4g256_k1024_gfx1201"
     ) {
         return Some(64);
     }
@@ -766,6 +772,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
+        | "gemv_hfq4g256_residual_global_gfx1201"
         | "gemv_hfq4g256_residual_cpol_rt"
         | "gemv_hfq4g256_residual_cpol_rt_low"
         | "gemv_hfq4g256_residual_cpol_slc"
@@ -825,9 +832,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
+        | "fused_qkv_hfq4g256_global_gfx1201"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
+        | "fused_qkvza_hfq4g256_global_gfx1201"
         | "fused_qkvza_hfq4g256_k2048"
         | "fused_qkvza_hfq4g256_k2048_r2"
         | "fused_qkvza_hfq4g256_k2048_cpol_slc"
@@ -2971,6 +2980,7 @@ mod tests {
         "rmsnorm_reduce_gfx1100",
         "rotate_with_rms_gfx1100",
         "fused_qkvza_hfq4g256",
+        "fused_qkvza_hfq4g256_global_gfx1201",
         "fused_qkvza_hfq4g256_k2048",
         "fused_qkvza_hfq4g256_k2048_r2",
         "fused_qkvza_hfq4g256_k2048_cpol_slc",
@@ -2991,6 +3001,7 @@ mod tests {
         "qwen35_fa_prep_gfx1151",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
+        "gemv_hfq4g256_residual_global_gfx1201",
         "gemv_hfq4g256_residual_cpol_rt",
         "gemv_hfq4g256_residual_cpol_rt_low",
         "gemv_hfq4g256_residual_cpol_slc",
@@ -3027,6 +3038,8 @@ mod tests {
         "moe_down_combine_rmsnorm_mq_rotate_vecsum",
         "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
         "fused_qkv_hfq4g256",
+        "fused_qkv_hfq4g256_global_gfx1201",
+        "fused_gate_up_hfq4g256_global_gfx1201",
         "deinterleave_f32",
         "rmsnorm_f32",
         "rope_partial_halfsplit_f32",
@@ -3536,6 +3549,7 @@ mod tests {
         assert_eq!(Pm4RegisterPolicy::from_value("invalid"), None);
         for kernel in [
             "fused_gate_up_hfq4g256",
+            "fused_gate_up_hfq4g256_global_gfx1201",
             "fused_gate_up_hfq4g256_k1024_gfx1201",
         ] {
             assert_eq!(expected_kernarg_bytes(kernel), Some(64));

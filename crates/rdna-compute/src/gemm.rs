@@ -2392,7 +2392,21 @@ impl Gpu {
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
             || gfx1151_wave64;
-        let (func_name, block, grid_x) = if gfx1151_x_buffer {
+        let gfx1201_27b_global = self.arch_caps.is_gfx1201()
+            && self.flags.gfx1201_hfq4_27b_global
+            && k == 5_120
+            && q_m == 12_288
+            && k_m == 1_024
+            && v_m == 1_024;
+        let (func_name, block, grid_x) = if gfx1201_27b_global {
+            let kernel = "fused_qkv_hfq4g256_global_gfx1201";
+            self.ensure_kernel(
+                kernel,
+                kernels::FUSED_QKV_HFQ4G256_GLOBAL_GFX1201_SRC,
+                kernel,
+            )?;
+            (kernel, [32u32, 1, 1], (q_m + k_m + v_m) as u32)
+        } else if gfx1151_x_buffer {
             self.ensure_kernel(
                 "fused_qkv_hfq4g256_k2048_x_buffer_gfx1151",
                 kernels::FUSED_QKV_HFQ4G256_K2048_X_BUFFER_GFX1151_SRC,
@@ -2671,7 +2685,22 @@ impl Gpu {
             });
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
-        let (func_name, block, grid_x) = if rdna3_ldsx8 {
+        let gfx1201_27b_global = self.arch_caps.is_gfx1201()
+            && self.flags.gfx1201_hfq4_27b_global
+            && k == 5_120
+            && qkv_m == 10_240
+            && z_m == 6_144
+            && beta_m == 48
+            && alpha_m == 48;
+        let (func_name, block, grid_x) = if gfx1201_27b_global {
+            let kernel = "fused_qkvza_hfq4g256_global_gfx1201";
+            self.ensure_kernel(
+                kernel,
+                kernels::FUSED_QKVZA_HFQ4G256_GLOBAL_GFX1201_SRC,
+                kernel,
+            )?;
+            (kernel, [32u32, 1, 1], total_m as u32)
+        } else if rdna3_ldsx8 {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_ldsx8_gfx1100",
                 kernels::FUSED_QKVZA_HFQ4G256_LDSX8_GFX1100_SRC,
@@ -18955,6 +18984,19 @@ impl Gpu {
                     (total + 1) / 2,
                 )
             }
+        } else if self.arch_caps.is_gfx1201()
+            && self.flags.gfx1201_hfq4_27b_global
+            && k == 5_120
+            && gate_m == 17_408
+            && up_m == 17_408
+        {
+            let kernel = "fused_gate_up_hfq4g256_global_gfx1201";
+            self.ensure_kernel(
+                kernel,
+                kernels::FUSED_GATE_UP_HFQ4G256_GLOBAL_GFX1201_SRC,
+                kernel,
+            )?;
+            (kernel, [32u32, 1, 1], (gate_m + up_m) as u32)
         } else if self.arch_caps.is_gfx1201() && k == 1024 {
             self.ensure_kernel(
                 "fused_gate_up_hfq4g256_k1024_gfx1201",

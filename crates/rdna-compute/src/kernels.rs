@@ -1220,6 +1220,16 @@ pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
+/// Exact dense Qwen3.5-27B gfx1201 residual policy: the K=6144 attention
+/// output and K=17408 FFN-down matrices are streaming workloads, so preserve
+/// the generic arithmetic while bypassing the RT raw-buffer lowering.
+pub const GEMV_HFQ4G256_RESIDUAL_GLOBAL_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_global_gfx1201\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
 /// Radiowave gfx1151 probe: preserve the generic dual-row arithmetic while
 /// lowering the weight stream to temporal raw-buffer loads. gfx1151 is not in
 /// the gfx1100 dGPU admission set, so this remains inert unless the exact-arch
@@ -2984,6 +2994,13 @@ pub const FUSED_QKVZA_HFQ4G256_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
+pub const FUSED_QKVZA_HFQ4G256_GLOBAL_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_hfq4g256_global_gfx1201\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
 
 /// Exact gfx1151 A3B candidate: preserve the generic one-row schedule while
 /// making K=2048 constant and lowering weights through temporal raw-buffer
@@ -3257,6 +3274,13 @@ pub const FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str =
 // wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
 // variant; grid = q_m + k_m + v_m. Cross-arch.
 pub const FUSED_QKV_HFQ4G256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+);
+pub const FUSED_QKV_HFQ4G256_GLOBAL_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256_global_gfx1201\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
@@ -3599,6 +3623,13 @@ pub const ATTENTION_GQA_WARP_DV_SRC: &str =
 /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per layer).
 /// Grid: [gate_m + up_m, 1, 1]. Each block processes one row from gate or up weight.
 pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+pub const FUSED_GATE_UP_HFQ4G256_GLOBAL_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_global_gfx1201\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
