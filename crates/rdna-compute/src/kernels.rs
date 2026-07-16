@@ -1419,6 +1419,37 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
+/// Exact gfx1151 A3B specialization: expose the fixed eight-group K=2048
+/// contract to LLVM while retaining ordinary global loads and the generic
+/// wave32 schedule. This isolates code shape from raw-buffer cache policy.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+/// gfx1151 occupancy probe: one-group-at-a-time activation/header live range,
+/// fixed K=2048, and ordinary global loads. Kept separate from gfx1100's
+/// admitted buffer/cache policy so one ISA cannot silently tune the other.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_LOW_VGPR_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_LOW_VGPR 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+/// gfx1151 middle-live-range probe: retain two groups of activation/header
+/// state at once, fixed K=2048, with ordinary global loads.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_PAIR_VGPR_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_RDNA3_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_vgpr_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
 /// Exact gfx1151 A3B candidate: expose K=2048 to LLVM and use temporal
 /// raw-buffer weight loads without importing gfx1100 cache or scheduling
 /// policy.

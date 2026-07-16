@@ -6565,6 +6565,24 @@ impl Gpu {
             let fixed_k2048 = self.arch_caps.is_gfx1100()
                 && self.flags.rdna3_hfq4_moe_gate_up_k2048
                 && k == 2_048;
+            static GFX1151_GATE_UP_K2048: OnceLock<bool> = OnceLock::new();
+            let gfx1151_k2048 = self.arch_caps.is_gfx1151()
+                && k == 2_048
+                && *GFX1151_GATE_UP_K2048.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_GATE_UP_K2048").as_deref() == Ok("1")
+                });
+            static GFX1151_GATE_UP_LOW_VGPR: OnceLock<bool> = OnceLock::new();
+            let gfx1151_low_vgpr = self.arch_caps.is_gfx1151()
+                && k == 2_048
+                && *GFX1151_GATE_UP_LOW_VGPR.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_GATE_UP_LOW_VGPR").as_deref() == Ok("1")
+                });
+            static GFX1151_GATE_UP_PAIR_VGPR: OnceLock<bool> = OnceLock::new();
+            let gfx1151_pair_vgpr = self.arch_caps.is_gfx1151()
+                && k == 2_048
+                && *GFX1151_GATE_UP_PAIR_VGPR.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_GATE_UP_PAIR_VGPR").as_deref() == Ok("1")
+                });
             static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
             let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
@@ -6573,7 +6591,40 @@ impl Gpu {
                         || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP").as_deref()
                             == Ok("1")
                 });
-            if pair_vgpr {
+            if gfx1151_low_vgpr {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_low_vgpr_gfx1151",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_LOW_VGPR_GFX1151_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151",
+                    [32u32, 1, 1],
+                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                )
+            } else if gfx1151_pair_vgpr {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_pair_vgpr_gfx1151",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_PAIR_VGPR_GFX1151_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_vgpr_gfx1151",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_vgpr_gfx1151",
+                    [32u32, 1, 1],
+                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                )
+            } else if gfx1151_k2048 {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_k2048_gfx1151",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1151_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151",
+                    [32u32, 1, 1],
+                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                )
+            } else if pair_vgpr {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_pair_slc",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_PAIR_SLC_GFX1100_SRC,
