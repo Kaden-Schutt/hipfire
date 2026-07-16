@@ -2783,6 +2783,18 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_R2_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256_r2.gfx1100.hip")
 );
 
+/// gfx1151 Radiowave dual-row candidate: retain the exact K=2048 two-row
+/// activation reuse schedule while lowering both independent weight streams
+/// through ordinary temporal buffer VMEM. The exact-architecture runtime gate
+/// keeps this from changing gfx1100's admitted R2 artifact or gfx12 codegen.
+pub const FUSED_QKVZA_HFQ4G256_K2048_R2_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_r2.gfx1100.hip")
+);
+
 /// gfx1100 decode experiment: keep the certified K=2048 projection schedule
 /// and fold the beta sigmoid plus alpha softplus/decay preparation into the
 /// two scalar projection tails. This removes one launch per DeltaNet layer.
