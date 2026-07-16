@@ -1,0 +1,64 @@
+# Build-context pruning for Containerfile (podman/docker).
+# The repo working tree carries ~160 GB of build output, venvs, and git
+# worktrees that must NOT be sent to the daemon. Goal: context < ~500 MB
+# (source + kernels/src + cli).
+
+# Rust build output
+/target
+/target-baseline
+**/target
+*.o
+*.so
+*.dll
+
+# Python venv + tooling state
+/.venv
+.venv/
+.serena/
+.remember/
+.codex
+
+# Git worktrees (79 GB + 43 GB on this box)
+/.worktrees
+/.claude
+
+# graphify knowledge-graph output
+/graphify-out
+/crates/graphify-out
+
+# Models & large weight blobs (runtime-only, mounted as a volume)
+/models
+*.gguf
+*.safetensors
+*.hfq
+*.mq2
+*.mq3
+*.mq4
+*.mq6
+
+# Quality-baseline reference dumps (~4.7 GB, mostly untracked) — used only by
+# offline KLD/PPL/astrea eval, never by the build or the GPU gates. The gates
+# read benchmarks/prompts/, which is kept.
+/benchmarks/quality-baselines
+
+# JIT kernel caches (rebuilt inside the container)
+kernels/compiled/
+.hipfire_kernels/
+.hipfire_kernels_*/
+
+# VCS / editor cruft
+/.git
+.gitignore
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Local build directories
+/dev/
+/dist/
+
+# The existing narrow gfx12-precompile helper is out of scope
+docker/
