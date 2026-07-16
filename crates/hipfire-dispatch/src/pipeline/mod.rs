@@ -445,13 +445,16 @@ pub fn run_moe_decode(
         }
     }
     let gfx1100_router_mode = std::env::var("HIPFIRE_GFX1100_ROUTER_W64").ok();
-    let exact_wave64_router = ctx.arch.is_gfx1100()
-        && p.n_exp == 256
-        // The exact fused router is the production gfx1100 path. `0` retains
-        // the two-launch reference path for A/B diagnosis; `approx` retains
-        // the old non-bit-exact research kernel without exposing it by
-        // accident through the former `1` opt-in.
-        && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx"));
+    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151()
+        && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1");
+    let exact_wave64_router = p.n_exp == 256
+        && ((ctx.arch.is_gfx1100()
+            // The exact fused router is the production gfx1100 path. `0` retains
+            // the two-launch reference path for A/B diagnosis; `approx` retains
+            // the old non-bit-exact research kernel without exposing it by
+            // accident through the former `1` opt-in.
+            && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx")))
+            || gfx1151_radiowave_fusions);
     static ROUTER_SHARED_FUSE: OnceLock<bool> = OnceLock::new();
     let router_shared_fuse = exact_wave64_router
         && p.batch_size == 1

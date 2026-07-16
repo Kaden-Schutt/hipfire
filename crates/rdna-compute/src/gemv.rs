@@ -2024,7 +2024,11 @@ impl Gpu {
                 x, weight, x_rot, k, eps,
             );
         }
-        let vecsum = self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_vecsum && k == 2048;
+        let gfx1151_radiowave_fusions = self.arch_caps.is_gfx1151()
+            && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1");
+        let vecsum = k == 2048
+            && ((self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_vecsum)
+                || gfx1151_radiowave_fusions);
         let sign_lds = vecsum && self.flags.rdna3_rmsnorm_sign_lds;
         let sign_const = vecsum && self.flags.rdna3_rmsnorm_sign_const;
         let (kernel, source) = if sign_const {
