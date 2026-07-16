@@ -143,6 +143,20 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     )
 }
 
+fn mtp_exact_host_sample_enabled_from_env() -> bool {
+    // Diagnostic oracle: use the same exact top-k/min-p/top-p ordering as the
+    // host sampler for both proposal and target distributions. This is much
+    // slower than the resident GPU path, but it cleanly separates sampling
+    // math from MTP state/rollback correctness while the GPU sparse sampler is
+    // brought to parity.
+    matches!(
+        std::env::var("HIPFIRE_MTP_EXACT_HOST_SAMPLE")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
 /// Default draft-confidence cutoff (adaptive-K) per arch. p_min=0.6 truncates
 /// the low-confidence tail of the K-chain — a win measured on the gfx1100 dGPU
 /// (2026-06-16 sweep: lifts every domain, even high-τ code +11%; 0.6 is the
@@ -365,6 +379,77 @@ pub fn sample_from_logits(logits: &[f32], cfg: &MtpSamplingConfig, rng: &mut Mtp
     // Numerical edge case: fall through to last.
     let last = probs.len() - 1;
     (pairs[last].0, probs[last] as f32)
+}
+
+/// Exact dense distribution for the host sampling oracle. The ordering is the
+/// same as [`sample_from_logits`]: top-k on logits, softmax over that retained
+/// set, min-p, then top-p, with renormalization after each cut.
+fn exact_truncated_distribution(logits: &[f32], cfg: &MtpSamplingConfig) -> Vec<f32> {
+    assert!(!logits.is_empty());
+    assert!(cfg.temp > 0.0);
+
+    let inv_temp = 1.0 / cfg.temp as f64;
+    let mut pairs: Vec<(usize, f64)> = logits
+        .iter()
+        .enumerate()
+        .map(|(index, &logit)| (index, logit as f64 * inv_temp))
+        .collect();
+    if cfg.top_k > 0 && cfg.top_k < pairs.len() {
+        pairs.select_nth_unstable_by(cfg.top_k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less)
+        });
+        pairs.truncate(cfg.top_k);
+    }
+    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
+
+    let max_logit = pairs[0].1;
+    let mut probs: Vec<f64> = pairs
+        .iter()
+        .map(|(_, logit)| (*logit - max_logit).exp())
+        .collect();
+    let mut mass: f64 = probs.iter().sum();
+    for probability in &mut probs {
+        *probability /= mass;
+    }
+
+    if cfg.min_p > 0.0 {
+        let threshold = cfg.min_p as f64 * probs[0];
+        let cutoff = probs
+            .iter()
+            .position(|&probability| probability < threshold)
+            .unwrap_or(probs.len())
+            .max(1);
+        pairs.truncate(cutoff);
+        probs.truncate(cutoff);
+        mass = probs.iter().sum();
+        for probability in &mut probs {
+            *probability /= mass;
+        }
+    }
+
+    if cfg.top_p < 1.0 {
+        let mut cumulative = 0.0f64;
+        let mut cutoff = probs.len();
+        for (index, &probability) in probs.iter().enumerate() {
+            cumulative += probability;
+            if cumulative >= cfg.top_p as f64 {
+                cutoff = index + 1;
+                break;
+            }
+        }
+        pairs.truncate(cutoff);
+        probs.truncate(cutoff);
+        mass = probs.iter().sum();
+        for probability in &mut probs {
+            *probability /= mass;
+        }
+    }
+
+    let mut dense = vec![0.0f32; logits.len()];
+    for ((index, _), probability) in pairs.into_iter().zip(probs) {
+        dense[index] = probability as f32;
+    }
+    dense
 }
 
 /// Compute the temperature-scaled softmax probability of a single token at
@@ -809,10 +894,6 @@ impl MtpSpecState {
 
     pub fn extend_sampling_history(&mut self, tokens: &[u32]) {
         self.sampling_history.extend_from_slice(tokens);
-    }
-
-    pub fn pop_sampling_history(&mut self) -> Option<u32> {
-        self.sampling_history.pop()
     }
 
     /// Allocate `mtp_lm_logits_compressed` shape `[max_n * cvs]` for the
@@ -2262,7 +2343,6 @@ pub fn spec_step_mtp_compressed(
 /// Full-vocab only: `candidates[k]` is already the trunk token id (vocab_map is
 /// None in full-vocab mode), so it indexes the target softmax row directly.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn mtp_sampled_accept(
     gpu: &mut Gpu,
     state: &mut MtpSpecState,
@@ -2270,6 +2350,7 @@ fn mtp_sampled_accept(
     draft_probs: &[f32],
     draft_taus: &[f32],
     draft_zs: &[f32],
+    exact_draft_rows: Option<&[Vec<f32>]>,
     draft_vocab_map: Option<&[u32]>,
     candidates: &[u32],
     drafts_generated: usize,
@@ -2282,6 +2363,60 @@ fn mtp_sampled_accept(
     committed: &mut Vec<u32>,
     accept_count: &mut usize,
 ) -> HipResult<bool> {
+    if let Some(draft_rows) = exact_draft_rows {
+        let target_logits = gpu.download_f32(logits_view)?;
+        debug_assert_eq!(target_logits.len(), (drafts_generated + 1) * vocab);
+        debug_assert_eq!(draft_rows.len(), drafts_generated);
+
+        for k in 0..drafts_generated {
+            let target_row = exact_truncated_distribution(
+                &target_logits[k * vocab..(k + 1) * vocab],
+                &state.sampling,
+            );
+            let p_d = draft_probs[k].max(f32::MIN_POSITIVE);
+            let p_t = target_row[candidates[k] as usize];
+            let u = state.rng.next_uniform_f32();
+            if u * p_d <= p_t {
+                committed.push(candidates[k]);
+                *accept_count += 1;
+                if candidates[k] == eos_token_id {
+                    return Ok(true);
+                }
+                continue;
+            }
+
+            let draft_row = if let Some(vocab_map) = draft_vocab_map {
+                let mut full = vec![0.0f32; vocab];
+                for (draft_id, &probability) in draft_rows[k].iter().enumerate() {
+                    if probability > 0.0 {
+                        full[vocab_map[draft_id] as usize] += probability;
+                    }
+                }
+                full
+            } else {
+                draft_rows[k].clone()
+            };
+            let bonus = sample_residual(
+                &target_row,
+                &draft_row,
+                state.rng.next_uniform_f32(),
+            );
+            committed.push(bonus);
+            return Ok(bonus == eos_token_id);
+        }
+
+        let bonus_row = exact_truncated_distribution(
+            &target_logits[drafts_generated * vocab..(drafts_generated + 1) * vocab],
+            &state.sampling,
+        );
+        let bonus = crate::speculative::sample_categorical(
+            &bonus_row,
+            state.rng.next_uniform_f32(),
+        );
+        committed.push(bonus);
+        return Ok(bonus == eos_token_id);
+    }
+
     // Target nucleus rows for ALL n_verify = drafts_generated + 1 positions.
     // Keep the dense rows resident: acceptance needs only K gathered scalars;
     // the all-accepted bonus is sampled on-device; and only an actual rejection
@@ -2810,6 +2945,12 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         Vec::new()
     };
+    let exact_host_sampling = use_sampling && mtp_exact_host_sample_enabled_from_env();
+    let mut exact_draft_rows: Vec<Vec<f32>> = if exact_host_sampling {
+        Vec::with_capacity(max_n)
+    } else {
+        Vec::new()
+    };
     let penalties_active = sampling.penalties_active();
     let use_device_token_chain = mtp_device_token_chain_enabled_from_env()
         && mtp_device_token_chain_eligible_for(
@@ -3064,71 +3205,89 @@ pub fn spec_step_mtp_compressed_serial(
 
             let draft_idx: usize;
             if use_sampling {
-                // Keep each draft distribution in its native (full or
-                // compressed) device row. The categorical draw returns only a
-                // token id and its effective probability; a dense row crosses
-                // to host only if this exact draft is later rejected.
-                debug_assert_eq!(argmax_vocab, state.mtp_sample_draft_vocab);
-                let probs_gpu = state
-                    .mtp_sample_draft_probs
-                    .sub_offset(k * argmax_vocab, argmax_vocab);
-                let tau_gpu = state.mtp_sample_draft_tau.sub_offset(k, 1);
-                let z_gpu = state.mtp_sample_draft_z.sub_offset(k, 1);
-                gpu.softmax_temp_topp_batched_into_f32(
-                    logits_for_argmax,
-                    &probs_gpu,
-                    &tau_gpu,
-                    &z_gpu,
-                    argmax_vocab,
-                    /* rows */ 1,
-                    sampling.temp,
-                    sampling.top_p,
-                    sampling.top_k,
-                    sampling.min_p,
-                )?;
-                let sampled_index = state.mtp_sample_draft_indices.sub_offset(k, 1);
-                let sampled_prob = state.mtp_sample_draft_prob_at_token.sub_offset(k, 1);
-                let seed = {
-                    let bits = state.rng.next_u64();
-                    ((bits >> 32) as u32 ^ bits as u32) | 1
-                };
-                gpu.batched_categorical_sample_f32(
-                    &probs_gpu,
-                    &tau_gpu,
-                    &z_gpu,
-                    &sampled_index,
-                    &sampled_prob,
-                    argmax_vocab,
-                    1,
-                    seed,
-                )?;
-
-                let mut sampled_index_host = 0i32;
-                let sampled_index_bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        &mut sampled_index_host as *mut i32 as *mut u8,
-                        std::mem::size_of::<i32>(),
-                    )
-                };
-                gpu.hip
-                    .memcpy_dtoh(sampled_index_bytes, &sampled_index.buf)?;
-                draft_idx = sampled_index_host as usize;
-                let sampled_prob_host = gpu.download_f32(&sampled_prob)?[0];
-                let tau = gpu.download_f32(&tau_gpu)?[0];
-                let z = gpu.download_f32(&z_gpu)?[0];
-                draft_probs.push(sampled_prob_host);
-                draft_taus.push(tau);
-                draft_zs.push(z);
-
-                // SampledPMin reads max(raw softmax), never the post-truncation
-                // probability at the sampled token. Reduce that scalar on GPU.
-                let top_prob = if use_sampled_pmin {
-                    let max_out = state.mtp_topk_logp.sub_offset(0, 1);
-                    gpu.max_value_f32(&probs_gpu, &max_out, argmax_vocab)?;
-                    gpu.download_f32(&max_out)?[0]
+                let top_prob;
+                if exact_host_sampling {
+                    let logits_host = gpu.download_f32(logits_for_argmax)?;
+                    let distribution = exact_truncated_distribution(&logits_host, &sampling);
+                    draft_idx = crate::speculative::sample_categorical(
+                        &distribution,
+                        state.rng.next_uniform_f32(),
+                    ) as usize;
+                    draft_probs.push(distribution[draft_idx]);
+                    draft_taus.push(0.0);
+                    draft_zs.push(1.0);
+                    top_prob = distribution
+                        .iter()
+                        .copied()
+                        .fold(0.0f32, f32::max);
+                    exact_draft_rows.push(distribution);
                 } else {
-                    0.0
-                };
+                    // Keep each draft distribution in its native (full or
+                    // compressed) device row. The categorical draw returns only a
+                    // token id and its effective probability; a dense row crosses
+                    // to host only if this exact draft is later rejected.
+                    debug_assert_eq!(argmax_vocab, state.mtp_sample_draft_vocab);
+                    let probs_gpu = state
+                        .mtp_sample_draft_probs
+                        .sub_offset(k * argmax_vocab, argmax_vocab);
+                    let tau_gpu = state.mtp_sample_draft_tau.sub_offset(k, 1);
+                    let z_gpu = state.mtp_sample_draft_z.sub_offset(k, 1);
+                    gpu.softmax_temp_topp_batched_into_f32(
+                        logits_for_argmax,
+                        &probs_gpu,
+                        &tau_gpu,
+                        &z_gpu,
+                        argmax_vocab,
+                        /* rows */ 1,
+                        sampling.temp,
+                        sampling.top_p,
+                        sampling.top_k,
+                        sampling.min_p,
+                    )?;
+                    let sampled_index = state.mtp_sample_draft_indices.sub_offset(k, 1);
+                    let sampled_prob = state.mtp_sample_draft_prob_at_token.sub_offset(k, 1);
+                    let seed = {
+                        let bits = state.rng.next_u64();
+                        ((bits >> 32) as u32 ^ bits as u32) | 1
+                    };
+                    gpu.batched_categorical_sample_f32(
+                        &probs_gpu,
+                        &tau_gpu,
+                        &z_gpu,
+                        &sampled_index,
+                        &sampled_prob,
+                        argmax_vocab,
+                        1,
+                        seed,
+                    )?;
+
+                    let mut sampled_index_host = 0i32;
+                    let sampled_index_bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            &mut sampled_index_host as *mut i32 as *mut u8,
+                            std::mem::size_of::<i32>(),
+                        )
+                    };
+                    gpu.hip
+                        .memcpy_dtoh(sampled_index_bytes, &sampled_index.buf)?;
+                    draft_idx = sampled_index_host as usize;
+                    let sampled_prob_host = gpu.download_f32(&sampled_prob)?[0];
+                    let tau = gpu.download_f32(&tau_gpu)?[0];
+                    let z = gpu.download_f32(&z_gpu)?[0];
+                    draft_probs.push(sampled_prob_host);
+                    draft_taus.push(tau);
+                    draft_zs.push(z);
+
+                    // SampledPMin reads max(raw softmax), never the
+                    // post-truncation probability at the sampled token.
+                    top_prob = if use_sampled_pmin {
+                        let max_out = state.mtp_topk_logp.sub_offset(0, 1);
+                        gpu.max_value_f32(&probs_gpu, &max_out, argmax_vocab)?;
+                        gpu.download_f32(&max_out)?[0]
+                    } else {
+                        0.0
+                    };
+                }
                 assert!(
                     draft_idx < argmax_vocab,
                     "draft sample {draft_idx} out of draft vocab {argmax_vocab}"
@@ -3479,6 +3638,7 @@ pub fn spec_step_mtp_compressed_serial(
             &draft_probs,
             &draft_taus,
             &draft_zs,
+            exact_host_sampling.then_some(exact_draft_rows.as_slice()),
             vocab_map_opt.map(Vec::as_slice),
             &candidates,
             drafts_generated,
@@ -3648,6 +3808,19 @@ pub fn spec_step_mtp_compressed_serial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_host_distribution_applies_top_k_before_top_p() {
+        let cfg = MtpSamplingConfig {
+            temp: 1.0,
+            top_k: 2,
+            top_p: 0.70,
+            ..MtpSamplingConfig::default()
+        };
+        let distribution = exact_truncated_distribution(&[4.0, 3.0, 2.0, 1.0], &cfg);
+
+        assert_eq!(distribution, vec![1.0, 0.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn trunk_spine_verify_tokens_are_seed_plus_candidates() {
