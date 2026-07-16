@@ -2874,6 +2874,13 @@ pub fn spec_step_mtp_compressed_serial(
             scratch.draft_probs.byte_size(),
             stream,
         )?;
+        if use_redline_proposal {
+            // The retained proposal runs on Redline's own queue. Order the
+            // HIP-stream clear before its scatter dispatches; otherwise the
+            // async memset can race and erase freshly scattered draft mass,
+            // collapsing sampled acceptance while leaving final tokens valid.
+            gpu.hip.stream_synchronize(stream)?;
+        }
     }
 
     // ── 1. K serial discrete-token roundtrips ─────────────────────────────
