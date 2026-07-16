@@ -71,16 +71,20 @@ def _target(value: Any) -> ReviewTarget:
         raise ValueError("invalid ReviewTarget") from exc
 
 
-def _time(envelope: Mapping[str, Any]) -> datetime:
-    value = _text(envelope.get("created_at"), "created_at")
+def _parse_time(value: Any, name: str) -> datetime:
+    value = _text(value, name)
     try:
         normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
         timestamp = datetime.fromisoformat(normalized)
     except ValueError as exc:
-        raise ValueError("created_at must be an ISO-8601 timestamp") from exc
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from exc
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise ValueError("created_at must include a timezone")
+        raise ValueError(f"{name} must include a timezone")
     return timestamp.astimezone(timezone.utc)
+
+
+def _time(envelope: Mapping[str, Any]) -> datetime:
+    return _parse_time(envelope.get("created_at"), "created_at")
 
 
 def _event_key(envelope: Mapping[str, Any]) -> tuple[datetime, str]:
@@ -112,7 +116,8 @@ def _validate_envelope(envelope: Mapping[str, Any], trusted: frozenset[str]) -> 
     payload = _payload(envelope.payload)
     _text(envelope.node_id, "node_id")
     _require_author(envelope, trusted)
-    _time(envelope)
+    if _parse_time(envelope.updated_at, "updated_at") != _time(envelope):
+        raise ValueError("edited protocol records are not allowed: updated_at differs from created_at")
     return payload
 
 
@@ -356,6 +361,8 @@ def _unique_records(records: Sequence[Mapping[str, Any]], trusted: frozenset[str
         if not isinstance(envelope, GitHubEnvelope):
             raise ValueError("append-only history requires typed GitHubEnvelope values")
         payload = envelope.payload
+        if _parse_time(envelope.updated_at, "updated_at") != _time(envelope):
+            raise ValueError("edited protocol records are not allowed: updated_at differs from created_at")
         logical_id = _record_id(envelope)
         node_id = _text(envelope.get("node_id"), "node_id")
         if logical_id in logical:

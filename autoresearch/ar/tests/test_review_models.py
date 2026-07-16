@@ -359,8 +359,15 @@ def test_review_contracts_bind_required_identity_and_target_fields():
     assert set(intent.__dataclass_fields__) == {
         "target", "attempt_id", "capability_id", "suite_revision", "provider_id"
     }
-    envelope = GitHubEnvelope({"record_id": "logical-intent"}, "gh-node", "review-bot", "2026-01-01T00:00:00Z")
+    envelope = GitHubEnvelope(
+        {"record_id": "logical-intent"}, "gh-node", "review-bot", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"
+    )
     assert envelope.node_id == "gh-node"
+    finding = Finding("src/main.py", (1, 2), "warning", "nonblocking")
+    proposal = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))
+    assert proposal.findings == (finding,)
+    request = ValidationRequest(TARGET, "request-1", "capability", "sha256:" + "a" * 64, "sha256:" + "b" * 64)
+    assert request.target == TARGET
 
 
 def test_intent_payload_model_matches_protocol_shape():
@@ -376,11 +383,34 @@ def test_intent_payload_model_matches_protocol_shape():
     payload = IntentPayload(**values)
     assert payload.to_mapping()["record_id"] == "logical-intent"
 
-    finding = Finding("src/main.py", (1, 2), "warning", "nonblocking")
-    proposal = ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (finding,))
-    assert proposal.findings == (finding,)
-    request = ValidationRequest(TARGET, "request-1", "capability", "sha256:" + "a" * 64, "sha256:" + "b" * 64)
-    assert request.target == TARGET
+
+def test_intent_payload_json_round_trip_normalizes_target_mapping():
+    values = {
+        "schema": "agentic-review/v1",
+        "record_type": "intent",
+        "record_id": "logical-intent",
+        "target": TARGET,
+        "target_key": TARGET.target_key(),
+        "attempt_id": "attempt-1",
+    }
+    values["target"] = {
+        "repository": TARGET.repository,
+        "number": TARGET.number,
+        "head_repository": TARGET.head_repository,
+        "head_sha": TARGET.head_sha,
+        "base_ref": TARGET.base_ref,
+        "base_sha": TARGET.base_sha,
+        "merge_base_sha": TARGET.merge_base_sha,
+    }
+    values["canonical_digest"] = canonical_digest(values)
+    decoded = json.loads(canonical_json(values).decode())
+    model = IntentPayload.from_mapping(decoded)
+    assert model.target == TARGET
+    assert canonical_json(model.to_mapping()) == canonical_json(decoded)
+    decoded["target"]["extra"] = "reject"
+    with pytest.raises(ValueError, match="target|shape"):
+        IntentPayload.from_mapping(decoded)
+
 
 
 @pytest.mark.parametrize("severity", ["critical", "blocker", "unknown"])

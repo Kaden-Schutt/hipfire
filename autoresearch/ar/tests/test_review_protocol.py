@@ -32,8 +32,21 @@ def _self_digest(payload, field):
     return payload
 
 
-def _envelope(payload, node_id, *, author="review-bot", created_at="2026-01-01T00:00:00Z"):
-    return GitHubEnvelope(payload=payload, node_id=node_id, author=author, created_at=created_at)
+def _envelope(
+    payload,
+    node_id,
+    *,
+    author="review-bot",
+    created_at="2026-01-01T00:00:00Z",
+    updated_at=None,
+):
+    return GitHubEnvelope(
+        payload=payload,
+        node_id=node_id,
+        author=author,
+        created_at=created_at,
+        updated_at=updated_at or created_at,
+    )
 
 
 def _refresh_envelope(envelope):
@@ -44,6 +57,7 @@ def _refresh_envelope(envelope):
         node_id=envelope["node_id"],
         author=envelope["author"],
         created_at=envelope["created_at"],
+        updated_at=envelope.get("updated_at", envelope["created_at"]),
     )
 
 
@@ -229,7 +243,9 @@ def test_github_envelope_snapshots_nested_payloads_without_aliasing():
         "canonical_digest": "digest",
         "nested": {"items": [1, {"value": "stable"}]},
     }
-    envelope = GitHubEnvelope(original, "gh-nested", "review-bot", "2026-01-01T00:00:00Z")
+    envelope = GitHubEnvelope(
+        original, "gh-nested", "review-bot", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"
+    )
     original["nested"]["items"].append(2)
     original["target"] = ReviewTarget("other/repo", 1, "other/repo", "other", "main", "base", "merge")
     assert envelope.payload["nested"]["items"] == (1, {"value": "stable"})
@@ -272,6 +288,28 @@ def test_post_publication_envelope_facts_are_authenticated_and_trusted():
     # The protocol consumes the typed envelope; provenance is authenticated by
     # the future fixed-endpoint client, not by this validator.
     assert validate_intent(replace(intent, node_id="different-node"), trusted_authors=TRUSTED)
+
+
+def test_unedited_envelope_is_accepted_and_edited_records_are_rejected():
+    intent = _intent()
+    report = _report(intent)
+    metadata = _metadata(intent, report)
+    validate_intent(intent, trusted_authors=TRUSTED)
+    validate_report(report, intent, canonical_intent=intent, trusted_authors=TRUSTED)
+    validate_review_metadata(metadata, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)
+    for edited, validator in (
+        (replace(intent, updated_at="2026-01-01T00:01:00Z"), lambda item: validate_intent(item, trusted_authors=TRUSTED)),
+        (replace(report, updated_at="2026-01-01T00:02:00Z"), lambda item: validate_report(item, intent, canonical_intent=intent, trusted_authors=TRUSTED)),
+        (replace(metadata, updated_at="2026-01-01T00:03:00Z"), lambda item: validate_review_metadata(item, intent, report, canonical_intent=intent, trusted_authors=TRUSTED)),
+    ):
+        with pytest.raises(ValueError, match="updated_at|edited"):
+            validator(edited)
+
+
+def test_updated_at_must_be_an_aware_timestamp():
+    intent = _intent()
+    with pytest.raises(ValueError, match="updated_at|timezone"):
+        validate_intent(replace(intent, updated_at="2026-01-01T00:00:00"), trusted_authors=TRUSTED)
 
 
 def test_valid_history_binds_report_metadata_and_completion_to_envelopes():

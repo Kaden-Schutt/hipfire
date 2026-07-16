@@ -131,6 +131,7 @@ class GitHubEnvelope(Mapping[str, Any]):
     node_id: str
     author: str
     created_at: str
+    updated_at: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload, Mapping):
@@ -139,17 +140,18 @@ class GitHubEnvelope(Mapping[str, Any]):
         _require_text("node_id", self.node_id)
         _require_text("author", self.author)
         _require_text("created_at", self.created_at)
+        _require_text("updated_at", self.updated_at)
 
     def __getitem__(self, key: str) -> Any:
-        if key not in {"payload", "node_id", "author", "created_at"}:
+        if key not in {"payload", "node_id", "author", "created_at", "updated_at"}:
             raise KeyError(key)
         return getattr(self, key)
 
     def __iter__(self):
-        return iter(("payload", "node_id", "author", "created_at"))
+        return iter(("payload", "node_id", "author", "created_at", "updated_at"))
 
     def __len__(self) -> int:
-        return 4
+        return 5
 
 
 def _freeze_payload(value: Any) -> Any:
@@ -226,7 +228,17 @@ class IntentPayload:
         expected = {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"}
         if not isinstance(payload, Mapping) or set(payload) != expected:
             raise ValueError("invalid intent payload shape")
-        return cls(**payload)
+        target = payload["target"]
+        target_keys = {
+            "repository", "number", "head_repository", "head_sha", "base_ref", "base_sha", "merge_base_sha"
+        }
+        if not isinstance(target, ReviewTarget):
+            if not isinstance(target, Mapping) or set(target) != target_keys:
+                raise ValueError("invalid intent payload target shape")
+            target = ReviewTarget(**target)
+        values = dict(payload)
+        values["target"] = target
+        return cls(**values)
 
 
 @dataclass(frozen=True)
