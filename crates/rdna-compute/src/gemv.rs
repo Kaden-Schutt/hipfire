@@ -6249,7 +6249,7 @@ impl Gpu {
         )
     }
 
-    /// gfx1100 heterogeneous dispatch for the two independent operations
+    /// gfx1100/gfx1151 heterogeneous dispatch for the two independent operations
     /// immediately following the fused gate-side projection: exact router
     /// selection and shared-expert SwiGLU + MQ rotation. Workgroup 0 runs the
     /// router while each later wave64 carries two original wave32 FWHT groups.
@@ -6268,12 +6268,20 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        let name = "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate";
-        self.ensure_kernel(
-            "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1100",
-            kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SHARED_SILU_MQ_ROTATE_SRC,
-            name,
-        )?;
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1151",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SHARED_SILU_MQ_ROTATE_GFX1151_SRC,
+                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1151",
+            )
+        } else {
+            (
+                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1100",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SHARED_SILU_MQ_ROTATE_SRC,
+                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
 
         let lp = logits.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
@@ -6301,9 +6309,9 @@ impl Gpu {
         ];
         let activation_workgroups = shared_k.div_ceil(512) as u32;
         let bytes = n_exp * 4 + 8 * (4 + 4) + shared_k * 4 * 3 + 2 * 256 * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "fused", name, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
-            name,
+            kernel,
             [1 + activation_workgroups, 1, 1],
             [64, 1, 1],
             0,

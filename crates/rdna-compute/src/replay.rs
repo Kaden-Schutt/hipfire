@@ -429,7 +429,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     ) {
         return Some(vec![read(0), read(8), read(16), write(24)]);
     }
-    if kernel == "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" {
+    if matches!(
+        kernel,
+        "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
+            | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1151"
+    ) {
         return Some(vec![
             read(0),
             write(8),
@@ -821,7 +825,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
-        | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
+        | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
+        | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1151" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_k2048"
@@ -2973,6 +2978,7 @@ mod tests {
         "moe_router_softmax_topk_k8_wave64",
         "moe_router_softmax_topk_k8_wave64_exact",
         "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate",
+        "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1151",
         "fused_silu_mul_mq_rotate",
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
@@ -3472,10 +3478,21 @@ mod tests {
         );
         assert!(pointer_effects("conv1d_silu_split_qknorm_b256").is_some());
         assert_eq!(
+            expected_kernarg_bytes("moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"),
+            Some(80)
+        );
+        assert_eq!(
             expected_kernarg_bytes(
-                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
+                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1151"
             ),
             Some(80)
+        );
+        assert_eq!(
+            pointer_effects(
+                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate_gfx1151"
+            )
+            .map(|effects| effects.len()),
+            Some(8)
         );
         assert_eq!(
             Pm4WaitPolicy::from_value("resource"),
