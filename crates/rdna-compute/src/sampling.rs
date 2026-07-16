@@ -1143,16 +1143,22 @@ extern "C" __global__ void mtp_topk20_finalize(
                 &mut partial_val_ptr as *mut _ as *mut c_void,
                 &mut partial_idx_ptr as *mut _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    &self.functions[FN_PARTIAL],
-                    [N_BLOCKS, 1, 1],
-                    [PARTIAL_BLOCK, 1, 1],
-                    PARTIAL_BLOCK * 4 * 2,
-                    self.stream_ref(),
-                    &mut partial_params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                FN_PARTIAL,
+                [N_BLOCKS, 1, 1],
+                [PARTIAL_BLOCK, 1, 1],
+                PARTIAL_BLOCK * 4 * 2,
+                &mut partial_params,
+                || {
+                    let mut blob = hip_bridge::KernargBlob::new();
+                    blob.push_ptr(logits_ptr);
+                    blob.push_i32(vs);
+                    blob.push_i32(nb);
+                    blob.push_ptr(partial_val_ptr);
+                    blob.push_ptr(partial_idx_ptr);
+                    blob
+                },
+            )?;
 
             let mut finalize_params: Vec<*mut c_void> = vec![
                 &mut partial_val_ptr as *mut _ as *mut c_void,
@@ -1162,16 +1168,23 @@ extern "C" __global__ void mtp_topk20_finalize(
                 &mut out_val_ptr as *mut _ as *mut c_void,
                 &mut kk as *mut _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    &self.functions[FN_FINALIZE],
-                    [1, 1, 1],
-                    [FINALIZE_BLOCK, 1, 1],
-                    FINALIZE_BLOCK * 4 * 3,
-                    self.stream_ref(),
-                    &mut finalize_params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                FN_FINALIZE,
+                [1, 1, 1],
+                [FINALIZE_BLOCK, 1, 1],
+                FINALIZE_BLOCK * 4 * 3,
+                &mut finalize_params,
+                || {
+                    let mut blob = hip_bridge::KernargBlob::new();
+                    blob.push_ptr(partial_val_ptr);
+                    blob.push_ptr(partial_idx_ptr);
+                    blob.push_i32(ncand);
+                    blob.push_ptr(out_idx_ptr);
+                    blob.push_ptr(out_val_ptr);
+                    blob.push_i32(kk);
+                    blob
+                },
+            )?;
         }
         Ok(())
     }
@@ -1227,16 +1240,27 @@ extern "C" __global__ void mtp_topk20_finalize(
             &mut presence as *mut _ as *mut c_void,
             &mut frequency as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                &self.functions[FUNCTION],
-                [1, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            FUNCTION,
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(logits_ptr);
+                blob.push_ptr(base_ptr);
+                blob.push_ptr(base_len_ptr);
+                blob.push_ptr(draft_ptr);
+                blob.push_i32(prefix);
+                blob.push_i32(vocab);
+                blob.push_i32(window);
+                blob.push_f32(repeat);
+                blob.push_f32(presence);
+                blob.push_f32(frequency);
+                blob
+            },
+        )
     }
 
     /// Sample an exact top-20 support on-device and write both the compressed
@@ -1297,16 +1321,30 @@ extern "C" __global__ void mtp_topk20_finalize(
             &mut ts as *mut _ as *mut c_void,
             &mut map_ptr as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                &self.functions[FUNCTION],
-                [1, 1, 1],
-                [1, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            FUNCTION,
+            [1, 1, 1],
+            [1, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(top_idx_ptr);
+                blob.push_ptr(top_val_ptr);
+                blob.push_i32(kk);
+                blob.push_f32(temp);
+                blob.push_f32(tp);
+                blob.push_f32(mp);
+                blob.push_ptr(uniform_ptr);
+                blob.push_i32(us);
+                blob.push_ptr(draft_idx_ptr);
+                blob.push_ptr(draft_prob_ptr);
+                blob.push_ptr(chain_ptr);
+                blob.push_i32(ts);
+                blob.push_ptr(map_ptr);
+                blob
+            },
+        )
     }
 
     pub fn argmax_token_chain_f32(
