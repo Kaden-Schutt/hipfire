@@ -397,6 +397,10 @@ fn committed_block_hidden_elems(accepted: usize, num_extract: usize, hidden: usi
 }
 
 impl Speculator for GenericDflashSpeculator {
+    fn name(&self) -> &'static str {
+        "dflash"
+    }
+
     fn prefill(
         &mut self,
         gpu: &mut Gpu,

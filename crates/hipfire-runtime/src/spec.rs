@@ -609,6 +609,14 @@ pub trait Speculator {
         false
     }
 
+    /// Short, human-readable drafter identity for per-request debug output
+    /// (e.g. "dspark", "mtp", "dflash", "ngram"). The daemon logs this at
+    /// request end so it's unambiguous which drafter actually ran (several
+    /// drafters share the same generate function). Default "spec".
+    fn name(&self) -> &'static str {
+        "spec"
+    }
+
     /// Run one acceptance window starting from `seed` at absolute `position`.
     /// `target` is the borrowed verifier; `emitted` is the prior committed
     /// tokens (repeat-penalty / n-gram context); `grammar` constrains both the
@@ -781,6 +789,13 @@ pub trait MtpDrafter {
     /// Whether verification is greedy-only (temp≈0). qwen35 MTP → `true`.
     fn requires_greedy(&self) -> bool;
 
+    /// Short drafter identity surfaced by [`MtpSpeculator::name`] for per-request
+    /// debug output. Plain MTP drafters keep the default "mtp"; the DSpark
+    /// drafter overrides to "dspark".
+    fn name(&self) -> &'static str {
+        "mtp"
+    }
+
     /// Stash the request sampling params for the next `mtp_step`. The
     /// [`MtpSpeculator`] forwards `set_sampling` + the per-step `temp` here so a
     /// temp>0-capable drafter (DSpark) can drive a sampled verify. Default no-op
@@ -841,6 +856,10 @@ fn lower_mtp_window(w: MtpWindow) -> Result<SpecStep, String> {
 }
 
 impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+    fn name(&self) -> &'static str {
+        self.arch.name()
+    }
+
     fn prefill(
         &mut self,
         gpu: &mut Gpu,
