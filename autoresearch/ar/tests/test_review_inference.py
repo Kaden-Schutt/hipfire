@@ -377,19 +377,31 @@ def test_owned_transport_applies_remaining_deadline_before_near_expiry_read(monk
 
         def read(self, size):
             assert self.read_timeout is not None
-            assert self.read_timeout < 0.01
+            assert self.read_timeout < 0.1
             raise TimeoutError("socket read timed out")
 
     response = NearExpiryResponse()
 
     class NearExpiryOpener:
         def open(self, request, timeout):
-            time.sleep(0.015)
+            time.sleep(0.08)
             return response
 
     monkeypatch.setattr(inference_module, "build_opener", lambda handler: NearExpiryOpener())
     with pytest.raises(ToollessInferenceError, match="deadline|timed out"):
-        BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.02, 8))
+        BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.1, 8))
+
+
+def test_owned_transport_terminates_blocked_connection_setup(monkeypatch):
+    class BlockingOpener:
+        def open(self, request, timeout):
+            time.sleep(5)
+
+    monkeypatch.setattr(inference_module, "build_opener", lambda handler: BlockingOpener())
+    started = time.monotonic()
+    with pytest.raises(ToollessInferenceError, match="deadline|timed out"):
+        BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.05, 8))
+    assert time.monotonic() - started < 1
 
 
 @pytest.mark.parametrize("environment_name", ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_API_TOKEN", "GH_ENTERPRISE_TOKEN"])

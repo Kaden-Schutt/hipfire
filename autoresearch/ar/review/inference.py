@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import json
+import multiprocessing
 import re
 import time
 from typing import Any, Protocol
@@ -49,11 +50,94 @@ class _NoRedirectHandler(HTTPRedirectHandler):
         raise ToollessInferenceError("HTTP redirects are forbidden")
 
 
+_TRANSPORT_CHUNK_BYTES = 64 * 1024
+_TRANSPORT_METADATA_BYTES = 64 * 1024
+
+
+def _apply_response_timeout(response: Any, remaining: float) -> None:
+    setter = getattr(response, "settimeout", None)
+    if callable(setter):
+        setter(remaining)
+        return
+    socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    setter = getattr(socket, "settimeout", None)
+    if callable(setter):
+        setter(remaining)
+        return
+    raise ToollessInferenceError("provider response socket timeout is unavailable")
+
+
+def _transport_worker(request: HttpRequest, result: Any) -> None:
+    try:
+        opener = build_opener(_NoRedirectHandler())
+        response = opener.open(
+            Request(request.url, data=request.body, headers=dict(request.headers), method=request.method),
+            timeout=request.timeout,
+        )
+        status = int(response.status)
+        if 300 <= status < 400:
+            raise ToollessInferenceError("HTTP redirects are forbidden")
+        headers = {str(key).casefold(): str(value) for key, value in response.headers.items()}
+        if sum(len(key) + len(value) for key, value in headers.items()) > _TRANSPORT_METADATA_BYTES:
+            raise ToollessInferenceError("provider response headers exceed byte limit")
+        if "chunked" in headers.get("transfer-encoding", "").lower() or "stream" in headers.get("content-type", "").lower():
+            raise ToollessInferenceError("streaming provider responses are forbidden")
+        length = headers.get("content-length")
+        if length is not None and (not length.isdigit() or int(length) > request.max_response_bytes):
+            raise ToollessInferenceError("provider response exceeds byte limit")
+        result.send(("headers", status, headers))
+        deadline = time.monotonic() + request.timeout
+        body_size = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ToollessInferenceError("provider request exceeded deadline")
+            _apply_response_timeout(response, remaining)
+            chunk = response.read(min(_TRANSPORT_CHUNK_BYTES, request.max_response_bytes - body_size + 1))
+            if not chunk:
+                result.send(("done",))
+                return
+            if not isinstance(chunk, bytes):
+                raise ToollessInferenceError("provider response body is not bytes")
+            body_size += len(chunk)
+            if body_size > request.max_response_bytes:
+                raise ToollessInferenceError("provider response exceeds byte limit while reading")
+            result.send(("chunk", chunk))
+    except ToollessInferenceError as exc:
+        try:
+            result.send(("error", str(exc)))
+        except (BrokenPipeError, OSError):
+            pass
+    except TimeoutError as exc:
+        try:
+            result.send(("error", "provider request exceeded deadline"))
+        except (BrokenPipeError, OSError):
+            pass
+    except HTTPError as exc:
+        message = "HTTP redirects are forbidden" if 300 <= exc.code < 400 else "provider HTTP request failed"
+        try:
+            result.send(("error", message))
+        except (BrokenPipeError, OSError):
+            pass
+    except (URLError, OSError):
+        try:
+            result.send(("error", "provider HTTP request failed"))
+        except (BrokenPipeError, OSError):
+            pass
+    except Exception:
+        try:
+            result.send(("error", "provider HTTP request failed"))
+        except (BrokenPipeError, OSError):
+            pass
+    finally:
+        result.close()
+
+
 class BoundedHttpTransport:
     """Owned HTTPS transport with no redirects, streaming, or unbounded reads."""
 
     def __init__(self):
-        self._opener = build_opener(_NoRedirectHandler())
+        self._context = multiprocessing.get_context()
         self._requests = 0
 
     def send(self, request: HttpRequest) -> HttpResponse:
@@ -63,62 +147,70 @@ class BoundedHttpTransport:
         if request.method != "POST" or not request.url.startswith("https://") or request.max_response_bytes <= 0:
             raise ToollessInferenceError("HTTP request contract is invalid")
         deadline = time.monotonic() + request.timeout
-
-        def check_deadline() -> None:
-            if time.monotonic() > deadline:
-                raise ToollessInferenceError("provider request exceeded deadline")
-
-        def apply_read_deadline(response: Any, remaining: float) -> None:
-            setter = getattr(response, "settimeout", None)
-            if callable(setter):
-                setter(remaining)
-                return
-            socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
-            setter = getattr(socket, "settimeout", None)
-            if callable(setter):
-                setter(remaining)
-                return
-            raise ToollessInferenceError("provider response socket timeout is unavailable")
-
+        wire_request = Request(request.url, data=request.body, headers=dict(request.headers), method=request.method)
+        calls = getattr(self, "calls", None)
+        if isinstance(calls, list):
+            calls.append(wire_request)
+        receiver, sender = multiprocessing.Pipe(duplex=False)
+        worker = self._context.Process(target=_transport_worker, args=(request, sender), daemon=True)
+        worker_started = False
         try:
-            response = self._opener.open(
-                Request(request.url, data=request.body, headers=dict(request.headers), method=request.method),
-                timeout=request.timeout,
-            )
-            check_deadline()
-            if 300 <= int(response.status) < 400:
-                raise ToollessInferenceError("HTTP redirects are forbidden")
-            headers = {str(key).casefold(): str(value) for key, value in response.headers.items()}
-            if "chunked" in headers.get("transfer-encoding", "").lower() or "stream" in headers.get("content-type", "").lower():
-                raise ToollessInferenceError("streaming provider responses are forbidden")
-            length = headers.get("content-length")
-            if length is not None and (not length.isdigit() or int(length) > request.max_response_bytes):
-                raise ToollessInferenceError("provider response exceeds byte limit")
+            worker.start()
+            worker_started = True
+            status = None
+            headers: Mapping[str, str] = {}
             body = bytearray()
             while True:
-                check_deadline()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise ToollessInferenceError("provider request exceeded deadline")
-                apply_read_deadline(response, remaining)
-                chunk = response.read(min(64 * 1024, request.max_response_bytes - len(body) + 1))
-                check_deadline()
-                if not chunk:
-                    break
-                body.extend(chunk)
-                if len(body) > request.max_response_bytes:
-                    raise ToollessInferenceError("provider response exceeds byte limit while reading")
-            return HttpResponse(int(response.status), headers, bytes(body))
+                if not receiver.poll(min(remaining, 0.05)):
+                    if not worker.is_alive():
+                        raise ToollessInferenceError("provider HTTP request failed")
+                    continue
+                message = receiver.recv()
+                kind = message[0]
+                if kind == "headers":
+                    status, headers = message[1], message[2]
+                    if 300 <= status < 400:
+                        raise ToollessInferenceError("HTTP redirects are forbidden")
+                    if "chunked" in headers.get("transfer-encoding", "").lower() or "stream" in headers.get("content-type", "").lower():
+                        raise ToollessInferenceError("streaming provider responses are forbidden")
+                    length = headers.get("content-length")
+                    if length is not None and (not length.isdigit() or int(length) > request.max_response_bytes):
+                        raise ToollessInferenceError("provider response exceeds byte limit")
+                elif kind == "chunk":
+                    if status is None or not isinstance(message[1], bytes):
+                        raise ToollessInferenceError("provider response body is malformed")
+                    body.extend(message[1])
+                    if len(body) > request.max_response_bytes:
+                        raise ToollessInferenceError("provider response exceeds byte limit while reading")
+                elif kind == "done":
+                    if status is None:
+                        raise ToollessInferenceError("provider response headers are missing")
+                    return HttpResponse(status, headers, bytes(body))
+                elif kind == "error":
+                    raise ToollessInferenceError(message[1])
+                else:
+                    raise ToollessInferenceError("provider transport result is malformed")
         except ToollessInferenceError:
             raise
-        except TimeoutError as exc:
-            raise ToollessInferenceError("provider request exceeded deadline") from exc
-        except HTTPError as exc:
-            if 300 <= exc.code < 400:
-                raise ToollessInferenceError("HTTP redirects are forbidden") from exc
+        except EOFError as exc:
+            if time.monotonic() >= deadline:
+                raise ToollessInferenceError("provider request exceeded deadline") from exc
             raise ToollessInferenceError("provider HTTP request failed") from exc
-        except (URLError, TimeoutError, OSError) as exc:
+        except OSError as exc:
             raise ToollessInferenceError("provider HTTP request failed") from exc
+        finally:
+            sender.close()
+            if worker_started and worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=0.2)
+                if worker.is_alive():
+                    worker.kill()
+            if worker_started:
+                worker.join()
+            receiver.close()
 
 
 REVIEW_INSTRUCTION = (

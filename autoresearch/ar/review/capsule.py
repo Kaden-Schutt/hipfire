@@ -22,6 +22,10 @@ MAX_TOTAL_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BLOB_BYTES = 2 * 1024 * 1024
 MAX_TREE_DEPTH = 64
 MAX_CANONICAL_BYTES = DEFAULT_MAX_BYTES
+_GITHUB_STANDARD_REQUEST_QUOTA = 5000
+_CAPSULE_NON_BLOB_REQUESTS = 4
+MAX_BLOB_REQUESTS = 4096
+assert MAX_BLOB_REQUESTS + _CAPSULE_NON_BLOB_REQUESTS < _GITHUB_STANDARD_REQUEST_QUOTA
 _SHA1_OID = re.compile(r"[0-9a-f]{40}")
 
 
@@ -247,9 +251,39 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
     if changed_path_cap_hit:
         reasons.append("changed path count exceeds item cap")
         changed_paths = changed_paths[:MAX_CHANGED_PATHS]
+    blob_keys: set[tuple[str, str]] = set()
+    for path in changed_paths:
+        base = base_tree.get(path)
+        head = head_tree.get(path)
+        if base is not None and base.get("type") == "blob":
+            blob_keys.add((target.repository, base["sha"]))
+        if head is not None and head.get("type") == "blob":
+            blob_keys.add((target.head_repository, head["sha"]))
+    if len(blob_keys) > MAX_BLOB_REQUESTS:
+        reasons.append("blob request budget exceeds fixed capsule limit")
     manifest: list[ReviewManifestEntry] = []
     files: list[ReviewFile] = []
     total_bytes = 0
+    blob_cache: dict[tuple[str, str], tuple[str | None, int | None]] = {}
+    blob_request_budget_reported = False
+
+    def load_blob(
+        repository: str, oid: str, path: str, side: str
+    ) -> tuple[str | None, int | None, list[str]]:
+        nonlocal blob_request_budget_reported
+        key = (repository, oid)
+        if key in blob_cache:
+            source, size = blob_cache[key]
+            return source, size, []
+        if len(blob_cache) >= MAX_BLOB_REQUESTS:
+            if not blob_request_budget_reported:
+                reasons.append("blob request budget exhausted before full capsule coverage")
+                blob_request_budget_reported = True
+            return None, None, []
+        source, size, blob_reasons = _blob(client, target, repository, oid, path, side)
+        blob_cache[key] = (source, size)
+        return source, size, blob_reasons
+
     for path in changed_paths:
         base = base_tree.get(path)
         head = head_tree.get(path)
@@ -288,14 +322,10 @@ def build_review_capsule(client: Any, target: ReviewTarget) -> ReviewCapsule:
         base_source = head_source = None
         base_size = head_size = None
         if base is not None:
-            base_source, base_size, blob_reasons = _blob(
-                client, target, target.repository, base["sha"], path, "base"
-            )
+            base_source, base_size, blob_reasons = load_blob(target.repository, base["sha"], path, "base")
             reasons.extend(blob_reasons)
         if head is not None:
-            head_source, head_size, blob_reasons = _blob(
-                client, target, target.head_repository, head["sha"], path, "head"
-            )
+            head_source, head_size, blob_reasons = load_blob(target.head_repository, head["sha"], path, "head")
             reasons.extend(blob_reasons)
         if unsupported_mode:
             reasons.append(f"binary or opaque file mode: {path}")

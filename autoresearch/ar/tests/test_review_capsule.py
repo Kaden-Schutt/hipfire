@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from autoresearch.ar.review.capsule import ReviewCapsuleError, build_review_capsule
+from autoresearch.ar.review.capsule import MAX_BLOB_REQUESTS, ReviewCapsuleError, build_review_capsule
 from autoresearch.ar.review.models import ReviewTarget
 
 
@@ -329,3 +329,45 @@ def test_total_source_byte_overflow_stops_remaining_blob_retrieval(monkeypatch):
     assert len(client.blob_calls) == 2
     assert client.blob_calls[-1][1] == oids[1]
     assert any("total source bytes" in reason for reason in capsule.rejections)
+
+
+def test_blob_request_budget_bounds_three_thousand_changed_paths():
+    base_entries = []
+    head_entries = []
+    blobs = {}
+    for index in range(3000):
+        old_payload = f"old-{index}\n".encode()
+        new_payload = f"new-{index}\n".encode()
+        old_oid = git_blob_oid(old_payload)
+        new_oid = git_blob_oid(new_payload)
+        path = f"file-{index}.py"
+        base_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": old_oid})
+        head_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": new_oid})
+        blobs[old_oid] = blob(old_oid, old_payload)
+        blobs[new_oid] = blob(new_oid, new_payload)
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", base_entries), "head-tree": tree("head-tree", head_entries)}, blobs
+    )
+
+    capsule = build_review_capsule(client, TARGET)
+
+    assert not capsule.complete
+    assert len(client.blob_calls) == MAX_BLOB_REQUESTS
+    assert any("blob request budget" in reason for reason in capsule.rejections)
+
+
+def test_repeated_blob_oids_are_fetched_once():
+    payload = b"shared\n"
+    oid = git_blob_oid(payload)
+    paths = [f"file-{index}.py" for index in range(3000)]
+    client = FakeGitHub(
+        {"merge-tree": tree("merge-tree", []), "head-tree": tree("head-tree", [
+            {"path": path, "mode": "100644", "type": "blob", "sha": oid} for path in paths
+        ])},
+        {oid: blob(oid, payload)},
+    )
+
+    capsule = build_review_capsule(client, TARGET)
+
+    assert capsule.complete
+    assert client.blob_calls == [("fork/repo", oid)]
