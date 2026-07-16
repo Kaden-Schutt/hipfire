@@ -10,6 +10,8 @@
 //
 // `full_to_local` maps full-vocabulary token IDs into a compressed draft
 // vocabulary. Pass map_vocab_size=0 for an identity (full-vocab) mapping.
+#include <hip/hip_runtime.h>
+
 extern "C" __global__ void sampling_penalty_history_f32(
     float* __restrict__ logits,
     const unsigned int* __restrict__ history_tokens,
