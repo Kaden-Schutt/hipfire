@@ -513,7 +513,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_coalesce_b4"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
@@ -708,7 +707,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             Some(52)
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_coalesce_b4"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64" => Some(64),
         "gemm_gate_up_hfq4g256_wmma_gfx12"
         | "gemm_gate_up_hfq4g256_wmma_gfx12_bt4"
@@ -1447,10 +1445,6 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
-            )
-            | (
-                "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
-                "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_coalesce_b4",
             )
             | (
                 "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
@@ -2950,7 +2944,6 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
-        "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_coalesce_b4",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
         "gemm_gate_up_hfq4g256_wmma_gfx12",
         "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",

@@ -1560,21 +1560,6 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_K2048_SRC: &str = conc
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
-/// gfx12 B4 expert-run schedule. The first route for each expert executes all
-/// matching verifier rows consecutively, preserving the indexed ABI and every
-/// dot product while increasing immediate reuse of repeated expert weights.
-/// The B4-only exported symbol must remain distinct from the general batched
-/// kernel so shape-specialized code cannot alias in the runtime function cache.
-pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_FUSED_K2048_COALESCE_SRC: &str = concat!(
-    "#define HIPFIRE_MOE_GATE_UP_BATCHED 1\n",
-    "#define HIPFIRE_MOE_GATE_UP_K2048 1\n",
-    "#define HIPFIRE_MOE_GATE_UP_COALESCE_B4 1\n",
-    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_batched_coalesce_b4\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
-);
-
 /// Two-group activation/weight schedule for the fused B=4 probe. This targets
 /// the occupancy band between the default four-group (95 VGPR on gfx1201) and
 /// the one-group low-register schedule without changing any arithmetic chain.
