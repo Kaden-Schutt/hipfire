@@ -5,10 +5,12 @@
 
 Unlike redline_daemon_harness.py (manual shadow capture), this drives the real
 default-off product lifecycle. The default ``ar`` workload records one ordinary
-AR forward and routes later forwards through retained replay. ``mtp-greedy``
-drives the production daemon MTP generator with a byte-pinned prompt and applies
-the same cache warmup and stationarity contract to its reported decode rate.
-Models stay resident within each arm and clocks are never modified.
+AR forward and routes later forwards through retained replay. The MTP workloads
+drive the production daemon generator with a byte-pinned prompt and apply the
+same cache warmup and stationarity contract to its reported decode rate:
+``mtp-greedy`` is the deterministic optimization gauge, while ``mtp-sampled``
+pins the Qwen3.6 A3B registry recipe used by user-facing serve. Models stay
+resident within each arm and clocks are never modified.
 """
 
 import argparse
@@ -213,7 +215,7 @@ class Daemon:
             HIPFIRE_GRAPH="1",
             HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
         )
-        if workload == "mtp-greedy":
+        if workload.startswith("mtp-"):
             env.update(
                 HIPFIRE_QWEN_MTP="1",
                 HIPFIRE_MTP_K=str(mtp_k),
@@ -226,6 +228,8 @@ class Daemon:
                 # become the retained-PM4 arm as MTP tape support lands.
                 HIPFIRE_MTP_PROPOSAL_GRAPH="0",
             )
+            if workload == "mtp-sampled":
+                env["HIPFIRE_MTP_SAMPLED"] = "1"
         env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -301,17 +305,17 @@ class Daemon:
 
 
 def metric_key(args):
-    return "decode_tok_s" if args.workload == "mtp-greedy" else "tok_s"
+    return "decode_tok_s" if args.workload.startswith("mtp-") else "tok_s"
 
 
 def validate_workload_row(args, row):
-    if args.workload == "mtp-greedy":
+    if args.workload.startswith("mtp-"):
         if row.get("mtp") is not True:
-            raise RuntimeError("greedy MTP smoke fell through to a non-MTP path")
+            raise RuntimeError(f"{args.workload} fell through to a non-MTP path")
         if row.get("cycles", 0) <= 0 or row.get("tau", 0.0) <= 0.0:
-            raise RuntimeError(f"greedy MTP smoke returned invalid cycle data: {row}")
+            raise RuntimeError(f"{args.workload} returned invalid cycle data: {row}")
         if row.get("committed_events") != row.get("tokens"):
-            raise RuntimeError(f"greedy MTP stream/final token mismatch: {row}")
+            raise RuntimeError(f"{args.workload} stream/final token mismatch: {row}")
     return row
 
 
@@ -337,27 +341,36 @@ def run_arm(args, backend, prompt):
                     "max_seq": args.max_seq,
                     "kv_mode": args.kv_mode,
                     "dflash_mode": "off",
-                    "mtp_mode": "on" if args.workload == "mtp-greedy" else "off",
+                    "mtp_mode": "on" if args.workload.startswith("mtp-") else "off",
                     "mtp_k": args.mtp_k,
                 },
             }
         )
-        if args.workload == "mtp-greedy":
+        if args.workload.startswith("mtp-"):
             request_serial = 0
 
             def mtp_request(max_tokens):
                 nonlocal request_serial
                 request_serial += 1
-                return {
+                request = {
                     "type": "generate",
                     "id": f"redline-mtp-{backend}-{request_serial}",
                     "prompt": prompt,
-                    "temperature": 0.0,
-                    "top_p": 1.0,
                     "max_tokens": max_tokens,
                     "max_think_tokens": 1,
                     "assistant_prefix": "closed_think",
                 }
+                if args.workload == "mtp-sampled":
+                    request.update(
+                        temperature=args.mtp_temperature,
+                        top_p=args.mtp_top_p,
+                        top_k=args.mtp_top_k,
+                        min_p=args.mtp_min_p,
+                        presence_penalty=args.mtp_presence_penalty,
+                    )
+                else:
+                    request.update(temperature=0.0, top_p=1.0)
+                return request
 
             def issue(max_tokens):
                 return validate_workload_row(args, daemon.generate(mtp_request(max_tokens)))
@@ -415,7 +428,7 @@ def run_arm(args, backend, prompt):
         output_hashes = sorted({row.get("token_ids_sha256") for row in rows} - {None})
         output_stable = len(output_hashes) <= 1
         tau_values = [row["tau"] for row in rows if "tau" in row]
-        if args.workload == "mtp-greedy":
+        if args.workload.startswith("mtp-"):
             measurement_validation["output_stable"] = output_stable
             measurement_validation["valid"] &= output_stable
         print(
@@ -460,7 +473,7 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--workload",
-        choices=("ar", "mtp-greedy"),
+        choices=("ar", "mtp-greedy", "mtp-sampled"),
         default="ar",
         help="stationary decode workload (default: ar)",
     )
@@ -472,15 +485,20 @@ def main():
     parser.add_argument(
         "--prompt-file",
         default=str(DEFAULT_MTP_PROMPT),
-        help="byte-pinned plain-text prompt used by mtp-greedy",
+        help="byte-pinned plain-text prompt used by MTP workloads",
     )
     parser.add_argument(
         "--mtp-k",
         type=int,
         default=3,
-        help="MTP draft depth; 3 matches the user-facing serve default",
+        help="MTP draft depth (default: 3)",
     )
     parser.add_argument("--mtp-p-min", type=float, default=0.0)
+    parser.add_argument("--mtp-temperature", type=float, default=1.0)
+    parser.add_argument("--mtp-top-p", type=float, default=0.95)
+    parser.add_argument("--mtp-top-k", type=int, default=20)
+    parser.add_argument("--mtp-min-p", type=float, default=0.0)
+    parser.add_argument("--mtp-presence-penalty", type=float, default=1.5)
     parser.add_argument(
         "--warmups",
         type=int,
@@ -571,13 +589,24 @@ def main():
         parser.error("--mtp-k must be in [1, 8]")
     if not 0.0 <= args.mtp_p_min <= 1.0:
         parser.error("--mtp-p-min must be in [0, 1]")
-    if args.workload == "mtp-greedy" and args.kv_mode != "q8":
-        parser.error("mtp-greedy currently requires --kv-mode q8")
+    if args.workload.startswith("mtp-") and args.kv_mode != "q8":
+        parser.error("MTP workloads currently require --kv-mode q8")
+    if args.workload == "mtp-sampled":
+        if args.mtp_temperature <= 0.0:
+            parser.error("mtp-sampled requires --mtp-temperature > 0")
+        if not 0.0 < args.mtp_top_p <= 1.0:
+            parser.error("--mtp-top-p must be in (0, 1]")
+        if args.mtp_top_k < 0:
+            parser.error("--mtp-top-k must be non-negative")
+        if not 0.0 <= args.mtp_min_p <= 1.0:
+            parser.error("--mtp-min-p must be in [0, 1]")
+        if args.mtp_presence_penalty < 0.0:
+            parser.error("--mtp-presence-penalty must be non-negative")
 
     model = Path(args.model).expanduser().resolve()
     daemon = Path(args.daemon).expanduser().resolve()
     prompt_path = Path(args.prompt_file).expanduser().resolve()
-    prompt = prompt_path.read_text() if args.workload == "mtp-greedy" else ""
+    prompt = prompt_path.read_text() if args.workload.startswith("mtp-") else ""
     report = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "host": socket.gethostname(),
@@ -604,8 +633,16 @@ def main():
         "kv_mode": args.kv_mode,
         "mtp": {
             "k": args.mtp_k,
-            "p_min": args.mtp_p_min,
-            "temperature": 0.0,
+            "draft_p_min": args.mtp_p_min,
+            "temperature": args.mtp_temperature
+            if args.workload == "mtp-sampled"
+            else 0.0,
+            "top_p": args.mtp_top_p if args.workload == "mtp-sampled" else 1.0,
+            "top_k": args.mtp_top_k if args.workload == "mtp-sampled" else 0,
+            "min_p": args.mtp_min_p if args.workload == "mtp-sampled" else 0.0,
+            "presence_penalty": args.mtp_presence_penalty
+            if args.workload == "mtp-sampled"
+            else 0.0,
             "prompt_file": str(prompt_path) if prompt else None,
             "prompt_md5": hashlib.md5(prompt.encode()).hexdigest() if prompt else None,
             "prompt_bytes": len(prompt.encode()) if prompt else None,
@@ -619,7 +656,7 @@ def main():
     report["valid"] = report["hip"]["measurement_validation"]["valid"] and report[
         "auto"
     ]["measurement_validation"]["valid"]
-    if args.workload == "mtp-greedy":
+    if args.workload.startswith("mtp-"):
         report["cross_arm_output_equal"] = (
             report["hip"]["output_hashes"] == report["auto"]["output_hashes"]
         )
