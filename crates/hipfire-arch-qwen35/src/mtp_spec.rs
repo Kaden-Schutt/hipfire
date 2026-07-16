@@ -52,6 +52,10 @@ pub struct MtpSamplingConfig {
     pub top_k: usize, // 0 = disabled (no top-K cutoff)
     pub top_p: f32,   // 1.0 = disabled (no nucleus cutoff)
     pub min_p: f32,   // 0.0 = disabled (no min-prob cutoff)
+    pub repeat_window: usize,
+    pub repeat_penalty: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
 }
 
 impl Default for MtpSamplingConfig {
@@ -61,6 +65,10 @@ impl Default for MtpSamplingConfig {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
+            repeat_window: 128,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -68,6 +76,13 @@ impl Default for MtpSamplingConfig {
 impl MtpSamplingConfig {
     pub fn is_greedy(&self) -> bool {
         self.temp <= 0.0
+    }
+
+    pub fn has_penalties(&self) -> bool {
+        self.repeat_window > 0
+            && (self.repeat_penalty > 1.0
+                || self.presence_penalty > 0.0
+                || self.frequency_penalty > 0.0)
     }
 }
 
@@ -582,6 +597,17 @@ pub struct MtpSpecState {
     /// by pointer, while the host refreshes the values before every launch.
     pub mtp_positions: GpuTensor,
 
+    /// Generated-token history used by penalty-aware sampled MTP. Prompt
+    /// tokens are deliberately excluded, matching the daemon AR sampler's
+    /// generated-token `ngram_scope`. The one-element length tensor keeps the
+    /// changing length out of retained PM4 kernargs.
+    mtp_sampling_history: GpuTensor,
+    mtp_sampling_history_len: GpuTensor,
+    mtp_sampling_history_host_len: usize,
+    /// Full-token -> compressed-draft index, or -1 when the sidecar does not
+    /// contain a token. None for a full-vocabulary MTP head.
+    mtp_sampling_vocab_inverse: Option<GpuTensor>,
+
     /// Captured q8 compressed proposal graph for the greedy device-token-chain
     /// path. It belongs to this state because the graph bakes scratch/weight
     /// pointers into captured kernel nodes.
@@ -736,6 +762,29 @@ impl MtpSpecState {
         let mtp_token_chain = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
         let mtp_token_embed = gpu.alloc_tensor(&[dim], DType::F32)?;
         let mtp_positions = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_sampling_history =
+            gpu.alloc_tensor(&[head.config.max_seq + max_n + 1], DType::F32)?;
+        let mtp_sampling_history_len = gpu.alloc_tensor(&[1], DType::F32)?;
+        let zero_len = 0_i32.to_ne_bytes();
+        gpu.hip
+            .memcpy_htod(&mtp_sampling_history_len.buf, &zero_len)?;
+        let mtp_sampling_vocab_inverse =
+            if let Some(vocab_map) = head.weights.lm_head_draft_vocab_map.as_ref() {
+                let mut inverse = vec![-1_i32; vocab];
+                for (compact, &full) in vocab_map.iter().enumerate() {
+                    if (full as usize) < vocab {
+                        inverse[full as usize] = compact as i32;
+                    }
+                }
+                let tensor = gpu.alloc_tensor(&[vocab], DType::F32)?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(inverse.as_ptr() as *const u8, inverse.len() * 4)
+                };
+                gpu.hip.memcpy_htod(&tensor.buf, bytes)?;
+                Some(tensor)
+            } else {
+                None
+            };
 
         // Per-step top-2 scratches for p_min early-exit (16 B total, always
         // allocated — only used when state.p_min > 0).
@@ -783,6 +832,10 @@ impl MtpSpecState {
             mtp_token_chain,
             mtp_token_embed,
             mtp_positions,
+            mtp_sampling_history,
+            mtp_sampling_history_len,
+            mtp_sampling_history_host_len: 0,
+            mtp_sampling_vocab_inverse,
             mtp_proposal_graph: None,
             mtp_proposal_graph_exec: None,
             mtp_proposal_graph_blobs: Vec::new(),
@@ -830,6 +883,11 @@ impl MtpSpecState {
             "set_sampling: min_p must be in [0,1], got {}",
             cfg.min_p
         );
+        assert!(
+            cfg.repeat_penalty >= 1.0,
+            "set_sampling: repeat_penalty must be >= 1.0, got {}",
+            cfg.repeat_penalty
+        );
         self.sampling = cfg;
         self.rng = MtpRng::new(seed);
         // GPU rng uses u32; mix the lower + upper halves so different seeds
@@ -840,6 +898,34 @@ impl MtpSpecState {
         // replaying a tape whose temp/top-k/top-p/min-p were baked previously.
         let _ = self.mtp_proposal_replay.reset_external_capture();
         self.mtp_proposal_replay_seq_cap = 0;
+    }
+
+    /// Replace the generated-token sampling history for a new request.
+    pub fn reset_sampling_history(&mut self, gpu: &Gpu, tokens: &[u32]) -> HipResult<()> {
+        self.mtp_sampling_history_host_len = 0;
+        self.append_sampling_history(gpu, tokens)
+    }
+
+    /// Append newly committed tokens to the fixed-address device history.
+    pub fn append_sampling_history(&mut self, gpu: &Gpu, tokens: &[u32]) -> HipResult<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        assert!(
+            self.mtp_sampling_history_host_len + tokens.len() <= self.mtp_sampling_history.numel(),
+            "sampled MTP history exceeds allocated sequence capacity"
+        );
+        let bytes =
+            unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, tokens.len() * 4) };
+        gpu.hip.memcpy_htod_offset(
+            &self.mtp_sampling_history.buf,
+            self.mtp_sampling_history_host_len * 4,
+            bytes,
+        )?;
+        self.mtp_sampling_history_host_len += tokens.len();
+        let len = (self.mtp_sampling_history_host_len as i32).to_ne_bytes();
+        gpu.hip
+            .memcpy_htod(&self.mtp_sampling_history_len.buf, &len)
     }
 
     /// Set the draft-confidence threshold for compressed-serial K-chain
@@ -936,6 +1022,11 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_token_chain);
         let _ = gpu.free_tensor(self.mtp_token_embed);
         let _ = gpu.free_tensor(self.mtp_positions);
+        let _ = gpu.free_tensor(self.mtp_sampling_history);
+        let _ = gpu.free_tensor(self.mtp_sampling_history_len);
+        if let Some(inverse) = self.mtp_sampling_vocab_inverse {
+            let _ = gpu.free_tensor(inverse);
+        }
         if let Some(exec) = self.mtp_proposal_graph_exec {
             let _ = gpu.hip.graph_exec_destroy(exec);
         }
@@ -1191,6 +1282,7 @@ fn run_mtp_sampled_proposal_body_q8(
         .lm_head_draft_vocab_map_gpu
         .as_ref()
         .expect("sampled Redline proposal requires GPU vocab_map");
+    let prefix_tokens = state.mtp_token_chain.sub_offset(1, max_n);
 
     for k in 0..max_n {
         let token_slot = state.mtp_token_chain.sub_offset(k, 1);
@@ -1234,6 +1326,23 @@ fn run_mtp_sampled_proposal_body_q8(
             )?;
         }
         mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
+
+        gpu.sampling_penalty_history_f32(
+            logits_c,
+            &state.mtp_sampling_history,
+            &state.mtp_sampling_history_len,
+            &prefix_tokens,
+            state.mtp_sampling_vocab_inverse.as_ref(),
+            vocab,
+            cvs,
+            1,
+            k,
+            0,
+            sampling.repeat_window,
+            sampling.repeat_penalty,
+            sampling.presence_penalty,
+            sampling.frequency_penalty,
+        )?;
 
         let resident = state.mtp_resident_sample.as_ref().unwrap();
         let probs_row = resident
@@ -1317,9 +1426,7 @@ fn try_run_mtp_sampled_proposal_redline(
     }
 
     let required_cap = mtp_proposal_graph_seq_cap(cur_pos, max_n, state.mtp_kv.max_seq);
-    if state.mtp_proposal_replay_seq_cap != 0
-        && required_cap > state.mtp_proposal_replay_seq_cap
-    {
+    if state.mtp_proposal_replay_seq_cap != 0 && required_cap > state.mtp_proposal_replay_seq_cap {
         state
             .mtp_proposal_replay
             .reset_external_capture()
@@ -2749,9 +2856,8 @@ pub fn spec_step_mtp_compressed_serial(
     // The GPU sampler preserves that choice: compact distributions are sampled
     // directly, then scattered through the sidecar vocab map into the full-vocab
     // storage consumed by the lossless residual accept kernel.
-    let gpu_sample_requested = state.mtp_resident_sample.is_some()
-        && !state.sampling.is_greedy()
-        && state.p_min <= 0.0;
+    let gpu_sample_requested =
+        state.mtp_resident_sample.is_some() && !state.sampling.is_greedy() && state.p_min <= 0.0;
     let use_full_vocab = head.weights.lm_head_draft.is_none();
     let (vocab_map_opt, cvs): (Option<&Vec<u32>>, usize) = if use_full_vocab {
         (None, vocab)
@@ -2927,7 +3033,7 @@ pub fn spec_step_mtp_compressed_serial(
         destroy_mtp_proposal_graph(gpu, state);
         state.mtp_proposal_graph_warmed = true;
     }
-    if use_device_token_chain {
+    if use_device_token_chain || (use_sampling && sampling.has_penalties()) {
         if use_proposal_graph || use_redline_proposal {
             upload_mtp_proposal_graph_inputs(gpu, state, last_committed, cur_pos, max_n)?;
         } else {
@@ -2962,16 +3068,7 @@ pub fn spec_step_mtp_compressed_serial(
     // ── 1. K serial discrete-token roundtrips ─────────────────────────────
     let mut proposal_graph_ran = if use_redline_proposal {
         try_run_mtp_sampled_proposal_redline(
-            gpu,
-            target,
-            head,
-            state,
-            cur_pos,
-            max_n,
-            dim,
-            vocab,
-            cvs,
-            sampling,
+            gpu, target, head, state, cur_pos, max_n, dim, vocab, cvs, sampling,
         )?
     } else {
         false
@@ -3160,6 +3257,29 @@ pub fn spec_step_mtp_compressed_serial(
             let argmax_vocab = cvs; // = full vocab in full-vocab mode, = compressed vocab in compressed mode
 
             let draft_idx: usize;
+            if use_sampling && sampling.has_penalties() {
+                let prefix_tokens = state.mtp_token_chain.sub_offset(1, max_n);
+                gpu.sampling_penalty_history_f32(
+                    logits_for_argmax,
+                    &state.mtp_sampling_history,
+                    &state.mtp_sampling_history_len,
+                    &prefix_tokens,
+                    if use_full_vocab {
+                        None
+                    } else {
+                        state.mtp_sampling_vocab_inverse.as_ref()
+                    },
+                    vocab,
+                    argmax_vocab,
+                    1,
+                    k,
+                    0,
+                    sampling.repeat_window,
+                    sampling.repeat_penalty,
+                    sampling.presence_penalty,
+                    sampling.frequency_penalty,
+                )?;
+            }
             if gpu_sample_active {
                 let probs_row = if use_full_vocab {
                     state
@@ -3214,9 +3334,7 @@ pub fn spec_step_mtp_compressed_serial(
                         4,
                     )?;
                 } else {
-                    let full_probs_row = resident
-                        .draft_probs
-                        .sub_offset(k * vocab, vocab);
+                    let full_probs_row = resident.draft_probs.sub_offset(k * vocab, vocab);
                     gpu.scatter_vocab_probs_token_chain_f32(
                         &probs_row,
                         &full_probs_row,
@@ -3320,6 +3438,11 @@ pub fn spec_step_mtp_compressed_serial(
                     None => draft_idx as u32,
                 };
                 candidates.push(token_id);
+                if sampling.has_penalties() {
+                    let bytes = token_id.to_ne_bytes();
+                    gpu.hip
+                        .memcpy_htod_offset(&state.mtp_token_chain.buf, (k + 1) * 4, &bytes)?;
+                }
 
                 // Store the draft nucleus at FULL-vocab width for the residual.
                 // Full-vocab: the row already is full-width. Compressed: scatter
@@ -3619,6 +3742,26 @@ pub fn spec_step_mtp_compressed_serial(
                 llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
             }
         }
+    }
+
+    if use_sampling && sampling.has_penalties() {
+        let prefix_tokens = state.mtp_token_chain.sub_offset(1, drafts_generated);
+        gpu.sampling_penalty_history_f32(
+            &logits_view,
+            &state.mtp_sampling_history,
+            &state.mtp_sampling_history_len,
+            &prefix_tokens,
+            None,
+            vocab,
+            vocab,
+            n_verify,
+            0,
+            1,
+            sampling.repeat_window,
+            sampling.repeat_penalty,
+            sampling.presence_penalty,
+            sampling.frequency_penalty,
+        )?;
     }
 
     let mut accept_count = 0usize;

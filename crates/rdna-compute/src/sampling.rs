@@ -39,6 +39,103 @@ fn sample_fast_stable_enabled() -> bool {
 }
 
 impl Gpu {
+    /// Apply repeat, presence, and frequency penalties to speculative logits.
+    /// Row `r` sees `history + prefix[..prefix_base + r * prefix_step]`, which
+    /// is the same history an autoregressive sampler observes at that position.
+    /// `full_to_local` maps full token IDs into a compressed draft vocabulary;
+    /// `None` selects the identity mapping for full-vocabulary target rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sampling_penalty_history_f32(
+        &mut self,
+        logits: &GpuTensor,
+        history_tokens: &GpuTensor,
+        history_len: &GpuTensor,
+        prefix_tokens: &GpuTensor,
+        full_to_local: Option<&GpuTensor>,
+        map_vocab_size: usize,
+        vocab_size: usize,
+        rows: usize,
+        prefix_base: usize,
+        prefix_step: usize,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<()> {
+        if rows == 0
+            || repeat_window == 0
+            || (repeat_penalty <= 1.0 && presence_penalty <= 0.0 && frequency_penalty <= 0.0)
+        {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "sampling_penalty_history",
+            kernels::SAMPLING_PENALTY_HISTORY_SRC,
+            "sampling_penalty_history_f32",
+        )?;
+
+        let lp = logits.buf.as_ptr();
+        let hp = history_tokens.buf.as_ptr();
+        let hl = history_len.buf.as_ptr();
+        let pp = prefix_tokens.buf.as_ptr();
+        let mp = full_to_local
+            .map(|tensor| tensor.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut::<c_void>());
+        let mvs = if full_to_local.is_some() {
+            map_vocab_size as i32
+        } else {
+            0
+        };
+        let vs = vocab_size as i32;
+        let pb = prefix_base as i32;
+        let ps = prefix_step as i32;
+        let rw = repeat_window as i32;
+        let rp = repeat_penalty;
+        let presence = presence_penalty;
+        let frequency = frequency_penalty;
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &hp as *const _ as *mut c_void,
+            &hl as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mp as *const _ as *mut c_void,
+            &mvs as *const _ as *mut c_void,
+            &vs as *const _ as *mut c_void,
+            &pb as *const _ as *mut c_void,
+            &ps as *const _ as *mut c_void,
+            &rw as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &presence as *const _ as *mut c_void,
+            &frequency as *const _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "sampling_penalty_history_f32",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(hp);
+                b.push_ptr(hl);
+                b.push_ptr(pp);
+                b.push_ptr(mp);
+                b.push_i32(mvs);
+                b.push_i32(vs);
+                b.push_i32(pb);
+                b.push_i32(ps);
+                b.push_i32(rw);
+                b.push_f32(rp);
+                b.push_f32(presence);
+                b.push_f32(frequency);
+                b
+            },
+        )
+    }
+
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
         &mut self,

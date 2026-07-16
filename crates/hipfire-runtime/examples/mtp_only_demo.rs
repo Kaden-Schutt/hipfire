@@ -340,6 +340,7 @@ fn main() {
             top_k,
             top_p,
             min_p,
+            ..Default::default()
         };
         state.set_sampling(cfg, seed);
         eprintln!("sampling: temp={temp} top_k={top_k} top_p={top_p} min_p={min_p} seed={seed}");

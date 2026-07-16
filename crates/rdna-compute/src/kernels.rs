@@ -1552,14 +1552,13 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
 /// Radiowave gfx1100 cache-policy probe for the atomic-free MoE down stream.
 /// Keep this replay-visible and opt-in until exact-shadow and product-level
 /// certification establish whether SLC helps this access pattern.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC: &str =
-    concat!(
-        "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
-        "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc\n",
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
 
 /// gfx1100 expert-wave-preserving down+combine experiment. Every workgroup
 /// still computes one expert rank; the last arriving rank for each four-row
@@ -3107,9 +3106,8 @@ pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str =
 /// gfx1100-only Qwen attention reduce/gate/MQ epilogue. Kept in a separate
 /// translation unit so its dormant body cannot perturb portable/gfx12 reducer
 /// codegen.
-pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC: &str = include_str!(
-    "../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip"
-);
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip");
 
 /// Turbo common header: shared definitions for turbo/givens kernels.
 pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common.h");
@@ -3725,6 +3723,12 @@ pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top
 /// kernel for distinct logits; recovers ~290 us/token on gfx1100 A3B decode.
 pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
     include_str!("../../../kernels/src/sample_top_p_parallel.hip");
+
+/// Penalty transform for speculative sampling. Each row observes the committed
+/// generation history plus its row-specific draft prefix, preserving the exact
+/// autoregressive history at every draft and target distribution.
+pub const SAMPLING_PENALTY_HISTORY_SRC: &str =
+    include_str!("../../../kernels/src/sampling_penalty_history.hip");
 
 /// Per-row temperature-scaled softmax probability gather. For each row r,
 /// returns the softmax prob of `indices[r]` under temp-scaled row logits.

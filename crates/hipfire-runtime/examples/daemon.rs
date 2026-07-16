@@ -6004,6 +6004,10 @@ fn generate_qwen35_mtp(
     // applied to BOTH draft + target nuclei → lossless == AR-at-(min_p,top_k,top_p).
     // 0.0 = disabled. Ignored on the greedy path.
     min_p: f32,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
 ) {
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -6273,6 +6277,10 @@ fn generate_qwen35_mtp(
                 top_k: top_k.map(|k| k as usize).unwrap_or(0),
                 top_p: top_p_eff,
                 min_p,
+                repeat_window,
+                repeat_penalty,
+                presence_penalty,
+                frequency_penalty,
             },
             42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
         );
@@ -6326,17 +6334,21 @@ fn generate_qwen35_mtp(
             return;
         }
     };
-    let seed_token = seed_logits
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
-        })
-        .0;
+    let seed_token = if state.sampling.is_greedy() {
+        seed_logits
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
+            })
+            .0
+    } else {
+        mtp_spec::sample_from_logits(&seed_logits, &state.sampling, &mut state.rng).0
+    };
 
     // ── Decode loop ─────────────────────────────────────────────────────
     let t_prefill = Instant::now();
@@ -6382,6 +6394,22 @@ fn generate_qwen35_mtp(
         }
     }
     generated += 1;
+    if let Err(e) = state.reset_sampling_history(gpu, &[seed_token]) {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!("initialize MTP sampling history: {e:?}"),
+        );
+        state.free_gpu(gpu);
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+            config: orig_config,
+            weights: target.weights,
+            scratch: target.scratch,
+            kv_cache: target.kv_cache,
+            dn_state: target.dn_state,
+        }));
+        return;
+    }
 
     let seed_is_eos = seed_token == eos_token
         || im_end_token == Some(seed_token)
@@ -6413,6 +6441,10 @@ fn generate_qwen35_mtp(
         };
         cycles += 1;
         accepted_total += result.accept_count;
+        if let Err(e) = state.append_sampling_history(gpu, &result.committed) {
+            step_error = Some(format!("append MTP sampling history: {e:?}"));
+            break;
+        }
 
         let mut hit_eos = false;
         for &tok in &result.committed {
@@ -6539,6 +6571,10 @@ fn generate_qwen35_mtp(
                 }
                 cur_pos += advance_toks.len();
                 last_committed = *close_ids.last().unwrap();
+                if let Err(e) = state.append_sampling_history(gpu, &close_ids) {
+                    step_error = Some(format!("append MTP close-token history: {e:?}"));
+                    break;
+                }
                 think_closed = true;
                 prev_in_think = false;
             }
@@ -8186,23 +8222,17 @@ fn generate(
     // thinking stays on MTP and uses the block-boundary continuation above.
     // Anything not satisfying these gates falls through to DFlash/AR.
     //
-    // SAMPLED (temp>0) MTP is now distribution-preserving and reachable here,
-    // but gated behind an opt-in env flag until the temp>0 coherence battery
-    // validates it. The arch layer's F5 DFlash-convention fix (mtp_spec.rs:
-    // independent per-side nuclei + sample_residual) makes the temp>0 branch
-    // lossless: draft + target each truncate to their own top_p nucleus, the
-    // accept ratio is computed against the truncated distributions, and the
-    // bonus is drawn from the renormalized residual (no longer the lossy
-    // un-truncated / sample_top_p(trunk) posture). Gating:
-    //   * greedy (temp <= 1e-6) → ALWAYS routes to MTP (default, unchanged), or
-    //   * sampled (temp > 0) → routes to MTP only when `HIPFIRE_MTP_SAMPLED=1`.
-    //     temp + top_p + top_k + min_p are all plumbed through and honored on the
-    //     sampled MTP path (top_k+top_p lossless on both nuclei; min_p applied via
-    //     the mtp_spec cutoff), so no sampling knob forces a fall-through here.
-    // With HIPFIRE_MTP_SAMPLED unset, a temp>0 MTP-opted-in request still falls
-    // through to DFlash (lossless sampled-spec) or AR exactly as before.
-    let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
-    let mtp_sampled_on = std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1");
+    // SAMPLED (temp>0) MTP is distribution-preserving and honors every sampler
+    // control used by the AR path: temp/top-p/top-k/min-p plus repeat, presence,
+    // and frequency penalties at each draft and target position. It is therefore
+    // enabled whenever MTP is selected. `HIPFIRE_MTP_SAMPLED=0` remains an
+    // explicit diagnostic escape hatch back to DFlash/AR.
+    let qwen_mtp_on = match std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
+    };
+    let mtp_sampled_on = std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() != Some("0");
     // Sampled MTP honors temp + top_p + top_k: the residual-accept sampler
     // applies the SAME top_k+top_p nucleus to BOTH the draft and target sides
     // (see mtp_sampled_accept / the draft truncation), so it stays lossless ==
@@ -8212,7 +8242,7 @@ fn generate(
     // into the nuclei — this is what lets a model whose card recommends top_k
     // (qwen3.6 A3B ships top_k=20) keep its recipe AND get the MTP speedup,
     // instead of silently dropping top_k/min_p or losing MTP.
-    if qwen_mtp_opt_in
+    if qwen_mtp_on
         && m.qwen35_mtp_head.is_some()
         && (temp <= 1e-6 || mtp_sampled_on)
         && (m.arch_id == 5 || m.arch_id == 6)
@@ -8234,14 +8264,14 @@ fn generate(
             top_p, // nucleus cutoff: honored on the sampled MTP path
             top_k, // top-k cutoff: honored on the sampled MTP path (both nuclei)
             min_p.unwrap_or(0.0), // min_p floor: honored on the sampled MTP nuclei
-        );
-        // Silence unused-variable warnings for AR-only / DFlash-only knobs the
-        // MTP serve path does not consume.
-        let _ = (
             repeat_penalty,
             repeat_window,
             presence_penalty,
             frequency_penalty,
+        );
+        // Silence unused-variable warnings for AR-only / DFlash-only knobs the
+        // MTP serve path does not consume.
+        let _ = (
             budget_alert_at_tok,
             budget_alert_text,
             pflash_state,
