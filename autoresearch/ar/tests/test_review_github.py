@@ -469,6 +469,31 @@ def test_authenticated_config_source_binds_branch_commit_and_policy_blobs(tmp_pa
     assert source.config_digest == configuration_source_digest(*contents)
 
 
+def test_authenticated_config_source_accepts_slash_default_branch(tmp_path):
+    paths = (
+        ".github/agentic-review/providers.json",
+        ".github/agentic-review/capabilities-v1.json",
+        ".github/agentic-review/trusted-publishers.json",
+    )
+    contents = tuple((ROOT / path).read_bytes() for path in paths)
+    blob_ids = [hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() for content in contents]
+    responses = [
+        result({"id": 8, "full_name": REPO, "default_branch": "release/stable"}),
+        result({"ref": "refs/heads/release/stable", "object": {"sha": "c" * 40, "type": "commit"}}),
+        result({"sha": "c" * 40, "tree": {"sha": "t" * 40}}),
+        result({"sha": "t" * 40, "tree": [
+            {"path": path, "mode": "100644", "type": "blob", "sha": oid}
+            for path, oid in zip(paths, blob_ids)
+        ], "truncated": False}),
+        *(result({"sha": oid, "encoding": "base64", "content": base64.b64encode(content).decode(), "size": len(content)})
+          for oid, content in zip(blob_ids, contents)),
+    ]
+    source = GitHubClient(FakeRunner(responses)).authenticated_config_source(
+        REPO, commit_sha="c" * 40, repository_root=str(tmp_path)
+    )
+    assert source.default_branch == "release/stable"
+
+
 def test_authenticated_config_source_rejects_stale_head_and_unverified_blob():
     responses = [
         result({"id": 8, "full_name": REPO, "default_branch": "main"}),

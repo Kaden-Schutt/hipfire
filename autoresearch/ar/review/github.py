@@ -826,7 +826,7 @@ class GitHubClient:
         default_branch = repository_data.get("default_branch")
         if not isinstance(default_branch, str) or not default_branch.strip():
             raise GitHubBoundaryError("repository default branch is unavailable")
-        default_branch = _identifier(default_branch, "default branch")
+        default_branch = _branch(default_branch)
         if self.get_branch_head(repository, default_branch) != commit_sha:
             raise GitHubBoundaryError("authenticated config source commit is not the live default-branch head")
         commit = self.get_commit(repository, commit_sha).data
