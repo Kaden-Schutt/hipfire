@@ -1695,6 +1695,20 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW2_BUFFER_GFX1151
             "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer.gfx1151.hip"
         )
     );
+/// Same two-row gfx1151 kernel with an explicit weight-VMEM clause before the
+/// dependent dequant/FMA phase.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW2_CLUSTERED_GFX1151_SRC: &str =
+    concat!(
+        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+        "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+        "#define HIPFIRE_MOE_DOWN_ROW2_CLUSTERED 1\n",
+        "#define HIPFIRE_MOE_DOWN_ROW2_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_clustered_gfx1151\n",
+        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+        include_str!(
+            "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer.gfx1151.hip"
+        )
+    );
 
 /// Radiowave gfx1100 cache-policy probe for the atomic-free MoE down stream.
 /// Keep this replay-visible and opt-in until exact-shadow and product-level

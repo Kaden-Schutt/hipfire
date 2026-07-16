@@ -4,6 +4,15 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_MOE_DOWN_ROW2_KERNEL
+#define HIPFIRE_MOE_DOWN_ROW2_KERNEL \
+    gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151
+#endif
+
+#ifndef HIPFIRE_MOE_DOWN_ROW2_CLUSTERED
+#define HIPFIRE_MOE_DOWN_ROW2_CLUSTERED 0
+#endif
+
 // gfx1151 K=512 routed-down compromise: two rows per wave.  Row1 proved that
 // the full routing/weight stream can be VMEM-only at 29 VGPR but did not keep
 // enough independent requests in flight; the four-row source emitted 92 VGPR.
@@ -12,7 +21,7 @@
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void
-gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151(
+HIPFIRE_MOE_DOWN_ROW2_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs,
     const int* __restrict__ topk_indices,
     const float* __restrict__ rot_batch,
@@ -54,13 +63,7 @@ gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151(
     const float4 x1a = *reinterpret_cast<const float4*>(x + 256 + tid * 8);
     const float4 x1b = *reinterpret_cast<const float4*>(x + 260 + tid * 8);
 
-    #define DOG_GROUP(resource, offset, accumulator, xa, xb) do { \
-        const float sc = __builtin_bit_cast(float, \
-            HIPFIRE_WEIGHT_LOAD_U32(resource, (offset))); \
-        const float zp = __builtin_bit_cast(float, \
-            HIPFIRE_WEIGHT_LOAD_U32(resource, (offset) + 4u)); \
-        const unsigned int pk = HIPFIRE_WEIGHT_LOAD_U32( \
-            resource, (offset) + 8u + (unsigned int)boff); \
+    #define DOG_VALUES(sc, zp, pk, accumulator, xa, xb) do { \
         (accumulator) += (sc * (float)(pk & 0xFu) + zp) * (xa).x \
             + (sc * (float)((pk >> 4) & 0xFu) + zp) * (xa).y \
             + (sc * (float)((pk >> 8) & 0xFu) + zp) * (xa).z \
@@ -73,11 +76,47 @@ gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151(
 
     float acc0 = 0.0f, acc1 = 0.0f;
     float bcc0 = 0.0f, bcc1 = 0.0f;
-    DOG_GROUP(row_rsrc0, 0u, acc0, x0a, x0b);
-    DOG_GROUP(row_rsrc1, 0u, bcc0, x0a, x0b);
-    DOG_GROUP(row_rsrc0, 136u, acc1, x1a, x1b);
-    DOG_GROUP(row_rsrc1, 136u, bcc1, x1a, x1b);
-    #undef DOG_GROUP
+#if HIPFIRE_MOE_DOWN_ROW2_CLUSTERED
+    // Keep the 12 weight VMEM operations ahead of the dependent VALU. The
+    // default immediate-consume source emitted 90 waits / 72 delay_alu at only
+    // 34 VGPR; this trades some of that unused register headroom for request
+    // overlap while preserving each row's accumulator and FMA order.
+    #define LOAD_GROUP(resource, offset, sc, zp, pk) do { \
+        (sc) = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_U32(resource, (offset))); \
+        (zp) = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_U32(resource, (offset) + 4u)); \
+        (pk) = HIPFIRE_WEIGHT_LOAD_U32( \
+            resource, (offset) + 8u + (unsigned int)boff); \
+    } while (0)
+    float sc00, zp00, sc01, zp01, sc10, zp10, sc11, zp11;
+    unsigned int pk00, pk01, pk10, pk11;
+    LOAD_GROUP(row_rsrc0, 0u, sc00, zp00, pk00);
+    LOAD_GROUP(row_rsrc0, 136u, sc01, zp01, pk01);
+    LOAD_GROUP(row_rsrc1, 0u, sc10, zp10, pk10);
+    LOAD_GROUP(row_rsrc1, 136u, sc11, zp11, pk11);
+    #undef LOAD_GROUP
+    DOG_VALUES(sc00, zp00, pk00, acc0, x0a, x0b);
+    DOG_VALUES(sc10, zp10, pk10, bcc0, x0a, x0b);
+    DOG_VALUES(sc01, zp01, pk01, acc1, x1a, x1b);
+    DOG_VALUES(sc11, zp11, pk11, bcc1, x1a, x1b);
+#else
+    #define LOAD_DOG(resource, offset, accumulator, xa, xb) do { \
+        const float sc = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_U32(resource, (offset))); \
+        const float zp = __builtin_bit_cast(float, \
+            HIPFIRE_WEIGHT_LOAD_U32(resource, (offset) + 4u)); \
+        const unsigned int pk = HIPFIRE_WEIGHT_LOAD_U32( \
+            resource, (offset) + 8u + (unsigned int)boff); \
+        DOG_VALUES(sc, zp, pk, accumulator, xa, xb); \
+    } while (0)
+    LOAD_DOG(row_rsrc0, 0u, acc0, x0a, x0b);
+    LOAD_DOG(row_rsrc1, 0u, bcc0, x0a, x0b);
+    LOAD_DOG(row_rsrc0, 136u, acc1, x1a, x1b);
+    LOAD_DOG(row_rsrc1, 136u, bcc1, x1a, x1b);
+    #undef LOAD_DOG
+#endif
+    #undef DOG_VALUES
 
     float acc = acc0 + acc1;
     float bcc = bcc0 + bcc1;
