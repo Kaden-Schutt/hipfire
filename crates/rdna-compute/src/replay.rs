@@ -2501,12 +2501,6 @@ impl ReplayController {
             let mut phase_commands = Vec::<Vec<Pm4Commands>>::with_capacity(plans.len());
             let mut command_dwords = 0_u32;
             let mut max_queue_count = 1_usize;
-            // AQL-phased IBs cross an ownership boundary at every phase, but
-            // native phases are concatenated into one retained IB per queue.
-            // Reacquiring at every logical phase both wastes packets and
-            // repeatedly invalidates the caches that producer/consumer
-            // overlap is intended to preserve.
-            let mut native_lane_initialized = vec![false; queue_limit];
 
             for phase in &plans {
                 let lane_count = if phase.parallel {
@@ -2517,7 +2511,7 @@ impl ReplayController {
                 };
                 if lane_count > 1 {
                     let mut lanes = (0..lane_count)
-                        .map(|lane| {
+                        .map(|_| {
                             let mut commands = Pm4Commands::new(
                                 pm4_architecture,
                                 self.pm4_register_policy,
@@ -2525,10 +2519,7 @@ impl ReplayController {
                                 dispatch_interleave,
                                 resource_limits_policy,
                             );
-                            if !native_phase_sync || !native_lane_initialized[lane] {
-                                commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
-                                native_lane_initialized[lane] = true;
-                            }
+                            commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                             commands
                         })
                         .collect::<Vec<_>>();
@@ -2560,10 +2551,7 @@ impl ReplayController {
                     dispatch_interleave,
                     resource_limits_policy,
                 );
-                if !native_phase_sync || !native_lane_initialized[0] {
-                    commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
-                    native_lane_initialized[0] = true;
-                }
+                commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                 let mut resource_frontier = ResourceFrontier::default();
                 for (position, index) in phase.indices.iter().copied().enumerate() {
                     if position != 0 && !phase.parallel {
