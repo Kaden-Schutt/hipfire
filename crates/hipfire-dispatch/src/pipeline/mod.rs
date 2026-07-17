@@ -1719,6 +1719,10 @@ fn select_grouped_lloyd_variant(
     }
 }
 
+fn use_gfx1151_i8_moe(arch: &str) -> bool {
+    arch == "gfx1151"
+}
+
 /// Dispatch one MQ2-Lloyd grouped GEMM. All seven variants share the signature
 /// `(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows)`, so
 /// this is called identically for gate_up (m=2*im, k=hidden, x_row_div=k_top,
@@ -1931,7 +1935,7 @@ pub fn run_moe_prefill_bias_aware(
     let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
     let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
     // i8 MMQ path (gfx1151 only): 2-bit Lloyd → int8 codebook LUT + i8 WMMA.
-    let i8_moe = gpu.arch.starts_with("gfx1151");
+    let i8_moe = use_gfx1151_i8_moe(&gpu.arch);
 
     if use_grouped {
         const BLOCK_M: usize = 16;
@@ -2805,9 +2809,17 @@ pub fn dispatch_fused(
 
 #[cfg(test)]
 mod mixed_dispatch_tests {
-    use super::build_contiguous_permutation;
+    use super::{build_contiguous_permutation, use_gfx1151_i8_moe};
     use crate::families::moe_buckets::bucket_topk_by_tier;
     use rdna_compute::DType::*;
+
+    #[test]
+    fn deepseek4_i8_moe_is_exact_gfx1151_only() {
+        assert!(use_gfx1151_i8_moe("gfx1151"));
+        for arch in ["gfx1100", "gfx1150", "gfx1152", "gfx1200", "gfx1201"] {
+            assert!(!use_gfx1151_i8_moe(arch), "unexpected i8 route on {arch}");
+        }
+    }
 
     /// EQUIVALENCE INVARIANT (host half): an all-ONE-tier table yields the
     /// IDENTITY permutation and a single full-width range. This is the
