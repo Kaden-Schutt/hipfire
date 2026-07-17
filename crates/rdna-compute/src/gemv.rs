@@ -5072,20 +5072,7 @@ impl Gpu {
             && self.flags.gfx1201_hfq4_27b_global
             && m == 5_120
             && matches!(k, 6_144 | 17_408);
-        static GFX1201_27B_RESIDUAL_HALF_SPLIT: OnceLock<bool> = OnceLock::new();
-        let gfx1201_27b_half_split = gfx1201_27b_global
-            && *GFX1201_27B_RESIDUAL_HALF_SPLIT.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_RESIDUAL_HALF_SPLIT")
-                    .as_deref()
-                    == Ok("1")
-            });
-        let (src, module, func_name) = if gfx1201_27b_half_split {
-            (
-                kernels::GEMV_HFQ4G256_RESIDUAL_HALF_SPLIT_GLOBAL_GFX1201_SRC,
-                "gemv_hfq4g256_residual_half_split_global_gfx1201",
-                "gemv_hfq4g256_residual_half_split_global_gfx1201",
-            )
-        } else if gfx1201_27b_global {
+        let (src, module, func_name) = if gfx1201_27b_global {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_GLOBAL_GFX1201_SRC,
                 "gemv_hfq4g256_residual_global_gfx1201",

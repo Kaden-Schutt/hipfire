@@ -38,17 +38,9 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     float* __restrict__ y,
     int M, int K
 ) {
-#if defined(HIPFIRE_RESIDUAL_HALF_SPLIT)
-    const int row0 = blockIdx.x;
-#else
     const int row0 = blockIdx.x << 1;
-#endif
     if (row0 >= M) return;
-#if defined(HIPFIRE_RESIDUAL_HALF_SPLIT)
-    const int row1 = row0 + ((M + 1) >> 1);
-#else
     const int row1 = row0 + 1;
-#endif
     const bool have_row1 = row1 < M;
     const int tid = threadIdx.x;
 
@@ -213,15 +205,10 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
 
     if (tid == 0) {
         if (have_row1) {
-#if defined(HIPFIRE_RESIDUAL_HALF_SPLIT)
-            y[row0] += acc;
-            y[row1] += bcc;
-#else
             float2 yy = *reinterpret_cast<float2*>(y + row0);
             yy.x += acc;
             yy.y += bcc;
             *reinterpret_cast<float2*>(y + row0) = yy;
-#endif
         } else {
             y[row0] += acc;
         }
