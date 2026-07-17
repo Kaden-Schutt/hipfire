@@ -3010,11 +3010,14 @@ fn main() {
                         continue;
                     }
                 };
-                if m.pp > 1 || m.ep.is_some() || (m.arch_id != 5 && m.arch_id != 6) {
+                if m.pp > 1
+                    || m.ep.is_some()
+                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 11)
+                {
                     let _ = writeln!(
                         stdout,
                         "{}",
-                        r#"{"type":"error","message":"bench_decode currently requires a single-GPU Qwen3.5 model"}"#
+                        r#"{"type":"error","message":"bench_decode currently requires a single-GPU Qwen3.5 or LFM2.5 model"}"#
                     );
                     let _ = stdout.flush();
                     continue;
@@ -3061,8 +3064,36 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
+                if m.arch_id == 11 {
+                    // LFM2.5 carries its own KV + conv-state cursors; reset
+                    // them so the prime writes from slot 0 (mirrors the
+                    // bench_prefill arch-11 arm and the chat reset handler).
+                    if let Some(b) = m.lfm2moe_mut() {
+                        let _ = b.state.reset(&mut gpu);
+                    }
+                }
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-                let prime_ok = {
+                let prime_ok = if m.arch_id == 11 {
+                    // LFM2.5 has no batched prefill kernel — the production
+                    // prefill shape IS the eager per-token decode_step (see
+                    // the bench_prefill arch-11 arm), so prime with it.
+                    let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if lfm2moe::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -3111,7 +3142,30 @@ fn main() {
 
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
-                let run_ok = {
+                let run_ok = if m.arch_id == 11 {
+                    let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
+                    let mut ok = true;
+                    for i in 0..iterations {
+                        let token = 101 + (i as u32 % 1000);
+                        if lfm2moe::forward::decode_step(
+                            config,
+                            weights,
+                            state,
+                            &mut gpu,
+                            token,
+                            (context + i) as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -3161,6 +3215,9 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
+                if let Some(b) = m.lfm2moe_mut() {
+                    let _ = b.state.reset(&mut gpu);
+                }
 
                 if run_ok {
                     let tok_s = iterations as f64 / elapsed.max(f64::MIN_POSITIVE);
