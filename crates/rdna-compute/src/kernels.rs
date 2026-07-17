@@ -1240,16 +1240,6 @@ pub const GEMV_HFQ4G256_RESIDUAL_K6144_GLOBAL_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
-/// Exact dense Qwen3.5-27B gfx1201 FFN-down residual. K=17408 is 68 HFQ4
-/// groups (seventeen group-quads), with no generic tail.
-pub const GEMV_HFQ4G256_RESIDUAL_K17408_GLOBAL_GFX1201_SRC: &str = concat!(
-    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
-    "#define HIPFIRE_RESIDUAL_GROUPS_PER_ROW 68\n",
-    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_k17408_global_gfx1201\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
-);
 /// Radiowave gfx1151 probe: preserve the generic dual-row arithmetic while
 /// lowering the weight stream to temporal raw-buffer loads. gfx1151 is not in
 /// the gfx1100 dGPU admission set, so this remains inert unless the exact-arch
