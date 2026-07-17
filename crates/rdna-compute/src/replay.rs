@@ -120,6 +120,11 @@ fn create_phased_pm4_graph(
             }
         }
         Pm4Architecture::Gfx12 => {
+            if native_sync {
+                return Err(
+                    "native PM4 phase synchronization is not yet lowered for gfx12".to_owned(),
+                );
+            }
             let gfx12 = phases
                 .iter()
                 .map(|phase| {
@@ -134,11 +139,7 @@ fn create_phased_pm4_graph(
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if native_sync {
-                PhasedMultiQueuePm4Ib::create_profiled_native_gfx12(device, pool, &gfx12)
-            } else {
-                PhasedMultiQueuePm4Ib::create_profiled(device, pool, &gfx12)
-            }
+            PhasedMultiQueuePm4Ib::create_profiled(device, pool, &gfx12)
         }
     }
     .map_err(|error| error.to_string())

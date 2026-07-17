@@ -14,8 +14,6 @@ use crate::{Kernel, LaunchGeometry};
 const PACKET3_SET_SH_REG: u32 = 0x76;
 const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
 const PACKET3_COPY_DATA: u32 = 0x40;
-const PACKET3_WRITE_DATA: u32 = 0x37;
-const PACKET3_WAIT_REG_MEM: u32 = 0x3c;
 const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
@@ -148,72 +146,6 @@ impl Gfx12Pm4CommandBuffer {
         ]);
     }
 
-    /// Append a complete independently-built command stream.
-    ///
-    /// The appended stream materializes its own register state. Clear this
-    /// builder's cache so any later dispatch also rematerializes state rather
-    /// than relying on values that the appended stream may have changed.
-    pub fn append_stream(&mut self, commands: &Self) {
-        self.dwords.extend_from_slice(&commands.dwords);
-        if let Some(register_state) = self.register_state.as_mut() {
-            register_state.clear();
-        }
-    }
-
-    /// Publish a 32-bit value only after all preceding compute work completes.
-    /// GFX12 retains the gfx9+ compute-ring `RELEASE_MEM` packet contract used
-    /// by ROCr and Mesa: bottom-of-pipe, memory destination, immediate 32-bit
-    /// data, and write confirmation.
-    pub fn release_memory_value(&mut self, address: u64, value: u32) {
-        debug_assert_ne!(address, 0);
-        debug_assert_eq!(address & 3, 0);
-        const BOTTOM_OF_PIPE_TS_EVENT: u32 = 40 | (5 << 8);
-        const VALUE_32_AFTER_WRITE_CONFIRM: u32 = (3 << 24) | (1 << 29);
-        self.dwords.extend_from_slice(&[
-            packet3(PACKET3_RELEASE_MEM, 7, false),
-            BOTTOM_OF_PIPE_TS_EVENT,
-            VALUE_32_AFTER_WRITE_CONFIRM,
-            address as u32,
-            (address >> 32) as u32,
-            value,
-            0,
-            0,
-        ]);
-    }
-
-    /// Publish a 32-bit value after an explicit compute-idle packet already
-    /// present in this stream, avoiding a second bottom-of-pipe event.
-    pub fn write_memory_value_after_idle(&mut self, address: u64, value: u32) {
-        debug_assert_ne!(address, 0);
-        debug_assert_eq!(address & 3, 0);
-        debug_assert!(self.ends_with_compute_idle());
-        const MEMORY_WRITE_CONFIRMED: u32 = (5 << 8) | (1 << 20);
-        self.dwords.extend_from_slice(&[
-            packet3(PACKET3_WRITE_DATA, 4, false),
-            MEMORY_WRITE_CONFIRMED,
-            address as u32,
-            (address >> 32) as u32,
-            value,
-        ]);
-    }
-
-    /// Stall this queue's command processor until a GPU-visible word equals
-    /// `value`. Peer queues remain schedulable while this queue is parked.
-    pub fn wait_memory_value(&mut self, address: u64, value: u32) {
-        debug_assert_ne!(address, 0);
-        debug_assert_eq!(address & 3, 0);
-        const MEMORY_SPACE_EQUAL: u32 = (1 << 4) | 3;
-        self.dwords.extend_from_slice(&[
-            packet3(PACKET3_WAIT_REG_MEM, 6, false),
-            MEMORY_SPACE_EQUAL,
-            address as u32,
-            (address >> 32) as u32,
-            value,
-            u32::MAX,
-            4,
-        ]);
-    }
-
     /// Same-agent inter-node acquire for one retained gfx12 tape. Kernel code
     /// is immutable and L2/MALL remains coherent, so only scalar/vector read
     /// caches plus forward sequencing are invalidated.
@@ -314,13 +246,6 @@ impl Gfx12Pm4CommandBuffer {
     pub fn wait_compute_idle(&mut self) {
         self.dwords.push(packet3(PACKET3_EVENT_WRITE, 1, false));
         self.dwords.push(0x407); // CS_PARTIAL_FLUSH, event-index 4.
-    }
-
-    pub fn ends_with_compute_idle(&self) -> bool {
-        self.dwords.ends_with(&[
-            packet3(PACKET3_EVENT_WRITE, 1, false),
-            0x407,
-        ])
     }
 
     pub fn len_dwords(&self) -> u32 {
@@ -479,54 +404,6 @@ mod tests {
         assert_eq!(commands.dwords()[16], 0xc006_5800);
         assert_eq!(commands.dwords()[23], 0x10180);
         assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x407]);
-        assert!(commands.ends_with_compute_idle());
-    }
-
-    #[test]
-    fn native_queue_semaphore_packets_match_gfx9_plus_compute_encodings() {
-        let address = 0x1234_5678_9abc_def0;
-        let mut commands = Gfx12Pm4CommandBuffer::new();
-        commands.release_memory_value(address, 7);
-        commands.wait_memory_value(address + 4, 7);
-        assert_eq!(
-            commands.dwords(),
-            &[
-                0xc006_4900,
-                0x528,
-                0x2300_0000,
-                0x9abc_def0,
-                0x1234_5678,
-                7,
-                0,
-                0,
-                0xc005_3c00,
-                0x13,
-                0x9abc_def4,
-                0x1234_5678,
-                7,
-                u32::MAX,
-                4,
-            ]
-        );
-    }
-
-    #[test]
-    fn confirmed_write_reuses_gfx12_compute_idle_boundary() {
-        let address = 0x1234_5678_9abc_def0;
-        let mut commands = Gfx12Pm4CommandBuffer::new();
-        commands.wait_compute_idle();
-        commands.write_memory_value_after_idle(address, 9);
-        assert_eq!(
-            &commands.dwords()[2..],
-            &[
-                0xc003_3700,
-                0x0010_0500,
-                0x9abc_def0,
-                0x1234_5678,
-                9,
-            ]
-        );
-        assert!(!commands.ends_with_compute_idle());
     }
 
     #[test]
