@@ -9517,6 +9517,80 @@ impl Gpu {
         }
         result
     }
+    /// Batched twin of `deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed`
+    /// (MQ3-Lloyd, 3-bit + 8-entry codebook, 112 B/group). Enables minimax
+    /// batched prefill / spec-verify on the mixed-tier `gate_up=MQ2 / down=MQ3`
+    /// k-map. Mirrors the MQ2 `_batched_k4` wrapper; only the per-group stride
+    /// (112 vs 72) and the kernel name differ.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq3g256_lloyd_moe_down_indexed_batched_k4",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_SRC,
+            "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let mq3_weight_bytes = m * (k / 256) * 112;
+        let bytes = batch_size * k_top * (mq3_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed_batched_k4",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rbp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,  // [n_exp] u64 device pointers
