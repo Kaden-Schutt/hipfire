@@ -39,7 +39,8 @@ RECIPES = {
     "nothink": {"temperature": 0.7, "top_p": 0.80, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5,
                 "reasoning_effort": "none"},
 }
-SAMPLE_KEYS = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "reasoning_effort"]
+SAMPLE_KEYS = ["temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+               "presence_penalty", "reasoning_effort"]
 
 GENRE_BATTERY = [
     ("code",     "Write a Python function `merge_sorted(a, b)` that merges two already-sorted lists "
