@@ -144,13 +144,34 @@ trait KvTierInputsExt: Sized {
 }
 
 impl KvTierInputsExt for hipfire_dispatch::families::kv_tier::KvTierInputs {
-    fn with_q8(mut self) -> Self { self.quant_q8 = true; self }
-    fn with_asym4(mut self) -> Self { self.quant_asym4 = true; self }
-    fn with_asym3(mut self) -> Self { self.quant_asym3 = true; self }
-    fn with_asym2(mut self) -> Self { self.quant_asym2 = true; self }
-    fn with_hfq8(mut self) -> Self { self.quant_hfq8 = true; self }
-    fn with_q4(mut self) -> Self { self.quant_q4 = true; self }
-    fn with_hfq4(mut self) -> Self { self.quant_hfq4 = true; self }
+    fn with_q8(mut self) -> Self {
+        self.quant_q8 = true;
+        self
+    }
+    fn with_asym4(mut self) -> Self {
+        self.quant_asym4 = true;
+        self
+    }
+    fn with_asym3(mut self) -> Self {
+        self.quant_asym3 = true;
+        self
+    }
+    fn with_asym2(mut self) -> Self {
+        self.quant_asym2 = true;
+        self
+    }
+    fn with_hfq8(mut self) -> Self {
+        self.quant_hfq8 = true;
+        self
+    }
+    fn with_q4(mut self) -> Self {
+        self.quant_q4 = true;
+        self
+    }
+    fn with_hfq4(mut self) -> Self {
+        self.quant_hfq4 = true;
+        self
+    }
 }
 
 // ─── Prefill batchability ─────────────────────────────────────
