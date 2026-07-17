@@ -11605,6 +11605,15 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch != "gfx1151" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_mq3g256_lloyd_moe_grouped_mmq_gfx1151 requires gfx1151; current arch = {}",
+                    self.arch
+                ),
+            ));
+        }
         let kernel_name = "gemm_mq3g256_lloyd_moe_grouped_mmq_gfx1151";
         let kernel_src = kernels::GEMM_MQ3G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC;
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
