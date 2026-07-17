@@ -4062,6 +4062,12 @@ pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
 
+/// Exact gfx1201 Qwen3.5-27B FA producer: deinterleave Q/Gate and normalize
+/// Q/K in one fixed-shape dispatch, leaving stock RoPE as the consumer.
+#[cfg(feature = "deltanet")]
+pub const QWEN35_FA_NORM_PREP_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/qwen35_fa_norm_prep.gfx1201.hip");
+
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
 /// attention. See `kernels/src/rope_2d_halfsplit.hip` for the layout

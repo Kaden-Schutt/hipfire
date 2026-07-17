@@ -13926,7 +13926,19 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 };
                 let tap_enabled = hipfire_runtime::triattn::tap_enabled();
                 let fused_prep = qwen35_fa_prep_enabled(gpu, config) && !tap_enabled;
-                if !fused_prep {
+                let fused_norm_prep =
+                    !fused_prep && qwen35_fa_norm_prep_gfx1201_enabled(gpu, config);
+                if fused_norm_prep {
+                    gpu.qwen35_fa_norm_prep_gfx1201(
+                        &s.fa_q_full,
+                        &s.fa_q,
+                        &s.fa_gate,
+                        &s.fa_k,
+                        q_norm,
+                        k_norm,
+                        config.norm_eps,
+                    )?;
+                } else if !fused_prep {
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
                         &s.fa_q,
@@ -14392,6 +14404,25 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && config.n_kv_heads == 2
         && config.head_dim == 256
         && n_rot == 64
+}
+
+/// Candidate gfx1201 producer/consumer boundary for dense Qwen3.5-27B.
+/// Collapse deinterleave + Q RMS + K RMS into one exact head-local producer,
+/// then retain the stock RoPE consumer. This is opt-in until strict PM4
+/// shadow parity and a stationary product battery establish a real win.
+fn qwen35_fa_norm_prep_gfx1201_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX1201_QWEN35_FA_NORM_PREP").as_deref() == Ok("1")
+    });
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    enabled
+        && gpu.arch_caps.is_gfx1201()
+        && config.dim == 5_120
+        && config.n_heads == 40
+        && config.n_kv_heads == 8
+        && config.head_dim == 128
+        && n_rot == 32
 }
 
 /// Pair Q8 K/V cache writes and fold the Qwen output gate plus MQ rotation into
