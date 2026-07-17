@@ -5,6 +5,175 @@
 
 use rdna_compute::DType;
 
+// ─── KV-tier dispatch sweep (Site A fix validation) ────────────
+//
+// These tests validate that each KvCache tier produces the correct
+// KvTierPlan via KvTierPlan::derive — mirroring what arch.rs Site A
+// (and the runtime forward) now do via kv_cache.tier_inputs().
+// GPU-free: tests pure dispatch-resolution logic only.
+
+fn tier_inputs_base() -> hipfire_dispatch::families::kv_tier::KvTierInputs {
+    use hipfire_dispatch::families::kv_tier::{F32AttnPolicy, KvTierInputs};
+    KvTierInputs {
+        quant_asym4: false,
+        quant_asym3: false,
+        quant_asym2: false,
+        quant_q8: false,
+        quant_fwht: false,
+        quant_hfq4: false,
+        quant_q4: false,
+        quant_int8: false,
+        quant_hfq8: false,
+        f32_policy: F32AttnPolicy::Simple,
+        v_mode_bits: 8,
+        pos: 0,
+        flash_mode: 0,
+        capture_mode: false,
+        batch_size: 1,
+        is_tree: false,
+        is_boundary: false,
+        q8_windowed: false,
+        window: 0,
+    }
+}
+
+#[test]
+fn llama_kv_tier_q8_uses_q8_kernels_no_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let plan = KvTierPlan::derive(tier_inputs_base().with_q8()).unwrap();
+    // Q8 never needs givens rotation buffers.
+    assert!(!plan.uses_givens, "Q8 must not set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteQ8_0);
+    // Short-context Q8 defaults to non-flash single-token attend.
+    assert_eq!(plan.attend_key, KernelKey::AttnQ8_0Kv);
+}
+
+#[test]
+fn llama_kv_tier_asym4_uses_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let plan = KvTierPlan::derive(tier_inputs_base().with_asym4()).unwrap();
+    assert!(plan.uses_givens, "Asym4 must set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteAsym4);
+    assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym4);
+}
+
+#[test]
+fn llama_kv_tier_asym3_uses_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let plan = KvTierPlan::derive(tier_inputs_base().with_asym3()).unwrap();
+    assert!(plan.uses_givens, "Asym3 must set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteAsym3);
+    assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym3);
+}
+
+#[test]
+fn llama_kv_tier_asym2_uses_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let plan = KvTierPlan::derive(tier_inputs_base().with_asym2()).unwrap();
+    assert!(plan.uses_givens, "Asym2 must set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteAsym2);
+    assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym2);
+}
+
+#[test]
+fn llama_kv_tier_hfq8_no_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let plan = KvTierPlan::derive(tier_inputs_base().with_hfq8()).unwrap();
+    assert!(!plan.uses_givens, "HFQ8 must not set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteHfq8);
+    assert_eq!(plan.attend_key, KernelKey::AttnHfq8Kv);
+}
+
+#[test]
+fn llama_kv_tier_q4_no_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let plan = KvTierPlan::derive(tier_inputs_base().with_q4()).unwrap();
+    assert!(!plan.uses_givens, "Q4 must not set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteQ4);
+    assert_eq!(plan.attend_key, KernelKey::AttnQ4Kv);
+}
+
+#[test]
+fn llama_kv_tier_hfq4_no_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let plan = KvTierPlan::derive(tier_inputs_base().with_hfq4()).unwrap();
+    assert!(!plan.uses_givens, "HFQ4 must not set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteHfq4);
+    assert_eq!(plan.attend_key, KernelKey::AttnHfq4Kv);
+}
+
+#[test]
+fn llama_kv_tier_f32_no_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let plan = KvTierPlan::derive(tier_inputs_base()).unwrap();
+    assert!(!plan.uses_givens, "F32 must not set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteF32);
+    assert_eq!(plan.attend_key, KernelKey::AttnF32);
+}
+
+#[test]
+fn llama_kv_tier_asym4_fwht_uses_givens() {
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::types::KernelKey;
+    let mut ti = tier_inputs_base().with_asym4();
+    ti.quant_fwht = true;
+    let plan = KvTierPlan::derive(ti).unwrap();
+    assert!(plan.uses_givens, "Asym4+FWHT must set uses_givens");
+    assert_eq!(plan.write_key, KernelKey::KvWriteAsym4Fwht);
+    assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym4Fwht);
+}
+
+// ─── Builder helpers (keep at module end) ─────────────────────
+
+trait KvTierInputsExt: Sized {
+    fn with_q8(self) -> Self;
+    fn with_asym4(self) -> Self;
+    fn with_asym3(self) -> Self;
+    fn with_asym2(self) -> Self;
+    fn with_hfq8(self) -> Self;
+    fn with_q4(self) -> Self;
+    fn with_hfq4(self) -> Self;
+}
+
+impl KvTierInputsExt for hipfire_dispatch::families::kv_tier::KvTierInputs {
+    fn with_q8(mut self) -> Self {
+        self.quant_q8 = true;
+        self
+    }
+    fn with_asym4(mut self) -> Self {
+        self.quant_asym4 = true;
+        self
+    }
+    fn with_asym3(mut self) -> Self {
+        self.quant_asym3 = true;
+        self
+    }
+    fn with_asym2(mut self) -> Self {
+        self.quant_asym2 = true;
+        self
+    }
+    fn with_hfq8(mut self) -> Self {
+        self.quant_hfq8 = true;
+        self
+    }
+    fn with_q4(mut self) -> Self {
+        self.quant_q4 = true;
+        self
+    }
+    fn with_hfq4(mut self) -> Self {
+        self.quant_hfq4 = true;
+        self
+    }
+}
+
 // ─── Prefill batchability ─────────────────────────────────────
 
 #[test]
