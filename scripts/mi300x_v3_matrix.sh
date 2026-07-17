@@ -40,14 +40,7 @@ qwen3.6-27b     Qwen/Qwen3.6-27B            6a9e13bd6fc8f0983b9b99948120bc37f49c
 qwen3.6-35b-a3b Qwen/Qwen3.6-35B-A3B        7da1103448ba36029c34ce1a9a741dfe93ee0c50  Qwen3.6-35B-A3B-GGUF
 EOF
 
-# ── Per-model overrides ────────────────────────────────────────────────────
-# A3B has a MoE router that's in F1 scope by default and triggered tool-call
-# schema corruption in PR #225/MFP4. v3 uses MQ4 not MFP4 — risk unknown.
-# For safety the first pass excludes the router; flip A3B_INCLUDE_ROUTER=1 to
-# also try the inclusive variant.
-A3B_INCLUDE_ROUTER="${A3B_INCLUDE_ROUTER:-0}"
-
-# Eval params (canonical from CLAUDE.md):
+# ── Eval configuration (canonical from CLAUDE.md) ──────────────────────────────
 KLD_PROMPT_NORMALIZE="${KLD_PROMPT_NORMALIZE:-true}"
 EVAL_KV_MODE="${EVAL_KV_MODE:-q8}"
 EVAL_CTX="${EVAL_CTX:-512}"
@@ -130,11 +123,7 @@ run_one() {
         local awq_args=( --input "$bf16_dir" --output "$awq_base"
                          --format mq4 --awq --awq-alpha 0.5
                          --imatrix "$imatrix" )
-        # MoE router exclusion for A3B unless explicitly opted in
-        if [ "$slug" = "qwen3.6-35b-a3b" ] && [ "$A3B_INCLUDE_ROUTER" != "1" ]; then
-            awq_args+=( --awq-exclude-pattern "router.weight" )
-            ok "A3B: excluding router from AWQ (set A3B_INCLUDE_ROUTER=1 to override)"
-        fi
+        # MoE routers are kept at Q8 by the quantizer and therefore bypass AWQ.
         ( cd "$HIPFIRE" && ./target/release/hipfire-quantize "${awq_args[@]}" ) 2>&1 \
             | tail -15 | tee "$model_out_dir/stage1_awq.log"
         [ -f "$awq_base" ] || die "stage 1 produced no output"
