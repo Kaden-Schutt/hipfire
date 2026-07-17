@@ -19,7 +19,7 @@ use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
-    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy,
+    Gfx12ComputeResourceLimitsPolicy, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy,
     KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy,
     RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
@@ -151,6 +151,7 @@ impl Pm4Commands {
         dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
         dispatch_interleave: Option<Gfx11DispatchInterleave>,
         resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
+        gfx12_resource_limits_policy: Gfx12ComputeResourceLimitsPolicy,
     ) -> Self {
         match architecture {
             Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
@@ -173,7 +174,8 @@ impl Pm4Commands {
                     Pm4RegisterPolicy::Legacy => Gfx12Pm4CommandBuffer::new(),
                     Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
                     Pm4RegisterPolicy::Stateful => Gfx12Pm4CommandBuffer::new_stateful(),
-                };
+                }
+                .with_resource_limits_policy(gfx12_resource_limits_policy);
                 Self::Gfx12(commands)
             }
         }
@@ -1235,6 +1237,42 @@ fn gfx1151_resource_limits_policy(
         eprintln!("[redline] gfx1151 PM4 resource-limits policy={policy:?}");
     }
     policy
+}
+
+fn gfx12_resource_limits_policy(
+    architecture: Pm4Architecture,
+    device_name: &str,
+) -> Gfx12ComputeResourceLimitsPolicy {
+    let value = std::env::var("HIPFIRE_GFX12_PM4_RESOURCE_LIMITS")
+        .unwrap_or_else(|_| "legacy".to_owned());
+    let policy = gfx12_resource_limits_policy_from_value(architecture, device_name, &value)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unknown HIPFIRE_GFX12_PM4_RESOURCE_LIMITS={value:?}; retaining legacy resource limits"
+            );
+            Gfx12ComputeResourceLimitsPolicy::Legacy
+        });
+    if policy != Gfx12ComputeResourceLimitsPolicy::Legacy {
+        eprintln!("[redline] gfx12 PM4 resource limits policy={policy:?}");
+    }
+    policy
+}
+
+fn gfx12_resource_limits_policy_from_value(
+    architecture: Pm4Architecture,
+    device_name: &str,
+    value: &str,
+) -> Option<Gfx12ComputeResourceLimitsPolicy> {
+    if architecture != Pm4Architecture::Gfx12
+        || !device_name.to_ascii_lowercase().starts_with("gfx12")
+    {
+        return Some(Gfx12ComputeResourceLimitsPolicy::Legacy);
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "" | "legacy" => Some(Gfx12ComputeResourceLimitsPolicy::Legacy),
+        "radv" | "mesa" => Some(Gfx12ComputeResourceLimitsPolicy::Radv),
+        _ => None,
+    }
 }
 
 fn gfx1151_resource_limits_policy_from_value(
@@ -2303,6 +2341,8 @@ impl ReplayController {
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
+        let gfx12_resource_limits_policy =
+            gfx12_resource_limits_policy(pm4_architecture, device.name());
         let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
         let entry_acquire_policy =
             gfx1151_entry_acquire_policy(pm4_architecture, device.name());
@@ -2429,6 +2469,7 @@ impl ReplayController {
                 dispatch_initiator_policy,
                 dispatch_interleave,
                 resource_limits_policy,
+                gfx12_resource_limits_policy,
             );
             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
             let mut resource_frontier = ResourceFrontier::default();
@@ -2518,6 +2559,7 @@ impl ReplayController {
                                 dispatch_initiator_policy,
                                 dispatch_interleave,
                                 resource_limits_policy,
+                                gfx12_resource_limits_policy,
                             );
                             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                             commands
@@ -2550,6 +2592,7 @@ impl ReplayController {
                     dispatch_initiator_policy,
                     dispatch_interleave,
                     resource_limits_policy,
+                    gfx12_resource_limits_policy,
                 );
                 commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                 let mut resource_frontier = ResourceFrontier::default();
@@ -3437,6 +3480,34 @@ mod tests {
             gfx1151_resource_limits_policy_from_value(
                 Pm4Architecture::Gfx11,
                 "gfx1151",
+                "invalid",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn gfx12_resource_limits_policy_is_exact_arch_only() {
+        assert_eq!(
+            gfx12_resource_limits_policy_from_value(
+                Pm4Architecture::Gfx12,
+                "gfx1201",
+                "radv",
+            ),
+            Some(Gfx12ComputeResourceLimitsPolicy::Radv)
+        );
+        assert_eq!(
+            gfx12_resource_limits_policy_from_value(
+                Pm4Architecture::Gfx11,
+                "gfx1151",
+                "radv",
+            ),
+            Some(Gfx12ComputeResourceLimitsPolicy::Legacy)
+        );
+        assert_eq!(
+            gfx12_resource_limits_policy_from_value(
+                Pm4Architecture::Gfx12,
+                "gfx1201",
                 "invalid",
             ),
             None

@@ -42,12 +42,47 @@ const SUPPORTED_KERNEL_PROPERTIES: u16 = ENABLE_SGPR_KERNARG_SEGMENT_PTR | ENABL
 const DISPATCH_INITIATOR_BASE: u32 = (1 << 0) | (1 << 2) | (1 << 5);
 const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
 
+/// GFX12 per-dispatch compute resource distribution policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Gfx12ComputeResourceLimitsPolicy {
+    #[default]
+    Legacy,
+    Radv,
+}
+
+impl Gfx12ComputeResourceLimitsPolicy {
+    fn bits(self, workgroup: [u16; 3], wave32: bool) -> u32 {
+        if self == Self::Legacy {
+            return 0x3ff;
+        }
+
+        const SIMD_DEST_CNTL: u32 = 1 << 22;
+        const CU_GROUP_COUNT_ONE: u32 = 1 << 24;
+        let threads = workgroup
+            .into_iter()
+            .fold(1_u32, |product, axis| product * u32::from(axis));
+        let wave_size = if wave32 { 32 } else { 64 };
+        let waves_per_threadgroup = threads.div_ceil(wave_size);
+        let mut bits = 0;
+        if waves_per_threadgroup % 4 == 0 {
+            bits |= SIMD_DEST_CNTL;
+        }
+        // Mesa permits two one-wave threadgroups per CU on gfx10+. The
+        // register stores threadgroups-per-CU minus one in CU_GROUP_COUNT.
+        if waves_per_threadgroup == 1 {
+            bits |= CU_GROUP_COUNT_ONE;
+        }
+        bits
+    }
+}
+
 /// Retained GFX12 PM4 command words suitable for one PM4 indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Gfx12Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
     cache_dynamic_registers: bool,
+    resource_limits_policy: Gfx12ComputeResourceLimitsPolicy,
 }
 
 impl Gfx12Pm4CommandBuffer {
@@ -63,6 +98,7 @@ impl Gfx12Pm4CommandBuffer {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             cache_dynamic_registers: true,
+            resource_limits_policy: Gfx12ComputeResourceLimitsPolicy::Legacy,
         }
     }
 
@@ -74,7 +110,16 @@ impl Gfx12Pm4CommandBuffer {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             cache_dynamic_registers: false,
+            resource_limits_policy: Gfx12ComputeResourceLimitsPolicy::Legacy,
         }
+    }
+
+    pub fn with_resource_limits_policy(
+        mut self,
+        policy: Gfx12ComputeResourceLimitsPolicy,
+    ) -> Self {
+        self.resource_limits_policy = policy;
+        self
     }
 
     /// Invalidate the agent caches at the HIP/HSA-to-PM4 ownership boundary.
@@ -290,7 +335,10 @@ impl Gfx12Pm4CommandBuffer {
         );
         // Match ROCr's direct-dispatch template: all waves per SH are allowed
         // and every shader engine remains eligible.
-        self.set_sh_regs(COMPUTE_RESOURCE_LIMITS, &[0x3ff]);
+        self.set_sh_regs(
+            COMPUTE_RESOURCE_LIMITS,
+            &[self.resource_limits_policy.bits(geometry.workgroup, wave32)],
+        );
         self.set_sh_regs(COMPUTE_STATIC_THREAD_MGMT_SE0, &[u32::MAX; 4]);
         if needs_kernarg {
             let address = kernarg_address as usize as u64;
@@ -463,6 +511,20 @@ mod tests {
     fn dispatch_initiator_tracks_kernel_descriptor_wave_size() {
         assert_eq!(dispatch_initiator(false), 0x25);
         assert_eq!(dispatch_initiator(true), 0x8025);
+    }
+
+    #[test]
+    fn radv_resource_limits_follow_wave_count() {
+        let policy = Gfx12ComputeResourceLimitsPolicy::Radv;
+        assert_eq!(policy.bits([32, 1, 1], true), 1 << 24);
+        assert_eq!(policy.bits([64, 1, 1], true), 0);
+        assert_eq!(policy.bits([128, 1, 1], true), 1 << 22);
+        assert_eq!(policy.bits([256, 1, 1], true), 1 << 22);
+        assert_eq!(policy.bits([64, 1, 1], false), 1 << 24);
+        assert_eq!(
+            Gfx12ComputeResourceLimitsPolicy::Legacy.bits([32, 1, 1], true),
+            0x3ff
+        );
     }
 
     #[test]
