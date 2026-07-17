@@ -114,6 +114,12 @@ def build_config(args):
         "dflash": args.dflash,
         "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
+        # Registry mode displays the resolved values for reproducibility but
+        # deliberately omits them from the HTTP request. The product serve
+        # resolver applies the same card defaults while preserving that they
+        # were defaults, not client-explicit controls (required by DDTree SWOR).
+        "sampling_wire": {} if args.sampling in ("registry", "daemon") else samp,
+        "sampling_mode": args.sampling,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
     }
@@ -222,7 +228,7 @@ def gram3(toks):
 def send(cfg, messages):
     body = {"model": cfg["model"], "messages": messages, "max_tokens": cfg["max_tokens"],
             "stream": True, "stream_options": {"include_usage": True}}
-    body.update(cfg["sampling"])
+    body.update(cfg.get("sampling_wire", cfg["sampling"]))
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
     t0 = time.time(); ttft = None; think = []; ans = []; tools = []

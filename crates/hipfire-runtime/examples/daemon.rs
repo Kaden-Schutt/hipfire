@@ -2415,17 +2415,13 @@ fn main() {
                         continue;
                     }
                     // Did the request explicitly set a non-temperature sampling
-                    // control? (gates temp>0 spec routing — see generate()).
-                    let user_explicit_sampling = [
-                        "top_p",
-                        "top_k",
-                        "min_p",
-                        "repeat_penalty",
-                        "presence_penalty",
-                        "frequency_penalty",
-                    ]
-                    .iter()
-                    .any(|k| msg.get(*k).is_some());
+                    // control? The CLI forwards a provenance bit captured BEFORE
+                    // it materializes registry/per-model defaults. Legacy/direct
+                    // IPC clients omit the bit and retain the old presence-based
+                    // inference. This distinction is load-bearing for sampled
+                    // DDTree: defaulted/advisory top-p must not disable SWOR, but
+                    // a client-explicit top-p still must fall back to AR.
+                    let user_explicit_sampling = request_has_explicit_sampling_controls(&msg);
                     generate(
                         m,
                         &mut gpu,
@@ -7725,6 +7721,30 @@ fn generate_multi(
         prefill_s * 1000.0
     );
     let _ = stdout.flush();
+}
+
+/// Resolve non-temperature sampling provenance from a generate IPC message.
+///
+/// New CLI clients capture `sampling_controls_explicit` before they add model
+/// card / per-model defaults. Direct and older IPC clients do not carry that
+/// field, so field-presence inference remains the compatibility fallback.
+fn request_has_explicit_sampling_controls(msg: &serde_json::Value) -> bool {
+    if let Some(explicit) = msg
+        .get("sampling_controls_explicit")
+        .and_then(serde_json::Value::as_bool)
+    {
+        return explicit;
+    }
+    [
+        "top_p",
+        "top_k",
+        "min_p",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+    ]
+    .iter()
+    .any(|key| msg.get(*key).is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14567,7 +14587,7 @@ fn run_dots_ocr_ngram_loop(
 
 #[cfg(test)]
 mod tool_call_parser_tests {
-    use super::extract_tool_calls_from_text;
+    use super::{extract_tool_calls_from_text, request_has_explicit_sampling_controls};
 
     #[test]
     fn parses_valid_block() {
@@ -14707,5 +14727,37 @@ mod tool_call_parser_tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+
+    #[test]
+    fn sampling_provenance_false_beats_resolved_field_presence() {
+        let msg = serde_json::json!({
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "frequency_penalty": 0.0,
+            "sampling_controls_explicit": false
+        });
+        assert!(!request_has_explicit_sampling_controls(&msg));
+    }
+
+    #[test]
+    fn sampling_provenance_true_preserves_explicit_request() {
+        let msg = serde_json::json!({
+            "top_p": 0.9,
+            "sampling_controls_explicit": true
+        });
+        assert!(request_has_explicit_sampling_controls(&msg));
+    }
+
+    #[test]
+    fn legacy_sampling_messages_still_infer_from_presence() {
+        assert!(request_has_explicit_sampling_controls(
+            &serde_json::json!({"top_p": 0.9})
+        ));
+        assert!(!request_has_explicit_sampling_controls(
+            &serde_json::json!({"temperature": 1.0})
+        ));
     }
 }

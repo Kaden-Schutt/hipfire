@@ -41,9 +41,10 @@ function withPerModelOverride<T>(tag: string, ov: Record<string, unknown>, fn: (
 }
 
 let resolveSamplingForSend: typeof import("./index.ts").resolveSamplingForSend;
+let requestHasExplicitSamplingControls: typeof import("./index.ts").requestHasExplicitSamplingControls;
 
 beforeAll(async () => {
-  ({ resolveSamplingForSend } = await import("./index.ts"));
+  ({ resolveSamplingForSend, requestHasExplicitSamplingControls } = await import("./index.ts"));
 });
 
 describe("W7 config-inheritance resolution (no-GPU)", () => {
@@ -100,5 +101,23 @@ describe("W7 config-inheritance resolution (no-GPU)", () => {
     expect(s.repeat_penalty).toBeUndefined();
     expect(s.presence_penalty).toBeUndefined();
     expect(s.system_prompt).toBeUndefined();
+  });
+
+  test("registry/default resolution is not a request-explicit sampling override", () => {
+    const body = { model: "qwen3.6:27b", temperature: 1.0 };
+    expect(requestHasExplicitSamplingControls(body)).toBe(false);
+
+    // The serve layer may subsequently materialize these card values, but the
+    // provenance decision was already made from the original request body.
+    const resolved = resolveSamplingForSend("qwen3.6:27b");
+    expect(resolved.top_p).toBe(0.95);
+    expect(resolved.top_k).toBe(20);
+  });
+
+  test("explicit non-temperature controls disable temperature-only DDTree SWOR", () => {
+    expect(requestHasExplicitSamplingControls({ temperature: 1.0, top_p: 0.9 })).toBe(true);
+    expect(requestHasExplicitSamplingControls({ top_k: 10 })).toBe(true);
+    expect(requestHasExplicitSamplingControls({ frequency_penalty: 0 })).toBe(true);
+    expect(requestHasExplicitSamplingControls({ top_p: null })).toBe(false);
   });
 });

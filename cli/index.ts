@@ -810,6 +810,23 @@ export function resolveSamplingForSend(
   return out;
 }
 
+/// Whether an OpenAI request explicitly supplied a non-temperature sampling
+/// control. DDTree's sampled SWOR verifier can honor temperature, but not an
+/// explicitly requested nucleus / penalty contract. Keep this provenance
+/// separate from `resolveSamplingForSend`: that helper also materializes model
+/// card and per-model defaults, and field presence after that resolution must
+/// not be mistaken for a per-request override.
+export function requestHasExplicitSamplingControls(body: Record<string, unknown>): boolean {
+  return [
+    "top_p",
+    "top_k",
+    "min_p",
+    "repeat_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+  ].some((key) => body[key] !== undefined && body[key] !== null);
+}
+
 // applyThinkingMode is intentionally NOT called anywhere. The previous
 // implementation injected a prose system directive that contained the
 // literal "<think>" / "</think>" special tokens, which Qwen3.5 read as
@@ -1945,6 +1962,7 @@ async function runViaHttp(
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
   system?: string,
   sampling?: SamplingForSend,
+  samplingControlsExplicit = false,
 ): Promise<boolean> {
   // VL requests proxy through the daemon's `image_base64` IPC field —
   // `hipfire run --image` can hit a running serve instead of cold-spawning
@@ -1962,13 +1980,18 @@ async function runViaHttp(
   // the concrete args as today.
   if (sampling) {
     if (typeof sampling.temperature === "number") body.temperature = sampling.temperature;
-    if (typeof sampling.top_p === "number") body.top_p = sampling.top_p;
-    if (typeof sampling.repeat_penalty === "number") body.repeat_penalty = sampling.repeat_penalty;
-    if (typeof sampling.presence_penalty === "number") body.presence_penalty = sampling.presence_penalty;
-    // top_k is now HONORED by the daemon (folded into the nucleus on AR + DFlash
-    // + MTP by the spec-sampling kernel); min_p remains carried-but-inert.
-    if (typeof sampling.top_k === "number") body.top_k = sampling.top_k;
-    if (typeof sampling.min_p === "number") body.min_p = sampling.min_p;
+    // Card/per-model defaults are resolved again by the serve process. Only put
+    // non-temperature controls in the HTTP body when the operator supplied a
+    // corresponding CLI flag; otherwise the serve layer would misclassify the
+    // resolved defaults as explicit request controls and disable DDTree SWOR.
+    if (samplingControlsExplicit) {
+      if (typeof sampling.top_p === "number") body.top_p = sampling.top_p;
+      if (typeof sampling.repeat_penalty === "number") body.repeat_penalty = sampling.repeat_penalty;
+      if (typeof sampling.presence_penalty === "number") body.presence_penalty = sampling.presence_penalty;
+      // top_k is honored by the daemon; min_p remains carried-but-inert.
+      if (typeof sampling.top_k === "number") body.top_k = sampling.top_k;
+      if (typeof sampling.min_p === "number") body.min_p = sampling.min_p;
+    }
   } else {
     body.temperature = temp;
     body.repeat_penalty = repeatPenalty;
@@ -2445,6 +2468,10 @@ interface RunExtra {
   // When undefined (legacy callers), the explicit temp/topP/repeatPenalty args
   // are sent as today.
   sampling?: SamplingForSend;
+  // True only for a non-temperature sampling CLI flag on THIS request. Model
+  // card / per-model defaults are not request-explicit and must not disable
+  // DDTree's temperature-only SWOR route.
+  samplingControlsExplicit?: boolean;
 }
 
 async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string, extra: RunExtra = {}) {
@@ -2478,7 +2505,11 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     || extra.jsonOut === true || extra.noStream === true;
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || wantsLocalControl;
   if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
-    const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system, extra.sampling);
+    const ok = await runViaHttp(
+      cfg.port, cfg.host, model, prompt, image, temp, maxTokens,
+      repeatPenalty, topP, system, extra.sampling,
+      extra.samplingControlsExplicit === true,
+    );
     if (ok) return;
     // runViaHttp logged its own failure reason.
     // hunt3 B-6: only fall back to a LOCAL daemon if the serve is now GONE.
@@ -2520,6 +2551,12 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     type: "generate", id: "run", prompt,
     max_tokens: maxTokens,
   };
+  // Preserve provenance across the CLI -> daemon IPC boundary for the new
+  // explicit-send path. Legacy callers without a sampling view omit the bit so
+  // the daemon retains its presence-based compatibility inference.
+  if (extra.sampling !== undefined) {
+    genMsg.sampling_controls_explicit = extra.samplingControlsExplicit === true;
+  }
   // Explicit-send guard: when an explicit-send view is supplied, transmit a
   // sampling field ONLY if it's in the view (flag / per-model / card). Anything
   // omitted falls through to the daemon's .hfq/arch-card resolution. Legacy
@@ -3656,9 +3693,16 @@ async function serve(port: number, host: string) {
         // A bare global CONFIG_DEFAULTS value is NOT sent, so the daemon's own
         // card/arch resolution is no longer masked by the CLI's temp=0.3.
         const sendView = resolveSamplingForSend(body.model);
+        // Capture request provenance BEFORE card/per-model defaults are
+        // materialized below. Without this bit, the daemon sees the resolved
+        // fields (and the always-forwarded zero frequency penalty) and mistakes
+        // every sampled serve request for an explicit top-p/penalty override,
+        // making DDTree SWOR unreachable.
+        const samplingControlsExplicit = requestHasExplicitSamplingControls(body);
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           max_tokens: requestMaxTokens,
+          sampling_controls_explicit: samplingControlsExplicit,
           // The daemon now applies OpenAI presence/frequency penalties natively
           // (subtractive, over the full repeat window) — strictly better than the
           // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
@@ -8086,6 +8130,7 @@ switch (cmd) {
       jsonOut: runJson,
       noStream: runNoStream,
       sampling,
+      samplingControlsExplicit: topPVal !== null || repeatPenaltyVal !== null,
     });
     break;
   }
