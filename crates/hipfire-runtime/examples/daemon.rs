@@ -2414,14 +2414,6 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    // Did the request explicitly set a non-temperature sampling
-                    // control? The CLI forwards a provenance bit captured BEFORE
-                    // it materializes registry/per-model defaults. Legacy/direct
-                    // IPC clients omit the bit and retain the old presence-based
-                    // inference. This distinction is load-bearing for sampled
-                    // DDTree: defaulted/advisory top-p must not disable SWOR, but
-                    // a client-explicit top-p still must fall back to AR.
-                    let user_explicit_sampling = request_has_explicit_sampling_controls(&msg);
                     generate(
                         m,
                         &mut gpu,
@@ -2430,7 +2422,6 @@ fn main() {
                         id,
                         prompt,
                         system,
-                        user_explicit_sampling,
                         temp,
                         top_p,
                         top_k,
@@ -7723,28 +7714,19 @@ fn generate_multi(
     let _ = stdout.flush();
 }
 
-/// Resolve non-temperature sampling provenance from a generate IPC message.
-///
-/// New CLI clients capture `sampling_controls_explicit` before they add model
-/// card / per-model defaults. Direct and older IPC clients do not carry that
-/// field, so field-presence inference remains the compatibility fallback.
-fn request_has_explicit_sampling_controls(msg: &serde_json::Value) -> bool {
-    if let Some(explicit) = msg
-        .get("sampling_controls_explicit")
-        .and_then(serde_json::Value::as_bool)
-    {
-        return explicit;
-    }
-    [
-        "top_p",
-        "top_k",
-        "min_p",
-        "repeat_penalty",
-        "presence_penalty",
-        "frequency_penalty",
-    ]
-    .iter()
-    .any(|key| msg.get(*key).is_some())
+/// DDTree's fused SWOR verifier supports temperature, top-p, and top-k. These
+/// remaining effective controls require the full AR sampler. Check values, not
+/// JSON field presence, because serve legitimately materializes neutral defaults.
+fn ddtree_has_unsupported_sampling_controls(
+    min_p: Option<f32>,
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+) -> bool {
+    min_p.is_some_and(|p| p > 0.0)
+        || (repeat_penalty - 1.0).abs() > f32::EPSILON
+        || presence_penalty > 0.0
+        || frequency_penalty > 0.0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7756,10 +7738,6 @@ fn generate(
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
-    // Whether the request EXPLICITLY set a non-temperature sampling control
-    // (top_p/top_k/min_p/penalties). Gates temp>0 spec routing: explicit controls
-    // force the AR sampler (the SWOR spec verify can only honor temperature).
-    user_explicit_sampling: bool,
     temp: f32,
     top_p: f32,
     top_k: Option<u32>,
@@ -8311,36 +8289,42 @@ fn generate(
     // The qwen35 DflashSpeculator carries BOTH temp>0 mechanisms, picked by how it
     // LOADED (not per-request); both preserve the target distribution, differing only
     // in which sampling controls they can honor (and in τ):
-    //   * ddtree mode (`supports_temp_verify`): SWOR tree-verify, fed `temp` directly
-    //     (#483). Distribution-exact but honors TEMPERATURE ONLY — it samples
-    //     softmax(logits/temp), so it cannot honor an explicit top_p/top_k/min_p/
-    //     penalty. Highest τ (multi-candidate tree).
+    //   * ddtree mode (`supports_temp_verify`): SWOR tree-verify, fed the resolved
+    //     temp + top_p + top_k contract directly. min_p and repetition/presence/
+    //     frequency penalties are not implemented and safely fall back to AR.
+    //     Highest τ (multi-candidate tree).
     //   * chain mode (`!ddtree`, `!requires_greedy`): master's lossless rejection
     //     sampling via `set_sampling`, honoring temp + top_p + top_k (== AR at that
     //     nucleus). Reproduces spec-graph's shipped default-on sampled-DFlash.
-    // Routing therefore PREFERS ddtree-SWOR for a bare-temperature request; an explicit
-    // sampling control SWOR can't honor falls to AR (ddtree mode) or is honored by
-    // chain rejection sampling (chain mode). A greedy-only drafter (MTP/n-gram) keeps
-    // temp>0 on AR. min_p is unimplemented on both spec paths (a min_p request → AR).
+    // Routing therefore prefers ddtree-SWOR whenever every effective control is
+    // supported. A non-neutral unsupported control falls to AR (ddtree mode) or
+    // is honored by chain rejection sampling where available. A greedy-only
+    // drafter (MTP/n-gram) keeps temp>0 on AR.
     // Opt out of temp>0 spec entirely: HIPFIRE_DFLASH_TEMP_SPEC=0.
     let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0");
-    let dflash_min_p_present = min_p.map(|p| p > 0.0).unwrap_or(false);
+    let dflash_min_p_present = min_p.is_some_and(|p| p > 0.0);
     let temp_spec_env_off = std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
     let supports_temp_swor = m
         .speculator
         .as_ref()
         .is_some_and(|s| s.supports_temp_verify());
-    // ddtree-SWOR: distribution-exact but temperature-only — engage only for a bare-
-    // temperature request (an explicit control it can't honor falls to AR below). A
-    // *defaulted* top_p (model recommendation) stays advisory.
-    let ddtree_swor_route =
-        temp > 1e-6 && supports_temp_swor && !user_explicit_sampling && !temp_spec_env_off;
+    // DDTree's fused verifier implements temperature + top_p + top_k. Route by
+    // effective semantics, not JSON field provenance: neutral zeros/defaults
+    // must not disable SWOR merely because the serve layer materialized them.
+    let ddtree_unsupported_sampling = ddtree_has_unsupported_sampling_controls(
+        min_p,
+        repeat_penalty,
+        presence_penalty,
+        frequency_penalty,
+    );
+    let ddtree_swor_route = temp > 1e-6
+        && supports_temp_swor
+        && !ddtree_unsupported_sampling
+        && !temp_spec_env_off;
     // chain rejection sampling (master): honors temp+top_p+top_k. `!requires_greedy()`
     // stops a sampled request from routing into a greedy-only drafter (MTP/n-gram) and
-    // being silently decoded greedy. Gate on `!supports_temp_swor` so a ddtree-mode
-    // drafter never takes this arm — its `step()` dispatches to the temp-only SWOR
-    // verify, which would silently drop top_p/top_k. `!supports_temp_swor` is exactly
-    // chain mode (no ddtree configured).
+    // being silently decoded greedy. Gate on `!supports_temp_swor` because that
+    // identifies chain mode (no ddtree configured).
     let spec_can_sample = m
         .speculator
         .as_ref()
@@ -8374,8 +8358,8 @@ fn generate(
     {
         let reason = if temp_spec_env_off {
             "HIPFIRE_DFLASH_TEMP_SPEC=0"
-        } else if supports_temp_swor && user_explicit_sampling {
-            "request set an explicit top_p/top_k/min_p/penalty (ddtree SWOR verify honors temperature only); AR applies them"
+        } else if supports_temp_swor && ddtree_unsupported_sampling {
+            "request resolved a non-neutral min_p/repetition/presence/frequency penalty unsupported by ddtree SWOR; AR applies it"
         } else if dflash_min_p_present {
             "request set min_p (sampled DFlash honors top_p/top_k only); AR applies it"
         } else if !spec_can_sample {
@@ -14587,7 +14571,7 @@ fn run_dots_ocr_ngram_loop(
 
 #[cfg(test)]
 mod tool_call_parser_tests {
-    use super::{extract_tool_calls_from_text, request_has_explicit_sampling_controls};
+    use super::{ddtree_has_unsupported_sampling_controls, extract_tool_calls_from_text};
 
     #[test]
     fn parses_valid_block() {
@@ -14730,34 +14714,32 @@ mod tool_call_parser_tests {
     }
 
     #[test]
-    fn sampling_provenance_false_beats_resolved_field_presence() {
-        let msg = serde_json::json!({
-            "temperature": 1.0,
-            "top_p": 0.95,
-            "top_k": 20,
-            "min_p": 0.0,
-            "frequency_penalty": 0.0,
-            "sampling_controls_explicit": false
-        });
-        assert!(!request_has_explicit_sampling_controls(&msg));
+    fn ddtree_accepts_neutral_materialized_sampling_defaults() {
+        assert!(!ddtree_has_unsupported_sampling_controls(
+            Some(0.0),
+            1.0,
+            0.0,
+            0.0,
+        ));
     }
 
     #[test]
-    fn sampling_provenance_true_preserves_explicit_request() {
-        let msg = serde_json::json!({
-            "top_p": 0.9,
-            "sampling_controls_explicit": true
-        });
-        assert!(request_has_explicit_sampling_controls(&msg));
+    fn ddtree_rejects_each_unsupported_effective_control() {
+        assert!(ddtree_has_unsupported_sampling_controls(
+            Some(0.05),
+            1.0,
+            0.0,
+            0.0,
+        ));
+        assert!(ddtree_has_unsupported_sampling_controls(
+            None, 1.1, 0.0, 0.0,
+        ));
+        assert!(ddtree_has_unsupported_sampling_controls(
+            None, 1.0, 0.5, 0.0,
+        ));
+        assert!(ddtree_has_unsupported_sampling_controls(
+            None, 1.0, 0.0, 0.5,
+        ));
     }
 
-    #[test]
-    fn legacy_sampling_messages_still_infer_from_presence() {
-        assert!(request_has_explicit_sampling_controls(
-            &serde_json::json!({"top_p": 0.9})
-        ));
-        assert!(!request_has_explicit_sampling_controls(
-            &serde_json::json!({"temperature": 1.0})
-        ));
-    }
 }

@@ -810,23 +810,6 @@ export function resolveSamplingForSend(
   return out;
 }
 
-/// Whether an OpenAI request explicitly supplied a non-temperature sampling
-/// control. DDTree's sampled SWOR verifier can honor temperature, but not an
-/// explicitly requested nucleus / penalty contract. Keep this provenance
-/// separate from `resolveSamplingForSend`: that helper also materializes model
-/// card and per-model defaults, and field presence after that resolution must
-/// not be mistaken for a per-request override.
-export function requestHasExplicitSamplingControls(body: Record<string, unknown>): boolean {
-  return [
-    "top_p",
-    "top_k",
-    "min_p",
-    "repeat_penalty",
-    "presence_penalty",
-    "frequency_penalty",
-  ].some((key) => body[key] !== undefined && body[key] !== null);
-}
-
 // applyThinkingMode is intentionally NOT called anywhere. The previous
 // implementation injected a prose system directive that contained the
 // literal "<think>" / "</think>" special tokens, which Qwen3.5 read as
@@ -2468,9 +2451,9 @@ interface RunExtra {
   // When undefined (legacy callers), the explicit temp/topP/repeatPenalty args
   // are sent as today.
   sampling?: SamplingForSend;
-  // True only for a non-temperature sampling CLI flag on THIS request. Model
-  // card / per-model defaults are not request-explicit and must not disable
-  // DDTree's temperature-only SWOR route.
+  // True only for a non-temperature sampling CLI flag on THIS request. Used
+  // when proxying `run` through HTTP so registry defaults are resolved once by
+  // the serving process rather than copied into the request body.
   samplingControlsExplicit?: boolean;
 }
 
@@ -2551,12 +2534,6 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     type: "generate", id: "run", prompt,
     max_tokens: maxTokens,
   };
-  // Preserve provenance across the CLI -> daemon IPC boundary for the new
-  // explicit-send path. Legacy callers without a sampling view omit the bit so
-  // the daemon retains its presence-based compatibility inference.
-  if (extra.sampling !== undefined) {
-    genMsg.sampling_controls_explicit = extra.samplingControlsExplicit === true;
-  }
   // Explicit-send guard: when an explicit-send view is supplied, transmit a
   // sampling field ONLY if it's in the view (flag / per-model / card). Anything
   // omitted falls through to the daemon's .hfq/arch-card resolution. Legacy
@@ -3693,16 +3670,9 @@ async function serve(port: number, host: string) {
         // A bare global CONFIG_DEFAULTS value is NOT sent, so the daemon's own
         // card/arch resolution is no longer masked by the CLI's temp=0.3.
         const sendView = resolveSamplingForSend(body.model);
-        // Capture request provenance BEFORE card/per-model defaults are
-        // materialized below. Without this bit, the daemon sees the resolved
-        // fields (and the always-forwarded zero frequency penalty) and mistakes
-        // every sampled serve request for an explicit top-p/penalty override,
-        // making DDTree SWOR unreachable.
-        const samplingControlsExplicit = requestHasExplicitSamplingControls(body);
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           max_tokens: requestMaxTokens,
-          sampling_controls_explicit: samplingControlsExplicit,
           // The daemon now applies OpenAI presence/frequency penalties natively
           // (subtractive, over the full repeat window) — strictly better than the
           // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
