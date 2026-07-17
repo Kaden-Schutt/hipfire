@@ -116,7 +116,11 @@ def review_record(*, submitted_at="2026-01-01T00:00:00Z", state="APPROVED"):
 
 
 def permission(login="review-bot", role="pull", principal_type="Bot"):
-    return {"user": user(login=login, principal_type=principal_type), "permissions": {}, "role_name": role}
+    return {
+        "user": {**user(login=login, principal_type=principal_type), "permissions": {}},
+        "permission": role,
+        "role_name": role,
+    }
 
 
 def installation_repositories(repositories=None, *, total_count=1):
@@ -438,7 +442,7 @@ def test_api_json_recursion_failure_is_a_bounded_boundary_error(include_http_hea
 
 
 def test_effective_permission_is_normalized():
-    response = result({"user": user(), "permissions": {"pull": True, "push": False, "admin": False}})
+    response = result({"user": {**user(), "permissions": {"pull": True, "push": False, "admin": False}}})
     permission = GitHubClient(FakeRunner([response])).collaborator_effective_permission(REPO, "review-bot")
     assert permission.login == "review-bot"
     assert permission.principal_type == "Bot"
@@ -447,12 +451,12 @@ def test_effective_permission_is_normalized():
 
 @pytest.mark.parametrize("role, expected", [("push", "write"), ("maintain", "write"), ("triage", "read"), ("pull", "read")])
 def test_effective_permission_roles_are_normalized(role, expected):
-    response = result({"user": user(), "permissions": {}, "role_name": role})
+    response = result({"user": {**user(), "permissions": {}}, "role_name": role})
     assert GitHubClient(FakeRunner([response])).collaborator_effective_permission(REPO, "review-bot").permission == expected
 
 
 def test_effective_permission_verifies_requested_login():
-    response = result({"user": user(login="other"), "permissions": {"pull": True}})
+    response = result({"user": {**user(login="other"), "permissions": {"pull": True}}})
     with pytest.raises(GitHubBoundaryError, match="login"):
         GitHubClient(FakeRunner([response])).collaborator_effective_permission(REPO, "review-bot")
 
