@@ -8399,14 +8399,17 @@ fn forward_prefill_chunk(
                 }
                 _ => true, // LA layers don't gate this check
             });
-    // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
-    // at capture time. `max_ctx_len = start_pos + n` grows per cycle, so the
-    // captured value would be stale on replay — the attention kernel would
-    // allocate too-small LDS for `scores[]` and over-read. Bake the physical
-    // cap instead (LDS sized for the worst case). The kernel still iterates
-    // over the actual `positions[b] + 1` per-row seq_len from a device buffer,
-    // so correctness is preserved; only the LDS allocation is over-provisioned.
-    let max_ctx_len = if gpu.graphs.capture_mode {
+    // Under hipGraph or an explicitly delimited Redline capture, scalar
+    // kernargs get BAKED into the retained command stream. `max_ctx_len =
+    // start_pos + n` grows per cycle, so the captured value would be stale on
+    // replay — the attention kernel would allocate too-small LDS for
+    // `scores[]` and over-read. Bake the physical cap instead (LDS sized for
+    // the worst case). The kernel still iterates over the actual
+    // `positions[b] + 1` per-row seq_len from a device buffer, so correctness
+    // is preserved; only the LDS allocation is over-provisioned.
+    let retained_capture = gpu.graphs.capture_mode
+        || (gpu.replay.is_external_sequence() && gpu.replay.is_recording());
+    let max_ctx_len = if retained_capture {
         kv_cache.physical_cap
     } else {
         start_pos + n
@@ -9715,7 +9718,7 @@ fn forward_prefill_chunk(
                 let plan = KvTierPlan::derive(KvTierInputs {
                     pos: start_pos,
                     flash_mode: s.flash_mode as usize,
-                    capture_mode: gpu.graphs.capture_mode,
+                    capture_mode: retained_capture,
                     batch_size: n,
                     is_tree,
                     ..kv_cache.tier_inputs()
@@ -11248,7 +11251,7 @@ fn forward_prefill_chunk(
                 let plan = KvTierPlan::derive(KvTierInputs {
                     pos: start_pos,
                     flash_mode: s.flash_mode as usize,
-                    capture_mode: gpu.graphs.capture_mode,
+                    capture_mode: retained_capture,
                     batch_size: n,
                     is_tree,
                     ..kv_cache.tier_inputs()

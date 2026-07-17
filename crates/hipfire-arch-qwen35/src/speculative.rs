@@ -2421,6 +2421,7 @@ fn verify_dflash_block_inner(
         && gpu.replay.uses_pm4_transport()
         && !tree_verify_present
         && dflash_batched_lm_head_supported(target.weights.output.gpu_dtype)
+        && target.kv_cache.quant_q8
         && matches!(
             target.weights.embd_format,
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
