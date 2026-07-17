@@ -14419,8 +14419,8 @@ fn qwen35_fa_norm_prep_gfx1201_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool
     enabled
         && gpu.arch_caps.is_gfx1201()
         && config.dim == 5_120
-        && config.n_heads == 20
-        && config.n_kv_heads == 8
+        && config.n_heads == 24
+        && config.n_kv_heads == 4
         && config.head_dim == 256
         && n_rot == 64
 }

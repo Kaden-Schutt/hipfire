@@ -883,7 +883,7 @@ impl Gpu {
     }
 
     /// Exact gfx1201 Qwen3.5-27B full-attention normalization producer.
-    /// Replaces deinterleave + Q RMS + K RMS with one fixed 20Q/8K x 256
+    /// Replaces deinterleave + Q RMS + K RMS with one fixed 24Q/4K x 256
     /// dispatch. Stock RoPE remains a separate consumer so its arithmetic and
     /// per-dimension execution order are unchanged.
     #[cfg(feature = "deltanet")]
@@ -922,7 +922,7 @@ impl Gpu {
             &kwp as *const _ as *mut c_void,
             &ep as *const _ as *mut c_void,
         ];
-        let bytes = (20 * 256 * 4 + 8 * 256 * 2 + 28 * 256) * 4;
+        let bytes = (24 * 256 * 4 + 4 * 256 * 2 + 28 * 256) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
         let result = self.launch_maybe_blob(
             KERNEL,

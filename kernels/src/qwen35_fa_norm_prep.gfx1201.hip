@@ -13,7 +13,7 @@
 // per-dimension execution order; each RMS workgroup below is byte-for-byte the
 // same 256-thread reduction tree used by rmsnorm_f32 for head_dim=256.
 //
-// Admitted shape: Qwen3.5-27B, Q=20 heads, K=8 heads, head_dim=256.
+// Admitted shape: Qwen3.5-27B, Q=24 heads, K=4 heads, head_dim=256.
 extern "C" __launch_bounds__(256, 1)
 __global__ void qwen35_fa_norm_prep_gfx1201(
     const float* __restrict__ q_interleaved,
@@ -24,7 +24,7 @@ __global__ void qwen35_fa_norm_prep_gfx1201(
     const float* __restrict__ k_weight,
     float eps)
 {
-    constexpr int NQ = 20;
+    constexpr int NQ = 24;
     constexpr int HD = 256;
 
     __shared__ float sdata[HD];
