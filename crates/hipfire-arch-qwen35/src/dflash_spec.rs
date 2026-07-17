@@ -390,10 +390,13 @@ impl Speculator for DflashSpeculator {
                 dd.budget,
                 dd.topk,
                 // Request temperature → distribution-preserving SWOR verify at
-                // temp>0 (greedy/argmax at temp 0). The ddtree-batched arm is the
-                // only DFlash mode with sampled verify; the chain below stays
-                // greedy, so `supports_temp_verify` gates serve routing to ddtree.
+                // temp>0 (greedy/argmax at temp 0). Thread the request's
+                // registry-resolved top-p/top-k into the fused SWOR target
+                // sampler as well, so tree mode preserves the same truncated
+                // target distribution as sampled chain DFlash.
                 temp,
+                self.sample_top_p,
+                self.sample_top_k,
                 &mut self.rng_state,
             )
         } else {
@@ -416,8 +419,7 @@ impl Speculator for DflashSpeculator {
                 // inline `generate_dflash` call verbatim: temp 0 ⇒ greedy/argmax;
                 // temp>0 ⇒ lossless rejection sampling with the IDENTICAL
                 // (top_k,top_p) nucleus truncation on draft + target. The DDTree
-                // branches above stay greedy (tree-verify is greedy by
-                // construction) and ignore these.
+                // tree branch above consumes the same top-p/top-k contract.
                 self.sample_temp,
                 self.sample_top_p, // top_p (1.0 = no truncation)
                 self.sample_top_k, // top_k (0 = top_p-only)

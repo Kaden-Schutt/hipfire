@@ -1082,6 +1082,8 @@ impl Gpu {
         q_pos: &GpuTensor,         // scratch [vocab]
         out: &GpuTensor,           // [2 + num_pos] i32
         temp: f32,
+        top_p: f32,
+        top_k: usize,
         k: usize,
         vocab: usize,
         n_slots: usize,
@@ -1104,6 +1106,8 @@ impl Gpu {
         let mut qp = q_pos.buf.as_ptr();
         let mut op = out.buf.as_ptr();
         let mut tp = temp;
+        let mut pp = top_p;
+        let mut pk = top_k as i32;
         let mut kk = k as i32;
         let mut vs = vocab as i32;
         let mut ns = n_slots as i32;
@@ -1119,6 +1123,8 @@ impl Gpu {
             &mut qp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
             &mut tp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut pk as *mut _ as *mut c_void,
             &mut kk as *mut _ as *mut c_void,
             &mut vs as *mut _ as *mut c_void,
             &mut ns as *mut _ as *mut c_void,
@@ -1142,6 +1148,8 @@ impl Gpu {
                 b.push_ptr(qp);
                 b.push_ptr(op);
                 b.push_f32(tp);
+                b.push_f32(pp);
+                b.push_i32(pk);
                 b.push_i32(kk);
                 b.push_i32(vs);
                 b.push_i32(ns);

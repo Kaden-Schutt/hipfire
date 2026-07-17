@@ -1610,6 +1610,8 @@ fn main() {
                         ddtree_budget,
                         ddtree_topk,
                         runtime_temp,
+                        1.0, // DDTree demo has no nucleus CLI; disable top_p
+                        0,   // top_k disabled
                         &mut rng_state,
                     )
                     .expect("ddtree-batched spec step")

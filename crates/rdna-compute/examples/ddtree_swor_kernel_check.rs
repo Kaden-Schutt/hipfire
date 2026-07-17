@@ -3,7 +3,9 @@
 //! the work. Depth-1 tree (root + k leaf children = the draft's WITHOUT-
 //! replacement samples). Per trial: sample candidates from q on the host, run
 //! the kernel, record the first emitted token; assert the marginal equals the
-//! TARGET p (TV < 0.02) — the on-device distribution-exactness check.
+//! TARGET p (TV < 0.02) — the on-device distribution-exactness check. A second
+//! arm enables top_k=2/top_p=.95 and proves that the emitted marginal becomes
+//! the normalized truncated target distribution rather than the full p.
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -101,6 +103,8 @@ fn main() {
             &t_qpos,
             &t_out,
             temp,
+            1.0, // top_p disabled: preserves the full-distribution MC fixture
+            0,   // top_k disabled
             k,
             vocab,
             n_slots,
@@ -138,5 +142,60 @@ fn main() {
     assert!(
         tv < 0.02,
         "GPU SWOR kernel must preserve the target distribution; TV={tv:.4}"
+    );
+
+    // Registry-style truncation proof. top_k=2 retains target tokens 0 and 4
+    // (p=.30/.25); top_p=.95 does not tighten that two-token set. Proposal q
+    // stays full-vocab, which is valid: it changes acceptance, not the emitted
+    // target marginal.
+    let mut trunc_hist = vec![0u64; vocab];
+    for run in 0..n_runs {
+        let cands = swor_sample(&q, k, &mut rng);
+        let cb =
+            unsafe { std::slice::from_raw_parts(cands.as_ptr() as *const u8, cands.len() * 4) };
+        gpu.memcpy_htod_auto(&t_pcand.buf, cb).unwrap();
+        gpu.ddtree_swor_walk_f32(
+            &t_tlog,
+            &t_dlog,
+            &t_pcand,
+            &t_depth,
+            &t_child,
+            &t_pres,
+            &t_qpos,
+            &t_out,
+            temp,
+            0.95,
+            2,
+            k,
+            vocab,
+            n_slots,
+            num_pos,
+            0x85eb_ca6b_u64.wrapping_mul(run as u64 + 1),
+        )
+        .unwrap();
+        let raw = gpu.download_f32(&t_out).unwrap();
+        let accept_len = raw[0].to_bits() as i32;
+        let bonus = raw[1].to_bits() as i32;
+        let first = if accept_len > 0 {
+            let child = raw[2].to_bits() as i32;
+            cands[child as usize]
+        } else {
+            bonus
+        };
+        trunc_hist[first as usize] += 1;
+    }
+    let mut truncated = [0.0f64; 6];
+    truncated[0] = p[0] as f64 / (p[0] + p[4]) as f64;
+    truncated[4] = p[4] as f64 / (p[0] + p[4]) as f64;
+    let trunc_tv: f64 = (0..vocab)
+        .map(|t| (trunc_hist[t] as f64 / n_runs as f64 - truncated[t]).abs())
+        .sum::<f64>()
+        * 0.5;
+    println!("truncated hist = {trunc_hist:?}");
+    println!("truncated target = {truncated:?}");
+    println!("TV(emitted, truncated target) = {trunc_tv:.4}");
+    assert!(
+        trunc_tv < 0.02,
+        "GPU SWOR kernel must preserve top-p/top-k target distribution; TV={trunc_tv:.4}"
     );
 }

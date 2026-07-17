@@ -4276,6 +4276,8 @@ fn swor_walk_gpu(
     k: usize,
     vocab: usize,
     temp: f32,
+    top_p: f32,
+    top_k: usize,
     seed: u64,
 ) -> HipResult<(Vec<usize>, u32)> {
     let n_slots = 1 + tree.nodes.len();
@@ -4313,6 +4315,8 @@ fn swor_walk_gpu(
         &t_qpos,
         &t_out,
         temp,
+        top_p,
+        top_k,
         k,
         vocab,
         n_slots,
@@ -4998,12 +5002,13 @@ pub fn spec_step_ddtree_batched(
     ctx_slice: Option<usize>,
     tree_budget: usize,
     tree_topk: usize,
-    // Temperature for the verify-side acceptance. temp == 0 → greedy argmax
-    // walk (follow_verified_tree); temp > 0 → distribution-preserving naive
-    // tree sampling (sample_verified_tree), which needs the full per-slot
-    // target logits and consumes `rng_state` (xorshift, shared with the linear
-    // DFlash sampler convention).
+    // Sampling contract for verify-side acceptance. temp == 0 → greedy
+    // argmax walk. temp > 0 → distribution-preserving SWOR over the target
+    // distribution after the same top-p/top-k truncation used by sampled chain
+    // DFlash. `top_p >= 1` / `top_k == 0` disable the respective cut.
     temp: f32,
+    top_p: f32,
+    top_k: usize,
     rng_state: &mut u64,
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
@@ -5308,6 +5313,8 @@ pub fn spec_step_ddtree_batched(
             tree_topk,
             vocab,
             temp,
+            top_p,
+            top_k,
             seed,
         )?
     } else {

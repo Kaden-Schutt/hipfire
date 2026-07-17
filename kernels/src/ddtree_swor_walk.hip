@@ -31,7 +31,8 @@ extern "C" __global__ void ddtree_swor_walk_f32(
     float* __restrict__ p_res,               // scratch [vocab]
     float* __restrict__ q_pos,               // scratch [vocab]
     int* __restrict__ out,                   // [2 + num_pos]
-    float temp, int k, int vocab, int n_slots, int num_pos, unsigned int seed)
+    float temp, float top_p, int top_k,
+    int k, int vocab, int n_slots, int num_pos, unsigned int seed)
 {
     if (blockIdx.x != 0) return;
     const int tid = threadIdx.x;
@@ -47,6 +48,13 @@ extern "C" __global__ void ddtree_swor_walk_f32(
     __shared__ int s_chosen_rank;
     __shared__ int s_drawn[SWOR_MAXK];
     __shared__ unsigned int s_rng;
+    // Same histogram nucleus/top-k threshold shape as
+    // softmax_temp_topp_batched_f32. This keeps the SWOR target marginal equal
+    // to sampled DFlash/AR at the registry-resolved (top_p, top_k), rather than
+    // silently sampling the untruncated full-vocab target distribution.
+    __shared__ float s_hist_mass[512];
+    __shared__ float s_hist_count[512];
+    __shared__ float s_tau_cut;
 
     if (tid == 0) {
         s_accept_len = 0;
@@ -76,6 +84,70 @@ extern "C" __global__ void ddtree_swor_walk_f32(
         const float tinv = 1.f / red[0]; __syncthreads();
         for (int t = tid; t < vocab; t += nth) p_res[t] *= tinv;
         __syncthreads();
+
+        // ---- target top-p/top-k truncation ------------------------------
+        // DDTree's proposal q remains the full draft distribution. That is
+        // valid for recursive speculative sampling: q controls acceptance,
+        // while every emitted token is drawn from the (now truncated) target
+        // residual p. Candidates outside p's support are simply rejected.
+        if (top_p < 1.0f || top_k > 0) {
+            float pmax = 0.0f;
+            for (int t = tid; t < vocab; t += nth) pmax = fmaxf(pmax, p_res[t]);
+            red[tid] = pmax; __syncthreads();
+            for (int s = nth / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]); __syncthreads(); }
+            pmax = red[0]; __syncthreads();
+
+            for (int b = tid; b < 512; b += nth) {
+                s_hist_mass[b] = 0.0f;
+                s_hist_count[b] = 0.0f;
+            }
+            __syncthreads();
+            const float floor_p = pmax * 1e-5f;
+            const float inv_bins = pmax > 0.0f ? 512.0f / pmax : 0.0f;
+            for (int t = tid; t < vocab; t += nth) {
+                const float p = p_res[t];
+                if (p < floor_p) continue;
+                int bin = (int)(p * inv_bins);
+                if (bin >= 512) bin = 511;
+                atomicAdd(&s_hist_mass[bin], p);
+                atomicAdd(&s_hist_count[bin], 1.0f);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                float cum_mass = 0.0f;
+                float cum_count = 0.0f;
+                float tau_p = 0.0f;
+                float tau_k = 0.0f;
+                bool found_p = top_p >= 1.0f;
+                bool found_k = top_k <= 0;
+                for (int b = 511; b >= 0 && !(found_p && found_k); --b) {
+                    cum_mass += s_hist_mass[b];
+                    cum_count += s_hist_count[b];
+                    if (!found_p && cum_mass >= top_p) {
+                        tau_p = ((float)b / 512.0f) * pmax;
+                        found_p = true;
+                    }
+                    if (!found_k && cum_count >= (float)top_k) {
+                        tau_k = ((float)b / 512.0f) * pmax;
+                        found_k = true;
+                    }
+                }
+                s_tau_cut = fmaxf(tau_p, tau_k);
+            }
+            __syncthreads();
+
+            float kept = 0.0f;
+            for (int t = tid; t < vocab; t += nth) {
+                if (p_res[t] < s_tau_cut) p_res[t] = 0.0f;
+                kept += p_res[t];
+            }
+            red[tid] = kept; __syncthreads();
+            for (int s = nth / 2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; __syncthreads(); }
+            const float keep_inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+            __syncthreads();
+            for (int t = tid; t < vocab; t += nth) p_res[t] *= keep_inv;
+            __syncthreads();
+        }
 
         // ---- leaf (no draft proposals): sample bonus from p_res, done ----
         if (depth >= num_pos) {
