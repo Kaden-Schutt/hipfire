@@ -673,7 +673,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hip-bridge"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libloading",
  "thiserror 2.0.18",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-cohere2moe"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-deepseek4"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-dots-ocr"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-llama"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-minimax"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen2"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-vl"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-toy"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-atlas"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "regex",
  "serde",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-detect"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "md5",
  "regex",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch-tests"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-loader"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-cohere2moe",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "byteorder",
  "clap",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-reap"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-runtime",
  "serde_json",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-runtime"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64",
  "byteorder",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-tui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "libloading",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "rayon",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "redline"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "libloading",
@@ -1769,7 +1769,7 @@ dependencies = [
 
 [[package]]
 name = "redline-dispatch"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libloading",
  "proptest",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "redline-rocr"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libloading",
  "proptest",

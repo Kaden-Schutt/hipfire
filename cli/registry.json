@@ -218,7 +218,7 @@
       "file": "qwen3.6-35b-a3b.mq4r",
       "size_gb": 18.7,
       "min_vram_gb": 22,
-      "desc": "MQ4 redline - uniform MQ4 everything incl. attention, fused gate path. Fastest 4-bit (~149 tok/s decode, +21% vs mq4), lower quality (unprotected attention)."
+      "desc": "MQ4 Redline speed SKU: uniform MQ4 attention and gate-side weights, graded routed experts, fused gate path. TG128 AR: 253.3 tok/s gfx1100, 115.1 gfx1151, 203.9 gfx1201. Lower quality than protected-attention MQ4P/MFP4."
     },
     "qwen3.6:27b": {
       "recommended_settings": {
