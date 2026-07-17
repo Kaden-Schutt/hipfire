@@ -16,7 +16,7 @@
 //!
 //! Usage:
 //!   minimax_prefill_bench <model.mq2> [--prompt FILE] [--tokens N]
-//!       [--reps R] [--warmup W] [--chunk C[,C2,...]]
+//!       [--reps R] [--warmup W] [--chunk C[,C2,...]] [--synthetic-tokens]
 //!
 //! Defaults: --tokens 2048, --reps 3, --warmup 1, --chunk 64.
 
@@ -44,6 +44,7 @@ fn main() -> Result<(), String> {
     let mut reps: usize = 3;
     let mut warmup: usize = 1;
     let mut chunks: Vec<usize> = vec![64];
+    let mut synthetic_tokens = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--prompt" => prompt_file = Some(args.next().expect("--prompt FILE")),
@@ -58,6 +59,7 @@ fn main() -> Result<(), String> {
                     .map(|s| s.parse().unwrap())
                     .collect()
             }
+            "--synthetic-tokens" => synthetic_tokens = true,
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -66,15 +68,23 @@ fn main() -> Result<(), String> {
     let mut hfq =
         HfqFile::open(std::path::Path::new(&model_path)).map_err(|e| format!("open: {e:?}"))?;
     let cfg = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
-    let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|e| format!("tokenizer: {e:?}"))?;
+    let tokenizer = if synthetic_tokens {
+        None
+    } else {
+        Some(
+            Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .map_err(|e| format!("tokenizer: {e:?}"))?,
+        )
+    };
 
     // Deterministic token sequence of exactly target_tokens length (tiled).
-    let base: Vec<u32> = if let Some(pf) = &prompt_file {
+    let base: Vec<u32> = if synthetic_tokens {
+        (1..cfg.vocab_size.min(257) as u32).collect()
+    } else if let Some(pf) = &prompt_file {
         let text = std::fs::read_to_string(pf).map_err(|e| format!("read prompt: {e}"))?;
-        tokenizer.encode(&text)
+        tokenizer.as_ref().unwrap().encode(&text)
     } else {
-        tokenizer.encode(
+        tokenizer.as_ref().unwrap().encode(
             "The quick brown fox jumps over the lazy dog. \
              Pack my box with five dozen liquor jugs. ",
         )
@@ -108,6 +118,9 @@ fn main() -> Result<(), String> {
     //    path, chunked at 64 like the daemon), then greedy-decode and print
     //    text. Validates the WMMA-projection prefill produces fluent output. ──
     if std::env::var_os("MINIMAX_GEN").is_some() {
+        let tokenizer = tokenizer
+            .as_ref()
+            .ok_or("MINIMAX_GEN requires tokenizer metadata")?;
         let gen_n: usize = std::env::var("MINIMAX_GEN")
             .ok()
             .and_then(|s| s.parse().ok())
