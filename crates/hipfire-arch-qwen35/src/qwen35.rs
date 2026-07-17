@@ -14419,10 +14419,10 @@ fn qwen35_fa_norm_prep_gfx1201_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool
     enabled
         && gpu.arch_caps.is_gfx1201()
         && config.dim == 5_120
-        && config.n_heads == 40
+        && config.n_heads == 20
         && config.n_kv_heads == 8
-        && config.head_dim == 128
-        && n_rot == 32
+        && config.head_dim == 256
+        && n_rot == 64
 }
 
 /// Pair Q8 K/V cache writes and fold the Qwen output gate plus MQ rotation into
