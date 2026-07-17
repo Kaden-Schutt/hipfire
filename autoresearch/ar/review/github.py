@@ -178,6 +178,11 @@ _MAX_TREE_ENTRIES = 65536
 _PAGE_SIZE = 100
 _PROBE_PAGE_SIZE = 1
 _PROTOCOL_RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
+_PROTOCOL_SCHEMAS = {"agentic-review/v1", "agentic-review/v1+coverage"}
+_COVERAGE_FIELDS = {
+    "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
+    "retrieved_content_count", "expected_content_count", "coverage_complete",
+}
 _PROTOCOL_FIELDS = {
     "intent": {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"},
     "report": {
@@ -307,9 +312,13 @@ def _safe_path(path: str) -> bool:
 
 def _validate_protocol_payload(payload: Mapping[str, Any]) -> None:
     record_type = payload.get("record_type")
-    if payload.get("schema") != "agentic-review/v1" or record_type not in _PROTOCOL_RECORD_TYPES:
+    schema = payload.get("schema")
+    if schema not in _PROTOCOL_SCHEMAS or record_type not in _PROTOCOL_RECORD_TYPES:
         raise ValueError("protocol body has an invalid schema or record type")
-    if set(payload) != _PROTOCOL_FIELDS[record_type]:
+    expected_fields = set(_PROTOCOL_FIELDS[record_type])
+    if schema == "agentic-review/v1+coverage" and record_type in {"report", "review-metadata", "completion"}:
+        expected_fields |= _COVERAGE_FIELDS
+    if set(payload) != expected_fields:
         raise ValueError("protocol body has unexpected or missing fields")
     if not isinstance(payload.get("record_id"), str) or not payload["record_id"].strip():
         raise ValueError("protocol body has no record identity")

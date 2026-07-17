@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from autoresearch.ar.review.discovery import DiscoverySummary, discover_pull_requests
 from autoresearch.ar.review.github import GitHubBoundaryError
+from autoresearch.ar.review.canonical import canonical_digest, metadata_digest
 from autoresearch.ar.review.models import ReviewTarget
+from autoresearch.ar.review.publisher import ReviewPublisher
 from autoresearch.ar.tests.test_review_publisher import (
     FakeGitHub,
     OPERATOR as BOT_OPERATOR,
@@ -32,12 +35,17 @@ OPERATOR = {
     "credential_attestation_digest": "sha256:" + "a" * 64,
 }
 DISCOVERY_BOT = {**BOT_OPERATOR, "allowed_operations": ["discover", "dismiss-workflow-review"]}
+DISCOVERY_HUMAN = {
+    **OPERATOR,
+    "principal": {"login": "reviewer", "type": "User"},
+}
 
 
 class Client:
     def __init__(self, pulls=None):
         self.pulls = pulls if pulls is not None else [{"number": TARGET.number, "draft": False}]
         self.target = TARGET
+        self.targets = {}
         self.labels = set()
         self.calls = []
         self.fail_add = False
@@ -49,7 +57,7 @@ class Client:
 
     def get_review_target(self, repository, number):
         self.calls.append(("target", number))
-        return self.target
+        return getattr(self, "targets", {}).get(number, self.target)
 
     def list_issue_comments(self, repository, number):
         self.calls.append(("comments", number))
@@ -111,6 +119,28 @@ def app_configuration():
     return result
 
 
+def multi_app_configuration():
+    result = app_configuration()
+    apps = list(result.trusted_publishers["apps"])
+    apps.append({
+        **apps[0],
+        "login": "other-bot",
+        "app_id": 2,
+        "installation_id": 3,
+    })
+    policy = {
+        "schema": "hipfire.agentic-review.trusted-publishers",
+        "version": 1,
+        "apps": apps,
+    }
+    result = result.with_trusted_publishers(policy)
+    source = result.source
+    object.__setattr__(result, "_loaded_from_protected_paths", True)
+    object.__setattr__(result, "_loaded_source_digest", source.config_digest)
+    object.__setattr__(result, "_loaded_root_identity", source.root_identity)
+    return result
+
+
 def completed_client(verdict="clean"):
     client = FakeGitHub()
     publish_target = PUBLISH_TARGET
@@ -123,6 +153,39 @@ def completed_client(verdict="clean"):
         data=[{"number": TARGET.number, "draft": False}], headers={}
     )
     client.get_repository = lambda repository: SimpleNamespace(data={"id": 8, "full_name": repository})
+    client.list_installation_repositories = lambda: SimpleNamespace(
+        data={"repositories": [{"id": 8}]}
+    )
+    return client
+
+
+def legacy_completed_client():
+    client = completed_client()
+    payloads = {
+        item["id"]: json.loads(client.payload_from_body(item["body"])) for item in client.comments
+    }
+    by_type = {payload["record_type"]: payload for payload in payloads.values()}
+    for payload in payloads.values():
+        payload["schema"] = "agentic-review/v1"
+        for field in (
+            "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
+            "retrieved_content_count", "expected_content_count", "coverage_complete",
+        ):
+            payload.pop(field, None)
+    intent = by_type["intent"]
+    intent["canonical_digest"] = canonical_digest({key: value for key, value in intent.items() if key != "canonical_digest"})
+    by_type["report"]["canonical_intent_digest"] = intent["canonical_digest"]
+    metadata = by_type["review-metadata"]
+    metadata["canonical_intent_digest"] = intent["canonical_digest"]
+    metadata["report_digest"] = canonical_digest(by_type["report"])
+    metadata["metadata_digest"] = metadata_digest(metadata)
+    completion = by_type["completion"]
+    completion["canonical_intent_digest"] = intent["canonical_digest"]
+    completion["report_digest"] = canonical_digest(by_type["report"])
+    completion["metadata_digest"] = metadata["metadata_digest"]
+    for item in client.comments:
+        payload = payloads[item["id"]]
+        item["body"] = json.dumps(payload)
     return client
 
 
@@ -140,17 +203,84 @@ def test_no_report_is_needing_review_and_labelled_idempotently():
 
 def test_drafts_and_fork_heads_are_not_filtered():
     client = Client([{"number": 2, "draft": True}, {"number": 1, "draft": False}])
-    client.target = replace(TARGET, number=1)
+    client.targets = {
+        1: replace(TARGET, number=1, head_repository="fork/one"),
+        2: replace(TARGET, number=2, head_repository="fork/two"),
+    }
     summary = discover_pull_requests(client, REPO, configuration=configuration(), operator_credential=manifest())
 
     assert [item.number for item in summary.needs_review] == [1, 2]
+    assert not summary.incomplete
+    assert all("mismatched" not in item.reason for item in summary.needs_review)
+
+
+def test_each_authorized_human_record_is_checked_and_accepted():
+    client = completed_client()
+    for record in [*client.comments, *client.reviews]:
+        record["user"] = {"login": "other-reviewer", "type": "User"}
+    client.collaborator_effective_permission = lambda repository, login: SimpleNamespace(
+        login=login, principal_type="User", permission="write"
+    )
+    summary = discover_pull_requests(
+        client, REPO, configuration=configuration(), operator_credential=DISCOVERY_HUMAN
+    )
+
+    assert [item.number for item in summary.clean] == [42]
+
+
+def test_each_configured_app_record_is_checked_against_installation_scope():
+    client = completed_client()
+    for record in [*client.comments, *client.reviews]:
+        record["user"] = {"login": "other-bot", "type": "Bot"}
+    summary = discover_pull_requests(
+        client, REPO, configuration=multi_app_configuration(), operator_credential=DISCOVERY_BOT
+    )
+
+    assert [item.number for item in summary.clean] == [42]
+
+
+def test_current_completion_requires_explicit_complete_coverage_evidence():
+    client = completed_client()
+    completion = next(
+        item for item in client.comments
+        if json.loads(client.payload_from_body(item["body"]))["record_type"] == "completion"
+    )
+    payload = json.loads(client.payload_from_body(completion["body"]))
+    payload["coverage_complete"] = False
+    completion["body"] = json.dumps(payload)
+    summary = discover_pull_requests(
+        client, REPO, configuration=app_configuration(), operator_credential=DISCOVERY_BOT
+    )
+
+    assert [item.number for item in summary.needs_review] == [42]
+
+
+def test_legacy_completion_without_coverage_evidence_requires_review():
+    client = legacy_completed_client()
+    summary = discover_pull_requests(
+        client, REPO, configuration=app_configuration(), operator_credential=DISCOVERY_BOT
+    )
+
+    assert [item.number for item in summary.needs_review] == [42]
+    assert "coverage" in summary.needs_review[0].reason
+
+
+def test_published_records_carry_strict_coverage_evidence():
+    client = completed_client()
+    payloads = [json.loads(client.payload_from_body(item["body"])) for item in client.comments]
+    for payload in payloads:
+        if payload["record_type"] in {"report", "review-metadata", "completion"}:
+            assert payload["coverage_complete"] is True
+            assert payload["retrieved_file_count"] == payload["expected_file_count"]
+            assert payload["retrieved_blob_count"] == payload["expected_blob_count"]
+            assert payload["retrieved_content_count"] == payload["expected_content_count"]
 
 
 def test_trusted_malformed_workflow_record_needs_review_but_untrusted_spoof_is_ignored():
     client = Client()
     client.list_issue_comments = lambda repository, number: SimpleNamespace(data=[
-        {"id": 1, "body": "{malformed", "user": {"login": "reviewer"}},
-        {"id": 2, "body": "{malformed", "user": {"login": "attacker"}},
+        {"id": 1, "body": "{malformed", "user": {"login": "reviewer", "type": "User"}},
+        {"id": 2, "body": "{malformed", "user": {"login": "attacker", "type": "User"}},
     ])
     summary = discover_pull_requests(client, REPO, configuration=configuration(), operator_credential=manifest())
 
@@ -193,8 +323,8 @@ def test_label_failure_is_an_error_and_needs_review_is_not_claimed_clean():
 def test_dynamic_human_permission_must_be_write_or_admin():
     client = Client()
     client.permission = "read"
-    with pytest.raises(ValueError, match="permission"):
-        discover_pull_requests(client, REPO, configuration=configuration(), operator_credential=manifest())
+    summary = discover_pull_requests(client, REPO, configuration=configuration(), operator_credential=manifest())
+    assert summary.incomplete
 
 
 def test_valid_current_clean_completion_is_clean_and_reconciles_label():
@@ -255,6 +385,54 @@ def test_stale_workflow_review_is_dismissed_before_clean_label_removal():
     ][-1]
 
 
+def test_workflow_review_is_dismissed_without_current_completion():
+    client = completed_client("changes-requested")
+    completion = next(
+        item for item in client.comments
+        if json.loads(client.payload_from_body(item["body"]))["record_type"] == "completion"
+    )
+    client.comments.remove(completion)
+    review_id = client.reviews[0]["id"]
+    summary = discover_pull_requests(
+        client, REPO, configuration=app_configuration(), operator_credential=DISCOVERY_BOT
+    )
+
+    assert [item.number for item in summary.needs_review] == [42]
+    assert ("dismiss", review_id) in client.calls
+
+
+def test_discovery_uses_public_reconciliation_not_private_publisher_helper(monkeypatch):
+    client = completed_client()
+    monkeypatch.setattr(ReviewPublisher, "_remove_label", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("private helper used")))
+    summary = discover_pull_requests(
+        client, REPO, configuration=app_configuration(), operator_credential=DISCOVERY_BOT
+    )
+
+    assert [item.number for item in summary.clean] == [42]
+
+
+def test_missing_mutation_authority_is_incomplete_and_retains_label():
+    client = completed_client()
+    client.labels.add("needs-review")
+    no_dismiss = {**DISCOVERY_BOT, "allowed_operations": ["discover"]}
+    summary = discover_pull_requests(
+        client, REPO, configuration=app_configuration(), operator_credential=no_dismiss
+    )
+
+    assert summary.incomplete
+    assert [item.number for item in summary.needs_review] == [42]
+    assert "needs-review" in client.labels
+
+
+def test_invalid_trust_configuration_returns_deterministic_incomplete_summary():
+    summary = discover_pull_requests(
+        Client(), REPO, configuration=configuration(), operator_credential={"invalid": True}
+    )
+
+    assert summary.incomplete
+    assert summary.errors == tuple(sorted(summary.errors, key=lambda item: (item.number, item.reason)))
+
+
 @pytest.mark.parametrize("mutation", ["edited", "deleted"])
 def test_edited_or_deleted_trusted_record_is_incomplete(mutation):
     client = completed_client()
@@ -298,5 +476,5 @@ def test_target_mutation_during_reconciliation_retains_safety_label():
 
 def test_unconfigured_app_cannot_become_trusted_by_spoofed_login():
     client = Client()
-    with pytest.raises(ValueError, match="App|provenance"):
-        discover_pull_requests(client, REPO, configuration=configuration(), operator_credential=DISCOVERY_BOT)
+    summary = discover_pull_requests(client, REPO, configuration=configuration(), operator_credential=DISCOVERY_BOT)
+    assert summary.incomplete

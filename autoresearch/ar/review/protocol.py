@@ -19,6 +19,12 @@ from .models import GitHubEnvelope, ReviewTarget
 
 _RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
 _SCHEMA = "agentic-review/v1"
+_COVERAGE_SCHEMA = "agentic-review/v1+coverage"
+_SCHEMAS = {_SCHEMA, _COVERAGE_SCHEMA}
+_COVERAGE_FIELDS = {
+    "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
+    "retrieved_content_count", "expected_content_count", "coverage_complete",
+}
 _SERVER_FIELDS = {"node_id", "author", "created_at", "payload_digest", "intent_node_id"}
 _TARGET_KEYS = {
     "repository", "number", "head_repository", "head_sha", "base_ref", "base_sha", "merge_base_sha"
@@ -105,9 +111,55 @@ def _payload(envelope: Mapping[str, Any]) -> Mapping[str, Any]:
     _text(payload.get("record_id"), "logical record ID")
     if payload.get("record_type") not in _RECORD_TYPES:
         raise ValueError("unknown review record type")
-    if payload.get("schema") != _SCHEMA:
+    if payload.get("schema") not in _SCHEMAS:
         raise ValueError("record schema must be agentic-review/v1")
     return payload
+
+
+def _coverage(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    if payload.get("schema") != _COVERAGE_SCHEMA:
+        if _COVERAGE_FIELDS & set(payload):
+            raise ValueError("legacy review records must not contain partial coverage evidence")
+        return None
+    if not _COVERAGE_FIELDS.issubset(payload):
+        raise ValueError("review record is missing complete coverage evidence")
+    values = {field: payload[field] for field in _COVERAGE_FIELDS}
+    for prefix in ("file", "blob", "content"):
+        retrieved = values[f"retrieved_{prefix}_count"]
+        expected = values[f"expected_{prefix}_count"]
+        if (
+            isinstance(retrieved, bool) or not isinstance(retrieved, int) or retrieved < 0
+            or isinstance(expected, bool) or not isinstance(expected, int) or expected < 0
+            or retrieved > expected
+        ):
+            raise ValueError("coverage counts are malformed")
+    if not isinstance(values["coverage_complete"], bool):
+        raise ValueError("coverage_complete must be a boolean")
+    if values["coverage_complete"] and any(
+        values[f"retrieved_{prefix}_count"] != values[f"expected_{prefix}_count"]
+        for prefix in ("file", "blob", "content")
+    ):
+        raise ValueError("coverage_complete is inconsistent with coverage counts")
+    return values
+
+
+def _require_matching_coverage(first: Mapping[str, Any], second: Mapping[str, Any]) -> None:
+    first_coverage = _coverage(first)
+    second_coverage = _coverage(second)
+    if first_coverage != second_coverage:
+        raise ValueError("review records do not carry matching coverage evidence")
+
+
+def _required(payload: Mapping[str, Any], fields: set[str]) -> set[str]:
+    return fields | (_COVERAGE_FIELDS if payload.get("schema") == _COVERAGE_SCHEMA else set())
+
+
+def _matching_schema(*payloads: Mapping[str, Any]) -> str:
+    schemas = {payload.get("schema") for payload in payloads}
+    schema = next(iter(schemas), None)
+    if len(schemas) != 1 or not isinstance(schema, str):
+        raise ValueError("review records use incompatible schema versions")
+    return schema
 
 
 def _validate_envelope(envelope: Mapping[str, Any], trusted: frozenset[str]) -> Mapping[str, Any]:
@@ -203,13 +255,15 @@ def validate_report(
     trusted = _trust_policy(trusted_authors)
     payload = _validate_envelope(envelope, trusted)
     intent = _payload(intent_envelope)
+    _matching_schema(payload, intent)
     validate_intent(intent_envelope, trusted_authors=trusted)
     required = {
         "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
         "canonical_intent_node_id", "canonical_intent_digest", "report_body", "report_body_sha256",
     }
-    if set(payload) != required or payload["record_type"] != "report":
+    if set(payload) != _required(payload, required) or payload["record_type"] != "report":
         raise ValueError("invalid report payload")
+    _coverage(payload)
     target = _same_binding(payload, intent)
     if payload["head_sha"] != target.head_sha:
         raise ValueError("report head SHA does not match target")
@@ -239,14 +293,16 @@ def validate_review_metadata(
     payload = _validate_envelope(envelope, trusted)
     intent = _payload(intent_envelope)
     report = _payload(report_envelope)
+    _matching_schema(payload, intent, report)
     validate_intent(intent_envelope, trusted_authors=trusted)
     required = {
         "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
         "report_record_id", "report_node_id", "report_digest", "report_body_sha256",
         "canonical_intent_digest", "canonical_intent_node_id", "metadata_digest",
     }
-    if set(payload) != required or payload["record_type"] != "review-metadata":
+    if set(payload) != _required(payload, required) or payload["record_type"] != "review-metadata":
         raise ValueError("invalid review metadata payload")
+    _coverage(payload)
     target = _same_binding(payload, intent)
     if payload["head_sha"] != target.head_sha:
         raise ValueError("review metadata head SHA does not match target")
@@ -266,6 +322,7 @@ def validate_review_metadata(
         raise ValueError("review metadata report digest does not match")
     if payload["report_body_sha256"] != report.get("report_body_sha256"):
         raise ValueError("review metadata report body digest does not match")
+    _require_matching_coverage(report, payload)
     canonical_payload = _payload(canonical_intent)
     validate_intent(canonical_intent, trusted_authors=trusted)
     canonical_payload = dict(canonical_payload, _node_id=canonical_intent["node_id"])
@@ -293,14 +350,16 @@ def validate_completion(
         "canonical_intent_digest", "canonical_intent_node_id", "report_record_id", "report_node_id",
         "report_digest", "metadata_record_id", "metadata_digest",
     }
-    if set(payload) != required or payload["record_type"] != "completion":
+    if set(payload) != _required(payload, required) or payload["record_type"] != "completion":
         raise ValueError("invalid completion payload")
+    _coverage(payload)
     if report_envelope is None:
         raise ValueError("completion references a missing report")
     if metadata_envelope is None:
         raise ValueError("completion references a missing review metadata record")
     report = _payload(report_envelope)
     metadata = _payload(metadata_envelope)
+    _matching_schema(payload, intent, report, metadata)
     validate_intent(intent_envelope, trusted_authors=trusted)
     canonical_payload = _payload(canonical_intent)
     validate_intent(canonical_intent, trusted_authors=trusted)
@@ -326,6 +385,8 @@ def validate_completion(
         raise ValueError("completion metadata binding does not match")
     if payload["metadata_digest"] != metadata.get("metadata_digest"):
         raise ValueError("completion metadata digest does not match")
+    _require_matching_coverage(report, payload)
+    _require_matching_coverage(metadata, payload)
 
 
 def validate_revocation(

@@ -283,6 +283,13 @@ class ReviewProposal:
     adapter_version: str
     model: str
     response_digest: str
+    retrieved_file_count: int = 0
+    expected_file_count: int = 0
+    retrieved_blob_count: int = 0
+    expected_blob_count: int = 0
+    retrieved_content_count: int = 0
+    expected_content_count: int = 0
+    coverage_complete: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, ReviewTarget):
@@ -305,7 +312,40 @@ class ReviewProposal:
             raise ValueError("clean proposals cannot contain actionable findings")
         if self.verdict == "changes-requested" and not has_actionable_finding:
             raise ValueError("changes-requested proposals require an actionable finding")
-        expected = "sha256:" + canonical_digest({
+        counts = (
+            ("retrieved_file_count", self.retrieved_file_count, self.expected_file_count),
+            ("retrieved_blob_count", self.retrieved_blob_count, self.expected_blob_count),
+            ("retrieved_content_count", self.retrieved_content_count, self.expected_content_count),
+        )
+        for name, retrieved, expected_count in counts:
+            if (
+                isinstance(retrieved, bool) or not isinstance(retrieved, int) or retrieved < 0
+                or isinstance(expected_count, bool) or not isinstance(expected_count, int) or expected_count < 0
+                or retrieved > expected_count
+            ):
+                raise ValueError(f"{name} and its expected count must be non-negative and ordered")
+        if not isinstance(self.coverage_complete, bool):
+            raise ValueError("coverage_complete must be a boolean")
+        if self.coverage_complete and any(retrieved != expected_count for _, retrieved, expected_count in counts):
+            raise ValueError("complete coverage must have matching retrieved and expected counts")
+        coverage = {
+            "retrieved_file_count": self.retrieved_file_count,
+            "expected_file_count": self.expected_file_count,
+            "retrieved_blob_count": self.retrieved_blob_count,
+            "expected_blob_count": self.expected_blob_count,
+            "retrieved_content_count": self.retrieved_content_count,
+            "expected_content_count": self.expected_content_count,
+            "coverage_complete": self.coverage_complete,
+        }
+        # Keep positional/legacy proposals constructible while binding real
+        # capsule coverage evidence into every new proposal digest.
+        bind_coverage = coverage != {
+            "retrieved_file_count": 0, "expected_file_count": 0,
+            "retrieved_blob_count": 0, "expected_blob_count": 0,
+            "retrieved_content_count": 0, "expected_content_count": 0,
+            "coverage_complete": True,
+        }
+        digest_values = {
             "target": self.target,
             "target_key": self.target.target_key(),
             "capsule_digest": self.capsule_digest,
@@ -315,9 +355,23 @@ class ReviewProposal:
             "response_digest": self.response_digest,
             "verdict": self.verdict,
             "findings": self.findings,
-        })
+        }
+        if bind_coverage:
+            digest_values["coverage"] = coverage
+        expected = "sha256:" + canonical_digest(digest_values)
         if self.proposal_digest != expected:
             raise ValueError("proposal digest is not bound to target, capsule, provider, and response")
+
+    def coverage_mapping(self) -> dict[str, Any]:
+        return {
+            "retrieved_file_count": self.retrieved_file_count,
+            "expected_file_count": self.expected_file_count,
+            "retrieved_blob_count": self.retrieved_blob_count,
+            "expected_blob_count": self.expected_blob_count,
+            "retrieved_content_count": self.retrieved_content_count,
+            "expected_content_count": self.expected_content_count,
+            "coverage_complete": self.coverage_complete,
+        }
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,7 +19,7 @@ from .config import (
     validate_publisher_operator_credential,
 )
 from .github import decode_protocol_body, encode_protocol_body
-from .models import GitHubEnvelope, ReviewProposal, ReviewTarget
+from .models import GitHubEnvelope, ReviewProposal, ReviewTarget, validate_trusted_publishers_policy
 from .protocol import validate_intent, validate_protocol, validate_revocation
 
 
@@ -68,7 +68,7 @@ class _UnsafeLabelSnapshot(RuntimeError):
     pass
 
 
-_SCHEMA = "agentic-review/v1"
+_SCHEMA = "agentic-review/v1+coverage"
 _LABEL = "needs-review"
 _MAX_RECONCILIATION_ROUNDS = 4
 
@@ -122,6 +122,8 @@ class ReviewPublisher:
         *,
         configuration: ReviewConfiguration,
         operator_credential: Mapping[str, Any],
+        trusted_authors: Iterable[str] | None = None,
+        author_authorizer: Callable[[str, str], bool] | None = None,
     ) -> None:
         if not isinstance(configuration, ReviewConfiguration) or not configuration.is_protected:
             raise PublisherError("publisher requires an authenticated immutable configuration")
@@ -134,6 +136,9 @@ class ReviewPublisher:
         self._client = client
         self._configuration = configuration
         self._operator = deepcopy(dict(operator_credential))
+        self._additional_trusted_authors = set(trusted_authors or ())
+        self._author_authorizer = author_authorizer
+        self._discovery_authority_enabled = False
 
     @property
     def _trusted_authors(self) -> frozenset[str]:
@@ -144,7 +149,18 @@ class ReviewPublisher:
                 app["login"] for app in apps
                 if isinstance(app, Mapping) and isinstance(app.get("login"), str)
             )
+        authors.update(self._additional_trusted_authors)
         return frozenset(authors)
+
+    def _author_trusted(self, login: Any, principal_type: Any) -> bool:
+        if self._author_authorizer is not None and isinstance(login, str) and isinstance(principal_type, str):
+            try:
+                if self._author_authorizer(login, principal_type):
+                    self._additional_trusted_authors.add(login)
+                    return True
+            except Exception as exc:
+                raise PublisherError("workflow author trust could not be revalidated") from exc
+        return isinstance(login, str) and login in self._trusted_authors
 
     def _pull_target(self, target: ReviewTarget) -> ReviewTarget:
         getter = getattr(self._client, "get_review_target", None)
@@ -170,6 +186,7 @@ class ReviewPublisher:
                     # and publication is already being aborted.
                     pass
             before = self._pull_target(target)
+            self._check_discovery_authority(target)
             self._client.add_labels(target.repository, target.number, [_LABEL])
             after = self._pull_target(target)
             if after != before:
@@ -196,7 +213,10 @@ class ReviewPublisher:
                 continue
             listed_user = raw.get("user")
             listed_login = listed_user.get("login") if isinstance(listed_user, Mapping) else None
-            if listed_login not in self._trusted_authors:
+            listed_type = listed_user.get("type") if isinstance(listed_user, Mapping) else None
+            if not (body.lstrip().startswith("{") or "agentic-review/v1" in body):
+                continue
+            if not self._author_trusted(listed_login, listed_type):
                 continue
             try:
                 payload = decode_protocol_body(body)
@@ -204,7 +224,7 @@ class ReviewPublisher:
                 if body.lstrip().startswith("{") or "agentic-review/v1" in body:
                     raise PublisherError("a protocol record was deleted or edited")
                 continue
-            if payload.get("schema") != _SCHEMA:
+            if payload.get("schema") not in {"agentic-review/v1", _SCHEMA}:
                 continue
             try:
                 if is_review:
@@ -217,7 +237,7 @@ class ReviewPublisher:
                     envelope = self._client.comment_envelope(target.repository, raw["id"])
                     state = commit_id = None
                     server_id = raw["id"]
-                if envelope.author not in self._trusted_authors:
+                if not self._author_trusted(envelope.author, envelope.author_type):
                     continue
                 record = _HistoryRecord(envelope, is_review, server_id, state, commit_id)
                 _target_from_payload(envelope.payload) if envelope.payload.get("record_type") != "revocation" else None
@@ -335,6 +355,7 @@ class ReviewPublisher:
         before_mutation: Callable[[GitHubEnvelope, _History], None] | None = None,
         return_snapshot: bool = False,
     ) -> Any:
+        self._check_discovery_authority(target)
         canonical: GitHubEnvelope | None = None
         history: _History | None = None
         if attempt_id is not None:
@@ -351,6 +372,179 @@ class ReviewPublisher:
                 raise PublisherError("mutation snapshot was not authenticated")
             return value, canonical, history
         return value
+
+    def _check_discovery_authority(self, target: ReviewTarget) -> None:
+        if not self._discovery_authority_enabled:
+            return
+        try:
+            validate_operator_credential_manifest(self._operator)
+            if self._operator["repository"] != target.repository:
+                raise PublisherError("operator manifest repository does not match target repository")
+            principal = self._operator["principal"]
+            if principal["type"] not in {"User", "Bot"}:
+                raise PublisherError("discovery operator principal is unsupported")
+            if not {"discover", "dismiss-workflow-review"}.issubset(self._operator["allowed_operations"]):
+                raise PublisherError("discovery operator lacks required mutation operations")
+            if any(
+                self._operator["write_permissions"].get(permission) not in {"write", "admin"}
+                for permission in ("issues", "pull_requests")
+            ):
+                raise PublisherError("discovery operator lacks issues and pull_requests write authority")
+            if principal["type"] == "User":
+                permission = self._client.collaborator_effective_permission(target.repository, principal["login"])
+                if (
+                    permission.login != principal["login"]
+                    or permission.principal_type != "User"
+                    or permission.permission not in {"write", "admin"}
+                ):
+                    raise PublisherError("discovery operator lacks current effective write authority")
+                return
+            repository = self._client.get_repository(target.repository).data
+            repository_id = repository.get("id") if isinstance(repository, Mapping) else None
+            validate_trusted_publishers_policy(self._configuration.trusted_publishers)
+            apps = [
+                app for app in self._configuration.trusted_publishers["apps"]
+                if app["login"] == principal["login"] and app["repository_id"] == repository_id
+            ]
+            if len(apps) != 1 or apps[0]["credential_attestation_digest"] != self._operator["credential_attestation_digest"]:
+                raise PublisherError("discovery App provenance does not match the operator")
+            installations = self._client.list_installation_repositories().data
+            repositories = installations.get("repositories") if isinstance(installations, Mapping) else None
+            if not isinstance(repositories, list) or not any(
+                isinstance(item, Mapping) and item.get("id") == repository_id for item in repositories
+            ):
+                raise PublisherError("discovery App installation does not include the repository")
+        except PublisherError:
+            raise
+        except Exception as exc:
+            raise PublisherError("discovery mutation authority could not be revalidated") from exc
+
+    def _raw_workflow_review_ids(self, target: ReviewTarget) -> list[tuple[int, str]]:
+        raw_reviews = self._client.list_pull_reviews(target.repository, target.number).data
+        if not isinstance(raw_reviews, list):
+            raise PublisherError("GitHub review history is malformed")
+        result: list[tuple[int, str]] = []
+        for raw in raw_reviews:
+            if not isinstance(raw, Mapping):
+                raise PublisherError("GitHub review history contains a malformed record")
+            user = raw.get("user")
+            login = user.get("login") if isinstance(user, Mapping) else None
+            user_type = user.get("type") if isinstance(user, Mapping) else None
+            body = raw.get("body")
+            if not isinstance(body, str) or not (body.lstrip().startswith("{") or "agentic-review/v1" in body):
+                continue
+            if not self._author_trusted(login, user_type):
+                continue
+            try:
+                payload = decode_protocol_body(body)
+            except PublisherError:
+                raise
+            except Exception:
+                continue
+            if payload.get("schema") not in {"agentic-review/v1", "agentic-review/v1+coverage"} or payload.get("record_type") != "review-metadata":
+                continue
+            try:
+                exact = self._client.get_pull_review_record(target.repository, target.number, raw["id"])
+                record_target = _target_from_payload(payload)
+                if (
+                    self._author_trusted(exact.envelope.author, exact.envelope.author_type)
+                    and exact.state == "CHANGES_REQUESTED"
+                    and exact.commit_id == record_target.head_sha
+                ):
+                    result.append((exact.server_id, exact.envelope.node_id))
+            except PublisherError:
+                raise
+            except Exception:
+                continue
+        return sorted(set(result))
+
+    def _remove_discovery_label(
+        self, target: ReviewTarget, attempt_id: str, intent_node: str, keep_node: str, *, keep_is_review: bool,
+    ) -> None:
+        for _ in range(_MAX_RECONCILIATION_ROUNDS):
+            canonical, history = self._canonical(target, attempt_id, intent_node)
+            self._validate_keep_review(history, target, keep_node) if keep_is_review else None
+            stale = [node_id for review_id, node_id in self._raw_workflow_review_ids(target) if node_id != keep_node]
+            if stale:
+                for review_id in [review_id for review_id, node_id in self._raw_workflow_review_ids(target) if node_id != keep_node]:
+                    self._mutate(
+                        target,
+                        lambda review_id=review_id: self._client.dismiss_workflow_review(
+                            target.repository, target.number, review_id,
+                            message="Superseded by a current agentic review",
+                        ),
+                        attempt_id=attempt_id,
+                        intent_node=canonical.node_id,
+                    )
+                continue
+            if not self._label_present(target):
+                self._assert_target(target)
+                return
+            self._mutate(
+                target,
+                lambda: self._client.remove_label(target.repository, target.number, _LABEL),
+                attempt_id=attempt_id,
+                intent_node=canonical.node_id,
+            )
+            self._assert_target(target)
+            stable, stable_history = self._canonical(target, attempt_id, intent_node)
+            if keep_is_review:
+                self._validate_keep_review(stable_history, target, keep_node)
+            if not self._raw_workflow_review_ids(target):
+                return
+        raise PublisherError("discovery label reconciliation did not stabilize")
+
+    def reconcile_discovery(
+        self,
+        target: ReviewTarget,
+        *,
+        attempt_id: str | None = None,
+        intent_node: str | None = None,
+        keep_node: str | None = None,
+        keep_is_review: bool = False,
+    ) -> bool:
+        """Public, authority-checked discovery reconciliation operation."""
+        source = self._configuration.source
+        if not isinstance(target, ReviewTarget) or source is None or target.repository != source.repository:
+            raise PublisherError("discovery reconciliation target is not bound to the configured repository")
+        self._discovery_authority_enabled = True
+        try:
+            self._check_discovery_authority(target)
+            had_label = self._label_present(target)
+            for _ in range(_MAX_RECONCILIATION_ROUNDS):
+                stale = [
+                    review_id for review_id, node_id in self._raw_workflow_review_ids(target)
+                    if node_id != keep_node
+                ]
+                if not stale:
+                    break
+                for review_id in stale:
+                    self._mutate(
+                        target,
+                        lambda review_id=review_id: self._client.dismiss_workflow_review(
+                            target.repository, target.number, review_id,
+                            message="Superseded by a current agentic review",
+                        ),
+                    )
+            else:
+                raise PublisherError("discovery workflow review reconciliation did not stabilize")
+            if attempt_id is not None and intent_node is not None and keep_node is not None:
+                self._remove_discovery_label(
+                    target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
+                )
+            else:
+                self._reapply_label(target)
+                self._assert_target(target)
+                return not had_label
+            return False
+        except Exception:
+            try:
+                self._reapply_label(target)
+            except Exception:
+                pass
+            raise
+        finally:
+            self._discovery_authority_enabled = False
 
     def _intent_payload(self, target: ReviewTarget, attempt_id: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -369,6 +563,7 @@ class ReviewPublisher:
             "intent_record_id": intent.payload["record_id"], "canonical_intent_node_id": intent.node_id,
             "canonical_intent_digest": intent.payload["canonical_digest"], "head_sha": target.head_sha,
             "report_body": body, "report_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            **proposal.coverage_mapping(),
         }
 
     def _metadata_payload(self, target: ReviewTarget, intent: GitHubEnvelope, report: GitHubEnvelope) -> dict[str, Any]:
@@ -380,6 +575,10 @@ class ReviewPublisher:
             "report_digest": canonical_digest(report.payload), "report_body_sha256": report.payload["report_body_sha256"],
             "canonical_intent_digest": intent.payload["canonical_digest"], "canonical_intent_node_id": intent.node_id,
             "metadata_digest": "",
+            **{field: report.payload[field] for field in (
+                "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
+                "retrieved_content_count", "expected_content_count", "coverage_complete",
+            )},
         }
         payload["metadata_digest"] = metadata_digest(payload)
         return payload
@@ -393,6 +592,10 @@ class ReviewPublisher:
             "report_record_id": report.payload["record_id"], "report_node_id": report.node_id,
             "report_digest": canonical_digest(report.payload), "metadata_record_id": metadata.payload["record_id"],
             "metadata_digest": metadata.payload["metadata_digest"],
+            **{field: metadata.payload[field] for field in (
+                "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
+                "retrieved_content_count", "expected_content_count", "coverage_complete",
+            )},
         }
 
     def _new_comment(

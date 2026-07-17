@@ -16,7 +16,9 @@ from .publisher import ReviewPublisher
 
 _LABEL = "needs-review"
 _SCHEMA = "agentic-review/v1"
+_SCHEMAS = {_SCHEMA, "agentic-review/v1+coverage"}
 _MAX_REASON = 512
+_MAX_AUTHOR_TRUST_CHECKS = 128
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,72 @@ class _Record:
     server_id: int
     state: str | None = None
     commit_id: str | None = None
+
+
+class _TrustContext:
+    def __init__(self, client: Any, repository: str, configuration: ReviewConfiguration) -> None:
+        self.client = client
+        self.repository = repository
+        self.configuration = configuration
+        self.authors: set[str] = set()
+        self._human_permissions: dict[str, bool] = {}
+        self._app_scope: dict[str, bool] = {}
+        self._repository_id: int | None = None
+        self._trust_checks = 0
+
+    def _check_budget(self) -> None:
+        self._trust_checks += 1
+        if self._trust_checks > _MAX_AUTHOR_TRUST_CHECKS:
+            raise GitHubBoundaryError("workflow author trust checks reached the fixed bound")
+
+    def _repo_id(self) -> int:
+        if self._repository_id is None:
+            getter = getattr(self.client, "get_repository", None)
+            if not callable(getter):
+                raise GitHubBoundaryError("repository identity is required for App trust")
+            data = _data(getter(self.repository))
+            repository_id = data.get("id") if isinstance(data, Mapping) else None
+            if isinstance(repository_id, bool) or not isinstance(repository_id, int) or repository_id <= 0:
+                raise GitHubBoundaryError("GitHub repository identity is malformed")
+            self._repository_id = repository_id
+        return self._repository_id
+
+    def _app_authorized(self, login: str) -> bool:
+        if login in self._app_scope:
+            return self._app_scope[login]
+        self._check_budget()
+        app = _configured_app(self.configuration, login, self._repo_id())
+        if app is None:
+            self._app_scope[login] = False
+            return False
+        repositories = _data(self.client.list_installation_repositories())
+        visible = repositories.get("repositories") if isinstance(repositories, Mapping) else None
+        authorized = isinstance(visible, list) and any(
+            isinstance(item, Mapping) and item.get("id") == self._repo_id() for item in visible
+        )
+        self._app_scope[login] = authorized
+        return authorized
+
+    def authorize(self, login: str, principal_type: str) -> bool:
+        if not isinstance(login, str) or not login.strip():
+            return False
+        if principal_type == "User":
+            if login not in self._human_permissions:
+                self._check_budget()
+                permission = self.client.collaborator_effective_permission(self.repository, login)
+                self._human_permissions[login] = bool(
+                    getattr(permission, "login", None) == login
+                    and getattr(permission, "principal_type", None) == "User"
+                    and getattr(permission, "permission", None) in {"write", "admin"}
+                )
+            authorized = self._human_permissions[login]
+        elif principal_type == "Bot":
+            authorized = self._app_authorized(login)
+        else:
+            authorized = False
+        if authorized:
+            self.authors.add(login)
+        return authorized
 
 
 def _data(response: Any) -> Any:
@@ -79,7 +147,7 @@ def _trust(
     repository: str,
     configuration: ReviewConfiguration,
     operator_credential: Mapping[str, Any],
-) -> frozenset[str]:
+) -> _TrustContext:
     try:
         validate_trusted_publishers_policy(configuration.trusted_publishers)
         validate_operator_credential_manifest(operator_credential)
@@ -92,34 +160,36 @@ def _trust(
 
     principal = operator_credential["principal"]
     login = principal["login"]
+    context = _TrustContext(client, repository, configuration)
     if principal["type"] == "User":
         try:
             permission = client.collaborator_effective_permission(repository, login)
         except Exception as exc:
             raise GitHubBoundaryError(f"effective permission API failure: {exc}") from exc
-        if getattr(permission, "login", None) != login or getattr(permission, "permission", None) not in {"write", "admin"}:
+        if (
+            getattr(permission, "login", None) != login
+            or getattr(permission, "principal_type", None) != "User"
+            or getattr(permission, "permission", None) not in {"write", "admin"}
+        ):
             raise ValueError("discovery operator lacks effective write permission")
-        return frozenset({login})
+        context._human_permissions[login] = True
+        context.authors.add(login)
+        return context
     if principal["type"] != "Bot":
         raise ValueError("discovery operator principal must be a User or configured App")
 
-    repository_id: int | None = None
-    getter = getattr(client, "get_repository", None)
-    if not callable(getter):
-        raise ValueError("GitHub repository identity is required for App trust")
     try:
-        data = _data(getter(repository))
+        app = _configured_app(configuration, login, context._repo_id())
     except Exception as exc:
+        if isinstance(exc, GitHubBoundaryError):
+            raise
         raise GitHubBoundaryError(f"repository identity API failure: {exc}") from exc
-    repository_id = data.get("id") if isinstance(data, Mapping) else None
-    if isinstance(repository_id, bool) or not isinstance(repository_id, int) or repository_id <= 0:
-        raise ValueError("GitHub repository identity is unavailable for App trust")
-    app = _configured_app(configuration, login, repository_id)
-    if app is None:
-        raise ValueError("discovery App is not configured with validated repository provenance")
-    if app.get("credential_attestation_digest") != operator_credential["credential_attestation_digest"]:
+    if app is None or app.get("credential_attestation_digest") != operator_credential["credential_attestation_digest"]:
         raise ValueError("discovery App attestation does not match configured provenance")
-    return frozenset({login})
+    if not context._app_authorized(login):
+        raise ValueError("discovery App installation does not include the repository")
+    context.authors.add(login)
+    return context
 
 
 def _candidate_body(body: Any) -> bool:
@@ -128,7 +198,7 @@ def _candidate_body(body: Any) -> bool:
     )
 
 
-def _history(client: Any, target: ReviewTarget, trusted: frozenset[str]) -> tuple[tuple[_Record, ...], str | None]:
+def _history(client: Any, target: ReviewTarget, trust: _TrustContext) -> tuple[tuple[_Record, ...], str | None]:
     try:
         comments = _data(client.list_issue_comments(target.repository, target.number))
         reviews = _data(client.list_pull_reviews(target.repository, target.number))
@@ -143,18 +213,25 @@ def _history(client: Any, target: ReviewTarget, trusted: frozenset[str]) -> tupl
             return (), "history contains a malformed API record"
         user = raw.get("user")
         login = user.get("login") if isinstance(user, Mapping) else None
-        if login not in trusted:
+        listed_type = user.get("type") if isinstance(user, Mapping) else None
+        if not isinstance(login, str) or not isinstance(listed_type, str):
             continue
         body = raw.get("body")
         if not isinstance(body, str):
-            return (), "trusted workflow record has a malformed body"
+            continue
         if not _candidate_body(body):
+            continue
+        try:
+            authorized = trust.authorize(login, listed_type)
+        except Exception as exc:
+            return (), _reason(f"record author trust API failure: {exc}")
+        if not authorized:
             continue
         try:
             payload = decode_protocol_body(body)
         except Exception as exc:
             return (), _reason(f"trusted workflow record is malformed: {exc}")
-        if payload.get("schema") != _SCHEMA:
+        if payload.get("schema") not in _SCHEMAS:
             continue
         if payload.get("record_type") not in {"intent", "report", "review-metadata", "completion", "revocation"}:
             return (), "trusted workflow record has an invalid record type"
@@ -170,7 +247,7 @@ def _history(client: Any, target: ReviewTarget, trusted: frozenset[str]) -> tupl
             else:
                 envelope = client.comment_envelope(target.repository, raw["id"])
                 record = _Record(envelope, False, raw["id"])
-            if envelope.author not in trusted:
+            if not trust.authorize(envelope.author, envelope.author_type):
                 continue
         except Exception as exc:
             return (), _reason(f"trusted workflow record is deleted, edited, or unavailable: {exc}")
@@ -191,7 +268,7 @@ def _target_from_record(record: _Record) -> ReviewTarget | None:
 
 
 def _current_completion(
-    records: Sequence[_Record], target: ReviewTarget, trusted: frozenset[str]
+    records: Sequence[_Record], target: ReviewTarget, trust: _TrustContext
 ) -> tuple[_Record, _Record, GitHubEnvelope] | str:
     current = []
     for record in records:
@@ -207,7 +284,9 @@ def _current_completion(
     try:
         canonical = cast(
             GitHubEnvelope,
-            validate_protocol([record.envelope for record in current], expected_target=target, trusted_authors=trusted),
+            validate_protocol(
+                [record.envelope for record in current], expected_target=target, trusted_authors=trust.authors
+            ),
         )
     except Exception as exc:
         return _reason(f"current review history is incomplete or invalid: {exc}")
@@ -220,6 +299,8 @@ def _current_completion(
     )
     if completion is None:
         return "no valid canonical agentic-review completion"
+    if completion.envelope.payload.get("schema") != "agentic-review/v1+coverage" or completion.envelope.payload.get("coverage_complete") is not True:
+        return "completion lacks complete coverage evidence"
     metadata_id = completion.envelope.payload.get("metadata_record_id")
     metadata = next(
         (record for record in current
@@ -232,43 +313,6 @@ def _current_completion(
     if metadata.is_review and (metadata.state != "CHANGES_REQUESTED" or metadata.commit_id != target.head_sha):
         return "active requested-change review is missing or does not match the current head"
     return completion, metadata, canonical
-
-
-def _label_present(client: Any, target: ReviewTarget) -> bool:
-    data = _data(client.list_issue_labels(target.repository, target.number))
-    if not isinstance(data, list):
-        raise GitHubBoundaryError("GitHub label state is malformed")
-    return any(isinstance(item, Mapping) and item.get("name") == _LABEL for item in data)
-
-
-def _ensure_label(client: Any, target: ReviewTarget) -> bool:
-    before = client.get_review_target(target.repository, target.number)
-    if before != target:
-        raise GitHubBoundaryError("target changed before needs-review labelling")
-    if _label_present(client, target):
-        return False
-    try:
-        client.add_labels(target.repository, target.number, [_LABEL])
-    finally:
-        after = client.get_review_target(target.repository, target.number)
-        if after != target:
-            raise GitHubBoundaryError("target changed during needs-review labelling")
-    if not _label_present(client, target):
-        raise GitHubBoundaryError("GitHub did not confirm needs-review label")
-    return True
-
-
-def _recover_label(client: Any, repository: str, number: int, original: ReviewTarget | None = None) -> bool:
-    """Restore the safety label against the latest complete target snapshot."""
-    try:
-        current = client.get_review_target(repository, number)
-        if _target_fields(current) and current.repository == repository and current.number == number:
-            return _ensure_label(client, current)
-    except Exception:
-        pass
-    if original is not None:
-        return _ensure_label(client, original)
-    raise GitHubBoundaryError("unable to recover needs-review label")
 
 
 def discover_pull_requests(
@@ -287,8 +331,8 @@ def discover_pull_requests(
     incomplete scan.
     """
     try:
-        trusted = _trust(client, repository, configuration, operator_credential)
-    except GitHubBoundaryError as exc:
+        trust = _trust(client, repository, configuration, operator_credential)
+    except Exception as exc:
         item = DiscoveryItem(0, _reason(f"incomplete scan: {exc}"))
         return DiscoverySummary(incomplete=(item,), errors=(item,))
     try:
@@ -306,8 +350,6 @@ def discover_pull_requests(
     clean: list[DiscoveryItem] = []
     incomplete: list[DiscoveryItem] = []
     errors: list[DiscoveryItem] = []
-    publisher: ReviewPublisher | None = None
-
     for pull in sorted(pulls, key=lambda value: value.get("number", 0) if isinstance(value, Mapping) else 0):
         number = pull.get("number", 0) if isinstance(pull, Mapping) else 0
         if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
@@ -319,13 +361,13 @@ def discover_pull_requests(
             target = client.get_review_target(repository, number)
             if not _target_fields(target) or target.repository != repository or target.number != number:
                 raise GitHubBoundaryError("pull request target is incomplete or mismatched")
-            records, history_error = _history(client, target, trusted)
+            records, history_error = _history(client, target, trust)
             reason: str | None = history_error
             completion = None
             metadata = None
             canonical = None
             if reason is None:
-                result = _current_completion(records, target, trusted)
+                result = _current_completion(records, target, trust)
                 if isinstance(result, str):
                     reason = result
                 else:
@@ -334,14 +376,14 @@ def discover_pull_requests(
                 item = DiscoveryItem(number, reason)
                 needs.append(item)
                 try:
-                    if _ensure_label(client, target):
+                    labelled_now = ReviewPublisher(
+                        client, configuration=configuration, operator_credential=operator_credential,
+                        trusted_authors=trust.authors,
+                        author_authorizer=trust.authorize,
+                    ).reconcile_discovery(target)
+                    if labelled_now:
                         labelled.append(item)
                 except Exception as exc:
-                    try:
-                        if _recover_label(client, repository, number, target):
-                            labelled.append(item)
-                    except Exception:
-                        pass
                     error = DiscoveryItem(number, _reason(f"needs-review label mutation failed: {exc}"))
                     errors.append(error)
                     incomplete.append(error)
@@ -354,24 +396,27 @@ def discover_pull_requests(
                 continue
 
             assert completion is not None and metadata is not None and canonical is not None
-            if publisher is None:
-                publisher = ReviewPublisher(
-                    client, configuration=configuration, operator_credential=operator_credential
-                )
             try:
-                assert publisher is not None
-                publisher._remove_label(
+                ReviewPublisher(
+                    client, configuration=configuration, operator_credential=operator_credential,
+                    trusted_authors=trust.authors,
+                    author_authorizer=trust.authorize,
+                ).reconcile_discovery(
                     target,
-                    completion.envelope.payload["attempt_id"],
-                    canonical.node_id,
-                    metadata.envelope.node_id,
+                    attempt_id=completion.envelope.payload["attempt_id"],
+                    intent_node=canonical.node_id,
+                    keep_node=metadata.envelope.node_id,
                     keep_is_review=metadata.is_review,
                 )
                 if client.get_review_target(repository, number) != target:
                     raise GitHubBoundaryError("target changed after clean reconciliation")
             except Exception as exc:
                 try:
-                    _recover_label(client, repository, number, target)
+                    labelled_now = ReviewPublisher(
+                        client, configuration=configuration, operator_credential=operator_credential,
+                        trusted_authors=trust.authors,
+                        author_authorizer=trust.authorize,
+                    ).reconcile_discovery(target)
                 except Exception as label_exc:
                     exc = RuntimeError(f"{exc}; label recovery failed: {label_exc}")
                 item = DiscoveryItem(number, _reason(f"clean reconciliation failed: {exc}"))
@@ -390,14 +435,15 @@ def discover_pull_requests(
             try:
                 recovery_target = client.get_review_target(repository, number)
                 if isinstance(recovery_target, ReviewTarget) and _target_fields(recovery_target):
-                    if _ensure_label(client, recovery_target):
+                    labelled_now = ReviewPublisher(
+                        client, configuration=configuration, operator_credential=operator_credential,
+                        trusted_authors=trust.authors,
+                        author_authorizer=trust.authorize,
+                    ).reconcile_discovery(recovery_target)
+                    if labelled_now:
                         labelled.append(item)
             except Exception as label_exc:
-                try:
-                    if _recover_label(client, repository, number, recovery_target):
-                        labelled.append(item)
-                except Exception:
-                    errors.append(DiscoveryItem(number, _reason(f"label recovery failed: {label_exc}")))
+                errors.append(DiscoveryItem(number, _reason(f"label recovery failed: {label_exc}")))
 
     key = lambda item: (item.number, item.reason)
     return DiscoverySummary(

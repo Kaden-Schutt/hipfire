@@ -468,6 +468,33 @@ class ToollessReviewAdapter:
                 raise ToollessInferenceError("provider finding is invalid") from exc
         try:
             response_digest = "sha256:" + canonical_digest(decoded, max_bytes=self._policy.max_response_bytes)
+            expected_file_count = len(capsule.manifest)
+            retrieved_file_count = len(capsule.files)
+            expected_blob_count = sum(
+                int(entry.base_blob_oid is not None) + int(entry.head_blob_oid is not None)
+                for entry in capsule.manifest
+            )
+            retrieved_content_count = sum(
+                int(file.base_source is not None) + int(file.head_source is not None)
+                for file in capsule.files
+            )
+            retrieved_blob_count = retrieved_content_count
+            expected_content_count = expected_blob_count
+            coverage_complete = (
+                capsule.complete
+                and retrieved_file_count == expected_file_count
+                and retrieved_blob_count == expected_blob_count
+                and retrieved_content_count == expected_content_count
+            )
+            coverage = {
+                "retrieved_file_count": retrieved_file_count,
+                "expected_file_count": expected_file_count,
+                "retrieved_blob_count": retrieved_blob_count,
+                "expected_blob_count": expected_blob_count,
+                "retrieved_content_count": retrieved_content_count,
+                "expected_content_count": expected_content_count,
+                "coverage_complete": coverage_complete,
+            }
             proposal_digest = "sha256:" + canonical_digest({
                 "target": capsule.target,
                 "target_key": capsule.target_key,
@@ -478,10 +505,13 @@ class ToollessReviewAdapter:
                 "response_digest": response_digest,
                 "verdict": proposal_payload["verdict"],
                 "findings": tuple(findings),
+                "coverage": coverage,
             }, max_bytes=max(self._policy.max_response_bytes, self._policy.max_capsule_bytes))
             return ReviewProposal(
                 capsule.target, capsule.digest, proposal_digest, proposal_payload["verdict"], tuple(findings),
                 self._policy.adapter_id, self._policy.adapter_version, self._policy.model, response_digest,
+                retrieved_file_count, expected_file_count, retrieved_blob_count, expected_blob_count,
+                retrieved_content_count, expected_content_count, coverage_complete,
             )
         except (TypeError, ValueError) as exc:
             raise ToollessInferenceError("provider proposal is invalid") from exc
