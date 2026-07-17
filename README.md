@@ -118,7 +118,7 @@ bring-your-own-model flows through `hipfire quantize`.
 |---|---|---|
 | Vega/CDNA | `gfx906`, `gfx908`, `gfx940`-`gfx942` | Native wave64 HIP paths |
 | RDNA1 | `gfx1010`-`gfx1013` | Portable HIP and Redline dispatch support |
-| RDNA2 | `gfx1030`-`gfx1032` | Portable HIP and Redline dispatch support |
+| RDNA2 | `gfx1030`-`gfx1032` | SDOT4 MQ2-Lloyd/Q8 batched prefill and Redline dispatch support |
 | RDNA3 | `gfx1100`-`gfx1103` | Architecture-tuned kernels and validated MQ4R route |
 | RDNA3.5 | `gfx1150`-`gfx1152` | Architecture-tuned kernels and validated MQ4R route |
 | RDNA4 | `gfx1200`, `gfx1201` | WMMA paths and validated retained-PM4 MQ4R route |

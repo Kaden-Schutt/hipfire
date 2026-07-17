@@ -19,7 +19,13 @@
 // Structure matches mq_rotate_x exactly — only phase 1 differs (read
 // gate[i]+up[i] and compute silu*up, vs read x[i]).
 
+#if defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__) \
+ || defined(__gfx1013__) || defined(__gfx1030__) || defined(__gfx1031__) \
+ || defined(__gfx1032__)
+extern "C" __launch_bounds__(32, 8)
+#else
 extern "C" __launch_bounds__(32, 16)
+#endif
 __global__ void fused_silu_mul_mq_rotate(
     const float* __restrict__ gate,
     const float* __restrict__ up,

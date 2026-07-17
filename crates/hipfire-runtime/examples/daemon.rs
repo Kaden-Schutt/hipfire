@@ -3300,6 +3300,13 @@ fn main() {
                             &bundle.scratch,
                         )
                         .map_err(|error| error.to_string())?;
+                        // The retained AQL/PM4 batch owns a raw HSA queue, not
+                        // HIP's launch stream. Complete the embedding and
+                        // position writes before crossing queue domains, just
+                        // like the production replay route in forward_scratch.
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
                         if pm4 {
                             let timing = unsafe { gpu.replay.replay_pm4(context + i) }?;
                             gpu_us += timing.span_microseconds();

@@ -368,6 +368,12 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    if kernel == "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed" {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+    if kernel == "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed" {
+        return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
+    }
     if matches!(
         kernel,
         "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
@@ -676,6 +682,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
         ]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
+        "attention_q8_0_kv" => {
+            Some(vec![read(0), read(8), read(16), write(24), read(32)])
+        }
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151" => {
             Some(vec![read(0), write(8), read(16), read(24), read(32), read(48)])
@@ -686,6 +695,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel == "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed" {
+        return Some(52);
+    }
+    if kernel == "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed" {
+        return Some(48);
+    }
     if matches!(
         kernel,
         "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
@@ -760,6 +775,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     match kernel {
         "softmax_f32" => Some(16),
+        "attention_q8_0_kv" => Some(64),
         "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
@@ -2963,6 +2979,8 @@ mod tests {
     use super::*;
 
     const A3B_REPLAY_KERNELS: &[&str] = &[
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+        "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
         "fused_rmsnorm_mq_rotate",
         "fused_rmsnorm_mq_rotate_vecsum",
         "fused_rmsnorm_mq_rotate_vecsum_sign_const",
@@ -3505,6 +3523,13 @@ mod tests {
             Some(96)
         );
         assert!(pointer_effects("gated_delta_net_q8_compact2_b2").is_some());
+        assert_eq!(
+            expected_kernarg_bytes(
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            ),
+            Some(52),
+            "dynamic top-k must be present in the captured ABI",
+        );
         assert_eq!(
             expected_kernarg_bytes("conv1d_silu_split_qknorm_b256"),
             Some(80)

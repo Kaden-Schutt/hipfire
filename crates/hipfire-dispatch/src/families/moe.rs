@@ -592,12 +592,7 @@ impl MoePrefillResolution {
         // Re-admit Path 2 for uniform MQ2L routed experts on gfx10*.
         let mq2l_gfx10 = d.routed_gate_up == DType::MQ2G256Lloyd
             && d.routed_down == DType::MQ2G256Lloyd
-            && (arch.is_gfx1030()
-                || arch.is_gfx1031()
-                || arch.is_gfx1032()
-                || arch.is_gfx1010()
-                || arch.is_gfx1011()
-                || arch.is_gfx1012());
+            && arch.has_hfq3_sdot4();
         let use_path2 = use_path2 || (mq2l_gfx10 && flags.moe_grouped_gemm);
         // MQ6 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
         // gfx12 `_gfx12` kernel). Only suppress Path 2 for MQ6 on archs that

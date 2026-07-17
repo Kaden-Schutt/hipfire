@@ -10,7 +10,7 @@
 // has no i8 WMMA; same host contract:
 //   - MQ2-Lloyd weights (72 B/group: 4×f16 codebook + 64 B 2-bit indices)
 //   - X pre-quantized to block_q8_1_mmq via ensure_q8_1_mmq_x
-//   - Grid [ceil(M/16), m_total/16], Block [32], LDS 0
+//   - Grid [ceil(M/16), ceil(m_total/16)], Block [32], LDS 0
 //   - Y_grouped layout [m_total × M] f32
 //
 // Thread map (weight-reuse oriented):
@@ -18,17 +18,16 @@
 //   slot_half = tid >> 4          → 0 covers slots 0..7, 1 covers 8..15
 //   acc[s] = Y[slot_start + slot_half*8 + s][row_start + row_local]
 //
-// B (activation) traffic: each of the 16 lanes loads ONE slot's Q8_1 sub-block
-// once per (kb, sb). Row threads then pull the 8 slots they own via __shfl
-// from source lane (slot_half*8 + s). A (weight) is decoded once per row and
-// dotted against those 8 shuffled B packs — ~2× weight traffic, ~1× B traffic
-// for the 16×16 tile.
+// B (activation) traffic: lanes 0..15 load one slot's Q8_1 sub-block once
+// per (kb, sb). Row threads pull the four slots they own via __shfl from
+// source lane (slot_half*8 + s). Streaming MQ2 indices plus bounded inner
+// unrolling retains 16-slot weight reuse without the original VGPR spills.
 //
 // Math: per group, quantize the 4-entry f16 Lloyd codebook to int8 + scale
 // once; decode 2-bit indices via byte-extract LUT; sdot4 vs Q8_1 qs;
 // `acc += sc * d_x * sumi` (no zp — MQ2-Lloyd is codebook-only).
 #if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) \
- || defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__)
+ || defined(__gfx1011__) || defined(__gfx1012__)
 #define HIPFIRE_GFX10_MQ2L_MMQ 1
 #else
 #define HIPFIRE_GFX10_MQ2L_MMQ 0
@@ -46,15 +45,12 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
 ) {}
 #else
 __device__ __forceinline__ int mq2l_lut4(unsigned int pk, int shift, unsigned int cbp) {
-    unsigned int q0 = (pk >> (shift + 0)) & 3u;
-    unsigned int q1 = (pk >> (shift + 2)) & 3u;
-    unsigned int q2 = (pk >> (shift + 4)) & 3u;
-    unsigned int q3 = (pk >> (shift + 6)) & 3u;
-    unsigned int b0 = (cbp >> (q0 * 8)) & 0xFFu;
-    unsigned int b1 = (cbp >> (q1 * 8)) & 0xFFu;
-    unsigned int b2 = (cbp >> (q2 * 8)) & 0xFFu;
-    unsigned int b3 = (cbp >> (q3 * 8)) & 0xFFu;
-    return (int)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+    const unsigned int q = (pk >> shift) & 0xFFu;
+    const unsigned int sel =  (q & 0x03u)
+                           | ((q & 0x0Cu) << 6)
+                           | ((q & 0x30u) << 12)
+                           | ((q & 0xC0u) << 18);
+    return (int)__builtin_amdgcn_perm(cbp, cbp, sel);
 }
 __launch_bounds__(32, 4)
 extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
@@ -70,6 +66,7 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
     const int tile_y = blockIdx.y;
     const int slot_start = tile_y * 16;
     if (row_start >= M || slot_start >= m_total) return;
+    // Host expert_tile_ids remains one entry per 16-slot routing tile.
     const int expert_id = expert_tile_ids[tile_y];
     if (expert_id < 0) return;
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
@@ -78,13 +75,11 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
     const int out_row = row_start + row_local;
     const int safe_row = (out_row < M) ? out_row : (M - 1);
 
-    // Each lane 0..15 is the B-cache owner for one slot in the 16-slot tile.
-    // Lanes 16..31 mirror lanes 0..15 for the same physical slots (wave has
-    // two copies of each lane id under the (tid&15) view).
-    const int b_owner_slot = row_local; // 0..15
+    // Only lanes 0..15 own B-cache entries for the sixteen physical slots.
+    // All row lanes consume them through wave shuffles below.
     int my_x_row = -1;
-    {
-        const int slot_idx = slot_start + b_owner_slot;
+    if (tid < 16) {
+        const int slot_idx = slot_start + tid;
         if (slot_idx < m_total) {
             const int flat = sorted_slot_index[slot_idx];
             if (flat >= 0) {
@@ -117,15 +112,8 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
                          | ((unsigned int)(q1 & 0xFF) << 8)
                          | ((unsigned int)(q2 & 0xFF) << 16)
                          | ((unsigned int)(q3 & 0xFF) << 24);
-        // Preload the whole group's 64 B of 2-bit indices (16 × u32).
-        unsigned int pk_all[16];
-        {
-            const int* pkp = reinterpret_cast<const int*>(gp + 8);
-            #pragma unroll
-            for (int i = 0; i < 16; i++) {
-                pk_all[i] = (unsigned int)pkp[i];
-            }
-        }
+        // Stream the two packed index words needed by each sub-block.
+        const unsigned int* pkp = reinterpret_cast<const unsigned int*>(gp + 8);
         for (int kb_in_group = 0; kb_in_group < 2; kb_in_group++) {
             const int kb_q8 = 2 * g + kb_in_group;
             if (kb_q8 >= blocks128) break;
@@ -150,8 +138,8 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
 
                 // Weight side: decode 32 int8 products from 2 × u32 (ONCE per row).
                 const int pk_base = kb_in_group * 8 + sb * 2;
-                const unsigned int pk0 = pk_all[pk_base + 0];
-                const unsigned int pk1 = pk_all[pk_base + 1];
+                const unsigned int pk0 = pkp[pk_base + 0];
+                const unsigned int pk1 = pkp[pk_base + 1];
                 const int a0 = mq2l_lut4(pk0, 0,  cbp);
                 const int a1 = mq2l_lut4(pk0, 8,  cbp);
                 const int a2 = mq2l_lut4(pk0, 16, cbp);
@@ -161,12 +149,8 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
                 const int a6 = mq2l_lut4(pk1, 16, cbp);
                 const int a7 = mq2l_lut4(pk1, 24, cbp);
 
-                // Dot the SAME weight pack against 8 activation slots via shfl.
-                // Source lane for slot s of this half: (slot_half*8 + s).
-                // Both k_grp halves of the wave hold identical B data for the
-                // same physical slot (lanes 0..15 and 16..31 mirror), so
-                // sourcing from lane 0..15 is always correct.
-                #pragma unroll
+                // Dot the weight pack against eight activation slots.
+                #pragma unroll 4
                 for (int s = 0; s < 8; s++) {
                     const int src = slot_half * 8 + s; // 0..15
                     float d_x = __int_as_float(__shfl(my_dx_bits, src));

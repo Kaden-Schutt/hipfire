@@ -33,6 +33,7 @@ Contributor deltas staged for this release:
 - #513: native Qwen XML tool calls across CLI, daemon, and cached history.
 - #528: DeepSeek V4 DSpark sidecar registration and re-pull discovery.
 - #529: quickstart refresh and historical benchmark labeling.
+- #533: gfx10 SDOT4 MQ2-Lloyd/Q8 batched prefill and byte-exact Redline PM4 decode.
 
 The release also refreshes the Rust and Bun dependency surface, adds standard
 `clap`/`safetensors`/`half`/`tracing` support, introduces Redline property

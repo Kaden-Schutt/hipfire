@@ -4743,6 +4743,12 @@ pub struct Qwen35Scratch {
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
     pub prefill_batch: Option<PrefillBatchScratch>,
+    /// Per-instance cap for the own_pbs prefill chunk allocation. 0 = unset
+    /// (use computed default). If a large max_batch allocation OOMs once, the
+    /// caller stores PREFILL_MAX_BATCH here so subsequent prefill calls on
+    /// THIS model instance skip the doomed large allocation; other model
+    /// instances still retry their own default.
+    pub prefill_batch_cap: std::sync::atomic::AtomicUsize,
 }
 
 impl Qwen35Scratch {
@@ -4897,6 +4903,7 @@ impl Qwen35Scratch {
             moe_topk_weights: None,
             moe_down_expanded: None,
             prefill_batch: None,
+            prefill_batch_cap: std::sync::atomic::AtomicUsize::new(0),
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -5188,9 +5195,6 @@ pub fn forward_scratch(
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
     gpu.replay.set_forward_eligible(graph_eligible);
-    gpu.replay
-        .begin_auto_capture_if_armed()
-        .map_err(|reason| HipError::new(0, reason))?;
     if ar_graph_test && !graph_eligible {
         gpu.graphs.ar_forward_replay_enabled = false;
         gpu.graphs.ar_forward_kernel_dirty = true;
@@ -5221,10 +5225,18 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
+    // The token embedding is intentionally prepared outside Redline replay.
+    // Arm capture only after it so the retained tape cannot overwrite the
+    // per-token scratch.x input with the embedding from the capture token.
+    gpu.replay
+        .begin_auto_capture_if_armed()
+        .map_err(|reason| HipError::new(0, reason))?;
+
     let pos_i32 = pos as i32;
     if gpu.replay.should_route_aql() {
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.hip.device_synchronize()?;
         let replay = unsafe { gpu.replay.replay_linear_aql() };
         return match replay {
             Ok(_) => Ok(()),
@@ -5238,6 +5250,7 @@ pub fn forward_scratch(
     if gpu.replay.should_route_pm4() {
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.hip.device_synchronize()?;
         let replay = unsafe { gpu.replay.replay_pm4(pos) };
         return match replay {
             Ok(_) => Ok(()),
@@ -5841,6 +5854,29 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 
 const MOE_GROUPED_BLOCK_M: usize = 16;
 
+/// Default batched-prefill chunk size for the proven MQ2-Lloyd-on-gfx10
+/// batched MoE path (issue #533): 2048 measured optimal on gfx1030 /
+/// RX 6950 XT. Scoped narrowly — dense / MQ4 / unbenchmarked models keep
+/// the long-standing 256.
+/// `HIPFIRE_PREFILL_MAX_BATCH` overrides unconditionally.
+fn prefill_max_batch_default(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
+    let mq2l_gfx10 = rdna_compute::arch_caps::ArchCaps::arch_has_hfq3_sdot4(&gpu.arch)
+        && weights.layers.iter().any(|lw| {
+        let ffn = match lw {
+            LayerWeights::DeltaNetMoe(l) => Some(&l.ffn),
+            LayerWeights::FullAttnMoe(l) => Some(&l.ffn),
+            _ => None,
+        };
+        ffn.is_some_and(|f| {
+            f.experts.first().is_some_and(|e| {
+                e.gate_up.gpu_dtype == DType::MQ2G256Lloyd
+                    || e.down.gpu_dtype == DType::MQ2G256Lloyd
+            })
+        })
+    });
+    if mq2l_gfx10 { 2048 } else { PREFILL_MAX_BATCH }
+}
+
 #[inline]
 fn prefill_should_emit_last_token_logits(
     has_per_token_hidden_out: bool,
@@ -6288,11 +6324,22 @@ pub fn forward_prefill_batch_with_pbs_opts(
     //
     // Exposed via PREFILL_MAX_BATCH so callers sizing `HiddenStateRingBuffer`
     // staging can match the chunk upper bound.
+    // The 2048 default is scoped to PLAIN prefill (no spec/HRB consumers):
+    // hidden_rb staging is sized by callers against PREFILL_MAX_BATCH, and
+    // tree/gdn flows assert chunks fit that staging. Those paths keep 256.
+    let plain_prefill =
+        hidden_rb.is_none() && tree_verify.is_none() && gdn_tape.is_none();
     let max_batch: usize = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v >= MIN_BATCH)
-        .unwrap_or(PREFILL_MAX_BATCH);
+        .unwrap_or_else(|| {
+            if plain_prefill {
+                prefill_max_batch_default(gpu, weights)
+            } else {
+                PREFILL_MAX_BATCH
+            }
+        });
 
     let n = tokens.len();
     if n == 0 {
@@ -6486,7 +6533,46 @@ pub fn forward_prefill_batch_with_pbs_opts(
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
             None => {
-                own_pbs = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
+                let cap = scratch
+                    .prefill_batch_cap
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let want = if cap >= MIN_BATCH {
+                    max_batch.min(cap)
+                } else {
+                    max_batch
+                };
+                // Only tree-verify consumes the per-token DeltaNet S tapes.
+                // Plain prefill must not reserve their O(max_batch) VRAM.
+                let cap_gdn_tape = tree_verify.is_some();
+                let pbs = match PrefillBatchScratch::new_opt(
+                    gpu,
+                    config,
+                    want,
+                    cap_gdn_tape,
+                ) {
+                    Ok(p) => p,
+                    // Retry at 256 ONLY for HIP out-of-memory; any other
+                    // error (invalid args, kernel/config bug) propagates.
+                    Err(e) if want > PREFILL_MAX_BATCH
+                        && e.message.contains("out of memory") =>
+                    {
+                        eprintln!(
+                            "[prefill] max_batch={want} scratch alloc OOM; downgrading to {PREFILL_MAX_BATCH} for this model instance"
+                        );
+                        scratch.prefill_batch_cap.store(
+                            PREFILL_MAX_BATCH,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        PrefillBatchScratch::new_opt(
+                            gpu,
+                            config,
+                            PREFILL_MAX_BATCH,
+                            cap_gdn_tape,
+                        )?
+                    }
+                    Err(e) => return Err(e),
+                };
+                own_pbs = Some(pbs);
                 own_pbs.as_ref().unwrap()
             }
         };
@@ -7231,16 +7317,7 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) 
 
     // MQ2-Lloyd sdot4 MMQ grouped GEMM on gfx10 (issue #533). Channel-tested
     // via test_mq2g256_lloyd_moe_grouped_mmq_gfx1030 (rms_q8 < 1e-4).
-    let admit_mq2l = matches!(
-        arch,
-        "gfx1010"
-            | "gfx1011"
-            | "gfx1012"
-            | "gfx1013"
-            | "gfx1030"
-            | "gfx1031"
-            | "gfx1032"
-    );
+    let admit_mq2l = rdna_compute::arch_caps::ArchCaps::arch_has_hfq3_sdot4(arch);
     moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro, admit_e8, admit_mq2l)
 }
 

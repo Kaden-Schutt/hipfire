@@ -467,6 +467,46 @@ impl HsaMemoryPool {
     }
 }
 
+const CLANG_OFFLOAD_BUNDLE_MAGIC: &[u8; 24] = b"__CLANG_OFFLOAD_BUNDLE__";
+
+/// Return the AMDGPU code object from a Clang offload bundle. Clang emits the
+/// host object first, so scanning for the first ELF selects the wrong ISA.
+fn amdgpu_code_object<'a>(bytes: &'a [u8], target: &str) -> Option<&'a [u8]> {
+    if bytes.get(..CLANG_OFFLOAD_BUNDLE_MAGIC.len()) != Some(CLANG_OFFLOAD_BUNDLE_MAGIC) {
+        return Some(bytes);
+    }
+    let read_u64 = |offset: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?))
+    };
+    let count = usize::try_from(read_u64(24)?).ok()?;
+    let mut descriptor = 32_usize;
+    for _ in 0..count {
+        let offset = usize::try_from(read_u64(descriptor)?).ok()?;
+        let size = usize::try_from(read_u64(descriptor + 8)?).ok()?;
+        let id_len = usize::try_from(read_u64(descriptor + 16)?).ok()?;
+        let id_start = descriptor.checked_add(24)?;
+        let id_end = id_start.checked_add(id_len)?;
+        let id = bytes.get(id_start..id_end)?;
+        descriptor = id_end;
+        let is_amdgpu = id
+            .windows(b"amdgcn-amd-amdhsa".len())
+            .any(|w| w == b"amdgcn-amd-amdhsa");
+        let is_target = !target.is_empty()
+            && id
+                .windows(target.len())
+                .any(|window| window == target.as_bytes());
+        if !is_amdgpu || !is_target {
+            continue;
+        }
+        let end = offset.checked_add(size)?;
+        let code_object = bytes.get(offset..end)?;
+        if code_object.get(..4) == Some(b"\x7fELF") {
+            return Some(code_object);
+        }
+    }
+    None
+}
+
 // ─── Executable / kernel loading ─────────────────────────────────────────
 
 pub struct HsaExecutable {
@@ -482,18 +522,19 @@ impl HsaExecutable {
     pub fn from_code_object(agent: &HsaAgent, hsaco_bytes: &[u8]) -> HsaResult<Self> {
         let runtime = agent.runtime.clone();
 
-        // Unwrap Clang offload bundle if present.
-        let bytes: &[u8] =
-            if hsaco_bytes.len() > 24 && &hsaco_bytes[0..24] == b"__CLANG_OFFLOAD_BUNDLE__" {
-                const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-                if let Some(pos) = hsaco_bytes.windows(4).position(|w| w == ELF_MAGIC) {
-                    &hsaco_bytes[pos..]
-                } else {
-                    return Err(HsaError::new(0, "clang offload bundle contains no ELF"));
-                }
-            } else {
-                hsaco_bytes
-            };
+        let target = if hsaco_bytes.get(..CLANG_OFFLOAD_BUNDLE_MAGIC.len())
+            == Some(CLANG_OFFLOAD_BUNDLE_MAGIC)
+        {
+            agent.name()?
+        } else {
+            String::new()
+        };
+        let bytes = amdgpu_code_object(hsaco_bytes, &target).ok_or_else(|| {
+            HsaError::new(
+                0,
+                &format!("clang offload bundle contains no AMDGPU code object for {target}"),
+            )
+        })?;
 
         // Create the code object reader.
         let mut reader: HsaCodeObjectReaderHandle = 0;
@@ -728,5 +769,69 @@ pub unsafe fn publish_dispatch_packet(slot: *mut HsaKernelDispatchPacket, header
         fence(Ordering::Release);
         let header_atomic = &*(slot as *const AtomicU16);
         header_atomic.store(header, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::amdgpu_code_object;
+
+    fn append_descriptor(out: &mut Vec<u8>, offset: u64, size: u64, id: &[u8]) {
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&(id.len() as u64).to_le_bytes());
+        out.extend_from_slice(id);
+    }
+
+    #[test]
+    fn clang_bundle_selects_amdgpu_object_not_host_elf() {
+        let host_id = b"host-x86_64-unknown-linux-gnu-";
+        let gpu_id = b"hipv4-amdgcn-amd-amdhsa--gfx1030";
+        let host = b"\x7fELFhost-object";
+        let gpu = b"\x7fELFamdgpu-object";
+        let header_len = 32 + 24 + host_id.len() + 24 + gpu_id.len();
+        let host_offset = header_len as u64;
+        let gpu_offset = host_offset + host.len() as u64;
+        let mut bundle = Vec::new();
+        bundle.extend_from_slice(b"__CLANG_OFFLOAD_BUNDLE__");
+        bundle.extend_from_slice(&2_u64.to_le_bytes());
+        append_descriptor(&mut bundle, host_offset, host.len() as u64, host_id);
+        append_descriptor(&mut bundle, gpu_offset, gpu.len() as u64, gpu_id);
+        bundle.extend_from_slice(host);
+        bundle.extend_from_slice(gpu);
+
+        assert_eq!(
+            amdgpu_code_object(&bundle, "gfx1030"),
+            Some(gpu.as_slice())
+        );
+    }
+
+    #[test]
+    fn clang_bundle_selects_the_requested_amdgpu_target() {
+        let first_id = b"hipv4-amdgcn-amd-amdhsa--gfx1100";
+        let wanted_id = b"hipv4-amdgcn-amd-amdhsa--gfx1030";
+        let first = b"\x7fELFgfx1100-object";
+        let wanted = b"\x7fELFgfx1030-object";
+        let header_len = 32 + 24 + first_id.len() + 24 + wanted_id.len();
+        let first_offset = header_len as u64;
+        let wanted_offset = first_offset + first.len() as u64;
+        let mut bundle = Vec::new();
+        bundle.extend_from_slice(b"__CLANG_OFFLOAD_BUNDLE__");
+        bundle.extend_from_slice(&2_u64.to_le_bytes());
+        append_descriptor(&mut bundle, first_offset, first.len() as u64, first_id);
+        append_descriptor(&mut bundle, wanted_offset, wanted.len() as u64, wanted_id);
+        bundle.extend_from_slice(first);
+        bundle.extend_from_slice(wanted);
+
+        assert_eq!(
+            amdgpu_code_object(&bundle, "gfx1030"),
+            Some(wanted.as_slice())
+        );
+    }
+
+    #[test]
+    fn raw_code_object_is_unchanged() {
+        let elf = b"\x7fELFamdgpu";
+        assert_eq!(amdgpu_code_object(elf, ""), Some(elf.as_slice()));
     }
 }

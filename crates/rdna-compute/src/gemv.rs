@@ -9408,6 +9408,7 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let k_top_val = k_top as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -9416,6 +9417,7 @@ impl Gpu {
             &xrp as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &k_top_val as *const _ as *mut c_void,
         ];
         // MQ2-Lloyd: 72 bytes / 256-weight group.
         let mq2_weight_bytes = m * (k / 256) * 72;
@@ -9428,7 +9430,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
-            [m as u32, k_top as u32, 1],
+            [m as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,
@@ -9441,6 +9443,7 @@ impl Gpu {
                 b.push_ptr(xrp);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(k_top_val);
                 b
             },
         );

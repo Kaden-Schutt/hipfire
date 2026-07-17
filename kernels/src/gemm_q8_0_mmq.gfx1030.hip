@@ -13,7 +13,7 @@
 //   X  : block_q8_1_mmq [K/128 × N] via ensure_q8_1_mmq_x
 //   Y  : FP32 [N, M] row-major
 //
-// v4: 32-row × 64-col tile, 128 threads (4 waves), BOTH operands LDS-staged.
+// v7: 32-row × 128-col tile, 256 threads (8 waves), BOTH operands LDS-staged.
 // v3 widened the column tile but left every lane loading its own row pair,
 // so each weight block was fetched 8× per workgroup (once per slot_oct
 // group) — weight traffic unchanged vs v2. v4 stages the 32 rows' Q8_0
@@ -23,12 +23,12 @@
 //
 // Thread map:
 //   row_local  = tid & 15        → rows row_start + row_local (+16 second row)
-//   slot_oct   = tid >> 4 (0..7) → cols slot_oct*8 .. +7 of the 64-col tile
+//   slot_oct   = tid >> 4 (0..15) → cols slot_oct*8 .. +7 of the 128-col tile
 //
-// Grid: [ceil(M/32), ceil(N/64)]. Block: [128].
-// LDS: B 2 KiB + B scales 256 B + W 1 KiB + W scales 128 B ≈ 3.4 KiB.
+// Grid: [ceil(M/32), ceil(N/128)]. Block: [256].
+// LDS: B/W rows use a 9-dword stride to avoid gfx10 bank aliasing.
 #if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) \
- || defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__)
+ || defined(__gfx1011__) || defined(__gfx1012__)
 #define HIPFIRE_GFX10_Q8_MMQ 1
 #else
 #define HIPFIRE_GFX10_Q8_MMQ 0
@@ -44,7 +44,7 @@ extern "C" __global__ void gemm_q8_0_mmq_gfx1030(
     const unsigned char*, const void*, float*, int, int, int
 ) {}
 #else
-__launch_bounds__(128, 4)
+__launch_bounds__(256, 1)
 extern "C" __global__ void gemm_q8_0_mmq_gfx1030(
     const unsigned char* __restrict__ A_q8, // [M, K/32 * 34]
     const block_q8_1_mmq* __restrict__ Xq,  // [K/128, N]
@@ -53,16 +53,16 @@ extern "C" __global__ void gemm_q8_0_mmq_gfx1030(
 ) {
     const int tid = threadIdx.x;
     const int row_start = (int)blockIdx.x * 32;
-    const int col_start = (int)blockIdx.y * 64;
+    const int col_start = (int)blockIdx.y * 128;
     if (row_start >= M || col_start >= N) return;
     const int row_local = tid & 15;
-    const int slot_oct = tid >> 4; // 0..7 → 8-col group
+    const int slot_oct = tid >> 4; // 0..15 → 8-col group
     const int blocks_per_row = K / 32;
     const int out_row0 = row_start + row_local;
     const int out_row1 = row_start + row_local + 16;
-    __shared__ int   lds_b[64 * 8];   // 64 cols × 32 int8 (as 8 dwords)
-    __shared__ float lds_dx[64];
-    __shared__ int   lds_w[32 * 8];   // 32 rows × 32 int8 (as 8 dwords)
+    __shared__ int   lds_b[128 * 9];  // 128 cols × 8 dwords, padded to 9 banks
+    __shared__ float lds_dx[128];
+    __shared__ int   lds_w[32 * 9];   // 32 rows × 8 dwords, padded to 9 banks
     __shared__ float lds_ws[32];
     float acc0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     float acc1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -90,7 +90,7 @@ extern "C" __global__ void gemm_q8_0_mmq_gfx1030(
                 if (sh == 2) {
                     d8 = (uint32_t)*(const uint16_t*)((const unsigned char*)dw + 32);
                 }
-                int* a = &lds_w[tid * 8];
+                int* a = &lds_w[tid * 9];
                 if (sh == 0) {
                     a[0] = (int)d0; a[1] = (int)d1; a[2] = (int)d2; a[3] = (int)d3;
                     a[4] = (int)d4; a[5] = (int)d5; a[6] = (int)d6; a[7] = (int)d7;
@@ -108,10 +108,10 @@ extern "C" __global__ void gemm_q8_0_mmq_gfx1030(
                 }
                 lds_ws[tid] = (float)(*((const _Float16*)bp));
             }
-            // ── Stage B: 64 cols × 32 int8 + 64 scales with 128 lanes ─────
+            // ── Stage B: 128 cols × 32 int8 + 128 scales with 256 lanes ──
             {
-                const int c = tid & 63;
-                const int quat = tid >> 6; // 0 or 1
+                const int c = tid & 127;
+                const int quat = tid >> 7; // 0 or 1
                 const int col = col_start + c;
                 int v0 = 0, v1 = 0, v2 = 0, v3 = 0;
                 float dx = 0.f;
@@ -125,27 +125,27 @@ extern "C" __global__ void gemm_q8_0_mmq_gfx1030(
                         dx = ds.x;
                     }
                 }
-                int* dst = &lds_b[c * 8 + quat * 4];
+                int* dst = &lds_b[c * 9 + quat * 4];
                 dst[0] = v0; dst[1] = v1; dst[2] = v2; dst[3] = v3;
                 if (quat == 0) lds_dx[c] = dx;
             }
             __syncthreads();
             // ── Compute: 8 cols × 2 rows; W read is an LDS broadcast ─────
-            const int* a0 = &lds_w[row_local * 8];
-            const int* a1 = &lds_w[(row_local + 16) * 8];
+            const int* a0 = &lds_w[row_local * 9];
+            const int* a1 = &lds_w[(row_local + 16) * 9];
             const float wsc0 = lds_ws[row_local];
             const float wsc1 = lds_ws[row_local + 16];
-            #pragma unroll
+            #pragma unroll 1
             for (int s = 0; s < 8; s++) {
                 const int c = slot_oct * 8 + s;
-                const int b0 = lds_b[c * 8 + 0];
-                const int b1 = lds_b[c * 8 + 1];
-                const int b2 = lds_b[c * 8 + 2];
-                const int b3 = lds_b[c * 8 + 3];
-                const int b4 = lds_b[c * 8 + 4];
-                const int b5 = lds_b[c * 8 + 5];
-                const int b6 = lds_b[c * 8 + 6];
-                const int b7 = lds_b[c * 8 + 7];
+                const int b0 = lds_b[c * 9 + 0];
+                const int b1 = lds_b[c * 9 + 1];
+                const int b2 = lds_b[c * 9 + 2];
+                const int b3 = lds_b[c * 9 + 3];
+                const int b4 = lds_b[c * 9 + 4];
+                const int b5 = lds_b[c * 9 + 5];
+                const int b6 = lds_b[c * 9 + 6];
+                const int b7 = lds_b[c * 9 + 7];
                 const float d_x = lds_dx[c];
                 int sumi = 0;
                 sumi = __builtin_amdgcn_sdot4(a0[0], b0, sumi, false);

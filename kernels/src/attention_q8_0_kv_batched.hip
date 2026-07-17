@@ -103,9 +103,20 @@ extern "C" __global__ void attention_q8_0_kv_batched(
                                       + (kv_head_block_start + bi) * 34;
             float d = (float)*((const _Float16*)blk);
             const float* qb = q_shared + bi * 32;
+#if defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__) \
+ || defined(__gfx1013__) || defined(__gfx1030__) || defined(__gfx1031__) \
+ || defined(__gfx1032__)
+            float block_dot = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 32; j++) {
+                block_dot += qb[j] * (float)((signed char)blk[2 + j]);
+            }
+            dot += d * block_dot;
+#else
             for (int j = 0; j < 32; j++) {
                 dot += qb[j] * (d * (float)((signed char)blk[2 + j]));
             }
+#endif
         }
         float s = dot * scale_attn;
         // Tree-attention bias: add per-row mask for keys inside the block.
