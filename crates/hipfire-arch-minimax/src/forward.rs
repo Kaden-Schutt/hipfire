@@ -998,6 +998,11 @@ pub fn forward_batch_supported(weights: &MiniMaxWeights) -> bool {
     })
 }
 
+fn grouped_moe_dtypes_supported(gate_up: DType, down: DType) -> bool {
+    matches!(gate_up, DType::MQ2G256Lloyd)
+        && matches!(down, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd)
+}
+
 /// Batched forward over `B` tokens in ONE pass — the spec-decode VERIFY forward
 /// and fast-prefill keystone. Fills the KV cache for all B positions and returns
 /// the LAST token's logits. Reads each weight matrix ONCE for all B tokens
@@ -1103,16 +1108,21 @@ pub fn forward_batch(
     // runs WMMA, but needs enough rows/expert to be worth the BLOCK_M padding.
     // Gate on chunk size: below MOE_GROUPED_GATE rows the 256 experts get too
     // few rows each to fill a BLOCK_M tile, so the per-token indexed path wins;
-    // at/above it the grouped path is unconditionally faster + coherent
-    // (validated by coherence-gate-minimax.sh).
+    // at/above it the grouped path is faster + coherent for the dtype pairs
+    // with grouped kernels (validated by coherence-gate-minimax.sh). Require
+    // every layer to be eligible before allocating grouped scratch: MiniMax
+    // k-maps can use MQ4 for down even when gate_up is MQ2-Lloyd, and that
+    // combination must retain the indexed path rather than failing mid-pass.
     const MOE_BLOCK_M: usize = 16;
     const MOE_GROUPED_GATE: usize = 256;
     let moe_grouped = b >= MOE_GROUPED_GATE
         && gpu.arch_caps.has_wmma()
-        && matches!(
-            weights.layers[0].experts[0].gate_up.gpu_dtype,
-            DType::MQ2G256Lloyd
-        );
+        && weights.layers.iter().all(|layer| {
+            grouped_moe_dtypes_supported(
+                layer.experts[0].gate_up.gpu_dtype,
+                layer.experts[0].down.gpu_dtype,
+            )
+        });
     // Round the padded-scatter bound UP to a whole number of BLOCK_M tiles.
     // The grouped kernels' grid is ceil(m_total/16) tiles and each tile reads
     // expert_tile_ids[tile_y]; sizing that buffer at `m_total_max / 16`
@@ -1343,7 +1353,7 @@ pub fn forward_batch(
                 other => {
                     return Err(format!(
                         "minimax L{l} grouped down dtype {other:?} unsupported"
-                    ))
+                    ));
                 }
             }
 
@@ -1384,7 +1394,7 @@ pub fn forward_batch(
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: gate_up dtype {other:?} has no batched kernel yet"
-                ))
+                ));
             }
         }
 
@@ -1461,7 +1471,7 @@ pub fn forward_batch(
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: down dtype {other:?} has no batched kernel yet"
-                ))
+                ));
             }
         }
     }
@@ -1653,5 +1663,25 @@ mod ship6_lower_tests {
     fn minimax_program_is_attend_then_moe() {
         let kinds: Vec<_> = minimax_lower_program().iter().map(|o| o.kind).collect();
         assert_eq!(kinds, vec![Attend, Moe]);
+    }
+
+    #[test]
+    fn grouped_moe_accepts_only_implemented_lloyd_pairs() {
+        assert!(grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ2G256Lloyd
+        ));
+        assert!(grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ3G256Lloyd
+        ));
+        assert!(!grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ4G256
+        ));
+        assert!(!grouped_moe_dtypes_supported(
+            DType::MQ4G256,
+            DType::MQ3G256Lloyd
+        ));
     }
 }
