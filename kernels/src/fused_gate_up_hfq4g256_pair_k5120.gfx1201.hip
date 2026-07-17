@@ -17,25 +17,46 @@
 // Twenty HFQ4-G256 groups means five complete quads and no tail machinery.
 // Set HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_PAIR=0 for the one-row control.
 
+#ifndef HIPFIRE_GATE_UP_PAIR_KERNEL
+#define HIPFIRE_GATE_UP_PAIR_KERNEL fused_gate_up_hfq4g256_pair_k5120_global_gfx1201
+#endif
+
+#ifndef HIPFIRE_GATE_UP_PAIR_SKEW
+#define HIPFIRE_GATE_UP_PAIR_SKEW 0
+#endif
+
 __launch_bounds__(32, 16)
-extern "C" __global__ void fused_gate_up_hfq4g256_pair_k5120_global_gfx1201(
+extern "C" __global__ void HIPFIRE_GATE_UP_PAIR_KERNEL(
     const char* __restrict__ A_gate,
     const char* __restrict__ A_up,
     const float* __restrict__ x,
     float* __restrict__ y_gate,
     float* __restrict__ y_up,
     int gate_m, int up_m, int K
+#if HIPFIRE_GATE_UP_PAIR_SKEW
+    , int up_skew
+#endif
 ) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     if (row >= gate_m || row >= up_m) return;
     (void)K;
 
+#if HIPFIRE_GATE_UP_PAIR_SKEW
+    // Pair a gate row with a different up row so the two simultaneous packed
+    // weight streams do not share identical low address bits. This is a pure
+    // execution permutation: every gate/up output row still has one writer.
+    int up_row_index = row + up_skew;
+    if (up_row_index >= up_m) up_row_index -= up_m;
+#else
+    const int up_row_index = row;
+#endif
+
     constexpr int groups_per_row = 20;
     constexpr int group_bytes = 136;
     constexpr int row_bytes = groups_per_row * group_bytes;
     const char* gate_row = A_gate + (long long)row * row_bytes;
-    const char* up_row = A_up + (long long)row * row_bytes;
+    const char* up_row = A_up + (long long)up_row_index * row_bytes;
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
     const auto gate_rsrc = HIPFIRE_WEIGHT_RSRC(gate_row);
@@ -104,6 +125,6 @@ extern "C" __global__ void fused_gate_up_hfq4g256_pair_k5120_global_gfx1201(
     }
     if (tid == 0) {
         y_gate[row] = gacc;
-        y_up[row] = uacc;
+        y_up[up_row_index] = uacc;
     }
 }

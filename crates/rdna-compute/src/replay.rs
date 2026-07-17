@@ -373,6 +373,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "fused_gate_up_hfq4g256"
             | "fused_gate_up_hfq4g256_global_gfx1201"
             | "fused_gate_up_hfq4g256_pair_k5120_global_gfx1201"
+            | "fused_gate_up_hfq4g256_pair_skew_k5120_global_gfx1201"
             | "fused_gate_up_hfq4g256_k1024_gfx1201"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
@@ -699,6 +700,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "fused_gate_up_hfq4g256"
             | "fused_gate_up_hfq4g256_global_gfx1201"
             | "fused_gate_up_hfq4g256_pair_k5120_global_gfx1201"
+            | "fused_gate_up_hfq4g256_pair_skew_k5120_global_gfx1201"
             | "fused_gate_up_hfq4g256_k1024_gfx1201"
     ) {
         return Some(64);
@@ -3050,6 +3052,7 @@ mod tests {
         "fused_qkv_hfq4g256_r2_k5120_global_gfx1201",
         "fused_gate_up_hfq4g256_global_gfx1201",
         "fused_gate_up_hfq4g256_pair_k5120_global_gfx1201",
+        "fused_gate_up_hfq4g256_pair_skew_k5120_global_gfx1201",
         "deinterleave_f32",
         "rmsnorm_f32",
         "rope_partial_halfsplit_f32",
@@ -3561,6 +3564,7 @@ mod tests {
             "fused_gate_up_hfq4g256",
             "fused_gate_up_hfq4g256_global_gfx1201",
             "fused_gate_up_hfq4g256_pair_k5120_global_gfx1201",
+            "fused_gate_up_hfq4g256_pair_skew_k5120_global_gfx1201",
             "fused_gate_up_hfq4g256_k1024_gfx1201",
         ] {
             assert_eq!(expected_kernarg_bytes(kernel), Some(64));

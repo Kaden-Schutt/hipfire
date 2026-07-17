@@ -19008,7 +19008,26 @@ impl Gpu {
                     Some("0" | "off" | "false")
                 )
             });
-        let (func_name, block, grid_x) = if gfx1201_27b_pair {
+        static GFX1201_27B_GATE_UP_SKEW: OnceLock<Option<i32>> = OnceLock::new();
+        let gfx1201_27b_up_skew = if gfx1201_27b_pair {
+            *GFX1201_27B_GATE_UP_SKEW.get_or_init(|| {
+                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_SKEW")
+                    .ok()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .filter(|&v| v > 0 && v < up_m as i32)
+            })
+        } else {
+            None
+        };
+        let (func_name, block, grid_x) = if gfx1201_27b_up_skew.is_some() {
+            let kernel = "fused_gate_up_hfq4g256_pair_skew_k5120_global_gfx1201";
+            self.ensure_kernel(
+                kernel,
+                kernels::FUSED_GATE_UP_HFQ4G256_PAIR_SKEW_K5120_GLOBAL_GFX1201_SRC,
+                kernel,
+            )?;
+            (kernel, [32u32, 1, 1], gate_m as u32)
+        } else if gfx1201_27b_pair {
             let kernel = "fused_gate_up_hfq4g256_pair_k5120_global_gfx1201";
             self.ensure_kernel(
                 kernel,
@@ -19091,6 +19110,7 @@ impl Gpu {
         let gm = gate_m as i32;
         let um = up_m as i32;
         let kv = k as i32;
+        let up_skew = gfx1201_27b_up_skew.unwrap_or(0);
         let mut params: Vec<*mut c_void> = vec![
             &ag as *const _ as *mut c_void,
             &au as *const _ as *mut c_void,
@@ -19101,6 +19121,9 @@ impl Gpu {
             &um as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
         ];
+        if gfx1201_27b_up_skew.is_some() {
+            params.push(&up_skew as *const _ as *mut c_void);
+        }
         self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ag);
@@ -19111,6 +19134,9 @@ impl Gpu {
             b.push_i32(gm);
             b.push_i32(um);
             b.push_i32(kv);
+            if gfx1201_27b_up_skew.is_some() {
+                b.push_i32(up_skew);
+            }
             b
         })
     }
