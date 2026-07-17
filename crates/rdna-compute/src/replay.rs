@@ -551,6 +551,18 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(56),
             write(64),
         ]),
+        "fused_qkvza_hfq4g256_r2_k5120_qkv_gfx1201" => {
+            Some(vec![read(0), read(32), write(40)])
+        }
+        "fused_qkvza_hfq4g256_r2_k5120_zba_gfx1201" => Some(vec![
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(48),
+            write(56),
+            write(64),
+        ]),
         "fused_sigmoid_alpha_gate_f32" => Some(vec![write(0), write(8), read(16), read(24)]),
         "conv1d_silu_split_f32" => Some(vec![
             write(0),
@@ -855,6 +867,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_global_gfx1201"
         | "fused_qkvza_hfq4g256_r2_k5120_global_gfx1201"
+        | "fused_qkvza_hfq4g256_r2_k5120_qkv_gfx1201"
+        | "fused_qkvza_hfq4g256_r2_k5120_zba_gfx1201"
         | "fused_qkvza_hfq4g256_k2048"
         | "fused_qkvza_hfq4g256_k2048_r2"
         | "fused_qkvza_hfq4g256_k2048_cpol_slc"
@@ -3000,6 +3014,8 @@ mod tests {
         "fused_qkvza_hfq4g256",
         "fused_qkvza_hfq4g256_global_gfx1201",
         "fused_qkvza_hfq4g256_r2_k5120_global_gfx1201",
+        "fused_qkvza_hfq4g256_r2_k5120_qkv_gfx1201",
+        "fused_qkvza_hfq4g256_r2_k5120_zba_gfx1201",
         "fused_qkvza_hfq4g256_k2048",
         "fused_qkvza_hfq4g256_k2048_r2",
         "fused_qkvza_hfq4g256_k2048_cpol_slc",
