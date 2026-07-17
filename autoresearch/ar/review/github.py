@@ -878,13 +878,14 @@ class GitHubClient:
         response = self._request("GET", f"/repos/{repository}/collaborators/{quote(login, safe='')}/permission")
         _capability_signal(response, required=("metadata",))
         data = self._require_mapping(response.data, "collaborator permission")
-        self._require(data, ("user", "permissions"), "collaborator permission")
+        self._require(data, ("user",), "collaborator permission")
+        self._require(data["user"], ("permissions",), "collaborator permission")
         principal = self._require(self._require_mapping(data["user"], "collaborator"), ("login", "type"), "collaborator")
         if principal.get("login") != login:
             raise GitHubBoundaryError("collaborator response login does not match requested login")
         if not isinstance(principal["type"], str) or principal["type"] not in _PRINCIPAL_TYPES:
             raise GitHubBoundaryError("collaborator has an unsupported principal type")
-        permissions = self._require_mapping(data["permissions"], "permissions")
+        permissions = self._require_mapping(data["user"]["permissions"], "permissions")
         permission_map = {"admin": "admin", "maintain": "write", "push": "write", "triage": "read", "pull": "read"}
         permission = next((permission_map[name] for name in _PERMISSIONS if permissions.get(name) is True), None)
         if permission is None:
