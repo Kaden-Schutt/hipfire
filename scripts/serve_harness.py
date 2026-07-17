@@ -371,12 +371,14 @@ def main():
     if not args.no_spawn:
         if not spawn_serve(cfg, args.home, args.serve_log):
             sys.exit("serve_harness: serve failed to warm after retries")
-        mtp_head = subprocess.run(f"grep -c 'MTP head loaded' {args.serve_log}", shell=True,
-                                  capture_output=True, text=True).stdout.strip()
-        dflash_head = subprocess.run(f"grep -c 'DFlash draft detected' {args.serve_log}", shell=True,
-                                     capture_output=True, text=True).stdout.strip()
-        print(f"  [serve warm; MTP head loaded lines={mtp_head}; "
-              f"DFlash draft detected lines={dflash_head}]", flush=True)
+        serve_text = open(args.serve_log).read() if os.path.exists(args.serve_log) else ""
+        mtp_head = serve_text.count("MTP head loaded")
+        dflash_head = sum(
+            "DFlash draft loaded" in line or "DFlash draft detected" in line
+            for line in serve_text.splitlines()
+        )
+        print(f"  [serve warm; MTP head load lines={mtp_head}; "
+              f"DFlash draft load lines={dflash_head}]", flush=True)
     run(cfg, args)
     if not args.no_spawn:
         _kill_serve()
