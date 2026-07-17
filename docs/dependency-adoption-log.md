@@ -51,6 +51,13 @@ Implemented by commit `b15e6f884`.
   non-aliasing, kernarg overlap rejection, deterministic ABI hashing, and the
   requirement that arbitrary/truncated ELF input never panics the ROCr metadata
   parser.
+- Extended `proptest` into `CompiledPlan` and replay bindings: generated DAGs
+  preserve dependency order and deterministic fingerprints, semantic changes
+  perturb fingerprints, unordered RAW/WAR/WAW overlaps are rejected until
+  ordered, recorder-owned IDs cannot cross recorder boundaries, cycle-forming
+  back edges are rejected without corrupting the graph, and resource/scalar
+  binding sizes enforce their exact acceptance boundaries. These cases live in
+  `redline-dispatch` only and remain excluded from release artifacts.
 - Centralized `libloading`, `half`, and `safetensors` in
   `[workspace.dependencies]` because each has multiple direct consumers.
 
@@ -75,7 +82,7 @@ Implemented by commit `b15e6f884`.
   example both pass with `safetensors`, `half`, and `tracing` enabled.
 - All three `hipfire-quantize` library tests pass, including exhaustive
   non-NaN F16 decode coverage and the byte-exact encoder regression.
-- All 73 `redline-dispatch` and `redline-rocr` library tests pass with the new
+- All 80 `redline-dispatch` and `redline-rocr` library tests pass with the new
   property cases enabled.
 - The complete `cargo test --lib --workspace --locked` no-GPU CI suite passes.
 - `cargo audit` reports no vulnerabilities in the 277-package resolved graph.

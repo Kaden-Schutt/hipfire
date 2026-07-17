@@ -357,3 +357,114 @@ pub enum ReplayBindingError {
         actual: usize,
     },
 }
+
+#[cfg(test)]
+mod property_tests {
+    use std::num::NonZeroUsize;
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::{Access, CompileOptions, Dim3, KernelArg, KernelLaunch, Recorder, ReplayMode};
+
+    fn bound_plan(
+        resource_size: u64,
+        scalar_size: u32,
+    ) -> (CompiledPlan, ResourceId, ScalarSlotId) {
+        let mut recorder = Recorder::new();
+        let resource = recorder
+            .resource("activation", resource_size)
+            .expect("valid resource");
+        let region = recorder
+            .region(resource, 0, resource_size)
+            .expect("valid region");
+        let slot = ScalarSlotId::new(7);
+        let launch = KernelLaunch::new(
+            "bound-kernel",
+            Dim3::x(1).expect("valid grid"),
+            Dim3::x(1).expect("valid block"),
+        )
+        .expect("valid launch")
+        .with_arguments([KernelArg::scalar_slot(slot, scalar_size).expect("valid scalar slot")]);
+        recorder
+            .dispatch(launch, [Access::read(region)])
+            .expect("valid dispatch");
+        let plan = recorder
+            .compile(CompileOptions::new(
+                NonZeroUsize::MIN,
+                ReplayMode::TokenLatency,
+            ))
+            .expect("valid plan");
+        (plan, resource, slot)
+    }
+
+    fn external_binding(storage: &mut [u8]) -> ResourceBinding {
+        // Validation only inspects the live allocation's address and extent;
+        // these tests never submit the host allocation for GPU replay.
+        unsafe {
+            ResourceBinding::new(
+                storage.as_mut_ptr().cast(),
+                storage.len() as u64,
+                BindingRevision(1),
+                AllocationPolicy::External,
+            )
+        }
+        .expect("non-empty live allocation")
+    }
+
+    proptest! {
+        #[test]
+        fn resource_binding_extent_is_an_exact_boundary(
+            required in 1_u64..8_192,
+            bound in 1_u64..8_192,
+            scalar_size in 1_u32..65,
+        ) {
+            let (plan, resource, slot) = bound_plan(required, scalar_size);
+            let mut storage = vec![0_u8; bound as usize];
+            let mut bindings = ReplayBindings::new();
+            bindings.bind_resource(resource, external_binding(&mut storage));
+            bindings.bind_scalar(slot, vec![0_u8; scalar_size as usize]);
+
+            let result = bindings.validate(&plan);
+            if bound >= required {
+                prop_assert_eq!(result, Ok(()));
+            } else {
+                prop_assert_eq!(
+                    result,
+                    Err(ReplayBindingError::ResourceTooSmall {
+                        resource,
+                        required,
+                        bound,
+                    }),
+                );
+            }
+        }
+
+        #[test]
+        fn scalar_binding_size_is_an_exact_boundary(
+            resource_size in 1_u64..8_192,
+            expected in 1_u32..65,
+            actual in 0_usize..96,
+        ) {
+            let (plan, resource, slot) = bound_plan(resource_size, expected);
+            let mut storage = vec![0_u8; resource_size as usize];
+            let mut bindings = ReplayBindings::new();
+            bindings.bind_resource(resource, external_binding(&mut storage));
+            bindings.bind_scalar(slot, vec![0_u8; actual]);
+
+            let result = bindings.validate(&plan);
+            if actual == expected as usize {
+                prop_assert_eq!(result, Ok(()));
+            } else {
+                prop_assert_eq!(
+                    result,
+                    Err(ReplayBindingError::ScalarSize {
+                        slot,
+                        expected,
+                        actual,
+                    }),
+                );
+            }
+        }
+    }
+}

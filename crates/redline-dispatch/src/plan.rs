@@ -615,3 +615,218 @@ impl CompileError {
         }
     }
 }
+
+#[cfg(test)]
+mod property_tests {
+    use std::num::{NonZeroU32, NonZeroUsize};
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::{Access, Dim3, RecordError};
+
+    fn launch(kernel: impl Into<String>, estimated_work: u32) -> KernelLaunch {
+        KernelLaunch::new(
+            kernel.into(),
+            Dim3::x(1).expect("valid grid"),
+            Dim3::x(1).expect("valid block"),
+        )
+        .expect("non-empty kernel")
+        .with_estimated_work(NonZeroU32::new(estimated_work).expect("nonzero work"))
+    }
+
+    fn options(lane_count: usize) -> CompileOptions {
+        CompileOptions::new(
+            NonZeroUsize::new(lane_count).expect("nonzero lane count"),
+            ReplayMode::TokenLatency,
+        )
+    }
+
+    fn single_dispatch_plan(estimated_work: u32, lane_count: usize) -> CompiledPlan {
+        let mut recorder = Recorder::new();
+        let resource = recorder
+            .resource("activation", 4_096)
+            .expect("valid resource");
+        let region = recorder.region(resource, 128, 1_024).expect("valid region");
+        let launch = launch("project", estimated_work)
+            .with_arguments([KernelArg::scalar(vec![3_u8, 1, 4, 1])]);
+        recorder
+            .dispatch(launch, [Access::read(region)])
+            .expect("valid dispatch");
+        recorder.compile(options(lane_count)).expect("valid plan")
+    }
+
+    proptest! {
+        #[test]
+        fn generated_dags_compile_in_dependency_order(
+            node_count in 1_usize..24,
+            edge_seeds in prop::collection::vec((0_usize..24, 0_usize..24), 0..96),
+            lane_count in 1_usize..5,
+        ) {
+            let mut recorder = Recorder::new();
+            let mut nodes = Vec::with_capacity(node_count);
+            for index in 0..node_count {
+                nodes.push(
+                    recorder
+                        .dispatch(launch(format!("node-{index}"), 1), [])
+                        .expect("valid dispatch"),
+                );
+            }
+
+            let mut edges = BTreeSet::new();
+            for (first, second) in edge_seeds {
+                let first = first % node_count;
+                let second = second % node_count;
+                if first < second && edges.insert((first, second)) {
+                    recorder
+                        .depends_on(nodes[second], nodes[first])
+                        .expect("forward edge cannot create a cycle");
+                }
+            }
+
+            let first = recorder.compile(options(lane_count)).expect("valid DAG");
+            let second = recorder.compile(options(lane_count)).expect("repeat compile");
+            prop_assert_eq!(&first, &second);
+
+            let mut positions = vec![0_usize; node_count];
+            for (position, dispatch) in first.dispatches().iter().enumerate() {
+                positions[dispatch.node().index() as usize] = position;
+                for dependency in dispatch.dependencies() {
+                    prop_assert!(positions[dependency.index() as usize] < position);
+                }
+            }
+            for (prerequisite, dependent) in edges {
+                prop_assert!(positions[prerequisite] < positions[dependent]);
+            }
+        }
+
+        #[test]
+        fn plan_fingerprints_ignore_recorder_identity_but_track_semantics(
+            estimated_work in 1_u32..u32::MAX,
+            lane_count in 1_usize..5,
+        ) {
+            let first = single_dispatch_plan(estimated_work, lane_count);
+            let equivalent = single_dispatch_plan(estimated_work, lane_count);
+            let changed = single_dispatch_plan(estimated_work + 1, lane_count);
+
+            prop_assert_eq!(first.fingerprint(), equivalent.fingerprint());
+            prop_assert_ne!(first.fingerprint(), changed.fingerprint());
+        }
+
+        #[test]
+        fn unordered_overlaps_are_hazards_until_ordered(
+            first_offset in 0_u64..4_096,
+            first_len in 1_u64..256,
+            overlap_seed in 0_u64..256,
+            second_len in 1_u64..256,
+            access_pair in 0_u8..3,
+        ) {
+            let second_offset = first_offset + overlap_seed % first_len;
+            let resource_size = (first_offset + first_len).max(second_offset + second_len);
+            let mut recorder = Recorder::new();
+            let resource = recorder
+                .resource("shared", resource_size)
+                .expect("valid resource");
+            let first_region = recorder
+                .region(resource, first_offset, first_len)
+                .expect("valid first region");
+            let second_region = recorder
+                .region(resource, second_offset, second_len)
+                .expect("valid second region");
+            let (first_access, second_access, kind) = match access_pair {
+                0 => (
+                    Access::write(first_region),
+                    Access::read(second_region),
+                    HazardKind::ReadAfterWrite,
+                ),
+                1 => (
+                    Access::read(first_region),
+                    Access::write(second_region),
+                    HazardKind::WriteAfterRead,
+                ),
+                _ => (
+                    Access::write(first_region),
+                    Access::write(second_region),
+                    HazardKind::WriteAfterWrite,
+                ),
+            };
+            let first = recorder
+                .dispatch(launch("first", 1), [first_access])
+                .expect("valid first dispatch");
+            let second = recorder
+                .dispatch(launch("second", 1), [second_access])
+                .expect("valid second dispatch");
+
+            let error = recorder.compile(options(2)).expect_err("unordered hazard");
+            let hazards = error.hazards();
+            prop_assert_eq!(hazards.len(), 1);
+            prop_assert_eq!(hazards[0].first, first);
+            prop_assert_eq!(hazards[0].second, second);
+            prop_assert_eq!(hazards[0].kind, kind);
+            prop_assert_eq!(hazards[0].overlap, first_region.intersection(second_region).unwrap());
+
+            recorder
+                .depends_on(second, first)
+                .expect("ordering resolves the hazard");
+            prop_assert!(recorder.compile(options(2)).is_ok());
+        }
+
+        #[test]
+        fn recorder_ownership_is_never_interchangeable(resource_size in 1_u64..65_536) {
+            let mut first = Recorder::new();
+            let first_resource = first
+                .resource("first", resource_size)
+                .expect("valid first resource");
+            let first_node = first
+                .dispatch(launch("first", 1), [])
+                .expect("valid first node");
+
+            let mut second = Recorder::new();
+            let second_node = second
+                .dispatch(launch("second", 1), [])
+                .expect("valid second node");
+
+            let region_error = second
+                .region(first_resource, 0, resource_size)
+                .expect_err("foreign resource");
+            assert!(matches!(
+                region_error,
+                RecordError::ForeignResource(resource) if resource == first_resource
+            ));
+
+            let node_error = second
+                .depends_on(second_node, first_node)
+                .err()
+                .expect("foreign prerequisite");
+            assert!(matches!(
+                node_error,
+                RecordError::ForeignNode(node) if node == first_node
+            ));
+        }
+
+        #[test]
+        fn generated_dependency_chains_reject_back_edges(node_count in 2_usize..32) {
+            let mut recorder = Recorder::new();
+            let mut nodes = Vec::with_capacity(node_count);
+            for index in 0..node_count {
+                nodes.push(
+                    recorder
+                        .dispatch(launch(format!("chain-{index}"), 1), [])
+                        .expect("valid dispatch"),
+                );
+            }
+            for index in 1..node_count {
+                recorder
+                    .depends_on(nodes[index], nodes[index - 1])
+                    .expect("valid chain edge");
+            }
+
+            let error = recorder
+                .depends_on(nodes[0], nodes[node_count - 1])
+                .err()
+                .expect("back edge creates a cycle");
+            assert!(matches!(error, RecordError::DependencyCycle { .. }));
+            prop_assert!(recorder.compile(options(1)).is_ok());
+        }
+    }
+}
