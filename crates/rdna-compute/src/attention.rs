@@ -6284,6 +6284,107 @@ impl Gpu {
         }
     }
 
+    /// DFlash causal sliding-window attention over persistent post-RoPE
+    /// context K/V plus the current noise block. Unlike `attention_dflash_f32`,
+    /// this path needs no context concat and enforces the Qwen3.6 per-layer SWA
+    /// contract from absolute position buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dflash_swa_f32(
+        &mut self,
+        q: &GpuTensor,
+        k_ctx: &GpuTensor,
+        v_ctx: &GpuTensor,
+        k_noise: &GpuTensor,
+        v_noise: &GpuTensor,
+        positions_q: &GpuTensor,
+        positions_ctx: &GpuTensor,
+        out: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_dflash_swa_f32",
+            kernels::ATTENTION_DFLASH_SRC,
+            "attention_dflash_swa_f32",
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let active_len = l.min(window) + b;
+        let block_size = std::cmp::min(256, std::cmp::max(active_len, head_dim)) as u32;
+        let block_size = block_size.next_power_of_two();
+        const LDS_BUDGET_F32: usize = 14_336;
+        let fixed = block_size as usize + head_dim;
+        let tile_size = active_len
+            .max(1)
+            .min(LDS_BUDGET_F32.saturating_sub(fixed).max(1));
+        let mut qp = q.buf.as_ptr();
+        let mut kcp = k_ctx.buf.as_ptr();
+        let mut vcp = v_ctx.buf.as_ptr();
+        let mut knp = k_noise.buf.as_ptr();
+        let mut vnp = v_noise.buf.as_ptr();
+        let mut pqp = positions_q.buf.as_ptr();
+        let mut pcp = positions_ctx.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut wn = window as i32;
+        let mut ts = tile_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kcp as *mut _ as *mut c_void,
+            &mut vcp as *mut _ as *mut c_void,
+            &mut knp as *mut _ as *mut c_void,
+            &mut vnp as *mut _ as *mut c_void,
+            &mut pqp as *mut _ as *mut c_void,
+            &mut pcp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
+            &mut ts as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((tile_size + block_size as usize + head_dim) * 4) as u32;
+        self.launch_maybe_blob(
+            "attention_dflash_swa_f32",
+            [n_heads as u32, b as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut args = hip_bridge::KernargBlob::new();
+                args.push_ptr(qp);
+                args.push_ptr(kcp);
+                args.push_ptr(vcp);
+                args.push_ptr(knp);
+                args.push_ptr(vnp);
+                args.push_ptr(pqp);
+                args.push_ptr(pcp);
+                args.push_ptr(op);
+                args.push_i32(bi);
+                args.push_i32(li);
+                args.push_i32(nh);
+                args.push_i32(nkv);
+                args.push_i32(hd);
+                args.push_f32(sc);
+                args.push_i32(wn);
+                args.push_i32(ts);
+                args
+            },
+        )
+    }
+
     /// WMMA-accelerated FlashAttention-style non-causal attention for
     /// the **large-B / large-L** case. Same Q/K/V layout and contract as
     /// [`Self::attention_dflash_f32`] — drop-in replacement.

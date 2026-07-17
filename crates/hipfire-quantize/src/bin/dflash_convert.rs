@@ -694,6 +694,8 @@ fn main() {
             "intermediate_size": intermediate_size,
             "rms_norm_eps": config.get("rms_norm_eps").cloned().unwrap_or_else(|| serde_json::Value::from(1e-6)),
             "rope_theta": config.get("rope_theta").cloned().unwrap_or_else(|| serde_json::Value::from(10_000_000.0)),
+            "sliding_window": config.get("sliding_window").cloned(),
+            "layer_types": config.get("layer_types").cloned(),
             "vocab_size": config.get("vocab_size").cloned(),
             "draft_dtype": draft_dtype,
         },

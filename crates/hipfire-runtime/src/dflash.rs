@@ -14,7 +14,9 @@
 //! reference and lets a single tokenizer / embedding table be shared.
 //!
 //! Architectural notes:
-//! - 5-layer Qwen3 decoder, all full attention, non-causal.
+//! - Qwen3.5/3.6 drafters may interleave causal sliding-window attention
+//!   with full non-causal attention. The exact per-layer pattern is read from
+//!   the draft checkpoint metadata (older checkpoints default to all-full).
 //! - Per-layer cross-attention over `target_hidden` (the projected
 //!   concatenation of hidden states from a configured set of target
 //!   layers, default `[1, 8, 15, 22, 29]` for a 32-layer target).
@@ -48,6 +50,12 @@ const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DflashAttentionKind {
+    Full,
+    Sliding { window: usize },
+}
+
 #[derive(Debug, Clone)]
 pub struct DflashConfig {
     pub n_layers: usize,
@@ -63,6 +71,7 @@ pub struct DflashConfig {
     pub mask_token_id: u32,
     pub target_layer_ids: Vec<usize>,
     pub num_target_layers: usize,
+    pub layer_attention: Vec<DflashAttentionKind>,
 }
 
 impl DflashConfig {
@@ -79,11 +88,27 @@ impl DflashConfig {
         self.n_heads * self.head_dim
     }
 
+    pub fn attention_kind(&self, layer: usize) -> &DflashAttentionKind {
+        self.layer_attention
+            .get(layer)
+            .unwrap_or(&DflashAttentionKind::Full)
+    }
+
     /// Parse from an HFQ file's metadata JSON. Expects the top-level
     /// `dflash` object written by `dflash_convert`.
     pub fn from_hfq(hfq: &HfqFile) -> Option<Self> {
         let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
+        Self::from_metadata(&meta)
+    }
+
+    fn from_metadata(meta: &serde_json::Value) -> Option<Self> {
         let df = meta.get("dflash")?;
+        // `dflash_convert` has always retained the complete upstream config in
+        // metadata.config. New files also copy the attention fields into the
+        // compact metadata.dflash object. Read compact-first, then fall back to
+        // the embedded upstream config so existing Qwen3.6 HFQs gain SWA without
+        // requiring a destructive/reproducibility-breaking reconversion.
+        let upstream = meta.get("config");
 
         let n_layers = df.get("num_hidden_layers").and_then(|v| v.as_u64())? as usize;
         let hidden = df.get("hidden_size").and_then(|v| v.as_u64())? as usize;
@@ -112,6 +137,32 @@ impl DflashConfig {
             .filter_map(|v| v.as_u64().map(|x| x as usize))
             .collect();
         let num_target_layers = df.get("num_target_layers").and_then(|v| v.as_u64())? as usize;
+        let sliding_window = df
+            .get("sliding_window")
+            .or_else(|| upstream.and_then(|c| c.get("sliding_window")))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let layer_types = df
+            .get("layer_types")
+            .or_else(|| upstream.and_then(|c| c.get("layer_types")))
+            .and_then(|v| v.as_array());
+        let layer_attention = match layer_types {
+            Some(types) if types.len() == n_layers => {
+                let mut out = Vec::with_capacity(n_layers);
+                for ty in types {
+                    match ty.as_str()? {
+                        "full_attention" => out.push(DflashAttentionKind::Full),
+                        "sliding_attention" => out.push(DflashAttentionKind::Sliding {
+                            window: sliding_window?,
+                        }),
+                        _ => return None,
+                    }
+                }
+                out
+            }
+            Some(_) => return None,
+            None => vec![DflashAttentionKind::Full; n_layers],
+        };
 
         Some(DflashConfig {
             n_layers,
@@ -127,6 +178,7 @@ impl DflashConfig {
             mask_token_id,
             target_layer_ids,
             num_target_layers,
+            layer_attention,
         })
     }
 }
@@ -636,7 +688,7 @@ pub struct DflashScratch {
     pub thlog: TargetHiddenLog,
 
     /// Per-layer cache of `k_ctx` and `v_ctx` (post-GEMM-of-target_hidden_proj,
-    /// K additionally post-RMSNorm-via-k_norm, both pre-RoPE). Filled
+    /// K additionally post-RMSNorm and post-RoPE). Filled
     /// incrementally as draft_forward sees new target_hidden rows.
     ///
     /// The win: without this cache, each `draft_forward` call re-ran 2
@@ -652,7 +704,7 @@ pub struct DflashScratch {
     /// Shapes: each entry is `[max_ctx, kv_dim]` f32.
     /// The valid extent of these caches (rows `[0..thlog.proj_cached_rows())`
     /// have finished fc + hidden_norm projection, per-layer wk/wv GEMMs, and
-    /// k_norm; still pre-RoPE). Tracked by `thlog` so it stays consistent with
+    /// k_norm + RoPE). Tracked by `thlog` so it stays consistent with
     /// the upload watermark.
     pub k_ctx_cached: Vec<GpuTensor>,
     pub v_ctx_cached: Vec<GpuTensor>,
@@ -719,7 +771,7 @@ impl DflashScratch {
             None
         };
 
-        // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
+        // Per-layer cache buffers for k_ctx/v_ctx (post-norm/post-RoPE for K).
         // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
         // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
         // = 128 MB. Trivial vs 24 GB VRAM.
@@ -1230,7 +1282,6 @@ pub fn draft_forward_opts(
     let tot = l + b;
     let h = cfg.hidden;
     let ne = cfg.num_extract();
-    let qd = cfg.q_dim();
     let kvd = cfg.kv_dim();
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
@@ -1285,6 +1336,10 @@ pub fn draft_forward_opts(
         }
         // prev == l: nothing new to upload (wouldn't happen in practice
         // since caller always appends, but harmless).
+        // A host-provided target-hidden slice is the diagnostic moving-window
+        // path. Its row zero can change even when its length does not, so an
+        // append-only projection watermark is not valid for it.
+        scratch.thlog.invalidate_proj_cache();
     }
     upload_slice_i32(gpu, &scratch.positions_q, positions_q)?;
     upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
@@ -1406,11 +1461,12 @@ pub fn draft_forward_opts(
         // accepted-context rows of target_hidden_proj. INCREMENTAL PATH:
         // only rows [cached_rows..L) need projection; rows [0..cached_rows)
         // were projected in a prior call and stored in the per-layer
-        // k_ctx_cached / v_ctx_cached buffers (post-k_norm for K).
+        // k_ctx_cached / v_ctx_cached buffers (post-k_norm + post-RoPE for K).
         //
         // If delta > 0, run wk/wv on the delta slice of target_hidden_proj
         // and write into the tail of the per-layer cache. Then run k_norm
-        // on those same delta rows (per-head) in-place on the cache.
+        // on those same delta rows (per-head) in-place on the cache, then apply
+        // RoPE once at insertion time. Context K is never re-rotated per cycle.
         //
         // For correctness note: the per-head K RMSNorm is row-local
         // (normalizes each kv_head row of size hd independently), so
@@ -1452,6 +1508,17 @@ pub fn draft_forward_opts(
                 hd,
                 eps,
             )?;
+            let pos_delta = scratch.positions_k.sub_offset(cached_rows, delta);
+            gpu.rope_batched_f32(
+                &scratch.q, // ignored because n_heads_q = 0
+                &k_slot,
+                &pos_delta,
+                0,
+                cfg.n_kv_heads,
+                hd,
+                theta,
+                delta,
+            )?;
         }
 
         if let Some(t) = t0 {
@@ -1464,30 +1531,6 @@ pub fn draft_forward_opts(
             None
         };
 
-        // Concat K = [K_ctx_cached | K_noise] → k_cat [L + B, kv_dim].
-        // The cached K prefix is already post-k_norm (applied incrementally
-        // above); the noise tail still needs k_norm applied below.
-        let ctx_bytes = (l * kvd) * 4;
-        let noise_bytes = (b * kvd) * 4;
-        gpu.hip
-            .memcpy_dtod_at(&scratch.k_cat.buf, 0, &k_cache_layer.buf, 0, ctx_bytes)?;
-        gpu.hip.memcpy_dtod_at(
-            &scratch.k_cat.buf,
-            ctx_bytes,
-            &scratch.k_noise.buf,
-            0,
-            noise_bytes,
-        )?;
-        gpu.hip
-            .memcpy_dtod_at(&scratch.v_cat.buf, 0, &v_cache_layer.buf, 0, ctx_bytes)?;
-        gpu.hip.memcpy_dtod_at(
-            &scratch.v_cat.buf,
-            ctx_bytes,
-            &scratch.v_noise.buf,
-            0,
-            noise_bytes,
-        )?;
-
         // Per-head RMSNorm on Q: each of B*n_heads rows, size head_dim,
         // weight [head_dim].
         gpu.rmsnorm_batched(
@@ -1498,47 +1541,28 @@ pub fn draft_forward_opts(
             hd,
             eps,
         )?;
-        // Per-head RMSNorm on the NOISE tail of K_cat only — the cached
-        // prefix was already normed when it was inserted into the layer's
-        // k_ctx_cached. batch = B × n_kv_heads, applied to the last B rows
-        // of k_cat.
-        {
-            let noise_slot = scratch.k_cat.sub_offset(l * kvd, b * kvd);
-            gpu.rmsnorm_batched(
-                &noise_slot,
-                &layer.k_norm,
-                &noise_slot,
-                b * cfg.n_kv_heads,
-                hd,
-                eps,
-            )?;
-        }
+        // K-noise is transient: normalize and RoPE it once in its own buffer.
+        gpu.rmsnorm_batched(
+            &scratch.k_noise,
+            &layer.k_norm,
+            &scratch.k_noise,
+            b * cfg.n_kv_heads,
+            hd,
+            eps,
+        )?;
 
-        // RoPE. rope_batched_f32 expects q and k at the SAME batch size,
-        // rotating at per-row positions. We call it twice with a zero
-        // "head count" on the inactive tensor so its loop doesn't execute.
-        // Call 1: rotate Q with positions_q. Pass k as a valid buffer
-        // (scratch.k_noise is shape-compatible; n_heads_k=0 skips its loop).
+        // Q and noise K share the same B absolute positions, so rotate both in
+        // one launch. Context K was rotated only when its delta entered the
+        // persistent per-layer cache above.
         gpu.rope_batched_f32(
             &scratch.q,
-            &scratch.k_noise,     // ignored because n_heads_k = 0
+            &scratch.k_noise,
             &scratch.positions_q, // [B]
             cfg.n_heads,
-            0,
-            hd,
-            theta,
-            b,
-        )?;
-        // Call 2: rotate K_cat with positions_k. n_heads_q = 0 skips Q.
-        gpu.rope_batched_f32(
-            &scratch.q, // ignored because n_heads_q = 0
-            &scratch.k_cat,
-            &scratch.positions_k, // [L + B]
-            0,
             cfg.n_kv_heads,
             hd,
             theta,
-            tot,
+            b,
         )?;
 
         if let Some(t) = t1 {
@@ -1551,35 +1575,71 @@ pub fn draft_forward_opts(
             None
         };
 
-        // Attention: Q [B, n_heads, hd] × K [tot, n_kv_heads, hd]^T → scores
-        // (with GQA expansion) → softmax → @V.
-        // Dispatched via unified full-attention path (AttnFullF32 → DflashScalar).
-        // NOTE: adding a WMMA rung here changes spec-decode numerics → draft logits
-        // → acceptance patterns. Any future WMMA draft rung requires a dedicated
-        // feedback_attention_precision sweep with acceptance-rate tracking.
-        {
-            use crate::llama::{attention_family, DispatchCtx, FullAttnParams, KernelKey};
-            let ctx = DispatchCtx::new(gpu);
-            let family = attention_family();
-            family
-                .run_full_attention(
-                    &ctx,
-                    gpu,
-                    &FullAttnParams {
-                        key: KernelKey::AttnFullF32,
-                        q: &scratch.q,
-                        k: &scratch.k_cat,
-                        v: &scratch.v_cat,
-                        out: &scratch.attn_out,
-                        n: b,
-                        seq_len: tot,
-                        n_heads: cfg.n_heads,
-                        n_kv_heads: cfg.n_kv_heads,
-                        head_dim: hd,
-                    },
-                )
-                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        };
+        match cfg.attention_kind(li) {
+            DflashAttentionKind::Sliding { window } => {
+                gpu.attention_dflash_swa_f32(
+                    &scratch.q,
+                    k_cache_layer,
+                    v_cache_layer,
+                    &scratch.k_noise,
+                    &scratch.v_noise,
+                    &scratch.positions_q,
+                    &scratch.positions_k,
+                    &scratch.attn_out,
+                    b,
+                    l,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    hd,
+                    *window,
+                )?;
+            }
+            DflashAttentionKind::Full => {
+                // The final full/non-causal layer keeps the existing optimized
+                // WMMA family. Only this layer pays concat, and both K sources
+                // are already post-RoPE.
+                let ctx_bytes = (l * kvd) * 4;
+                let noise_bytes = (b * kvd) * 4;
+                gpu.hip
+                    .memcpy_dtod_at(&scratch.k_cat.buf, 0, &k_cache_layer.buf, 0, ctx_bytes)?;
+                gpu.hip.memcpy_dtod_at(
+                    &scratch.k_cat.buf,
+                    ctx_bytes,
+                    &scratch.k_noise.buf,
+                    0,
+                    noise_bytes,
+                )?;
+                gpu.hip
+                    .memcpy_dtod_at(&scratch.v_cat.buf, 0, &v_cache_layer.buf, 0, ctx_bytes)?;
+                gpu.hip.memcpy_dtod_at(
+                    &scratch.v_cat.buf,
+                    ctx_bytes,
+                    &scratch.v_noise.buf,
+                    0,
+                    noise_bytes,
+                )?;
+                use crate::llama::{attention_family, DispatchCtx, FullAttnParams, KernelKey};
+                let ctx = DispatchCtx::new(gpu);
+                attention_family()
+                    .run_full_attention(
+                        &ctx,
+                        gpu,
+                        &FullAttnParams {
+                            key: KernelKey::AttnFullF32,
+                            q: &scratch.q,
+                            k: &scratch.k_cat,
+                            v: &scratch.v_cat,
+                            out: &scratch.attn_out,
+                            n: b,
+                            seq_len: tot,
+                            n_heads: cfg.n_heads,
+                            n_kv_heads: cfg.n_kv_heads,
+                            head_dim: hd,
+                        },
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            }
+        }
         if let Some(t) = t2 {
             gpu.hip.device_synchronize()?;
             us_attn_kernel += t.elapsed().as_micros();
@@ -1636,8 +1696,87 @@ pub fn draft_forward_opts(
     // ── 4. Advance the draft-ctx projection cache pointer ────────────────
     // All rows [0..l) of target_hidden_proj and every layer's
     // k_ctx_cached / v_ctx_cached now contain finalized per-layer
-    // projections. Next call's delta starts from here.
+    // projections (K is post-RoPE). Next call's delta starts from here.
     scratch.thlog.mark_proj_cached(l);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DflashAttentionKind, DflashConfig};
+    use serde_json::{json, Value};
+
+    fn metadata(config: Value) -> Value {
+        json!({
+            "dflash": {
+                "num_hidden_layers": 5,
+                "hidden_size": 1024,
+                "intermediate_size": 3072,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 128,
+                "vocab_size": 248320,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 10000000.0,
+                "block_size": 16,
+                "mask_token_id": 248044,
+                "target_layer_ids": [7, 15, 23, 31, 39],
+                "num_target_layers": 40
+            },
+            "config": config
+        })
+    }
+
+    #[test]
+    fn parses_qwen36_attention_contract_from_embedded_config() {
+        let meta = metadata(json!({
+            "sliding_window": 2048,
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention"
+            ]
+        }));
+        let cfg = DflashConfig::from_metadata(&meta).expect("valid Qwen3.6 DFlash metadata");
+        assert_eq!(
+            cfg.layer_attention,
+            vec![
+                DflashAttentionKind::Sliding { window: 2048 },
+                DflashAttentionKind::Sliding { window: 2048 },
+                DflashAttentionKind::Sliding { window: 2048 },
+                DflashAttentionKind::Sliding { window: 2048 },
+                DflashAttentionKind::Full,
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_remains_all_full_attention() {
+        let cfg = DflashConfig::from_metadata(&metadata(json!({})))
+            .expect("legacy metadata remains supported");
+        assert_eq!(cfg.layer_attention, vec![DflashAttentionKind::Full; 5]);
+    }
+
+    #[test]
+    fn malformed_attention_contract_is_rejected() {
+        let wrong_layer_count = metadata(json!({
+            "sliding_window": 2048,
+            "layer_types": ["sliding_attention", "full_attention"]
+        }));
+        assert!(DflashConfig::from_metadata(&wrong_layer_count).is_none());
+
+        let missing_window = metadata(json!({
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention"
+            ]
+        }));
+        assert!(DflashConfig::from_metadata(&missing_window).is_none());
+    }
 }

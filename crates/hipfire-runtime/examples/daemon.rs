@@ -4779,6 +4779,27 @@ fn plan_prompt_cache(
             asst_turn_cache.get(&fp).cloned()
         },
     );
+    plan_prompt_cache_from_rendered(
+        rendered,
+        conversation_tokens,
+        eviction_is_none,
+        cache_disabled,
+        dflash_ckpt_positions,
+        resume_enabled,
+    )
+}
+
+/// Shared LCP/checkpoint half of the prompt-cache planner. Both Plain/ChatML
+/// and Jinja renderers feed their canonical token stream here so cache policy
+/// cannot drift between normal AR and DFlash.
+fn plan_prompt_cache_from_rendered(
+    rendered: Vec<u32>,
+    conversation_tokens: &[u32],
+    eviction_is_none: bool,
+    cache_disabled: bool,
+    dflash_ckpt_positions: &[usize],
+    resume_enabled: bool,
+) -> PromptCachePlan {
     let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
     if cache_eligible {
         let prior_len = conversation_tokens.len();
@@ -4839,6 +4860,62 @@ fn plan_prompt_cache(
         resume_from: None,
         rendered,
     }
+}
+
+/// Canonical Jinja history render used by the AR and DFlash prefix-cache paths.
+/// Cached assistant bodies are spliced as verbatim token IDs so thinking/tool
+/// turns remain BPE-identical to the sequence resident in target KV.
+#[allow(clippy::too_many_arguments)]
+fn render_cached_history_jinja(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    template: &str,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    enable_thinking: bool,
+    history: &[hipfire_runtime::prompt_frame::Message],
+    tools: Option<&[serde_json::Value]>,
+    cold_prompt_tokens: &[u32],
+    asst_turn_cache: &mut AsstTurnCache,
+) -> Result<Vec<u32>, String> {
+    let im_start = tokenizer.special_token_id("<|im_start|>");
+    let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
+    let primer: Vec<u32> =
+        match im_start.and_then(|id| cold_prompt_tokens.iter().rposition(|&t| t == id)) {
+            Some(q) if q + opener_len <= cold_prompt_tokens.len() => {
+                cold_prompt_tokens[q + opener_len..].to_vec()
+            }
+            _ => Vec::new(),
+        };
+    let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        tokenizer,
+        template,
+        system: system_prompt,
+        user: prompt,
+        enable_thinking,
+        bos_token: None,
+    };
+    hipfire_runtime::prompt_frame::build_cached_history_jinja(&frame, history, tools, |msg| {
+        let stripped = strip_think_for_fingerprint(&msg.content);
+        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+        let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+        let hit = asst_turn_cache.get(&fp).map(|cached| {
+            let mut v = primer.clone();
+            v.extend_from_slice(cached);
+            v
+        });
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                    "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
+                    fp,
+                    msg.role,
+                    msg.content.len(),
+                    normalized.len(),
+                    primer.len(),
+                    hit.is_some(),
+                );
+        }
+        hit
+    })
 }
 
 /// Zero qwen3.5 (arch 5/6) recurrent DeltaNet + KV state IN PLACE for a fresh
@@ -5139,13 +5216,12 @@ fn generate_dflash(
         None
     };
 
-    // Prompt-cache plan (native DFlash reuse). For non-jinja chat with history,
-    // decide whether this turn is a pure extension of the cached conversation.
+    // Prompt-cache plan (native DFlash reuse). Plain and Jinja histories both
+    // render a canonical token stream, then share the same LCP/checkpoint policy.
     // On a HIT we reuse target KV + DeltaNet[0..start_pos] and the draft's
     // cumulative target_hidden, prefilling only the suffix; on a MISS we
     // full-reset and prefill the whole conversation (legacy behaviour).
-    let cache_disabled =
-        try_jinja || std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -5161,8 +5237,34 @@ fn generate_dflash(
         .as_ref()
         .map(|s| s.checkpoint_positions())
         .unwrap_or_default();
-    let cache_plan: Option<PromptCachePlan> = if !try_jinja {
-        messages_history.map(|hist| {
+    let cache_plan: Option<PromptCachePlan> = messages_history.map(|hist| {
+        if try_jinja {
+            let rendered = render_cached_history_jinja(
+                tokenizer,
+                m.chat_template.as_deref().unwrap(),
+                system_prompt,
+                prompt,
+                max_think_tokens != 1,
+                hist,
+                tools,
+                &prompt_tokens,
+                &mut m.asst_turn_cache,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "[qwen-cache] dflash jinja cached-history build failed ({e}) — cold render"
+                );
+                prompt_tokens.clone()
+            });
+            plan_prompt_cache_from_rendered(
+                rendered,
+                &m.conversation_tokens,
+                m.eviction.is_none(),
+                cache_disabled,
+                &dflash_ckpt_positions,
+                dflash_resume_enabled,
+            )
+        } else {
             let tok = m.tokenizer.as_ref().unwrap();
             plan_prompt_cache(
                 tok,
@@ -5177,10 +5279,8 @@ fn generate_dflash(
                 &dflash_ckpt_positions,
                 dflash_resume_enabled,
             )
-        })
-    } else {
-        None
-    };
+        }
+    });
     let resume_from: Option<usize> = cache_plan.as_ref().and_then(|p| p.resume_from);
     // `prompt_tokens` becomes the full canonical conversation when the cache
     // plan rendered it (keeps the end-of-turn `conversation_tokens` bake and the
@@ -8884,56 +8984,21 @@ fn generate(
             // we prepend the assistant-opener primer (e.g. `<think>\n`) that
             // THIS turn's cold render emitted — making the spliced stream
             // byte-match `conversation_tokens` for a clean forward extension.
-            let primer: Vec<u32> = {
-                let im_start = tokenizer.special_token_id("<|im_start|>");
-                let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
-                match im_start.and_then(|id| new_tokens.iter().rposition(|&t| t == id)) {
-                    Some(q) if q + opener_len <= new_tokens.len() => {
-                        new_tokens[q + opener_len..].to_vec()
-                    }
-                    _ => Vec::new(),
-                }
-            };
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            render_cached_history_jinja(
                 tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking: max_think_tokens != 1,
-                bos_token: None,
-            };
-            let cache_ref = &mut m.asst_turn_cache;
-            let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
-                &frame,
+                m.chat_template.as_deref().unwrap(),
+                system_prompt,
+                prompt,
+                max_think_tokens != 1,
                 history,
                 tools,
-                |msg| {
-                    let stripped = strip_think_for_fingerprint(&msg.content);
-                    let normalized =
-                        hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    let hit = cache_ref.get(&fp).map(|cached| {
-                        let mut v = primer.clone();
-                        v.extend_from_slice(cached);
-                        v
-                    });
-                    if trace_cache {
-                        eprintln!(
-                            "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
-                            fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
-                        );
-                    }
-                    hit
-                },
-            );
-            match built {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("[qwen-cache] jinja cached-history build failed ({e}) — cold render");
-                    new_tokens.clone()
-                }
-            }
+                &new_tokens,
+                &mut m.asst_turn_cache,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("[qwen-cache] jinja cached-history build failed ({e}) — cold render");
+                new_tokens.clone()
+            })
         } else {
             let cache_ref = &mut m.asst_turn_cache;
             hipfire_runtime::prompt_frame::build_cached_history(
@@ -14571,7 +14636,34 @@ fn run_dots_ocr_ngram_loop(
 
 #[cfg(test)]
 mod tool_call_parser_tests {
-    use super::{ddtree_has_unsupported_sampling_controls, extract_tool_calls_from_text};
+    use super::{
+        ddtree_has_unsupported_sampling_controls, extract_tool_calls_from_text,
+        plan_prompt_cache_from_rendered,
+    };
+
+    #[test]
+    fn shared_prompt_cache_planner_accepts_only_forward_extensions() {
+        let hit = plan_prompt_cache_from_rendered(vec![1, 2, 3], &[1, 2], true, false, &[], false);
+        assert!(hit.cache_hit);
+        assert_eq!(hit.start_pos, 2);
+        assert_eq!(hit.new_tokens, vec![3]);
+
+        let exact = plan_prompt_cache_from_rendered(vec![1, 2], &[1, 2], true, false, &[], false);
+        assert!(
+            !exact.cache_hit,
+            "exact match must not over-advance DeltaNet"
+        );
+        assert_eq!(exact.start_pos, 0);
+    }
+
+    #[test]
+    fn shared_prompt_cache_planner_resumes_divergence_from_checkpoint() {
+        let plan =
+            plan_prompt_cache_from_rendered(vec![1, 9, 10], &[1, 2, 3], true, false, &[1], true);
+        assert!(plan.cache_hit);
+        assert_eq!(plan.resume_from, Some(1));
+        assert_eq!(plan.new_tokens, vec![9, 10]);
+    }
 
     #[test]
     fn parses_valid_block() {

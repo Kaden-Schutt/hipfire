@@ -259,3 +259,136 @@ extern "C" __global__ void attention_dflash_f32(
         out_ptr[d] = out_run[d] * inv_l;
     }
 }
+
+// Qwen3.5/3.6 DFlash causal sliding-window attention.
+//
+// Context K/V are persistent, already RoPE'd rows. Noise K/V are the current
+// draft block. Query `qi` may see context/noise keys only when
+//   key_pos <= query_pos && query_pos - key_pos < window.
+// The host therefore never has to concatenate or re-RoPE the context prefix.
+// Only the last `window` context rows can possibly be visible; the kernel starts
+// there and still checks absolute positions so compacted/sparse context remains
+// correct.
+extern "C" __global__ void attention_dflash_swa_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k_ctx,
+    const float* __restrict__ v_ctx,
+    const float* __restrict__ k_noise,
+    const float* __restrict__ v_noise,
+    const int* __restrict__ positions_q,
+    const int* __restrict__ positions_ctx,
+    float* __restrict__ out,
+    int B, int L, int n_heads, int n_kv_heads, int head_dim,
+    float scale,
+    int window,
+    int tile_size
+) {
+    extern __shared__ float sdata[];
+    const int head = blockIdx.x;
+    const int qi = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    if (head >= n_heads || qi >= B) return;
+
+    const int rep = n_heads / n_kv_heads;
+    const int kv_head = head / rep;
+    const int q_stride = n_heads * head_dim;
+    const int kv_stride = n_kv_heads * head_dim;
+    const int ctx_start = L > window ? L - window : 0;
+    const int ctx_count = L - ctx_start;
+    const int active_len = ctx_count + B;
+    const int query_pos = positions_q[qi];
+
+    float* tile_scores = sdata;
+    float* ws = sdata + tile_size;
+    float* out_run = sdata + tile_size + nthreads;
+    const float* q_ptr = q + qi * q_stride + head * head_dim;
+
+    for (int d = tid; d < head_dim; d += nthreads) out_run[d] = 0.0f;
+    __syncthreads();
+
+    float m_run = -INFINITY;
+    float l_run = 0.0f;
+    const int n_tiles = (active_len + tile_size - 1) / tile_size;
+    for (int t = 0; t < n_tiles; ++t) {
+        const int tile_start = t * tile_size;
+        int tile_len = active_len - tile_start;
+        if (tile_len > tile_size) tile_len = tile_size;
+
+        float local_max = -INFINITY;
+        for (int j = tid; j < tile_len; j += nthreads) {
+            const int active_j = tile_start + j;
+            const bool is_ctx = active_j < ctx_count;
+            const int row = is_ctx ? ctx_start + active_j : active_j - ctx_count;
+            const int key_pos = is_ctx ? positions_ctx[row] : positions_q[row];
+            const bool visible = key_pos <= query_pos && query_pos - key_pos < window;
+            float score = -INFINITY;
+            if (visible) {
+                const float* k_ptr = (is_ctx ? k_ctx : k_noise)
+                    + (size_t)row * kv_stride + kv_head * head_dim;
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+                const int head_dim_8 = head_dim & ~7;
+                #pragma unroll 4
+                for (int d = 0; d < head_dim_8; d += 8) {
+                    a0 += q_ptr[d    ] * k_ptr[d    ];
+                    a1 += q_ptr[d + 1] * k_ptr[d + 1];
+                    a2 += q_ptr[d + 2] * k_ptr[d + 2];
+                    a3 += q_ptr[d + 3] * k_ptr[d + 3];
+                    a4 += q_ptr[d + 4] * k_ptr[d + 4];
+                    a5 += q_ptr[d + 5] * k_ptr[d + 5];
+                    a6 += q_ptr[d + 6] * k_ptr[d + 6];
+                    a7 += q_ptr[d + 7] * k_ptr[d + 7];
+                }
+                for (int d = head_dim_8; d < head_dim; ++d) a0 += q_ptr[d] * k_ptr[d];
+                score = ((a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7)) * scale;
+            }
+            tile_scores[j] = score;
+            if (score > local_max) local_max = score;
+        }
+        ws[tid] = local_max;
+        __syncthreads();
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]);
+            __syncthreads();
+        }
+        const float tile_max = ws[0];
+        __syncthreads();
+        if (!isfinite(tile_max)) continue;
+
+        const float m_new = fmaxf(m_run, tile_max);
+        const float alpha = isfinite(m_run) ? expf(m_run - m_new) : 0.0f;
+        float local_sum = 0.0f;
+        for (int j = tid; j < tile_len; j += nthreads) {
+            const float e = isfinite(tile_scores[j]) ? expf(tile_scores[j] - m_new) : 0.0f;
+            tile_scores[j] = e;
+            local_sum += e;
+        }
+        ws[tid] = local_sum;
+        __syncthreads();
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) ws[tid] += ws[tid + s];
+            __syncthreads();
+        }
+        const float tile_sum = ws[0];
+        for (int d = tid; d < head_dim; d += nthreads) {
+            float acc = alpha * out_run[d];
+            for (int j = 0; j < tile_len; ++j) {
+                const int active_j = tile_start + j;
+                const bool is_ctx = active_j < ctx_count;
+                const int row = is_ctx ? ctx_start + active_j : active_j - ctx_count;
+                const float* v_ptr = (is_ctx ? v_ctx : v_noise)
+                    + (size_t)row * kv_stride + kv_head * head_dim;
+                acc += tile_scores[j] * v_ptr[d];
+            }
+            out_run[d] = acc;
+        }
+        __syncthreads();
+        l_run = alpha * l_run + tile_sum;
+        m_run = m_new;
+    }
+
+    float* out_ptr = out + qi * q_stride + head * head_dim;
+    const float inv_l = l_run > 0.0f ? 1.0f / l_run : 0.0f;
+    for (int d = tid; d < head_dim; d += nthreads) out_ptr[d] = out_run[d] * inv_l;
+}

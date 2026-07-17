@@ -18,7 +18,7 @@
 
 use crate::carrier::Qwen35Bundle;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
-use hip_bridge::{DeviceBuffer, HipResult, Stream};
+use hip_bridge::{DeviceBuffer, Event, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
@@ -1016,6 +1016,14 @@ pub struct GdnTape {
     pub q_scratch: GpuTensor,     // [max_n × v_dim] (post repeat-interleave)
     pub k_scratch: GpuTensor,     // [max_n × v_dim]
     pub attn_scratch: GpuTensor,  // [max_n × v_dim]
+    /// Secondary stream and two events for overlapping accepted-prefix replay
+    /// with the next draft forward. `replay_ready` orders the secondary stream
+    /// after the target restore; `replay_done` is the exact dependency boundary
+    /// consumed immediately before the next target verify.
+    replay_stream: Option<Stream>,
+    replay_ready: Option<Event>,
+    replay_done: Option<Event>,
+    replay_pending: bool,
 }
 
 impl GdnTape {
@@ -1062,10 +1070,17 @@ impl GdnTape {
             q_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             k_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            replay_stream: Some(gpu.hip.stream_create()?),
+            replay_ready: Some(gpu.hip.event_create()?),
+            replay_done: Some(gpu.hip.event_create()?),
+            replay_pending: false,
         })
     }
 
-    pub fn free_gpu(self, gpu: &mut Gpu) {
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        // A queued replay owns the tape scratch and writes the live recurrent
+        // state. It must finish before either resource is released.
+        let _ = self.wait_replay(gpu);
         for t in self
             .qkv_bufs
             .into_iter()
@@ -1080,6 +1095,81 @@ impl GdnTape {
         let _ = gpu.free_tensor(self.q_scratch);
         let _ = gpu.free_tensor(self.k_scratch);
         let _ = gpu.free_tensor(self.attn_scratch);
+        if let Some(event) = self.replay_ready.take() {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(event) = self.replay_done.take() {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(stream) = self.replay_stream.take() {
+            let _ = gpu.hip.stream_destroy(stream);
+        }
+    }
+
+    /// Complete an overlapped replay before any target operation consumes the
+    /// recurrent state or overwrites the innovation tape. The wait is delayed
+    /// until after the next draft has been submitted, so replay and draft still
+    /// overlap; a host event wait is used because target snapshot copies are
+    /// synchronous HIP copies and are not ordered by `gpu.active_stream`.
+    pub fn wait_replay(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        if !self.replay_pending {
+            return Ok(());
+        }
+        gpu.hip
+            .event_synchronize(self.replay_done.as_ref().expect("replay_done event"))?;
+        self.replay_pending = false;
+        Ok(())
+    }
+
+    /// Queue accepted-prefix GDN replay on a secondary stream. The main target
+    /// state is not consumed again until `wait_replay`, while the next DFlash
+    /// draft is independent and can execute concurrently.
+    pub fn replay_gdn_async(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &mut qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> HipResult<()> {
+        self.wait_replay(gpu)?;
+        if gpu.active_stream.is_none() {
+            return self.replay_gdn(gpu, weights, config, dn_state, n_steps);
+        }
+
+        let ready = self.replay_ready.as_ref().expect("replay_ready event");
+        gpu.hip.event_record(ready, gpu.active_stream.as_ref())?;
+
+        let main_stream = gpu.active_stream.take().expect("checked active stream");
+        let replay_stream = self.replay_stream.take().expect("replay stream");
+        let wait_result = gpu.hip.stream_wait_event(&replay_stream, ready);
+        gpu.active_stream = Some(replay_stream);
+        let replay_result = if wait_result.is_ok() {
+            self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps)
+        } else {
+            wait_result
+        };
+        let done_result = if replay_result.is_ok() {
+            gpu.hip.event_record(
+                self.replay_done.as_ref().expect("replay_done event"),
+                gpu.active_stream.as_ref(),
+            )
+        } else {
+            replay_result
+        };
+        self.replay_stream = gpu.active_stream.take();
+        gpu.active_stream = Some(main_stream);
+
+        if let Err(err) = done_result {
+            // Do not leave partially queued work owning scratch/state after an
+            // error. This path is cold and correctness takes priority.
+            if let Some(stream) = self.replay_stream.as_ref() {
+                let _ = gpu.hip.stream_synchronize(stream);
+            }
+            return Err(err);
+        }
+        self.replay_pending = true;
+        Ok(())
     }
 
     /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
@@ -1300,7 +1390,6 @@ impl GdnTape {
         }
         Ok(())
     }
-
 }
 
 impl DeltaNetTape {
@@ -1739,6 +1828,12 @@ impl HiddenStateRingBuffer {
         self.head = 0;
         self.written = 0;
     }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for tensor in self.layer_bufs.into_iter().chain(self.staging_bufs) {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
 }
 
 /// Single-pass argmax for token sampling. Not SIMD-optimized — the logit
@@ -2107,6 +2202,17 @@ pub struct DflashVerifyOutput {
 
 fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape: bool) -> bool {
     caller_supplied_tape && verify_populates_tape
+}
+
+#[inline]
+fn dflash_replay_overlap_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_DFLASH_REPLAY_OVERLAP")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// Run the target on `draft_tokens` (length B) positions starting at
@@ -2855,7 +2961,11 @@ pub fn spec_step_dflash(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
 
-    assert!(b >= 2, "dflash block size must be ≥ 2");
+    // B=1 is the scheduler's true AR off-ramp: skip the drafter, verify only
+    // the current seed, and emit the target's next token. It preserves the same
+    // hidden-ring/context bookkeeping as speculative cycles without paying a
+    // draft forward or over-wide target verify.
+    assert!(b >= 1, "dflash block size must be ≥ 1");
     // `target_hidden_host` is only authoritative on the ctx_slice=Some path,
     // where it backs the CPU slice handed to draft_forward. On the default
     // ctx_slice=None path the data lives on GPU in draft_scratch.target_hidden
@@ -2955,7 +3065,10 @@ pub fn spec_step_dflash(
     let mut c8_draft_tokens_dev: Option<GpuTensor> = None;
     let mut c8_draft_p_at_token_dev: Option<GpuTensor> = None;
 
-    if let Some(pld) = pld_spine {
+    if b == 1 {
+        // No draft candidates. `drafted=[seed]` and `block=[seed]` already have
+        // exactly the shape the shared verify/accept/hidden-commit tail needs.
+    } else if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
         // At temp>0, draft "probability" at each PLD token is 1.0 — PLD is
         // context-deterministic, not a softmax. The rejection math below
@@ -3442,7 +3555,17 @@ pub fn spec_step_dflash(
     // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
     // replay just the GDN recurrence for `accept+1` steps without
     // re-running the target.
-    target_snap.save_from(&target.dn_state, gpu)?;
+    // A prior cycle may be replaying the accepted GDN prefix on the secondary
+    // stream. The draft above is target-state independent and was allowed to
+    // overlap it; this is the first operation that consumes target recurrent
+    // state / overwrites the innovation tape, so it is the minimal safe join.
+    let mut gdn_tape = gdn_tape;
+    if let Some(tape) = gdn_tape.as_deref_mut() {
+        tape.wait_replay(gpu)?;
+    }
+    if b > 1 {
+        target_snap.save_from(&target.dn_state, gpu)?;
+    }
     // Mutable variable to allow both verify capture + rollback replay usage.
     let moe_router_logits_present = verify_scratch
         .prefill_batch
@@ -3457,7 +3580,8 @@ pub fn spec_step_dflash(
         gpu.arch.as_str(),
         moe_router_logits_present,
     );
-    let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
+    let use_tape_replay =
+        b > 1 && dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
 
     if phase_on {
@@ -3548,8 +3672,9 @@ pub fn spec_step_dflash(
             let tau_d_dev = c8_draft_tau_dev.as_ref().unwrap();
             let z_d_dev = c8_draft_z_dev.as_ref().unwrap();
 
-            let out_dev = gpu.alloc_tensor(&[4], rdna_compute::DType::F32)?; // 4×i32 via f32 slot
-            // kernel's b parameter = number of draft comparison positions = b-1
+            // Four i32 results stored in an F32-sized slot. The kernel's `b`
+            // parameter is the number of draft comparison positions (B - 1).
+            let out_dev = gpu.alloc_tensor(&[4], rdna_compute::DType::F32)?;
             let draft_b = b - 1;
             let rng_seed = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
             gpu.chain_accept_spec_f32(
@@ -3936,7 +4061,9 @@ pub fn spec_step_dflash(
     // draft tokens). The bonus token is NOT replayed — it will be
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
-    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    if b > 1 {
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+    }
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -3953,30 +4080,42 @@ pub fn spec_step_dflash(
     // Fallback (no tape): batched forward_prefill_batch over (accept+1)
     // tokens, same as the prior version — re-runs the full target but one
     // batched call instead of (accept+1) sequential decodes.
-    if let Some(tape) = gdn_tape_opt.as_deref() {
-        tape.replay_gdn(
-            gpu,
-            &target.weights,
-            &target.config,
-            &mut target.dn_state,
-            accept_len + 1,
-        )?;
-    } else {
-        let replay_tokens = &committed[..accept_len + 1];
-        qwen35::forward_prefill_batch(
-            gpu,
-            &target.weights,
-            &target.config,
-            replay_tokens,
-            position,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            None,
-            None,
-            None,
-            None,
-        )?;
+    if b > 1 {
+        if let Some(tape) = gdn_tape_opt.as_deref_mut() {
+            if dflash_replay_overlap_enabled() {
+                tape.replay_gdn_async(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    accept_len + 1,
+                )?;
+            } else {
+                tape.replay_gdn(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    accept_len + 1,
+                )?;
+            }
+        } else {
+            let replay_tokens = &committed[..accept_len + 1];
+            qwen35::forward_prefill_batch(
+                gpu,
+                &target.weights,
+                &target.config,
+                replay_tokens,
+                position,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        }
     }
     // Target state is now at position + accept_len + 1. KV cache has
     // written K/V at positions [position..position+accept_len]. The bonus

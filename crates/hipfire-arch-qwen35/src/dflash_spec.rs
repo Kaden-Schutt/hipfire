@@ -11,7 +11,7 @@
 //! constructor). All types here are qwen35 + runtime types — no loader types —
 //! so the loader only calls in; it never owns the DFlash mechanics.
 
-use crate::qwen35::{self, DeltaNetState, LayerType, Qwen35Config};
+use crate::qwen35::{self, DeltaNetState, Qwen35Config};
 use crate::speculative::{
     apply_eviction_retain_to_draft, scatter_hidden_block_to_interleaved,
     seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
@@ -24,6 +24,7 @@ use hipfire_runtime::spec::{
     EvictRetain, PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
+use std::collections::VecDeque;
 use std::path::Path;
 
 // ─── DDTree side state ────────────────────────────────────────────────
@@ -172,7 +173,7 @@ fn lower_qwen35(r: SpecStepResult) -> SpecStep {
     SpecStep::new(
         r.committed[1..].iter().copied(),
         r.bonus_token,
-        r.drafted.len(),
+        r.drafted.len().saturating_sub(1),
         r.accepted,
     )
 }
@@ -204,13 +205,62 @@ pub struct DflashSpeculator {
     resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
+    /// Production adaptive verify width. B=1 is a true target-only AR step;
+    /// B={2,4,8,16} are DFlash probes selected from recent acceptance/utilization.
+    adaptive_enabled: bool,
+    adaptive_b: usize,
+    adaptive_samples: VecDeque<(usize, usize, f64)>, // (B, accepted, committed/ms)
+    adaptive_cooldown: usize,
+    ar_probe_remaining: usize,
+    ar_rate_ewma: Option<f64>,
+    spec_rate_ewma: Option<f64>,
+}
+
+/// Pure policy core for the production width controller. Keeping the decision
+/// separate from GPU state makes the threshold behavior deterministic and
+/// unit-testable.
+fn adaptive_transition(
+    max_b: usize,
+    b: usize,
+    util: f64,
+    mean_rate: f64,
+    ar_rate: Option<f64>,
+) -> (usize, usize) {
+    if util < 0.25 {
+        if b > 2 {
+            return (
+                if b > 8 {
+                    8
+                } else if b > 4 {
+                    4
+                } else {
+                    2
+                },
+                0,
+            );
+        }
+        let ar_is_better = ar_rate.map(|ar| mean_rate <= ar * 1.05).unwrap_or(true);
+        if ar_is_better || util < 0.12 {
+            return (b, if ar_rate.is_some() { 8 } else { 4 });
+        }
+    } else if util > 0.55 && b < max_b {
+        return ((b * 2).min(max_b), 0);
+    }
+    (b, 0)
 }
 
 impl DflashSpeculator {
     /// `resume_enabled`/`ck_interval`/`ck_cap` mirror the daemon's
     /// `ckpt_resume_enabled()`/`ckpt_interval()`/`ckpt_max()` — passed in by
     /// `build_dflash_speculator` so `new` itself is env-free (and unit-testable).
-    pub fn new(df: DflashState, resume_enabled: bool, ck_interval: usize, ck_cap: usize) -> Self {
+    pub fn new(
+        df: DflashState,
+        resume_enabled: bool,
+        ck_interval: usize,
+        ck_cap: usize,
+        adaptive_enabled: bool,
+    ) -> Self {
+        let adaptive_b = df.block_size;
         Self {
             df,
             // Same fixed seed the daemon's DFlash loop used. `set_sampling`
@@ -228,6 +278,98 @@ impl DflashSpeculator {
             resume_enabled,
             ck_interval,
             ck_cap,
+            adaptive_enabled,
+            adaptive_b,
+            adaptive_samples: VecDeque::with_capacity(4),
+            adaptive_cooldown: 0,
+            ar_probe_remaining: 0,
+            ar_rate_ewma: None,
+            spec_rate_ewma: None,
+        }
+    }
+
+    fn adaptive_width(&self) -> usize {
+        if !self.adaptive_enabled || self.df.ddtree.is_some() {
+            self.df.block_size
+        } else if self.ar_probe_remaining > 0 {
+            1
+        } else {
+            self.adaptive_b
+        }
+    }
+
+    fn update_adaptive(&mut self, b: usize, accepted: usize, elapsed_ms: f64) {
+        if !self.adaptive_enabled || self.df.ddtree.is_some() {
+            return;
+        }
+        let rate = (accepted + 1) as f64 / elapsed_ms.max(0.001);
+        let ewma = |old: Option<f64>, x: f64| Some(old.map_or(x, |v| 0.7 * v + 0.3 * x));
+        if b == 1 {
+            self.ar_rate_ewma = ewma(self.ar_rate_ewma, rate);
+            self.ar_probe_remaining = self.ar_probe_remaining.saturating_sub(1);
+            if self.ar_probe_remaining == 0 {
+                // Periodically probe the smallest speculative width so a phase
+                // change can re-enter speculation without request restart.
+                self.adaptive_b = self.df.block_size.min(2).max(1);
+                self.adaptive_samples.clear();
+                self.adaptive_cooldown = 0;
+            }
+            return;
+        }
+
+        self.spec_rate_ewma = ewma(self.spec_rate_ewma, rate);
+        self.adaptive_samples.push_back((b, accepted, rate));
+        while self.adaptive_samples.len() > 3 {
+            self.adaptive_samples.pop_front();
+        }
+        self.adaptive_cooldown += 1;
+        if self.adaptive_samples.len() < 3
+            || self.adaptive_cooldown < 2
+            || self
+                .adaptive_samples
+                .iter()
+                .any(|(sample_b, _, _)| *sample_b != b)
+        {
+            return;
+        }
+
+        let mean_accept = self
+            .adaptive_samples
+            .iter()
+            .map(|(_, a, _)| *a as f64)
+            .sum::<f64>()
+            / self.adaptive_samples.len() as f64;
+        let util = mean_accept / (b - 1) as f64;
+        let mean_rate = self
+            .adaptive_samples
+            .iter()
+            .map(|(_, _, r)| *r)
+            .sum::<f64>()
+            / self.adaptive_samples.len() as f64;
+        let old_b = self.adaptive_b;
+
+        (self.adaptive_b, self.ar_probe_remaining) =
+            adaptive_transition(self.df.block_size, b, util, mean_rate, self.ar_rate_ewma);
+
+        if self.adaptive_b != old_b || self.ar_probe_remaining > 0 {
+            self.adaptive_samples.clear();
+            self.adaptive_cooldown = 0;
+        }
+        if std::env::var("HIPFIRE_DFLASH_ADAPTIVE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!(
+                "[dflash-adaptive] B={} accept={:.2} util={:.3} rate={:.3} tok/ms ar={:?} -> B={} ar_cycles={}",
+                b,
+                mean_accept,
+                util,
+                mean_rate,
+                self.ar_rate_ewma,
+                self.adaptive_b,
+                self.ar_probe_remaining,
+            );
         }
     }
 }
@@ -244,6 +386,13 @@ impl Speculator for DflashSpeculator {
         resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        // The final decode cycle may have returned while accepted-prefix replay
+        // was still overlapping on the secondary stream. A new-turn prefill
+        // consumes the live target recurrent state, so join it here.
+        self.df
+            .gdn_tape
+            .wait_replay(gpu)
+            .map_err(|e| e.to_string())?;
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -370,6 +519,16 @@ impl Speculator for DflashSpeculator {
         // batched (SWOR) verify when a tree is configured, else chain-mode DFlash.
         // The grammar arg is ignored — qwen35 enforces tool-call grammar post-hoc
         // in the daemon.
+        let selected_b = self.adaptive_width();
+        let started = std::time::Instant::now();
+        if self.df.ddtree.is_some() {
+            // Tree mode currently replays synchronously, but drain any pending
+            // chain replay before entering it if a caller changes mode/state.
+            self.df
+                .gdn_tape
+                .wait_replay(gpu)
+                .map_err(|e| e.to_string())?;
+        }
         let result = if let Some(dd) = self.df.ddtree.as_mut() {
             spec_step_ddtree_batched(
                 gpu,
@@ -424,8 +583,8 @@ impl Speculator for DflashSpeculator {
                 self.sample_top_p, // top_p (1.0 = no truncation)
                 self.sample_top_k, // top_k (0 = top_p-only)
                 &mut self.rng_state,
-                None, // block_size override
-                None, // ngram_cache
+                Some(selected_b), // production adaptive width; B=1 is AR
+                None,             // ngram_cache
                 emitted,
                 self.sample_cactus, // 0.0 = lossless; >0 = deliberately lossy
                 None,               // pld_spine
@@ -434,7 +593,14 @@ impl Speculator for DflashSpeculator {
             )
         };
 
-        result.map(lower_qwen35).map_err(|e| e.to_string())
+        let raw = result.map_err(|e| e.to_string())?;
+        let accepted = raw.accepted;
+        self.update_adaptive(
+            selected_b,
+            accepted,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        Ok(lower_qwen35(raw))
     }
 
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
@@ -457,6 +623,7 @@ impl Speculator for DflashSpeculator {
         // Drafter-local reset: invalidate cached suffix projections and free the
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
         // daemon's job — it owns the bundle).
+        let _ = self.df.gdn_tape.wait_replay(gpu);
         self.df.draft_scratch.reset_upload_tracking();
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
@@ -485,6 +652,10 @@ impl Speculator for DflashSpeculator {
         // `position` and drop the now-stale tail of the ring (mirrors the old
         // divergent-render resume at generate_dflash 4021-4036). Caller rewinds
         // seq_pos / conversation_tokens to match.
+        self.df
+            .gdn_tape
+            .wait_replay(gpu)
+            .map_err(|e| e.to_string())?;
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -510,6 +681,12 @@ impl Speculator for DflashSpeculator {
         self.sample_top_k = top_k;
         self.sample_cactus = cactus_delta;
         self.rng_state = 0x13579BDF;
+        self.adaptive_b = self.df.block_size;
+        self.adaptive_samples.clear();
+        self.adaptive_cooldown = 0;
+        self.ar_probe_remaining = 0;
+        self.ar_rate_ewma = None;
+        self.spec_rate_ewma = None;
     }
 
     fn requires_greedy(&self) -> bool {
@@ -523,12 +700,38 @@ impl Speculator for DflashSpeculator {
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
-        // Mirrors the `unload_model` dflash teardown + the checkpoint-ring free.
+        // Release the complete state graph. These types intentionally do not
+        // implement Drop because freeing needs the live HIP context; omitting a
+        // member here leaks VRAM across daemon unload/reload cycles.
         let DflashSpeculator {
-            df, checkpoints, ..
+            mut df,
+            checkpoints,
+            ..
         } = *self;
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
+        let _ = df.gdn_tape.wait_replay(gpu);
+        let DflashState {
+            draft_config: _,
+            draft_weights,
+            draft_scratch,
+            hidden_rb,
+            verify_scratch,
+            target_snap,
+            gdn_tape,
+            target_hidden_host: _,
+            ctx_capacity: _,
+            block_size: _,
+            ddtree,
+        } = df;
+        draft_weights.free_gpu(gpu);
+        draft_scratch.free_gpu(gpu);
+        hidden_rb.free_gpu(gpu);
+        verify_scratch.free_gpu(gpu);
+        target_snap.free_gpu(gpu);
+        gdn_tape.free_gpu(gpu);
+        if let Some(dd) = ddtree {
+            dd.post_seed_snap.free_gpu(gpu);
+            dd.scratch.free_gpu(gpu);
+        }
         for (_, snap) in checkpoints {
             snap.free_gpu(gpu);
         }
@@ -553,10 +756,38 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize)
         .max(1);
+    let adaptive_enabled = std::env::var("HIPFIRE_DFLASH_ADAPTIVE_B").ok().as_deref() != Some("0");
     Box::new(DflashSpeculator::new(
         df,
         resume_enabled,
         ck_interval,
         ck_cap,
+        adaptive_enabled,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adaptive_transition;
+
+    #[test]
+    fn adaptive_width_shrinks_low_utility_blocks() {
+        assert_eq!(adaptive_transition(16, 16, 0.20, 0.1, None), (8, 0));
+        assert_eq!(adaptive_transition(16, 8, 0.20, 0.1, None), (4, 0));
+        assert_eq!(adaptive_transition(16, 4, 0.20, 0.1, None), (2, 0));
+    }
+
+    #[test]
+    fn adaptive_width_enters_and_leaves_true_ar_probes() {
+        assert_eq!(adaptive_transition(16, 2, 0.10, 0.1, None), (2, 4));
+        assert_eq!(adaptive_transition(16, 2, 0.20, 0.10, Some(0.12)), (2, 8));
+        assert_eq!(adaptive_transition(16, 2, 0.20, 0.20, Some(0.12)), (2, 0));
+    }
+
+    #[test]
+    fn adaptive_width_expands_only_after_high_utility() {
+        assert_eq!(adaptive_transition(16, 2, 0.60, 0.1, None), (4, 0));
+        assert_eq!(adaptive_transition(16, 8, 0.60, 0.1, None), (16, 0));
+        assert_eq!(adaptive_transition(16, 16, 0.90, 0.1, None), (16, 0));
+    }
 }
