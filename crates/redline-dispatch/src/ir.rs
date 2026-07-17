@@ -311,3 +311,69 @@ impl KernelLaunch {
         self.estimated_work
     }
 }
+
+#[cfg(test)]
+mod property_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn region_intersection_matches_half_open_ranges(
+            owner in any::<u64>(),
+            resource_index in any::<u32>(),
+            first_offset in 0_u64..1_000_000,
+            first_len in 1_u64..4_096,
+            second_offset in 0_u64..1_000_000,
+            second_len in 1_u64..4_096,
+        ) {
+            let resource = ResourceId {
+                owner,
+                index: resource_index,
+            };
+            let first = DeviceRegion::new(resource, first_offset, first_len).unwrap();
+            let second = DeviceRegion::new(resource, second_offset, second_len).unwrap();
+            let expected = first_offset < second_offset + second_len
+                && second_offset < first_offset + first_len;
+
+            prop_assert_eq!(first.overlaps(second), expected);
+            prop_assert_eq!(second.overlaps(first), expected);
+
+            match first.intersection(second) {
+                Some(intersection) => {
+                    prop_assert!(expected);
+                    prop_assert_eq!(intersection.resource(), resource);
+                    prop_assert_eq!(intersection.offset(), first_offset.max(second_offset));
+                    prop_assert_eq!(
+                        intersection.end(),
+                        (first_offset + first_len).min(second_offset + second_len),
+                    );
+                }
+                None => prop_assert!(!expected),
+            }
+        }
+
+        #[test]
+        fn distinct_resources_never_overlap(
+            owner in any::<u64>(),
+            resource_index in any::<u32>(),
+            offset in 0_u64..1_000_000,
+            len in 1_u64..4_096,
+        ) {
+            let first = ResourceId {
+                owner,
+                index: resource_index,
+            };
+            let second = ResourceId {
+                owner,
+                index: resource_index.wrapping_add(1),
+            };
+            let first = DeviceRegion::new(first, offset, len).unwrap();
+            let second = DeviceRegion::new(second, offset, len).unwrap();
+
+            prop_assert!(!first.overlaps(second));
+            prop_assert_eq!(first.intersection(second), None);
+        }
+    }
+}

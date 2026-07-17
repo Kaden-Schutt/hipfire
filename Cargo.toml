@@ -32,3 +32,9 @@ members = [
 version = "0.2.1"
 edition = "2021"
 license = "MIT"
+
+[workspace.dependencies]
+half = "2.7"
+libloading = "0.9"
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+safetensors = "0.8"

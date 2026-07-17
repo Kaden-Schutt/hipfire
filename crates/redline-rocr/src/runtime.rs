@@ -2339,7 +2339,21 @@ impl std::error::Error for RuntimeError {}
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn arbitrary_elf_bytes_never_panic(
+            elf in proptest::collection::vec(any::<u8>(), 0..4_096),
+            loaded_descriptor in any::<u64>(),
+        ) {
+            let _ = parse_kernel_pm4_metadata(&elf, "kernel.kd", loaded_descriptor);
+        }
+    }
 
     #[test]
     fn queue_fault_callback_keeps_the_first_status_in_stable_state() {

@@ -6,4 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Auditable public ROCr/HSA ABI, resource ownership, and AQL packet publication"
 
 [dependencies]
-libloading = "0.9"
+libloading.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -316,3 +316,46 @@ pub enum KernargAbiError {
         actual: u32,
     },
 }
+
+#[cfg(test)]
+mod property_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn overlapping_kernarg_fields_are_rejected(
+            offset in 0_u32..1_024,
+            first_size in 2_u32..128,
+            overlap_seed in any::<u32>(),
+            second_size in 1_u32..128,
+        ) {
+            let second_offset = offset + overlap_seed % first_size;
+            let first = KernargField::new(offset, first_size, 1).unwrap();
+            let second = KernargField::new(second_offset, second_size, 1).unwrap();
+            let segment_size = first.end().max(second.end());
+
+            assert_eq!(
+                KernargAbi::new(segment_size, 1, [first, second]).unwrap_err(),
+                KernargAbiError::OverlappingFields {
+                    first: 0,
+                    second: 1,
+                },
+            );
+        }
+
+        #[test]
+        fn identical_kernarg_layouts_have_stable_hashes(
+            field_size in 1_u32..256,
+            trailing_padding in 0_u32..256,
+        ) {
+            let field = KernargField::new(0, field_size, 1).unwrap();
+            let segment_size = field_size + trailing_padding;
+            let first = KernargAbi::new(segment_size, 1, [field]).unwrap();
+            let second = KernargAbi::new(segment_size, 1, [field]).unwrap();
+
+            prop_assert_eq!(first.hash(), second.hash());
+        }
+    }
+}
