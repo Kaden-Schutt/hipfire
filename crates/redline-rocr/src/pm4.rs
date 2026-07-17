@@ -42,12 +42,38 @@ const SUPPORTED_KERNEL_PROPERTIES: u16 = ENABLE_SGPR_KERNARG_SEGMENT_PTR | ENABL
 const DISPATCH_INITIATOR_BASE: u32 = (1 << 0) | (1 << 2) | (1 << 5);
 const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
 
+/// GFX12 `COMPUTE_DISPATCH_INITIATOR` scheduling policy.
+///
+/// `OrderMode` matches Mesa's out-of-order wave admission. `Radv` also sets
+/// asynchronous-compute tunneling; the KMD treats that bit as a no-op unless
+/// the queue has the required priority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Gfx12DispatchInitiatorPolicy {
+    #[default]
+    Legacy,
+    OrderMode,
+    Radv,
+}
+
+impl Gfx12DispatchInitiatorPolicy {
+    const fn bits(self) -> u32 {
+        const ORDER_MODE: u32 = 1 << 6;
+        const TUNNEL_ENABLE: u32 = 1 << 13;
+        match self {
+            Self::Legacy => 0,
+            Self::OrderMode => ORDER_MODE,
+            Self::Radv => ORDER_MODE | TUNNEL_ENABLE,
+        }
+    }
+}
+
 /// Retained GFX12 PM4 command words suitable for one PM4 indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Gfx12Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
     cache_dynamic_registers: bool,
+    dispatch_initiator_policy: Gfx12DispatchInitiatorPolicy,
 }
 
 impl Gfx12Pm4CommandBuffer {
@@ -63,6 +89,7 @@ impl Gfx12Pm4CommandBuffer {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             cache_dynamic_registers: true,
+            dispatch_initiator_policy: Gfx12DispatchInitiatorPolicy::Legacy,
         }
     }
 
@@ -74,7 +101,16 @@ impl Gfx12Pm4CommandBuffer {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             cache_dynamic_registers: false,
+            dispatch_initiator_policy: Gfx12DispatchInitiatorPolicy::Legacy,
         }
+    }
+
+    pub fn with_dispatch_initiator_policy(
+        mut self,
+        policy: Gfx12DispatchInitiatorPolicy,
+    ) -> Self {
+        self.dispatch_initiator_policy = policy;
+        self
     }
 
     /// Invalidate the agent caches at the HIP/HSA-to-PM4 ownership boundary.
@@ -305,7 +341,8 @@ impl Gfx12Pm4CommandBuffer {
         // COMPUTE_SHADER_EN | FORCE_START_AT_000 | USE_THREAD_DIMENSIONS,
         // with CS_W32_EN derived from the kernel descriptor. A mixed-wave
         // retained tape must never inherit this bit from the preceding node.
-        self.dwords.push(dispatch_initiator(wave32));
+        self.dwords
+            .push(dispatch_initiator(wave32, self.dispatch_initiator_policy));
         Ok(())
     }
 
@@ -394,8 +431,9 @@ fn packet3(opcode: u32, body_dwords: u32, compute: bool) -> u32 {
     (3 << 30) | ((body_dwords - 1) << 16) | (opcode << 8) | if compute { 1 << 1 } else { 0 }
 }
 
-fn dispatch_initiator(wave32: bool) -> u32 {
+fn dispatch_initiator(wave32: bool, policy: Gfx12DispatchInitiatorPolicy) -> u32 {
     DISPATCH_INITIATOR_BASE
+        | policy.bits()
         | if wave32 {
             DISPATCH_INITIATOR_CS_W32_EN
         } else {
@@ -461,8 +499,22 @@ mod tests {
 
     #[test]
     fn dispatch_initiator_tracks_kernel_descriptor_wave_size() {
-        assert_eq!(dispatch_initiator(false), 0x25);
-        assert_eq!(dispatch_initiator(true), 0x8025);
+        assert_eq!(
+            dispatch_initiator(false, Gfx12DispatchInitiatorPolicy::Legacy),
+            0x25
+        );
+        assert_eq!(
+            dispatch_initiator(true, Gfx12DispatchInitiatorPolicy::Legacy),
+            0x8025
+        );
+        assert_eq!(
+            dispatch_initiator(true, Gfx12DispatchInitiatorPolicy::OrderMode),
+            0x8065
+        );
+        assert_eq!(
+            dispatch_initiator(true, Gfx12DispatchInitiatorPolicy::Radv),
+            0xa065
+        );
     }
 
     #[test]
