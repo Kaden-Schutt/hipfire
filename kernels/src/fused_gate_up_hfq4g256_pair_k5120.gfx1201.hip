@@ -25,10 +25,6 @@
 #define HIPFIRE_GATE_UP_PAIR_SKEW 0
 #endif
 
-#ifndef HIPFIRE_GATE_UP_PAIR_WINDOW
-#define HIPFIRE_GATE_UP_PAIR_WINDOW 4
-#endif
-
 __launch_bounds__(32, 16)
 extern "C" __global__ void HIPFIRE_GATE_UP_PAIR_KERNEL(
     const char* __restrict__ A_gate,
@@ -115,21 +111,9 @@ extern "C" __global__ void HIPFIRE_GATE_UP_PAIR_KERNEL(
     for (int q = 0; q < 5; q++) {
         const int g = q << 2;
         PAIRED_DOG(g + 0, gacc0, uacc0);
-#if HIPFIRE_GATE_UP_PAIR_WINDOW == 1
-        asm volatile("" ::: "memory");
-#endif
         PAIRED_DOG(g + 1, gacc1, uacc1);
-#if HIPFIRE_GATE_UP_PAIR_WINDOW <= 2
-        asm volatile("" ::: "memory");
-#endif
         PAIRED_DOG(g + 2, gacc2, uacc2);
-#if HIPFIRE_GATE_UP_PAIR_WINDOW == 1
-        asm volatile("" ::: "memory");
-#endif
         PAIRED_DOG(g + 3, gacc3, uacc3);
-#if HIPFIRE_GATE_UP_PAIR_WINDOW <= 2
-        asm volatile("" ::: "memory");
-#endif
     }
     #undef PAIRED_DOG
 

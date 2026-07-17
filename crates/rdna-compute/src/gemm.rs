@@ -19019,34 +19019,7 @@ impl Gpu {
         } else {
             None
         };
-        static GFX1201_27B_GATE_UP_WINDOW: OnceLock<Option<i32>> = OnceLock::new();
-        let gfx1201_27b_window = if gfx1201_27b_up_skew.is_some() {
-            *GFX1201_27B_GATE_UP_WINDOW.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_WINDOW")
-                    .ok()
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .filter(|v| matches!(v, 1 | 2))
-            })
-        } else {
-            None
-        };
-        let (func_name, block, grid_x) = if gfx1201_27b_window == Some(1) {
-            let kernel = "fused_gate_up_hfq4g256_pair_skew_w1_k5120_global_gfx1201";
-            self.ensure_kernel(
-                kernel,
-                kernels::FUSED_GATE_UP_HFQ4G256_PAIR_SKEW_W1_K5120_GLOBAL_GFX1201_SRC,
-                kernel,
-            )?;
-            (kernel, [32u32, 1, 1], gate_m as u32)
-        } else if gfx1201_27b_window == Some(2) {
-            let kernel = "fused_gate_up_hfq4g256_pair_skew_w2_k5120_global_gfx1201";
-            self.ensure_kernel(
-                kernel,
-                kernels::FUSED_GATE_UP_HFQ4G256_PAIR_SKEW_W2_K5120_GLOBAL_GFX1201_SRC,
-                kernel,
-            )?;
-            (kernel, [32u32, 1, 1], gate_m as u32)
-        } else if gfx1201_27b_up_skew.is_some() {
+        let (func_name, block, grid_x) = if gfx1201_27b_up_skew.is_some() {
             let kernel = "fused_gate_up_hfq4g256_pair_skew_k5120_global_gfx1201";
             self.ensure_kernel(
                 kernel,

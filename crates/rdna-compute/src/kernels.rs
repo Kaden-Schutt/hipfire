@@ -3670,24 +3670,6 @@ pub const FUSED_GATE_UP_HFQ4G256_PAIR_SKEW_K5120_GLOBAL_GFX1201_SRC: &str = conc
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256_pair_k5120.gfx1201.hip")
 );
-pub const FUSED_GATE_UP_HFQ4G256_PAIR_SKEW_W1_K5120_GLOBAL_GFX1201_SRC: &str = concat!(
-    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    "#define HIPFIRE_GATE_UP_PAIR_SKEW 1\n",
-    "#define HIPFIRE_GATE_UP_PAIR_WINDOW 1\n",
-    "#define HIPFIRE_GATE_UP_PAIR_KERNEL fused_gate_up_hfq4g256_pair_skew_w1_k5120_global_gfx1201\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_pair_k5120.gfx1201.hip")
-);
-pub const FUSED_GATE_UP_HFQ4G256_PAIR_SKEW_W2_K5120_GLOBAL_GFX1201_SRC: &str = concat!(
-    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    "#define HIPFIRE_GATE_UP_PAIR_SKEW 1\n",
-    "#define HIPFIRE_GATE_UP_PAIR_WINDOW 2\n",
-    "#define HIPFIRE_GATE_UP_PAIR_KERNEL fused_gate_up_hfq4g256_pair_skew_w2_k5120_global_gfx1201\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_pair_k5120.gfx1201.hip")
-);
 /// gfx1201 dense decode specialization. The host admits this artifact only
 /// for K=1024, allowing LLVM to remove the generic quad loop and dead tail
 /// bodies while retaining the base kernel's exact load/FMA/reduction order.
