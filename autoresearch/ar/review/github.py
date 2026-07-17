@@ -141,6 +141,14 @@ class GitHubResponse:
 
 
 @dataclass(frozen=True)
+class GitHubReviewRecord:
+    envelope: GitHubEnvelope
+    server_id: int
+    state: str
+    commit_id: str
+
+
+@dataclass(frozen=True)
 class EffectivePermission:
     login: str
     principal_type: str
@@ -724,6 +732,17 @@ class GitHubClient:
             extra=("state", "commit_id", "body"), expected_id=review_id, require_timestamp=False,
         )
         return response
+
+    def get_pull_review_record(self, repository: str, number: int, review_id: int) -> GitHubReviewRecord:
+        """Fetch review metadata and its protocol envelope from one exact API response."""
+        response = self.get_pull_review(repository, number, review_id)
+        data = self._require_mapping(response.data, "pull review")
+        envelope = self._envelope(data, record_name="pull request review")
+        state = data.get("state")
+        commit_id = data.get("commit_id")
+        if not isinstance(state, str) or not isinstance(commit_id, str):
+            raise GitHubBoundaryError("GitHub pull review state or commit identity is malformed")
+        return GitHubReviewRecord(envelope, data["id"], state, commit_id)
 
     def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
         repository = _repository(repository)

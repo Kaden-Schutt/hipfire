@@ -194,6 +194,10 @@ class ReviewPublisher:
             body = raw.get("body")
             if not isinstance(body, str):
                 continue
+            listed_user = raw.get("user")
+            listed_login = listed_user.get("login") if isinstance(listed_user, Mapping) else None
+            if listed_login not in self._trusted_authors:
+                continue
             try:
                 payload = decode_protocol_body(body)
             except Exception:
@@ -203,15 +207,19 @@ class ReviewPublisher:
             if payload.get("schema") != _SCHEMA:
                 continue
             try:
-                envelope = (
-                    self._client.review_envelope(target.repository, target.number, raw["id"])
-                    if is_review else self._client.comment_envelope(target.repository, raw["id"])
-                )
-                record = _HistoryRecord(
-                    envelope, is_review, raw["id"],
-                    raw.get("state") if is_review else None,
-                    raw.get("commit_id") if is_review else None,
-                )
+                if is_review:
+                    exact = self._client.get_pull_review_record(target.repository, target.number, raw["id"])
+                    envelope = exact.envelope
+                    state = exact.state
+                    commit_id = exact.commit_id
+                    server_id = exact.server_id
+                else:
+                    envelope = self._client.comment_envelope(target.repository, raw["id"])
+                    state = commit_id = None
+                    server_id = raw["id"]
+                if envelope.author not in self._trusted_authors:
+                    continue
+                record = _HistoryRecord(envelope, is_review, server_id, state, commit_id)
                 _target_from_payload(envelope.payload) if envelope.payload.get("record_type") != "revocation" else None
             except (KeyError, TypeError, ValueError, PublisherError) as exc:
                 raise PublisherError("a protocol record was deleted, edited, or malformed") from exc
@@ -417,11 +425,11 @@ class ReviewPublisher:
         record = response.data if hasattr(response, "data") else response
         if not isinstance(record, Mapping) or not isinstance(record.get("id"), int):
             raise PublisherError("GitHub review mutation did not return a server record")
-        server = self._client.get_pull_review(target.repository, target.number, record["id"]).data
-        envelope = self._client.review_envelope(target.repository, target.number, record["id"])
-        if server.get("state") != "CHANGES_REQUESTED" or server.get("commit_id") != target.head_sha:
+        exact = self._client.get_pull_review_record(target.repository, target.number, record["id"])
+        envelope = exact.envelope
+        if exact.state != "CHANGES_REQUESTED" or exact.commit_id != target.head_sha:
             raise PublisherError("created review metadata is not an active exact-head CHANGES_REQUESTED review")
-        return _HistoryRecord(envelope, True, record["id"], server["state"], server["commit_id"])
+        return _HistoryRecord(envelope, True, exact.server_id, exact.state, exact.commit_id)
 
     def _find_record(self, history: _History, target: ReviewTarget, attempt_id: str, record_type: str) -> _HistoryRecord | None:
         return next(
@@ -519,6 +527,9 @@ class ReviewPublisher:
         )
         for _ in range(_MAX_RECONCILIATION_ROUNDS):
             if not self._label_present(target):
+                self._reconcile_workflow_reviews(
+                    target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
+                )
                 return
             _, canonical = self._reconcile_workflow_reviews(
                 target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,

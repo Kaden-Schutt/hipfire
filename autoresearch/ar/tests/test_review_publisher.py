@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -100,6 +101,7 @@ class FakeGitHub:
         self.inject_review_on_remove = False
         self.inject_review_on_dismiss = False
         self.invalidate_keep_on_labels = False
+        self.mutate_exact_review_before_envelope = False
         self.arm_stale_on_canonical = False
         self.arm_keep_invalidation_on_canonical = False
         self.arm_stale_on_mutate_canonical = False
@@ -110,6 +112,7 @@ class FakeGitHub:
         self.transient_stale_on_history_read: int | None = None
         self.transient_keep_on_history_read: int | None = None
         self.transient_records: dict[int, dict] = {}
+        self.transient_review_states: dict[int, str] = {}
         self.deleted_comment_ids: set[int] = set()
         self.edited_comment_ids: set[int] = set()
 
@@ -153,6 +156,7 @@ class FakeGitHub:
             self.transient_records.pop(905, None)
             self.transient_stale_on_history_read = None
         if self.transient_keep_on_history_read == self.history_reads - 1:
+            self.transient_review_states.clear()
             self.transient_keep_on_history_read = None
         reviews = list(self.reviews)
         if self.inject_stale_on_history_read == self.history_reads and self.reviews:
@@ -180,6 +184,7 @@ class FakeGitHub:
             reviews.append(stale)
         if self.transient_keep_on_history_read == self.history_reads and reviews:
             reviews[0] = {**reviews[0], "state": "DISMISSED"}
+            self.transient_review_states[reviews[0]["id"]] = "DISMISSED"
         return GitHubResponse(reviews, {}, 200)
 
     def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
@@ -217,8 +222,10 @@ class FakeGitHub:
         if record["id"] in self.edited_comment_ids:
             updated = "2026-01-01T00:09:00Z"
         published = record["created_at"] if "created_at" in record else record["submitted_at"]
+        user = record.get("user", {})
         return GitHubEnvelope(
-            json.loads(self.payload_from_body(record["body"])), record["node_id"], TRUSTED, published, updated, "Bot"
+            json.loads(self.payload_from_body(record["body"])), record["node_id"],
+            user.get("login", TRUSTED), published, updated, user.get("type", "Bot")
         )
 
     def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:
@@ -230,6 +237,21 @@ class FakeGitHub:
 
     def get_pull_review(self, repository: str, number: int, review_id: int) -> GitHubResponse:
         return GitHubResponse(next(item for item in self.reviews if item["id"] == review_id), {}, 200)
+
+    def get_pull_review_record(self, repository: str, number: int, review_id: int):
+        records = [*self.reviews, *self.transient_records.values()]
+        record = next(item for item in records if item["id"] == review_id)
+        if review_id in self.transient_review_states:
+            record = {**record, "state": self.transient_review_states[review_id]}
+        if self.mutate_exact_review_before_envelope:
+            record["state"] = "DISMISSED"
+            self.mutate_exact_review_before_envelope = False
+        return SimpleNamespace(
+            envelope=self._envelope(record, "review"),
+            state=record["state"],
+            commit_id=record["commit_id"],
+            server_id=record["id"],
+        )
 
     def create_issue_comment(self, repository: str, number: int, body: str) -> GitHubResponse:
         record_type = json.loads(self.payload_from_body(body))["record_type"]
@@ -794,3 +816,76 @@ def test_pre_delete_canonical_snapshot_keep_review_invalidation_never_deletes_la
     assert result.status in {"error", "incomplete"}
     assert client.removed_labels == []
     assert "needs-review" in client.labels
+
+
+def test_absent_label_still_reconciles_new_stale_review():
+    client = FakeGitHub()
+    client.fail.add("remove_label")
+    first = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert first.status == "incomplete"
+    client.fail.remove("remove_label")
+    client.labels.clear()
+    client.inject_review_on_labels = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "duplicate", result.reason
+    assert ("dismiss", 902) in client.calls
+
+
+def test_exact_review_fetch_state_wins_over_list_state_on_retry():
+    client = FakeGitHub()
+    client.fail.add("remove_label")
+    first = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert first.status == "incomplete"
+    client.fail.remove("remove_label")
+    client.mutate_exact_review_before_envelope = True
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status == "error"
+    assert not client.removed_labels
+
+
+def test_untrusted_malformed_and_marker_comments_do_not_block_publication():
+    client = FakeGitHub()
+    client.comments.extend([
+        {"id": 700, "node_id": "hostile-marker", "user": {"login": "alice", "type": "User"},
+         "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+         "body": "<!-- agentic-review/v1\nnot protocol\n-->"},
+        {"id": 701, "node_id": "hostile-json", "user": {"login": "alice", "type": "User"},
+         "created_at": "2025-01-01T00:00:01Z", "updated_at": "2025-01-01T00:00:01Z",
+         "body": "{not protocol}"},
+    ])
+
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "complete", result.reason
+
+
+def test_untrusted_valid_intent_does_not_shadow_canonical_attempt():
+    target = {"repository": REPO, "number": 42, "head_repository": REPO, "head_sha": "head-sha",
+              "base_ref": "main", "base_sha": "base-sha", "merge_base_sha": "merge-sha"}
+    payload = {"schema": "agentic-review/v1", "record_type": "intent", "record_id": "untrusted-intent",
+               "target": target, "target_key": TARGET.target_key(), "attempt_id": "untrusted-attempt",
+               "canonical_digest": ""}
+    payload["canonical_digest"] = canonical_digest({key: value for key, value in payload.items() if key != "canonical_digest"})
+    client = FakeGitHub()
+    client.comments.append({"id": 702, "node_id": "untrusted-intent", "user": {"login": "alice", "type": "User"},
+                            "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+                            "body": json.dumps(payload)})
+
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "complete", result.reason
+
+
+def test_trusted_malformed_protocol_record_fails_closed():
+    client = FakeGitHub()
+    client.comments.append({"id": 703, "node_id": "trusted-malformed", "user": {"login": TRUSTED, "type": "Bot"},
+                            "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+                            "body": json.dumps({"schema": "agentic-review/v1", "record_type": "report"})})
+
+    result = _publisher(client).publish(_proposal(), TARGET)
+
+    assert result.status == "error"
