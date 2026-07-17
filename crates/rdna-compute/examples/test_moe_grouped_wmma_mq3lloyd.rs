@@ -1,5 +1,5 @@
 //! Byte-equivalent CPU/GPU correctness check for
-//! `gemm_mq3g256_lloyd_moe_grouped_wmma` (MQ3-Lloyd grouped WMMA).
+//! `gemm_mq3g256_lloyd_moe_grouped` (arch-resolved MQ3-Lloyd grouped GEMM).
 //!
 //! Weight layout: 112 B/group = 16 B (8 × fp16 codebook entries) +
 //! 96 B (256 × 3-bit indices, packed 8-per-3-bytes LSB-first).
@@ -410,7 +410,7 @@ fn run_case(
 
     let y_gpu = alloc_f32_zeros(&mut gpu, m_total * m);
 
-    gpu.gemm_mq3g256_lloyd_moe_grouped_wmma(
+    gpu.gemm_mq3g256_lloyd_moe_grouped(
         &expert_weight_ptrs,
         &expert_tile_ids,
         &sorted_slot_index,
