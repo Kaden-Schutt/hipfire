@@ -3678,6 +3678,12 @@ async function serve(port: number, host: string) {
           // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
           frequency_penalty: Math.max(0, Number(body.frequency_penalty) || 0),
         };
+        // OpenAI-compatible deterministic sampling. Keep omission meaningful:
+        // the daemon retains its historical default stream when the client did
+        // not request a seed.
+        if (typeof (body as any).seed === "number" && Number.isFinite((body as any).seed)) {
+          genParams.seed = Math.trunc((body as any).seed);
+        }
         // temperature is sent verbatim (the legacy ×0.82 TEMP_CORRECTION was
         // removed 2026-06-18 — see the note at the top of the file).
         {

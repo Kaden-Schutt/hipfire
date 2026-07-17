@@ -701,6 +701,12 @@ pub trait Speculator {
     /// applies the IDENTICAL (top_k,top_p) nucleus truncation to draft + target
     /// inside `step` (lossless == AR-at-(top_k,top_p)). `temp <= 0` ⇒ greedy.
     fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
+
+    /// Seed the per-request sampler stream. The OpenAI `seed` field reaches
+    /// this hook before `prefill`, so sampling-capable drafters use one stream
+    /// for the initial target token and every later acceptance window.
+    /// Greedy-only drafters may ignore it.
+    fn set_seed(&mut self, _seed: u64) {}
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────

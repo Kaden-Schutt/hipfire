@@ -474,22 +474,37 @@ impl Speculator for DflashSpeculator {
             self.df.draft_scratch.thlog.set_resume_checkpoint(ckpt);
         }
 
-        // First emit = target argmax at the final prompt position (seed already
-        // ran the per-token forward; scratch.logits holds the post-prompt logits).
+        // First emit comes directly from the target distribution at the final
+        // prompt position. This token is outside every later draft/verify
+        // window, so using argmax here for a sampled request silently changed
+        // the request distribution before speculation even began.
         let first_logits = gpu
             .download_f32(&slot.scratch.logits)
             .map_err(|e| e.to_string())?;
-        let first_token = first_logits
-            .iter()
-            .enumerate()
-            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-                if v > bv {
-                    (i as u32, v)
-                } else {
-                    (best, bv)
-                }
-            })
-            .0;
+        let first_token = if self.sample_temp > 0.0 {
+            let cfg = crate::mtp_spec::MtpSamplingConfig {
+                temp: self.sample_temp,
+                top_k: self.sample_top_k,
+                top_p: self.sample_top_p,
+                min_p: 0.0,
+            };
+            let mut rng = crate::mtp_spec::MtpRng::from_state(self.rng_state);
+            let (token, _) = crate::mtp_spec::sample_from_logits(&first_logits, &cfg, &mut rng);
+            self.rng_state = rng.state();
+            token
+        } else {
+            first_logits
+                .iter()
+                .enumerate()
+                .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                    if v > bv {
+                        (i as u32, v)
+                    } else {
+                        (best, bv)
+                    }
+                })
+                .0
+        };
         Ok(PrefillOutcome::Ready { first_token })
     }
 
@@ -671,22 +686,25 @@ impl Speculator for DflashSpeculator {
 
     fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, cactus_delta: f32) {
         // Store the request's sampling config for the chain-mode branch of
-        // `step`. Re-seed the RNG to the same fixed value spec-graph used per
-        // `generate_dflash` call (a fresh `let mut rng_state = 0x13579BDF`), so a
-        // sampled request is deterministic given its seed and two identical
-        // requests in one session produce identical output — preserving
-        // spec-graph's behavior rather than letting the seed drift across turns.
+        // `step`. `set_seed` owns per-request RNG initialization so changing
+        // sampling controls cannot silently clobber the OpenAI seed.
         self.sample_temp = temp;
         self.sample_top_p = top_p;
         self.sample_top_k = top_k;
         self.sample_cactus = cactus_delta;
-        self.rng_state = 0x13579BDF;
         self.adaptive_b = self.df.block_size;
         self.adaptive_samples.clear();
         self.adaptive_cooldown = 0;
         self.ar_probe_remaining = 0;
         self.ar_rate_ewma = None;
         self.spec_rate_ewma = None;
+    }
+
+    fn set_seed(&mut self, seed: u64) {
+        // MtpRng's seed mixer avoids the all-zero fixed point and gives the
+        // first-token host sampler a valid raw state. Later DFlash windows keep
+        // advancing this same state through their existing xorshift path.
+        self.rng_state = crate::mtp_spec::MtpRng::new(seed).state();
     }
 
     fn requires_greedy(&self) -> bool {

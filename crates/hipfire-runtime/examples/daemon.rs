@@ -2065,6 +2065,14 @@ fn main() {
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(4096) as usize;
+                // OpenAI-compatible reproducibility seed. Fold signed JSON
+                // integers into u64 as two's-complement so every accepted
+                // integer has a deterministic stream. Omitted preserves the
+                // historical default stream.
+                let sampling_seed = msg
+                    .get("seed")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|seed| seed as u64)))
+                    .unwrap_or(0x13579BDF);
                 let top_p = msg
                     .get("top_p")
                     .and_then(|v| v.as_f64())
@@ -2424,6 +2432,7 @@ fn main() {
                         system,
                         temp,
                         top_p,
+                        sampling_seed,
                         top_k,
                         min_p,
                         cactus_delta,
@@ -7840,6 +7849,7 @@ fn generate(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    sampling_seed: u64,
     top_k: Option<u32>,
     min_p: Option<f32>,
     // CACTUS acceptance-boost δ (0 = lossless). Request opt-in; applies only to a
@@ -7861,11 +7871,14 @@ fn generate(
     think_mode: ThinkMode,
     stop: &[String],
 ) {
-    // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
-    // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
-    // request and does not carry RNG state across requests. Matches the u32 the
-    // GPU sample path uses (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    // One request seed drives AR fallbacks, grammar sampling, the initial
+    // target token, and every speculative window. Previously the HTTP `seed`
+    // was dropped and DFlash independently reset itself to 0x13579BDF.
+    let sampling_seed_u32 = ((sampling_seed >> 32) as u32) ^ sampling_seed as u32;
+    hipfire_runtime::llama::reset_cpu_sampler_rng(sampling_seed_u32);
+    if let Some(spec) = m.speculator.as_mut() {
+        spec.set_seed(sampling_seed);
+    }
     // Expert-parallel (task #26): route to generate_ep BEFORE any arch
     // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
@@ -7876,8 +7889,8 @@ fn generate(
         // ladder, all done at the call site above) into the EP decode loops.
         // Previously the EP path dropped these to a hardcoded greedy argmax,
         // which loops on ds4's quantized instruct model (card mandates
-        // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
-        // called above, so the host-side draw in ep_serve_* is deterministic.
+        // temp=1.0/top_p=1.0). The request seed was already installed above,
+        // so the host-side draw in ep_serve_* is deterministic when requested.
         let ep_sampling = EpSampling {
             temp,
             top_p,
@@ -10734,6 +10747,7 @@ fn generate(
         );
         let _ = stdout.flush();
     }
+
 }
 
 /// DeepSeek V4 Flash generate path (arch_id=9, hipfire-arch-deepseek4).
@@ -14833,5 +14847,4 @@ mod tool_call_parser_tests {
             None, 1.0, 0.0, 0.5,
         ));
     }
-
 }
