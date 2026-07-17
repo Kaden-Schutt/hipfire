@@ -597,3 +597,59 @@ def test_unconfigured_app_cannot_become_trusted_by_spoofed_login():
     client = Client()
     summary = discover_pull_requests(client, REPO, configuration=configuration(), operator_credential=DISCOVERY_BOT)
     assert summary.incomplete
+
+
+def test_discover_review_push_discover_cycle():
+    """Full lifecycle: discover → publish review → discover clean → push new head → discover needs-review."""
+    config = _configuration().with_trusted_publishers({
+        "schema": "hipfire.agentic-review.trusted-publishers",
+        "version": 1,
+        "apps": [{
+            "app_id": 1,
+            "login": "review-bot",
+            "installation_id": 2,
+            "repository_id": 8,
+            "credential_attestation_digest": BOT_OPERATOR["credential_attestation_digest"],
+        }],
+    })
+    source = config.source
+    object.__setattr__(config, "_loaded_from_protected_paths", True)
+    object.__setattr__(config, "_loaded_source_digest", source.config_digest)
+    object.__setattr__(config, "_loaded_root_identity", source.root_identity)
+
+    client = FakeGitHub()
+    client.get_repository = lambda repository: SimpleNamespace(data={"id": 8, "full_name": repository})
+    client.list_installation_repositories = lambda: SimpleNamespace(data={"repositories": [{"id": 8}]})
+    client.get_authenticated_user = lambda: SimpleNamespace(data={"id": 1, "login": "review-bot", "type": "Bot"})
+    client.list_pull_requests = lambda repository, *, max_pages=16: SimpleNamespace(
+        data=[{"number": 42, "draft": False}], headers={}
+    )
+
+    repo = PUBLISH_TARGET.repository
+    discovery_op = {
+        "schema": "hipfire.agentic-review.operator-credentials",
+        "version": 1,
+        "repository": repo,
+        "principal": {"login": "review-bot", "type": "Bot"},
+        "allowed_operations": ["discover", "dismiss-workflow-review"],
+        "write_permissions": {"issues": "write", "pull_requests": "write"},
+        "credential_attestation_digest": BOT_OPERATOR["credential_attestation_digest"],
+    }
+
+    summary = discover_pull_requests(client, repo, configuration=config, operator_credential=discovery_op)
+    assert [item.number for item in summary.needs_review] == [42]
+    assert not summary.clean
+
+    publisher = ReviewPublisher(client, configuration=config, operator_credential=BOT_OPERATOR)
+    result = publisher.publish(_proposal("clean"), PUBLISH_TARGET)
+    assert result.status == "complete", result.reason
+
+    summary = discover_pull_requests(client, repo, configuration=config, operator_credential=discovery_op)
+    assert [item.number for item in summary.clean] == [42]
+    assert not summary.needs_review
+
+    new_target = replace(PUBLISH_TARGET, head_sha="new-head-sha", head_repository=repo)
+    client.pull = client._pull(new_target)
+
+    summary = discover_pull_requests(client, repo, configuration=config, operator_credential=discovery_op)
+    assert [item.number for item in summary.needs_review] == [42]
