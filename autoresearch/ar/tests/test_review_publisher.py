@@ -101,6 +101,7 @@ class FakeGitHub:
         self.inject_review_on_remove = False
         self.inject_review_on_dismiss = False
         self.invalidate_keep_on_labels = False
+        self.change_target_on_labels: ReviewTarget | None = None
         self.mutate_exact_review_before_envelope = False
         self.arm_stale_on_canonical = False
         self.arm_keep_invalidation_on_canonical = False
@@ -189,6 +190,9 @@ class FakeGitHub:
 
     def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
         self.calls.append(("list_labels", None))
+        if self.change_target_on_labels is not None:
+            self.pull = self._pull(self.change_target_on_labels)
+            self.change_target_on_labels = None
         if self.invalidate_keep_on_labels and self.reviews:
             self.reviews[0]["state"] = "DISMISSED"
             self.invalidate_keep_on_labels = False
@@ -845,6 +849,21 @@ def test_exact_review_fetch_state_wins_over_list_state_on_retry():
 
     assert result.status == "error"
     assert not client.removed_labels
+
+
+def test_absent_label_target_change_during_lookup_returns_stale():
+    client = FakeGitHub()
+    client.fail.add("remove_label")
+    first = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+    assert first.status == "incomplete"
+    client.fail.remove("remove_label")
+    client.labels.clear()
+    client.change_target_on_labels = replace(TARGET, base_sha="advanced-base")
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status in {"stale", "error"}
+    assert "needs-review" in client.labels
 
 
 def test_untrusted_malformed_and_marker_comments_do_not_block_publication():
