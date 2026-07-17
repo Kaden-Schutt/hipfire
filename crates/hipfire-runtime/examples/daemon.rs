@@ -5767,6 +5767,10 @@ fn generate_spec(
     // conversation; fall back to a cold next turn rather than publishing that
     // mismatched state to the LCP cache.
     let mut terminal_state_cacheable = true;
+    // A normal full window leaves its final bonus unforwarded and needs the
+    // post-loop seed bake. A successfully trimmed partial window replays through
+    // its last visible accepted token, so its cursor is already fully baked.
+    let mut terminal_seed_materialized = false;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
@@ -5955,13 +5959,37 @@ fn generate_spec(
                 None => {}
             }
         }
-        if observed_tail != committed_tail.len() {
-            terminal_state_cacheable = false;
+        let partial_tail = observed_tail != committed_tail.len();
+        if partial_tail
+            && terminal_state_cacheable
+            && forced_after.is_empty()
+            && !emit.grammar_violated()
+        {
+            // The verifier advanced through more accepted drafts than the
+            // emitter exposed (most commonly `<|im_end|>` inside an accepted
+            // block). DFlash can restore its pre-window snapshot and replay the
+            // visible seed+prefix exactly; other speculators decline and reset.
+            match spec.trim_terminal_window(gpu, slot, position, observed_tail) {
+                Ok(()) => {
+                    position += observed_tail + 1;
+                    terminal_seed_materialized = true;
+                }
+                Err(e) => {
+                    eprintln!("[spec] terminal window trim unavailable: {e}");
+                    terminal_state_cacheable = false;
+                    position += step.emit.len();
+                    seed_token = step.next_seed;
+                }
+            }
+        } else {
+            if partial_tail {
+                terminal_state_cacheable = false;
+            }
+            // Full-window contract: advance by emit.len() (= accepted + 1),
+            // leaving the final bonus at `position` as the next unbaked seed.
+            position += step.emit.len();
+            seed_token = step.next_seed;
         }
-        // Advance by the emitted-tail length (= accepted + 1), NOT by `accepted`
-        // — the loop contract pinned by spec.rs's `emit_len_drives_advance`.
-        position += step.emit.len();
-        seed_token = step.next_seed;
 
         // Forced-token injection (cohere2moe generation guards; no-op for every
         // other emitter — `take_forced` defaulted empty). The target already
@@ -6033,11 +6061,19 @@ fn generate_spec(
     let streamed_tokens = emit.streamed_tokens().to_vec();
     let grammar_violated = emit.grammar_violated();
 
+    if terminal_state_cacheable && terminal_seed_materialized && m.eviction.is_none() {
+        debug_assert_eq!(
+            position,
+            prompt_tokens.len() + emitted.len(),
+            "trimmed spec terminal cursor must equal the visible conversation length"
+        );
+    }
+
     // The final emitted token is the next seed returned by the last speculative
     // window. It has not yet been forwarded: target state covers positions
     // `[0, position)`, while `seed_token` lives at `position`. Bake it before
     // advertising the full rendered conversation as a reusable prefix.
-    if terminal_state_cacheable && !grammar_violated {
+    if terminal_state_cacheable && !grammar_violated && !terminal_seed_materialized {
         if m.eviction.is_none() {
             debug_assert_eq!(
                 position + 1,

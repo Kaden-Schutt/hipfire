@@ -609,6 +609,20 @@ mod target_hidden_log {
             }
         }
 
+        /// Terminal partial-window rollback: keep only the committed prefix
+        /// `[0..rows)`. The target recurrent state is rewound separately by the
+        /// speculator; this makes the draft's hidden/projection cursors describe
+        /// the same prefix and hides stale rows from the next turn.
+        pub fn truncate_committed(&mut self, rows: usize) {
+            debug_assert!(
+                rows <= self.uploaded_rows,
+                "truncate_committed: rows exceeds uploaded watermark"
+            );
+            self.uploaded_rows = rows;
+            self.abs_positions.truncate(rows);
+            self.proj_cached_rows = self.proj_cached_rows.min(rows);
+        }
+
         /// Post-eviction rebuild: `new_abs` is the compacted absolute-position
         /// list (one entry per retained row). Replaces the row layout and
         /// invalidates the projection cache (row indices shifted).
@@ -1704,7 +1718,7 @@ pub fn draft_forward_opts(
 
 #[cfg(test)]
 mod tests {
-    use super::{DflashAttentionKind, DflashConfig};
+    use super::{DflashAttentionKind, DflashConfig, TargetHiddenLog};
     use serde_json::{json, Value};
 
     fn metadata(config: Value) -> Value {
@@ -1778,5 +1792,20 @@ mod tests {
             ]
         }));
         assert!(DflashConfig::from_metadata(&missing_window).is_none());
+    }
+
+    #[test]
+    fn target_hidden_log_truncates_terminal_verify_tail() {
+        let mut log = TargetHiddenLog::new();
+        log.seed_prompt(4);
+        log.mark_proj_cached(4);
+        log.append_committed(4, 4, 0);
+        log.mark_proj_cached(8);
+
+        log.truncate_committed(6);
+
+        assert_eq!(log.uploaded_rows(), 6);
+        assert_eq!(log.abs_positions(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(log.proj_cached_rows(), 6);
     }
 }

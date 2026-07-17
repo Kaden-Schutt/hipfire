@@ -676,6 +676,46 @@ impl Speculator for DflashSpeculator {
         Ok(())
     }
 
+    fn trim_terminal_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        keep_tail: usize,
+    ) -> Result<(), String> {
+        // `target_snap` is the pre-window DeltaNet state and `gdn_tape` holds
+        // the just-verified linear inputs. A strict prefix of `step.emit` cannot
+        // include the final bonus, so replaying seed + kept accepted drafts
+        // (`keep_tail + 1` rows) exactly materializes the visible conversation.
+        self.df
+            .gdn_tape
+            .wait_replay(gpu)
+            .map_err(|e| e.to_string())?;
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        self.df
+            .target_snap
+            .restore_to(&mut slot.dn_state, gpu)
+            .map_err(|e| e.to_string())?;
+        self.df
+            .gdn_tape
+            .replay_gdn(
+                gpu,
+                &slot.weights,
+                &slot.config,
+                &mut slot.dn_state,
+                keep_tail + 1,
+            )
+            .map_err(|e| e.to_string())?;
+        self.df
+            .draft_scratch
+            .thlog
+            .truncate_committed(position + keep_tail + 1);
+        Ok(())
+    }
+
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
         // Compact the drafter's cached target-hidden rows to match the target KV
         // after the FlashCASK eviction the daemon already applied to the target.

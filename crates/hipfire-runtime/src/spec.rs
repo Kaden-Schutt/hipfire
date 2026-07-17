@@ -648,6 +648,26 @@ pub trait Speculator {
         }
     }
 
+    /// Rewind a verified window when emission stopped inside its committed
+    /// tail, then retain exactly `keep_tail` visible tail tokens plus the
+    /// window's input seed. The target is at the pre-window `position` before
+    /// those `keep_tail + 1` inputs conceptually advance it.
+    ///
+    /// Only stateful speculators that retain a pre-window snapshot/tape can do
+    /// this without a cold reset. The default declines the optimization; the
+    /// daemon will discard the resident state rather than cache an over-advanced
+    /// verifier trajectory.
+    fn trim_terminal_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        keep_tail: usize,
+    ) -> Result<(), String> {
+        let _ = (gpu, target, position, keep_tail);
+        Err("speculator cannot trim a partially emitted verify window".to_string())
+    }
+
     /// Compact drafter-local cached state after a target KV eviction the daemon
     /// already applied. Default no-op for drafters with no target-hidden cache.
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
