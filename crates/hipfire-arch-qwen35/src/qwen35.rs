@@ -13565,9 +13565,6 @@ struct Qwen35Bindings<'a> {
     n_v_heads: usize,
     hd: usize,
     precomputed_attn_x_rot: bool,
-    /// The gfx1201 dense-27B PM4 experiment emits QKV in `run_proj`, then
-    /// defers the independent Z/beta/alpha producer until after convolution.
-    defer_qkvza_tail: bool,
     fa_output_prerotated: bool,
     defer_routed_combine: bool,
 }
@@ -13675,32 +13672,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         ))
                     }
                 };
-                if qkvza_pc_split_gfx1201_enabled(
-                    gpu, config, wqkv, wz, w_beta, w_alpha,
-                ) {
-                    let eff_x = if self.precomputed_attn_x_rot {
-                        &s.x_rot
-                    } else {
-                        fused_rmsnorm_rotate_for_mq(
-                            gpu,
-                            wqkv,
-                            &s.x,
-                            attn_norm,
-                            &s.tmp,
-                            &s.x_rot,
-                            config.norm_eps,
-                        )
-                        .map_err(|e| DispatchError::Hip(e.to_string()))?
-                        .unwrap_or(&s.tmp)
-                    };
-                    let result = gpu.fused_qkvza_hfq4g256_r2_k5120_qkv_gfx1201(
-                        &wqkv.buf, eff_x, &s.dn_qkv,
-                    );
-                    if result.is_ok() {
-                        self.defer_qkvza_tail = true;
-                    }
-                    result
-                } else if self.precomputed_attn_x_rot {
+                if self.precomputed_attn_x_rot {
                     qkvza_from_prerotated_mq(
                         gpu,
                         wqkv,
@@ -14082,7 +14054,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         self.n_v_heads,
                         self.dn_state.quant,
                     );
-                if !self.defer_qkvza_tail && !qkvza_scalar_prep && !conv_scalar_prep {
+                if !qkvza_scalar_prep && !conv_scalar_prep {
                     gpu.fused_sigmoid_alpha_gate_f32(
                         &s.dn_beta,
                         &s.dn_alpha,
@@ -14147,29 +14119,6 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         1.0 / (self.hd as f32).sqrt(),
                         config.norm_eps,
                     )?;
-                }
-                if self.defer_qkvza_tail {
-                    // QKV has completed before convolution. Z/beta/alpha reads
-                    // only the normalized input and distinct weights/outputs,
-                    // so Redline can omit the conv->ZBA boundary and overlap
-                    // both producers until this sigmoid join.
-                    gpu.fused_qkvza_hfq4g256_r2_k5120_zba_gfx1201(
-                        &wz.buf,
-                        &w_beta.buf,
-                        &w_alpha.buf,
-                        &s.x_rot,
-                        &s.dn_z,
-                        &s.dn_beta,
-                        &s.dn_alpha,
-                    )?;
-                    gpu.fused_sigmoid_alpha_gate_f32(
-                        &s.dn_beta,
-                        &s.dn_alpha,
-                        dt_bias,
-                        a_log,
-                        self.n_v_heads,
-                    )?;
-                    self.defer_qkvza_tail = false;
                 }
                 if gdn_compact2_enabled(gpu, config, self.n_v_heads, self.dn_state.quant) {
                     // The compact Q8 recurrence maps state head h to Q/K head
@@ -14476,42 +14425,6 @@ fn qwen35_fa_norm_prep_gfx1201_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool
         && n_rot == 64
 }
 
-/// PM4 producer/consumer experiment for the exact dense Qwen3.5-27B MQ4
-/// shape. QKV is emitted first; `ATTEND_DN_PREP` consumes it with convolution
-/// before emitting the independent Z/beta/alpha tail. This is deliberately
-/// opt-in until strict replay parity and a stationary battery justify it.
-#[allow(clippy::too_many_arguments)]
-fn qkvza_pc_split_gfx1201_enabled(
-    gpu: &Gpu,
-    config: &Qwen35Config,
-    wqkv: &WeightTensor,
-    wz: &WeightTensor,
-    w_beta: &WeightTensor,
-    w_alpha: &WeightTensor,
-) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_GFX1201_QKVZA_PC_SPLIT").as_deref() == Ok("1")
-    });
-    enabled
-        && gpu.arch_caps.is_gfx1201()
-        && gpu.flags.gfx1201_hfq4_27b_global
-        && config.dim == 5_120
-        && wqkv.k == 5_120
-        && wqkv.m == 10_240
-        && wz.m == 6_144
-        && w_beta.m == 48
-        && w_alpha.m == 48
-        && wqkv.gpu_dtype == DType::MQ4G256
-        && wz.gpu_dtype == DType::MQ4G256
-        && w_beta.gpu_dtype == DType::MQ4G256
-        && w_alpha.gpu_dtype == DType::MQ4G256
-        && wqkv.awq_scale.is_none()
-        && wz.awq_scale.is_none()
-        && w_beta.awq_scale.is_none()
-        && w_alpha.awq_scale.is_none()
-}
-
 /// Pair Q8 K/V cache writes and fold the Qwen output gate plus MQ rotation into
 /// the flash-attention reduce epilogue on the certified gfx1100/MQ4 shape. Set
 /// `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
@@ -14729,7 +14642,6 @@ fn forward_scratch_layers_lowered(
                 n_v_heads,
                 hd,
                 precomputed_attn_x_rot: fused_transition && reuse_fused_rotation,
-                defer_qkvza_tail: false,
                 fa_output_prerotated: false,
                 defer_routed_combine: combine_next_rms && layer_idx + 1 < config.n_layers,
             };
@@ -14887,7 +14799,6 @@ pub fn forward_ep(
                 n_v_heads,
                 hd,
                 precomputed_attn_x_rot: false,
-                defer_qkvza_tail: false,
                 fa_output_prerotated: false,
                 defer_routed_combine: false,
             });
