@@ -5962,7 +5962,6 @@ fn generate_spec(
         let partial_tail = observed_tail != committed_tail.len();
         if partial_tail
             && terminal_state_cacheable
-            && forced_after.is_empty()
             && !emit.grammar_violated()
         {
             // The verifier advanced through more accepted drafts than the
@@ -5991,41 +5990,56 @@ fn generate_spec(
             seed_token = step.next_seed;
         }
 
-        // Forced-token injection (cohere2moe generation guards; no-op for every
-        // other emitter — `take_forced` defaulted empty). The target already
-        // batch-advanced over the whole committed tail, so `position` is now its
-        // true cursor: advance it over each forced token, re-feed the token
-        // through the emitter (a marker transitions its state machine + emits a
-        // Committed event), set the next draft seed to it, and continue WITHOUT
-        // honoring the suppressed terminator. Bounded by the emitter's own
-        // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
+        // Forced-token injection (think-budget close / generation guards). First
+        // materialize the triggering visible token exactly. Then advance every
+        // forced token EXCEPT the last through target + drafter side state; the
+        // last remains the next unbaked speculative seed at `position`. This is
+        // the same invariant as an ordinary window and avoids re-feeding the
+        // final forced marker at the following position.
         if !forced_after.is_empty() {
-            // Intervention changes the visible sequence after a verifier has
-            // already advanced over its original tail. Preserve the response,
-            // but do not reuse this mixed speculative state on the next turn.
-            terminal_state_cacheable = false;
-            for ft in std::mem::take(&mut forced_after) {
-                if let Err(e) =
-                    slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
-                {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"error","id":"{}","message":"forced-token advance: {}"}}"#,
-                        id, e
-                    );
-                    let _ = stdout.flush();
-                    hit_eos = true;
-                    break;
+            if terminal_state_cacheable && !terminal_seed_materialized {
+                match spec.bake_terminal_seed(gpu, slot, position, seed_token) {
+                    Ok(()) => {
+                        position += 1;
+                        terminal_seed_materialized = true;
+                    }
+                    Err(e) => {
+                        eprintln!("[spec] forced-token seed bake failed: {e}");
+                        terminal_state_cacheable = false;
+                    }
                 }
-                position += 1;
+            }
+
+            let forced = std::mem::take(&mut forced_after);
+            let materialized_count = forced.len().saturating_sub(1);
+            if terminal_state_cacheable && materialized_count > 0 {
+                if let Err(e) = spec.advance_materialized_tokens(
+                    gpu,
+                    slot,
+                    position,
+                    &forced[..materialized_count],
+                ) {
+                    eprintln!("[spec] forced-token prefix advance failed: {e}");
+                    terminal_state_cacheable = false;
+                } else {
+                    position += materialized_count;
+                }
+            }
+
+            for &ft in &forced {
                 emit.set_generated_hint(generated);
                 let fo = emit.observe(ft);
                 if !fo.events.is_empty() {
                     emitted.push(ft);
                     render_client_events(stdout, id, &fo.events, t0.elapsed().as_millis() as u64);
                     generated += 1;
+                } else {
+                    terminal_state_cacheable = false;
                 }
-                seed_token = ft;
+            }
+            if let Some(&last) = forced.last() {
+                seed_token = last;
+                terminal_seed_materialized = false;
             }
         }
         // Per-cycle eviction (FlashCASK). Fires whenever current physical

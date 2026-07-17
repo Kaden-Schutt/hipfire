@@ -631,6 +631,19 @@ impl Speculator for DflashSpeculator {
         // and mirror its extracted hidden row into DFlash's cumulative context.
         // Without this bake, an exact LCP cache hit starts its suffix one token
         // ahead of both the target recurrent state and the draft hidden log.
+        self.advance_materialized_tokens(gpu, target, position, &[seed])
+    }
+
+    fn advance_materialized_tokens(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        tokens: &[u32],
+    ) -> Result<(), String> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
         self.df
             .gdn_tape
             .wait_replay(gpu)
@@ -648,7 +661,7 @@ impl Speculator for DflashSpeculator {
             gpu,
             slot,
             &mut self.df.hidden_rb,
-            &[seed],
+            tokens,
             position,
             &|| false,
             ckpt_sink,
@@ -657,22 +670,22 @@ impl Speculator for DflashSpeculator {
         )
         .map_err(|e| e.to_string())?;
         if aborted {
-            return Err("terminal DFlash seed bake unexpectedly aborted".to_string());
+            return Err("materialized DFlash token advance unexpectedly aborted".to_string());
         }
         scatter_hidden_block_to_interleaved(
             gpu,
             &self.df.hidden_rb,
             &self.df.draft_scratch.target_hidden,
             position,
-            1,
-            1,
+            tokens.len(),
+            tokens.len(),
         )
         .map_err(|e| e.to_string())?;
         let compact_offset = slot.kv_cache.compact_offset as i32;
         self.df
             .draft_scratch
             .thlog
-            .append_committed(position, 1, compact_offset);
+            .append_committed(position, tokens.len(), compact_offset);
         Ok(())
     }
 

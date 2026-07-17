@@ -642,9 +642,26 @@ pub trait Speculator {
         position: usize,
         seed: u32,
     ) -> Result<(), String> {
-        match target.spec_advance(gpu, &[seed], position, false, &|| false, None)? {
+        self.advance_materialized_tokens(gpu, target, position, &[seed])
+    }
+
+    /// Advance target and drafter side state over already-committed tokens.
+    /// Used for forced generation markers that must be materialized before the
+    /// final forced token becomes the next speculative seed. The default owns
+    /// no drafter-local position cache and advances only the target.
+    fn advance_materialized_tokens(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        tokens: &[u32],
+    ) -> Result<(), String> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        match target.spec_advance(gpu, tokens, position, false, &|| false, None)? {
             SpecAdvance::Ready { .. } => Ok(()),
-            SpecAdvance::Aborted => Err("terminal seed bake unexpectedly aborted".to_string()),
+            SpecAdvance::Aborted => Err("committed token advance unexpectedly aborted".to_string()),
         }
     }
 
