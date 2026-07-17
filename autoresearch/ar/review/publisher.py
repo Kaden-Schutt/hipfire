@@ -557,6 +557,7 @@ class ReviewPublisher:
                 self._reconcile_workflow_reviews(
                     target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
                 )
+                self._assert_target(target)
                 return
             except Exception:
                 self._reapply_label(target, attempt_id)

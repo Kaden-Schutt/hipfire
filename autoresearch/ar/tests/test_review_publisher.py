@@ -102,6 +102,9 @@ class FakeGitHub:
         self.inject_review_on_dismiss = False
         self.invalidate_keep_on_labels = False
         self.change_target_on_labels: ReviewTarget | None = None
+        self.change_target_after_remove: ReviewTarget | None = None
+        self.change_target_on_history_read: ReviewTarget | None = None
+        self.change_target_on_history_read_at: int | None = None
         self.mutate_exact_review_before_envelope = False
         self.arm_stale_on_canonical = False
         self.arm_keep_invalidation_on_canonical = False
@@ -153,6 +156,10 @@ class FakeGitHub:
     def list_pull_reviews(self, repository: str, number: int) -> GitHubResponse:
         self.calls.append(("list_reviews", None))
         self.history_reads += 1
+        if self.change_target_on_history_read is not None and self.change_target_on_history_read_at == self.history_reads:
+            self.pull = self._pull(self.change_target_on_history_read)
+            self.change_target_on_history_read = None
+            self.change_target_on_history_read_at = None
         if self.transient_stale_on_history_read == self.history_reads - 1:
             self.transient_records.pop(905, None)
             self.transient_stale_on_history_read = None
@@ -325,6 +332,10 @@ class FakeGitHub:
             raise RuntimeError("label removal failed")
         self.removed_labels.append(label)
         self.labels.discard(label)
+        if self.change_target_after_remove is not None:
+            self.change_target_on_history_read = self.change_target_after_remove
+            self.change_target_on_history_read_at = self.history_reads + 2
+            self.change_target_after_remove = None
         if self.inject_review_on_remove and self.reviews:
             stale = deepcopy(self.reviews[0])
             stale["id"] = 903
@@ -859,6 +870,16 @@ def test_absent_label_target_change_during_lookup_returns_stale():
     client.fail.remove("remove_label")
     client.labels.clear()
     client.change_target_on_labels = replace(TARGET, base_sha="advanced-base")
+
+    result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
+
+    assert result.status in {"stale", "error"}
+    assert "needs-review" in client.labels
+
+
+def test_target_change_during_final_reconciliation_never_returns_complete():
+    client = FakeGitHub()
+    client.change_target_after_remove = replace(TARGET, merge_base_sha="advanced-merge")
 
     result = _publisher(client).publish(_proposal("changes-requested"), TARGET)
 
