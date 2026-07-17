@@ -123,7 +123,7 @@ class ReviewPublisher:
         configuration: ReviewConfiguration,
         operator_credential: Mapping[str, Any],
         trusted_authors: Iterable[str] | None = None,
-        author_authorizer: Callable[[str, str], bool] | None = None,
+        author_authorizer: Callable[..., bool] | None = None,
     ) -> None:
         if not isinstance(configuration, ReviewConfiguration) or not configuration.is_protected:
             raise PublisherError("publisher requires an authenticated immutable configuration")
@@ -139,6 +139,7 @@ class ReviewPublisher:
         self._additional_trusted_authors = set(trusted_authors or ())
         self._author_authorizer = author_authorizer
         self._discovery_authority_enabled = False
+        self._discovery_requires_dismissal = False
 
     @property
     def _trusted_authors(self) -> frozenset[str]:
@@ -152,10 +153,14 @@ class ReviewPublisher:
         authors.update(self._additional_trusted_authors)
         return frozenset(authors)
 
-    def _author_trusted(self, login: Any, principal_type: Any) -> bool:
+    def _author_trusted(self, login: Any, principal_type: Any, envelope: GitHubEnvelope | None = None) -> bool:
         if self._author_authorizer is not None and isinstance(login, str) and isinstance(principal_type, str):
             try:
-                if self._author_authorizer(login, principal_type):
+                if envelope is not None:
+                    authorized = self._author_authorizer(login, principal_type, envelope)
+                else:
+                    authorized = self._author_authorizer(login, principal_type)
+                if authorized:
                     self._additional_trusted_authors.add(login)
                     return True
             except Exception as exc:
@@ -186,7 +191,7 @@ class ReviewPublisher:
                     # and publication is already being aborted.
                     pass
             before = self._pull_target(target)
-            self._check_discovery_authority(target)
+            self._check_discovery_authority(target, require_cleanup=False)
             self._client.add_labels(target.repository, target.number, [_LABEL])
             after = self._pull_target(target)
             if after != before:
@@ -237,7 +242,7 @@ class ReviewPublisher:
                     envelope = self._client.comment_envelope(target.repository, raw["id"])
                     state = commit_id = None
                     server_id = raw["id"]
-                if not self._author_trusted(envelope.author, envelope.author_type):
+                if not self._author_trusted(envelope.author, envelope.author_type, envelope):
                     continue
                 record = _HistoryRecord(envelope, is_review, server_id, state, commit_id)
                 _target_from_payload(envelope.payload) if envelope.payload.get("record_type") != "revocation" else None
@@ -373,7 +378,7 @@ class ReviewPublisher:
             return value, canonical, history
         return value
 
-    def _check_discovery_authority(self, target: ReviewTarget) -> None:
+    def _check_discovery_authority(self, target: ReviewTarget, *, require_cleanup: bool | None = None) -> None:
         if not self._discovery_authority_enabled:
             return
         try:
@@ -383,11 +388,14 @@ class ReviewPublisher:
             principal = self._operator["principal"]
             if principal["type"] not in {"User", "Bot"}:
                 raise PublisherError("discovery operator principal is unsupported")
-            if not {"discover", "dismiss-workflow-review"}.issubset(self._operator["allowed_operations"]):
-                raise PublisherError("discovery operator lacks required mutation operations")
+            cleanup = self._discovery_requires_dismissal if require_cleanup is None else require_cleanup
+            if "discover" not in self._operator["allowed_operations"]:
+                raise PublisherError("discovery operator lacks discover operation")
+            if cleanup and "dismiss-workflow-review" not in self._operator["allowed_operations"]:
+                raise PublisherError("discovery operator lacks dismissal operation")
             if any(
                 self._operator["write_permissions"].get(permission) not in {"write", "admin"}
-                for permission in ("issues", "pull_requests")
+                for permission in (("issues", "pull_requests") if cleanup else ("issues",))
             ):
                 raise PublisherError("discovery operator lacks issues and pull_requests write authority")
             if principal["type"] == "User":
@@ -437,25 +445,23 @@ class ReviewPublisher:
                 continue
             try:
                 payload = decode_protocol_body(body)
-            except PublisherError:
-                raise
-            except Exception:
-                continue
+            except Exception as exc:
+                raise PublisherError("newly observed workflow review is malformed") from exc
+            if payload.get("record_type") == "review-metadata" and payload.get("schema") not in {"agentic-review/v1", "agentic-review/v1+coverage"}:
+                raise PublisherError("newly observed workflow review uses an unsupported schema")
             if payload.get("schema") not in {"agentic-review/v1", "agentic-review/v1+coverage"} or payload.get("record_type") != "review-metadata":
                 continue
             try:
                 exact = self._client.get_pull_review_record(target.repository, target.number, raw["id"])
                 record_target = _target_from_payload(payload)
                 if (
-                    self._author_trusted(exact.envelope.author, exact.envelope.author_type)
+                    self._author_trusted(exact.envelope.author, exact.envelope.author_type, exact.envelope)
                     and exact.state == "CHANGES_REQUESTED"
                     and exact.commit_id == record_target.head_sha
                 ):
                     result.append((exact.server_id, exact.envelope.node_id))
-            except PublisherError:
-                raise
             except Exception:
-                continue
+                raise PublisherError("newly observed workflow review could not be authenticated")
         return sorted(set(result))
 
     def _remove_discovery_label(
@@ -466,6 +472,8 @@ class ReviewPublisher:
             self._validate_keep_review(history, target, keep_node) if keep_is_review else None
             stale = [node_id for review_id, node_id in self._raw_workflow_review_ids(target) if node_id != keep_node]
             if stale:
+                self._discovery_requires_dismissal = True
+                self._check_discovery_authority(target, require_cleanup=True)
                 for review_id in [review_id for review_id, node_id in self._raw_workflow_review_ids(target) if node_id != keep_node]:
                     self._mutate(
                         target,
@@ -477,6 +485,7 @@ class ReviewPublisher:
                         intent_node=canonical.node_id,
                     )
                 continue
+            self._discovery_requires_dismissal = False
             if not self._label_present(target):
                 self._assert_target(target)
                 return
@@ -494,6 +503,29 @@ class ReviewPublisher:
                 return
         raise PublisherError("discovery label reconciliation did not stabilize")
 
+    def _active_canonical_review_node(self, target: ReviewTarget) -> str | None:
+        try:
+            history = self._history(target)
+            canonical = validate_protocol(
+                [record.envelope for record in history.current],
+                expected_target=target,
+                trusted_authors=self._trusted_authors,
+            )
+            attempt_id = canonical.payload.get("attempt_id")
+            for record in history.current:
+                payload = record.envelope.payload
+                if (
+                    record.is_review
+                    and payload.get("record_type") == "review-metadata"
+                    and payload.get("attempt_id") == attempt_id
+                    and record.state == "CHANGES_REQUESTED"
+                    and record.commit_id == target.head_sha
+                ):
+                    return record.envelope.node_id
+        except Exception:
+            return None
+        return None
+
     def reconcile_discovery(
         self,
         target: ReviewTarget,
@@ -509,8 +541,11 @@ class ReviewPublisher:
             raise PublisherError("discovery reconciliation target is not bound to the configured repository")
         self._discovery_authority_enabled = True
         try:
-            self._check_discovery_authority(target)
+            self._discovery_requires_dismissal = False
+            self._check_discovery_authority(target, require_cleanup=False)
             had_label = self._label_present(target)
+            if keep_node is None:
+                keep_node = self._active_canonical_review_node(target)
             for _ in range(_MAX_RECONCILIATION_ROUNDS):
                 stale = [
                     review_id for review_id, node_id in self._raw_workflow_review_ids(target)
@@ -518,6 +553,8 @@ class ReviewPublisher:
                 ]
                 if not stale:
                     break
+                self._discovery_requires_dismissal = True
+                self._check_discovery_authority(target, require_cleanup=True)
                 for review_id in stale:
                     self._mutate(
                         target,
@@ -533,17 +570,20 @@ class ReviewPublisher:
                     target, attempt_id, intent_node, keep_node, keep_is_review=keep_is_review,
                 )
             else:
+                self._discovery_requires_dismissal = False
                 self._reapply_label(target)
                 self._assert_target(target)
                 return not had_label
             return False
         except Exception:
+            self._discovery_requires_dismissal = False
             try:
                 self._reapply_label(target)
             except Exception:
                 pass
             raise
         finally:
+            self._discovery_requires_dismissal = False
             self._discovery_authority_enabled = False
 
     def _intent_payload(self, target: ReviewTarget, attempt_id: str) -> dict[str, Any]:

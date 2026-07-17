@@ -115,6 +115,23 @@ class _TrustContext:
             self.authors.add(login)
         return authorized
 
+    def authorize_record(self, login: str, principal_type: str, envelope: GitHubEnvelope) -> bool:
+        if not self.authorize(login, principal_type):
+            return False
+        if principal_type != "Bot":
+            return True
+        app = _configured_app(self.configuration, login, self._repo_id())
+        return bool(
+            app is not None
+            and envelope.app_id == app.get("app_id")
+            and envelope.installation_id == app.get("installation_id")
+            and envelope.repository_id == app.get("repository_id")
+            and envelope.credential_attestation_digest == app.get("credential_attestation_digest")
+        )
+
+    def authorize_publisher(self, login: str, principal_type: str, envelope: GitHubEnvelope | None = None) -> bool:
+        return self.authorize_record(login, principal_type, envelope) if envelope is not None else self.authorize(login, principal_type)
+
 
 def _data(response: Any) -> Any:
     return response.data if hasattr(response, "data") else response
@@ -247,7 +264,7 @@ def _history(client: Any, target: ReviewTarget, trust: _TrustContext) -> tuple[t
             else:
                 envelope = client.comment_envelope(target.repository, raw["id"])
                 record = _Record(envelope, False, raw["id"])
-            if not trust.authorize(envelope.author, envelope.author_type):
+            if not trust.authorize_record(envelope.author, envelope.author_type, envelope):
                 continue
         except Exception as exc:
             return (), _reason(f"trusted workflow record is deleted, edited, or unavailable: {exc}")
@@ -379,7 +396,7 @@ def discover_pull_requests(
                     labelled_now = ReviewPublisher(
                         client, configuration=configuration, operator_credential=operator_credential,
                         trusted_authors=trust.authors,
-                        author_authorizer=trust.authorize,
+                        author_authorizer=trust.authorize_publisher,
                     ).reconcile_discovery(target)
                     if labelled_now:
                         labelled.append(item)
@@ -400,7 +417,7 @@ def discover_pull_requests(
                 ReviewPublisher(
                     client, configuration=configuration, operator_credential=operator_credential,
                     trusted_authors=trust.authors,
-                    author_authorizer=trust.authorize,
+                    author_authorizer=trust.authorize_publisher,
                 ).reconcile_discovery(
                     target,
                     attempt_id=completion.envelope.payload["attempt_id"],
@@ -412,10 +429,10 @@ def discover_pull_requests(
                     raise GitHubBoundaryError("target changed after clean reconciliation")
             except Exception as exc:
                 try:
-                    labelled_now = ReviewPublisher(
+                    ReviewPublisher(
                         client, configuration=configuration, operator_credential=operator_credential,
                         trusted_authors=trust.authors,
-                        author_authorizer=trust.authorize,
+                        author_authorizer=trust.authorize_publisher,
                     ).reconcile_discovery(target)
                 except Exception as label_exc:
                     exc = RuntimeError(f"{exc}; label recovery failed: {label_exc}")
@@ -438,7 +455,7 @@ def discover_pull_requests(
                     labelled_now = ReviewPublisher(
                         client, configuration=configuration, operator_credential=operator_credential,
                         trusted_authors=trust.authors,
-                        author_authorizer=trust.authorize,
+                        author_authorizer=trust.authorize_publisher,
                     ).reconcile_discovery(recovery_target)
                     if labelled_now:
                         labelled.append(item)

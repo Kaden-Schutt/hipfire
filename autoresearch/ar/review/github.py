@@ -1110,8 +1110,18 @@ class GitHubClient:
         except (GitHubBoundaryError, TypeError, ValueError, RecursionError) as exc:
             raise GitHubBoundaryError(f"GitHub {record_name} body is not a valid protocol payload") from exc
         publication_time = record["created_at"] if record_kind == "comment" else record["submitted_at"]
+        app = record.get("performed_via_github_app")
+        app_mapping = app if isinstance(app, Mapping) else {}
+        installation = app_mapping.get("installation")
+        installation_mapping = installation if isinstance(installation, Mapping) else {}
+        repository = record.get("repository")
+        repository_mapping = repository if isinstance(repository, Mapping) else {}
         return GitHubEnvelope(
-            payload, record["node_id"], author["login"], publication_time, publication_time, author["type"]
+            payload, record["node_id"], author["login"], publication_time, publication_time, author["type"],
+            record.get("app_id", app_mapping.get("id")),
+            record.get("installation_id", app_mapping.get("installation_id", installation_mapping.get("id"))),
+            record.get("repository_id", repository_mapping.get("id")),
+            record.get("credential_attestation_digest"),
         )
 
     def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:

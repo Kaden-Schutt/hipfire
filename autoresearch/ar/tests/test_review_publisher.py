@@ -68,6 +68,15 @@ def _proposal(verdict: str = "clean", response_digest: str = "sha256:" + "c" * 6
         "response_digest": response_digest,
         "verdict": verdict,
         "findings": findings,
+        "coverage": {
+            "retrieved_file_count": 0,
+            "expected_file_count": 0,
+            "retrieved_blob_count": 0,
+            "expected_blob_count": 0,
+            "retrieved_content_count": 0,
+            "expected_content_count": 0,
+            "coverage_complete": True,
+        },
     }
     return ReviewProposal(
         TARGET,
@@ -79,6 +88,7 @@ def _proposal(verdict: str = "clean", response_digest: str = "sha256:" + "c" * 6
         "1",
         "model",
         values["response_digest"],
+        0, 0, 0, 0, 0, 0, True,
     )
 
 
@@ -236,7 +246,9 @@ class FakeGitHub:
         user = record.get("user", {})
         return GitHubEnvelope(
             json.loads(self.payload_from_body(record["body"])), record["node_id"],
-            user.get("login", TRUSTED), published, updated, user.get("type", "Bot")
+            user.get("login", TRUSTED), published, updated, user.get("type", "Bot"),
+            record.get("app_id"), record.get("installation_id"), record.get("repository_id"),
+            record.get("credential_attestation_digest"),
         )
 
     def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:

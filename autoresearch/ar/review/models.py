@@ -133,6 +133,10 @@ class GitHubEnvelope(Mapping[str, Any]):
     created_at: str
     updated_at: str
     author_type: str = "User"
+    app_id: int | None = None
+    installation_id: int | None = None
+    repository_id: int | None = None
+    credential_attestation_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload, Mapping):
@@ -144,17 +148,35 @@ class GitHubEnvelope(Mapping[str, Any]):
         _require_text("updated_at", self.updated_at)
         if self.author_type not in {"User", "Bot", "Organization"}:
             raise ValueError("author_type is not supported")
+        app_fields = (self.app_id, self.installation_id, self.repository_id, self.credential_attestation_digest)
+        if any(value is not None for value in app_fields):
+            if self.author_type != "Bot":
+                raise ValueError("App provenance may only be attached to Bot envelopes")
+            if (
+                isinstance(self.app_id, bool) or not isinstance(self.app_id, int) or self.app_id <= 0
+                or isinstance(self.installation_id, bool) or not isinstance(self.installation_id, int) or self.installation_id <= 0
+                or isinstance(self.repository_id, bool) or not isinstance(self.repository_id, int) or self.repository_id <= 0
+                or not isinstance(self.credential_attestation_digest, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.credential_attestation_digest)
+            ):
+                raise ValueError("App provenance is incomplete or malformed")
 
     def __getitem__(self, key: str) -> Any:
-        if key not in {"payload", "node_id", "author", "created_at", "updated_at", "author_type"}:
+        if key not in {
+            "payload", "node_id", "author", "created_at", "updated_at", "author_type",
+            "app_id", "installation_id", "repository_id", "credential_attestation_digest",
+        }:
             raise KeyError(key)
         return getattr(self, key)
 
     def __iter__(self):
-        return iter(("payload", "node_id", "author", "created_at", "updated_at", "author_type"))
+        return iter((
+            "payload", "node_id", "author", "created_at", "updated_at", "author_type",
+            "app_id", "installation_id", "repository_id", "credential_attestation_digest",
+        ))
 
     def __len__(self) -> int:
-        return 6
+        return 10
 
 
 def _freeze_payload(value: Any) -> Any:
@@ -283,13 +305,13 @@ class ReviewProposal:
     adapter_version: str
     model: str
     response_digest: str
-    retrieved_file_count: int = 0
-    expected_file_count: int = 0
-    retrieved_blob_count: int = 0
-    expected_blob_count: int = 0
-    retrieved_content_count: int = 0
-    expected_content_count: int = 0
-    coverage_complete: bool = True
+    retrieved_file_count: int | None = None
+    expected_file_count: int | None = None
+    retrieved_blob_count: int | None = None
+    expected_blob_count: int | None = None
+    retrieved_content_count: int | None = None
+    expected_content_count: int | None = None
+    coverage_complete: bool | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, ReviewTarget):
@@ -312,11 +334,23 @@ class ReviewProposal:
             raise ValueError("clean proposals cannot contain actionable findings")
         if self.verdict == "changes-requested" and not has_actionable_finding:
             raise ValueError("changes-requested proposals require an actionable finding")
-        counts = (
-            ("retrieved_file_count", self.retrieved_file_count, self.expected_file_count),
-            ("retrieved_blob_count", self.retrieved_blob_count, self.expected_blob_count),
-            ("retrieved_content_count", self.retrieved_content_count, self.expected_content_count),
+        coverage_values = (
+            self.retrieved_file_count, self.expected_file_count, self.retrieved_blob_count,
+            self.expected_blob_count, self.retrieved_content_count, self.expected_content_count,
+            self.coverage_complete,
         )
+        if all(value is None for value in coverage_values):
+            bind_coverage = False
+            counts = ()
+        elif any(value is None for value in coverage_values):
+            raise ValueError("coverage evidence must be complete or entirely absent")
+        else:
+            counts = (
+                ("retrieved_file_count", self.retrieved_file_count, self.expected_file_count),
+                ("retrieved_blob_count", self.retrieved_blob_count, self.expected_blob_count),
+                ("retrieved_content_count", self.retrieved_content_count, self.expected_content_count),
+            )
+            bind_coverage = True
         for name, retrieved, expected_count in counts:
             if (
                 isinstance(retrieved, bool) or not isinstance(retrieved, int) or retrieved < 0
@@ -324,9 +358,9 @@ class ReviewProposal:
                 or retrieved > expected_count
             ):
                 raise ValueError(f"{name} and its expected count must be non-negative and ordered")
-        if not isinstance(self.coverage_complete, bool):
+        if bind_coverage and not isinstance(self.coverage_complete, bool):
             raise ValueError("coverage_complete must be a boolean")
-        if self.coverage_complete and any(retrieved != expected_count for _, retrieved, expected_count in counts):
+        if bind_coverage and self.coverage_complete and any(retrieved != expected_count for _, retrieved, expected_count in counts):
             raise ValueError("complete coverage must have matching retrieved and expected counts")
         coverage = {
             "retrieved_file_count": self.retrieved_file_count,
@@ -339,12 +373,6 @@ class ReviewProposal:
         }
         # Keep positional/legacy proposals constructible while binding real
         # capsule coverage evidence into every new proposal digest.
-        bind_coverage = coverage != {
-            "retrieved_file_count": 0, "expected_file_count": 0,
-            "retrieved_blob_count": 0, "expected_blob_count": 0,
-            "retrieved_content_count": 0, "expected_content_count": 0,
-            "coverage_complete": True,
-        }
         digest_values = {
             "target": self.target,
             "target_key": self.target.target_key(),
@@ -363,6 +391,12 @@ class ReviewProposal:
             raise ValueError("proposal digest is not bound to target, capsule, provider, and response")
 
     def coverage_mapping(self) -> dict[str, Any]:
+        if any(value is None for value in (
+            self.retrieved_file_count, self.expected_file_count, self.retrieved_blob_count,
+            self.expected_blob_count, self.retrieved_content_count, self.expected_content_count,
+            self.coverage_complete,
+        )):
+            raise ValueError("proposal has no complete coverage evidence")
         return {
             "retrieved_file_count": self.retrieved_file_count,
             "expected_file_count": self.expected_file_count,
