@@ -43,15 +43,25 @@ def _operator_manifest(path: str, root: Path) -> dict[str, Any]:
     return load_operator_credential_manifest(root, manifest_path=path)
 
 
+def _authenticated_configuration(client: Any, repository: str, root: Path):
+    repository_data = client.get_repository(repository).data
+    default_branch = repository_data.get("default_branch")
+    commit_sha = client.get_branch_head(repository, default_branch)
+    source = client.authenticated_config_source(
+        repository, commit_sha=commit_sha, repository_root=str(root)
+    )
+    return load_review_configuration(root, source=source)
+
+
 def cmd_discover(args: argparse.Namespace) -> None:
     root = _root()
     repo = args.repository or os.environ.get("GITHUB_REPOSITORY", "")
     if not repo:
         print("error: --repository or GITHUB_REPOSITORY required", file=sys.stderr)
         raise SystemExit(2)
-    config = load_review_configuration(root)
-    operator = _operator_manifest(args.operator, root)
     client = GitHubClient()
+    config = _authenticated_configuration(client, repo, root)
+    operator = _operator_manifest(args.operator, root)
     summary = discover_pull_requests(
         client, repo, configuration=config, operator_credential=operator
     )
@@ -74,9 +84,9 @@ def cmd_preflight(args: argparse.Namespace) -> None:
     if not repo:
         print("error: --repository or GITHUB_REPOSITORY required", file=sys.stderr)
         raise SystemExit(2)
-    config = load_review_configuration(root)
-    operator = _operator_manifest(args.operator, root) if args.operator else None
     client = GitHubClient()
+    config = _authenticated_configuration(client, repo, root)
+    operator = _operator_manifest(args.operator, root) if args.operator else None
     result = preflight_read_only(
         client,
         repo,
