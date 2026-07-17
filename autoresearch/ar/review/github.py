@@ -202,7 +202,9 @@ _PROTOCOL_FIELDS = {
     },
     "revocation": {"schema", "record_type", "record_id", "target_key", "attempt_id", "canonical_intent_digest", "reason"},
 }
-_ACCEPTED_PERMISSION_RE = re.compile(r"([A-Za-z0-9_-]+)\s*=\s*(read|write|admin)")
+_ACCEPTED_PERMISSION_RE: re.Pattern[str] = re.compile(
+    r"""\A(?P<key>[A-Za-z0-9._-]+)=(?P<value>(read|write|none|true))\Z""",
+)
 _ENDPOINTS = (
     ("GET", re.compile(rf"/user$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}$"), False),
@@ -1143,6 +1145,7 @@ def _capability_signal(
                 raise PreflightError("classic repo OAuth scope is not permitted")
     raw_permissions = response.headers.get("x-accepted-github-permissions")
     accepted: dict[str, str] = {}
+    permissionless_access = False
     if raw_permissions is not None:
         if not isinstance(raw_permissions, str) or not raw_permissions.strip():
             raise PreflightError("GitHub permission header is malformed")
@@ -1150,8 +1153,11 @@ def _capability_signal(
             match = _ACCEPTED_PERMISSION_RE.fullmatch(item.strip())
             if match is None:
                 raise PreflightError("GitHub permission header is malformed")
-            accepted[match.group(1)] = match.group(2)
-    if not scopes and not accepted:
+            if match.group("value") != "true":
+                accepted[match.group("key")] = match.group("value")
+            elif match.group("key") == "allows_permissionless_access":
+                permissionless_access = True
+    if not scopes and not accepted and not permissionless_access:
         raise PreflightError("no usable GitHub capability signal (scope or permission header) is visible")
     rank = {"read": 1, "write": 2, "admin": 3}
     if accepted:
