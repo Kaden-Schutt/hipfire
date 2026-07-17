@@ -214,7 +214,7 @@ _ENDPOINTS = (
     ("GET", re.compile(rf"/repos/{_REPO}/issues/comments/[1-9][0-9]*$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews$"), True),
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews/[1-9][0-9]*$"), False),
-    ("GET", re.compile(rf"/repos/{_REPO}/compare/{_SHA}\.{3}{_SHA}$"), False),
+    ("GET", re.compile(rf"/repos/{_REPO}/compare/{_SHA}\.\.\.{_SHA}$"), False),
     ("GET", re.compile(r"/installation/repositories$"), False),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), True),

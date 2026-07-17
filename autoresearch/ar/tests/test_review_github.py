@@ -262,6 +262,18 @@ def test_paginated_pull_requests_are_flattened_and_bounded():
     assert all("per_page=100" in " ".join(call[0]) for call in runner.calls)
 
 
+def test_merge_base_compare_endpoint_is_allowlisted():
+    runner = FakeRunner([
+        result({
+            "base_commit": {"sha": "base-sha"},
+            "merge_base_commit": {"sha": "merge-sha"},
+        }),
+    ])
+
+    assert GitHubClient(runner).get_merge_base_sha(REPO, "base-sha", "head-sha") == "merge-sha"
+    assert runner.calls[0][0][-1] == "/repos/owner/repo/compare/base-sha...head-sha"
+
+
 def test_issue_labels_follow_bounded_link_pagination():
     next_page = '<https://api.github.com/repos/owner/repo/issues/42/labels?page=2>; rel="next"'
     runner = FakeRunner([
