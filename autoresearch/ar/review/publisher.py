@@ -164,6 +164,7 @@ class ReviewPublisher:
                 if authorized:
                     self._additional_trusted_authors.add(login)
                     return True
+                return False
             except Exception as exc:
                 raise PublisherError("workflow author trust could not be revalidated") from exc
         return isinstance(login, str) and login in self._trusted_authors
@@ -635,7 +636,7 @@ class ReviewPublisher:
                 "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
                 "retrieved_content_count", "expected_content_count", "coverage_complete",
             )},
-            **{field: report.payload[field] for field in _APP_FIELDS if field in report.payload},
+            **self._app_provenance_payload(),
         }
         payload["metadata_digest"] = metadata_digest(payload)
         return payload
@@ -653,7 +654,7 @@ class ReviewPublisher:
                 "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
                 "retrieved_content_count", "expected_content_count", "coverage_complete",
             )},
-            **{field: metadata.payload[field] for field in _APP_FIELDS if field in metadata.payload},
+            **self._app_provenance_payload(),
         }
 
     def _new_comment(
