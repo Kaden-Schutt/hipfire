@@ -2230,6 +2230,26 @@ fn with_external_replay<T>(
     result
 }
 
+fn dflash_redline_capture_only() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_DFLASH_REDLINE_CAPTURE_ONLY")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+fn dflash_redline_hip_replay() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_DFLASH_REDLINE_HIP_REPLAY")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 /// Run the target on `draft_tokens` (length B) positions starting at
 /// `start_pos`. Advances `target.kv_cache` and `target.dn_state` by B
 /// positions. Writes B hidden-state rows into `hidden_rb` (ring head
@@ -2462,14 +2482,24 @@ fn verify_dflash_block_inner(
 
         if gpu.replay.should_route_pm4() {
             vg_mode = "redline-replay";
-            // SAFETY: every captured model, cache, scratch, hidden-ring, and
-            // tape allocation belongs to the live DflashSpeculator. Dynamic
-            // position/grid and GDN frame bindings are patched by replay_pm4.
-            unsafe { gpu.replay.replay_pm4(start_pos) }.map_err(|reason| {
-                gpu.replay
-                    .poison(format!("DFlash verify PM4 replay failed: {reason}"));
-                hip_bridge::HipError::new(0, &reason)
-            })?;
+            if dflash_redline_hip_replay() {
+                gpu.replay_recorded_hip_prefix(gpu.replay.recorded_launches().len())?;
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.stream_synchronize(stream)?;
+                } else {
+                    gpu.hip.device_synchronize()?;
+                }
+            } else {
+                // SAFETY: every captured model, cache, scratch, hidden-ring,
+                // and tape allocation belongs to the live DflashSpeculator.
+                // Dynamic position/grid and GDN frame bindings are patched by
+                // replay_pm4.
+                unsafe { gpu.replay.replay_pm4(start_pos) }.map_err(|reason| {
+                    gpu.replay
+                        .poison(format!("DFlash verify PM4 replay failed: {reason}"));
+                    hip_bridge::HipError::new(0, &reason)
+                })?;
+            }
             replay_includes_lmhead_argmax = true;
             Ok(())
         } else if gpu.replay.state() == ReplayState::Armed {
@@ -2513,24 +2543,31 @@ fn verify_dflash_block_inner(
                     .replay
                     .finish_capture()
                     .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
-                let device_ordinal = usize::try_from(gpu.device_id)
-                    .map_err(|_| hip_bridge::HipError::new(0, "negative HIP device ordinal"))?;
-                match gpu
-                    .replay
-                    .prepare_pm4_prefix(device_ordinal, summary.launch_count)
-                {
-                    Ok((dispatches, dwords, queue)) => eprintln!(
-                        "[dflash-redline] retained verify B={} dispatches={} dwords={} queue={}",
-                        b, dispatches, dwords, queue
-                    ),
-                    Err(reason) => {
-                        gpu.replay.poison(format!(
-                            "DFlash verify PM4 preparation failed: {reason}"
-                        ));
-                        eprintln!(
-                            "[dflash-redline] disabled B={} after PM4 preparation failure: {}",
-                            b, reason
-                        );
+                if dflash_redline_capture_only() {
+                    gpu.replay
+                        .reset_external_capture()
+                        .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+                } else {
+                    let device_ordinal = usize::try_from(gpu.device_id).map_err(|_| {
+                        hip_bridge::HipError::new(0, "negative HIP device ordinal")
+                    })?;
+                    match gpu
+                        .replay
+                        .prepare_pm4_prefix(device_ordinal, summary.launch_count)
+                    {
+                        Ok((dispatches, dwords, queue)) => eprintln!(
+                            "[dflash-redline] retained verify B={} dispatches={} dwords={} queue={}",
+                            b, dispatches, dwords, queue
+                        ),
+                        Err(reason) => {
+                            gpu.replay.poison(format!(
+                                "DFlash verify PM4 preparation failed: {reason}"
+                            ));
+                            eprintln!(
+                                "[dflash-redline] disabled B={} after PM4 preparation failure: {}",
+                                b, reason
+                            );
+                        }
                     }
                 }
                 // Capture executes the body directly; even a fail-closed PM4
