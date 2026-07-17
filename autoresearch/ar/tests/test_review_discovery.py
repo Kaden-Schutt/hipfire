@@ -149,13 +149,6 @@ def completed_client(verdict="clean"):
         client, configuration=configuration(), operator_credential=BOT_OPERATOR
     ).publish(_proposal(verdict), publish_target)
     assert result.status == "complete", result.reason
-    for record in [*client.comments, *client.reviews]:
-        record.update(
-            app_id=1,
-            installation_id=2,
-            repository_id=8,
-            credential_attestation_digest=DISCOVERY_BOT["credential_attestation_digest"],
-        )
     client.list_pull_requests = lambda repository, *, max_pages=16: SimpleNamespace(
         data=[{"number": TARGET.number, "draft": False}], headers={}
     )
@@ -242,6 +235,29 @@ def test_each_configured_app_record_is_checked_against_installation_scope():
     for record in [*client.comments, *client.reviews]:
         record["user"] = {"login": "other-bot", "type": "Bot"}
         record.update(app_id=2, installation_id=3)
+        payload = json.loads(client.payload_from_body(record["body"]))
+        for field, value in (("app_id", 2), ("installation_id", 3)):
+            if field in payload:
+                payload[field] = value
+        record["body"] = json.dumps(payload)
+    payloads = {
+        json.loads(client.payload_from_body(item["body"]))["record_type"]: json.loads(client.payload_from_body(item["body"]))
+        for item in client.comments
+    }
+    intent = payloads["intent"]
+    intent["canonical_digest"] = canonical_digest({key: value for key, value in intent.items() if key != "canonical_digest"})
+    report = payloads["report"]
+    report["canonical_intent_digest"] = intent["canonical_digest"]
+    metadata = payloads["review-metadata"]
+    metadata["canonical_intent_digest"] = intent["canonical_digest"]
+    metadata["report_digest"] = canonical_digest(report)
+    metadata["metadata_digest"] = metadata_digest(metadata)
+    completion = payloads["completion"]
+    completion["canonical_intent_digest"] = intent["canonical_digest"]
+    completion["report_digest"] = canonical_digest(report)
+    completion["metadata_digest"] = metadata["metadata_digest"]
+    for item in client.comments:
+        item["body"] = json.dumps(payloads[json.loads(client.payload_from_body(item["body"]))["record_type"]])
     summary = discover_pull_requests(
         client, REPO, configuration=multi_app_configuration(), operator_credential=DISCOVERY_BOT
     )
@@ -280,10 +296,18 @@ def test_published_records_carry_strict_coverage_evidence():
     payloads = [json.loads(client.payload_from_body(item["body"])) for item in client.comments]
     for payload in payloads:
         if payload["record_type"] in {"report", "review-metadata", "completion"}:
+            assert payload["app_id"] == 1
+            assert payload["installation_id"] == 2
+            assert payload["repository_id"] == 8
+            assert payload["credential_attestation_digest"] == DISCOVERY_BOT["credential_attestation_digest"]
             assert payload["coverage_complete"] is True
             assert payload["retrieved_file_count"] == payload["expected_file_count"]
             assert payload["retrieved_blob_count"] == payload["expected_blob_count"]
             assert payload["retrieved_content_count"] == payload["expected_content_count"]
+    assert all(
+        not any(field in record for field in ("app_id", "installation_id", "repository_id", "credential_attestation_digest"))
+        for record in [*client.comments, *client.reviews]
+    )
 
 
 def test_publisher_rejects_proposal_without_explicit_coverage():
@@ -367,7 +391,7 @@ def test_valid_current_clean_completion_is_clean_and_reconciles_label():
         client, REPO, configuration=app_configuration(), operator_credential=DISCOVERY_BOT
     )
 
-    assert [item.number for item in summary.clean] == [42], summary
+    assert [item.number for item in summary.clean] == [42]
     assert not summary.needs_review
     assert not summary.incomplete
 
@@ -470,12 +494,11 @@ def test_label_only_discovery_does_not_require_dismissal_authority():
 
 def test_app_record_envelope_must_bind_configured_app_identity():
     client = completed_client()
-    for record in [*client.comments, *client.reviews]:
-        record["user"] = {"login": "review-bot", "type": "Bot"}
-        record["app_id"] = 999
-        record["installation_id"] = 2
-        record["repository_id"] = 8
-        record["credential_attestation_digest"] = DISCOVERY_BOT["credential_attestation_digest"]
+    for record in client.comments:
+        payload = json.loads(client.payload_from_body(record["body"]))
+        if payload["record_type"] in {"report", "review-metadata", "completion"}:
+            payload["app_id"] = 999
+            record["body"] = json.dumps(payload)
     summary = discover_pull_requests(
         client, REPO, configuration=app_configuration(), operator_credential=DISCOVERY_BOT
     )

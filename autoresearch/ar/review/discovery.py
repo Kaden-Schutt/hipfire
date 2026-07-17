@@ -16,7 +16,7 @@ from .publisher import ReviewPublisher
 
 _LABEL = "needs-review"
 _SCHEMA = "agentic-review/v1"
-_SCHEMAS = {_SCHEMA, "agentic-review/v1+coverage"}
+_SCHEMAS = {_SCHEMA}
 _MAX_REASON = 512
 _MAX_AUTHOR_TRUST_CHECKS = 128
 
@@ -108,7 +108,10 @@ class _TrustContext:
                 )
             authorized = self._human_permissions[login]
         elif principal_type == "Bot":
-            authorized = self._app_authorized(login)
+            # A record author is checked against that author's configured App
+            # binding.  Do not use the operator token's installation listing
+            # as evidence for a different App.
+            authorized = _configured_app(self.configuration, login, self._repo_id()) is not None
         else:
             authorized = False
         if authorized:
@@ -121,12 +124,13 @@ class _TrustContext:
         if principal_type != "Bot":
             return True
         app = _configured_app(self.configuration, login, self._repo_id())
+        payload = envelope.payload
         return bool(
             app is not None
-            and envelope.app_id == app.get("app_id")
-            and envelope.installation_id == app.get("installation_id")
-            and envelope.repository_id == app.get("repository_id")
-            and envelope.credential_attestation_digest == app.get("credential_attestation_digest")
+            and payload.get("app_id") == app.get("app_id")
+            and payload.get("installation_id") == app.get("installation_id")
+            and payload.get("repository_id") == app.get("repository_id")
+            and payload.get("credential_attestation_digest") == app.get("credential_attestation_digest")
         )
 
     def authorize_publisher(self, login: str, principal_type: str, envelope: GitHubEnvelope | None = None) -> bool:
@@ -316,7 +320,7 @@ def _current_completion(
     )
     if completion is None:
         return "no valid canonical agentic-review completion"
-    if completion.envelope.payload.get("schema") != "agentic-review/v1+coverage" or completion.envelope.payload.get("coverage_complete") is not True:
+    if completion.envelope.payload.get("schema") != _SCHEMA or completion.envelope.payload.get("coverage_complete") is not True:
         return "completion lacks complete coverage evidence"
     metadata_id = completion.envelope.payload.get("metadata_record_id")
     metadata = next(

@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
+import re
 from typing import Any
 
 from .canonical import canonical_digest, canonical_json, metadata_digest
@@ -19,12 +20,12 @@ from .models import GitHubEnvelope, ReviewTarget
 
 _RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
 _SCHEMA = "agentic-review/v1"
-_COVERAGE_SCHEMA = "agentic-review/v1+coverage"
-_SCHEMAS = {_SCHEMA, _COVERAGE_SCHEMA}
+_SCHEMAS = {_SCHEMA}
 _COVERAGE_FIELDS = {
     "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
     "retrieved_content_count", "expected_content_count", "coverage_complete",
 }
+_APP_FIELDS = {"app_id", "installation_id", "repository_id", "credential_attestation_digest"}
 _SERVER_FIELDS = {"node_id", "author", "created_at", "payload_digest", "intent_node_id"}
 _TARGET_KEYS = {
     "repository", "number", "head_repository", "head_sha", "base_ref", "base_sha", "merge_base_sha"
@@ -117,11 +118,10 @@ def _payload(envelope: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _coverage(payload: Mapping[str, Any]) -> dict[str, Any] | None:
-    if payload.get("schema") != _COVERAGE_SCHEMA:
-        if _COVERAGE_FIELDS & set(payload):
-            raise ValueError("legacy review records must not contain partial coverage evidence")
+    present = _COVERAGE_FIELDS & set(payload)
+    if not present:
         return None
-    if not _COVERAGE_FIELDS.issubset(payload):
+    if present != _COVERAGE_FIELDS:
         raise ValueError("review record is missing complete coverage evidence")
     values = {field: payload[field] for field in _COVERAGE_FIELDS}
     for prefix in ("file", "blob", "content"):
@@ -143,6 +143,22 @@ def _coverage(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     return values
 
 
+def _app_provenance(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    present = _APP_FIELDS & set(payload)
+    if not present:
+        return None
+    if present != _APP_FIELDS:
+        raise ValueError("App provenance is incomplete")
+    for field in ("app_id", "installation_id", "repository_id"):
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("App provenance identifiers are malformed")
+    digest = payload["credential_attestation_digest"]
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValueError("App provenance attestation is malformed")
+    return {field: payload[field] for field in _APP_FIELDS}
+
+
 def _require_matching_coverage(first: Mapping[str, Any], second: Mapping[str, Any]) -> None:
     first_coverage = _coverage(first)
     second_coverage = _coverage(second)
@@ -150,8 +166,16 @@ def _require_matching_coverage(first: Mapping[str, Any], second: Mapping[str, An
         raise ValueError("review records do not carry matching coverage evidence")
 
 
+def _require_matching_app_provenance(*payloads: Mapping[str, Any]) -> None:
+    values = [_app_provenance(payload) for payload in payloads]
+    if any(value != values[0] for value in values[1:]):
+        raise ValueError("review records do not carry matching App provenance")
+
+
 def _required(payload: Mapping[str, Any], fields: set[str]) -> set[str]:
-    return fields | (_COVERAGE_FIELDS if payload.get("schema") == _COVERAGE_SCHEMA else set())
+    return fields | (_COVERAGE_FIELDS if _COVERAGE_FIELDS & set(payload) else set()) | (
+        _APP_FIELDS if _APP_FIELDS & set(payload) else set()
+    )
 
 
 def _matching_schema(*payloads: Mapping[str, Any]) -> str:
@@ -234,8 +258,9 @@ def validate_intent(
     trusted = _trust_policy(trusted_authors)
     payload = _validate_envelope(envelope, trusted)
     required = {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"}
-    if set(payload) != required or payload["record_type"] != "intent":
+    if set(payload) != _required(payload, required) or payload["record_type"] != "intent":
         raise ValueError("invalid intent payload")
+    _app_provenance(payload)
     target = _target(payload["target"])
     if payload["target_key"] != target.target_key():
         raise ValueError("intent target_key does not match target")
@@ -256,6 +281,7 @@ def validate_report(
     payload = _validate_envelope(envelope, trusted)
     intent = _payload(intent_envelope)
     _matching_schema(payload, intent)
+    _app_provenance(payload)
     validate_intent(intent_envelope, trusted_authors=trusted)
     required = {
         "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
@@ -294,6 +320,7 @@ def validate_review_metadata(
     intent = _payload(intent_envelope)
     report = _payload(report_envelope)
     _matching_schema(payload, intent, report)
+    _app_provenance(payload)
     validate_intent(intent_envelope, trusted_authors=trusted)
     required = {
         "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
@@ -323,6 +350,7 @@ def validate_review_metadata(
     if payload["report_body_sha256"] != report.get("report_body_sha256"):
         raise ValueError("review metadata report body digest does not match")
     _require_matching_coverage(report, payload)
+    _require_matching_app_provenance(intent, report, payload)
     canonical_payload = _payload(canonical_intent)
     validate_intent(canonical_intent, trusted_authors=trusted)
     canonical_payload = dict(canonical_payload, _node_id=canonical_intent["node_id"])
@@ -360,6 +388,7 @@ def validate_completion(
     report = _payload(report_envelope)
     metadata = _payload(metadata_envelope)
     _matching_schema(payload, intent, report, metadata)
+    _app_provenance(payload)
     validate_intent(intent_envelope, trusted_authors=trusted)
     canonical_payload = _payload(canonical_intent)
     validate_intent(canonical_intent, trusted_authors=trusted)
@@ -387,6 +416,7 @@ def validate_completion(
         raise ValueError("completion metadata digest does not match")
     _require_matching_coverage(report, payload)
     _require_matching_coverage(metadata, payload)
+    _require_matching_app_provenance(intent, report, metadata, payload)
 
 
 def validate_revocation(

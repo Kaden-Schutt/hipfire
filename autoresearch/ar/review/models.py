@@ -133,10 +133,6 @@ class GitHubEnvelope(Mapping[str, Any]):
     created_at: str
     updated_at: str
     author_type: str = "User"
-    app_id: int | None = None
-    installation_id: int | None = None
-    repository_id: int | None = None
-    credential_attestation_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload, Mapping):
@@ -148,35 +144,17 @@ class GitHubEnvelope(Mapping[str, Any]):
         _require_text("updated_at", self.updated_at)
         if self.author_type not in {"User", "Bot", "Organization"}:
             raise ValueError("author_type is not supported")
-        app_fields = (self.app_id, self.installation_id, self.repository_id, self.credential_attestation_digest)
-        if any(value is not None for value in app_fields):
-            if self.author_type != "Bot":
-                raise ValueError("App provenance may only be attached to Bot envelopes")
-            if (
-                isinstance(self.app_id, bool) or not isinstance(self.app_id, int) or self.app_id <= 0
-                or isinstance(self.installation_id, bool) or not isinstance(self.installation_id, int) or self.installation_id <= 0
-                or isinstance(self.repository_id, bool) or not isinstance(self.repository_id, int) or self.repository_id <= 0
-                or not isinstance(self.credential_attestation_digest, str)
-                or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.credential_attestation_digest)
-            ):
-                raise ValueError("App provenance is incomplete or malformed")
 
     def __getitem__(self, key: str) -> Any:
-        if key not in {
-            "payload", "node_id", "author", "created_at", "updated_at", "author_type",
-            "app_id", "installation_id", "repository_id", "credential_attestation_digest",
-        }:
+        if key not in {"payload", "node_id", "author", "created_at", "updated_at", "author_type"}:
             raise KeyError(key)
         return getattr(self, key)
 
     def __iter__(self):
-        return iter((
-            "payload", "node_id", "author", "created_at", "updated_at", "author_type",
-            "app_id", "installation_id", "repository_id", "credential_attestation_digest",
-        ))
+        return iter(("payload", "node_id", "author", "created_at", "updated_at", "author_type"))
 
     def __len__(self) -> int:
-        return 10
+        return 6
 
 
 def _freeze_payload(value: Any) -> Any:
@@ -226,6 +204,10 @@ class IntentPayload:
     target_key: str
     attempt_id: str
     canonical_digest: str
+    app_id: int | None = None
+    installation_id: int | None = None
+    repository_id: int | None = None
+    credential_attestation_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema != "agentic-review/v1":
@@ -238,13 +220,23 @@ class IntentPayload:
             raise ValueError("target must be a ReviewTarget")
         if self.target_key != self.target.target_key():
             raise ValueError("intent payload target_key does not match target")
+        app_values = (self.app_id, self.installation_id, self.repository_id, self.credential_attestation_digest)
+        if any(value is not None for value in app_values):
+            if (
+                isinstance(self.app_id, bool) or not isinstance(self.app_id, int) or self.app_id <= 0
+                or isinstance(self.installation_id, bool) or not isinstance(self.installation_id, int) or self.installation_id <= 0
+                or isinstance(self.repository_id, bool) or not isinstance(self.repository_id, int) or self.repository_id <= 0
+                or not isinstance(self.credential_attestation_digest, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.credential_attestation_digest)
+            ):
+                raise ValueError("intent App provenance is incomplete or malformed")
         if _RAW_SHA256_RE.fullmatch(self.canonical_digest) is None or self.canonical_digest != canonical_digest(
             {key: value for key, value in self.to_mapping().items() if key != "canonical_digest"}
         ):
             raise ValueError("canonical_digest must exactly match the intent payload")
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": self.schema,
             "record_type": self.record_type,
             "record_id": self.record_id,
@@ -253,11 +245,20 @@ class IntentPayload:
             "attempt_id": self.attempt_id,
             "canonical_digest": self.canonical_digest,
         }
+        if self.app_id is not None:
+            result.update({
+                "app_id": self.app_id,
+                "installation_id": self.installation_id,
+                "repository_id": self.repository_id,
+                "credential_attestation_digest": self.credential_attestation_digest,
+            })
+        return result
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "IntentPayload":
         expected = {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"}
-        if not isinstance(payload, Mapping) or set(payload) != expected:
+        app_fields = {"app_id", "installation_id", "repository_id", "credential_attestation_digest"}
+        if not isinstance(payload, Mapping) or set(payload) not in (expected, expected | app_fields):
             raise ValueError("invalid intent payload shape")
         target = payload["target"]
         target_keys = {

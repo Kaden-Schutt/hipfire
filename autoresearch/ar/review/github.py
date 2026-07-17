@@ -178,11 +178,12 @@ _MAX_TREE_ENTRIES = 65536
 _PAGE_SIZE = 100
 _PROBE_PAGE_SIZE = 1
 _PROTOCOL_RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
-_PROTOCOL_SCHEMAS = {"agentic-review/v1", "agentic-review/v1+coverage"}
+_PROTOCOL_SCHEMAS = {"agentic-review/v1"}
 _COVERAGE_FIELDS = {
     "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
     "retrieved_content_count", "expected_content_count", "coverage_complete",
 }
+_APP_FIELDS = {"app_id", "installation_id", "repository_id", "credential_attestation_digest"}
 _PROTOCOL_FIELDS = {
     "intent": {"schema", "record_type", "record_id", "target", "target_key", "attempt_id", "canonical_digest"},
     "report": {
@@ -316,8 +317,10 @@ def _validate_protocol_payload(payload: Mapping[str, Any]) -> None:
     if schema not in _PROTOCOL_SCHEMAS or record_type not in _PROTOCOL_RECORD_TYPES:
         raise ValueError("protocol body has an invalid schema or record type")
     expected_fields = set(_PROTOCOL_FIELDS[record_type])
-    if schema == "agentic-review/v1+coverage" and record_type in {"report", "review-metadata", "completion"}:
+    if _COVERAGE_FIELDS & set(payload) and record_type in {"report", "review-metadata", "completion"}:
         expected_fields |= _COVERAGE_FIELDS
+    if _APP_FIELDS & set(payload):
+        expected_fields |= _APP_FIELDS
     if set(payload) != expected_fields:
         raise ValueError("protocol body has unexpected or missing fields")
     if not isinstance(payload.get("record_id"), str) or not payload["record_id"].strip():
@@ -1110,18 +1113,8 @@ class GitHubClient:
         except (GitHubBoundaryError, TypeError, ValueError, RecursionError) as exc:
             raise GitHubBoundaryError(f"GitHub {record_name} body is not a valid protocol payload") from exc
         publication_time = record["created_at"] if record_kind == "comment" else record["submitted_at"]
-        app = record.get("performed_via_github_app")
-        app_mapping = app if isinstance(app, Mapping) else {}
-        installation = app_mapping.get("installation")
-        installation_mapping = installation if isinstance(installation, Mapping) else {}
-        repository = record.get("repository")
-        repository_mapping = repository if isinstance(repository, Mapping) else {}
         return GitHubEnvelope(
-            payload, record["node_id"], author["login"], publication_time, publication_time, author["type"],
-            record.get("app_id", app_mapping.get("id")),
-            record.get("installation_id", app_mapping.get("installation_id", installation_mapping.get("id"))),
-            record.get("repository_id", repository_mapping.get("id")),
-            record.get("credential_attestation_digest"),
+            payload, record["node_id"], author["login"], publication_time, publication_time, author["type"]
         )
 
     def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:

@@ -351,6 +351,27 @@ def test_envelope_acquisition_uses_server_author_for_later_app_bot_trust():
     assert envelope.author_type == "User"
 
 
+def test_api_shaped_app_record_uses_body_provenance_not_top_level_fields():
+    payload = body_payload()
+    payload.update({
+        "app_id": 7,
+        "installation_id": 8,
+        "repository_id": 9,
+        "credential_attestation_digest": "sha256:" + "a" * 64,
+    })
+    payload["canonical_digest"] = canonical_digest({key: value for key, value in payload.items() if key != "canonical_digest"})
+    raw = record()
+    raw["body"] = json.dumps(payload, separators=(",", ":"))
+    raw.update(app_id=999, installation_id=999, repository_id=999)
+
+    envelope = GitHubClient(FakeRunner([result(raw)])).comment_envelope(REPO, 11)
+
+    assert envelope.payload["app_id"] == 7
+    assert envelope.payload["installation_id"] == 8
+    assert envelope.payload["repository_id"] == 9
+    assert not hasattr(envelope, "app_id")
+
+
 def test_review_envelope_is_constructed_from_authenticated_review():
     review = review_record()
     runner = FakeRunner([result(review)])

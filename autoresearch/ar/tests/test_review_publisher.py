@@ -44,7 +44,10 @@ def _configuration() -> ReviewConfiguration:
     configuration = ReviewConfiguration(
         {},
         {},
-        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": []},
+        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [{
+            "app_id": 1, "login": TRUSTED, "installation_id": 2, "repository_id": 8,
+            "credential_attestation_digest": OPERATOR["credential_attestation_digest"],
+        }]},
         source,
     )
     object.__setattr__(configuration, "_loaded_from_protected_paths", True)
@@ -246,9 +249,7 @@ class FakeGitHub:
         user = record.get("user", {})
         return GitHubEnvelope(
             json.loads(self.payload_from_body(record["body"])), record["node_id"],
-            user.get("login", TRUSTED), published, updated, user.get("type", "Bot"),
-            record.get("app_id"), record.get("installation_id"), record.get("repository_id"),
-            record.get("credential_attestation_digest"),
+            user.get("login", TRUSTED), published, updated, user.get("type", "Bot")
         )
 
     def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:

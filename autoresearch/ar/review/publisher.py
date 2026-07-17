@@ -68,9 +68,10 @@ class _UnsafeLabelSnapshot(RuntimeError):
     pass
 
 
-_SCHEMA = "agentic-review/v1+coverage"
+_SCHEMA = "agentic-review/v1"
 _LABEL = "needs-review"
 _MAX_RECONCILIATION_ROUNDS = 4
+_APP_FIELDS = ("app_id", "installation_id", "repository_id", "credential_attestation_digest")
 
 
 def _target_from_payload(payload: Mapping[str, Any]) -> ReviewTarget:
@@ -166,6 +167,19 @@ class ReviewPublisher:
             except Exception as exc:
                 raise PublisherError("workflow author trust could not be revalidated") from exc
         return isinstance(login, str) and login in self._trusted_authors
+
+    def _app_provenance_payload(self) -> dict[str, Any]:
+        principal = self._operator["principal"]
+        if principal["type"] != "Bot":
+            return {}
+        apps = [
+            app for app in self._configuration.trusted_publishers.get("apps", ())
+            if isinstance(app, Mapping) and app.get("login") == principal["login"]
+        ]
+        if len(apps) != 1:
+            raise PublisherError("publisher App provenance is not uniquely configured")
+        app = apps[0]
+        return {field: app[field] for field in _APP_FIELDS}
 
     def _pull_target(self, target: ReviewTarget) -> ReviewTarget:
         getter = getattr(self._client, "get_review_target", None)
@@ -447,9 +461,9 @@ class ReviewPublisher:
                 payload = decode_protocol_body(body)
             except Exception as exc:
                 raise PublisherError("newly observed workflow review is malformed") from exc
-            if payload.get("record_type") == "review-metadata" and payload.get("schema") not in {"agentic-review/v1", "agentic-review/v1+coverage"}:
+            if payload.get("record_type") == "review-metadata" and payload.get("schema") != _SCHEMA:
                 raise PublisherError("newly observed workflow review uses an unsupported schema")
-            if payload.get("schema") not in {"agentic-review/v1", "agentic-review/v1+coverage"} or payload.get("record_type") != "review-metadata":
+            if payload.get("schema") != _SCHEMA or payload.get("record_type") != "review-metadata":
                 continue
             try:
                 exact = self._client.get_pull_review_record(target.repository, target.number, raw["id"])
@@ -591,6 +605,7 @@ class ReviewPublisher:
             "schema": _SCHEMA, "record_type": "intent", "record_id": f"intent-{attempt_id}",
             "target": target, "target_key": target.target_key(), "attempt_id": attempt_id,
             "canonical_digest": "",
+            **self._app_provenance_payload(),
         }
         payload["canonical_digest"] = canonical_digest({key: value for key, value in payload.items() if key != "canonical_digest"})
         return payload
@@ -604,6 +619,7 @@ class ReviewPublisher:
             "canonical_intent_digest": intent.payload["canonical_digest"], "head_sha": target.head_sha,
             "report_body": body, "report_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
             **proposal.coverage_mapping(),
+            **{field: intent.payload[field] for field in _APP_FIELDS if field in intent.payload},
         }
 
     def _metadata_payload(self, target: ReviewTarget, intent: GitHubEnvelope, report: GitHubEnvelope) -> dict[str, Any]:
@@ -619,6 +635,7 @@ class ReviewPublisher:
                 "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
                 "retrieved_content_count", "expected_content_count", "coverage_complete",
             )},
+            **{field: report.payload[field] for field in _APP_FIELDS if field in report.payload},
         }
         payload["metadata_digest"] = metadata_digest(payload)
         return payload
@@ -636,6 +653,7 @@ class ReviewPublisher:
                 "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
                 "retrieved_content_count", "expected_content_count", "coverage_complete",
             )},
+            **{field: metadata.payload[field] for field in _APP_FIELDS if field in metadata.payload},
         }
 
     def _new_comment(
