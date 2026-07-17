@@ -32,6 +32,7 @@ from .protocol import (
     validate_revocation,
 )
 from .publisher import LabelError, PublishResult, PublisherError, ReviewPublisher, publish_review, render_report
+from .discovery import DiscoveryItem, DiscoverySummary, discover_open_pull_requests, discover_pull_requests
 
 __all__ = [
     "AttemptIntentConfig",
@@ -69,4 +70,8 @@ __all__ = [
     "ReviewPublisher",
     "publish_review",
     "render_report",
+    "DiscoveryItem",
+    "DiscoverySummary",
+    "discover_open_pull_requests",
+    "discover_pull_requests",
 ]
