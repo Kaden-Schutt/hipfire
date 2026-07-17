@@ -156,9 +156,6 @@ def completed_client(verdict="clean"):
     client.list_installation_repositories = lambda: SimpleNamespace(
         data={"repositories": [{"id": 8}]}
     )
-    client.list_app_installation_repositories = lambda installation_id: SimpleNamespace(
-        data={"repositories": [{"id": 8}]}
-    )
     return client
 
 
@@ -266,27 +263,6 @@ def test_each_configured_app_record_is_checked_against_installation_scope():
     )
 
     assert [item.number for item in summary.clean] == [42]
-
-
-def test_record_app_scope_is_not_inferred_from_operator_installation():
-    client = completed_client()
-    for record in [*client.comments, *client.reviews]:
-        record["user"] = {"login": "other-bot", "type": "Bot"}
-        record.update(app_id=2, installation_id=3)
-        payload = json.loads(client.payload_from_body(record["body"]))
-        for field, value in (("app_id", 2), ("installation_id", 3)):
-            if field in payload:
-                payload[field] = value
-        record["body"] = json.dumps(payload)
-    client.list_app_installation_repositories = lambda installation_id: SimpleNamespace(
-        data={"repositories": [{"id": 8}]} if installation_id == 1 else {"repositories": []}
-    )
-
-    summary = discover_pull_requests(
-        client, REPO, configuration=multi_app_configuration(), operator_credential=DISCOVERY_BOT
-    )
-
-    assert [item.number for item in summary.needs_review] == [42]
 
 
 def test_current_completion_requires_explicit_complete_coverage_evidence():

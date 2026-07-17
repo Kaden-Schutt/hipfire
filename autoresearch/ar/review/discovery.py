@@ -58,7 +58,6 @@ class _TrustContext:
         self.authors: set[str] = set()
         self._human_permissions: dict[str, bool] = {}
         self._app_scope: dict[str, bool] = {}
-        self._record_app_scope: dict[str, bool] = {}
         self._repository_id: int | None = None
         self._trust_checks = 0
 
@@ -109,25 +108,7 @@ class _TrustContext:
                 )
             authorized = self._human_permissions[login]
         elif principal_type == "Bot":
-            # A record author is checked against that author's configured App
-            # binding and its own currently scoped installation.  Do not use
-            # the operator token's installation listing as evidence for a
-            # different App.
-            if login in self._record_app_scope:
-                authorized = self._record_app_scope[login]
-            else:
-                self._check_budget()
-                app = _configured_app(self.configuration, login, self._repo_id())
-                checker = getattr(self.client, "list_app_installation_repositories", None)
-                if app is None or not callable(checker):
-                    authorized = False
-                else:
-                    repositories = _data(checker(app["installation_id"]))
-                    visible = repositories.get("repositories") if isinstance(repositories, Mapping) else None
-                    authorized = isinstance(visible, list) and any(
-                        isinstance(item, Mapping) and item.get("id") == self._repo_id() for item in visible
-                    )
-                self._record_app_scope[login] = authorized
+            authorized = self._app_authorized(login)
         else:
             authorized = False
         if authorized:

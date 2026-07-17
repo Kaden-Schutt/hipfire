@@ -214,7 +214,6 @@ _ENDPOINTS = (
     ("GET", re.compile(rf"/repos/{_REPO}/pulls/[1-9][0-9]*/reviews/[1-9][0-9]*$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/compare/{_SHA}\.{3}{_SHA}$"), False),
     ("GET", re.compile(r"/installation/repositories$"), False),
-    ("GET", re.compile(r"/app/installations/[1-9][0-9]*/repositories$"), True),
     ("POST", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), False),
     ("GET", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels$"), True),
     ("DELETE", re.compile(rf"/repos/{_REPO}/issues/[1-9][0-9]*/labels/[^/]+$"), False),
@@ -616,44 +615,6 @@ class GitHubClient:
                 break
         else:
             raise GitHubBoundaryError("GitHub installation repository pagination reached its fixed page bound")
-        return GitHubResponse({"total_count": total_count, "repositories": repositories}, headers, 200)
-
-    def list_app_installation_repositories(self, installation_id: int) -> GitHubResponse:
-        installation_id = _positive_integer(installation_id, "installation ID")
-        repositories: list[Mapping[str, Any]] = []
-        headers: dict[str, str] = {}
-        total_count: int | None = None
-        path = f"/app/installations/{installation_id}/repositories"
-        for page in range(1, _MAX_PAGINATED_PAGES + 1):
-            response = self._request("GET", path, query={"per_page": _PAGE_SIZE, "page": page})
-            data = self._require_mapping(response.data, "App installation repositories")
-            page_total = data.get("total_count")
-            if isinstance(page_total, bool) or not isinstance(page_total, int) or page_total < 0:
-                raise GitHubBoundaryError("GitHub App installation repository total count is malformed")
-            if total_count is None:
-                total_count = page_total
-            elif page_total != total_count:
-                raise GitHubBoundaryError("GitHub App installation repository total count changed")
-            page_repositories = data.get("repositories")
-            if not isinstance(page_repositories, list):
-                raise GitHubBoundaryError("GitHub App installation repositories response is malformed")
-            if len(repositories) + len(page_repositories) > _MAX_PAGINATED_ITEMS:
-                raise GitHubBoundaryError("GitHub App installation repository pagination exceeds its fixed bound")
-            for item in page_repositories:
-                repository = self._require_mapping(item, "App installation repository")
-                if isinstance(repository.get("id"), bool) or not isinstance(repository.get("id"), int) or repository["id"] <= 0:
-                    raise GitHubBoundaryError("GitHub App installation repository identity is malformed")
-                repositories.append(repository)
-            headers.update(response.headers)
-            has_next = _has_next_page(response.headers)
-            if page == _MAX_PAGINATED_PAGES and has_next:
-                raise GitHubBoundaryError("GitHub App installation repository pagination reached its fixed bound")
-            if not has_next:
-                if total_count is None or len(repositories) < total_count:
-                    raise GitHubBoundaryError("GitHub App installation repositories response is incomplete")
-                break
-        else:
-            raise GitHubBoundaryError("GitHub App installation repository pagination reached its fixed bound")
         return GitHubResponse({"total_count": total_count, "repositories": repositories}, headers, 200)
 
     def list_pull_requests(self, repository: str, *, max_pages: int = _MAX_PAGINATED_PAGES) -> GitHubResponse:
