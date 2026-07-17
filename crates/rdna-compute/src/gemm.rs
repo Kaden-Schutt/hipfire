@@ -19008,21 +19008,8 @@ impl Gpu {
                     Some("0" | "off" | "false")
                 )
             });
-        static GFX1201_27B_GATE_UP_PERSISTENT_BLOCKS: OnceLock<Option<u32>> = OnceLock::new();
-        let gfx1201_27b_persistent_blocks = if gfx1201_27b_pair {
-            *GFX1201_27B_GATE_UP_PERSISTENT_BLOCKS.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_PERSISTENT_BLOCKS")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .filter(|&v| v > 0)
-            })
-        } else {
-            None
-        };
         static GFX1201_27B_GATE_UP_SKEW: OnceLock<Option<i32>> = OnceLock::new();
-        let gfx1201_27b_up_skew = if gfx1201_27b_pair
-            && gfx1201_27b_persistent_blocks.is_none()
-        {
+        let gfx1201_27b_up_skew = if gfx1201_27b_pair {
             *GFX1201_27B_GATE_UP_SKEW.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1201_HFQ4_27B_GATE_UP_SKEW")
                     .ok()
@@ -19032,15 +19019,7 @@ impl Gpu {
         } else {
             None
         };
-        let (func_name, block, grid_x) = if let Some(blocks) = gfx1201_27b_persistent_blocks {
-            let kernel = "fused_gate_up_hfq4g256_persistent_k5120_global_gfx1201";
-            self.ensure_kernel(
-                kernel,
-                kernels::FUSED_GATE_UP_HFQ4G256_PERSISTENT_K5120_GLOBAL_GFX1201_SRC,
-                kernel,
-            )?;
-            (kernel, [256u32, 1, 1], blocks)
-        } else if gfx1201_27b_up_skew.is_some() {
+        let (func_name, block, grid_x) = if gfx1201_27b_up_skew.is_some() {
             let kernel = "fused_gate_up_hfq4g256_pair_skew_k5120_global_gfx1201";
             self.ensure_kernel(
                 kernel,

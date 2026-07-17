@@ -3660,14 +3660,6 @@ pub const FUSED_GATE_UP_HFQ4G256_PAIR_K5120_GLOBAL_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256_pair_k5120.gfx1201.hip")
 );
-/// Persistent multi-wave companion to the accepted dense 27B paired-row
-/// producer. Eight waves share one transposed K=5120 activation in LDS.
-pub const FUSED_GATE_UP_HFQ4G256_PERSISTENT_K5120_GLOBAL_GFX1201_SRC: &str = concat!(
-    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_persistent_k5120.gfx1201.hip")
-);
 /// Exact-output memory-partition probe for the dense Qwen3.5-27B paired
 /// producer. The host supplies a row skew as an extra scalar kernarg.
 pub const FUSED_GATE_UP_HFQ4G256_PAIR_SKEW_K5120_GLOBAL_GFX1201_SRC: &str = concat!(
