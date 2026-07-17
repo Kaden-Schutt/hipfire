@@ -619,7 +619,7 @@ class ReviewPublisher:
             "canonical_intent_digest": intent.payload["canonical_digest"], "head_sha": target.head_sha,
             "report_body": body, "report_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
             **proposal.coverage_mapping(),
-            **{field: intent.payload[field] for field in _APP_FIELDS if field in intent.payload},
+            **self._app_provenance_payload(),
         }
 
     def _metadata_payload(self, target: ReviewTarget, intent: GitHubEnvelope, report: GitHubEnvelope) -> dict[str, Any]:
