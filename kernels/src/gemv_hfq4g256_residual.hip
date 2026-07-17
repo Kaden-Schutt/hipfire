@@ -44,7 +44,12 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     const bool have_row1 = row1 < M;
     const int tid = threadIdx.x;
 
-#if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
+#if defined(HIPFIRE_RESIDUAL_GROUPS_PER_ROW)
+    // Exact-shape specialization supplied by the host selector. Both dense
+    // Qwen3.5-27B residual shapes are whole group-quads, so this also lets the
+    // compiler delete the generic tail machinery without changing the ABI.
+    const int groups_per_row = HIPFIRE_RESIDUAL_GROUPS_PER_ROW;
+#elif defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
     // Exact Qwen3.6 A3B decode contract. Making both quads static lets LLVM
     // schedule the two independent row chains across the full K extent and
     // removes the dead generic tail machinery on gfx1151.
@@ -67,7 +72,9 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     float bcc0 = 0.0f, bcc1 = 0.0f, bcc2 = 0.0f, bcc3 = 0.0f;
     const int quads = groups_per_row >> 2;
+#if !defined(HIPFIRE_RESIDUAL_GROUPS_PER_ROW)
     const int tail = groups_per_row & 3;
+#endif
 
     #define DOG_X8(sc, zp, pk, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
         (a) += ((sc) * (float)((pk) & 0xFu)         + (zp)) * (x0) \
@@ -94,7 +101,7 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
 
-#if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
+#if defined(HIPFIRE_GFX1151_RESIDUAL_K4096) || defined(HIPFIRE_RESIDUAL_GROUPS_PER_ROW)
     // Keep the fixed four-quad bound without expanding the body. Full unroll
     // doubles the instruction footprint; factor-two unroll spills private=16
     // and is not admissible for direct gfx1151 PM4 replay.
@@ -149,6 +156,7 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
                xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
     }
 
+#if !defined(HIPFIRE_RESIDUAL_GROUPS_PER_ROW)
     if (tail >= 1) {
         const int g = quads << 2;
         const int base = g * 256 + tid * 8;
@@ -191,6 +199,7 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         DOG_X8(sc1, zp1, pk1, bcc2,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
     }
+#endif
     #undef LOAD_W
     #undef HIPFIRE_RESIDUAL_LOAD_SC
     #undef HIPFIRE_RESIDUAL_LOAD_ZP
