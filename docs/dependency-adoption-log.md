@@ -72,6 +72,20 @@ Implemented by commit `b15e6f884`.
 - `approx`: deferred to a future CPU numerical-test cleanup; explicit GPU error
   metrics remain the correctness contract.
 
+## Future beta follow-ups
+
+- Add a `QuantizeArgs::try_parse_from` regression using the live argument shape
+  from `scripts/mi300x_v3_matrix.sh` so script/CLI drift fails in unit tests.
+- Add a generated safetensors fixture that checks tensor names, shapes, absolute
+  data offsets, and emitted HFQ byte parity through the shared reader.
+- Add a localhost HTTP/SSE test for the `ureq` 3 TUI migration, including
+  streamed deltas, HTTP error bodies, and timeout behavior.
+- Run one lightweight live serve smoke with structured logging enabled to prove
+  tracing remains on stderr and cannot contaminate daemon JSON on stdout. A
+  full GPU architecture matrix is not required for this dependency-only work.
+- At the end of the beta run, return to the README update and the maintainer's
+  additional beta ideas before promoting or merging the staging branch.
+
 ## Validation recorded for this adoption
 
 - `bun install --frozen-lockfile`, `bun run typecheck`, and all 288 Bun tests
