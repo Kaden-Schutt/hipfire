@@ -1720,7 +1720,11 @@ fn select_grouped_lloyd_variant(
 }
 
 fn use_gfx1151_i8_moe(arch: &str) -> bool {
+    // gfx1151: i8 WMMA MMQ. gfx10*: sdot4 MMQ (same host contract, different
+    // inner product). Both share GroupedLloydVariant::I8 → auto-route.
     arch == "gfx1151"
+        || arch.starts_with("gfx103")
+        || arch.starts_with("gfx101")
 }
 
 /// Dispatch one MQ2-Lloyd grouped GEMM. All seven variants share the signature
@@ -1744,7 +1748,8 @@ fn dispatch_grouped_lloyd(
 ) -> Result<(), DispatchError> {
     use GroupedLloydVariant as V;
     let r = match variant {
-        V::I8 => gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+        // Auto-route: gfx1151 i8-WMMA MMQ / gfx10 sdot4 MMQ / WMMA FP16.
+        V::I8 => gpu.gemm_mq2g256_lloyd_moe_grouped(
             ptrs,
             tile_ids,
             slot_index,
@@ -2305,6 +2310,20 @@ fn dispatch_grouped_gemm(
             m_total,
             rows,
         )),
+        // MQ2-Lloyd: auto-routes to gfx1151 i8-WMMA MMQ, gfx10 sdot4 MMQ, or
+        // WMMA FP16 4w_k2 fallback (see gemm_mq2g256_lloyd_moe_grouped).
+        DType::MQ2G256Lloyd => hip!(gpu.gemm_mq2g256_lloyd_moe_grouped(
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
+        )),
         _other => Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "prefill-grouped-gemm-dtype",
@@ -2574,9 +2593,13 @@ pub fn run_moe_prefill(
         match p.dtypes.routed_down {
             // MFP4G32E8 reuses the weight-agnostic silu+FWHT-rotate (E8 down expects
             // FWHT(silu(g)*u), same as MQ4 — see the decode E8 path).
+            // MQ2/MQ3-Lloyd: same FWHT-G256 rotate as MQ4 (codebook Lloyd still
+            // trains on FWHT-rotated activations).
             DType::MQ4G256
             | DType::MQ5G256
             | DType::MQ6G256
+            | DType::MQ2G256Lloyd
+            | DType::MQ3G256Lloyd
             | DType::MFP4G32E8
             | DType::MFP3G32E8
             | DType::MFP2G32E8 => {

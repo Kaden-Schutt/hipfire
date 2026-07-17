@@ -446,6 +446,7 @@ fn main() {
                     .unwrap(),
                 };
             }
+            hip_bridge::launch_counters::reset();
             let t_prefill = Instant::now();
             qwen35::forward_prefill_batch(
                 &mut gpu,
@@ -462,8 +463,41 @@ fn main() {
                 None,
             )
             .expect("prefill forward failed");
+            let issue_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            let t_sync = Instant::now();
             gpu.hip.device_synchronize().expect("sync after prefill");
+            let sync_ms = t_sync.elapsed().as_secs_f64() * 1000.0;
             let ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            {
+                use hip_bridge::launch_counters as lc;
+                eprintln!(
+                    "  HOST_BREAKDOWN issue={:.1}ms sync={:.1}ms wall={:.1}ms",
+                    issue_ms, sync_ms, ms
+                );
+                eprintln!(
+                    "    launch={:.1}ms n={} | dtoh={:.1}ms n={} | htod={:.1}ms n={} bytes={} | dtod={:.1}ms n={} | memset={:.1}ms n={}",
+                    lc::launch_kernel::time_ns() as f64 / 1e6,
+                    lc::launch_kernel::count(),
+                    lc::memcpy_dtoh::time_ns() as f64 / 1e6,
+                    lc::memcpy_dtoh::count(),
+                    lc::memcpy_htod::time_ns() as f64 / 1e6,
+                    lc::memcpy_htod::count(),
+                    lc::memcpy_htod::bytes(),
+                    lc::memcpy_dtod::time_ns() as f64 / 1e6,
+                    lc::memcpy_dtod::count(),
+                    lc::memset::time_ns() as f64 / 1e6,
+                    lc::memset::count(),
+                );
+                eprintln!(
+                    "    stream_sync={:.1}ms n={} | device_sync={:.1}ms n={} | event_sync={:.1}ms n={}",
+                    lc::stream_sync::time_ns() as f64 / 1e6,
+                    lc::stream_sync::count(),
+                    lc::device_sync::time_ns() as f64 / 1e6,
+                    lc::device_sync::count(),
+                    lc::event_sync::time_ns() as f64 / 1e6,
+                    lc::event_sync::count(),
+                );
+            }
             prefill_samples_ms.push(ms);
             if prefill_runs > 1 {
                 eprintln!(

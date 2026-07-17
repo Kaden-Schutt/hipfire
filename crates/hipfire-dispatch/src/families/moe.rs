@@ -557,7 +557,7 @@ pub struct MoePrefillParams<'a> {
 /// Pure function of [`MoeDtypes`] + arch + [`FeatureFlags`].
 pub struct MoePrefillResolution {
     /// Gate_up + down via grouped-GEMM scatter pipeline (Path 2).
-    /// Requires WMMA-capable arch (gfx11/gfx12) + `moe_grouped_gemm` flag.
+    /// Requires WMMA (gfx11/12) OR MQ2L-sdot4-MMQ on gfx10 + `moe_grouped_gemm` flag.
     pub use_path2: bool,
     /// Down uses atomic-accumulate GEMV (Path 0) instead of atomic-free
     /// expanded+combine (Path 1). gfx9* wave64 archs (gfx906/gfx908/gfx94x).
@@ -587,6 +587,18 @@ impl MoePrefillResolution {
     ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
+        // MQ2-Lloyd sdot4 MMQ grouped GEMM on gfx10 (issue #533): no WMMA
+        // required. Channel-tested gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030.
+        // Re-admit Path 2 for uniform MQ2L routed experts on gfx10*.
+        let mq2l_gfx10 = d.routed_gate_up == DType::MQ2G256Lloyd
+            && d.routed_down == DType::MQ2G256Lloyd
+            && (arch.is_gfx1030()
+                || arch.is_gfx1031()
+                || arch.is_gfx1032()
+                || arch.is_gfx1010()
+                || arch.is_gfx1011()
+                || arch.is_gfx1012());
+        let use_path2 = use_path2 || (mq2l_gfx10 && flags.moe_grouped_gemm);
         // MQ6 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
         // gfx12 `_gfx12` kernel). Only suppress Path 2 for MQ6 on archs that
         // have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and not

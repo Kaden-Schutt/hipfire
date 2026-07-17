@@ -2403,6 +2403,8 @@ pub const GEMM_Q8_0_WMMA_4W_SRC: &str = include_str!("../../../kernels/src/gemm_
 /// at ~2x. Y[N,M] = X[N,K] @ W[M,K]^T. Requires M%64==0, N%64==0, K%128==0.
 pub const GEMM_Q8_0_MMQ_4W_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_mmq_4w.gfx1151.hip");
+pub const GEMM_Q8_0_MMQ_GFX1030_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_mmq.gfx1030.hip");
 
 /// Path 2 combine for down: per (token, m) iterates K_TOP slots via
 /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
@@ -4851,6 +4853,12 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
 /// layout + trailing x_src_rows).
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip");
+/// i8 sdot4 MMQ MoE grouped-GEMM for MQ2-Lloyd weights on gfx1030 (RDNA2).
+/// Same kernarg contract as the gfx1151 i8-WMMA twin; inner product uses
+/// `__builtin_amdgcn_sdot4` instead of WMMA. Weight-reuse thread map:
+/// each thread owns one output row × 8 slots; B is wave-shuffled.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1030_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1030.hip");
 pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq3g256_lloyd_moe_grouped_mmq.gfx1151.hip");
 
