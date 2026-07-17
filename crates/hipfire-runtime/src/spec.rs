@@ -627,6 +627,27 @@ pub trait Speculator {
         temp: f32,
     ) -> Result<SpecStep, String>;
 
+    /// Materialize the final emitted seed in target state before a completed
+    /// turn is exposed to the prompt cache. Every speculative window consumes
+    /// its input `seed` and returns a bonus as the NEXT seed, so when the loop
+    /// stops that last bonus is still one position ahead of KV/recurrent state.
+    ///
+    /// The default advances only the target. Drafters with position-aligned
+    /// side state (DFlash target-hidden rows, MTP private caches, etc.) override
+    /// this hook and advance that state in the same operation.
+    fn bake_terminal_seed(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<(), String> {
+        match target.spec_advance(gpu, &[seed], position, false, &|| false, None)? {
+            SpecAdvance::Ready { .. } => Ok(()),
+            SpecAdvance::Aborted => Err("terminal seed bake unexpectedly aborted".to_string()),
+        }
+    }
+
     /// Compact drafter-local cached state after a target KV eviction the daemon
     /// already applied. Default no-op for drafters with no target-hidden cache.
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {

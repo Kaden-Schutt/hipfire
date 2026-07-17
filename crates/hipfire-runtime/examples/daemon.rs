@@ -5761,6 +5761,12 @@ fn generate_spec(
     let mut spec_cycles = 0usize;
     let mut spec_accepted = 0usize;
     let mut generated = 0usize;
+    // A cacheable terminal state must contain exactly every client-committed
+    // token and no speculative tail beyond it. A stop/length/grammar decision
+    // in the middle of a verified window leaves the target ahead of the visible
+    // conversation; fall back to a cold next turn rather than publishing that
+    // mismatched state to the LCP cache.
+    let mut terminal_state_cacheable = true;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
@@ -5810,6 +5816,8 @@ fn generate_spec(
     // returns no events for an EOS-first prefill argmax, yielding an empty turn.
     if !first_begin.events.is_empty() {
         generated += 1;
+    } else {
+        terminal_state_cacheable = false;
     }
     let first_token_is_eos = first_begin.stop.is_some();
 
@@ -5871,6 +5879,7 @@ fn generate_spec(
         ) {
             Ok(s) => s,
             Err(e) => {
+                terminal_state_cacheable = false;
                 let _ = writeln!(
                     stdout,
                     r#"{{"type":"error","id":"{}","message":"spec_step: {}"}}"#,
@@ -5888,10 +5897,12 @@ fn generate_spec(
         let mut hit_eos = false;
         let mut think_cap_hit = false;
         let mut forced_after: Vec<u32> = Vec::new();
+        let mut observed_tail = 0usize;
         for &tok in &committed_tail {
             if generated >= max_tokens {
                 break;
             }
+            observed_tail += 1;
             // `emit.observe` runs the per-token emission policy: grammar
             // pre-check (reject → grammar violation, NO emit, post-loop forces a
             // full KV/DN reset to clear the polluted slots spec_step wrote), then
@@ -5917,6 +5928,8 @@ fn generate_spec(
                 emitted.push(tok);
                 render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
                 generated += 1;
+            } else {
+                terminal_state_cacheable = false;
             }
             // Generation-intervention hook: the emitter may request tokens to
             // FORCE after this one, suppressing the step's terminator (cohere2moe
@@ -5942,6 +5955,9 @@ fn generate_spec(
                 None => {}
             }
         }
+        if observed_tail != committed_tail.len() {
+            terminal_state_cacheable = false;
+        }
         // Advance by the emitted-tail length (= accepted + 1), NOT by `accepted`
         // — the loop contract pinned by spec.rs's `emit_len_drives_advance`.
         position += step.emit.len();
@@ -5956,6 +5972,10 @@ fn generate_spec(
         // honoring the suppressed terminator. Bounded by the emitter's own
         // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
         if !forced_after.is_empty() {
+            // Intervention changes the visible sequence after a verifier has
+            // already advanced over its original tail. Preserve the response,
+            // but do not reuse this mixed speculative state on the next turn.
+            terminal_state_cacheable = false;
             for ft in std::mem::take(&mut forced_after) {
                 if let Err(e) =
                     slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
@@ -6013,6 +6033,27 @@ fn generate_spec(
     let streamed_tokens = emit.streamed_tokens().to_vec();
     let grammar_violated = emit.grammar_violated();
 
+    // The final emitted token is the next seed returned by the last speculative
+    // window. It has not yet been forwarded: target state covers positions
+    // `[0, position)`, while `seed_token` lives at `position`. Bake it before
+    // advertising the full rendered conversation as a reusable prefix.
+    if terminal_state_cacheable && !grammar_violated {
+        if m.eviction.is_none() {
+            debug_assert_eq!(
+                position + 1,
+                prompt_tokens.len() + emitted.len(),
+                "spec terminal cursor must trail the visible conversation by one seed"
+            );
+        }
+        match spec.bake_terminal_seed(gpu, slot, position, seed_token) {
+            Ok(()) => position += 1,
+            Err(e) => {
+                eprintln!("[spec] terminal seed bake failed: {e} — forcing cold next turn");
+                terminal_state_cacheable = false;
+            }
+        }
+    }
+
     m.seq_pos = position;
     // Bake the FULL conversation (prefill + decode) into conversation_tokens
     // so subsequent turns can compute LCP against it. Previously this stored
@@ -6031,8 +6072,12 @@ fn generate_spec(
     // + KV eviction offset via reset_recurrent, plus the drafter's checkpoint
     // ring via spec.reset) so the next request starts clean. The user pays the
     // prefill cost on the retry but never sees the bad tokens; see Pi turn-12.
-    if grammar_violated {
-        eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
+    if grammar_violated || !terminal_state_cacheable {
+        if grammar_violated {
+            eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
+        } else {
+            eprintln!("[spec] verified tail diverged from emitted turn — forcing cold next turn");
+        }
         slot.reset_recurrent(gpu);
         spec.reset(gpu);
         m.conversation_tokens.clear();

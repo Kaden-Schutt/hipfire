@@ -618,6 +618,64 @@ impl Speculator for DflashSpeculator {
         Ok(lower_qwen35(raw))
     }
 
+    fn bake_terminal_seed(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<(), String> {
+        // A spec window commits target state through `position - 1`; its bonus
+        // is emitted at `position` and normally becomes the next window's seed.
+        // At end-of-turn there is no next window, so advance that one token now
+        // and mirror its extracted hidden row into DFlash's cumulative context.
+        // Without this bake, an exact LCP cache hit starts its suffix one token
+        // ahead of both the target recurrent state and the draft hidden log.
+        self.df
+            .gdn_tape
+            .wait_replay(gpu)
+            .map_err(|e| e.to_string())?;
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        let ckpt_sink = if self.resume_enabled {
+            Some(&mut self.checkpoints)
+        } else {
+            None
+        };
+        let aborted = seed_target_hidden_suffix_abortable(
+            gpu,
+            slot,
+            &mut self.df.hidden_rb,
+            &[seed],
+            position,
+            &|| false,
+            ckpt_sink,
+            self.ck_interval,
+            self.ck_cap,
+        )
+        .map_err(|e| e.to_string())?;
+        if aborted {
+            return Err("terminal DFlash seed bake unexpectedly aborted".to_string());
+        }
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            &self.df.hidden_rb,
+            &self.df.draft_scratch.target_hidden,
+            position,
+            1,
+            1,
+        )
+        .map_err(|e| e.to_string())?;
+        let compact_offset = slot.kv_cache.compact_offset as i32;
+        self.df
+            .draft_scratch
+            .thlog
+            .append_committed(position, 1, compact_offset);
+        Ok(())
+    }
+
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
         // Compact the drafter's cached target-hidden rows to match the target KV
         // after the FlashCASK eviction the daemon already applied to the target.
