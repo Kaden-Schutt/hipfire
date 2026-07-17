@@ -1003,6 +1003,10 @@ fn grouped_moe_dtypes_supported(gate_up: DType, down: DType) -> bool {
         && matches!(down, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd)
 }
 
+fn grouped_moe_topology_supported(n_experts: usize, experts_per_token: usize) -> bool {
+    n_experts == 256 && experts_per_token == 8
+}
+
 /// Batched forward over `B` tokens in ONE pass — the spec-decode VERIFY forward
 /// and fast-prefill keystone. Fills the KV cache for all B positions and returns
 /// the LAST token's logits. Reads each weight matrix ONCE for all B tokens
@@ -1117,6 +1121,7 @@ pub fn forward_batch(
     const MOE_GROUPED_GATE: usize = 256;
     let moe_grouped = b >= MOE_GROUPED_GATE
         && gpu.arch_caps.has_wmma()
+        && grouped_moe_topology_supported(n_exp, k_top)
         && weights.layers.iter().all(|layer| {
             grouped_moe_dtypes_supported(
                 layer.experts[0].gate_up.gpu_dtype,
@@ -1683,5 +1688,12 @@ mod ship6_lower_tests {
             DType::MQ4G256,
             DType::MQ3G256Lloyd
         ));
+    }
+
+    #[test]
+    fn grouped_moe_accepts_only_minimax_m2_topology() {
+        assert!(grouped_moe_topology_supported(256, 8));
+        assert!(!grouped_moe_topology_supported(16, 8));
+        assert!(!grouped_moe_topology_supported(256, 4));
     }
 }
