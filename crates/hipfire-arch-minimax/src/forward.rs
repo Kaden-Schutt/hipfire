@@ -1007,6 +1007,16 @@ fn grouped_moe_topology_supported(n_experts: usize, experts_per_token: usize) ->
     n_experts == 256 && experts_per_token == 8
 }
 
+fn large_batch_topology_supported(cfg: &MiniMaxConfig) -> bool {
+    cfg.hidden_size == 3072
+        && cfg.intermediate_size == 1536
+        && cfg.num_attention_heads == 48
+        && cfg.num_key_value_heads == 8
+        && cfg.head_dim == 128
+        && cfg.rotary_dim == 64
+        && grouped_moe_topology_supported(cfg.num_local_experts, cfg.num_experts_per_tok)
+}
+
 /// Batched forward over `B` tokens in ONE pass — the spec-decode VERIFY forward
 /// and fast-prefill keystone. Fills the KV cache for all B positions and returns
 /// the LAST token's logits. Reads each weight matrix ONCE for all B tokens
@@ -1049,6 +1059,11 @@ pub fn forward_batch(
     if b > 4096 {
         return Err(format!(
             "minimax forward_batch: B={b} exceeds supported prefill chunk 4096"
+        ));
+    }
+    if b > 64 && !large_batch_topology_supported(cfg) {
+        return Err(format!(
+            "minimax forward_batch: B={b} requires the validated MiniMax-M2 production topology"
         ));
     }
     let hidden = cfg.hidden_size;
@@ -1695,5 +1710,32 @@ mod ship6_lower_tests {
         assert!(grouped_moe_topology_supported(256, 8));
         assert!(!grouped_moe_topology_supported(16, 8));
         assert!(!grouped_moe_topology_supported(256, 4));
+    }
+
+    #[test]
+    fn large_batch_accepts_only_minimax_m2_production_topology() {
+        let mut cfg = MiniMaxConfig {
+            vocab_size: 200064,
+            hidden_size: 3072,
+            num_hidden_layers: 62,
+            num_attention_heads: 48,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            intermediate_size: 1536,
+            num_local_experts: 256,
+            num_experts_per_tok: 8,
+            rotary_dim: 64,
+            rope_theta: 5_000_000.0,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 204800,
+            use_qk_norm: true,
+            use_routing_bias: true,
+            scoring_func: "sigmoid".to_string(),
+            num_mtp_modules: 3,
+            reap_keep: None,
+        };
+        assert!(large_batch_topology_supported(&cfg));
+        cfg.num_local_experts = 16;
+        assert!(!large_batch_topology_supported(&cfg));
     }
 }
