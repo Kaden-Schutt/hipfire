@@ -2398,6 +2398,12 @@ pub const MOE_UNSCATTER_SILU_CLAMP_K8_SRC: &str =
 /// reuse per block vs the single-warp 16×16 kernel.
 pub const GEMM_Q8_0_WMMA_4W_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_wmma_4w.hip");
 
+/// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 4-warp 64x64 tile (gfx1151). i8
+/// port of gemm_q8_0_wmma_4w: int8 weights direct + Q8_1 activations + i8 WMMA
+/// at ~2x. Y[N,M] = X[N,K] @ W[M,K]^T. Requires M%64==0, N%64==0, K%128==0.
+pub const GEMM_Q8_0_MMQ_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_mmq_4w.gfx1151.hip");
+
 /// Path 2 combine for down: per (token, m) iterates K_TOP slots via
 /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
 /// x_residual. No atomic contention (each token's m column is owned by
@@ -4838,6 +4844,13 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
 /// dim stays at 16 due to expert-spanning constraint.
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip");
+
+/// i8 WMMA MMQ MoE grouped-GEMM for MQ2-Lloyd weights on gfx1151. Decodes the
+/// 2-bit Lloyd index via an in-kernel int8-codebook LUT and runs i8 WMMA at
+/// ~2x the FP16 rate. Drop-in for the FP16 `_4w_k2` sibling (same kernarg
+/// layout + trailing x_src_rows).
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip");
 
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_N32_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.hip");

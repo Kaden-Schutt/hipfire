@@ -162,6 +162,14 @@ pub struct FeatureFlags {
     pub deterministic: bool,
     pub mw16: bool,
     pub q8_batched_legacy: bool,
+    /// `HIPFIRE_DEEPSEEK4_Q8_WMMA=0` disables the Q8_0 dense WMMA prefill path
+    /// (forces the scalar chunked fallback). Consumed by
+    /// `gemm_q8_0_wmma_prefill_auto`.
+    pub deepseek4_q8_wmma_off: bool,
+    /// `HIPFIRE_DEEPSEEK4_Q8_4W=0` forces the single-warp 16×16 Q8_0 WMMA
+    /// kernel instead of the 4-warp 64×64 tile. Consumed by
+    /// `gemm_q8_0_wmma_prefill_auto`.
+    pub deepseek4_q8_4w_off: bool,
     pub rope_interleaved_legacy: bool,
     pub wo_wmma_variant: Option<String>,
 
@@ -470,6 +478,8 @@ impl FeatureFlags {
             deterministic: std::env::var("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: std::env::var("HIPFIRE_MW16").map_or(false, |v| v == "1"),
             q8_batched_legacy: std::env::var("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
+            deepseek4_q8_wmma_off: std::env::var("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
+            deepseek4_q8_4w_off: std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
             rope_interleaved_legacy: std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY")
                 .ok()
                 .as_deref()
@@ -683,6 +693,8 @@ impl FeatureFlags {
             deterministic: false,
             mw16: false,
             q8_batched_legacy: false,
+            deepseek4_q8_wmma_off: false,
+            deepseek4_q8_4w_off: false,
             rope_interleaved_legacy: false,
             wo_wmma_variant: None,
             rocblas_all_archs: false,

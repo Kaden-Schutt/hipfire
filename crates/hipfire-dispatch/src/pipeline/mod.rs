@@ -1675,6 +1675,10 @@ pub fn run_moe_decode_bias_aware(
 /// `Lloyd4w` on gfx11+, `Base` otherwise). Selected once per gate_up/down call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GroupedLloydVariant {
+    /// i8 WMMA MMQ path (gfx1151): decodes the 2-bit Lloyd index via an int8
+    /// codebook LUT and runs i8 WMMA at ~2x the FP16 rate. Top priority when
+    /// enabled — ~1.7x the FP16 grouped GEMM on the DeepSeek-V4 prefill shape.
+    I8,
     N32,
     Cnd,
     EightW,
@@ -1689,13 +1693,16 @@ enum GroupedLloydVariant {
 /// only on the 4w path; `use_nosync` ⊂ `use_mmqload` ⊂ `use_lloyd_4w`.
 fn select_grouped_lloyd_variant(
     use_lloyd_4w: bool,
+    i8: bool,
     n32: bool,
     cnd: bool,
     eightw: bool,
     use_mmqload: bool,
     use_nosync: bool,
 ) -> GroupedLloydVariant {
-    if use_lloyd_4w && n32 {
+    if i8 {
+        GroupedLloydVariant::I8
+    } else if use_lloyd_4w && n32 {
         GroupedLloydVariant::N32
     } else if use_lloyd_4w && cnd {
         GroupedLloydVariant::Cnd
@@ -1710,6 +1717,10 @@ fn select_grouped_lloyd_variant(
     } else {
         GroupedLloydVariant::Base
     }
+}
+
+fn use_gfx1151_i8_moe(arch: &str) -> bool {
+    arch == "gfx1151"
 }
 
 /// Dispatch one MQ2-Lloyd grouped GEMM. All seven variants share the signature
@@ -1733,6 +1744,18 @@ fn dispatch_grouped_lloyd(
 ) -> Result<(), DispatchError> {
     use GroupedLloydVariant as V;
     let r = match variant {
+        V::I8 => gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
         V::N32 => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
             ptrs,
             tile_ids,
@@ -1911,6 +1934,8 @@ pub fn run_moe_prefill_bias_aware(
     let eightw = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
     let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
     let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+    // i8 MMQ path (gfx1151 only): 2-bit Lloyd → int8 codebook LUT + i8 WMMA.
+    let i8_moe = use_gfx1151_i8_moe(&gpu.arch);
 
     if use_grouped {
         const BLOCK_M: usize = 16;
@@ -1935,8 +1960,11 @@ pub fn run_moe_prefill_bias_aware(
             lloyd_4w_base.unwrap_or(arch_4w) && (2 * im) % 64 == 0 && hidden % 256 == 0;
         let use_mmqload_gu = use_lloyd_4w_gu && mmqload_env;
         let use_nosync_gu = use_mmqload_gu && nosync_env;
+        // i8 path requires (2*im)%16==0 && hidden%256==0 (looser than 4w's %64).
+        let use_i8_gu = i8_moe && (2 * im) % 16 == 0 && hidden % 256 == 0;
         let v_gu = select_grouped_lloyd_variant(
             use_lloyd_4w_gu,
+            use_i8_gu,
             n32,
             cnd,
             eightw,
@@ -1999,8 +2027,10 @@ pub fn run_moe_prefill_bias_aware(
         let use_lloyd_4w_dn = lloyd_4w_base.unwrap_or(arch_4w) && hidden % 64 == 0 && im % 256 == 0;
         let use_mmqload_dn = use_lloyd_4w_dn && mmqload_env;
         let use_nosync_dn = use_mmqload_dn && nosync_env;
+        let use_i8_dn = i8_moe && hidden % 16 == 0 && im % 256 == 0;
         let v_dn = select_grouped_lloyd_variant(
             use_lloyd_4w_dn,
+            use_i8_dn,
             n32,
             cnd,
             eightw,
@@ -2779,9 +2809,17 @@ pub fn dispatch_fused(
 
 #[cfg(test)]
 mod mixed_dispatch_tests {
-    use super::build_contiguous_permutation;
+    use super::{build_contiguous_permutation, use_gfx1151_i8_moe};
     use crate::families::moe_buckets::bucket_topk_by_tier;
     use rdna_compute::DType::*;
+
+    #[test]
+    fn deepseek4_i8_moe_is_exact_gfx1151_only() {
+        assert!(use_gfx1151_i8_moe("gfx1151"));
+        for arch in ["gfx1100", "gfx1150", "gfx1152", "gfx1200", "gfx1201"] {
+            assert!(!use_gfx1151_i8_moe(arch), "unexpected i8 route on {arch}");
+        }
+    }
 
     /// EQUIVALENCE INVARIANT (host half): an all-ONE-tier table yields the
     /// IDENTITY permutation and a single full-width range. This is the
