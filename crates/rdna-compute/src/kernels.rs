@@ -1230,6 +1230,16 @@ pub const GEMV_HFQ4G256_RESIDUAL_GLOBAL_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
+/// Exact dense-27B R2 memory-partition probe: pair each output row with the
+/// corresponding row in the matrix's opposite half instead of its neighbor.
+pub const GEMV_HFQ4G256_RESIDUAL_HALF_SPLIT_GLOBAL_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS 1\n",
+    "#define HIPFIRE_RESIDUAL_HALF_SPLIT 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_half_split_global_gfx1201\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
 /// Radiowave gfx1151 probe: preserve the generic dual-row arithmetic while
 /// lowering the weight stream to temporal raw-buffer loads. gfx1151 is not in
 /// the gfx1100 dGPU admission set, so this remains inert unless the exact-arch
