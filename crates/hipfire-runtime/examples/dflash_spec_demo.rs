@@ -1651,6 +1651,7 @@ fn main() {
                     seed_token,
                     ctx_slice,
                     if no_tape { None } else { Some(&mut gdn_tape) },
+                    None, // product DFlash owns the retained-PM4 verifier cache
                     runtime_temp,
                     1.0_f32, // top_p: demo has no nucleus CLI; 1.0 = disabled (byte-path unchanged)
                     0,       // top_k: demo has no top-k CLI; 0 = disabled

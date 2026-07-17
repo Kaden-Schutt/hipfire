@@ -24,6 +24,7 @@ use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
+use rdna_compute::replay::{ReplayBackendRequest, ReplayController, ReplayState};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2215,6 +2216,20 @@ fn dflash_replay_overlap_enabled() -> bool {
     })
 }
 
+/// Temporarily install an engine-owned replay controller for one explicitly
+/// delimited sequence. Always restore the model/plain-AR controller before
+/// returning, including the error path.
+fn with_external_replay<T>(
+    gpu: &mut Gpu,
+    replay: &mut ReplayController,
+    run: impl FnOnce(&mut Gpu) -> HipResult<T>,
+) -> HipResult<T> {
+    std::mem::swap(&mut gpu.replay, replay);
+    let result = run(gpu);
+    std::mem::swap(&mut gpu.replay, replay);
+    result
+}
+
 /// Run the target on `draft_tokens` (length B) positions starting at
 /// `start_pos`. Advances `target.kv_cache` and `target.dn_state` by B
 /// positions. Writes B hidden-state rows into `hidden_rb` (ring head
@@ -2303,7 +2318,7 @@ fn verify_dflash_block_inner(
     draft_tokens: &[u32],
     start_pos: usize,
     hidden_rb: &mut HiddenStateRingBuffer,
-    gdn_tape: Option<&mut GdnTape>,
+    mut gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
     verify_scratch: &VerifyScratch,
@@ -2396,7 +2411,24 @@ fn verify_dflash_block_inner(
     // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
     // would skip a verify-graph that now replays fine and forfeit the long-context
     // spec speedup.
-    let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
+    // An engine-owned controller means the caller selected chain DFlash's
+    // fixed-width retained verifier. Keep its shape deliberately narrower
+    // than hipGraph: no tree mask, fixed B, persistent PBS/tape buffers, and a
+    // batched lm_head so the retained body has no host work in its interior.
+    let redline_verify_ok = gpu.replay.is_external_sequence()
+        && gpu.replay.request() == ReplayBackendRequest::Auto
+        && gpu.replay.is_enabled()
+        && gpu.replay.uses_pm4_transport()
+        && !tree_verify_present
+        && dflash_batched_lm_head_supported(target.weights.output.gpu_dtype)
+        && matches!(
+            target.weights.embd_format,
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
+                | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
+        )
+        && verify_scratch.prefill_batch.is_some();
+    let verify_graph_ok = !redline_verify_ok
+        && std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
         && tree_ok_for_graph
         && matches!(
             target.weights.embd_format,
@@ -2417,9 +2449,120 @@ fn verify_dflash_block_inner(
     } else {
         None
     };
-    let mut graph_includes_lmhead_argmax = false;
+    let mut replay_includes_lmhead_argmax = false;
 
-    let batch_result = if verify_graph_ok {
+    let batch_result = if redline_verify_ok {
+        let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
+        debug_assert!(b <= pbs.max_batch);
+        qwen35::upload_prefill_batch_inputs(gpu, pbs, draft_tokens, start_pos)?;
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create()?);
+        }
+
+        if gpu.replay.should_route_pm4() {
+            vg_mode = "redline-replay";
+            // SAFETY: every captured model, cache, scratch, hidden-ring, and
+            // tape allocation belongs to the live DflashSpeculator. Dynamic
+            // position/grid and GDN frame bindings are patched by replay_pm4.
+            unsafe { gpu.replay.replay_pm4(start_pos) }.map_err(|reason| {
+                gpu.replay
+                    .poison(format!("DFlash verify PM4 replay failed: {reason}"));
+                hip_bridge::HipError::new(0, &reason)
+            })?;
+            replay_includes_lmhead_argmax = true;
+            Ok(())
+        } else if gpu.replay.state() == ReplayState::Armed {
+            vg_mode = "redline-capture";
+            gpu.replay
+                .begin_capture()
+                .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+            let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
+                gpu,
+                &target.weights,
+                &target.config,
+                draft_tokens,
+                start_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                pbs,
+                Some(hidden_rb),
+                Some(&final_hidden),
+                gdn_tape.as_deref_mut(),
+                None,
+                false,
+            )
+            .and_then(|_| {
+                dflash_enqueue_verify_lm_head_argmax(
+                    gpu,
+                    &target.weights.output,
+                    &final_hidden,
+                    verify_scratch,
+                    b,
+                    vocab,
+                )
+            });
+            if r.is_ok() {
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.stream_synchronize(stream)?;
+                } else {
+                    gpu.hip.device_synchronize()?;
+                }
+                let summary = gpu
+                    .replay
+                    .finish_capture()
+                    .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+                let device_ordinal = usize::try_from(gpu.device_id)
+                    .map_err(|_| hip_bridge::HipError::new(0, "negative HIP device ordinal"))?;
+                match gpu
+                    .replay
+                    .prepare_pm4_prefix(device_ordinal, summary.launch_count)
+                {
+                    Ok((dispatches, dwords, queue)) => eprintln!(
+                        "[dflash-redline] retained verify B={} dispatches={} dwords={} queue={}",
+                        b, dispatches, dwords, queue
+                    ),
+                    Err(reason) => {
+                        gpu.replay.poison(format!(
+                            "DFlash verify PM4 preparation failed: {reason}"
+                        ));
+                        eprintln!(
+                            "[dflash-redline] disabled B={} after PM4 preparation failure: {}",
+                            b, reason
+                        );
+                    }
+                }
+                // Capture executes the body directly; even a fail-closed PM4
+                // preparation leaves this cycle's outputs valid.
+                replay_includes_lmhead_argmax = true;
+            } else {
+                gpu.replay
+                    .poison("DFlash verify capture failed while dispatching");
+            }
+            r
+        } else {
+            // A non-ready, non-armed state is not expected for the explicit
+            // controller. Execute once through HIP and let the controller's
+            // sticky state keep future cycles off the retained route.
+            vg_mode = "redline-direct";
+            qwen35::forward_prefill_batch_single_chunk_captured_opts(
+                gpu,
+                &target.weights,
+                &target.config,
+                draft_tokens,
+                start_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                pbs,
+                Some(hidden_rb),
+                Some(&final_hidden),
+                gdn_tape.as_deref_mut(),
+                None,
+                false,
+            )
+        }
+    } else if verify_graph_ok {
         let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
         debug_assert!(b <= pbs.max_batch);
         // Pre-capture: pre-upload inputs and ensure a stream exists. memcpy_htod
@@ -2430,7 +2573,7 @@ fn verify_dflash_block_inner(
         }
         if gpu.graphs.verify_has_graph(b) {
             vg_mode = "replay";
-            graph_includes_lmhead_argmax =
+            replay_includes_lmhead_argmax =
                 moe_lmhead_graph_ok && gpu.graphs.verify_graph_has_lmhead_argmax(b);
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
@@ -2521,7 +2664,7 @@ fn verify_dflash_block_inner(
                 )?;
                 if capture_lmhead_argmax {
                     gpu.graphs.verify_mark_graph_lmhead_argmax(b);
-                    graph_includes_lmhead_argmax = true;
+                    replay_includes_lmhead_argmax = true;
                 }
                 // Under `hipStreamBeginCapture`, kernels + memcpys on the
                 // captured stream are RECORDED, not executed. final_hidden
@@ -2580,7 +2723,7 @@ fn verify_dflash_block_inner(
     // those rows at the current head and advances head by b. Under the
     // graph path we manually drive this because the non-graph chunk loop
     // (forward_prefill_batch_with_pbs) that usually calls it was bypassed.
-    if verify_graph_ok && batch_result.is_ok() {
+    if (redline_verify_ok || verify_graph_ok) && batch_result.is_ok() {
         hidden_rb.commit_staging_to_ring(gpu, b)?;
     }
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
@@ -2622,12 +2765,21 @@ fn verify_dflash_block_inner(
 
     let try_batched = dflash_batched_lm_head_supported(w_out.gpu_dtype);
 
-    if graph_includes_lmhead_argmax {
-        debug_assert!(!want_full_logits);
-        // The MoE-only extended verify graph already enqueued lm_head+argmax.
-        // Mirror MTP's graph shape: keep device work captured, then perform
-        // the single small D2H read after graph launch.
-        argmax_per_pos = dflash_download_verify_argmax(gpu, verify_scratch, b)?;
+    if replay_includes_lmhead_argmax {
+        // Redline always retains lm_head+argmax; the MoE extended HIP graph
+        // does so for its greedy-only shape. Sampling may still request the
+        // full logits, which are already resident in the same scratch buffer.
+        if want_full_logits {
+            let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
+            let host_logits = gpu.download_f32(&logits_batch)?;
+            for i in 0..b {
+                let row = &host_logits[i * vocab..(i + 1) * vocab];
+                argmax_per_pos.push(argmax_u32(row));
+            }
+            logits_per_pos = host_logits;
+        } else {
+            argmax_per_pos = dflash_download_verify_argmax(gpu, verify_scratch, b)?;
+        }
     } else if try_batched {
         let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
         // Q8_0 routes through the DFlash lm_head helper so the gfx12 WMMA
@@ -2914,6 +3066,10 @@ pub fn spec_step_dflash(
     seed_token: u32,
     ctx_slice: Option<usize>,
     gdn_tape: Option<&mut GdnTape>,
+    // Optional fixed-width retained verifier owned by the DFlash speculator.
+    // Installed only around target verify; drafting, sampling, acceptance,
+    // rollback, and the model/plain-AR replay controller remain unchanged.
+    verify_replay: Option<&mut ReplayController>,
     temp: f32,
     // Nucleus (top_p) cutoff applied IDENTICALLY to both the draft and target
     // softmax rows on the temp sampling path. 1.0 (or >= 0.999) disables it →
@@ -3588,21 +3744,33 @@ pub fn spec_step_dflash(
         gpu.hip.device_synchronize()?;
     }
     let t_verify_start = std::time::Instant::now();
-    let verify_out = verify_dflash_block(
-        gpu,
-        target,
-        &block,
-        position,
-        hidden_rb,
-        gdn_tape_opt.as_deref_mut(),
-        // Full target logits are D2H'd to the host for rejection sampling, RP,
-        // or n-gram block. Under FAST_SAMPLE the rejection sampler reads the
-        // GPU-softmaxed target probs directly from the resident
-        // `verify_scratch.logits` buffer, so the host full-logit download +
-        // host argmax are skipped — that's the target-side half of the cost cut.
-        (use_temp_sampling && !fast_sample_active) || host_path_active,
-        verify_scratch,
-    )?;
+    let want_full_verify_logits =
+        (use_temp_sampling && !fast_sample_active) || host_path_active;
+    let verify_out = if let Some(replay) = verify_replay {
+        with_external_replay(gpu, replay, |gpu| {
+            verify_dflash_block(
+                gpu,
+                target,
+                &block,
+                position,
+                hidden_rb,
+                gdn_tape_opt.as_deref_mut(),
+                want_full_verify_logits,
+                verify_scratch,
+            )
+        })?
+    } else {
+        verify_dflash_block(
+            gpu,
+            target,
+            &block,
+            position,
+            hidden_rb,
+            gdn_tape_opt.as_deref_mut(),
+            want_full_verify_logits,
+            verify_scratch,
+        )?
+    };
 
     if phase_on {
         gpu.hip.device_synchronize()?;

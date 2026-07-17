@@ -1908,6 +1908,10 @@ pub struct ReplayController {
     prepared_pm4: Option<PreparedPm4Replay>,
     auto_lifecycle: bool,
     forward_eligible: bool,
+    /// True for an engine-owned sequence whose capture/replay lifecycle is
+    /// explicitly delimited by the caller (for example a fixed-width DFlash
+    /// verifier). Nested model forwards must not revoke its eligibility.
+    external_sequence: bool,
 }
 
 impl ReplayController {
@@ -1952,6 +1956,7 @@ impl ReplayController {
             prepared_pm4: None,
             auto_lifecycle: false,
             forward_eligible: true,
+            external_sequence: false,
         }
     }
 
@@ -1960,6 +1965,24 @@ impl ReplayController {
         if request != ReplayBackendRequest::Hip {
             controller.state = ReplayState::Armed;
         }
+        controller
+    }
+
+    /// Build an isolated controller for an explicitly delimited engine-owned
+    /// sequence. It inherits the parent's selected route while keeping capture
+    /// state separate from plain AR. Mutable verifier state is correctness-first:
+    /// retain one queue and conservative inter-dispatch visibility until the
+    /// sequence receives an independent dependency audit.
+    pub fn new_external_from(parent: &Self) -> Self {
+        let mut controller = Self::new_armed(parent.request);
+        controller.transport = parent.transport;
+        controller.pm4_mid_acquire_policy = Pm4MidAcquirePolicy::Conservative;
+        controller.pm4_wait_policy = parent.pm4_wait_policy;
+        controller.pm4_register_policy = parent.pm4_register_policy;
+        controller.auto_lifecycle = false;
+        controller.forward_eligible = true;
+        controller.external_sequence = true;
+        controller.pm4_queue_policy = QueuePolicy::One;
         controller
     }
 
@@ -2021,6 +2044,7 @@ impl ReplayController {
         self.prepared_pm4 = None;
         self.auto_lifecycle = auto_lifecycle;
         self.forward_eligible = true;
+        self.external_sequence = false;
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -2060,7 +2084,33 @@ impl ReplayController {
     /// forward. Speculative/MTP re-seed and verify calls must neither populate
     /// the plain-AR capture nor route its prepared replay.
     pub fn set_forward_eligible(&mut self, eligible: bool) {
-        self.forward_eligible = eligible;
+        if !self.external_sequence {
+            self.forward_eligible = eligible;
+        }
+    }
+
+    pub fn is_external_sequence(&self) -> bool {
+        self.external_sequence
+    }
+
+    /// Drop an engine-owned prepared tape and return it to its initial route.
+    /// This is intentionally unavailable on the model/plain-AR controller.
+    pub fn reset_external_capture(&mut self) -> Result<(), &'static str> {
+        if !self.external_sequence {
+            return Err("replay controller does not own an external sequence");
+        }
+        self.recorded.clear();
+        self.certified_speedups.clear();
+        self.fallback_reason = None;
+        self.prepared = None;
+        self.prepared_pm4 = None;
+        self.forward_eligible = true;
+        self.state = if self.request == ReplayBackendRequest::Hip {
+            ReplayState::Hip
+        } else {
+            ReplayState::Armed
+        };
+        Ok(())
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -3899,6 +3949,34 @@ mod tests {
         assert_eq!(controller.state(), ReplayState::Hip);
         assert_eq!(controller.transport_name(), "aql");
         assert!(!controller.is_enabled());
+    }
+
+    #[test]
+    fn external_sequence_inherits_route_but_owns_capture_lifecycle() {
+        let mut parent = ReplayController::new(ReplayBackendRequest::Hip);
+        parent.apply_model_default(true, ReplayTransport::Pm4Ib);
+        let mut external = ReplayController::new_external_from(&parent);
+
+        assert_eq!(external.request(), ReplayBackendRequest::Auto);
+        assert_eq!(external.transport_name(), "pm4");
+        assert_eq!(external.pm4_queue_policy(), QueuePolicy::One);
+        assert_eq!(
+            external.pm4_mid_acquire_policy,
+            Pm4MidAcquirePolicy::Conservative
+        );
+        assert!(external.is_external_sequence());
+
+        // Nested model calls may mark plain AR ineligible; an explicit
+        // engine-owned sequence must remain recordable.
+        external.set_forward_eligible(false);
+        external.begin_capture().unwrap();
+        assert!(external.is_recording());
+        external.record_hip_launch("k", None, [1; 3], [32, 1, 1], 0, &[]);
+        assert_eq!(external.recorded_launches().len(), 1);
+
+        external.reset_external_capture().unwrap();
+        assert_eq!(external.state(), ReplayState::Armed);
+        assert!(external.recorded_launches().is_empty());
     }
 
     #[test]

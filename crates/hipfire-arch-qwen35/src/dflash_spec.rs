@@ -23,8 +23,9 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
     EvictRetain, PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator,
 };
+use rdna_compute::replay::{ReplayBackendRequest, ReplayController};
 use rdna_compute::Gpu;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 // ─── DDTree side state ────────────────────────────────────────────────
@@ -187,6 +188,11 @@ fn lower_qwen35(r: SpecStepResult) -> SpecStep {
 /// render DeltaNet checkpoint ring folded in from `LoadedModel.dflash_checkpoints`.
 pub struct DflashSpeculator {
     df: DflashState,
+    /// One retained target-verifier tape per fixed chain width. The controller
+    /// is isolated from plain AR because nested batched forwards deliberately
+    /// mark the model controller ineligible. DDTree owns a different dynamic
+    /// contract and does not use this cache.
+    verify_replays: HashMap<usize, ReplayController>,
     rng_state: u64,
     /// Per-request sampling, set via `set_sampling` before each step loop and
     /// applied in the chain-mode `spec_step_dflash` branch of `step`. Default
@@ -263,6 +269,7 @@ impl DflashSpeculator {
         let adaptive_b = df.block_size;
         Self {
             df,
+            verify_replays: HashMap::new(),
             // Same fixed seed the daemon's DFlash loop used. `set_sampling`
             // re-seeds it to this value per request (matching spec-graph's local
             // `let mut rng_state = 0x13579BDF` per `generate_dflash` call) so a
@@ -544,6 +551,21 @@ impl Speculator for DflashSpeculator {
                 .wait_replay(gpu)
                 .map_err(|e| e.to_string())?;
         }
+        let redline_verify = if self.df.ddtree.is_none()
+            && std::env::var("HIPFIRE_DFLASH_REDLINE").ok().as_deref() != Some("0")
+            && gpu.replay.request() == ReplayBackendRequest::Auto
+            && gpu.replay.is_enabled()
+            && gpu.replay.uses_pm4_transport()
+        {
+            if !self.verify_replays.contains_key(&selected_b) {
+                let replay = ReplayController::new_external_from(&gpu.replay);
+                self.verify_replays.insert(selected_b, replay);
+            }
+            self.verify_replays.get_mut(&selected_b)
+        } else {
+            None
+        };
+
         let result = if let Some(dd) = self.df.ddtree.as_mut() {
             spec_step_ddtree_batched(
                 gpu,
@@ -588,6 +610,7 @@ impl Speculator for DflashSpeculator {
                 seed,
                 None, // ctx_slice = full history
                 Some(&mut self.df.gdn_tape),
+                redline_verify,
                 // Sampling threaded from the request via `set_sampling` (#477
                 // merge re-wire). These four positions reproduce spec-graph's old
                 // inline `generate_dflash` call verbatim: temp 0 ⇒ greedy/argmax;
@@ -834,9 +857,13 @@ impl Speculator for DflashSpeculator {
         // member here leaks VRAM across daemon unload/reload cycles.
         let DflashSpeculator {
             mut df,
+            verify_replays,
             checkpoints,
             ..
         } = *self;
+        // Drop retained queues/kernarg pools before releasing any allocation
+        // whose address is baked into their command buffers.
+        drop(verify_replays);
         let _ = df.gdn_tape.wait_replay(gpu);
         let DflashState {
             draft_config: _,
