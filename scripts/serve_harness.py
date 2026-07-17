@@ -58,6 +58,10 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 def resolve_sampling(spec, tag, registry_path):
     """Return (values_dict, source_dict). spec: 'registry'|'greedy'|'recipe:NAME'|json string."""
     src = {}
+    if spec == "daemon":
+        # Send no sampling fields. The product path then resolves the target
+        # HFQ generation_config first and the architecture defaults second.
+        return {}, {}
     if spec == "greedy":
         return {"temperature": 0.0}, {"temperature": "explicit(greedy)"}
     if spec.startswith("recipe:"):
@@ -106,6 +110,7 @@ def build_config(args):
         sys.exit(f"thinking_budget {args.thinking!r} not a key of {list(THINKING_BUDGET)}")
     return {
         "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
+        "dflash": args.dflash,
         "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
@@ -126,7 +131,8 @@ def show_config(cfg):
     print("==================== serve_harness pre-flight (CONFIRM before run) ====================")
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
-    print(f"  kv_mode       : {cfg['kv']}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
+    print(f"  kv_mode       : {cfg['kv']}   mtp_mode: {cfg['mtp']}   "
+          f"dflash_mode: {cfg['dflash']}   mode: {cfg['mode']}")
     print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {cfg['thinking_cap_tokens']} tok (CONCRETE cap)")
     print(f"  max_tokens     : {cfg['max_tokens']}  ({'>cap, model can answer' if cfg['max_tokens'] > cfg['thinking_cap_tokens'] or cfg['thinking_cap_tokens']==0 else 'WARNING: <= think cap -> empty/think-only risk'})")
@@ -170,7 +176,7 @@ def spawn_serve(cfg, home, log):
             os.symlink(os.path.join(models, "..", ln) if ln == "templates" else models, dst)
         except OSError:
             pass
-    conf = {"max_seq": cfg.get("max_seq", 32768), "dflash_mode": "off", "mtp_mode": cfg["mtp"],
+    conf = {"max_seq": cfg.get("max_seq", 32768), "dflash_mode": cfg["dflash"], "mtp_mode": cfg["mtp"],
             "ngram_mode": "off", "max_tokens": 16384, "thinking_budget": cfg["thinking_budget"]}
     json.dump(conf, open(os.path.join(home, ".hipfire", "config.json"), "w"))
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
@@ -285,7 +291,7 @@ def turn_line(i, r, recall=""):
 
 
 def run(cfg, args):
-    label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
+    label = f"{os.path.basename(cfg['model'])}|mtp={cfg['mtp']}|dflash={cfg['dflash']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
     battery = load_prompt_battery(cfg.get("prompts_file"))
@@ -329,11 +335,13 @@ def main():
     ap.add_argument("--registry", default=os.path.join(REPO, "cli/registry.json"))
     ap.add_argument("--kv", default="fwht3")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
+    ap.add_argument("--dflash", default="off", choices=["off", "on", "auto"],
+                    help="product DFlash load mode written to the serve config")
     ap.add_argument("--thinking", default="med", help="thinking_budget preset key")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--sampling", default="registry",
-                    help="registry | greedy | recipe:general|coding|nothink | json:{...}")
+                    help="registry | daemon | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
     ap.add_argument("--session", default="/home/kaden/mv/session_coding.json")
     ap.add_argument("--port", type=int, default=11520)
@@ -356,9 +364,12 @@ def main():
     if not args.no_spawn:
         if not spawn_serve(cfg, args.home, args.serve_log):
             sys.exit("serve_harness: serve failed to warm after retries")
-        head = subprocess.run(f"grep -c 'MTP head loaded' {args.serve_log}", shell=True,
-                              capture_output=True, text=True).stdout.strip()
-        print(f"  [serve warm; MTP head loaded lines={head}]", flush=True)
+        mtp_head = subprocess.run(f"grep -c 'MTP head loaded' {args.serve_log}", shell=True,
+                                  capture_output=True, text=True).stdout.strip()
+        dflash_head = subprocess.run(f"grep -c 'DFlash draft detected' {args.serve_log}", shell=True,
+                                     capture_output=True, text=True).stdout.strip()
+        print(f"  [serve warm; MTP head loaded lines={mtp_head}; "
+              f"DFlash draft detected lines={dflash_head}]", flush=True)
     run(cfg, args)
     if not args.no_spawn:
         _kill_serve()
