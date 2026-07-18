@@ -456,15 +456,27 @@
       "size_gb": 0.38,
       "min_vram_gb": 1.9,
       "desc": "LFM2.5 350M dense (MQ4, embedded chat template)",
-      "quant_recipe": "q8"
+      "quant_recipe": "q8",
+      "recommended_settings": {
+        "temperature": 0.1,
+        "top_p": 1.0,
+        "top_k": 50,
+        "repeat_penalty": 1.05
+      }
     },
     "lfm2.5:8b-a1b": {
       "repo": "hipfire-models/hipfire-LFM2.5-8B-A1B",
       "file": "lfm2.5-8b-a1b.mq4",
       "size_gb": 4.66,
       "min_vram_gb": 6.2,
-      "desc": "LFM2.5 8B-A1B MoE (MQ4, jinja-validated)",
-      "quant_recipe": "mq4-moe"
+      "desc": "LFM2.5 8B-A1B reasoning MoE (MQ4, upstream Jinja template)",
+      "quant_recipe": "mq4-moe",
+      "recommended_settings": {
+        "temperature": 0.2,
+        "top_p": 1.0,
+        "top_k": 80,
+        "repeat_penalty": 1.05
+      }
     },
     "lfm2.5:1.2b": {
       "repo": "hipfire-models/hipfire-LFM2.5-1.2B",
@@ -472,7 +484,13 @@
       "size_gb": 0.7,
       "min_vram_gb": 2.2,
       "desc": "LFM2.5 1.2B Instruct dense (Q8, embedded chat template)",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 0.1,
+        "top_p": 1.0,
+        "top_k": 50,
+        "repeat_penalty": 1.05
+      }
     },
     "lfm2.5:1.2b-thinking": {
       "repo": "hipfire-models/hipfire-LFM2.5-1.2B-Thinking",
@@ -480,7 +498,13 @@
       "size_gb": 0.7,
       "min_vram_gb": 2.2,
       "desc": "LFM2.5 1.2B Thinking dense (Q8, reasoning)",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 0.05,
+        "top_p": 1.0,
+        "top_k": 50,
+        "repeat_penalty": 1.05
+      }
     },
     "qwen3.5:2b-mq3": {
       "repo": "schuttdev/hipfire-qwen3.5-2b",

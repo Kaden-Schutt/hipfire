@@ -58,7 +58,8 @@ const TEMPLATES_DIR = join(HIPFIRE_DIR, "templates");
 const DRAFTS_DIR = join(HIPFIRE_DIR, "drafts");
 const TRIATTN_DIR = join(HIPFIRE_DIR, "triattn");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
-const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
+const MODELS_CATALOG_PATH =
+  process.env.HIPFIRE_MODELS_CATALOG_PATH ?? join(HIPFIRE_DIR, "models.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 // Named thinking budgets → per-turn <think> token cap. uncapped=0 means unlimited.
@@ -671,7 +672,7 @@ export function resolveServeThinkCap(
   return cap;
 }
 
-function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
+export function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
   const base = loadConfig();
   if (!tag) { resolveThinkingBudget(base); return base as ResolvedConfig; }
   const all = loadPerModelConfigs();
@@ -764,6 +765,8 @@ export function resolveSamplingForSend(
     top_p?: number;
     repeat_penalty?: number;
     presence_penalty?: number;
+    top_k?: number;
+    min_p?: number;
   },
 ): SamplingForSend {
   const out: SamplingForSend = {};
@@ -803,9 +806,17 @@ export function resolveSamplingForSend(
     out.presence_penalty = card.presence_penalty;
   }
 
-  // top_k / min_p: card-only today (no flag/per-model surface). Carried-but-inert.
-  if (card && typeof card.top_k === "number") out.top_k = card.top_k;
-  if (card && typeof card.min_p === "number") out.min_p = card.min_p;
+  // top_k / min_p: explicit request > card. min_p remains carried-but-inert.
+  if (flags && typeof flags.top_k === "number") {
+    out.top_k = flags.top_k;
+  } else if (card && typeof card.top_k === "number") {
+    out.top_k = card.top_k;
+  }
+  if (flags && typeof flags.min_p === "number") {
+    out.min_p = flags.min_p;
+  } else if (card && typeof card.min_p === "number") {
+    out.min_p = card.min_p;
+  }
   if (card && typeof card.system_prompt === "string") out.system_prompt = card.system_prompt;
   return out;
 }
@@ -2604,22 +2615,15 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     genMsg.repeat_penalty = repeatPenalty;
     genMsg.top_p = topP;
   }
-  // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
-  // a closed `<think></think>` block via assistant_prefix=closed_think, so
-  // the model never starts a thinking turn at all. This mirrors the
-  // enable_thinking=false semantics from the OpenAI API path
-  // (cli/index.ts ~1668-1680). The Jinja path keys off max_think_tokens==1
-  // for `enable_thinking=false`; the legacy ChatFrame path keys off
-  // assistant_prefix=closed_think. Setting both makes either daemon path
-  // do the right thing.
-  // Previous attempts to inject prose directives with <think>/<no_think>
-  // caused Qwen3.5 to halt at 3-4 tokens — the token-cap approach works
-  // reliably because it operates at the daemon level, not in the prompt.
+  // thinking=off: hard-suppress by capping thinking to 1 token and sending
+  // the template-authoritative enable_thinking=false signal. The token cap is
+  // also retained as the off signal for compatibility with older daemons.
   if (modelCfg.thinking === "off") {
     genMsg.max_think_tokens = 1;
-    genMsg.assistant_prefix = "closed_think";
-  } else if (modelCfg.max_think_tokens > 0) {
-    genMsg.max_think_tokens = modelCfg.max_think_tokens;
+    genMsg.enable_thinking = false;
+  } else {
+    genMsg.enable_thinking = true;
+    if (modelCfg.max_think_tokens > 0) genMsg.max_think_tokens = modelCfg.max_think_tokens;
   }
   if (image) {
     genMsg.image = resolve(image);
@@ -3772,7 +3776,7 @@ async function serve(port: number, host: string) {
         //   >  OMIT (let the daemon's .hfq generation_config → arch ladder resolve).
         // A bare global CONFIG_DEFAULTS value is NOT sent, so the daemon's own
         // card/arch resolution is no longer masked by the CLI's temp=0.3.
-        const sendView = resolveSamplingForSend(body.model);
+        const sendView = resolveSamplingForSend(body.model, body);
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           max_tokens: requestMaxTokens,
@@ -3815,15 +3819,12 @@ async function serve(port: number, host: string) {
           reasoningEffort,
         );
         if (serveThinkCap !== undefined) genParams.max_think_tokens = serveThinkCap;
-        // Wire thinking control for both legacy assistant_prefix
-        // (ChatFrame::ClosedThink) and the new Jinja template path.
-        // The Jinja path uses max_think_tokens==1 as the signal for
-        // enable_thinking=false (daemon.rs line 3099). For the legacy
-        // ChatFrame path, assistant_prefix="closed_think" is sufficient.
-        // `assistant_prefix` drives the legacy ChatFrame path (Qwen et al.);
+        // Wire template-authoritative thinking control separately from ds4
+        // framing. The daemon derives its internal assistant prefix from
+        // enable_thinking; max_think_tokens remains only the budget (and the
+        // old-daemon off signal when it is 1).
         // `think_mode` drives arch_id=9 (DeepSeek V4), whose generate path
-        // ignores assistant_prefix/max_think_tokens and selects framing +
-        // reasoning-parse from think_mode alone:
+        // selects framing + reasoning parsing from think_mode alone:
         //   chat     → `<｜Assistant｜></think>` (no reasoning, content only)
         //   thinking → `<｜Assistant｜><think>`  (emits <think>…</think> reasoning)
         //   max      → thinking + the "Absolute maximum" reasoning preamble
@@ -3831,26 +3832,21 @@ async function serve(port: number, host: string) {
         // encoding/README.md: thinking_mode=chat|thinking, reasoning_effort=max.)
         const rEffort = effortStr;
         if (effective.thinking === "off") {
-          genParams.assistant_prefix = "closed_think";
+          genParams.enable_thinking = false;
           genParams.thinking_mode = "chat";
         } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
-          genParams.assistant_prefix = "closed_think";
-          genParams.max_think_tokens = 1; // Jinja path signal
+          genParams.enable_thinking = false;
+          genParams.max_think_tokens = 1; // old-daemon off signal
           genParams.thinking_mode = "chat";
         } else if (rEffort === "none") {
-          genParams.assistant_prefix = "closed_think";
+          genParams.enable_thinking = false;
           genParams.max_think_tokens = 1;
           genParams.thinking_mode = "chat";
         } else {
           // Thinking is ON (config default, or explicit enable_thinking=true /
-          // reasoning.effort>=minimal). OPEN the <think> block so the model
-          // actually reasons instead of emitting an empty <think></think> and
-          // answering directly. Without this, generic OpenAI clients (which
-          // never send assistant_prefix) get no-think behaviour, which fails
-          // hard reasoning on thinking models like Qwen3.6. Safe for non-
-          // thinking models: the daemon's prompt frame falls back to Plain
-          // when the tokenizer has no `<think>` special token.
-          genParams.assistant_prefix = "open_think";
+          // reasoning.effort>=minimal). Signal that explicitly so the daemon's
+          // chat template and internal assistant prefix use thinking framing.
+          genParams.enable_thinking = true;
           // reasoning_effort max / xhigh → deepest reasoning; otherwise standard.
           genParams.thinking_mode = (rEffort === "max" || rEffort === "xhigh") ? "max" : "thinking";
         }
@@ -4307,11 +4303,13 @@ async function serve(port: number, host: string) {
                   }, forceAnswerSecs * 1000)
                 : null;
               try {
-                // open_think injects the opening <think> into the PROMPT, so the
-                // output begins inside the think span (no <think> token to detect
-                // at 2725). Start in-think so the leading reasoning streams as
-                // reasoning_content and is split off content at the first </think>.
-                let inThink = genParams.assistant_prefix === "open_think";
+                // Framing is daemon-authoritative: the `gen_start` event
+                // (handled below) sets `inThink` from the actually-rendered
+                // prompt (`started_in_think`). This initializer is only the
+                // OLD-daemon fallback (no gen_start) — seed from the requested
+                // `enable_thinking` so thinking turns still route leading
+                // reasoning to reasoning_content until the first </think>.
+                let inThink = genParams.enable_thinking === true;
                 // Latches once the daemon sends an explicit `reasoning:true` token
                 // (Cohere2/North marker-machine split). After that, unflagged
                 // tokens are visible content, not `<think>`-delimited reasoning.
@@ -4349,6 +4347,10 @@ async function serve(port: number, host: string) {
                 let sawDaemonReasoning = false;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
+                  if (msg.type === "gen_start") {
+                    if (typeof msg.started_in_think === "boolean") inThink = msg.started_in_think;
+                    continue;
+                  }
                   if (msg.type === "token") {
                     completionTokens++;
                     let text = msg.text as string;
@@ -4356,8 +4358,9 @@ async function serve(port: number, host: string) {
                     // marker state machine splits reasoning itself) tags thinking
                     // tokens with an explicit `reasoning:true` flag and emits NO
                     // `<think>`/`</think>` text. Honor the flag — it's
-                    // authoritative. The default thinking-on path sets
-                    // assistant_prefix="open_think" (inThink starts true) on the
+                    // authoritative. The default thinking-on path starts
+                    // inThink=true (seeded from the daemon's gen_start
+                    // started_in_think, or enable_thinking for old daemons) on the
                     // assumption the model closes its reasoning with a `</think>`
                     // token; North never emits one, so the `</think>` heuristic
                     // below would trap the entire visible answer in
@@ -4745,6 +4748,7 @@ async function serve(port: number, host: string) {
         // and strip the whole answer). ds4 uses reasoning EVENTS, not the
         // `reasoning:true` flag, so nsSawReasoningFlag alone doesn't cover it.
         let nsSawDaemonReasoning = false;
+        let nsStartedInThink: boolean | undefined;
         for await (const msg of e.generate(genParams)) {
           if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
           if (msg.type === "token") {
@@ -4760,6 +4764,9 @@ async function serve(port: number, host: string) {
             // text was silently dropped on every think-mode V4F turn.
             nsSawDaemonReasoning = true;
             if (typeof msg.text === "string") reasoningContent += msg.text;
+          }
+          else if (msg.type === "gen_start") {
+            if (typeof msg.started_in_think === "boolean") nsStartedInThink = msg.started_in_think;
           }
           else if (msg.type === "done") {
             // O3c-1: record the real decode rate for GET /stats (see streaming
@@ -4843,7 +4850,7 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        const extracted = extractVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think" && !nsSawReasoningFlag && !nsSawDaemonReasoning);
+        const extracted = extractVisibleThinking(content, preserveThinking, (nsStartedInThink ?? (genParams.enable_thinking === true)) && !nsSawReasoningFlag && !nsSawDaemonReasoning);
         content = extracted.content;
         // Surface the reasoning the split pulled out of the token-text stream
         // (Qwen / MiniMax open_think) under reasoning_content — UNLESS structured
@@ -7910,7 +7917,7 @@ function findDep(binary: string, extraDirs: string[]): string | null {
 // when `</think>` is missing (the "empty after unclosed think strip" bug). This
 // mirrors the streaming path, which already routes inThink token text to
 // reasoning_content. Returns trimmed { content, reasoning }.
-function extractVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): { content: string; reasoning: string } {
+export function extractVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): { content: string; reasoning: string } {
   if (preserveThinking) return { content: content.replace(/<\|im_end\|>/g, "").trim(), reasoning: "" };
   let text = content.replace(/<\|im_end\|>/g, "");
   // `open_think` injects the opening <think> into the PROMPT, so the output

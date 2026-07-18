@@ -35,10 +35,9 @@ use rdna_compute::{DType, Gpu};
 
 /// Decode one token; returns the full logits vector.
 ///
-/// Routes to the hipGraph capture/replay path when `HIPFIRE_LFM2_GRAPH=1`
-/// (default OFF → exact prior behavior). The graph path amortizes the ~377
-/// per-token kernel launches by replaying a single captured graph; see
-/// `decode_step_with_graph`.
+/// `HIPFIRE_LFM2_GRAPH=1` selects the experimental graph path. It is default
+/// OFF and not safe for production: Q8 attention launch geometry is captured
+/// at the initial sequence length and does not grow during replay.
 pub fn decode_step(
     cfg: &Lfm2MoeConfig,
     weights: &Lfm2MoeWeights,
@@ -347,17 +346,7 @@ fn decode_step_layers_and_head(
                     )
                     .map_err(|e| format!("lfm2moe L{l}: down(mq6): {e:?}"))?;
                 } else {
-                    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                        &m.expert_down_ptrs,
-                        &state.topk_indices,
-                        &state.rot_batch,
-                        &state.down_expanded,
-                        hidden,
-                        moe_inter,
-                        k_top,
-                        1,
-                    )
-                    .map_err(|e| format!("lfm2moe L{l}: down: {e:?}"))?;
+                    hfq4_moe_down_expanded(gpu, m, state, hidden, moe_inter, k_top, l)?;
                 }
 
                 gpu.moe_down_combine_k8_batched(
@@ -559,6 +548,49 @@ fn dense_down_block(
         .map_err(|e| format!("lfm2moe L{l}: dense w2: {e}"))
 }
 
+fn hfq4_moe_down_expanded(
+    gpu: &mut Gpu,
+    m: &MoeFfn,
+    state: &Lfm2MoeState,
+    hidden: usize,
+    moe_inter: usize,
+    k_top: usize,
+    l: usize,
+) -> Result<(), String> {
+    if (hidden, moe_inter, k_top)
+        == (
+            crate::kernels::LFM2_A1B_HIDDEN,
+            crate::kernels::LFM2_A1B_MOE_INTERMEDIATE,
+            crate::kernels::LFM2_A1B_TOP_K,
+        )
+    {
+        return crate::kernels::lfm2_a1b_moe_down(
+            gpu,
+            &m.expert_down_ptrs,
+            &state.topk_indices,
+            &state.rot_batch,
+            &state.down_expanded,
+            m.experts[0].down.gpu_dtype,
+            hidden,
+            moe_inter,
+            k_top,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: down: {e}"));
+    }
+
+    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+        &m.expert_down_ptrs,
+        &state.topk_indices,
+        &state.rot_batch,
+        &state.down_expanded,
+        hidden,
+        moe_inter,
+        k_top,
+        1,
+    )
+    .map_err(|e| format!("lfm2moe L{l}: down: {e:?}"))
+}
+
 /// MoE FFN block (ffn-norm folded in). Mirrors the hand-loop Moe arm.
 fn moe_ffn_block(
     gpu: &mut Gpu,
@@ -647,17 +679,7 @@ fn moe_ffn_block(
         )
         .map_err(|e| format!("lfm2moe L{l}: down(mq6): {e:?}"))?;
     } else {
-        gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-            &m.expert_down_ptrs,
-            &state.topk_indices,
-            &state.rot_batch,
-            &state.down_expanded,
-            hidden,
-            moe_inter,
-            k_top,
-            1,
-        )
-        .map_err(|e| format!("lfm2moe L{l}: down: {e:?}"))?;
+        hfq4_moe_down_expanded(gpu, m, state, hidden, moe_inter, k_top, l)?;
     }
     gpu.moe_down_combine_k8_batched(
         &state.down_expanded,
@@ -908,9 +930,9 @@ fn decode_step_layers_and_head_lowered(
     Ok(())
 }
 
-/// hipGraph-amortized decode_step. Opt-in via `HIPFIRE_LFM2_GRAPH=1`
-/// (default OFF → exact `decode_step_inner` behavior). Mirrors the working
-/// DeepSeek-V4 integration (`decode_step_with_graph`).
+/// Experimental hipGraph-amortized decode. Opt-in via `HIPFIRE_LFM2_GRAPH=1`;
+/// default OFF. Do not enable for production until Q8 attention capture uses
+/// max-sequence or tiled launch geometry.
 ///
 /// Three-state machine driven by `state.graph_warmed_up` and `gpu.graph_exec`:
 ///   1. !warmed_up                 → direct dispatch once (so kernel JIT and
@@ -928,13 +950,12 @@ fn decode_step_layers_and_head_lowered(
 ///   * `token_id` — baked into `embedding_lookup_q8`'s kernarg, so the
 ///     embedding lookup runs DIRECT each token (writes `state.h`); the
 ///     captured region begins at layer 0's rmsnorm reading `state.h`.
-///   * `position` — staged into the STABLE device buffer `state.pos_buf` via a
-///     direct `memcpy_htod` before each `graph_launch`; every captured kernel
-///     (rope/kv-write/attention) reads `pos_buf` from the device, so replay at
-///     a new position is correct without re-capture. The attention kernel's
-///     launch-baked `block_size`/`shared_mem` are sized to `max_seq` under
-///     capture (see `attention_q8_0_kv` in dispatch.rs), so one capture
-///     replays correctly at every later position.
+///   * `position` — staged into the stable `state.pos_buf` before replay.
+///     Kernel data arguments therefore see the new position, but
+///     `attention_q8_0_kv` currently bakes `block_size` and shared-memory size
+///     from the capture-time `seq_len`. Replaying at longer lengths can exceed
+///     that geometry; this is why the whole graph path remains experimental
+///     and default-off.
 ///
 /// `state.n_tokens` is advanced here to match `decode_step_inner` semantics.
 pub fn decode_step_with_graph(

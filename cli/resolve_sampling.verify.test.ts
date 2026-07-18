@@ -2,31 +2,23 @@
 //
 // Drives resolveSamplingForSend (the CLI-side explicit-send guard that layers
 // registry card recommended_settings < per-model models.json < explicit --flag)
-// for every mandated resolution case. A per-model override is injected via a
-// temp HOME so loadPerModelConfigs reads a controlled models.json, never the
-// real one.
-//
-// IMPORTANT: HOME must be set BEFORE importing index.ts because the path
-// constants (MODELS_CATALOG_PATH etc.) are computed at module-load from
-// homedir().
+// for every mandated resolution case. Per-model overrides use an explicit
+// temporary models-catalog path, never the operator's real configuration.
 
-import { test, expect, describe, beforeAll } from "bun:test";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { homedir } from "os";
+import { test, expect, describe, beforeAll, afterAll } from "bun:test";
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
 import { join } from "path";
+import type {
+  resolveModelConfig as ResolveModelConfig,
+  resolveSamplingForSend as ResolveSamplingForSend,
+} from "./index.ts";
 
-// NOTE: os.homedir() ignores $HOME on linux (reads the user db directly), so
-// the per-model override case drives the REAL ~/.hipfire/models.json: the
-// helper below snapshots it, injects `qwen3.6:35b-a3b.temperature=0.7`, runs
-// the assertion, and restores the snapshot — so it is deterministic in the
-// full suite and leaves no residue. The card / flag / unlisted cases need no
-// filesystem setup.
-
-const MODELS_JSON = join(homedir(), ".hipfire", "models.json");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "hipfire-resolve-sampling-"));
+const MODELS_JSON = join(TEST_DIR, "models.json");
+process.env.HIPFIRE_MODELS_CATALOG_PATH = MODELS_JSON;
 
 function withPerModelOverride<T>(tag: string, ov: Record<string, unknown>, fn: () => T): T {
-  const dir = join(homedir(), ".hipfire");
-  mkdirSync(dir, { recursive: true });
   const had = existsSync(MODELS_JSON);
   const snapshot = had ? readFileSync(MODELS_JSON, "utf8") : null;
   try {
@@ -37,13 +29,22 @@ function withPerModelOverride<T>(tag: string, ov: Record<string, unknown>, fn: (
     return fn();
   } finally {
     if (snapshot !== null) writeFileSync(MODELS_JSON, snapshot);
+    else rmSync(MODELS_JSON, { force: true });
   }
 }
 
-let resolveSamplingForSend: typeof import("./index.ts").resolveSamplingForSend;
+let resolveSamplingForSend: typeof ResolveSamplingForSend;
+let resolveModelConfig: typeof ResolveModelConfig;
 
+// Runtime import is intentional: the module reads HIPFIRE_MODELS_CATALOG_PATH
+// during initialization, so the test must set that environment first.
 beforeAll(async () => {
-  ({ resolveSamplingForSend } = await import("./index.ts"));
+  ({ resolveSamplingForSend, resolveModelConfig } = await import("./index.ts"));
+});
+
+afterAll(() => {
+  delete process.env.HIPFIRE_MODELS_CATALOG_PATH;
+  rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
 describe("W7 config-inheritance resolution (no-GPU)", () => {
@@ -78,6 +79,40 @@ describe("W7 config-inheritance resolution (no-GPU)", () => {
     expect(s.temperature).toBe(1.0);
     expect(s.top_p).toBe(1.0);
   });
+
+  test("lfm2.5:8b-a1b inherits the LiquidAI card sampler", () => {
+    const s = resolveSamplingForSend("lfm2.5:8b-a1b");
+    expect(s.temperature).toBe(0.2);
+    expect(s.top_p).toBe(1.0);
+    expect(s.top_k).toBe(80);
+    expect(s.repeat_penalty).toBe(1.05);
+  });
+
+  test("all dense LFM cards inherit their LiquidAI samplers", () => {
+    const cases = [
+      ["lfm2.5:350m", 0.1],
+      ["lfm2.5:1.2b", 0.1],
+      ["lfm2.5:1.2b-thinking", 0.05],
+    ] as const;
+    for (const [tag, temperature] of cases) {
+      const s = resolveSamplingForSend(tag);
+      expect(s.temperature).toBe(temperature);
+      expect(s.top_p).toBe(1.0);
+      expect(s.top_k).toBe(50);
+      expect(s.repeat_penalty).toBe(1.05);
+    }
+  });
+
+  test("explicit request sampling survives an absolute model path", () => {
+    const s = resolveSamplingForSend("/models/lfm2.5-350m.q8", {
+      top_k: 17,
+      min_p: 0.2,
+    });
+    expect(s.top_k).toBe(17);
+    expect(s.min_p).toBe(0.2);
+  });
+
+
 
   test("minimax-m2.7 → temperature=1.0 / top_p=0.95 + system_prompt", () => {
     const s = resolveSamplingForSend("minimax-m2.7");

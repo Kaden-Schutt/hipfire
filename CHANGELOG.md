@@ -33,6 +33,22 @@ Contributor deltas staged for this release:
 - #513: native Qwen XML tool calls across CLI, daemon, and cached history.
 - #528: DeepSeek V4 DSpark sidecar registration and re-pull discovery.
 - #529: quickstart refresh and historical benchmark labeling.
+- LFM2.5 sampler inheritance and 8B-A1B coherence across gfx1010, gfx1030,
+  gfx1100, gfx1151, and gfx1201: restore the full K=1792 routed-expert down
+  projection with an LFM-owned, shape-guarded wave32 kernel while leaving the
+  shared K=512 MoE fast path unchanged; honor each model card's sampler defaults.
+- Daemon-authoritative think framing and thinking-control graduation: the daemon
+  emits a per-request `gen_start` with `started_in_think` computed from the
+  actually-rendered prompt tail, so the CLI frames both streaming and non-stream
+  responses from what the template rendered rather than guessing from the
+  requested `assistant_prefix`. Fixes LFM2.5 instruct answers being trapped in
+  `reasoning_content` with empty `message.content` (its embedded chat template is
+  identical for instruct/thinking and never opens `<think>`). Retires the forced
+  open/closed-think jerry-rig in favor of a single explicit `enable_thinking`
+  signal: the CLI stops sending `assistant_prefix`, the daemon derives the
+  Plain-fallback prefix internally (never forcing `<think>` on an unasked turn)
+  and gates decode-time think handling on the post-render `started_in_think`.
+  Old CLIs keep working via the `max_think_tokens != 1` fallback.
 
 The release also refreshes the Rust and Bun dependency surface, adds standard
 `clap`/`safetensors`/`half`/`tracing` support, introduces Redline property

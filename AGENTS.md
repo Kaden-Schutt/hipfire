@@ -162,33 +162,21 @@ works, what to measure, what counts as pass/fail.
 
 ## 0 · Hard rules from CLAUDE.md (always apply)
 
-1. **Coherence-gate-dflash is the canonical correctness gate.** Quality-
-   gate.sh is deprecated — its byte-exact baselines drift faster than
-   the engine evolves. Run `./scripts/coherence-gate-dflash.sh` after
-   any change touching kernels, quant formats, dispatch, fusion,
-   rotation, rmsnorm, or the spec-decode path. Its detector enforces
-   three tiers (matching the CLAUDE.md "DFlash Coherence Gate" section):
-   **Tier 1** (first 128 tokens, HARD fail) `unique_token_ratio < 0.15`
-   OR `max_single_token_frequency > 0.50`; **Tier 2** (last 128 tokens,
-   HARD fail) `unique_token_ratio < 0.30` OR
-   `max_single_token_frequency > 0.50`; **Tier 3** (full output, SOFT
-   `FLAG` for human eyeball) consecutive-3gram repetition density > 0.50
-   in the final half OR full-output `unique_token_ratio < 0.10`.
-2. **Prompt structure dictates τ.** One newline character can swing τ
+1. **Prompt structure dictates τ.** One newline character can swing τ
    by 17%. Any tok/s comparison across sessions, agents, or commits
    MUST use **byte-identical prompts**. Embed prompts as committed
    files (`benchmarks/prompts/*.txt`); record the prompt md5 alongside
    results. Whitespace cleanups in scripts are forensic landmines.
-3. **Tight stddev on a spec-decode bench is SUSPICIOUS, not reassuring.**
+2. **Tight stddev on a spec-decode bench is SUSPICIOUS, not reassuring.**
    Real acceptance noise is wider. Always eyeball the decoded output
    when τ comes back unusually high — single-token attractor failures
    pass every statistical gate as fake wins.
-4. **Never store canonical bench prompts under `/tmp/`.** /tmp gets
+3. **Never store canonical bench prompts under `/tmp/`.** /tmp gets
    wiped on reboot. Use `benchmarks/prompts/`, `~/.hipfire/datasets/`,
    or a heredoc inside a committed script.
-5. **No grep / find / glob inside `exec:bash`.** Use the `Grep` tool
+4. **No grep / find / glob inside `exec:bash`.** Use the `Grep` tool
    directly, or `exec:nodejs` with `execSync('rg -n PATTERN')`.
-6. **`scripts/install.{sh,ps1}` copy the whole `cli/` directory recursively
+5. **`scripts/install.{sh,ps1}` copy the whole `cli/` directory recursively
    and prune dev/test artifacts by pattern.** New `.ts` files in `cli/`
    are auto-installed — no install-script edit required. Tests must
    follow `*.test.ts` / `test_*.ts` / `bench_*.ts` naming so the prune

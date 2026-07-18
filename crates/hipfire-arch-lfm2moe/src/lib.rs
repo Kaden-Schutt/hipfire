@@ -20,6 +20,8 @@
 pub mod arch;
 pub mod config;
 pub mod forward;
+#[doc(hidden)]
+pub mod kernels;
 pub mod lfm2moe;
 pub mod spec_impl;
 

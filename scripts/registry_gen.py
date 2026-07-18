@@ -117,7 +117,7 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
     if not isinstance(rs, dict):
         errors.append(f"{tag}: recommended_settings must be an object, got {type(rs).__name__}")
         return
-    allowed = set(RECOMMENDED_BOUNDS) | {"system_prompt"}
+    allowed = set(RECOMMENDED_BOUNDS) | {"system_prompt", "thinking"}
     for key, val in rs.items():
         if key not in allowed:
             errors.append(f"{tag}: recommended_settings has unknown key {key!r} (allowed: {sorted(allowed)})")

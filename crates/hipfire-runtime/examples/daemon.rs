@@ -699,6 +699,23 @@ fn emit_error_with_id(stdout: &mut std::io::Stdout, id: &str, message: impl std:
     let _ = stdout.flush();
 }
 
+fn emit_gen_start(stdout: &mut std::io::Stdout, id: &str, started_in_think: bool) {
+    let _ = writeln!(stdout, r#"{{"type":"gen_start","id":"{}","started_in_think":{}}}"#, id, started_in_think);
+    let _ = stdout.flush();
+}
+
+/// True iff the rendered prompt's TAIL opens an unclosed `<think>` — i.e. the model
+/// begins generation inside a reasoning span (drives the per-request `started_in_think`
+/// signal). Deliberately TAIL-ONLY: scanning the whole render for a dangling `<think>`
+/// would let a literal `<think>` inside the USER message flip framing and trap the
+/// answer in `reasoning_content` (the exact bug this signal fixes). The chat template
+/// always appends the generation-prompt suffix after the user turn, so the trimmed tail
+/// reflects only what the template itself opened, never user content.
+fn render_tail_opens_think(rendered: &str) -> bool {
+    let tail = rendered.trim_end();
+    tail.ends_with("<think>")
+}
+
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut std::io::Stdout, message: impl std::fmt::Display) {
     let envelope = serde_json::json!({
@@ -2265,19 +2282,28 @@ fn main() {
                     .get("max_think_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-
-                // assistant_prefix: "plain", "open_think", or "closed_think"
-                // Controls the ChatML framing after the assistant role header.
-                // Consumed by the text path; VL path does not yet propagate
-                // it (tracked as a follow-up to the post-#169 rebase).
-                let assistant_prefix = match msg
-                    .get("assistant_prefix")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("plain")
-                {
-                    "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
-                    "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
-                    _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                // Stage 2 graduation: two INDEPENDENT thinking signals, so a turn
+                // that carries no framing hint never force-injects <think> on a
+                // template-less model, while legacy uncapped thinking (mtt=0) still
+                // renders as enabled on the template path.
+                //
+                //   enable_thinking  → the Jinja `enable_thinking` flag (template
+                //     paths). Explicit CLI signal wins; else the legacy convention
+                //     `max_think_tokens != 1` (0/uncapped = enabled, 1 = off).
+                //   assistant_prefix → Plain-fallback framing for template-LESS
+                //     models only. Explicit enable_thinking maps directly; else an
+                //     old CLI's wire assistant_prefix; else Plain (no forced think).
+                let wire_prefix = msg.get("assistant_prefix").and_then(|v| v.as_str());
+                let explicit_thinking = msg.get("enable_thinking").and_then(|v| v.as_bool());
+                let enable_thinking = explicit_thinking.unwrap_or(max_think_tokens != 1);
+                let assistant_prefix = match explicit_thinking {
+                    Some(true) => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
+                    Some(false) => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
+                    None => match wire_prefix {
+                        Some("open_think") => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
+                        Some("closed_think") => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
+                        _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                    },
                 };
 
                 let has_image = image_base64.is_some() || image.is_some();
@@ -2508,6 +2534,7 @@ fn main() {
                         budget_alert_at_tok,
                         &budget_alert_text,
                         max_think_tokens,
+                        enable_thinking,
                         assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
@@ -3944,7 +3971,9 @@ fn generate_ep(
     prompt: &str,
     system_prompt: Option<&str>,
     max_tokens: usize,
-    max_think_tokens: usize,
+    _max_think_tokens: usize,
+    enable_thinking: bool,
+    _assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -3961,7 +3990,7 @@ fn generate_ep(
     // generation primer (re-emitted display-only in ep_serve_minimax). ──
     let mut primed_think = false;
     let prompt_ids: Vec<u32> = if m.arch_id == 9 {
-        primed_think = false;
+        primed_think = matches!(think_mode, ThinkMode::High | ThinkMode::Max);
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let eos_tok = m.deepseek4_eos_tok;
         build_deepseek4_dsml_prompt(
@@ -3982,7 +4011,7 @@ fn generate_ep(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking: enable_thinking,
                 bos_token: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
@@ -4018,7 +4047,7 @@ fn generate_ep(
             };
             match render_result {
                 Ok(rendered) => {
-                    primed_think = rendered.trim_end().ends_with("<think>");
+                    primed_think = render_tail_opens_think(&rendered);
                     tokenizer.encode(&rendered)
                 }
                 Err(e) => {
@@ -4090,6 +4119,7 @@ fn generate_ep(
             &prompt_ids,
             eos_tok,
             max_tokens,
+            primed_think,
             think_mode,
             tools,
             stop,
@@ -4208,6 +4238,7 @@ fn ep_serve_ds4(
     prompt_ids: &[u32],
     eos_tok: u32,
     max_tokens: usize,
+    primed_think: bool,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     stop: &[String],
@@ -4335,6 +4366,8 @@ fn ep_serve_ds4(
             }
         }
     };
+
+    emit_gen_start(stdout, id, primed_think);
 
     let t_prefill = Instant::now();
     // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
@@ -4680,6 +4713,8 @@ fn ep_serve_minimax(
     }
 
     // ── Prefill the suffix [prefill_from, prompt_n) across ranks. ──
+    emit_gen_start(stdout, id, primed_think);
+
     let t_prefill = Instant::now();
     // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
     // loop. Declared outside the borrow scope so the abort guard below can read
@@ -4751,6 +4786,7 @@ fn ep_serve_minimax(
 
     // MiniMax primes the assistant with `<think>\n`; re-emit display-only so the
     // assistant message is a well-formed think block (parity with single-GPU).
+
     if primed_think {
         let _ = writeln!(
             stdout,
@@ -5139,6 +5175,7 @@ struct SpecEmitRequest {
     stop: Vec<String>,
     max_think: usize,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    started_in_think: bool,
     /// Reasoning-effort level (consumed by the ds4 emitter; ignored by ChatML).
     think_mode: ThinkMode,
     /// Pre-decoded vocab for arches whose grammar masks per-token (ds4). The
@@ -5177,6 +5214,7 @@ fn generate_dflash(
     system_prompt: Option<&str>,
     max_tokens: usize,
     max_think_tokens: usize,
+    enable_thinking: bool,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
@@ -5234,6 +5272,10 @@ fn generate_dflash(
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -5241,7 +5283,7 @@ fn generate_dflash(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking: enable_thinking,
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
@@ -5275,7 +5317,10 @@ fn generate_dflash(
             frame.render()
         };
         match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!(
                     "[daemon] jinja render failed in dflash path ({e}) — falling back to Plain"
@@ -5426,6 +5471,7 @@ fn generate_dflash(
             stop: stop.to_vec(),
             max_think: max_think_tokens,
             assistant_prefix,
+            started_in_think,
             think_mode: ThinkMode::NonThink,
             decoded_vocab: None,
         },
@@ -5720,6 +5766,8 @@ fn generate_spec(
         let _ = stdout.flush();
         return None;
     }
+
+    emit_gen_start(stdout, id, emit_req.started_in_think);
 
     // Prefill: the speculator seeds the target's hidden state (advancing its KV
     // + recurrent state), primes the drafter's cached target-hidden, snapshots
@@ -6173,6 +6221,7 @@ fn generate_qwen35_mtp(
     system_prompt: Option<&str>,
     max_tokens: usize,
     max_think_tokens: usize,
+    enable_thinking: bool,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -6228,6 +6277,10 @@ fn generate_qwen35_mtp(
     // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -6235,7 +6288,7 @@ fn generate_qwen35_mtp(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking: enable_thinking,
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
@@ -6269,7 +6322,10 @@ fn generate_qwen35_mtp(
             frame.render()
         };
         match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
@@ -6474,6 +6530,8 @@ fn generate_qwen35_mtp(
 
     let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new
 
+    emit_gen_start(stdout, id, started_in_think);
+
     let t0 = Instant::now();
 
     // ── Prefill: trunk batched + MTP private-KV fill (trunk-spine) ──────
@@ -6651,10 +6709,7 @@ fn generate_qwen35_mtp(
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(
-                        assistant_prefix,
-                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                    ),
+                    started_in_think,
                 );
                 if in_think && !prev_in_think {
                     think_count = 0;
@@ -6844,6 +6899,7 @@ fn generate_multi(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
+    enable_thinking: bool,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -7019,6 +7075,10 @@ fn generate_multi(
     // below (guarded on seq_pos > 0) re-zeros recurrent state so the full render
     // writes from position 0 instead of appending to the prior turn's KV/DeltaNet.
     let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -7026,7 +7086,7 @@ fn generate_multi(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking: enable_thinking,
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
@@ -7060,7 +7120,10 @@ fn generate_multi(
             frame.render()
         };
         match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
@@ -7185,6 +7248,8 @@ fn generate_multi(
     };
 
     let prefill_tokens = new_tokens.len();
+    emit_gen_start(stdout, id, started_in_think);
+
     let t0 = Instant::now();
 
     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
@@ -7510,10 +7575,7 @@ fn generate_multi(
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let in_think = currently_in_think(
                 raw_str,
-                matches!(
-                    assistant_prefix,
-                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                ),
+                started_in_think,
             );
             if in_think {
                 total_think_tokens += 1;
@@ -7639,10 +7701,7 @@ fn generate_multi(
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let in_think = currently_in_think(
                 raw_str,
-                matches!(
-                    assistant_prefix,
-                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                ),
+                started_in_think,
             );
             if !in_think {
                 let _ = writeln!(
@@ -7930,6 +7989,7 @@ fn generate(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
+    enable_thinking: bool,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
     pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
@@ -7969,6 +8029,8 @@ fn generate(
             system_prompt,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
+            assistant_prefix,
             think_mode,
             tools,
             messages_history,
@@ -8021,6 +8083,7 @@ fn generate(
             system_prompt,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             assistant_prefix,
             None, // pflash_bypass_reason — no pflash on the n-gram path
             None, // pflash_alpha
@@ -8058,6 +8121,7 @@ fn generate(
             system_prompt,
             temp,
             top_p,
+            enable_thinking,
             max_tokens,
             repeat_penalty,
             repeat_window,
@@ -8153,6 +8217,7 @@ fn generate(
             system_prompt,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             assistant_prefix,
             None, // pflash_bypass_reason — no pflash on the n-gram path
             None, // pflash_alpha
@@ -8167,11 +8232,9 @@ fn generate(
         return;
     }
     if m.arch_id == 11 {
-        // arch_id=11 (LFM2.5-8B-A1B). Standalone bring-up — same shape as
-        // the deepseek4 short-circuit above. PFlash / DFlash / VL / multi-GPU
-        // / sampler-budget scaffolding all bypass. We honour `system_prompt`,
-        // `temp`, `top_p`, `tools`, and `messages_history`; everything else
-        // routes through future follow-ups.
+        // arch_id=11 (LFM2.5). Standalone AR path; sampling must preserve the
+        // model-card contract because this branch bypasses the generic sampler.
+        // Prompt framing stays on the model's embedded Jinja template.
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -8180,7 +8243,7 @@ fn generate(
             pflash_cfg,
             think_mode,
         );
-        let _ = (repeat_penalty, repeat_window);
+        let top_k = top_k.map(|k| k as usize).unwrap_or(0);
         generate_lfm2moe(
             m,
             gpu,
@@ -8190,8 +8253,11 @@ fn generate(
             system_prompt,
             temp,
             top_p,
+            top_k,
+            repeat_penalty,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             tools,
             messages_history,
         );
@@ -8218,6 +8284,7 @@ fn generate(
             system_prompt,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             assistant_prefix,
             None, // pflash_bypass_reason — no pflash on the n-gram path
             None, // pflash_alpha
@@ -8256,6 +8323,7 @@ fn generate(
             top_p,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             tools,
             messages_history,
         );
@@ -8281,6 +8349,7 @@ fn generate(
             system_prompt,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             assistant_prefix,
             None, // pflash_bypass_reason — no pflash on the n-gram path
             None, // pflash_alpha
@@ -8321,6 +8390,7 @@ fn generate(
             top_p,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             tools,
             messages_history,
         );
@@ -8384,6 +8454,7 @@ fn generate(
             budget_alert_at_tok,
             budget_alert_text,
             max_think_tokens,
+            enable_thinking,
             assistant_prefix,
             tools,
             messages_history,
@@ -8457,6 +8528,7 @@ fn generate(
             system_prompt,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             assistant_prefix,
             tools,
             messages_history,
@@ -8625,6 +8697,7 @@ fn generate(
             system_prompt,
             max_tokens,
             max_think_tokens,
+            enable_thinking,
             assistant_prefix,
             dflash_bypass_reason,
             dflash_alpha,
@@ -8918,13 +8991,10 @@ fn generate(
     // single-turn parity is Stage 2; multi-turn message-history state on
     // the daemon side is Stage 2 follow-up.
     //
-    // Thinking-off interop with `assistant_prefix`: the CLI sets BOTH
-    // `max_think_tokens = 1` AND `assistant_prefix = ClosedThink` when
-    // the request asks for non-thinking. The Jinja path keys off
-    // `max_think_tokens != 1` for `enable_thinking`; the Plain path
-    // honors `assistant_prefix` directly (ClosedThink emits a closed
-    // `<think></think>` block after the assistant prefix). Each path
-    // picks up the signal it needs.
+    // Thinking-control interop: `enable_thinking` is the Jinja-template flag,
+    // while `assistant_prefix` controls only template-less Plain framing.
+    // Explicit thinking can therefore diverge from the legacy token-cap/prefix
+    // convention; keep both values independent here.
     // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
     // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
@@ -8941,6 +9011,10 @@ fn generate(
     // template). The cold-reset further down (`jinja_active && seq_pos > 0`)
     // re-prefills this full render from position 0.
     let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -8948,7 +9022,7 @@ fn generate(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking: enable_thinking,
             bos_token: None,
         };
         // Phase 1 of Jinja-everywhere migration: when the caller supplies
@@ -8992,7 +9066,10 @@ fn generate(
             frame.render()
         };
         match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
@@ -9102,7 +9179,7 @@ fn generate(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking: enable_thinking,
                 bos_token: None,
             };
             let cache_ref = &mut m.asst_turn_cache;
@@ -9560,6 +9637,8 @@ fn generate(
         _ => None,
     };
     let prefill_tokens = new_tokens.len();
+    emit_gen_start(stdout, id, started_in_think);
+
     let t0 = Instant::now();
 
     if m.arch_id == 5 || m.arch_id == 6 {
@@ -10166,10 +10245,7 @@ fn generate(
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(
-                        assistant_prefix,
-                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                    ),
+                    started_in_think,
                 );
                 // Total-think bound (re-arm-proof). Count every think token; at the
                 // cap, latch force-answer (force-close + block <think>); a margin
@@ -10322,10 +10398,7 @@ fn generate(
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(
-                        assistant_prefix,
-                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                    ),
+                    started_in_think,
                 );
                 if !in_think {
                     let _ = writeln!(
@@ -11350,6 +11423,7 @@ fn generate_deepseek4_spec(
             stop: Vec::new(),
             max_think: 0,
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            started_in_think: matches!(think_mode, ThinkMode::High | ThinkMode::Max),
             think_mode,
             decoded_vocab,
         },
@@ -11666,6 +11740,12 @@ fn generate_deepseek4(
         let _ = stdout.flush();
         return;
     }
+
+    emit_gen_start(
+        stdout,
+        id,
+        matches!(think_mode, ThinkMode::High | ThinkMode::Max),
+    );
 
     // Prefill: batched chunked through PBS. (The MTP-fill prefill variant moved
     // to the drafter's `mtp_prefill`, driven by `generate_deepseek4_spec`.)
@@ -12082,6 +12162,38 @@ fn generate_deepseek4(
     eprintln!("[req {id}] drafter=ar tau=1.00 tok/s={tok_s:.1} decode ({generated_count} tok, autoregressive)");
 }
 
+fn apply_hf_repetition_penalty(
+    logits: &mut [f32],
+    seen_tokens: &std::collections::HashSet<u32>,
+    penalty: f32,
+) {
+    if penalty == 1.0 {
+        return;
+    }
+    for &token in seen_tokens {
+        if let Some(logit) = logits.get_mut(token as usize) {
+            if *logit > 0.0 {
+                *logit /= penalty;
+            } else {
+                *logit *= penalty;
+            }
+        }
+    }
+}
+
+fn sample_lfm_token(
+    logits: &mut [f32],
+    seen_tokens: &std::collections::HashSet<u32>,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    repeat_penalty: f32,
+    rng: &mut deepseek4::sampling::Xorshift,
+) -> u32 {
+    apply_hf_repetition_penalty(logits, seen_tokens, repeat_penalty);
+    deepseek4::sampling::sample_token(logits, temp, top_k, top_p, rng)
+}
+
 fn generate_lfm2moe(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -12091,8 +12203,11 @@ fn generate_lfm2moe(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    top_k: usize,
+    repeat_penalty: f32,
     max_tokens: usize,
-    max_think_tokens: usize,
+    _max_think_tokens: usize,
+    enable_thinking: bool,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -12116,6 +12231,7 @@ fn generate_lfm2moe(
     }
 
     // ── Prompt build (same two-path branch as the minimax AR path) ──
+    let mut started_in_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
@@ -12134,7 +12250,7 @@ fn generate_lfm2moe(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking: enable_thinking,
                 bos_token: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
@@ -12169,7 +12285,10 @@ fn generate_lfm2moe(
                 frame.render()
             };
             match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    started_in_think = render_tail_opens_think(&rendered);
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
                     hipfire_runtime::prompt_frame::ChatFrame {
@@ -12266,6 +12385,8 @@ fn generate_lfm2moe(
         return;
     }
 
+    emit_gen_start(stdout, id, started_in_think);
+
     let t0 = Instant::now();
 
     // ── Prefill: decode_step per prompt token. The LAST decode_step's logits
@@ -12291,6 +12412,8 @@ fn generate_lfm2moe(
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);
     }
+    let mut seen_tokens: std::collections::HashSet<u32> =
+        m.conversation_tokens.iter().copied().collect();
     let prefill_ms = t0.elapsed().as_millis();
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
@@ -12306,7 +12429,15 @@ fn generate_lfm2moe(
         if generated_count >= max_tokens {
             break;
         }
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        let next_tok = sample_lfm_token(
+            &mut last_logits,
+            &seen_tokens,
+            temp,
+            top_p,
+            top_k,
+            repeat_penalty,
+            &mut rng,
+        );
         if stop_toks.contains(&next_tok) {
             break;
         }
@@ -12332,6 +12463,7 @@ fn generate_lfm2moe(
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
         m.conversation_tokens.push(next_tok);
+        seen_tokens.insert(next_tok);
         generated_count += 1;
 
         let step = {
@@ -12395,7 +12527,8 @@ fn generate_minimax(
     temp: f32,
     top_p: f32,
     max_tokens: usize,
-    max_think_tokens: usize,
+    _max_think_tokens: usize,
+    enable_thinking: bool,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -12445,7 +12578,7 @@ fn generate_minimax(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking: enable_thinking,
                 bos_token: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
@@ -12481,7 +12614,7 @@ fn generate_minimax(
             };
             match render_result {
                 Ok(rendered) => {
-                    primed_think = rendered.trim_end().ends_with("<think>");
+                    primed_think = render_tail_opens_think(&rendered);
                     tokenizer.encode(&rendered)
                 }
                 Err(e) => {
@@ -12616,6 +12749,8 @@ fn generate_minimax(
             }
         };
 
+    emit_gen_start(stdout, id, primed_think);
+
     let t0 = Instant::now();
 
     // ── Prefill: decode_step per prompt token, or chunked batched prefill.
@@ -12688,6 +12823,7 @@ fn generate_minimax(
     // The primer is already in the KV from prefill; re-emit it into the token
     // stream (display-only, not pushed to state) so the assistant message is a
     // well-formed `<think>...</think>...` block for every consumer.
+
     if primed_think {
         let _ = writeln!(
             stdout,
@@ -12794,6 +12930,7 @@ fn generate_cohere2moe(
     top_p: f32,
     max_tokens: usize,
     max_think_tokens: usize,
+    enable_thinking: bool,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -12844,7 +12981,7 @@ fn generate_cohere2moe(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking: enable_thinking,
                 bos_token: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
@@ -12880,7 +13017,7 @@ fn generate_cohere2moe(
             };
             match render_result {
                 Ok(rendered) => {
-                    primed_think = rendered.trim_end().ends_with("<think>");
+                    primed_think = render_tail_opens_think(&rendered);
                     if std::env::var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
                         let ids = tokenizer.encode(&rendered);
                         eprintln!(
@@ -13016,6 +13153,8 @@ fn generate_cohere2moe(
         }
     };
 
+    emit_gen_start(stdout, id, primed_think);
+
     let t0 = Instant::now();
 
     // ── Prefill: BATCHED `forward_batch` (~9× the per-token path) when the
@@ -13079,6 +13218,7 @@ fn generate_cohere2moe(
     // not pushed to state) when the rendered prompt primed the assistant turn
     // inside a reasoning block, so downstream `<think>` consumers see a
     // well-formed block. No-op for templates that don't prime think.
+
     if primed_think {
         let _ = writeln!(
             stdout,
@@ -13455,6 +13595,7 @@ fn generate_qwen2(
     _system_prompt: Option<&str>,
     _temp: f32,
     _top_p: f32,
+    enable_thinking: bool,
     max_tokens: usize,
     _repeat_penalty: f32,
     _repeat_window: usize,
@@ -13490,17 +13631,21 @@ fn generate_qwen2(
     // Apply the model's chat template (if present) so instruct-tuned qwen2
     // models receive properly-framed ChatML input. Falls back to raw encoding
     // when no template is loaded (e.g. base/pre-train weights).
+    let mut started_in_think = false;
     let prompt_ids = if let Some(template) = m.chat_template.as_ref() {
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: _system_prompt,
             user: prompt,
-            enable_thinking: true,
+            enable_thinking: enable_thinking,
             bos_token: None,
         };
         match frame.render() {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!("[daemon] qwen2 jinja render failed ({e}) — falling back to raw encode");
                 tokenizer.encode(prompt)
@@ -13556,6 +13701,8 @@ fn generate_qwen2(
             return;
         }
     }
+
+    emit_gen_start(stdout, id, started_in_think);
 
     let t0 = Instant::now();
 
@@ -13897,6 +14044,8 @@ fn generate_vl(
         vision_config.temporal_patch_size,
         vision_config.spatial_merge_size,
     );
+    emit_gen_start(stdout, id, false);
+
     let visual_tokens =
         qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
             .expect("vision forward failed");
@@ -14343,6 +14492,8 @@ fn generate_vl_dots_ocr(
             return;
         }
     };
+    emit_gen_start(stdout, id, false);
+
     let merged_gpu = match dots_ocr::vision_forward(
         gpu,
         &weights.vision,
@@ -14855,6 +15006,8 @@ fn generate_dots_ocr_text(
         return;
     }
 
+    emit_gen_start(stdout, id, false);
+
     // Prefill: build the [seq × dim] embedding matrix via per-token
     // embedding lookup dispatch, then run through batched prefill.
     state.reset();
@@ -15143,5 +15296,59 @@ mod tool_call_parser_tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+}
+
+#[cfg(test)]
+mod lfm_sampling_tests {
+    use super::{apply_hf_repetition_penalty, sample_lfm_token};
+    use hipfire_arch_deepseek4::sampling::Xorshift;
+
+    #[test]
+    fn card_repetition_penalty_precedes_top_k() {
+        let mut logits = [9.8_f32, 10.0, 1.0];
+        let seen = [1_u32].into_iter().collect();
+        let mut rng = Xorshift::new(7);
+        let token =
+            sample_lfm_token(&mut logits, &seen, 0.2, 1.0, 1, 1.05, &mut rng);
+        assert_eq!(token, 0);
+    }
+
+    #[test]
+    fn hf_repetition_penalty_is_once_per_unique_token() {
+        let mut logits = [10.0_f32, -10.0];
+        let seen = [0_u32, 0, 0, 1].into_iter().collect();
+        apply_hf_repetition_penalty(&mut logits, &seen, 1.05);
+        assert!((logits[0] - (10.0 / 1.05)).abs() < 1e-6);
+        assert!((logits[1] - (-10.0 * 1.05)).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod render_tail_think_tests {
+    use super::render_tail_opens_think;
+
+    #[test]
+    fn tail_think_opener_primes() {
+        // Template appended the generation-prompt <think> opener (Qwen-style).
+        assert!(render_tail_opens_think("<|im_start|>assistant\n<think>"));
+        assert!(render_tail_opens_think("<|im_start|>assistant\n<think>\n")); // trailing ws tolerated
+    }
+
+    #[test]
+    fn plain_or_closed_tail_does_not_prime() {
+        assert!(!render_tail_opens_think("<|im_start|>assistant\n")); // LFM: no think opener
+        assert!(!render_tail_opens_think("<think>reasoning</think>\n")); // closed pair
+        assert!(!render_tail_opens_think(""));
+    }
+
+    #[test]
+    fn user_message_literal_think_does_not_prime() {
+        // A user typing a literal <think> must NOT flip framing: the template appends
+        // the assistant generation suffix AFTER the user turn, so the tail is the
+        // assistant header, not the user's <think>. Guards the content->reasoning bug
+        // a whole-render scan would reintroduce.
+        let rendered = "<|im_start|>user\nExplain the literal token <think><|im_end|>\n<|im_start|>assistant\n";
+        assert!(!render_tail_opens_think(rendered));
     }
 }

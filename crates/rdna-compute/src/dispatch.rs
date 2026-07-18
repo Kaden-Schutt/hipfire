@@ -1253,13 +1253,11 @@ impl Gpu {
                         "deinterleave_f32_batched" => {
                             self.compiler.compiled_kernels().get("deinterleave_batched")
                         }
-                        name
-                            if name.starts_with(
-                                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
-                            ) => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_residual_scaled"),
+                        name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
+                            self.compiler
+                                .compiled_kernels()
+                                .get("gemv_hfq4g256_residual_scaled")
+                        }
                         "gemv_hfq4g256_moe_gate_up_k8_indexed" => self
                             .compiler
                             .compiled_kernels()
@@ -1431,6 +1429,24 @@ impl Gpu {
             self.hip
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         }
+    }
+
+    /// Launch an externally owned kernel through the same direct/capture/replay
+    /// path as rdna-compute's built-in kernels.
+    ///
+    /// The caller owns the kernel ABI and must provide matching `kernelParams`
+    /// pointers and an equivalent stable kernarg blob. This API does not select
+    /// a kernel or add it to any shared dispatch tree.
+    pub fn launch_external_kernel(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut Vec<*mut std::ffi::c_void>,
+        blob: hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
+        self.launch_maybe_blob(func_name, grid, block, shared_mem, params, || blob)
     }
 
     /// Compile and load a kernel, caching the result.

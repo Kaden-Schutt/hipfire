@@ -178,6 +178,7 @@ describe("validateRegistryV1", () => {
     expect(validateRegistryV1(r2)).toBeNull();
   });
 
+
   test("drops aliases pointing at missing tags instead of failing", () => {
     const r = goodRegistry();
     r.aliases["ghost"] = "not:a:tag";
