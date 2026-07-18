@@ -2889,12 +2889,23 @@ fn main() {
                     let weights = &b.weights;
                     let state = &mut b.state;
                     let mut ok = true;
+                    let gfx1201 = gpu.arch_caps.is_gfx1201();
+                    let last_idx = synthetic.len().saturating_sub(1);
                     for (i, &tok) in synthetic.iter().enumerate() {
-                        if lfm2moe::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
+                        // Phase 0 head-elision (gfx1201-only): non-final prefill
+                        // tokens skip the lm_head + full-vocab logits D2H, matching
+                        // the production generate_lfm2moe prefill shape.
+                        let r = if gfx1201 && i != last_idx {
+                            lfm2moe::forward::decode_step_prefill(
+                                config, weights, state, &mut gpu, tok, i as u32,
+                            )
+                        } else {
+                            lfm2moe::forward::decode_step(
+                                config, weights, state, &mut gpu, tok, i as u32,
+                            )
+                            .map(|_| ())
+                        };
+                        if r.is_err() {
                             ok = false;
                             break;
                         }
@@ -12449,8 +12460,18 @@ fn generate_lfm2moe(
         let weights = &b.weights;
         let state = &mut b.state;
         let mut position = state.n_tokens as u32;
-        for &tok in &prompt_ids {
-            match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+        let gfx1201 = gpu.arch_caps.is_gfx1201();
+        let last_idx = prompt_ids.len().saturating_sub(1);
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            // Phase 0 head-elision (gfx1201-only): non-final prompt tokens skip
+            // the lm_head + full-vocab logits D2H; their logits are never read.
+            let step = if gfx1201 && i != last_idx {
+                lfm2moe::forward::decode_step_prefill(cfg, weights, state, gpu, tok, position)
+                    .map(|()| Vec::new())
+            } else {
+                lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position)
+            };
+            match step {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));

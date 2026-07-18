@@ -49,9 +49,33 @@ pub fn decode_step(
     if graph_enabled() {
         return decode_step_with_graph(cfg, weights, state, gpu, token_id, position);
     }
-    decode_step_inner(cfg, weights, state, gpu, token_id, position, None)?;
+    decode_step_inner(cfg, weights, state, gpu, token_id, position, true, None)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("lfm2moe: download logits: {e:?}"))
+}
+
+/// Prefill a single non-final prompt token: full mixer/FFN layer stack + state
+/// advance (KV, conv, n_tokens), WITHOUT the final RMSNorm + lm_head + logits
+/// D2H. The intermediate token's logits are never consumed by the prefill loop,
+/// so skipping the 128000-vocab lm_head GEMV + full-vocab download is a pure,
+/// output-identical speedup. When the graph path is explicitly selected
+/// (HIPFIRE_LFM2_GRAPH=1) it is preserved (no head-elision). Used by the
+/// gfx1201-gated LFM prefill loop (Phase 0 head-elision).
+pub fn decode_step_prefill(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<(), String> {
+    if graph_enabled() {
+        // Explicit graph mode: do not bypass the user-selected path. Run the
+        // full decode (graph) and discard the logits; head-elision is a
+        // non-graph optimization.
+        return decode_step(cfg, weights, state, gpu, token_id, position).map(|_| ());
+    }
+    decode_step_inner(cfg, weights, state, gpu, token_id, position, false, None)
 }
 
 /// `HIPFIRE_LFM2_GRAPH=1` opt-in switch. Default OFF (unset / "0") →
@@ -80,7 +104,7 @@ pub fn decode_step_capture(
     position: u32,
     capture: &mut [Vec<f32>],
 ) -> Result<(), String> {
-    decode_step_inner(cfg, weights, state, gpu, token_id, position, Some(capture))
+    decode_step_inner(cfg, weights, state, gpu, token_id, position, true, Some(capture))
 }
 
 fn decode_step_inner(
@@ -90,6 +114,7 @@ fn decode_step_inner(
     gpu: &mut Gpu,
     token_id: u32,
     position: u32,
+    emit_head: bool,
     capture: Option<&mut [Vec<f32>]>,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
@@ -103,7 +128,7 @@ fn decode_step_inner(
     gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
         .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
 
-    decode_step_layers_and_head(cfg, weights, state, gpu, position, capture)
+    decode_step_layers_and_head(cfg, weights, state, gpu, position, emit_head, capture)
 }
 
 /// Per-layer mixer/FFN stack + final norm + lm_head. Reads the residual
@@ -125,6 +150,7 @@ fn decode_step_layers_and_head(
     state: &mut Lfm2MoeState,
     gpu: &mut Gpu,
     position: u32,
+    emit_head: bool,
     mut capture: Option<&mut [Vec<f32>]>,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
@@ -143,7 +169,7 @@ fn decode_step_layers_and_head(
     // when capturing (the oracle dumper needs the per-layer hand path) — that path
     // stays byte-identical. Default off (opt-in) until fleet byte-parity validated.
     if lfm2_forward_lowered_enabled() && capture.is_none() {
-        return decode_step_layers_and_head_lowered(cfg, weights, state, gpu, position);
+        return decode_step_layers_and_head_lowered(cfg, weights, state, gpu, position, emit_head);
     }
 
     for (l, layer) in weights.layers.iter().enumerate() {
@@ -373,16 +399,19 @@ fn decode_step_layers_and_head(
     }
     state.n_tokens = seq_len;
 
-    // Final RMSNorm + lm_head (tied to embed_tokens, Q8).
-    gpu.rmsnorm_f32(
-        &state.h,
-        &weights.embedding_norm,
-        &state.final_norm_buf,
-        eps,
-    )
-    .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("lfm2moe: lm_head: {e}"))?;
+    // Final RMSNorm + lm_head (tied to embed_tokens, Q8). Non-final prefill
+    // tokens (Phase 0 head-elision) skip this: their logits are never read.
+    if emit_head {
+        gpu.rmsnorm_f32(
+            &state.h,
+            &weights.embedding_norm,
+            &state.final_norm_buf,
+            eps,
+        )
+        .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
+        weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
+            .map_err(|e| format!("lfm2moe: lm_head: {e}"))?;
+    }
     Ok(())
 }
 
@@ -899,6 +928,7 @@ fn decode_step_layers_and_head_lowered(
     state: &mut Lfm2MoeState,
     gpu: &mut Gpu,
     position: u32,
+    emit_head: bool,
 ) -> Result<(), String> {
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
@@ -918,15 +948,17 @@ fn decode_step_layers_and_head_lowered(
         }
     }
     state.n_tokens = seq_len;
-    gpu.rmsnorm_f32(
-        &state.h,
-        &weights.embedding_norm,
-        &state.final_norm_buf,
-        eps,
-    )
-    .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("lfm2moe: lm_head: {e}"))?;
+    if emit_head {
+        gpu.rmsnorm_f32(
+            &state.h,
+            &weights.embedding_norm,
+            &state.final_norm_buf,
+            eps,
+        )
+        .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
+        weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
+            .map_err(|e| format!("lfm2moe: lm_head: {e}"))?;
+    }
     Ok(())
 }
 
@@ -973,7 +1005,7 @@ pub fn decode_step_with_graph(
     // before any stream capture (capturing a hipMalloc errors).
     if !state.graph_warmed_up {
         state.graph_warmed_up = true;
-        decode_step_inner(cfg, weights, state, gpu, token_id, position, None)?;
+        decode_step_inner(cfg, weights, state, gpu, token_id, position, true, None)?;
         return gpu
             .download_f32(&state.logits)
             .map_err(|e| format!("lfm2moe: download logits (graph warmup): {e:?}"));
@@ -1002,7 +1034,7 @@ pub fn decode_step_with_graph(
         gpu.graphs
             .begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("lfm2moe: begin_graph_capture: {e:?}"))?;
-        decode_step_layers_and_head(cfg, weights, state, gpu, position, None)?;
+        decode_step_layers_and_head(cfg, weights, state, gpu, position, true, None)?;
         gpu.graphs
             .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("lfm2moe: end_graph_capture: {e:?}"))?;
