@@ -4856,6 +4856,10 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
 /// layout + trailing x_src_rows).
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip");
+/// Exact-gfx1030 sdot4 MMQ probe for MQ2-Lloyd grouped GEMM. Production MoE
+/// dispatch does not reference this source.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1030_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1030.hip");
 pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq3g256_lloyd_moe_grouped_mmq.gfx1151.hip");
 
