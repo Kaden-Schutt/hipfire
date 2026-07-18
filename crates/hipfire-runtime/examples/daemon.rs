@@ -4939,52 +4939,29 @@ fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_frame::
     )
 }
 
-/// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
-/// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
-/// so the DFlash path can use it too. Renders the canonical conversation via
-/// `build_cached_history` (verbatim assistant-turn replay through
-/// `asst_turn_cache`, which is what makes the LCP byte-exact across turns), then
-/// compares against `m.conversation_tokens`. Reports a HIT only on a strict
-/// forward extension (`lcp == prior_len && lcp < rendered.len()`), which keeps
-/// the recurrent DeltaNet state valid by construction (the prior turn left it at
+/// Pure LCP prompt-cache decision over an ALREADY-RENDERED canonical conversation
+/// token stream. Side-effect-free (no GPU/seq_pos/tokenizer/asst_turn_cache). The
+/// CALLER renders `rendered` via `build_cached_history` (non-Jinja ChatScaffold) or
+/// `build_cached_history_jinja` (the model's trained template) so it byte-matches
+/// what was baked into `conversation_tokens` last turn — that byte-exactness is
+/// what makes the LCP hit. HIT only on a strict forward extension
+/// (`lcp == prior_len && lcp < rendered.len() && lcp > 0`), which keeps the
+/// recurrent DeltaNet state valid by construction (the prior turn left it at
 /// exactly `prior_len`, so prefilling the suffix advances it correctly with no
-/// rewind). The exact-match edge (`lcp == rendered.len()`) degrades to a miss to
-/// avoid a 1-token DeltaNet over-advance. Caller must be in the
-/// `messages_history.is_some()` case.
-#[allow(clippy::too_many_arguments)]
+/// rewind). A GENUINE divergence (`lcp < prior_len`) may resume from the latest
+/// checkpoint `<= lcp`; the exact-match edge (`lcp == rendered.len()`) is a cold
+/// MISS (no forward progress ⇒ nothing to prefill, and a resume would rewind past
+/// state we already hold).
 fn plan_prompt_cache(
-    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
-    asst_turn_cache: &mut AsstTurnCache,
+    rendered: Vec<u32>,
     conversation_tokens: &[u32],
     eviction_is_none: bool,
-    system_prompt: Option<&str>,
-    prompt: &str,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    tool_render: hipfire_runtime::prompt_frame::ToolCallRender,
-    messages_history: &[hipfire_runtime::prompt_frame::Message],
     cache_disabled: bool,
-    // Ascending DeltaNet checkpoint positions (from `m.dflash_checkpoints`) and
-    // whether resume-from-checkpoint is enabled. On a divergence the plan picks
-    // the latest checkpoint `<= lcp && < rendered.len()` to resume from.
+    // Ascending DeltaNet checkpoint positions (from the speculator). On a genuine
+    // divergence the plan picks the latest checkpoint `<= lcp && < rendered.len()`.
     dflash_ckpt_positions: &[usize],
     resume_enabled: bool,
 ) -> PromptCachePlan {
-    let q_tokens = tokenizer.encode(prompt);
-    let rendered = hipfire_runtime::prompt_frame::build_cached_history(
-        tokenizer,
-        system_prompt,
-        messages_history,
-        &q_tokens,
-        assistant_prefix,
-        tool_render,
-        |msg| {
-            let stripped = strip_think_for_fingerprint(&msg.content);
-            let normalized =
-                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-            let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-            asst_turn_cache.get(&fp).cloned()
-        },
-    );
     let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
     if cache_eligible {
         let prior_len = conversation_tokens.len();
@@ -5001,6 +4978,8 @@ fn plan_prompt_cache(
                 lcp
             );
         }
+        // Strict forward extension: the prior conversation is a proper prefix of
+        // this render. Reuse KV + DeltaNet[0..lcp]; prefill only the suffix.
         if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
             return PromptCachePlan {
                 new_tokens: rendered[lcp..].to_vec(),
@@ -5011,12 +4990,11 @@ fn plan_prompt_cache(
                 rendered,
             };
         }
-        // Divergent render (lcp < prior_len, or the exact-match edge): not a
-        // pure extension, so the recurrent state at the end is stale. If resume
-        // is enabled, rewind to the latest checkpoint at-or-before lcp that
-        // still leaves ≥1 token to re-prefill, and resume from there instead of
-        // cold-prefilling the whole conversation.
-        if resume_enabled {
+        // GENUINE divergence only (`lcp < prior_len`): the client edited/dropped
+        // earlier history so the tail recurrent state is stale. The exact-match
+        // edge (`lcp == prior_len == rendered.len()`) is NOT a divergence and MUST
+        // fall through to a cold miss — never resume past state we still hold.
+        if resume_enabled && lcp < prior_len {
             if let Some(&ckpt) = dflash_ckpt_positions
                 .iter()
                 .filter(|&&p| p <= lcp && p < rendered.len())
@@ -5360,7 +5338,7 @@ fn generate_dflash(
     // cumulative target_hidden, prefilling only the suffix; on a MISS we
     // full-reset and prefill the whole conversation (legacy behaviour).
     let cache_disabled =
-        try_jinja || std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -5376,24 +5354,97 @@ fn generate_dflash(
         .as_ref()
         .map(|s| s.checkpoint_positions())
         .unwrap_or_default();
-    let cache_plan: Option<PromptCachePlan> = if !try_jinja {
-        messages_history.map(|hist| {
-            let tok = m.tokenizer.as_ref().unwrap();
-            plan_prompt_cache(
-                tok,
-                &mut m.asst_turn_cache,
-                &m.conversation_tokens,
-                m.eviction.is_none(),
+    let cache_plan: Option<PromptCachePlan> = if !cache_disabled
+        && m.eviction.is_none()
+        && !m.conversation_tokens.is_empty()
+        && messages_history.is_some()
+    {
+        let history = messages_history.unwrap();
+        let trace_cache =
+            std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+        // Render the canonical full conversation so its LCP vs conversation_tokens
+        // is byte-exact. Jinja path mirrors the AR generate() cache (item #37):
+        // splice each cached assistant turn's VERBATIM tokens through the trained
+        // template, prepending this turn's assistant-opener primer so the stream
+        // byte-matches what was baked last turn. Non-jinja path uses the
+        // ChatScaffold build_cached_history (byte-identical to the prior DFlash cache).
+        let rendered: Vec<u32> = if try_jinja {
+            let primer: Vec<u32> = {
+                let im_start = tokenizer.special_token_id("<|im_start|>");
+                let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
+                match im_start.and_then(|id| prompt_tokens.iter().rposition(|&t| t == id)) {
+                    Some(q) if q + opener_len <= prompt_tokens.len() => {
+                        prompt_tokens[q + opener_len..].to_vec()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking,
+                bos_token: None,
+            };
+            let cache_ref = &mut m.asst_turn_cache;
+            match hipfire_runtime::prompt_frame::build_cached_history_jinja(
+                &frame,
+                history,
+                tools,
+                |msg| {
+                    let stripped = strip_think_for_fingerprint(&msg.content);
+                    let normalized =
+                        hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    let hit = cache_ref.get(&fp).map(|cached| {
+                        let mut v = primer.clone();
+                        v.extend_from_slice(cached);
+                        v
+                    });
+                    if trace_cache {
+                        eprintln!(
+                            "[qwen-cache jinja lookup dflash] fp={:#018x} role={:?} primer={} hit={}",
+                            fp, msg.role, primer.len(), hit.is_some(),
+                        );
+                    }
+                    hit
+                },
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[qwen-cache] jinja cached-history build failed dflash ({e}) — cold render");
+                    prompt_tokens.clone()
+                }
+            }
+        } else {
+            let q_tokens = tokenizer.encode(prompt);
+            let cache_ref = &mut m.asst_turn_cache;
+            hipfire_runtime::prompt_frame::build_cached_history(
+                tokenizer,
                 system_prompt,
-                prompt,
+                history,
+                &q_tokens,
                 assistant_prefix,
                 qwen_history_tool_render(&m.model_path),
-                hist,
-                cache_disabled,
-                &dflash_ckpt_positions,
-                dflash_resume_enabled,
+                |msg| {
+                    let stripped = strip_think_for_fingerprint(&msg.content);
+                    let normalized =
+                        hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    cache_ref.get(&fp).cloned()
+                },
             )
-        })
+        };
+        Some(plan_prompt_cache(
+            rendered,
+            &m.conversation_tokens,
+            m.eviction.is_none(),
+            cache_disabled,
+            &dflash_ckpt_positions,
+            dflash_resume_enabled,
+        ))
     } else {
         None
     };
@@ -15350,5 +15401,67 @@ mod render_tail_think_tests {
         // a whole-render scan would reintroduce.
         let rendered = "<|im_start|>user\nExplain the literal token <think><|im_end|>\n<|im_start|>assistant\n";
         assert!(!render_tail_opens_think(rendered));
+    }
+}
+
+#[cfg(test)]
+mod plan_prompt_cache_tests {
+    use super::plan_prompt_cache;
+
+    #[test]
+    fn strict_forward_extension_hit() {
+        let p = plan_prompt_cache(vec![1, 2, 3, 4, 5], &[1, 2, 3], true, false, &[], false);
+        assert!(p.cache_hit);
+        assert_eq!(p.start_pos, 3);
+        assert_eq!(p.cached_tokens, 3);
+        assert_eq!(p.new_tokens, vec![4, 5]);
+        assert_eq!(p.resume_from, None);
+    }
+
+    #[test]
+    fn exact_match_is_cold_miss_even_with_checkpoint() {
+        // lcp == prior_len == rendered.len(): no forward progress ⇒ MISS, and it
+        // must NOT resume (that would rewind past state we still hold).
+        let p = plan_prompt_cache(vec![1, 2, 3], &[1, 2, 3], true, false, &[2], true);
+        assert!(!p.cache_hit);
+        assert_eq!(p.start_pos, 0);
+        assert_eq!(p.cached_tokens, 0);
+        assert_eq!(p.resume_from, None);
+    }
+
+    #[test]
+    fn genuine_divergence_resumes_from_checkpoint() {
+        let p = plan_prompt_cache(vec![1, 2, 9, 10], &[1, 2, 3, 4], true, false, &[2], true);
+        assert!(p.cache_hit);
+        assert_eq!(p.start_pos, 2);
+        assert_eq!(p.resume_from, Some(2));
+        assert_eq!(p.new_tokens, vec![9, 10]);
+    }
+
+    #[test]
+    fn divergence_without_resume_is_miss() {
+        let p = plan_prompt_cache(vec![1, 2, 9, 10], &[1, 2, 3, 4], true, false, &[2], false);
+        assert!(!p.cache_hit);
+        assert_eq!(p.start_pos, 0);
+        assert_eq!(p.resume_from, None);
+    }
+
+    #[test]
+    fn disabled_is_miss() {
+        let p = plan_prompt_cache(vec![1, 2, 3, 4, 5], &[1, 2, 3], true, true, &[], false);
+        assert!(!p.cache_hit);
+        assert_eq!(p.cached_tokens, 0);
+    }
+
+    #[test]
+    fn empty_conversation_is_miss() {
+        let p = plan_prompt_cache(vec![1, 2, 3], &[], true, false, &[], false);
+        assert!(!p.cache_hit);
+    }
+
+    #[test]
+    fn eviction_active_is_miss() {
+        let p = plan_prompt_cache(vec![1, 2, 3, 4, 5], &[1, 2, 3], false, false, &[], false);
+        assert!(!p.cache_hit);
     }
 }

@@ -1,0 +1,466 @@
+{
+  "title": "qwen3.5-9b DFlash prefix-cache perf matrix",
+  "date": "2026-07-18",
+  "branch": "lfm-redline",
+  "command": "python3 benchmarks/results/qwen35-9b-dflash-pfix.py",
+  "run_fingerprint": "c90fea2d77365b43",
+  "hardware": {
+    "gpu": "AMD Radeon RX 9070 (Navi 48)",
+    "gfx": "gfx1201",
+    "rocm": "7.2.0",
+    "cpu": "AMD Ryzen 9 3900X 12-Core"
+  },
+  "binaries": {
+    "daemon_md5": "f1f207cd5fe5666b350a6c49053e094f",
+    "daemon_sha256": "60ca388ed4ee7fc4d6b524668ecd6064beb384f3334e9f5011b0b87488175bf7"
+  },
+  "model": {
+    "target": "qwen3.5-9b.mq4",
+    "target_md5": "31a8d8dc7603226801b08d8319015602",
+    "draft": "qwen35-9b-dflash-mq4.hf4",
+    "draft_md5": "590f35403cd7f1d634945233234a12b7"
+  },
+  "method": {
+    "reps": 3,
+    "aggregate": "median",
+    "fresh_process_per_rep": true,
+    "max_tokens": 512,
+    "kv_mode": "q8",
+    "cask": "off",
+    "multiturn_turns": 3,
+    "greedy": {
+      "temperature": 0.0,
+      "seed": 4242
+    },
+    "sampled": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "seed": 4242
+    },
+    "prompt_md5": "e9b7ad8ddc17056c9baaa126e9cf21dd",
+    "prompts": [
+      "Write a Python function that checks whether a number is prime.",
+      "Now modify it to return a list of all primes up to n.",
+      "Add a docstring and PEP 484 type hints to that function."
+    ]
+  },
+  "axes": {
+    "prefix_cache": [
+      "on",
+      "off"
+    ],
+    "dflash": [
+      "on",
+      "off"
+    ],
+    "sampling": [
+      "greedy",
+      "sampled"
+    ]
+  },
+  "results": [
+    {
+      "dflash": "off",
+      "prefix_cache": "off",
+      "sampling": "greedy",
+      "turns": [
+        {
+          "turn": 1,
+          "decode_tok_s_median": 109.5,
+          "ttft_ms_median": 19.3,
+          "cached_tokens": 0,
+          "tau_median": null,
+          "gen_tokens": 296,
+          "prefill_tokens": 24,
+          "decode_tok_s_raw": [
+            109.5,
+            109.5,
+            109.8
+          ]
+        },
+        {
+          "turn": 2,
+          "decode_tok_s_median": 109.5,
+          "ttft_ms_median": 143.5,
+          "cached_tokens": 0,
+          "tau_median": null,
+          "gen_tokens": 512,
+          "prefill_tokens": 341,
+          "decode_tok_s_raw": [
+            109.3,
+            109.5,
+            110
+          ]
+        },
+        {
+          "turn": 3,
+          "decode_tok_s_median": 109.5,
+          "ttft_ms_median": 356,
+          "cached_tokens": 0,
+          "tau_median": null,
+          "gen_tokens": 512,
+          "prefill_tokens": 882,
+          "decode_tok_s_raw": [
+            109.1,
+            109.5,
+            109.8
+          ]
+        }
+      ]
+    },
+    {
+      "dflash": "off",
+      "prefix_cache": "off",
+      "sampling": "sampled",
+      "turns": [
+        {
+          "turn": 1,
+          "decode_tok_s_median": 109.5,
+          "ttft_ms_median": 19.2,
+          "cached_tokens": 0,
+          "tau_median": null,
+          "gen_tokens": 479,
+          "prefill_tokens": 24,
+          "decode_tok_s_raw": [
+            109.5,
+            109.5,
+            109.5
+          ]
+        },
+        {
+          "turn": 2,
+          "decode_tok_s_median": 109.7,
+          "ttft_ms_median": 210.8,
+          "cached_tokens": 0,
+          "tau_median": null,
+          "gen_tokens": 512,
+          "prefill_tokens": 523,
+          "decode_tok_s_raw": [
+            109.7,
+            107.7,
+            109.7
+          ]
+        },
+        {
+          "turn": 3,
+          "decode_tok_s_median": 109.4,
+          "ttft_ms_median": 434.5,
+          "cached_tokens": 0,
+          "tau_median": null,
+          "gen_tokens": 512,
+          "prefill_tokens": 1056,
+          "decode_tok_s_raw": [
+            109.3,
+            109.4,
+            109.4
+          ]
+        }
+      ]
+    },
+    {
+      "dflash": "off",
+      "prefix_cache": "on",
+      "sampling": "greedy",
+      "turns": [
+        {
+          "turn": 1,
+          "decode_tok_s_median": 109.4,
+          "ttft_ms_median": 19.2,
+          "cached_tokens": 0,
+          "tau_median": null,
+          "gen_tokens": 296,
+          "prefill_tokens": 24,
+          "decode_tok_s_raw": [
+            109.3,
+            109.4,
+            109.6
+          ]
+        },
+        {
+          "turn": 2,
+          "decode_tok_s_median": 109.7,
+          "ttft_ms_median": 21.7,
+          "cached_tokens": 321,
+          "tau_median": null,
+          "gen_tokens": 512,
+          "prefill_tokens": 26,
+          "decode_tok_s_raw": [
+            107.8,
+            109.7,
+            109.7
+          ]
+        },
+        {
+          "turn": 3,
+          "decode_tok_s_median": 109.6,
+          "ttft_ms_median": 19.5,
+          "cached_tokens": 859,
+          "tau_median": null,
+          "gen_tokens": 512,
+          "prefill_tokens": 31,
+          "decode_tok_s_raw": [
+            109.4,
+            109.6,
+            109.6
+          ]
+        }
+      ]
+    },
+    {
+      "dflash": "off",
+      "prefix_cache": "on",
+      "sampling": "sampled",
+      "turns": [
+        {
+          "turn": 1,
+          "decode_tok_s_median": 108,
+          "ttft_ms_median": 21.6,
+          "cached_tokens": 0,
+          "tau_median": null,
+          "gen_tokens": 479,
+          "prefill_tokens": 24,
+          "decode_tok_s_raw": [
+            109.4,
+            65.2,
+            108
+          ]
+        },
+        {
+          "turn": 2,
+          "decode_tok_s_median": 109.4,
+          "ttft_ms_median": 21.3,
+          "cached_tokens": 504,
+          "tau_median": null,
+          "gen_tokens": 512,
+          "prefill_tokens": 26,
+          "decode_tok_s_raw": [
+            109.4,
+            64.2,
+            109.7
+          ]
+        },
+        {
+          "turn": 3,
+          "decode_tok_s_median": 109.2,
+          "ttft_ms_median": 20.2,
+          "cached_tokens": 1042,
+          "tau_median": null,
+          "gen_tokens": 512,
+          "prefill_tokens": 31,
+          "decode_tok_s_raw": [
+            109.2,
+            64.2,
+            109.5
+          ]
+        }
+      ]
+    },
+    {
+      "dflash": "on",
+      "prefix_cache": "off",
+      "sampling": "greedy",
+      "turns": [
+        {
+          "turn": 1,
+          "decode_tok_s_median": 324.4,
+          "ttft_ms_median": 46.8,
+          "cached_tokens": 0,
+          "tau_median": 6.7,
+          "gen_tokens": 337,
+          "prefill_tokens": 24,
+          "decode_tok_s_raw": [
+            324.6,
+            324.4,
+            227.7
+          ]
+        },
+        {
+          "turn": 2,
+          "decode_tok_s_median": 327.4,
+          "ttft_ms_median": 215.6,
+          "cached_tokens": 0,
+          "tau_median": 7.1,
+          "gen_tokens": 512,
+          "prefill_tokens": 382,
+          "decode_tok_s_raw": [
+            327.4,
+            327.8,
+            236.1
+          ]
+        },
+        {
+          "turn": 3,
+          "decode_tok_s_median": 447.6,
+          "ttft_ms_median": 456.3,
+          "cached_tokens": 0,
+          "tau_median": 11.7,
+          "gen_tokens": 512,
+          "prefill_tokens": 923,
+          "decode_tok_s_raw": [
+            447.6,
+            450,
+            336.4
+          ]
+        }
+      ]
+    },
+    {
+      "dflash": "on",
+      "prefix_cache": "off",
+      "sampling": "sampled",
+      "turns": [
+        {
+          "turn": 1,
+          "decode_tok_s_median": 259,
+          "ttft_ms_median": 44.8,
+          "cached_tokens": 0,
+          "tau_median": 5.8,
+          "gen_tokens": 398,
+          "prefill_tokens": 24,
+          "decode_tok_s_raw": [
+            259.3,
+            259,
+            186
+          ]
+        },
+        {
+          "turn": 2,
+          "decode_tok_s_median": 272.3,
+          "ttft_ms_median": 239.5,
+          "cached_tokens": 0,
+          "tau_median": 6.4,
+          "gen_tokens": 512,
+          "prefill_tokens": 440,
+          "decode_tok_s_raw": [
+            274.6,
+            272.3,
+            201
+          ]
+        },
+        {
+          "turn": 3,
+          "decode_tok_s_median": 348.3,
+          "ttft_ms_median": 487.5,
+          "cached_tokens": 0,
+          "tau_median": 9.5,
+          "gen_tokens": 512,
+          "prefill_tokens": 976,
+          "decode_tok_s_raw": [
+            348.3,
+            351.6,
+            260.4
+          ]
+        }
+      ]
+    },
+    {
+      "dflash": "on",
+      "prefix_cache": "on",
+      "sampling": "greedy",
+      "turns": [
+        {
+          "turn": 1,
+          "decode_tok_s_median": 326.9,
+          "ttft_ms_median": 46.6,
+          "cached_tokens": 0,
+          "tau_median": 6.7,
+          "gen_tokens": 337,
+          "prefill_tokens": 24,
+          "decode_tok_s_raw": [
+            326.9,
+            328.4,
+            305.1
+          ]
+        },
+        {
+          "turn": 2,
+          "decode_tok_s_median": 282.3,
+          "ttft_ms_median": 43.2,
+          "cached_tokens": 361,
+          "tau_median": 6.0,
+          "gen_tokens": 512,
+          "prefill_tokens": 27,
+          "decode_tok_s_raw": [
+            282.3,
+            283,
+            281.4
+          ]
+        },
+        {
+          "turn": 3,
+          "decode_tok_s_median": 401.5,
+          "ttft_ms_median": 44,
+          "cached_tokens": 900,
+          "tau_median": 10.1,
+          "gen_tokens": 512,
+          "prefill_tokens": 31,
+          "decode_tok_s_raw": [
+            396.2,
+            402.7,
+            401.5
+          ]
+        }
+      ]
+    },
+    {
+      "dflash": "on",
+      "prefix_cache": "on",
+      "sampling": "sampled",
+      "turns": [
+        {
+          "turn": 1,
+          "decode_tok_s_median": 259.4,
+          "ttft_ms_median": 46.8,
+          "cached_tokens": 0,
+          "tau_median": 5.8,
+          "gen_tokens": 398,
+          "prefill_tokens": 24,
+          "decode_tok_s_raw": [
+            259.7,
+            259.2,
+            259.4
+          ]
+        },
+        {
+          "turn": 2,
+          "decode_tok_s_median": 265.5,
+          "ttft_ms_median": 42.2,
+          "cached_tokens": 422,
+          "tau_median": 6.4,
+          "gen_tokens": 512,
+          "prefill_tokens": 27,
+          "decode_tok_s_raw": [
+            266,
+            265.5,
+            256.6
+          ]
+        },
+        {
+          "turn": 3,
+          "decode_tok_s_median": 398.6,
+          "ttft_ms_median": 44.2,
+          "cached_tokens": 961,
+          "tau_median": 10.9,
+          "gen_tokens": 512,
+          "prefill_tokens": 31,
+          "decode_tok_s_raw": [
+            398.6,
+            403.8,
+            398.2
+          ]
+        }
+      ]
+    }
+  ],
+  "table_human": "qwen3.5-9b.mq4  |  gfx1201 / ROCm 7.2.0  |  median of 3 fresh runs  |  3-turn chat, max_tokens=512\ndecode = decode tok/s   ttft = time-to-first-token (ms)   cached = reused prefix tokens   tau = draft accept/cycle\n\nDFlash Cache  Sampling \u2502 T1 decode/ttft/cached/tau      \u2502 T2 decode/ttft/cached/tau      \u2502 T3 decode/ttft/cached/tau     \n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\noff    off    greedy   \u2502  109.5 /  19.3 /    0 /    -   \u2502  109.5 / 143.5 /    0 /    -   \u2502  109.5 /   356 /    0 /    -  \noff    off    sampled  \u2502  109.5 /  19.2 /    0 /    -   \u2502  109.7 / 210.8 /    0 /    -   \u2502  109.4 / 434.5 /    0 /    -  \noff    on     greedy   \u2502  109.4 /  19.2 /    0 /    -   \u2502  109.7 /  21.7 /  321 /    -   \u2502  109.6 /  19.5 /  859 /    -  \noff    on     sampled  \u2502    108 /  21.6 /    0 /    -   \u2502  109.4 /  21.3 /  504 /    -   \u2502  109.2 /  20.2 / 1042 /    -  \non     off    greedy   \u2502  324.4 /  46.8 /    0 /  6.7   \u2502  327.4 / 215.6 /    0 /  7.1   \u2502  447.6 / 456.3 /    0 / 11.7  \non     off    sampled  \u2502    259 /  44.8 /    0 /  5.8   \u2502  272.3 / 239.5 /    0 /  6.4   \u2502  348.3 / 487.5 /    0 /  9.5  \non     on     greedy   \u2502  326.9 /  46.6 /    0 /  6.7   \u2502  282.3 /  43.2 /  361 /    6   \u2502  401.5 /    44 /  900 / 10.1  \non     on     sampled  \u2502  259.4 /  46.8 /    0 /  5.8   \u2502  265.5 /  42.2 /  422 /  6.4   \u2502  398.6 /  44.2 /  961 / 10.9  ",
+  "findings": [
+    "Prefix cache: pure TTFT/prefill win on turns 2-3 (only the new suffix prefills). e.g. AR t3 ttft 356ms->20ms, DFlash t3 456ms->44ms; cached tokens grow 321->1042. AR decode tok/s is unchanged by the cache (~109.5 across all cache/turn cells).",
+    "DFlash: lifts decode from ~109.5 tok/s (AR) to ~325 (t1) rising to ~400-448 (t3) at greedy, tracking tau 6.7->11.7 as later code-continuation turns get more predictable (~3x-4x).",
+    "Sampling: AR greedy ~= AR sampled (~109.5; sampling overhead negligible). DFlash sampled is ~1.1-1.3x slower than greedy from lower acceptance (tau 5.8 vs 6.7 .. 9.5 vs 11.7) but DFlash STILL engages under sampling (tau 6-11), not an AR fallback."
+  ],
+  "caveats": [
+    "Cells run AR-before-DFlash in a single interleave order; DFlash decode carries residual cool->hot thermal drift (playbook ~10-15% session drift). Medians reject the per-cell 3rd-rep throttle (visible in decode_tok_s_raw) but not a systematic trend. AR is stable.",
+    "DFlash decode differences between cache on/off are confounded by trajectory + tau (cache-on/off follow different transcripts at temp=0) plus thermal ordering; they are NOT attributable to prefix caching. Only AR decode is a clean cache-invariant control.",
+    "Greedy cache-ON output is not byte-identical to cache-OFF (coherent but divergent trajectory) - separate correctness item, parked by request."
+  ]
+}
