@@ -95,7 +95,15 @@ fn main() {
     } else {
         f32::INFINITY
     };
-    let logits_bit_identical = logits_eager == logits_elided;
+    let logits_bit_identical = logits_eager.len() == logits_elided.len()
+        && logits_eager
+            .iter()
+            .zip(&logits_elided)
+            .all(|(eager, elided)| eager.to_bits() == elided.to_bits());
+    let logits_finite = logits_eager
+        .iter()
+        .chain(&logits_elided)
+        .all(|value| value.is_finite());
     let n_tokens_equal = n_tokens_eager == n_tokens_elided;
 
     let mut conv_bit_identical = conv_eager.len() == conv_elided.len();
@@ -111,16 +119,27 @@ fn main() {
         };
         let layer_identical = matches!(
             (conv_eager.get(layer), conv_elided.get(layer)),
-            (Some(eager), Some(elided)) if eager == elided
+            (Some(eager), Some(elided))
+                if eager.len() == elided.len()
+                    && eager
+                        .iter()
+                        .zip(elided)
+                        .all(|(eager, elided)| eager.to_bits() == elided.to_bits())
         );
         conv_bit_identical &= layer_identical;
         conv_max_diffs.push(max_abs_conv_diff);
     }
+    let conv_finite = conv_eager
+        .iter()
+        .chain(&conv_elided)
+        .flatten()
+        .all(|value| value.is_finite());
 
     println!("model={}", model.display());
     println!("prompt_tokens={N_TOKENS}");
     println!("max_abs_logit_diff={max_abs_logit_diff:e}");
     println!("logits_bit_identical={logits_bit_identical}");
+    println!("logits_finite={logits_finite}");
     println!("n_tokens_eager={n_tokens_eager}");
     println!("n_tokens_elided={n_tokens_elided}");
     println!("n_tokens_equal={n_tokens_equal}");
@@ -128,8 +147,14 @@ fn main() {
         println!("conv_layer_{layer}_max_abs_conv_diff={max_abs_conv_diff:e}");
     }
     println!("conv_bit_identical={conv_bit_identical}");
+    println!("conv_finite={conv_finite}");
 
-    if logits_bit_identical && n_tokens_equal && conv_bit_identical {
+    if logits_bit_identical
+        && logits_finite
+        && n_tokens_equal
+        && conv_bit_identical
+        && conv_finite
+    {
         println!("PREFILL_HEAD_ELIDE_PARITY_PASS");
     } else {
         eprintln!("PREFILL_HEAD_ELIDE_PARITY_FAIL");
