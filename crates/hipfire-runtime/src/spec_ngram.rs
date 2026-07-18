@@ -199,11 +199,18 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
             self.scratch = Some(target.new_spec_scratch(gpu, self.block_size)?);
         }
 
-        // Advance the target over the prompt (miss → reset + full) or just the
-        // new suffix (hit → no reset, from prefill_start). The target owns the
-        // chunked/abortable forward; we only need its KV + recurrent state moved.
+        // Advance the target over the prompt (miss → full) or just the new suffix
+        // (hit → from prefill_start). The central speculative lifecycle already
+        // performed the authoritative miss reset.
         let start = if cache_hit { prefill_start } else { 0 };
-        let adv = target.spec_advance(gpu, prefill_tokens, start, !cache_hit, abort, None)?;
+        let adv = target.spec_advance_cold_start(
+            gpu,
+            prefill_tokens,
+            start,
+            !cache_hit,
+            abort,
+            None,
+        )?;
         let first_token = match adv {
             SpecAdvance::Aborted => return Ok(PrefillOutcome::Aborted),
             SpecAdvance::Ready { last_argmax } => last_argmax,

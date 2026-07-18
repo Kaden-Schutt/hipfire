@@ -106,15 +106,6 @@ impl SpecTarget for ModelSlot {
         self
     }
 
-    fn reset_recurrent(&mut self, gpu: &mut Gpu) {
-        // Reuse the canonical DeltaNet reset (zeroes s_matrices / s_scales /
-        // conv_states / s_ef_residual, stream-aware) rather than re-inlining the
-        // memset loop the daemon abort path currently hand-writes, then drop the
-        // KV eviction offset so the next conversation rotates from absolute 0.
-        self.dn_state.reset(gpu);
-        self.kv_cache.compact_offset = 0;
-    }
-
     fn new_spec_scratch(
         &mut self,
         gpu: &mut Gpu,
@@ -172,21 +163,16 @@ impl SpecTarget for ModelSlot {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
-        reset: bool,
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Plain target advance, chunked at PREFILL_MAX_BATCH with abort checks
         // between chunks. No hidden extraction — only KV + recurrent state move.
-        if reset {
-            self.reset_state(gpu);
-        }
         let chunk_max = qwen35::PREFILL_MAX_BATCH;
         let mut off = 0usize;
         let mut pos = start_pos;
         while off < tokens.len() {
             if abort() {
-                self.reset_state(gpu);
                 return Ok(SpecAdvance::Aborted);
             }
             let end = (off + chunk_max).min(tokens.len());
@@ -207,7 +193,6 @@ impl SpecTarget for ModelSlot {
             )
             .map_err(|e| e.to_string())?;
             if !completed {
-                self.reset_state(gpu);
                 return Ok(SpecAdvance::Aborted);
             }
             pos += end - off;
@@ -216,14 +201,12 @@ impl SpecTarget for ModelSlot {
         // Last-position argmax (the per-token forward left last-token logits in
         // scratch.logits).
         if abort() {
-            self.reset_state(gpu);
             return Ok(SpecAdvance::Aborted);
         }
         let logits = gpu
             .download_f32(&self.scratch.logits)
             .map_err(|e| e.to_string())?;
         if abort() {
-            self.reset_state(gpu);
             return Ok(SpecAdvance::Aborted);
         }
         Ok(SpecAdvance::Ready {

@@ -11,7 +11,6 @@ pub use carriers::*;
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
 /// both `LoadedModel`/`ModelState` and the arch crates are in scope.
 pub mod model_parallel;
-pub mod session_state;
 pub mod spec_build;
 pub use model_parallel::{ModelParallel, ModelParallelKind, PipelineImpl};
 
@@ -259,6 +258,145 @@ pub enum ModelState {
     DotsOcr(hipfire_arch_dots_ocr::DotsOcrBundle),
 }
 
+/// A typed discriminant for the architecture state used by reset ownership
+/// validation. Keeping this separate from the GPU-backed bundles makes the
+/// ownership contract checkable without constructing a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelStateKind {
+    Qwen2,
+    Qwen35,
+    Llama,
+    Lfm2Moe,
+    Minimax,
+    Cohere2Moe,
+    Deepseek4,
+    DotsOcr,
+}
+
+impl From<&ModelState> for ModelStateKind {
+    fn from(state: &ModelState) -> Self {
+        match state {
+            ModelState::Qwen2(_) => Self::Qwen2,
+            ModelState::Qwen35(_) => Self::Qwen35,
+            ModelState::Llama(_) => Self::Llama,
+            ModelState::Lfm2Moe(_) => Self::Lfm2Moe,
+            ModelState::Minimax(_) => Self::Minimax,
+            ModelState::Cohere2Moe(_) => Self::Cohere2Moe,
+            ModelState::Deepseek4(_) => Self::Deepseek4,
+            ModelState::DotsOcr(_) => Self::DotsOcr,
+        }
+    }
+}
+
+/// A reset can only proceed when the architecture state is owned by the
+/// selected parallelism axis and the model metadata agrees with that state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResetError {
+    InvalidOwnership {
+        parallel: ModelParallelKind,
+        state: Option<ModelStateKind>,
+    },
+    Architecture {
+        parallel: ModelParallelKind,
+        state: Option<ModelStateKind>,
+        arch_id: u32,
+        message: String,
+    },
+    Session {
+        message: String,
+    },
+    Speculator {
+        message: String,
+    },
+}
+
+impl ResetError {
+    /// A failed reset means the daemon cannot prove that device state is
+    /// request-local.  Session/speculator failures are GPU-buffer ownership
+    /// failures; architecture failures are also fatal when they originate in
+    /// a device operation.  The daemon uses this classification to stop
+    /// serving instead of attempting another request on possibly dirty state.
+    pub fn is_gpu_fatal(&self) -> bool {
+        matches!(self, Self::Session { .. } | Self::Speculator { .. })
+            || matches!(self, Self::Architecture { message, .. } if is_gpu_reset_message(message))
+    }
+}
+
+fn is_gpu_reset_message(message: &str) -> bool {
+    [
+        "bind ",
+        "reset ",
+        "synchronize ",
+        "invalidate ",
+        "memset",
+        "free",
+    ]
+    .iter()
+    .any(|prefix| message.contains(prefix))
+        || message.contains("GPU")
+        || message.contains("hip")
+}
+
+/// Validate which object owns the state that a total reset must clear.
+///
+/// TP, dense PP, and EP carry their architecture state inside the parallel
+/// owner, so `LoadedModel.state` must be `None`. Qwen35 PP keeps Qwen35 state
+/// in `LoadedModel.state`, and every single model keeps architecture state
+/// there. Parallel-owned paths validate their supported architecture family
+/// against `arch_id`; single-owned state validates the concrete state kind.
+pub(crate) fn reset_ownership_kind(
+    parallel: ModelParallelKind,
+    state: Option<ModelStateKind>,
+    arch_id: u32,
+) -> Result<ModelParallelKind, ResetError> {
+    use ModelParallelKind::*;
+
+    let valid = match parallel {
+        Tp | PpDense | Ep => state.is_none(),
+        PpQwen35 => state == Some(ModelStateKind::Qwen35),
+        Single => state.is_some(),
+    };
+
+    if !valid {
+        return Err(ResetError::InvalidOwnership { parallel, state });
+    }
+
+    let architecture_valid = match parallel {
+        Tp | PpDense => state.is_none() && matches!(arch_id, 0 | 1),
+        Ep => state.is_none() && matches!(arch_id, 9 | 10),
+        PpQwen35 => state == Some(ModelStateKind::Qwen35) && matches!(arch_id, 5 | 6),
+        Single => match state {
+            Some(state) => state_matches_arch_id(state, arch_id),
+            None => false,
+        },
+    };
+    if !architecture_valid {
+        return Err(ResetError::Architecture {
+            parallel,
+            state,
+            arch_id,
+            message: format!(
+                "arch_id={arch_id} is incompatible with parallel={parallel:?} state={state:?}"
+            ),
+        });
+    }
+
+    Ok(parallel)
+}
+
+fn state_matches_arch_id(state: ModelStateKind, arch_id: u32) -> bool {
+    match state {
+        ModelStateKind::Qwen2 => arch_id == 7,
+        ModelStateKind::Qwen35 => matches!(arch_id, 5 | 6),
+        ModelStateKind::Llama => matches!(arch_id, 0 | 1),
+        ModelStateKind::Lfm2Moe => arch_id == 11,
+        ModelStateKind::Minimax => arch_id == 10,
+        ModelStateKind::Cohere2Moe => arch_id == 12,
+        ModelStateKind::Deepseek4 => arch_id == 9,
+        ModelStateKind::DotsOcr => arch_id == 8,
+    }
+}
+
 /// LFM2.5-MoE (arch_id=11) GPU bundle. Re-exported from the arch crate, which
 /// owns it so `impl SpecTarget for Lfm2MoeBundle` (the n-gram verify seam, incl.
 /// the conv-state snapshot/rollback) can live next to the forward it drives
@@ -297,26 +435,58 @@ pub struct Qwen35Vl {
 pub struct SessionState {
     pub seq_pos: usize,
     pub conversation_tokens: Vec<u32>,
+    /// Fingerprint of the preprocessed image for the active VL model turn.
+    /// This is request state, not a model cache: a reset clears it, and the
+    /// daemon updates it only after image preprocessing succeeds.
+    pub vl_image_state: Option<u64>,
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
 }
 
 impl SessionState {
-    /// Total reset of request-scoped state. Frees GPU checkpoint snapshots
-    /// (DeltaNetSnapshot has no Drop) before clearing, then resets scalars.
-    pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
-        for (_, snap) in self.prefill_checkpoints.drain(..) {
-            snap.free_gpu(gpu);
-        }
-        for (_, snap) in self.dflash_checkpoints.drain(..) {
-            snap.free_gpu(gpu);
-        }
+    /// Reset CPU-owned request state without requiring a GPU. Checkpoint
+    /// snapshots are deliberately not touched here; [`Self::reset`] drains
+    /// and frees those before calling this CPU-only helper.
+    pub fn reset_cpu(&mut self) {
+        self.seq_pos = 0;
+        self.conversation_tokens.clear();
+        self.vl_image_state = None;
         if let Some(ad) = self.kv_adaptive.as_mut() {
             ad.reset();
         }
-        self.seq_pos = 0;
-        self.conversation_tokens.clear();
+    }
+
+    /// Total reset of request-scoped state. Frees GPU checkpoint snapshots
+    /// (DeltaNetSnapshot has no Drop) before clearing, then resets scalars.
+    pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+        let _ = self.reset_checked(gpu);
+    }
+
+    /// Fallible reset for the model owner. Checkpoint GPU frees are attempted
+    /// before the request state is cleared, and any failure is returned. A
+    /// checkpoint whose buffer free fails remains owned by this session for a
+    /// later poison/unload retry.
+    pub fn reset_checked(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        let mut first_error = None;
+        let mut prefill_remaining = Vec::new();
+        for (position, mut snap) in self.prefill_checkpoints.drain(..) {
+            if let Err(error) = snap.free_gpu_checked(gpu) {
+                first_error.get_or_insert(error);
+                prefill_remaining.push((position, snap));
+            }
+        }
+        self.prefill_checkpoints = prefill_remaining;
+        let mut dflash_remaining = Vec::new();
+        for (position, mut snap) in self.dflash_checkpoints.drain(..) {
+            if let Err(error) = snap.free_gpu_checked(gpu) {
+                first_error.get_or_insert(error);
+                dflash_remaining.push((position, snap));
+            }
+        }
+        self.dflash_checkpoints = dflash_remaining;
+        self.reset_cpu();
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -526,6 +696,25 @@ impl LoadedModel {
         }
     }
 
+    /// Reset all request-scoped state while retaining model-lifetime state.
+    ///
+    /// Ownership is validated before any mutation. A single-GPU model and a
+    /// Qwen35 pipeline model own their architecture state in `state`; dense TP,
+    /// dense PP, and EP own it in `parallel`. The latter two dense drivers have
+    /// no physical KV reset primitive: their next prefill overwrites KV from
+    /// position zero, so their physical state is intentionally left alone.
+    pub fn reset_context(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), ResetError> {
+        let state_kind = self.state.as_ref().map(ModelStateKind::from);
+        reset_ownership_kind(self.parallel.kind(), state_kind, self.meta.arch_id)?;
+        validate_reset_layout(&self.parallel, &self.state, self.meta.arch_id)?;
+
+        map_session_reset(self.session.reset_checked(gpu))?;
+        if let Some(speculator) = self.speculator.as_mut() {
+            map_speculator_reset(speculator.reset_checked(gpu))?;
+        }
+        reset_owned_arch_state(&mut self.parallel, &mut self.state, self.meta.arch_id, gpu)
+    }
+
     /// Whether the loaded DeepSeek model carries MTP/spec weights that
     /// `mtp_mode=auto` should treat as spec-eligible.
     pub fn mtp_weights_present(&self) -> bool {
@@ -570,6 +759,580 @@ impl LoadedModel {
                 mtp_k,
             )
         }
+    }
+}
+
+fn qwen35_recurrent_groups<'a, T>(
+    s_matrices: &'a [T],
+    s_scales: &'a [T],
+    conv_states: &'a [T],
+    s_ef_residual: &'a [T],
+) -> [&'a [T]; 4] {
+    [s_matrices, s_scales, conv_states, s_ef_residual]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpArchKind {
+    Ds4,
+    Minimax,
+}
+
+fn validate_ep_layout(
+    arch_id: u32,
+    arch_kind: EpArchKind,
+    state_len: usize,
+    device_len: usize,
+) -> Result<(), ResetError> {
+    let expected_kind = match arch_id {
+        9 => EpArchKind::Ds4,
+        10 => EpArchKind::Minimax,
+        _ => {
+            return Err(architecture_error(
+                ModelParallelKind::Ep,
+                None,
+                arch_id,
+                "unsupported EP architecture",
+            ));
+        }
+    };
+    if arch_kind != expected_kind {
+        return Err(architecture_error(
+            ModelParallelKind::Ep,
+            None,
+            arch_id,
+            format!("EP arch_id={arch_id} does not match {arch_kind:?} state"),
+        ));
+    }
+    ep_owner_visitation(arch_id, state_len, device_len).map(|_| ())
+}
+
+/// Return the EP owners in reset order.  Keeping this as a pure layout helper
+/// makes the rank-visitation contract testable without constructing GPU state;
+/// `reset_ep_state` consumes the same order for the actual device reset.
+fn ep_owner_visitation(
+    arch_id: u32,
+    state_len: usize,
+    device_len: usize,
+) -> Result<Vec<usize>, ResetError> {
+    if state_len != device_len {
+        return Err(architecture_error(
+            ModelParallelKind::Ep,
+            None,
+            arch_id,
+            format!("EP state/device cardinality mismatch: state={state_len} devices={device_len}"),
+        ));
+    }
+    Ok((0..state_len).collect())
+}
+
+fn require_qwen35_pipeline_metadata(
+    pipeline_present: bool,
+    arch_id: u32,
+) -> Result<(), ResetError> {
+    if pipeline_present {
+        Ok(())
+    } else {
+        Err(architecture_error(
+            ModelParallelKind::PpQwen35,
+            Some(ModelStateKind::Qwen35),
+            arch_id,
+            "Qwen35 ArchResident PP is missing pipeline metadata",
+        ))
+    }
+}
+
+fn reject_qwen35_single_pipeline_metadata(
+    pipeline_present: bool,
+    arch_id: u32,
+) -> Result<(), ResetError> {
+    if pipeline_present {
+        Err(architecture_error(
+            ModelParallelKind::Single,
+            Some(ModelStateKind::Qwen35),
+            arch_id,
+            "single Qwen35 model unexpectedly carries pipeline metadata",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_qwen35_recurrent_cardinality(
+    expected: usize,
+    s_scales: usize,
+    conv_states: usize,
+    s_ef_residual: usize,
+    dn_la_to_device: usize,
+    arch_id: u32,
+) -> Result<(), ResetError> {
+    for (name, actual) in [
+        ("s_scales", s_scales),
+        ("conv_states", conv_states),
+        ("dn_la_to_device", dn_la_to_device),
+    ] {
+        if actual != expected {
+            return Err(architecture_error(
+                ModelParallelKind::PpQwen35,
+                Some(ModelStateKind::Qwen35),
+                arch_id,
+                format!("Qwen35 PP {name} cardinality={actual}, expected={expected}"),
+            ));
+        }
+    }
+    // Error feedback is optional for Qwen35. An enabled vector must still be
+    // one entry per DeltaNet layer; an empty vector means the feature is off.
+    if s_ef_residual != 0 && s_ef_residual != expected {
+        return Err(architecture_error(
+            ModelParallelKind::PpQwen35,
+            Some(ModelStateKind::Qwen35),
+            arch_id,
+            format!("Qwen35 PP s_ef_residual cardinality={s_ef_residual}, expected={expected}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_qwen35_pipeline_layout(
+    bundle: &hipfire_arch_qwen35::Qwen35Bundle,
+    gpus: &Gpus,
+    arch_id: u32,
+) -> Result<(), ResetError> {
+    let pipeline = match bundle.pipeline.as_ref() {
+        Some(pipeline) => pipeline,
+        None => return require_qwen35_pipeline_metadata(false, arch_id),
+    };
+    let expected = bundle.dn_state.s_matrices.len();
+    validate_qwen35_recurrent_cardinality(
+        expected,
+        bundle.dn_state.s_scales.len(),
+        bundle.dn_state.conv_states.len(),
+        bundle.dn_state.s_ef_residual.len(),
+        pipeline.dn_la_to_device.len(),
+        arch_id,
+    )?;
+    qwen35_pp_owner_visitation(
+        &pipeline.dn_la_to_device,
+        expected,
+        gpus.devices.len(),
+        arch_id,
+    )?;
+    Ok(())
+}
+
+/// Return the PP owner for each recurrent layer in visitation order.  The
+/// reset loop below uses this exact vector, so emulated meshes exercise the
+/// same owner routing as physical PP meshes without needing a GPU in tests.
+fn qwen35_pp_owner_visitation(
+    dn_la_to_device: &[u8],
+    expected_layers: usize,
+    device_len: usize,
+    arch_id: u32,
+) -> Result<Vec<usize>, ResetError> {
+    if dn_la_to_device.len() != expected_layers {
+        return Err(architecture_error(
+            ModelParallelKind::PpQwen35,
+            Some(ModelStateKind::Qwen35),
+            arch_id,
+            format!(
+                "Qwen35 PP dn_la_to_device cardinality={}, expected={expected_layers}",
+                dn_la_to_device.len()
+            ),
+        ));
+    }
+    if let Some((layer, device_id)) = dn_la_to_device
+        .iter()
+        .enumerate()
+        .find(|(_, device_id)| usize::from(**device_id) >= device_len)
+    {
+        return Err(architecture_error(
+            ModelParallelKind::PpQwen35,
+            Some(ModelStateKind::Qwen35),
+            arch_id,
+            format!("Qwen35 PP layer {layer} maps to device {device_id}"),
+        ));
+    }
+    Ok(dn_la_to_device
+        .iter()
+        .map(|&device| device as usize)
+        .collect())
+}
+
+fn reset_qwen35_pipeline_recurrent(
+    dn: &hipfire_arch_qwen35::qwen35::DeltaNetState,
+    dn_la_to_device: &[u8],
+    gpus: &mut Gpus,
+    arch_id: u32,
+) -> Result<(), ResetError> {
+    let owner_devices = qwen35_pp_owner_visitation(
+        dn_la_to_device,
+        dn.s_matrices.len(),
+        gpus.devices.len(),
+        arch_id,
+    )?;
+    for buffers in qwen35_recurrent_groups(
+        &dn.s_matrices,
+        &dn.s_scales,
+        &dn.conv_states,
+        &dn.s_ef_residual,
+    ) {
+        if buffers.is_empty() {
+            continue;
+        }
+        reset_each_owner(&owner_devices, |layer_index, device_id| {
+            let s = &buffers[layer_index];
+            let g = gpus.devices.get_mut(device_id).ok_or_else(|| {
+                architecture_error(
+                    ModelParallelKind::PpQwen35,
+                    Some(ModelStateKind::Qwen35),
+                    arch_id,
+                    format!("PP device index {device_id} is out of range"),
+                )
+            })?;
+            g.bind_thread().map_err(|error| {
+                architecture_error(
+                    ModelParallelKind::PpQwen35,
+                    Some(ModelStateKind::Qwen35),
+                    arch_id,
+                    format!("bind PP device {device_id}: {error:?}"),
+                )
+            })?;
+            match g.active_stream.as_ref() {
+                Some(stream) => {
+                    g.hip
+                        .memset_async(&s.buf, 0, s.buf.size(), stream)
+                        .map_err(|error| {
+                            architecture_error(
+                                ModelParallelKind::PpQwen35,
+                                Some(ModelStateKind::Qwen35),
+                                arch_id,
+                                format!("reset PP recurrent state: {error:?}"),
+                            )
+                        })?;
+                }
+                None => {
+                    g.hip.memset(&s.buf, 0, s.buf.size()).map_err(|error| {
+                        architecture_error(
+                            ModelParallelKind::PpQwen35,
+                            Some(ModelStateKind::Qwen35),
+                            arch_id,
+                            format!("reset PP recurrent state: {error:?}"),
+                        )
+                    })?;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    for (device_id, g) in gpus.devices.iter_mut().enumerate() {
+        g.bind_thread().map_err(|error| {
+            architecture_error(
+                ModelParallelKind::PpQwen35,
+                Some(ModelStateKind::Qwen35),
+                arch_id,
+                format!("bind PP device {device_id}: {error:?}"),
+            )
+        })?;
+        g.hip.device_synchronize().map_err(|error| {
+            architecture_error(
+                ModelParallelKind::PpQwen35,
+                Some(ModelStateKind::Qwen35),
+                arch_id,
+                format!("synchronize PP recurrent reset on device {device_id}: {error:?}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Invoke every physical reset owner in the order selected by the production
+/// layout. Both arch-resident PP and EP call this helper from
+/// `LoadedModel::reset_context`; keeping the invocation seam injectable makes
+/// owner coverage testable without pretending that booleans are GPU state.
+fn reset_each_owner<F>(owners: &[usize], mut reset: F) -> Result<(), ResetError>
+where
+    F: FnMut(usize, usize) -> Result<(), ResetError>,
+{
+    for (index, &owner) in owners.iter().enumerate() {
+        reset(index, owner)?;
+    }
+    Ok(())
+}
+
+fn architecture_error(
+    parallel: ModelParallelKind,
+    state: Option<ModelStateKind>,
+    arch_id: u32,
+    message: impl Into<String>,
+) -> ResetError {
+    ResetError::Architecture {
+        parallel,
+        state,
+        arch_id,
+        message: message.into(),
+    }
+}
+
+fn map_session_reset(result: Result<(), String>) -> Result<(), ResetError> {
+    result.map_err(|message| ResetError::Session { message })
+}
+
+fn map_speculator_reset(result: Result<(), String>) -> Result<(), ResetError> {
+    result.map_err(|message| ResetError::Speculator { message })
+}
+
+fn reset_single_arch_state(
+    state: &mut ModelState,
+    arch_id: u32,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), ResetError> {
+    match state {
+        ModelState::Qwen2(b) => b.state.reset(),
+        ModelState::Qwen35(b) => {
+            b.dn_state.reset_checked(gpu).map_err(|error| {
+                architecture_error(
+                    ModelParallelKind::Single,
+                    Some(ModelStateKind::Qwen35),
+                    arch_id,
+                    error.to_string(),
+                )
+            })?;
+            b.kv_cache.compact_offset = 0;
+        }
+        ModelState::Llama(b) => b.kv.compact_offset = 0,
+        ModelState::Lfm2Moe(b) => {
+            b.state.reset(gpu).map_err(|error| {
+                architecture_error(
+                    ModelParallelKind::Single,
+                    Some(ModelStateKind::Lfm2Moe),
+                    arch_id,
+                    error,
+                )
+            })?;
+            b.state.kv.compact_offset = 0;
+        }
+        ModelState::Minimax(b) => b.state.reset(),
+        ModelState::Cohere2Moe(b) => {
+            b.state.reset(gpu).map_err(|error| {
+                architecture_error(
+                    ModelParallelKind::Single,
+                    Some(ModelStateKind::Cohere2Moe),
+                    arch_id,
+                    error,
+                )
+            })?;
+        }
+        ModelState::Deepseek4(b) => {
+            b.state.reset_with_gpu(gpu).map_err(|error| {
+                architecture_error(
+                    ModelParallelKind::Single,
+                    Some(ModelStateKind::Deepseek4),
+                    arch_id,
+                    format!("reset DeepSeek MTP state: {error:?}"),
+                )
+            })?;
+            b.state.zero_decode_caches_checked(gpu).map_err(|error| {
+                architecture_error(
+                    ModelParallelKind::Single,
+                    Some(ModelStateKind::Deepseek4),
+                    arch_id,
+                    error.to_string(),
+                )
+            })?;
+            gpu.invalidate_graph_state_checked().map_err(|error| {
+                architecture_error(
+                    ModelParallelKind::Single,
+                    Some(ModelStateKind::Deepseek4),
+                    arch_id,
+                    format!("invalidate DeepSeek graphs: {error}"),
+                )
+            })?;
+            gpu.hip.device_synchronize().map_err(|error| {
+                architecture_error(
+                    ModelParallelKind::Single,
+                    Some(ModelStateKind::Deepseek4),
+                    arch_id,
+                    format!("synchronize DeepSeek graph invalidation: {error:?}"),
+                )
+            })?;
+        }
+        ModelState::DotsOcr(b) => b.state.reset(),
+    }
+    Ok(())
+}
+
+fn reset_ep_state(ep: &mut EpState, arch_id: u32) -> Result<(), ResetError> {
+    let (arch_kind, state_len) = match &ep.inner {
+        EpArch::Ds4 { state, .. } => (EpArchKind::Ds4, state.len()),
+        EpArch::Minimax { state, .. } => (EpArchKind::Minimax, state.len()),
+    };
+    validate_ep_layout(arch_id, arch_kind, state_len, ep.gpus.devices.len())?;
+    let owner_ranks = ep_owner_visitation(arch_id, state_len, ep.gpus.devices.len())?;
+
+    match &mut ep.inner {
+        EpArch::Ds4 { state, .. } => {
+            reset_each_owner(&owner_ranks, |_index, rank| {
+                let state = &mut state[rank];
+                let gpu = &mut ep.gpus.devices[rank];
+                gpu.bind_thread().map_err(|error| {
+                    architecture_error(
+                        ModelParallelKind::Ep,
+                        None,
+                        arch_id,
+                        format!("bind EP device {rank}: {error:?}"),
+                    )
+                })?;
+                state.reset_with_gpu(gpu).map_err(|error| {
+                    architecture_error(
+                        ModelParallelKind::Ep,
+                        None,
+                        arch_id,
+                        format!("reset DeepSeek MTP state on rank {rank}: {error:?}"),
+                    )
+                })?;
+                state.zero_decode_caches_checked(gpu).map_err(|error| {
+                    architecture_error(ModelParallelKind::Ep, None, arch_id, error.to_string())
+                })?;
+                gpu.invalidate_graph_state_checked().map_err(|error| {
+                    architecture_error(
+                        ModelParallelKind::Ep,
+                        None,
+                        arch_id,
+                        format!("invalidate DeepSeek graphs on rank {rank}: {error}"),
+                    )
+                })?;
+                gpu.hip.device_synchronize().map_err(|error| {
+                    architecture_error(
+                        ModelParallelKind::Ep,
+                        None,
+                        arch_id,
+                        format!(
+                            "synchronize DeepSeek graph invalidation on rank {rank}: {error:?}"
+                        ),
+                    )
+                })?;
+                Ok(())
+            })?;
+        }
+        EpArch::Minimax { state, .. } => {
+            reset_each_owner(&owner_ranks, |_index, rank| {
+                state[rank].reset();
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_reset_layout(
+    parallel: &ModelParallel,
+    state: &Option<ModelState>,
+    arch_id: u32,
+) -> Result<(), ResetError> {
+    match parallel {
+        ModelParallel::Single => match state {
+            Some(ModelState::Qwen35(bundle)) => {
+                reject_qwen35_single_pipeline_metadata(bundle.pipeline.is_some(), arch_id)
+            }
+            _ => Ok(()),
+        },
+        ModelParallel::Pp(PipelineImpl::ArchResident(gpus)) => match state {
+            Some(ModelState::Qwen35(bundle)) => {
+                validate_qwen35_pipeline_layout(bundle, gpus, arch_id)
+            }
+            _ => Ok(()),
+        },
+        ModelParallel::Ep(ep) => {
+            let (arch_kind, state_len) = match &ep.inner {
+                EpArch::Ds4 { state, .. } => (EpArchKind::Ds4, state.len()),
+                EpArch::Minimax { state, .. } => (EpArchKind::Minimax, state.len()),
+            };
+            validate_ep_layout(arch_id, arch_kind, state_len, ep.gpus.devices.len())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn reset_owned_arch_state(
+    parallel: &mut ModelParallel,
+    state: &mut Option<ModelState>,
+    arch_id: u32,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), ResetError> {
+    let parallel_kind = parallel.kind();
+    let state_kind = state.as_ref().map(ModelStateKind::from);
+    let invalid = || {
+        Err(ResetError::InvalidOwnership {
+            parallel: parallel_kind,
+            state: state_kind,
+        })
+    };
+
+    match parallel {
+        ModelParallel::Single => match state {
+            Some(state) => reset_single_arch_state(state, arch_id, gpu),
+            None => invalid(),
+        },
+        ModelParallel::Tp(_) => match state {
+            None => Ok(()),
+            Some(ModelState::Qwen2(_))
+            | Some(ModelState::Qwen35(_))
+            | Some(ModelState::Llama(_))
+            | Some(ModelState::Lfm2Moe(_))
+            | Some(ModelState::Minimax(_))
+            | Some(ModelState::Cohere2Moe(_))
+            | Some(ModelState::Deepseek4(_))
+            | Some(ModelState::DotsOcr(_)) => invalid(),
+        },
+        ModelParallel::Pp(PipelineImpl::Dense(_)) => match state {
+            None => Ok(()),
+            Some(ModelState::Qwen2(_))
+            | Some(ModelState::Qwen35(_))
+            | Some(ModelState::Llama(_))
+            | Some(ModelState::Lfm2Moe(_))
+            | Some(ModelState::Minimax(_))
+            | Some(ModelState::Cohere2Moe(_))
+            | Some(ModelState::Deepseek4(_))
+            | Some(ModelState::DotsOcr(_)) => invalid(),
+        },
+        ModelParallel::Pp(PipelineImpl::ArchResident(gpus)) => match state {
+            Some(ModelState::Qwen35(bundle)) => {
+                let pipeline = bundle.pipeline.as_ref().ok_or_else(|| {
+                    architecture_error(
+                        ModelParallelKind::PpQwen35,
+                        Some(ModelStateKind::Qwen35),
+                        arch_id,
+                        "Qwen35 ArchResident PP is missing pipeline metadata",
+                    )
+                })?;
+                reset_qwen35_pipeline_recurrent(
+                    &bundle.dn_state,
+                    &pipeline.dn_la_to_device,
+                    gpus,
+                    arch_id,
+                )?;
+                bundle.kv_cache.compact_offset = 0;
+                Ok(())
+            }
+            None
+            | Some(ModelState::Qwen2(_))
+            | Some(ModelState::Llama(_))
+            | Some(ModelState::Lfm2Moe(_))
+            | Some(ModelState::Minimax(_))
+            | Some(ModelState::Cohere2Moe(_))
+            | Some(ModelState::Deepseek4(_))
+            | Some(ModelState::DotsOcr(_)) => invalid(),
+        },
+        ModelParallel::Ep(ep) => match state {
+            None => reset_ep_state(ep, arch_id),
+            Some(ModelState::Qwen2(_))
+            | Some(ModelState::Qwen35(_))
+            | Some(ModelState::Llama(_))
+            | Some(ModelState::Lfm2Moe(_))
+            | Some(ModelState::Minimax(_))
+            | Some(ModelState::Cohere2Moe(_))
+            | Some(ModelState::Deepseek4(_))
+            | Some(ModelState::DotsOcr(_)) => invalid(),
+        },
     }
 }
 
@@ -2272,6 +3035,78 @@ mod registry_tests {
         assert!(super::reject_qwen_native_mtp("off").is_ok());
     }
 
+    #[test]
+    #[ignore = "requires an AMD GPU and qwen3.6-27b.mq4"]
+    fn reset_context_clears_active_request_but_preserves_model_state() {
+        use std::sync::Arc;
+
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_RESET_CONTEXT_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        assert!(
+            std::path::Path::new(&target_path).is_file(),
+            "missing {target_path}"
+        );
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let mut model = super::load_model(
+            &target_path,
+            64,
+            None,
+            Some("q8"),
+            None,
+            None,
+            &super::CaskConfig::default(),
+            &mesh,
+            None,
+            super::SpecLoadCfg::default(),
+            &mut gpu,
+        )
+        .expect("load qwen35 reset fixture");
+
+        let checkpoint = hipfire_arch_qwen35::speculative::DeltaNetSnapshot::new_for(
+            &mut gpu,
+            &model.qwen35().expect("qwen35 state").dn_state,
+        )
+        .expect("allocate checkpoint fixture");
+        model.session.prefill_checkpoints.push((11, checkpoint));
+
+        // Install a small real eviction owner so this checks ownership, not just
+        // that the field happens to be None on a no-sidecar load.
+        let centers = super::TriAttnCenters::new(1, 1, 2, 10_000.0, 1.0);
+        let eviction =
+            super::EvictionCtx::new(&mut gpu, &centers, vec![0], 1, 1, 1, 1, 2, 2, 10_000.0, 4)
+                .expect("build eviction fixture");
+        model.eviction = Some(super::Eviction::Plain(eviction));
+
+        model.session.seq_pos = 17;
+        model
+            .session
+            .conversation_tokens
+            .extend_from_slice(&[1, 2, 3]);
+        model.persist.asst_turn_cache.insert(9, vec![4, 5]);
+        model.persist.decoded_vocab = Some(Arc::new(vec!["<pad>".to_string()]));
+        let model_path = model.meta.model_path.clone();
+
+        model
+            .reset_context(&mut gpu)
+            .expect("reset_context should accept loaded ownership");
+
+        assert_eq!(model.session.seq_pos, 0);
+        assert!(model.session.conversation_tokens.is_empty());
+        assert!(model.session.prefill_checkpoints.is_empty());
+        assert!(model.persist.asst_turn_cache.contains_key(&9));
+        assert_eq!(
+            model.persist.decoded_vocab.as_deref().map(Vec::len),
+            Some(1)
+        );
+        assert!(model.eviction.is_some());
+        assert_eq!(model.meta.model_path, model_path);
+
+        super::unload_model(model, &mut gpu);
+    }
+
     /// Exercises the published loader owner, rather than `Speculator::free` in
     /// isolation: `unload_model` must release DFlash, its DDTree snapshots, the
     /// Qwen35 target, and the pool before the next model lifetime begins.
@@ -2427,5 +3262,312 @@ mod registry_tests {
             after, baseline,
             "sidecar read failure leaked unpublished Qwen35 bundle: baseline={baseline}, after={after}"
         );
+    }
+}
+
+#[cfg(test)]
+mod reset_ownership_tests {
+    use super::{
+        architecture_error,
+        ep_owner_visitation, qwen35_pp_owner_visitation, reject_qwen35_single_pipeline_metadata,
+        require_qwen35_pipeline_metadata, reset_each_owner, reset_ownership_kind, validate_ep_layout,
+        validate_qwen35_recurrent_cardinality, EpArchKind, ModelParallelKind, ModelStateKind,
+        ResetError,
+    };
+
+    #[test]
+    fn ownership_truth_table() {
+        use ModelParallelKind::*;
+        use ModelStateKind::*;
+
+        #[derive(Clone, Copy)]
+        enum Expected {
+            Valid,
+            Ownership,
+            Architecture,
+        }
+
+        let cases = [
+            ("single Qwen2", Single, Some(Qwen2), 7, Expected::Valid),
+            ("single Qwen35", Single, Some(Qwen35), 5, Expected::Valid),
+            ("single Llama", Single, Some(Llama), 0, Expected::Valid),
+            ("single Lfm2Moe", Single, Some(Lfm2Moe), 11, Expected::Valid),
+            ("single Minimax", Single, Some(Minimax), 10, Expected::Valid),
+            (
+                "single Cohere2Moe",
+                Single,
+                Some(Cohere2Moe),
+                12,
+                Expected::Valid,
+            ),
+            (
+                "single Deepseek4",
+                Single,
+                Some(Deepseek4),
+                9,
+                Expected::Valid,
+            ),
+            ("single DotsOcr", Single, Some(DotsOcr), 8, Expected::Valid),
+            ("Qwen35 PP", PpQwen35, Some(Qwen35), 5, Expected::Valid),
+            ("parked Qwen35 PP", PpQwen35, None, 5, Expected::Ownership),
+            (
+                "mismatched Qwen35 PP",
+                PpQwen35,
+                Some(Qwen2),
+                7,
+                Expected::Ownership,
+            ),
+            ("TP with state", Tp, Some(Qwen35), 5, Expected::Ownership),
+            (
+                "dense PP with state",
+                PpDense,
+                Some(Qwen35),
+                5,
+                Expected::Ownership,
+            ),
+            ("EP with state", Ep, Some(Qwen35), 5, Expected::Ownership),
+            ("TP owns state", Tp, None, 0, Expected::Valid),
+            ("dense PP owns state", PpDense, None, 1, Expected::Valid),
+            ("EP owns state", Ep, None, 9, Expected::Valid),
+            ("single parked", Single, None, 0, Expected::Ownership),
+            (
+                "single architecture mismatch",
+                Single,
+                Some(Qwen2),
+                5,
+                Expected::Architecture,
+            ),
+            (
+                "TP architecture mismatch",
+                Tp,
+                None,
+                9,
+                Expected::Architecture,
+            ),
+            (
+                "dense PP architecture mismatch",
+                PpDense,
+                None,
+                5,
+                Expected::Architecture,
+            ),
+            (
+                "EP architecture mismatch",
+                Ep,
+                None,
+                0,
+                Expected::Architecture,
+            ),
+            (
+                "Qwen35 PP architecture mismatch",
+                PpQwen35,
+                Some(Qwen35),
+                9,
+                Expected::Architecture,
+            ),
+        ];
+
+        for (name, parallel, state, arch_id, expected) in cases {
+            let result = reset_ownership_kind(parallel, state, arch_id);
+            match expected {
+                Expected::Valid => assert_eq!(result, Ok(parallel), "{name}"),
+                Expected::Ownership => assert!(
+                    matches!(result, Err(ResetError::InvalidOwnership { .. })),
+                    "{name}: result={result:?}"
+                ),
+                Expected::Architecture => assert!(
+                    matches!(result, Err(ResetError::Architecture { .. })),
+                    "{name}: result={result:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn ep_rejects_arch_variant_mismatch() {
+        let result = validate_ep_layout(9, EpArchKind::Minimax, 2, 2);
+        assert!(matches!(result, Err(ResetError::Architecture { .. })));
+    }
+
+    #[test]
+    fn ep_rejects_state_device_cardinality_mismatch() {
+        let result = validate_ep_layout(10, EpArchKind::Minimax, 2, 1);
+        assert!(matches!(result, Err(ResetError::Architecture { .. })));
+    }
+
+    #[test]
+    fn qwen35_pp_rejects_missing_pipeline_metadata() {
+        let result = require_qwen35_pipeline_metadata(false, 5);
+        assert!(matches!(result, Err(ResetError::Architecture { .. })));
+    }
+
+    #[test]
+    fn single_qwen35_rejects_pipeline_metadata() {
+        assert!(reject_qwen35_single_pipeline_metadata(false, 5).is_ok());
+        let result = reject_qwen35_single_pipeline_metadata(true, 5);
+        assert!(matches!(result, Err(ResetError::Architecture { .. })));
+    }
+
+    #[test]
+    fn qwen35_pp_accepts_disabled_error_feedback() {
+        assert!(validate_qwen35_recurrent_cardinality(3, 3, 3, 0, 3, 5).is_ok());
+        assert!(validate_qwen35_recurrent_cardinality(3, 3, 3, 3, 3, 5).is_ok());
+    }
+
+    #[test]
+    fn qwen35_pp_rejects_nonempty_error_feedback_cardinality_mismatch() {
+        let result = validate_qwen35_recurrent_cardinality(3, 3, 3, 2, 3, 5);
+        assert!(matches!(result, Err(ResetError::Architecture { .. })));
+    }
+
+    #[test]
+    fn production_pp_reset_owner_invocations_are_observable() {
+        let owners =
+            qwen35_pp_owner_visitation(&[0, 1, 1, 0], 4, 2, 5).expect("valid emulated PP mapping");
+        let mut invoked = Vec::new();
+        reset_each_owner(&owners, |_index, owner| {
+            invoked.push(owner);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(invoked, owners);
+        assert!(qwen35_pp_owner_visitation(&[0, 2], 2, 2, 5).is_err());
+        assert!(qwen35_pp_owner_visitation(&[0], 2, 2, 5).is_err());
+    }
+
+    #[test]
+    fn production_ep_reset_owner_invocations_are_observable() {
+        let owners = ep_owner_visitation(9, 3, 3).unwrap();
+        let mut invoked = Vec::new();
+        reset_each_owner(&owners, |_index, owner| {
+            invoked.push(owner);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(invoked, owners);
+        assert!(ep_owner_visitation(9, 3, 2).is_err());
+    }
+
+    #[test]
+    fn reset_failure_classifies_gpu_owned_failures_as_fatal() {
+        assert!(ResetError::Session {
+            message: "checkpoint free failed".into(),
+        }
+        .is_gpu_fatal());
+        assert!(ResetError::Speculator {
+            message: "drafter reset failed".into(),
+        }
+        .is_gpu_fatal());
+        assert!(architecture_error(
+            ModelParallelKind::Single,
+            Some(ModelStateKind::Qwen35),
+            5,
+            "reset recurrent state: hipErrorIllegalAddress"
+        )
+        .is_gpu_fatal());
+        assert!(!architecture_error(
+            ModelParallelKind::Single,
+            Some(ModelStateKind::Qwen35),
+            5,
+            "single Qwen35 model unexpectedly carries pipeline metadata"
+        )
+        .is_gpu_fatal());
+    }
+}
+
+#[cfg(test)]
+mod session_state_tests {
+    use super::{map_session_reset, map_speculator_reset, LoadedModel, ResetError, SessionState};
+
+    fn test_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
+        hipfire_runtime::tokenizer::Tokenizer::from_hf_json(
+            r#"{"model":{"vocab":{"a":0},"merges":[]}}"#,
+        )
+        .expect("test tokenizer")
+    }
+
+    #[test]
+    fn reset_cpu_clears_active_session_state() {
+        let mut session = SessionState::default();
+        session.seq_pos = 23;
+        session.conversation_tokens.extend_from_slice(&[1, 2, 3]);
+        session.kv_adaptive = Some(hipfire_runtime::kv_adaptive::KvAdaptive::from_preset(
+            hipfire_runtime::kv_adaptive::Preset::Balanced,
+            128,
+            2,
+            64,
+        ));
+        session
+            .kv_adaptive
+            .as_mut()
+            .expect("adaptive state")
+            .next_step = 2;
+
+        session.reset_cpu();
+
+        assert_eq!(session.seq_pos, 0);
+        assert!(session.conversation_tokens.is_empty());
+        assert!(session.prefill_checkpoints.is_empty());
+        assert!(session.dflash_checkpoints.is_empty());
+        assert_eq!(session.kv_adaptive.as_ref().unwrap().next_step, 0);
+    }
+
+    #[test]
+    fn cpu_session_reset_preserves_persist_and_metadata() {
+        let mut model = LoadedModel::skeleton(
+            5,
+            test_tokenizer(),
+            128,
+            128,
+            "model.mq4".to_string(),
+            Some("template".to_string()),
+            "auto",
+            3,
+        );
+        model.session.seq_pos = 9;
+        model.persist.asst_turn_cache.insert(7, vec![11, 12]);
+        model.persist.decoded_vocab = Some(std::sync::Arc::new(vec!["token".to_string()]));
+        let meta = (
+            model.meta.arch_id,
+            model.meta.model_path.clone(),
+            model.meta.chat_template.clone(),
+        );
+
+        model.session.reset_cpu();
+
+        assert_eq!(model.session.seq_pos, 0);
+        assert!(model.persist.asst_turn_cache.contains_key(&7));
+        assert_eq!(
+            model.persist.decoded_vocab.as_deref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            (
+                model.meta.arch_id,
+                model.meta.model_path,
+                model.meta.chat_template,
+            ),
+            meta
+        );
+    }
+
+    #[test]
+    fn reset_propagates_session_checkpoint_failure() {
+        let error = map_session_reset(Err("checkpoint free failed".to_string()))
+            .expect_err("session reset failure must propagate");
+        assert!(matches!(
+            error,
+            ResetError::Session { ref message } if message == "checkpoint free failed"
+        ));
+    }
+
+    #[test]
+    fn reset_propagates_speculator_failure() {
+        let error = map_speculator_reset(Err("drafter reset failed".to_string()))
+            .expect_err("speculator reset failure must propagate");
+        assert!(matches!(
+            error,
+            ResetError::Speculator { ref message } if message == "drafter reset failed"
+        ));
     }
 }

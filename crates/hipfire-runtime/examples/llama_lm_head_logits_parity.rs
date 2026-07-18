@@ -75,7 +75,7 @@ fn main() {
     let no_abort = || false;
 
     let adv = bundle
-        .spec_advance(&mut gpu, &prompt, 0, true, &no_abort, None)
+        .spec_advance(&mut gpu, &prompt, 0, &no_abort, None)
         .expect("spec_advance");
 
     let last_argmax = match adv {

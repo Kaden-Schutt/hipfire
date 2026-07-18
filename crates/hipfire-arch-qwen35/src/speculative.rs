@@ -1058,21 +1058,63 @@ impl DeltaNetSnapshot {
     /// no `Drop`, so a bare `Vec::clear()`/`truncate()` on a checkpoint ring
     /// orphans this device memory — the source of the per-reset GPU-memory leak
     /// that OOMs long-lived serves (a fresh `hipMalloc` per reset, never freed).
-    /// Every site that drops a snapshot must route through here.
+    /// Every non-retryable site that drops a snapshot must route through here.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for b in self.s_matrix_bufs {
-            let _ = gpu.hip.free(b);
-        }
-        for b in self.s_scale_bufs {
-            let _ = gpu.hip.free(b);
-        }
-        for b in self.conv_state_bufs {
-            let _ = gpu.hip.free(b);
-        }
-        for b in self.s_ef_residual_bufs {
-            let _ = gpu.hip.free(b);
+        let mut snapshot = self;
+        let _ = snapshot.free_gpu_checked(gpu);
+    }
+
+    /// Fallible snapshot teardown for reset paths that must report a failed
+    /// device free to their owner. Successful buffers are removed; every buffer
+    /// whose hipFree fails remains in this snapshot so the owner can retry the
+    /// same snapshot later.
+    pub fn free_gpu_checked(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        let mut first_error = None;
+        first_error = free_snapshot_buffers(&mut self.s_matrix_bufs, &gpu.hip, first_error);
+        first_error = free_snapshot_buffers(&mut self.s_scale_bufs, &gpu.hip, first_error);
+        first_error = free_snapshot_buffers(&mut self.conv_state_bufs, &gpu.hip, first_error);
+        first_error = free_snapshot_buffers(&mut self.s_ef_residual_bufs, &gpu.hip, first_error);
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
         }
     }
+}
+
+fn free_snapshot_buffers(
+    buffers: &mut Vec<DeviceBuffer>,
+    hip: &hip_bridge::HipRuntime,
+    first_error: Option<String>,
+) -> Option<String> {
+    retain_failed_buffers(
+        buffers,
+        |buffer| {
+            hip.free_preserving(buffer)
+                .map_err(|(buffer, error)| (buffer, error.to_string()))
+        },
+        first_error,
+    )
+}
+
+fn retain_failed_buffers<T>(
+    buffers: &mut Vec<T>,
+    mut free: impl FnMut(T) -> Result<(), (T, String)>,
+    first_error: Option<String>,
+) -> Option<String> {
+    let mut retained = Vec::with_capacity(buffers.len());
+    let mut first_error = first_error;
+    for buffer in buffers.drain(..) {
+        match free(buffer) {
+            Ok(()) => {}
+            Err((buffer, error)) => {
+                retained.push(buffer);
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    *buffers = retained;
+    first_error
 }
 
 /// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
@@ -5786,8 +5828,6 @@ pub fn seed_target_hidden_from_prompt(
     target_hidden_host: &mut Vec<f32>,
     prompt_tokens: &[u32],
 ) -> HipResult<()> {
-    // Reset target state to avoid double-prefill of the same context.
-    target.reset_state(gpu);
     // Fast path: one batched prefill populates hidden_rb + KV + dn_state in a
     // single forward, instead of N per-token forwards. On 9B MQ4 with a
     // 6.2k-token prompt this drops prompt ingest from ~51s (121 tok/s) to
@@ -5818,8 +5858,8 @@ pub fn seed_target_hidden_from_prompt(
 /// Abortable variant of `seed_target_hidden_from_prompt`. Manually
 /// chunks the prefill at [`qwen35::PREFILL_MAX_BATCH`] boundaries and
 /// calls `abort_check` between chunks. Returns `Ok(true)` if aborted
-/// (state has been fully reset — caller should NOT continue with
-/// decode), `Ok(false)` on normal completion. The chunked path matches
+/// (the central lifecycle performs cleanup), `Ok(false)` on normal
+/// completion. The chunked path matches
 /// the kernel-internal sub-batch size, so per-chunk throughput is the
 /// same as the one-shot variant; the only overhead is one
 /// `download_hidden_block` per chunk (host-side memcpy of ~5 MB).
@@ -5842,25 +5882,12 @@ pub fn seed_target_hidden_from_prompt_abortable(
     ckpt_interval: usize,
     ckpt_cap: usize,
 ) -> HipResult<bool> {
-    target.reset_state(gpu);
     target_hidden_host.clear();
-    if let Some(cks) = checkpoints.as_deref_mut() {
-        // fresh cold prefill ⇒ stale checkpoints no longer valid; free their GPU buffers
-        for (_, snap) in cks.drain(..) {
-            snap.free_gpu(gpu);
-        }
-    }
     let chunk_max = qwen35::PREFILL_MAX_BATCH;
     let mut seq_pos: usize = 0;
     while seq_pos < prompt_tokens.len() {
         if abort_check() {
-            target.reset_state(gpu);
             target_hidden_host.clear();
-            if let Some(cks) = checkpoints.as_deref_mut() {
-                for (_, snap) in cks.drain(..) {
-                    snap.free_gpu(gpu);
-                }
-            }
             return Ok(true);
         }
         let end = (seq_pos + chunk_max).min(prompt_tokens.len());
@@ -5905,8 +5932,8 @@ pub fn seed_target_hidden_from_prompt_abortable(
 /// (FullAttention KV + DeltaNet recurrent) forward exactly as if the prefix had
 /// just been prefilled, because the recurrent state is naturally at the end of
 /// the prior conversation (pure extension — no rewind). Returns `Ok(true)` if
-/// aborted mid-prefill (state left as-is; caller must full-reset & retry),
-/// `Ok(false)` on completion.
+/// aborted mid-prefill (state left as-is; the central lifecycle performs the
+/// full reset), `Ok(false)` on completion.
 #[allow(clippy::too_many_arguments)]
 pub fn seed_target_hidden_suffix_abortable(
     gpu: &mut Gpu,
@@ -6044,6 +6071,33 @@ mod tests {
             ("conv_states", &state.conv_states),
             ("s_ef_residual", &state.s_ef_residual),
         ]
+    }
+
+    #[test]
+    fn checked_free_retains_every_failed_buffer_for_retry() {
+        let mut buffers = vec![1_u8, 2, 3, 4];
+        let error = retain_failed_buffers(
+            &mut buffers,
+            |buffer| {
+                if buffer % 2 == 0 {
+                    Err((buffer, format!("hipFree failed for {buffer}")))
+                } else {
+                    Ok(())
+                }
+            },
+            None,
+        );
+
+        assert_eq!(buffers, vec![2, 4]);
+        assert_eq!(error.as_deref(), Some("hipFree failed for 2"));
+
+        let retry_error = retain_failed_buffers(
+            &mut buffers,
+            |_buffer| Ok::<(), (u8, String)>(()),
+            None,
+        );
+        assert!(retry_error.is_none());
+        assert!(buffers.is_empty(), "successful retry removes retained buffers");
     }
 
     /// CPU mirror of the GPU `softmax_temp_topp_batched_f32` nucleus phase:

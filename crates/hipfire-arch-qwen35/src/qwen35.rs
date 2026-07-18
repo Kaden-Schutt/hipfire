@@ -1010,36 +1010,47 @@ impl DeltaNetState {
     /// without allocating per chunk (which leaks since DeltaNetState has no
     /// Drop). Mirrors `ModelSlot::reset_state` in speculative.rs.
     pub fn reset(&mut self, gpu: &mut Gpu) {
+        let _ = self.reset_checked(gpu);
+    }
+
+    /// Fallible variant of [`Self::reset`] for callers that must report GPU
+    /// reset failures instead of continuing with partially reset state.
+    pub fn reset_checked(&mut self, gpu: &mut Gpu) -> HipResult<()> {
         match gpu.active_stream.as_ref() {
             Some(stream) => {
                 for s in &self.s_matrices {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
                 }
                 for s in &self.s_scales {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
                 }
                 for s in &self.conv_states {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
                 }
                 for s in &self.s_ef_residual {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
                 }
             }
             None => {
                 for s in &self.s_matrices {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
                 }
                 for s in &self.s_scales {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
                 }
                 for s in &self.conv_states {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
                 }
                 for s in &self.s_ef_residual {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
                 }
             }
         }
+        // The memset_async path only reports launch errors here. Synchronize
+        // before declaring reset complete so queued clears have executed and
+        // asynchronous device errors are surfaced to the caller.
+        gpu.hip.device_synchronize()?;
+        Ok(())
     }
 
     /// Multi-GPU companion to `new_with_quant`. Each LA-layer's state is

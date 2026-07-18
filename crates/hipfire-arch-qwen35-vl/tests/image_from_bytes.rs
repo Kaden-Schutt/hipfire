@@ -84,6 +84,30 @@ fn output_matches_load_and_preprocess_for_same_input() {
 }
 
 #[test]
+fn distinct_images_are_isolated_between_turns() {
+    // Vision preprocessing is request-local. Process A, then B, then A again
+    // to catch accidental reuse of a mutable image buffer or cached pixels.
+    let image_a = solid_png_bytes(10, 100, 200, 32, 32);
+    let image_b = solid_png_bytes(220, 40, 15, 32, 32);
+    let (a_first, ah, aw) = load_and_preprocess_from_bytes(&image_a, 16, 2).unwrap();
+    let (b, bh, bw) = load_and_preprocess_from_bytes(&image_b, 16, 2).unwrap();
+    let (a_second, ah2, aw2) = load_and_preprocess_from_bytes(&image_a, 16, 2).unwrap();
+
+    assert_eq!((ah, aw), (bh, bw));
+    assert_eq!((ah, aw), (ah2, aw2));
+    assert_ne!(
+        a_first,
+        b,
+        "different images must not share preprocessed pixels"
+    );
+    assert_eq!(
+        a_first,
+        a_second,
+        "image A changed after image B was processed"
+    );
+}
+
+#[test]
 fn channel_order_preserved_from_bytes() {
     // Use distinct values per channel so the test actually verifies
     // channel ordering — pure red (255, 0, 0) is identical under RGB

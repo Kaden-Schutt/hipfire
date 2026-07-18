@@ -952,13 +952,24 @@ impl Speculator for DflashSpeculator {
     }
 
     fn reset(&mut self, gpu: &mut Gpu) {
+        let _ = self.reset_checked(gpu);
+    }
+
+    fn reset_checked(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Drafter-local reset: invalidate cached suffix projections and free the
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
         // daemon's job — it owns the bundle).
         self.df.draft_scratch.reset_upload_tracking();
-        for (_, snap) in self.checkpoints.drain(..) {
-            snap.free_gpu(gpu);
+        let mut first_error = None;
+        let mut remaining = Vec::new();
+        for (position, mut snap) in self.checkpoints.drain(..) {
+            if let Err(error) = snap.free_gpu_checked(gpu) {
+                first_error.get_or_insert(error);
+                remaining.push((position, snap));
+            }
         }
+        self.checkpoints = remaining;
+        first_error.map_or(Ok(()), Err)
     }
 
     fn block_size(&self) -> usize {
@@ -992,8 +1003,19 @@ impl Speculator for DflashSpeculator {
                 .1
                 .restore_to(&mut slot.dn_state, gpu)
                 .map_err(|e| format!("DflashSpeculator: checkpoint restore at {position}: {e}"))?;
-            for (_, snap) in self.checkpoints.drain(idx + 1..) {
-                snap.free_gpu(gpu);
+            let mut remaining = Vec::new();
+            let mut first_error = None;
+            for (checkpoint_position, mut snap) in self.checkpoints.drain(idx + 1..) {
+                if let Err(error) = snap.free_gpu_checked(gpu) {
+                    first_error.get_or_insert(error);
+                    remaining.push((checkpoint_position, snap));
+                }
+            }
+            self.checkpoints.extend(remaining);
+            if let Some(error) = first_error {
+                return Err(format!(
+                    "DflashSpeculator: checkpoint release after {position}: {error}"
+                ));
             }
         }
         Ok(position)

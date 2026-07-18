@@ -913,13 +913,6 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         }
     }
 
-    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
-        // Exact existing helper (daemon.rs:4105): handles both the pp>1
-        // multi-GPU DeltaNet memset path and the single-GPU path; also
-        // resets kv_cache.compact_offset. No logic duplicated here.
-        reset_qwen35_recurrent(self.m, gpu);
-    }
-
     fn as_spec_target(&mut self) -> Option<&mut dyn hipfire_runtime::spec::SpecTarget> {
         // TODO(Task 1.4): wire qwen35 SpecTarget when ar_generate needs it.
         //
@@ -1085,18 +1078,6 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         );
     }
 
-    fn abort_zero_recurrent(&mut self, ctx: ForwardCtx<'_>) {
-        let ForwardCtx::Single(gpu) = ctx else {
-            unreachable!("single-GPU dispatch received Mesh ctx")
-        };
-        let m = &mut *self.m;
-        reset_qwen35_recurrent(m, gpu);
-        // Co-resident Llama KV reset (arm does the same defensive no-op).
-        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-            b.kv.compact_offset = 0;
-        }
-    }
-
     fn sample(
         &mut self,
         ctx: ForwardCtx<'_>,
@@ -1171,13 +1152,6 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
 
     fn prefill_max_batch(&self) -> usize {
         qwen35::PREFILL_MAX_BATCH
-    }
-
-    fn free_prefill_checkpoints(&mut self, ctx: ForwardCtx<'_>) {
-        let ForwardCtx::Single(gpu) = ctx else {
-            unreachable!("single-GPU dispatch received Mesh ctx")
-        };
-        free_checkpoints(&mut self.m.session.prefill_checkpoints, gpu);
     }
 
     fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
@@ -1289,17 +1263,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
             supports_grammar: false,
             supports_vision: false,
         }
-    }
-
-    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
-        // Mirrors generate_qwen2's overflow-reset: Qwen2State cursor + daemon
-        // bookkeeping. No GPU buffers to free (KV is overwritten on re-prefill).
-        let _ = gpu;
-        if let Some(ModelState::Qwen2(b)) = self.m.state.as_mut() {
-            b.state.reset();
-        }
-        self.m.session.seq_pos = 0;
-        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -1453,15 +1416,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
         }
     }
 
-    fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
-        // Llama has no DeltaNet recurrent state; a fresh context resets the KV
-        // compaction offset (seq_pos/conversation are cleared by the caller via
-        // model_reset_context; KV contents are overwritten by re-prefill).
-        if let Some(ModelState::Llama(b)) = self.m.state.as_mut() {
-            b.kv.compact_offset = 0;
-        }
-    }
-
     fn prefill_forward(
         &mut self,
         ctx: ForwardCtx<'_>,
@@ -1574,13 +1528,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
         llama::PREFILL_MAX_BATCH
     }
 
-    fn free_prefill_checkpoints(&mut self, ctx: ForwardCtx<'_>) {
-        let ForwardCtx::Single(gpu) = ctx else {
-            unreachable!("single-GPU dispatch received Mesh ctx")
-        };
-        free_checkpoints(&mut self.m.session.prefill_checkpoints, gpu);
-    }
-
     fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
         if self.m.persist.decoded_vocab.is_none() {
             let v: Vec<String> = {
@@ -1658,15 +1605,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
             supports_grammar: false,
             supports_vision: false,
         }
-    }
-
-    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
-        let _ = gpu;
-        if let Some(b) = self.m.minimax_mut() {
-            b.state.reset();
-        }
-        self.m.session.seq_pos = 0;
-        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -1811,6 +1749,10 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
 struct Cohere2MoeDispatch<'m> {
     m: &'m mut LoadedModel,
     tools: Option<Vec<serde_json::Value>>,
+    /// True only for a full cold prefill. The legacy Cohere path uses the
+    /// numerically-parity-tested batched prefill for this case; suffix reuse
+    /// must not infer cold-start status from `seq_pos`.
+    cold_start: bool,
 }
 
 #[allow(dead_code)]
@@ -1848,14 +1790,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
         }
     }
 
-    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
-        if let Some(b) = self.m.cohere2moe_mut() {
-            let _ = b.state.reset(gpu);
-        }
-        self.m.session.seq_pos = 0;
-        self.m.session.conversation_tokens.clear();
-    }
-
     fn prefill_forward(
         &mut self,
         ctx: ForwardCtx<'_>,
@@ -1869,7 +1803,19 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
             .m
             .cohere2moe_mut()
             .ok_or("prefill_forward: no cohere2moe bundle")?;
-        let batched = cohere2moe::forward::forward_batch_supported(&b.weights);
+        let force_per_token = std::env::var("HIPFIRE_COHERE_PREFILL")
+            .ok()
+            .as_deref()
+            == Some("per_token");
+        let batched = self.cold_start
+            && !force_per_token
+            && cohere2moe::forward::forward_batch_supported(&b.weights);
+        eprintln!(
+            "[cohere-prefill] mode={} cold_start={} force_per_token={}",
+            if batched { "batched" } else { "per_token" },
+            self.cold_start,
+            force_per_token,
+        );
         let mut pos = seq_pos;
         if batched {
             // Chunk at 256 to match the legacy generate_cohere2moe prefill (`i+256`);
@@ -2052,14 +1998,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
         }
     }
 
-    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
-        if let Some(b) = self.m.lfm2moe_mut() {
-            let _ = b.state.reset(gpu);
-        }
-        self.m.session.seq_pos = 0;
-        self.m.session.conversation_tokens.clear();
-    }
-
     fn prefill_forward(
         &mut self,
         ctx: ForwardCtx<'_>,
@@ -2238,29 +2176,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
             supports_grammar: true,
             supports_vision: false,
         }
-    }
-
-    fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
-        // EP reaches its own devices via `m.parallel` (Ep variant), NOT the single-GPU
-        // param (which is inert here). Mirror ep_serve_ds4's per-rank cross-conversation
-        // reset (daemon.rs:4522): `reset()` rewinds n_tokens; `zero_decode_caches`
-        // clears the position-indexed SWA-ring / compressed+full KV / indexer
-        // scratch; `invalidate_graph_state` drops the captured HIP graph. Zeroing
-        // the decode caches is load-bearing — `reset()` alone bleeds the prior
-        // turn's residue into the next conversation.
-        if let ModelParallel::Ep(EpState { gpus, inner }) = &mut self.m.parallel {
-            if let EpArch::Ds4 { state, .. } = inner {
-                for (rank, s) in state.iter_mut().enumerate() {
-                    let g = &mut gpus.devices[rank];
-                    let _ = g.bind_thread();
-                    s.reset();
-                    s.zero_decode_caches(g);
-                    g.invalidate_graph_state();
-                }
-            }
-        }
-        self.m.session.seq_pos = 0;
-        self.m.session.conversation_tokens.clear();
     }
 
     fn prefill_forward(
@@ -2690,25 +2605,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
         }
     }
 
-    fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
-        // Fresh-context reset: per-rank state.reset() (mirrors single-GPU
-        // MinimaxDispatch::reset, looped over ranks). Unlike Deepseek4EpDispatch::reset
-        // this needs NO zero_decode_caches / invalidate_graph_state — MiniMax uses
-        // standard attention (KV overwritten by re-prefill) with no position-indexed
-        // decode caches (matches the deleted ep_serve_minimax's reset). The per-TURN
-        // LCP prefix rewind is the arm's preamble, not this hook (ar_generate doesn't
-        // call reset).
-        if let ModelParallel::Ep(EpState { inner, .. }) = &mut self.m.parallel {
-            if let EpArch::Minimax { state, .. } = inner {
-                for s in state.iter_mut() {
-                    s.reset();
-                }
-            }
-        }
-        self.m.session.seq_pos = 0;
-        self.m.session.conversation_tokens.clear();
-    }
-
     fn prefill_forward(
         &mut self,
         ctx: ForwardCtx<'_>,
@@ -2925,13 +2821,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for DenseDispatch<'_> {
         }
     }
 
-    fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
-        // Dense is stateless per request (KV overwritten by re-prefill each turn) —
-        // a fresh context just rewinds the driver cursor + token history.
-        self.m.session.seq_pos = 0;
-        self.m.session.conversation_tokens.clear();
-    }
-
     fn prefill_forward(
         &mut self,
         ctx: ForwardCtx<'_>,
@@ -3014,19 +2903,6 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for DenseDispatch<'_> {
         // One chunk: DenseServed::prefill batches internally (≤256) at pos 0, so the
         // whole suffix goes in a single prefill_forward call (seq_pos = LCP start).
         usize::MAX
-    }
-}
-
-/// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
-/// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
-/// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
-/// Routes every drop through `DeltaNetSnapshot::free_gpu`.
-fn free_checkpoints(
-    cks: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    gpu: &mut rdna_compute::Gpu,
-) {
-    for (_, snap) in cks.drain(..) {
-        snap.free_gpu(gpu);
     }
 }
 
@@ -3246,7 +3122,7 @@ fn main() {
     });
     let mut stdout = std::io::stdout();
 
-    while let Ok(daemon_msg) = msg_rx.recv() {
+    'daemon: while let Ok(daemon_msg) = msg_rx.recv() {
         let msg = match daemon_msg {
             DaemonMsg::Regular(m) => m,
             DaemonMsg::ParseError(e) => {
@@ -3912,7 +3788,7 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
-                        let cache_capable = matches!(m.meta.arch_id, 5 | 6 | 9 | 10 | 12);
+                        let cache_capable = reset_domain_cache_capable(m.meta.arch_id);
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#,
@@ -4428,58 +4304,6 @@ fn main() {
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
                 } else if has_image && has_vl {
-                    // DEFENSIVE: VL is single-image, single-turn only. The
-                    // CLI rejects images in non-last turns, but a raw
-                    // JSONL client could send a second image on turn 2+.
-                    // If seq_pos > 0 here, a previous conversation's KV
-                    // entries are live — running vision_forward and
-                    // splicing visual tokens into that context would
-                    // produce garbage. Force a reset so VL always starts
-                    // from a clean KV state.
-                    //
-                    // Must mirror the "reset" command handler (line ~2098).
-                    // VL only runs on qwen35-vl (arch_id 5/8), so
-                    // qwen2_state, deepseek4_state, and llama_kv are
-                    // None — but clear them anyway for defense-in-depth
-                    // in case a future arch adds VL support.
-                    if m.session.seq_pos > 0 {
-                        eprintln!(
-                            "[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation",
-                            m.session.seq_pos
-                        );
-                        m.session.seq_pos = 0;
-                        m.session.conversation_tokens.clear();
-                        free_checkpoints(&mut m.session.prefill_checkpoints, &mut gpu);
-                        free_checkpoints(&mut m.session.dflash_checkpoints, &mut gpu);
-                        // The DFlash checkpoint ring now lives inside the
-                        // speculator (m.session.dflash_checkpoints is vestigial/empty),
-                        // so free THAT ring on conversation reset too — else its
-                        // GPU snapshots persist until the next prefill-miss.
-                        if let Some(s) = m.speculator.as_mut() {
-                            s.reset(&mut gpu);
-                        }
-                        // qwen35(-vl) recurrent state lives in the bundle
-                        // (ModelState::Qwen35), not the always-None
-                        // m.dn_state/m.kv_cache direct fields.
-                        reset_qwen35_recurrent(m, &mut gpu);
-                        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-                            b.kv.compact_offset = 0;
-                        }
-                        // dots-ocr (arch_id=8) state is in ModelState::DotsOcr.
-                        if let Some(b) = m.dots_ocr_mut() {
-                            b.state.reset();
-                        }
-                        // Plain qwen2 (arch_id=7) state is in ModelState::Qwen2.
-                        if let Some(b) = m.qwen2_mut() {
-                            b.state.reset();
-                        }
-                        if let Some(b) = m.deepseek4_mut() {
-                            b.state.reset();
-                        }
-                        if let Some(ref mut ad) = m.session.kv_adaptive {
-                            ad.reset();
-                        }
-                    }
                     if image_base64.is_some() && image.is_some() {
                         eprintln!(
                             "[daemon/vl] both image and image_base64 provided — using image_base64"
@@ -4524,10 +4348,40 @@ fn main() {
                         repeat_window,
                         max_think_tokens: vl_max_think_tokens,
                     };
-                    if is_dots_ocr {
-                        generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params);
+                    let generation_result = if is_dots_ocr {
+                        generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params)
                     } else {
-                        generate_vl(m, &mut gpu, &mut stdout, &params);
+                        generate_vl(m, &mut gpu, &mut stdout, &params)
+                    };
+                    match generation_result {
+                        GenerateResult::Complete => {}
+                        GenerateResult::Deferred(terminal) => {
+                            if let Err(error) = reset_then_emit(m, &mut gpu, &mut stdout, terminal) {
+                                poison_model_slot(
+                                    &mut model,
+                                    &mut pflash_state,
+                                    &mut pflash_drafter_gpu,
+                                    &mut pflash_cfg,
+                                    &mut gpu,
+                                );
+                                emit_reset_error(&mut stdout, id, &error);
+                                break 'daemon;
+                            }
+                        }
+                        GenerateResult::ResetFailed { id, message } => {
+                            poison_model_slot(
+                                &mut model,
+                                &mut pflash_state,
+                                &mut pflash_drafter_gpu,
+                                &mut pflash_cfg,
+                                &mut gpu,
+                            );
+                            emit_reset_error_message(&mut stdout, &id, &message);
+                            break 'daemon;
+                        }
+                        GenerateResult::PpCompletion { .. } => {
+                            unreachable!("PP completion must be consumed by its outer wrapper")
+                        }
                     }
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
@@ -4629,7 +4483,7 @@ fn main() {
                     ]
                     .iter()
                     .any(|k| msg.get(*k).is_some());
-                    generate(
+                    let generation_result = generate(
                         m,
                         &mut gpu,
                         pflash_drafter_gpu.as_mut(),
@@ -4659,20 +4513,71 @@ fn main() {
                         think_mode,
                         &stop_seqs, // hunt3 M-F
                     );
+                    match generation_result {
+                        GenerateResult::Complete => {}
+                        GenerateResult::Deferred(terminal) => {
+                            if let Some(current) = model.as_mut() {
+                                if let Err(error) = reset_then_emit(
+                                    current,
+                                    &mut gpu,
+                                    &mut stdout,
+                                    terminal,
+                                ) {
+                                    poison_model_slot(
+                                        &mut model,
+                                        &mut pflash_state,
+                                        &mut pflash_drafter_gpu,
+                                        &mut pflash_cfg,
+                                        &mut gpu,
+                                    );
+                                    emit_reset_error(&mut stdout, id, &error);
+                                    break 'daemon;
+                                }
+                            }
+                        }
+                        GenerateResult::ResetFailed { id, message } => {
+                            poison_model_slot(
+                                &mut model,
+                                &mut pflash_state,
+                                &mut pflash_drafter_gpu,
+                                &mut pflash_cfg,
+                                &mut gpu,
+                            );
+                            emit_reset_error_message(&mut stdout, &id, &message);
+                            break 'daemon;
+                        }
+                        GenerateResult::PpCompletion { .. } => {
+                            unreachable!("PP completion must be consumed by its outer wrapper")
+                        }
+                    }
                 }
             }
 
             "reset" => {
                 // Reset conversation state without unloading the model.
-                if let Some(ref mut m) = model {
+                if model.is_some() {
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                        eprintln!(
-                            "[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})",
-                            m.session.conversation_tokens.len()
-                        );
+                        eprintln!("[qwen-cache RESET] daemon received reset");
                     }
-                    model_reset_context(m, &mut gpu);
-                    let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
+                    let reset_result = model
+                        .as_mut()
+                        .map(|m| model_reset_context(m, &mut gpu));
+                    match reset_result {
+                        Some(Ok(())) | None => {
+                            let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
+                        }
+                        Some(Err(error)) => {
+                            poison_model_slot(
+                                &mut model,
+                                &mut pflash_state,
+                                &mut pflash_drafter_gpu,
+                                &mut pflash_cfg,
+                                &mut gpu,
+                            );
+                            emit_reset_error(&mut stdout, "", &error);
+                            break 'daemon;
+                        }
+                    }
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
                 }
@@ -4837,25 +4742,18 @@ fn main() {
                 let synthetic: Vec<u32> = (0..n as u32).map(|i| 10 + (i % 1000)).collect();
 
                 // Reset state BEFORE timing so we're measuring cold prefill, not
-                // prefill-on-top-of-prior-state. qwen35 recurrent state lives in
-                // the bundle (ModelState::Qwen35), not the always-None m.dn_state.
-                m.session.seq_pos = 0;
-                m.session.conversation_tokens.clear();
-                reset_qwen35_recurrent(m, &mut gpu);
-                // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
-                // and the per-step scratch share `Qwen2State`. Reset its position
-                // cursor here so bench_prefill measures cold prefill. The live
-                // state is in the ModelState::Qwen2 bundle; dots-ocr (arch_id=8)
-                // is in ModelState::DotsOcr — rewind both, else this measures warm
-                // prefill.
-                if let Some(b) = m.dots_ocr_mut() {
-                    b.state.reset();
-                }
-                if let Some(b) = m.qwen2_mut() {
-                    b.state.reset();
-                }
-                if let Some(b) = m.cohere2moe_mut() {
-                    let _ = b.state.reset(&mut gpu);
+                // prefill-on-top-of-prior-state. The loader owns this total reset.
+                if let Err(error) = model_reset_context(m, &mut gpu) {
+                    poison_model_slot(
+                        &mut model,
+                        &mut pflash_state,
+                        &mut pflash_drafter_gpu,
+                        &mut pflash_cfg,
+                        &mut gpu,
+                    );
+                    let bench_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    emit_reset_error(&mut stdout, bench_id, &error);
+                    break 'daemon;
                 }
 
                 // Flush any residual GPU work so it doesn't bleed into the
@@ -5008,22 +4906,19 @@ fn main() {
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
 
-                // Reset state AFTER measurement — we've written N KV slots and a
-                // DeltaNet state that the next real request must not inherit.
-                // qwen35 recurrent state lives in the bundle (ModelState::Qwen35),
-                // not the always-None m.dn_state.
-                m.session.seq_pos = 0;
-                m.session.conversation_tokens.clear();
-                reset_qwen35_recurrent(m, &mut gpu);
-                // LFM2.5-MoE state carries its own KV + conv-state cache;
-                // reset cursors (takes gpu) so the next request starts cold.
-                if let Some(b) = m.lfm2moe_mut() {
-                    let _ = b.state.reset(&mut gpu);
-                }
-                // MiniMax-M2 (arch_id=10): KV cache + scratch share MiniMaxState;
-                // reset its cursor (no gpu) for a cold prefill on the next request.
-                if let Some(b) = m.minimax_mut() {
-                    b.state.reset();
+                // Reset state AFTER measurement — the synthetic request must not
+                // leak into the next real request.
+                if let Err(error) = model_reset_context(m, &mut gpu) {
+                    poison_model_slot(
+                        &mut model,
+                        &mut pflash_state,
+                        &mut pflash_drafter_gpu,
+                        &mut pflash_cfg,
+                        &mut gpu,
+                    );
+                    let bench_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    emit_reset_error(&mut stdout, bench_id, &error);
+                    break 'daemon;
                 }
 
                 if run_ok {
@@ -5167,6 +5062,7 @@ fn dense_model_mut(m: &mut LoadedModel) -> Option<&mut dyn DenseServed> {
 #[allow(clippy::too_many_arguments)]
 fn dense_serve_via_ar_generate(
     m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     system_prompt: Option<&str>,
@@ -5179,7 +5075,7 @@ fn dense_serve_via_ar_generate(
     min_p: Option<f32>,
     max_tokens: usize,
     stop: &[String],
-) {
+) -> GenerateResult {
     let hist: &[hipfire_runtime::prompt_frame::Message] = messages_history.unwrap_or(&[]);
     let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     let plan = {
@@ -5214,7 +5110,16 @@ fn dense_serve_via_ar_generate(
             id, rendered_n, max_tokens, m.meta.physical_cap
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
+    }
+    // A dense TP/PP cache miss is still a total context discard. The physical
+    // KV buffers are intentionally not zeroed by reset_context; the next cold
+    // prefill overwrites them from position zero, while the parallel owner
+    // still needs its request/session reset routed through the loader façade.
+    if !plan.cache_hit {
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        }
     }
     if start_pos == 0 {
         m.session.conversation_tokens.clear();
@@ -5225,7 +5130,7 @@ fn dense_serve_via_ar_generate(
     let prefill_len = new_tokens.len();
     let t0 = std::time::Instant::now();
     let mut disp = DenseDispatch { m };
-    ar_generate(
+    return ar_generate(
         &mut disp,
         ForwardCtx::Mesh,
         stdout,
@@ -5263,6 +5168,7 @@ fn dense_serve_via_ar_generate(
 
 fn generate_ep(
     m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -5274,7 +5180,7 @@ fn generate_ep(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
     sampling: EpSampling,
-) {
+) -> GenerateResult {
     // ── Canonical multi-turn render via the arch's trained chat_template
     // (ds4/minimax). Mirrors generate_minimax: `messages_history` (the full
     // conversation, live user last) → render_messages with `tools` threaded;
@@ -5353,7 +5259,7 @@ fn generate_ep(
                         format!("{e}").replace('"', "'")
                     );
                     let _ = stdout.flush();
-                    return;
+                    return GenerateResult::Complete;
                 }
             }
         } else {
@@ -5386,7 +5292,7 @@ fn generate_ep(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
     // Both ds4 and minimax EP eos are unified into m.meta.eos_tok at load time.
     let eos_tok = m.meta.eos_tok;
@@ -5400,8 +5306,9 @@ fn generate_ep(
             // capital/code, emulated EP-2). eos_tok is now the ds4 arm's; minimax
             // reads m.meta.eos_tok via MinimaxEpDispatch::eos_token.
             let _ = eos_tok;
-            ep_serve_minimax_via_ar_generate(
+            return ep_serve_minimax_via_ar_generate(
                 m,
+                gpu,
                 stdout,
                 id,
                 &prompt_ids,
@@ -5418,8 +5325,10 @@ fn generate_ep(
             // then cold-prefill the full DSML prompt through ar_generate. Validated
             // pre-flip by the dual-run token-parity (ep_serve_ds4 == ar_generate+EP on
             // capital/reasoning/code/tool-call, emulated EP-2).
-            ep_reset_ds4_state(m);
-            ep_serve_ds4_via_ar_generate(
+            if let Err(error) = model_reset_context(m, gpu) {
+                return reset_failed(id, error);
+            }
+            return ep_serve_ds4_via_ar_generate(
                 m,
                 stdout,
                 id,
@@ -5432,30 +5341,6 @@ fn generate_ep(
             );
         }
     }
-}
-
-/// Per-rank ds4 EP cross-conversation reset — `bind_thread → reset →
-/// zero_decode_caches → invalidate_graph_state` on each rank's own device, then
-/// the generic `seq_pos=0 / conversation_tokens.clear()`. Mirrors ep_serve_ds4's
-/// start-of-turn reset (which it does internally). No single-GPU `gpu` needed: EP
-/// reaches its devices via `ModelParallel::Ep(EpState { gpus, .. })`. Used between
-/// the inc-4 dual-run arms; the inc-5 flip calls it per turn before
-/// `ep_serve_ds4_via_ar_generate` (EP has no LCP → every turn re-prefills the full
-/// prompt from a clean state).
-fn ep_reset_ds4_state(m: &mut LoadedModel) {
-    if let ModelParallel::Ep(EpState { gpus, inner }) = &mut m.parallel {
-        if let EpArch::Ds4 { state, .. } = inner {
-            for (rank, s) in state.iter_mut().enumerate() {
-                let g = &mut gpus.devices[rank];
-                let _ = g.bind_thread();
-                s.reset();
-                s.zero_decode_caches(g);
-                g.invalidate_graph_state();
-            }
-        }
-    }
-    m.session.seq_pos = 0;
-    m.session.conversation_tokens.clear();
 }
 
 /// Drive ds4 EP AR decode through the unified `ar_generate` driver (Axis B): build
@@ -5476,7 +5361,7 @@ fn ep_serve_ds4_via_ar_generate(
     tools: Option<&[serde_json::Value]>,
     stop: &[String],
     sampling: EpSampling,
-) {
+) -> GenerateResult {
     // Capacity guard (was ep_serve_ds4's O2b-2 guard, lost in the flip): EP
     // cold-prefills the FULL prompt every turn (no LCP), so the absolute KV span is
     // prompt_n + max_tokens. ar_generate has NO pre-prefill physical_cap check on the
@@ -5493,7 +5378,7 @@ fn ep_serve_ds4_via_ar_generate(
             id, prompt_n, max_tokens, m.meta.physical_cap
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
     let mut disp = Deepseek4EpDispatch {
         m,
@@ -5533,7 +5418,7 @@ fn ep_serve_ds4_via_ar_generate(
         None,                // pflash_alpha
         std::time::Instant::now(),
         None, // tape (dual-run scaffolding removed at the flip)
-    );
+    )
 }
 
 /// Drive minimax-EP AR decode through the unified `ar_generate` driver. Mirrors the
@@ -5546,6 +5431,7 @@ fn ep_serve_ds4_via_ar_generate(
 #[allow(clippy::too_many_arguments)]
 fn ep_serve_minimax_via_ar_generate(
     m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt_ids: &[u32],
@@ -5553,7 +5439,7 @@ fn ep_serve_minimax_via_ar_generate(
     primed_think: bool,
     stop: &[String],
     sampling: EpSampling,
-) {
+) -> GenerateResult {
     let prompt_n = prompt_ids.len();
     // Capacity guard (mirror ep_serve_minimax): absolute KV span is prompt_n +
     // max_tokens; overrunning drives forward_ep past the per-rank KV buffer.
@@ -5564,7 +5450,7 @@ fn ep_serve_minimax_via_ar_generate(
             id, prompt_n, max_tokens, m.meta.physical_cap
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
     // LCP partial reuse (mirror generate_minimax + ep_serve_minimax's per-rank rewind):
     // rewind every rank's KV cursor to the common prefix, prefill only the suffix.
@@ -5590,6 +5476,11 @@ fn ep_serve_minimax_via_ar_generate(
         {
             for s in state.iter_mut() {
                 s.n_tokens = prefill_from;
+            }
+        }
+        if !cache_hit {
+            if let Err(error) = model_reset_context(m, gpu) {
+                return reset_failed(id, error);
             }
         }
         m.session.seq_pos = prefill_from;
@@ -5640,7 +5531,7 @@ fn ep_serve_minimax_via_ar_generate(
         None, // pflash_alpha
         std::time::Instant::now(),
         None, // tape (dual-run scaffolding removed at the flip)
-    );
+    )
 }
 
 /// Outcome of the LCP prompt-cache decision (see [`plan_prompt_cache`]).
@@ -5779,150 +5670,226 @@ fn plan_prompt_cache(
     }
 }
 
-fn qwen35_recurrent_groups<'a, T>(
-    s_matrices: &'a [T],
-    s_scales: &'a [T],
-    conv_states: &'a [T],
-    s_ef_residual: &'a [T],
-) -> [&'a [T]; 4] {
-    [s_matrices, s_scales, conv_states, s_ef_residual]
+/// Fallible façade for the loader-owned total reset authority.  The daemon
+/// deliberately does not know how session, speculative, architecture, or
+/// mesh state is laid out; it only decides when a request has crossed a
+/// total-discard boundary.
+fn model_reset_context(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), hipfire_loader::ResetError> {
+    let result = m.reset_context(gpu);
+    if let Err(error) = &result {
+        eprintln!(
+            "[daemon] reset failed; gpu_fatal={} — model slot must not be reused",
+            error.is_gpu_fatal()
+        );
+    }
+    result
 }
 
-fn reset_qwen35_pipeline_recurrent(
-    dn: &hipfire_arch_qwen35::qwen35::DeltaNetState,
-    dn_la_to_device: &[u8],
-    gpus: &mut hipfire_hardware::Gpus,
-) {
-    for buffers in qwen35_recurrent_groups(
-        &dn.s_matrices,
-        &dn.s_scales,
-        &dn.conv_states,
-        &dn.s_ef_residual,
-    ) {
-        for (i, s) in buffers.iter().enumerate() {
-            let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-            let _ = g.bind_thread();
-            match g.active_stream.as_ref() {
-                Some(stream) => {
-                    let _ = g.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
-                }
-                None => {
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-        }
+/// Architectures whose request reset may preserve an LCP prefix cache. The
+/// cache is persistent model state; the total reset still clears the active
+/// request and all speculative mirrors before the next turn.
+fn reset_domain_cache_capable(arch_id: u32) -> bool {
+    matches!(arch_id, 5 | 6 | 9 | 10 | 12)
+}
+
+/// A Qwen prompt-cache miss is evaluated as a fresh context for capacity
+/// purposes. The production caller performs the GPU reset before the guard;
+/// this pure mirror keeps the zero-capacity regression explicit in CPU tests.
+fn qwen_cache_guard_position(seq_pos: usize, cold_reset_required: bool) -> usize {
+    if cold_reset_required {
+        0
+    } else {
+        seq_pos
     }
 }
 
-fn reset_qwen35_recurrent_parts(
-    state: &mut Option<ModelState>,
-    parallel: &mut ModelParallel,
+/// VL images are request-local. A second image-bearing turn must cold-reset
+/// before vision tokens are spliced into the text context, regardless of the
+/// architecture's cache capability.
+fn vl_request_requires_cold_reset(
+    has_image: bool,
+    seq_pos: usize,
+    prior_image_state: Option<u64>,
+) -> bool {
+    has_image && (seq_pos > 0 || prior_image_state.is_some())
+}
+
+/// Stable, content-derived state for a preprocessed VL image. A compact FNV-1a
+/// digest is sufficient here: this is a request-transition sentinel, not a
+/// cryptographic identity or a cache key.
+fn vl_image_state(pixels: &[f32], height: usize, width: usize) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in (height as u64)
+        .to_le_bytes()
+        .into_iter()
+        .chain((width as u64).to_le_bytes())
+        .chain(pixels.iter().flat_map(|value| value.to_bits().to_le_bytes()))
+    {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Apply the CPU-visible model-turn transition before the fallible GPU reset.
+/// Keeping this seam separate makes the image-turn isolation contract testable
+/// without a vision model or a GPU, while `model_reset_context` remains the
+/// authority for device and architecture state.
+fn prepare_vl_request_state(
+    session: &mut hipfire_loader::SessionState,
+    image_state: u64,
+) -> bool {
+    if vl_request_requires_cold_reset(true, session.seq_pos, session.vl_image_state) {
+        session.reset_cpu();
+        session.vl_image_state = Some(image_state);
+        true
+    } else {
+        session.vl_image_state = Some(image_state);
+        false
+    }
+}
+
+fn reset_error_json(id: &str, error: &impl std::fmt::Debug) -> String {
+    let message = format!("context reset failed: {error:?}");
+    reset_error_json_message(id, &message)
+}
+
+fn reset_error_json_message(id: &str, message: &str) -> String {
+    format!(
+        r#"{{"type":"error","id":{},"message":{}}}"#,
+        serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string()),
+        serde_json::to_string(message)
+            .unwrap_or_else(|_| "\"context reset failed\"".to_string())
+    )
+}
+
+fn emit_reset_error(stdout: &mut std::io::Stdout, id: &str, error: &impl std::fmt::Debug) {
+    let _ = writeln!(stdout, "{}", reset_error_json(id, error));
+    let _ = stdout.flush();
+}
+
+fn emit_reset_error_message(stdout: &mut std::io::Stdout, id: &str, message: &str) {
+    let _ = writeln!(stdout, "{}", reset_error_json_message(id, message));
+    let _ = stdout.flush();
+}
+
+fn deepseek4_abort_json(id: &str, generated: usize) -> (String, String) {
+    (
+        serde_json::json!({
+            "type": "aborted",
+            "id": id,
+            "reason": "client_cancelled",
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "done",
+            "id": id,
+            "finish_reason": "aborted",
+            "prompt_tokens": 0,
+            "completion_tokens": generated,
+        })
+        .to_string(),
+    )
+}
+
+fn poison_model_slot(
+    model: &mut Option<LoadedModel>,
+    pflash_state: &mut Option<hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_drafter_gpu: &mut Option<rdna_compute::Gpu>,
+    pflash_cfg: &mut Option<hipfire_arch_qwen35::pflash::PflashConfig>,
     gpu: &mut rdna_compute::Gpu,
 ) {
-    if parallel.is_pipelined() {
-        if let (Some(ModelState::Qwen35(b)), ModelParallel::Pp(PipelineImpl::ArchResident(gpus))) =
-            (state.as_ref(), parallel)
-        {
-            if let Some(pl) = b.pipeline.as_ref() {
-                reset_qwen35_pipeline_recurrent(&b.dn_state, &pl.dn_la_to_device, gpus);
-            }
+    // PFlash owns sibling-device allocations and must be torn down first.
+    if let Some(mut pf) = pflash_state.take() {
+        if let Some(mut dg) = pflash_drafter_gpu.take() {
+            dg.bind_thread_or_warn();
+            pf.unload_drafter(&mut dg);
+            gpu.bind_thread_or_warn();
+        } else {
+            pf.unload_drafter(gpu);
         }
-    } else if let Some(ModelState::Qwen35(b)) = state.as_mut() {
-        b.dn_state.reset(gpu);
     }
-    if let Some(ModelState::Qwen35(b)) = state.as_mut() {
-        b.kv_cache.compact_offset = 0;
+    *pflash_cfg = None;
+    if let Some(old) = model.take() {
+        hipfire_loader::unload_model(old, gpu);
     }
 }
 
-/// Zero qwen3.5 (arch 5/6) recurrent DeltaNet + KV state IN PLACE for a fresh
-/// turn. The state lives in the bundle (ModelState::Qwen35), NOT the always-None
-/// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
-/// no double-free). Pipeline buffers remain on their owning devices; the
-/// single-device path delegates to DeltaNetState's canonical reset.
-fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
-    reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeferredTerminal {
+    Aborted { id: String, generated: usize },
+    Error { id: String, message: String },
 }
 
-/// Full conversation-state reset: clears CPU cursor + token history, frees GPU
-/// checkpoint rings, resets the speculator ring, zeros per-arch recurrent /
-/// KV state, and rewinds the adaptive-KV controller. This is the single
-/// canonical site for "start a fresh conversation without unloading the model"
-/// semantics — mirrors the "reset" command handler (lines ~2406-2491). All
-/// per-arch arms are no-ops when that arch is not loaded, so calling this
-/// function on any LoadedModel is always safe.
-fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
-    // Lifecycle boundary: `m.eviction` owns calibrated sidecar data and reusable
-    // GPU scratch until unload. The request owns the physical cursor, compact
-    // offset, target recurrent/KV state, and DFlash's target-hidden mirror, so a
-    // fresh context resets those without rebuilding the eviction policy.
-    m.session.reset(gpu);
-    if let Some(s) = m.speculator.as_mut() {
-        s.reset(gpu);
+#[derive(Debug, Clone, PartialEq)]
+enum GenerateResult {
+    Complete,
+    Deferred(DeferredTerminal),
+    ResetFailed { id: String, message: String },
+    /// Produced by the borrowed PP worker. The outer wrapper owns the model
+    /// again and must perform the optional reset before publishing `done`.
+    PpCompletion {
+        generated: usize,
+        prefill_tokens: usize,
+        tok_s: f64,
+        prefill_ms: f64,
+        prefill_tok_s: f64,
+        decode_tok_s: f64,
+        reset_required: bool,
+    },
+}
+
+fn reset_failed(id: &str, error: impl std::fmt::Debug) -> GenerateResult {
+    GenerateResult::ResetFailed {
+        id: id.to_string(),
+        message: format!("{error:?}"),
     }
-    reset_qwen35_recurrent(m, gpu);
-    if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-        b.kv.compact_offset = 0;
+}
+
+fn reset_failed_message(id: &str, message: String) -> GenerateResult {
+    GenerateResult::ResetFailed {
+        id: id.to_string(),
+        message,
     }
-    // dots-ocr (arch_id=8) recurrent state is now in ModelState::DotsOcr.
-    if let Some(b) = m.dots_ocr_mut() {
-        b.state.reset();
-    }
-    if let Some(b) = m.qwen2_mut() {
-        b.state.reset();
-    }
-    if let Some(b) = m.deepseek4_mut() {
-        b.state.reset();
-        b.state.zero_decode_caches(gpu);
-        gpu.invalidate_graph_state();
-    }
-    if let Some(b) = m.lfm2moe_mut() {
-        let _ = b.state.reset(gpu);
-    }
-    if let Some(b) = m.minimax_mut() {
-        b.state.reset();
-    }
-    // Cohere2-MoE (arch 12): reset n_tokens + clear the KV. Was MISSING — every
-    // other dual-run/reset arch is handled above, so the ArchDispatch dual-run's
-    // ar_generate arm (which relies on model_reset_context to restore the clean
-    // pre-legacy-arm state) started on stale cohere2moe KV/n_tokens → drifted
-    // logits → a temp0 argmax flip a few tokens into decode. Also closes a latent
-    // #462-class multi-turn bleed on the `reset` command for cohere2moe.
-    if let Some(b) = m.cohere2moe_mut() {
-        let _ = b.state.reset(gpu);
-    }
-    // Mesh (multi-GPU) state. The flipped EP/dense serve paths already reset per
-    // turn (generate_ep's ep_reset_ds4_state / minimax's LCP rewind / dense's cold
-    // re-prefill from pos 0), so this is belt-and-suspenders — but it makes the
-    // `reset` command EXPLICITLY correct instead of relying on the per-turn-reset
-    // invariant (the eos-checklist lesson: "confirm model_reset_context resets the
-    // arch"). Uses EP `gpus` from `m.parallel`, NOT the passed single-GPU `gpu`
-    // (distinct handles).
-    if let ModelParallel::Ep(EpState { gpus, inner }) = &mut m.parallel {
-        match inner {
-            EpArch::Ds4 { state, .. } => {
-                for (rank, s) in state.iter_mut().enumerate() {
-                    let g = &mut gpus.devices[rank];
-                    let _ = g.bind_thread();
-                    s.reset();
-                    s.zero_decode_caches(g);
-                    g.invalidate_graph_state();
-                }
-            }
-            EpArch::Minimax { state, .. } => {
-                // MiniMax uses standard attention (KV overwritten by re-prefill) with
-                // no position-indexed decode caches, so a per-rank `state.reset()` is
-                // sufficient — the extra ds4 zero_decode_caches/invalidate_graph_state
-                // steps aren't needed (matches the deleted ep_serve_minimax's reset).
-                for s in state.iter_mut() {
-                    s.reset();
-                }
-            }
+}
+
+/// Reset the loader-owned model state before publishing a deferred terminal.
+/// The caller owns the model slot and decides what to do when this fallible
+/// reset fails (normally: unload/poison the slot).
+fn reset_then_emit(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    terminal: DeferredTerminal,
+) -> Result<(), hipfire_loader::ResetError> {
+    model_reset_context(m, gpu)?;
+    match terminal {
+        DeferredTerminal::Aborted { id, generated } => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"aborted","id":{},"reason":"client_cancelled"}}"#,
+                serde_json::to_string(&id).unwrap_or_else(|_| "\"\"".to_string())
+            );
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"done","id":{},"finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
+                serde_json::to_string(&id).unwrap_or_else(|_| "\"\"".to_string()), generated
+            );
+        }
+        DeferredTerminal::Error { id, message } => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":{},"message":{}}}"#,
+                serde_json::to_string(&id).unwrap_or_else(|_| "\"\"".to_string()),
+                serde_json::to_string(&message).unwrap_or_default()
+            );
         }
     }
-    // Dense TP/PP (m.parallel::Tp / m.parallel::Pp(Dense)) are stateless per request — KV is
-    // overwritten by the next turn's re-prefill from pos 0, so clearing
-    // seq_pos/conversation_tokens above is sufficient; the models expose no reset and need none.
+    let _ = stdout.flush();
+    Ok(())
 }
 
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
@@ -6140,10 +6107,11 @@ fn finish_spec_caller_after_guard<'a>(
     guard: Option<Box<dyn SpecTargetGuard + 'a>>,
     emit: Option<Box<dyn SpecEmit + 'a>>,
     outcome: SpecRunOutcome,
-    mut reset: impl FnMut(),
+    id: &str,
+    mut reset: impl FnMut() -> Result<(), String>,
     mut cache_insert: impl FnMut(&SpecRun),
     mut envelope: impl FnMut(SpecTerminalEnvelope),
-) -> Option<SpecRun> {
+) -> Result<Option<SpecRun>, GenerateResult> {
     // Drop first. Qwen's guard restores its moved bundle here; DeepSeek's
     // in-place guard releases its borrow here. Canonical reset must never run
     // while either production borrow is alive.
@@ -6157,26 +6125,32 @@ fn finish_spec_caller_after_guard<'a>(
                 run.finish = finish;
             }
             if !run.target_reusable {
-                reset();
+                if let Err(error) = reset() {
+                    return Err(reset_failed_message(id, error));
+                }
             }
             cache_insert(&run);
             envelope(SpecTerminalEnvelope::Done {
                 generated: run.generated,
             });
-            Some(run)
+            Ok(Some(run))
         }
         SpecRunOutcome::ImmediateError(error) | SpecRunOutcome::Failed(error) => {
             drop(emit);
-            reset();
+            if let Err(reset_error) = reset() {
+                return Err(reset_failed_message(id, reset_error));
+            }
             envelope(SpecTerminalEnvelope::Error(error));
-            None
+            Ok(None)
         }
         SpecRunOutcome::Aborted { generated } => {
             drop(emit);
-            reset();
+            if let Err(reset_error) = reset() {
+                return Err(reset_failed_message(id, reset_error));
+            }
             envelope(SpecTerminalEnvelope::Aborted { generated });
             envelope(SpecTerminalEnvelope::DoneAborted { generated });
-            None
+            Ok(None)
         }
     }
 }
@@ -6186,20 +6160,21 @@ fn emit_spec_terminal_envelope(
     id: &str,
     envelope: SpecTerminalEnvelope,
 ) {
+    let json_id = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
     match envelope {
         SpecTerminalEnvelope::Error(error) => emit_error_with_id(stdout, id, error),
         SpecTerminalEnvelope::Aborted { .. } => {
             let _ = writeln!(
                 stdout,
-                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-                id
+                r#"{{"type":"aborted","id":{},"reason":"client_cancelled"}}"#,
+                json_id
             );
         }
         SpecTerminalEnvelope::DoneAborted { generated } => {
             let _ = writeln!(
                 stdout,
-                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
-                id, generated
+                r#"{{"type":"done","id":{},"finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
+                json_id, generated
             );
             let _ = stdout.flush();
         }
@@ -6388,7 +6363,7 @@ fn generate_dflash(
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
     // field can reach it without re-touching this signature.
     cactus_delta: f32,
-) {
+) -> GenerateResult {
     // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
     // SpecStats that this function used to drive inline now live behind the
     // arch-generic `Speculator` trait (the loader's `DflashSpeculator`) and the
@@ -6608,9 +6583,10 @@ fn generate_dflash(
         },
         temp,
     ) {
-        Some(r) => r,
+        Ok(Some(r)) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
-        None => return,
+        Ok(None) => return GenerateResult::Complete,
+        Err(failure) => return failure,
     };
     debug_assert_eq!(run.prefill_tokens_len, prefill_tokens_full);
 
@@ -6690,6 +6666,7 @@ fn generate_dflash(
         pflash_done_field,
     );
     let _ = stdout.flush();
+    GenerateResult::Complete
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -6719,14 +6696,13 @@ fn generate_spec(
     // report `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR); greedy
     // drafters ignore it. The daemon's routing gate enforces that invariant.
     temp: f32,
-) -> Option<SpecRun> {
+) -> Result<Option<SpecRun>, GenerateResult> {
     // See the prefill-cancellation lifecycle call below: the emitter borrows
     // the model tokenizer, while reset must run only after that emitter and the
     // target guard are released.
     let model_ptr = m as *mut LoadedModel;
     let gpu_ptr = gpu as *mut rdna_compute::Gpu;
     let qwen_cache_ptr = &mut m.persist.asst_turn_cache as *mut _;
-    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // Acquire the target via the RAII slot guard — it restores the bundle into
     // m.state on EVERY exit path (return, `?`, panic), which structurally
@@ -6743,7 +6719,7 @@ fn generate_spec(
                 id
             );
             let _ = stdout.flush();
-            return None;
+            return Ok(None);
         }
     };
     // Resolve the arch's carrier once — the single dispatch the spec path routes
@@ -6760,7 +6736,7 @@ fn generate_spec(
                 id, arch_id
             );
             let _ = stdout.flush();
-            return None;
+            return Ok(None);
         }
     };
     // Capacity checks. With eviction enabled the advertised context window is
@@ -6787,7 +6763,7 @@ fn generate_spec(
             if m.eviction.is_some() { "on" } else { "off" },
         );
         let _ = stdout.flush();
-        return None;
+        return Ok(None);
     }
     if m.eviction.is_none()
         && prompt_tokens
@@ -6802,8 +6778,19 @@ fn generate_spec(
             id, ctx_capacity,
         );
         let _ = stdout.flush();
-        return None;
+        return Ok(None);
     }
+
+    // A speculative cache miss is a full context transition, not just a
+    // bookkeeping change. Reset before borrowing the target/emitter so all
+    // request-owned GPU state is cleared and ResetFailed can propagate.
+    if !cache_hit {
+        if let Err(error) = model_reset_context(m, gpu) {
+            return Err(reset_failed(id, error));
+        }
+    }
+
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
     // (`m.meta.model_path` is a disjoint field → no borrow conflict with the
@@ -6819,7 +6806,7 @@ fn generate_spec(
                 id, e
             );
             let _ = stdout.flush();
-            return None;
+            return Ok(None);
         }
     };
     let outcome = 'spec: {
@@ -6867,16 +6854,7 @@ fn generate_spec(
             m.session.conversation_tokens.truncate(ckpt);
         }
 
-        if !cache_hit {
-            // Fresh target state — full prefill from position 0. The DeltaNet
-            // recurrent state is zeroed by the prefill seed itself
-            // (`seed_target_hidden_from_prompt_abortable` calls `target.reset_state`,
-            // which also zeroes s_ef_residual — more complete than the memset loop
-            // the old inline path ran here), so only the daemon-side position
-            // bookkeeping remains.
-            m.session.seq_pos = 0;
-            m.session.conversation_tokens.clear();
-        } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if cache_hit && std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
                 prefill_start,
@@ -6916,15 +6894,21 @@ fn generate_spec(
                 // reset as a raw-pointer hook. The lifecycle function drops
                 // both production borrows before invoking it; that ordering is
                 // the safety invariant this seam exists to enforce.
-                let _ = finish_spec_caller_after_guard(
+                match finish_spec_caller_after_guard(
                     Some(guard),
                     Some(emit),
                     outcome,
-                    || unsafe { model_reset_context(&mut *model_ptr, &mut *gpu_ptr) },
+                    id,
+                    || unsafe {
+                        model_reset_context(&mut *model_ptr, &mut *gpu_ptr)
+                            .map_err(|error| format!("{error:?}"))
+                    },
                     |_| {},
                     |envelope| emit_spec_terminal_envelope(stdout, id, envelope),
-                );
-                return None;
+                ) {
+                    Ok(_) => return Ok(None),
+                    Err(failure) => return Err(failure),
+                }
             }
         };
 
@@ -7331,7 +7315,8 @@ fn generate_spec(
         None,
         None,
         outcome,
-        || model_reset_context(m, gpu),
+        id,
+        || model_reset_context(m, gpu).map_err(|error| format!("{error:?}")),
         |run| {
             if matches!(arch_id, 5 | 6) {
                 let finalized = run
@@ -7359,8 +7344,7 @@ mod spec_recovery_tests {
     use super::{
         abort_for_id, admit_spec_prefill_before_output, advance_forced_tokens,
         forced_advance_completed, observe_forced_seed, publish_eviction_position,
-        qwen35_recurrent_groups, record_forced_batch, replay_forced_tokens, AbortLatch,
-        SpecRunOutcome,
+        record_forced_batch, replay_forced_tokens, AbortLatch, SpecRunOutcome,
     };
     use hipfire_runtime::spec::PrefillOutcome;
     use hipfire_runtime::spec::SpecAdvance;
@@ -7486,25 +7470,15 @@ mod spec_recovery_tests {
         record_forced_batch(&mut session_tokens, &forced);
         assert_eq!(session_tokens, vec![1, 10, 41, 42, 43]);
     }
-
-    #[test]
-    fn pipeline_reset_includes_q8_error_feedback_buffers() {
-        let groups = qwen35_recurrent_groups(&[1], &[2], &[3], &[4]);
-
-        assert_eq!(
-            groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
-            [1, 1, 1, 1]
-        );
-        assert_eq!(groups[3], &[4]);
-    }
 }
 
 #[cfg(test)]
 mod spec_emit_lifecycle_tests {
     use super::{
-        admit_spec_prefill, admit_spec_prefill_before_output, finish_spec_caller_after_guard,
-        settle_spec_emit_for_outcome, spec_emit_disposition, SpecEmitDisposition, SpecRun,
-        SpecRunOutcome, SpecTerminalEnvelope,
+        admit_spec_prefill, admit_spec_prefill_before_output, deepseek4_abort_json,
+        finish_spec_caller_after_guard, reset_error_json, reset_error_json_message,
+        settle_spec_emit_for_outcome, spec_emit_disposition, SpecEmitDisposition,
+        GenerateResult, SpecRun, SpecRunOutcome, SpecTerminalEnvelope,
     };
     use hipfire_runtime::spec::{
         EmitOutcome, FinishSummary, PrefillOutcome, SpecEmit, SpecTargetGuard,
@@ -7634,6 +7608,7 @@ mod spec_emit_lifecycle_tests {
                 Some(guard),
                 Some(emit),
                 SpecRunOutcome::Aborted { generated: 0 },
+                "qwen-spec-abort-test",
                 || {
                     assert_eq!(
                         drops.load(Ordering::SeqCst),
@@ -7642,6 +7617,7 @@ mod spec_emit_lifecycle_tests {
                     );
                     fresh_state.store(true, Ordering::SeqCst);
                     events.lock().unwrap().push("Reset");
+                    Ok(())
                 },
                 |_| {
                     cache_inserts.fetch_add(1, Ordering::SeqCst);
@@ -7654,7 +7630,7 @@ mod spec_emit_lifecycle_tests {
                     })
                 },
             );
-            assert!(outcome.is_none());
+            assert!(outcome.expect("successful abort lifecycle").is_none());
         }
 
         assert_eq!(
@@ -7692,10 +7668,12 @@ mod spec_emit_lifecycle_tests {
             Some(guard),
             Some(emit),
             SpecRunOutcome::Aborted { generated: 3 },
+            "deepseek-test",
             || {
                 assert_eq!(drops.load(Ordering::SeqCst), 1);
                 events.lock().unwrap().push("zero_decode_caches");
                 events.lock().unwrap().push("reset");
+                Ok(())
             },
             |_| {
                 qwen_cache_proxy.fetch_add(1, Ordering::SeqCst);
@@ -7709,7 +7687,7 @@ mod spec_emit_lifecycle_tests {
             },
         );
 
-        assert!(outcome.is_none());
+        assert!(outcome.expect("successful abort lifecycle").is_none());
         assert_eq!(
             &*events.lock().unwrap(),
             &vec!["zero_decode_caches", "reset", "Aborted", "DoneAborted"]
@@ -7735,7 +7713,11 @@ mod spec_emit_lifecycle_tests {
             Some(guard),
             Some(emit),
             SpecRunOutcome::Ready(ready_run(true)),
-            || events.lock().unwrap().push("Reset"),
+            "qwen-spec-test",
+            || {
+                events.lock().unwrap().push("Reset");
+                Ok(())
+            },
             |_| events.lock().unwrap().push("Cache"),
             |envelope| {
                 if matches!(envelope, SpecTerminalEnvelope::Done { .. }) {
@@ -7744,9 +7726,64 @@ mod spec_emit_lifecycle_tests {
             },
         );
 
-        assert!(result.is_some());
+        assert!(result.expect("successful completion lifecycle").is_some());
         assert_eq!(finish_count.load(Ordering::SeqCst), 1);
         assert_eq!(&*events.lock().unwrap(), &vec!["Finish", "Cache", "Done"]);
+    }
+
+    #[test]
+    fn reset_failure_is_terminal_before_abort_or_done_envelopes() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (emit, _finish_count, _drop_count) = fake();
+        let result = finish_spec_caller_after_guard(
+            None,
+            Some(emit),
+            SpecRunOutcome::Aborted { generated: 4 },
+            "reset-failed-test",
+            || Err("poisoned reset".to_string()),
+            |_| panic!("reset failure must not publish a cache"),
+            |envelope| {
+                events.lock().unwrap().push(match envelope {
+                    SpecTerminalEnvelope::Error(message) => message,
+                    _ => panic!("reset failure published a non-error terminal envelope"),
+                });
+            },
+        );
+
+        match result {
+            Err(GenerateResult::ResetFailed { id, message }) => {
+                assert_eq!(id, "reset-failed-test");
+                assert_eq!(message, "poisoned reset");
+            }
+            _ => panic!("reset failure was not propagated untouched"),
+        }
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reset_command_error_is_valid_json_when_debug_text_contains_quotes() {
+        let json = reset_error_json("req\"1", &"bad \"gpu\" {state}");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid reset JSON");
+        assert_eq!(value["id"], "req\"1");
+        assert_eq!(value["type"], "error");
+        assert!(value["message"].as_str().unwrap().contains("gpu"));
+
+        let json = reset_error_json_message("req\"1", "bad \"gpu\" {state}");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid reset JSON");
+        assert_eq!(value["message"], "bad \"gpu\" {state}");
+    }
+
+    #[test]
+    fn deepseek_abort_envelopes_escape_request_ids() {
+        let (aborted, done) = deepseek4_abort_json("req\"1\\2", 7);
+        let aborted: serde_json::Value =
+            serde_json::from_str(&aborted).expect("valid aborted JSON");
+        let done: serde_json::Value = serde_json::from_str(&done).expect("valid done JSON");
+
+        assert_eq!(aborted["id"], "req\"1\\2");
+        assert_eq!(aborted["reason"], "client_cancelled");
+        assert_eq!(done["id"], "req\"1\\2");
+        assert_eq!(done["completion_tokens"], 7);
     }
 
     #[test]
@@ -8023,7 +8060,7 @@ mod qwen_sealed_turn_daemon_tests {
     }
 }
 
-fn generate_multi(
+fn generate_multi_borrowed(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
@@ -8048,9 +8085,11 @@ fn generate_multi(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
-) {
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+) -> GenerateResult {
+    let prompt_est = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        tokenizer.encode(prompt).len() + 20
+    };
     if m.session
         .seq_pos
         .saturating_add(prompt_est)
@@ -8061,15 +8100,19 @@ fn generate_multi(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.session.seq_pos, m.meta.max_seq
         );
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
-        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
-        if let Some(ad) = m.session.kv_adaptive.as_mut() {
-            ad.reset();
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
         }
     }
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
+    if try_jinja && m.session.seq_pos > 0 {
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        }
+    }
+
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
@@ -8171,14 +8214,12 @@ fn generate_multi(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
     // Now Jinja renders the full conversation every turn; the cold-reset block
     // below (guarded on seq_pos > 0) re-zeros recurrent state so the full render
     // writes from position 0 instead of appending to the prior turn's KV/DeltaNet.
-    let try_jinja = jinja_enabled && m.meta.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.meta.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -8257,21 +8298,9 @@ fn generate_multi(
     // + prefill — otherwise the full render appends to the prior turn's dirty
     // KV / DeltaNet / checkpoint state (stale recurrent state → drift; the
     // system prompt was also being silently dropped on turn 2+). Mirrors the
-    // `reset_pp_uncommitted_state!` semantics, written inline because that macro
-    // is defined later (after kv/dn/gpus are borrowed). Same shape as the
-    // context-full reset at the top of this fn and generate()'s `jinja_active &&
+    // loader reset semantics, written here before the PP state is borrowed. Same
+    // shape as the context-full reset at the top of this fn and generate()'s `jinja_active &&
     // seq_pos > 0` block.
-    if try_jinja && m.session.seq_pos > 0 {
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
-        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
-        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-            b.kv.compact_offset = 0;
-        }
-    }
-
     let trailer = nl.len();
     if m.session
         .seq_pos
@@ -8291,7 +8320,7 @@ fn generate_multi(
             m.meta.physical_cap
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     let im_end_token = if im_end.len() == 1 {
@@ -8327,26 +8356,11 @@ fn generate_multi(
         .as_ref()
         .expect("pp>1 qwen35 must carry pipeline scratch");
     let scratch_set = &pl.scratch_set;
-    let dn_la_to_device = &pl.dn_la_to_device;
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
     let ModelParallel::Pp(PipelineImpl::ArchResident(gpus)) = &mut m.parallel else {
         unreachable!("qwen35 pp>1 forward without ArchResident mesh")
     };
-
-    macro_rules! reset_pp_uncommitted_state {
-        () => {{
-            m.session.seq_pos = 0;
-            m.session.conversation_tokens.clear();
-            free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-            free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-            reset_qwen35_pipeline_recurrent(dn, dn_la_to_device, gpus);
-            kv.compact_offset = 0;
-            if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-                b.kv.compact_offset = 0;
-            }
-        }};
-    }
 
     let dev_last = gpus.output_device;
     let vocab_size = config.vocab_size;
@@ -8413,35 +8427,19 @@ fn generate_multi(
         dn,
         scratch_set,
     ) {
-        // hunt3 M-A: a partial-band prefill failure leaves DeltaNet partially
-        // advanced; without resetting, the next cold turn prefills over dirty
-        // recurrent state (drift). Mirror both abort paths, which already reset.
-        reset_pp_uncommitted_state!();
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"forward_prefill_batch_multi: {}"}}"#,
-            id, e
-        );
-        let _ = stdout.flush();
-        return;
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: format!("forward_prefill_batch_multi: {e}"),
+        });
     }
     m.session.seq_pos += new_tokens.len();
     m.session.conversation_tokens.extend_from_slice(&new_tokens);
 
     if check_abort(id) {
-        reset_pp_uncommitted_state!();
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-            id
-        );
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#,
-            id
-        );
-        let _ = stdout.flush();
-        return;
+        return GenerateResult::Deferred(DeferredTerminal::Aborted {
+            id: id.to_string(),
+            generated: 0,
+        });
     }
 
     // ngram scope: generated tokens only (matches pp=1).
@@ -8541,19 +8539,10 @@ fn generate_multi(
 
     while generated < max_tokens {
         if check_abort(id) {
-            reset_pp_uncommitted_state!();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-                id
-            );
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
-                id, generated
-            );
-            let _ = stdout.flush();
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: id.to_string(),
+                generated,
+            });
         }
         let semantic_stop = next_token == config.eos_token
             || im_end_token == Some(next_token)
@@ -8593,17 +8582,10 @@ fn generate_multi(
             dn,
             scratch_set,
         ) {
-            // hunt3 M-A: a decode-step failure leaves DeltaNet advanced past the
-            // (un-baked) conversation_tokens; reset so the next cold turn starts
-            // clean. Mirrors both abort paths.
-            reset_pp_uncommitted_state!();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"forward_scratch_multi decode: {}"}}"#,
-                id, e
-            );
-            let _ = stdout.flush();
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("forward_scratch_multi decode: {e}"),
+            });
         }
         m.session.seq_pos += 1;
         target_advanced += 1;
@@ -8710,14 +8692,10 @@ fn generate_multi(
                         scratch_set,
                     ) {
                         eprintln!("[daemon] max_think close forward_scratch_multi: {}", e);
-                        reset_pp_uncommitted_state!();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"error","id":"{}","message":"max_think close forward_scratch_multi: {}"}}"#,
-                            id, e
-                        );
-                        let _ = stdout.flush();
-                        return;
+                        return GenerateResult::Deferred(DeferredTerminal::Error {
+                            id: id.to_string(),
+                            message: format!("max_think close forward_scratch_multi: {e}"),
+                        });
                     }
                     m.session.seq_pos += 1;
                     target_advanced += 1;
@@ -8893,14 +8871,10 @@ fn generate_multi(
                         scratch_set,
                     ) {
                         eprintln!("[daemon] budget_alert forward_scratch_multi: {}", e);
-                        reset_pp_uncommitted_state!();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"error","id":"{}","message":"budget_alert forward_scratch_multi: {}"}}"#,
-                            id, e
-                        );
-                        let _ = stdout.flush();
-                        return;
+                        return GenerateResult::Deferred(DeferredTerminal::Error {
+                            id: id.to_string(),
+                            message: format!("budget_alert forward_scratch_multi: {e}"),
+                        });
                     }
                     m.session.seq_pos += 1;
                     target_advanced += 1;
@@ -9023,14 +8997,10 @@ fn generate_multi(
                 scratch_set,
             ) {
                 eprintln!("[daemon] trailer forward_scratch_multi: {}", e);
-                reset_pp_uncommitted_state!();
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","id":"{}","message":"trailer forward_scratch_multi: {}"}}"#,
-                    id, e
-                );
-                let _ = stdout.flush();
-                return;
+                return GenerateResult::Deferred(DeferredTerminal::Error {
+                    id: id.to_string(),
+                    message: format!("trailer forward_scratch_multi: {e}"),
+                });
             }
             m.session.seq_pos += 1;
             m.session.conversation_tokens.push(t);
@@ -9065,11 +9035,6 @@ fn generate_multi(
     );
     if target_reusable {
         let _ = cache_sealed_qwen_turn(&mut m.persist.asst_turn_cache, &finalized, true);
-    } else {
-        // The target may have accepted bytes which are not a whole-token
-        // replay boundary.  Do not approximate rollback by popping tokens;
-        // reset the PP recurrent/KV state before publishing the done frame.
-        reset_pp_uncommitted_state!();
     }
 
     let t_end = Instant::now();
@@ -9091,19 +9056,103 @@ fn generate_multi(
     } else {
         0.0
     };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
-        id,
+    GenerateResult::PpCompletion {
         generated,
-        tok_s,
         prefill_tokens,
-        prefill_s * 1000.0,
+        tok_s,
+        prefill_ms: prefill_s * 1000.0,
         prefill_tok_s,
         decode_tok_s,
-        prefill_s * 1000.0
+        reset_required: !target_reusable,
+    }
+}
+
+fn generate_multi(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
+) -> GenerateResult {
+    let result = generate_multi_borrowed(
+        m,
+        gpu,
+        pflash_state,
+        pflash_cfg,
+        stdout,
+        id,
+        prompt,
+        system_prompt,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        budget_alert_at_tok,
+        budget_alert_text,
+        max_think_tokens,
+        assistant_prefix,
+        tools,
+        messages_history,
+        stop,
     );
-    let _ = stdout.flush();
+    match result {
+        GenerateResult::PpCompletion {
+            generated,
+            prefill_tokens,
+            tok_s,
+            prefill_ms,
+            prefill_tok_s,
+            decode_tok_s,
+            reset_required,
+        } => {
+            // `generate_multi_borrowed` has returned, so every PP bundle
+            // borrow is dead before the authoritative reset is attempted.
+            if reset_required {
+                if let Err(error) = model_reset_context(m, gpu) {
+                    return reset_failed(id, error);
+                }
+            }
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+                id,
+                generated,
+                tok_s,
+                prefill_tokens,
+                prefill_ms,
+                prefill_tok_s,
+                decode_tok_s,
+                prefill_ms
+            );
+            let _ = stdout.flush();
+            GenerateResult::Complete
+        }
+        other => other,
+    }
 }
 
 fn qwen35_pp_eos_filter_config(stop: &[String]) -> EosFilterConfig {
@@ -9420,7 +9469,7 @@ fn ar_generate(
     pflash_alpha: Option<f32>,
     t0: std::time::Instant,
     mut tape: Option<&mut TokenTape>,
-) {
+) -> GenerateResult {
     // Local copy of the `generate`-nested pflash `done`-event fragment builder
     // (pure over its args; duplicated here so ar_generate stays self-contained).
     fn pflash_done_fragment(
@@ -9453,29 +9502,18 @@ fn ar_generate(
     // model and written back at finalize / on abort.
     let mut seq_pos = dispatch.seq_pos();
 
-    // On any GPU forward / hook error mid-generation, emit a clean {"type":"error"}
-    // and reset the arch to a clean state (mirrors the abort cleanup) so a partial
-    // state can't bleed into the next request, then return — instead of a `.unwrap()`
-    // panic that kills the serve thread. Shared by all arches on this driver (the
-    // deleted generate_dense had an equivalent `fail!`; the EP/dense folds inherit
-    // this). Used as an expression (yields the Ok value) or a statement.
+    // On any GPU forward / hook error mid-generation, leave model reset and
+    // terminal emission to the owner of the model slot. The dispatch borrows the
+    // model, so doing either here would alias the loader-owned reset authority.
     macro_rules! prefill_hook_or_fail {
         ($call:expr, $what:expr) => {
             match $call {
                 Ok(v) => v,
                 Err(e) => {
-                    dispatch.abort_zero_recurrent(ctx.reborrow());
-                    dispatch.set_seq_pos(0);
-                    dispatch.conversation_tokens_mut().clear();
-                    dispatch.free_prefill_checkpoints(ctx.reborrow());
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"error","id":"{}","message":{}}}"#,
-                        id,
-                        serde_json::to_string(&format!("{}: {}", $what, e)).unwrap_or_default()
-                    );
-                    let _ = stdout.flush();
-                    return;
+                    return GenerateResult::Deferred(DeferredTerminal::Error {
+                        id: id.to_string(),
+                        message: format!("{}: {}", $what, e),
+                    });
                 }
             }
         };
@@ -9531,22 +9569,10 @@ fn ar_generate(
         }
     }
     if prefill_aborted {
-        dispatch.abort_zero_recurrent(ctx.reborrow());
-        dispatch.set_seq_pos(0);
-        dispatch.conversation_tokens_mut().clear();
-        dispatch.free_prefill_checkpoints(ctx.reborrow());
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-            id
-        );
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#,
-            id
-        );
-        let _ = stdout.flush();
-        return;
+        return GenerateResult::Deferred(DeferredTerminal::Aborted {
+            id: id.to_string(),
+            generated: 0,
+        });
     }
     // Post-prefill adaptive-KV downshift.
     dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
@@ -10200,38 +10226,16 @@ fn ar_generate(
     match decode_outcome {
         ArDecodeOutcome::Complete => {}
         ArDecodeOutcome::Aborted => {
-            // The parser was consumed by settle_ar_parser without finish.
-            dispatch.set_seq_pos(0);
-            dispatch.conversation_tokens_mut().clear();
-            dispatch.free_prefill_checkpoints(ctx.reborrow());
-            dispatch.abort_zero_recurrent(ctx.reborrow());
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-                id
-            );
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
-                id, generated
-            );
-            let _ = stdout.flush();
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: id.to_string(),
+                generated,
+            });
             }
         ArDecodeOutcome::Error(message) => {
-            // The parser was consumed by settle_ar_parser without finish.
-            dispatch.abort_zero_recurrent(ctx.reborrow());
-            dispatch.set_seq_pos(0);
-            dispatch.conversation_tokens_mut().clear();
-            dispatch.free_prefill_checkpoints(ctx.reborrow());
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":{}}}"#,
-                id,
-                serde_json::to_string(&message).unwrap_or_default()
-            );
-            let _ = stdout.flush();
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message,
+            });
         }
     }
 
@@ -10352,6 +10356,7 @@ fn ar_generate(
         pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
     );
     let _ = stdout.flush();
+    GenerateResult::Complete
 }
 
 fn generate(
@@ -10388,7 +10393,7 @@ fn generate(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     stop: &[String],
-) {
+) -> GenerateResult {
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -10402,8 +10407,9 @@ fn generate(
     match m.parallel.kind() {
         ModelParallelKind::Tp | ModelParallelKind::PpDense => {
             // Dense TP / dense-PP AR decode on the unified ar_generate driver.
-            dense_serve_via_ar_generate(
+            return dense_serve_via_ar_generate(
                 m,
+                gpu,
                 stdout,
                 id,
                 system_prompt,
@@ -10417,7 +10423,6 @@ fn generate(
                 max_tokens,
                 stop,
             );
-            return;
         }
         ModelParallelKind::Ep => {
             // EP serve (ds4/minimax): thread the SAME resolved sampling the
@@ -10433,8 +10438,9 @@ fn generate(
                 top_k,
                 min_p,
             };
-            generate_ep(
+            return generate_ep(
                 m,
+                gpu,
                 stdout,
                 id,
                 prompt,
@@ -10447,7 +10453,6 @@ fn generate(
                 stop,
                 ep_sampling,
             );
-            return;
         }
         ModelParallelKind::Single | ModelParallelKind::PpQwen35 => {
             // Fall through to the per-arch single-GPU / qwen35-PP short-circuit below.
@@ -10488,7 +10493,7 @@ fn generate(
             pflash_state,
             pflash_cfg,
         );
-        generate_dflash(
+        return generate_dflash(
             m,
             gpu,
             stdout,
@@ -10508,7 +10513,7 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-        return;
+
     }
     if m.meta.arch_id == 7 {
         // Silence the qwen35/llama-only params we deliberately don't
@@ -10525,7 +10530,7 @@ fn generate(
             messages_history,
         );
         let _ = stop; // hunt3 M-F: not wired for arch_id=7 (qwen2 bring-up)
-        generate_qwen2(
+        return generate_qwen2(
             m,
             gpu,
             stdout,
@@ -10538,7 +10543,6 @@ fn generate(
             repeat_penalty,
             repeat_window,
         );
-        return;
     }
     if m.meta.arch_id == 9 {
         // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
@@ -10575,7 +10579,7 @@ fn generate(
                 .map_or(false, |s| !s.requires_greedy());
         let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
-            generate_deepseek4_spec(
+            return generate_deepseek4_spec(
                 m,
                 gpu,
                 stdout,
@@ -10592,7 +10596,7 @@ fn generate(
                 messages_history,
             );
         } else {
-            generate_deepseek4(
+            return generate_deepseek4(
                 m,
                 gpu,
                 stdout,
@@ -10607,7 +10611,7 @@ fn generate(
                 messages_history,
             );
         }
-        return;
+
     }
     // arch_id=11 (LFM2.5-MoE) with an opt-in model-free n-gram speculator loaded
     // (lfm2moe `SpecTarget`, conv-state snapshot/rollback) routes to the
@@ -10620,7 +10624,7 @@ fn generate(
             pflash_state,
             pflash_cfg,
         );
-        generate_dflash(
+        return generate_dflash(
             m,
             gpu,
             stdout,
@@ -10640,7 +10644,7 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-        return;
+
     }
     if m.meta.arch_id == 11 {
         // arch_id=11 (LFM2.5-8B-A1B). Standalone bring-up — same shape as
@@ -10657,7 +10661,7 @@ fn generate(
             think_mode,
         );
         let _ = (repeat_penalty, repeat_window);
-        generate_lfm2moe(
+        return generate_lfm2moe(
             m,
             gpu,
             stdout,
@@ -10671,7 +10675,7 @@ fn generate(
             tools,
             messages_history,
         );
-        return;
+
     }
     // arch_id=12 (Cohere2-MoE) with an opt-in model-free n-gram speculator loaded
     // (cohere2moe `SpecTarget` + `Cohere2MoeEmit`, which ports the agentic-marker
@@ -10685,7 +10689,7 @@ fn generate(
             pflash_state,
             pflash_cfg,
         );
-        generate_dflash(
+        return generate_dflash(
             m,
             gpu,
             stdout,
@@ -10705,7 +10709,7 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-        return;
+
     }
     if m.meta.arch_id == 12 {
         // arch_id=12 (Cohere2-MoE / North-Mini-Code). Standalone bring-up
@@ -10721,7 +10725,7 @@ fn generate(
             think_mode,
         );
         let _ = (repeat_penalty, repeat_window);
-        generate_cohere2moe(
+        return generate_cohere2moe(
             m,
             gpu,
             stdout,
@@ -10735,7 +10739,7 @@ fn generate(
             tools,
             messages_history,
         );
-        return;
+
     }
     // arch_id=10 (MiniMax-M2) with an opt-in model-free n-gram speculator loaded
     // (minimax `SpecTarget`) routes to the arch-generic spec loop, exactly like
@@ -10748,7 +10752,7 @@ fn generate(
             pflash_state,
             pflash_cfg,
         );
-        generate_dflash(
+        return generate_dflash(
             m,
             gpu,
             stdout,
@@ -10768,7 +10772,7 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-        return;
+
     }
     if m.meta.arch_id == 10 {
         // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
@@ -10786,7 +10790,7 @@ fn generate(
             think_mode,
         );
         let _ = (repeat_penalty, repeat_window);
-        generate_minimax(
+        return generate_minimax(
             m,
             gpu,
             stdout,
@@ -10800,7 +10804,7 @@ fn generate(
             tools,
             messages_history,
         );
-        return;
+
     }
     // Expert-parallel dispatch (task #26). ep.is_some() → generate_ep (AR via
     // forward_ep, full sampler on rank-0 logits). Refusals enforced at load.
@@ -10808,7 +10812,7 @@ fn generate(
     // is refused at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
     if matches!(m.parallel, ModelParallel::Pp(PipelineImpl::ArchResident(_))) {
-        generate_multi(
+        return generate_multi(
             m,
             gpu,
             pflash_state,
@@ -10834,7 +10838,7 @@ fn generate(
             messages_history,
             stop, // hunt3 M-F: thread user stop sequences into the pp>1 path
         );
-        return;
+
     }
     // DFlash fast path -- only when a draft model is loaded. DFlash now serves
     // BOTH greedy (temp≈0 → argmax-accept) AND temp>0 (lossless rejection-
@@ -10989,7 +10993,7 @@ fn generate(
         // mirrors the AR path's <think>/</think> counter). The "ignored
         // on DFlash" warning that used to live here is gone -- the cap
         // is real on both paths now.
-        generate_dflash(
+        return generate_dflash(
             m,
             gpu,
             stdout,
@@ -11009,18 +11013,7 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (chain path; recipe → folded into tau)
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-        // Silence unused-variable warnings for the params DFlash doesn't
-        // consume. top_p IS now applied to the spec sampling (nucleus on both
-        // draft + target). repeat penalties are AR-only sampling knobs;
-        // pflash_state is bypassed on the DFlash decode path.
-        let _ = (
-            repeat_penalty,
-            repeat_window,
-            budget_alert_at_tok,
-            budget_alert_text,
-            pflash_state,
-        );
-        return;
+
     }
 
     // Auto-reset on multi-turn rollover. When eviction is active (operator
@@ -11028,8 +11021,10 @@ fn generate(
     // budget+beta+safety regardless of conversation length, so reset never
     // needs to fire — eviction reclaims slots after each token. When eviction
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+    let prompt_est = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        tokenizer.encode(prompt).len() + 20
+    };
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache GEN-ENTRY] conv_tok={} seq_pos={}",
@@ -11048,24 +11043,28 @@ fn generate(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.session.seq_pos, m.meta.max_seq
         );
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
-        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-        // Free the speculator's (relocated) checkpoint ring on reset — this AR
-        // path is reachable by a DFlash-capable model (temp>0 / budgeted-think /
-        // HIPFIRE_DFLASH_CHAT=0), so its drafter state must not survive here.
-        if let Some(s) = m.speculator.as_mut() {
-            s.reset(gpu);
-        }
-        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
-        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-            b.kv.compact_offset = 0;
-        }
-        if let Some(ad) = m.session.kv_adaptive.as_mut() {
-            ad.reset();
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
         }
     }
+    let cache_kill_switch =
+        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let pflash_active = pflash_cfg
+        .map(|c| !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off))
+        .unwrap_or(false);
+    let jinja_active = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
+        && m.meta.chat_template.is_some();
+    let cache_eligible = !cache_kill_switch
+        && messages_history.is_some()
+        && m.eviction.is_none()
+        && !pflash_active
+        && !m.session.conversation_tokens.is_empty();
+    if jinja_active && !cache_eligible && m.session.seq_pos > 0 {
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        }
+    }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // `nl` is needed for the trailer write after natural <|im_end|>
     // termination; `im_end` derives the EOS-check token id. Other
@@ -11394,10 +11393,6 @@ fn generate(
     // (seq_pos=0, conversation_tokens.clear(), zero DeltaNet, KV
     // compact_offset=0) and prefill the FULL rendered prompt — DeltaNet
     // is not reversible to position M<N so partial rollback is unsafe.
-    let cache_kill_switch = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
-    let pflash_active = pflash_cfg
-        .map(|c| !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off))
-        .unwrap_or(false);
     // Jinja-on disqualification: when `HIPFIRE_JINJA_CHAT=1` the first
     // turn renders through the upstream HF chat template (which the
     // model was actually trained on — emits default system prompts,
@@ -11410,18 +11405,11 @@ fn generate(
     // so the operator gets consistent rendering across all turns.
     // Cache-with-Jinja is a future project (would require Jinja-side
     // assistant-turn replay).
-    let jinja_active = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
-        && m.meta.chat_template.is_some();
     // Cache-with-Jinja (item #37): `jinja_active` is NO LONGER a disqualifier.
     // When jinja is active the prompt-build below routes through
     // `build_cached_history_jinja` (verbatim assistant-turn splice through the
     // model's trained template) instead of the ChatScaffold `build_cached_history`,
     // so the LCP forward-extension cache now works under HIPFIRE_JINJA_CHAT too.
-    let cache_eligible = !cache_kill_switch
-        && messages_history.is_some()
-        && m.eviction.is_none()
-        && !pflash_active
-        && !m.session.conversation_tokens.is_empty();
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} jinja={} conv_tok={}",
@@ -11435,6 +11423,7 @@ fn generate(
         );
     }
     let mut cached_tokens_count: usize = 0;
+    let mut cold_reset_required = false;
     let new_tokens: Vec<u32> = if cache_eligible {
         let history = messages_history.unwrap();
         let trace_cache = std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
@@ -11766,13 +11755,7 @@ fn generate(
                 None => {
                     // No usable checkpoint — full cold reset. DeltaNet recurrent
                     // state is non-reversible; treat as a miss.
-                    m.session.seq_pos = 0;
-                    m.session.conversation_tokens.clear();
-                    free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-                    reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
-                    if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-                        b.kv.compact_offset = 0;
-                    }
+                    cold_reset_required = true;
                     rendered
                 }
             }
@@ -11803,21 +11786,16 @@ fn generate(
     // from position 0 rather than appending to the prior turn's dirty
     // DeltaNet/KV/checkpoint state. Uses `free_checkpoints` (NOT a bare
     // `.clear()`) so the checkpoint GPU buffers are freed rather than leaked.
-    if jinja_active && !cache_eligible && m.session.seq_pos > 0 {
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
-        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-        // Free the speculator's (relocated) checkpoint ring on reset — this AR
-        // path is reachable by a DFlash-capable model.
-        if let Some(s) = m.speculator.as_mut() {
-            s.reset(gpu);
-        }
-        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
-        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-            b.kv.compact_offset = 0;
+    // A cache miss is a total context transition. Do this before the capacity
+    // guard: a reset can move an effectively-zero-capacity session back to
+    // position zero, while checking the dirty position first can reject a
+    // request that would fit in the freshly reset context.
+    if cold_reset_required {
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
         }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
@@ -11827,6 +11805,7 @@ fn generate(
     // the advertised context window (max_seq) — refuse requests that would
     // overflow it in absolute position terms (current absolute + new).
     let trailer = nl.len();
+    let guard_seq_pos = qwen_cache_guard_position(m.session.seq_pos, cold_reset_required);
     let absolute_pos = m.session.seq_pos.saturating_add(
         m.state
             .as_ref()
@@ -11840,8 +11819,7 @@ fn generate(
             .unwrap_or(0),
     );
     if m.eviction.is_none() {
-        if m.session
-            .seq_pos
+        if guard_seq_pos
             .saturating_add(new_tokens.len())
             .saturating_add(max_tokens)
             .saturating_add(trailer)
@@ -11851,14 +11829,14 @@ fn generate(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
                 id,
-                m.session.seq_pos,
+                guard_seq_pos,
                 new_tokens.len(),
                 max_tokens,
                 trailer,
                 m.meta.physical_cap
             );
             let _ = stdout.flush();
-            return;
+            return GenerateResult::Complete;
         }
     } else if absolute_pos
         .saturating_add(new_tokens.len())
@@ -11877,7 +11855,7 @@ fn generate(
             m.meta.max_seq
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     let im_end_token = if im_end.len() == 1 {
@@ -11913,7 +11891,7 @@ fn generate(
         // shadow-parity gate proved token-identity, single-GPU + emulated-2, FP32
         // DeltaNet + deterministic). The legacy arm + parity scaffold are removed.
         let mut __disp = Qwen35Dispatch { m: &mut *m };
-        ar_generate(
+        return ar_generate(
             &mut __disp,
             ForwardCtx::Single(gpu),
             stdout,
@@ -11954,7 +11932,7 @@ fn generate(
         // sampling. NOT byte-identical to the legacy fused forward_scratch arm
         // (coherence + perf validated, not strict parity). pflash is qwen35-only.
         let mut __disp = LlamaDispatch { m: &mut *m };
-        ar_generate(
+        return ar_generate(
             &mut __disp,
             ForwardCtx::Single(gpu),
             stdout,
@@ -12326,13 +12304,13 @@ fn generate_deepseek4_spec(
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
+) -> GenerateResult {
     // eos token (for the DSML prompt build) from the bundle — immutable peek.
     let eos_tok = match m.state.as_ref() {
         Some(ModelState::Deepseek4(b)) => b.eos_tok,
         _ => {
             emit_error_with_id(stdout, id, "deepseek4 bundle missing on arch_id=9 spec");
-            return;
+            return GenerateResult::Complete;
         }
     };
 
@@ -12342,7 +12320,7 @@ fn generate_deepseek4_spec(
             Some(t) => t,
             None => {
                 emit_error_with_id(stdout, id, "tokenizer not loaded");
-                return;
+                return GenerateResult::Complete;
             }
         };
         build_deepseek4_dsml_prompt(
@@ -12358,7 +12336,7 @@ fn generate_deepseek4_spec(
     };
     if prompt_ids.is_empty() {
         emit_error_with_id(stdout, id, "empty prompt after tokenize");
-        return;
+        return GenerateResult::Complete;
     }
 
     let spec_k = m.meta.mtp_k;
@@ -12395,18 +12373,7 @@ fn generate_deepseek4_spec(
                 m.meta.physical_cap
             ),
         );
-        return;
-    }
-
-    // DSA decode-cache miss teardown (the part NOT done by the drafter's
-    // cache-miss `state.reset()` or generate_spec's seq_pos/conversation clear):
-    // zero the position-indexed rings + invalidate the captured decode graph so a
-    // fresh conversation reproduces a freshly-launched daemon's clean state.
-    if !plan.cache_hit {
-        if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
-            b.state.zero_decode_caches(gpu);
-        }
-        gpu.invalidate_graph_state();
+        return GenerateResult::Complete;
     }
 
     // The ds4 emitter builds its in-step tool-call grammar from the raw tool
@@ -12458,9 +12425,10 @@ fn generate_deepseek4_spec(
         },
         temp, // temp>0 → DSpark sampled verify (routed here only when supports_temp_verify)
     ) {
-        Some(r) => r,
+        Ok(Some(r)) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
-        None => return,
+        Ok(None) => return GenerateResult::Complete,
+        Err(failure) => return failure,
     };
 
     // ── ds4 done envelope ────────────────────────────────────────
@@ -12500,6 +12468,7 @@ fn generate_deepseek4_spec(
     });
     let _ = writeln!(stdout, "{}", done_envelope);
     let _ = stdout.flush();
+    GenerateResult::Complete
 }
 
 /// Local terminal policy for DeepSeek's bespoke AR parser. The parser owns
@@ -12533,48 +12502,44 @@ fn generate_deepseek4(
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    // The single-GPU ds4 bundle (config/weights/state/eos/pbs) lives in
-    // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`/
-    // `pbs` (shared) and `state` (`&mut`) are live simultaneously, exactly as
-    // the forward path needs.
-    let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
+) -> GenerateResult {
+    let eos_tok = match m.state.as_ref() {
+        Some(ModelState::Deepseek4(b)) => b.eos_tok,
+        _ => {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
+        }
     };
-    let cfg = &b.config;
-    let weights = &b.weights;
-    let state = &mut b.state;
-    let eos_tok = b.eos_tok;
-    let pbs = &b.pbs;
 
-    let prompt_ids = build_deepseek4_dsml_prompt(
-        tokenizer,
-        system_prompt,
-        tools,
-        messages_history,
-        prompt,
-        think_mode,
-        eos_tok,
-        &mut m.persist.asst_turn_cache,
-    );
+    let prompt_ids = {
+        let tokenizer = match m.tokenizer.as_ref() {
+            Some(t) => t,
+            None => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
+                    id
+                );
+                let _ = stdout.flush();
+                return GenerateResult::Complete;
+            }
+        };
+        build_deepseek4_dsml_prompt(
+            tokenizer,
+            system_prompt,
+            tools,
+            messages_history,
+            prompt,
+            think_mode,
+            eos_tok,
+            &mut m.persist.asst_turn_cache,
+        )
+    };
 
     if prompt_ids.is_empty() {
         let _ = writeln!(
@@ -12583,7 +12548,7 @@ fn generate_deepseek4(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
@@ -12591,6 +12556,7 @@ fn generate_deepseek4(
         .as_deref()
         == Some("1")
     {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
         let rendered = tokenizer.decode(&prompt_ids);
         let path = format!(
             "/tmp/hipfire-prompt-{}.txt",
@@ -12713,29 +12679,11 @@ fn generate_deepseek4(
 
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
-        state.reset();
-        // reset() only rewinds n_tokens; the position-indexed decode caches
-        // (SWA ring, compressed/full KV, indexer scratch) still hold the prior
-        // turn's residue, which bleeds into this fresh conversation's forward
-        // and makes greedy output drift turn-to-turn (the "recall/tool-calls
-        // unreliable" symptom). Zero them so a fresh conversation reproduces a
-        // freshly-launched daemon's clean, deterministic state.
-        state.zero_decode_caches(gpu);
-        m.session.conversation_tokens.clear();
-        // Tear down the captured V4F decode hipGraph alongside the
-        // state, same rationale as the daemon's `"reset"` handler:
-        // a fresh-context turn invalidates every device-buffer pointer
-        // and host scalar the captured graph baked in at capture time
-        // (state.attn_state_buf slot/n_valid/k_active values derived
-        // from the prior n_tokens, compressor ring/commit slots, etc.).
-        // Without this, the warmup-then-replay state machine fires
-        // warmup on the first decode (because `state.reset()` clears
-        // `ar_forward_warmed_up`), then immediately replays the STALE
-        // graph on the second decode and crashes with the same
-        // "download logits (graph path): illegal memory access" we
-        // saw on multi-turn pi sessions before the explicit-reset fix.
-        gpu.invalidate_graph_state();
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
     let start_pos: u32 = lcp as u32;
 
     // Slice off the suffix — the only tokens we actually need to prefill.
@@ -12764,8 +12712,18 @@ fn generate_deepseek4(
             m.meta.physical_cap
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
+
+    // All lifecycle decisions and guards are complete. Only now borrow the
+    // architecture bundle for the forward/decode phase.
+    let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
+        unreachable!();
+    };
+    let cfg = &b.config;
+    let weights = &b.weights;
+    let state = &mut b.state;
+    let pbs = &b.pbs;
 
     // Prefill: batched chunked through PBS. (The MTP-fill prefill variant moved
     // to the drafter's `mtp_prefill`, driven by `generate_deepseek4_spec`.)
@@ -12784,9 +12742,12 @@ fn generate_deepseek4(
             // Release the architecture borrows before the canonical reset;
             // otherwise this path can emit an error while dirty DS4 rings and
             // session tokens remain reusable by turn two.
-            model_reset_context(m, gpu);
-            emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
-            return;
+            if let Err(reset_error) = model_reset_context(m, gpu) {
+                return reset_failed(id, reset_error);
+            } else {
+                emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
+            }
+            return GenerateResult::Complete;
         }
     };
     // `forward_prefill_batch_chunked` does NOT advance `state.n_tokens`.
@@ -13025,19 +12986,15 @@ fn generate_deepseek4(
                 // the parser's buffered DSML/text state without flushing it.
                 settle_deepseek4_ar_parser(parser, false, |_| {});
                 drop(absorb_event);
-                model_reset_context(m, gpu);
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-                    id
-                );
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{}}}"#,
-                    id, generated_count
-                );
+                if let Err(reset_error) = model_reset_context(m, gpu) {
+                    return reset_failed(id, reset_error);
+                } else {
+                    let (aborted, done) = deepseek4_abort_json(id, generated_count);
+                    let _ = writeln!(stdout, "{aborted}");
+                    let _ = writeln!(stdout, "{done}");
+                }
                 let _ = stdout.flush();
-                return;
+                return GenerateResult::Complete;
             }
             let frag = tokenizer.decode(&[next_tok]);
             for ev in parser.feed(&frag) {
@@ -13076,10 +13033,13 @@ fn generate_deepseek4(
                     // GPU errors must not run the parser's terminal flush.
                     settle_deepseek4_ar_parser(parser, false, |_| {});
                     drop(absorb_event);
-                    model_reset_context(m, gpu);
+                    if let Err(reset_error) = model_reset_context(m, gpu) {
+                        return reset_failed(id, reset_error);
+                    } else {
                     emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
+                    }
                     let _ = stdout.flush();
-                    return;
+                    return GenerateResult::Complete;
                 }
             }
         }
@@ -13206,6 +13166,7 @@ fn generate_deepseek4(
     });
     let _ = writeln!(stdout, "{}", done_envelope);
     let _ = stdout.flush();
+    GenerateResult::Complete
 }
 
 fn generate_lfm2moe(
@@ -13221,7 +13182,7 @@ fn generate_lfm2moe(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
+) -> GenerateResult {
     if m.tokenizer.is_none() {
         let _ = writeln!(
             stdout,
@@ -13229,7 +13190,7 @@ fn generate_lfm2moe(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
     if m.lfm2moe().is_none() {
         let _ = writeln!(
@@ -13238,7 +13199,7 @@ fn generate_lfm2moe(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     // ── Prompt build (same two-path branch as the minimax AR path) ──
@@ -13329,7 +13290,7 @@ fn generate_lfm2moe(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     let eos_tok = m.lfm2moe().unwrap().eos_tok;
@@ -13377,9 +13338,9 @@ fn generate_lfm2moe(
     // prompt each turn; it now does so from position 0 with no stale KV. A
     // continuing conversation re-prefills its whole history from the prompt, so
     // multi-turn is preserved (validated: Bjorn/axolotl recall).
-    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
-    m.session.seq_pos = 0;
-    m.session.conversation_tokens.clear();
+    if let Err(error) = model_reset_context(m, gpu) {
+        return reset_failed(id, error);
+    }
 
     // After the reset the KV starts at 0, so the only overflow risk is a SINGLE
     // prompt+generation larger than the whole context — the prefill decode_step
@@ -13398,7 +13359,7 @@ fn generate_lfm2moe(
             cap
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     let t0 = Instant::now();
@@ -13416,7 +13377,7 @@ fn generate_lfm2moe(
         m: &mut *m,
         stop_ids,
     };
-    ar_generate(
+    let ar_result = ar_generate(
         &mut __disp,
         ForwardCtx::Single(gpu),
         stdout,
@@ -13450,6 +13411,8 @@ fn generate_lfm2moe(
         t0,
         None, // tape (prod: no dual-run)
     );
+    drop(__disp);
+    ar_result
 }
 
 /// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
@@ -13482,7 +13445,7 @@ fn generate_minimax(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
+) -> GenerateResult {
     if m.tokenizer.is_none() {
         let _ = writeln!(
             stdout,
@@ -13490,7 +13453,7 @@ fn generate_minimax(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
     if m.minimax().is_none() {
         let _ = writeln!(
@@ -13499,7 +13462,7 @@ fn generate_minimax(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
@@ -13601,7 +13564,7 @@ fn generate_minimax(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     // Capacity guard. No eviction on arch_id=10 — reset the KV cursor when the
@@ -13617,9 +13580,9 @@ fn generate_minimax(
             (state.n_tokens, state.max_seq)
         };
         eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
-        m.minimax_mut().unwrap().state.reset();
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        }
 
         // O2b-2 capacity guard (minimax single): the reset above recovers a
         // grown multi-turn conversation, but a SINGLE prompt larger than the
@@ -13639,7 +13602,7 @@ fn generate_minimax(
                 cap
             );
             let _ = stdout.flush();
-            return;
+            return GenerateResult::Complete;
         }
     }
 
@@ -13694,10 +13657,12 @@ fn generate_minimax(
             m.session.seq_pos = lcp;
             prompt_ids[lcp..].to_vec()
         } else {
-            if prior_len > 0 {
-                m.minimax_mut().unwrap().state.reset();
-                m.session.seq_pos = 0;
-                m.session.conversation_tokens.clear();
+            // A cold-prefill decision owns the full context transition even
+            // when the session mirror is already empty (for example after an
+            // aborted or externally cleared request). Do not infer reset
+            // ownership from `prior_len`; route it through the loader façade.
+            if let Err(error) = model_reset_context(m, gpu) {
+                return reset_failed(id, error);
             }
             prompt_ids.clone()
         }
@@ -13736,7 +13701,7 @@ fn generate_minimax(
     // design). No think-cap (minimax primes its own `<think>` and emits its own
     // `</think>`), no grammar, no stop-seqs plumbed.
     let mut __disp = MinimaxDispatch { m: &mut *m };
-    ar_generate(
+    let ar_result = ar_generate(
         &mut __disp,
         ForwardCtx::Single(gpu),
         stdout,
@@ -13770,6 +13735,8 @@ fn generate_minimax(
         t0,
         None, // tape (prod: no dual-run)
     );
+    drop(__disp);
+    ar_result
 }
 
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
@@ -14110,7 +14077,7 @@ fn generate_cohere2moe(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
+) -> GenerateResult {
     if m.tokenizer.is_none() {
         let _ = writeln!(
             stdout,
@@ -14118,7 +14085,7 @@ fn generate_cohere2moe(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
     if m.cohere2moe().is_none() {
         let _ = writeln!(
@@ -14127,7 +14094,7 @@ fn generate_cohere2moe(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     // ── Prompt build (same two-path branch as the minimax / lfm2moe AR path) ──
@@ -14216,7 +14183,7 @@ fn generate_cohere2moe(
                         "[daemon] cohere2moe jinja render failed ({e}) — refusing ChatML fallback"
                     );
                     emit_error_with_id(stdout, id, format!("cohere2moe jinja render failed: {e}"));
-                    return;
+                    return GenerateResult::Complete;
                 }
             }
         } else {
@@ -14237,7 +14204,7 @@ fn generate_cohere2moe(
                 id,
                 format!("cohere2moe requires its jinja chat template ({why})"),
             );
-            return;
+            return GenerateResult::Complete;
         }
     };
 
@@ -14248,7 +14215,7 @@ fn generate_cohere2moe(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     // Capacity guard. No eviction on arch_id=12 — reset the KV cursor when the
@@ -14268,6 +14235,9 @@ fn generate_cohere2moe(
             prompt_ids.len(),
             max_seq,
         );
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        } else {
         emit_error_with_id(
             stdout,
             id,
@@ -14277,10 +14247,8 @@ fn generate_cohere2moe(
                 max_seq
             ),
         );
-        let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
-        return;
+        }
+        return GenerateResult::Complete;
     }
     // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
     // cache. `max_tokens` is shadowed for the decode loop below.
@@ -14292,6 +14260,7 @@ fn generate_cohere2moe(
     // positions ≥ lcp are simply overwritten by the new prefill and the stale
     // tail is never attended. We rewind `n_tokens` to `lcp` and re-prefill the
     // suffix; the reused prefix GROWS with the conversation.
+    let cold_start: bool;
     let prefill_ids: Vec<u32> = {
         let prior_len = m.session.conversation_tokens.len();
         let max_match = prior_len.min(prompt_ids.len());
@@ -14303,6 +14272,7 @@ fn generate_cohere2moe(
         // `partial` is the divergence case (lcp < prior_len); lcp == prior_len is
         // the degenerate pure-extension case (rewind is then a no-op).
         let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+        cold_start = !cache_hit;
         let partial = lcp < prior_len;
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
@@ -14326,10 +14296,12 @@ fn generate_cohere2moe(
             m.session.seq_pos = lcp;
             prompt_ids[lcp..].to_vec()
         } else {
-            if prior_len > 0 {
-                let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-                m.session.seq_pos = 0;
-                m.session.conversation_tokens.clear();
+            // A cold-prefill decision owns the full context transition even
+            // when the session mirror is already empty (for example after an
+            // aborted or externally cleared request). Do not infer reset
+            // ownership from `prior_len`; route it through the loader façade.
+            if let Err(error) = model_reset_context(m, gpu) {
+                return reset_failed(id, error);
             }
             prompt_ids.clone()
         }
@@ -14348,8 +14320,9 @@ fn generate_cohere2moe(
     let mut __disp = Cohere2MoeDispatch {
         m: &mut *m,
         tools: tools.map(|t| t.to_vec()),
+        cold_start,
     };
-    ar_generate(
+    let ar_result = ar_generate(
         &mut __disp,
         ForwardCtx::Single(gpu),
         stdout,
@@ -14383,6 +14356,8 @@ fn generate_cohere2moe(
         t0,
         None, // tape (prod: no dual-run)
     );
+    drop(__disp);
+    ar_result
 }
 
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
@@ -14414,38 +14389,26 @@ fn generate_qwen2(
     max_tokens: usize,
     _repeat_penalty: f32,
     _repeat_window: usize,
-) {
+) -> GenerateResult {
     // Qwen2 (arch 7) AR decode via the generic ar_generate driver (Inc 2 — flipped
     // from the legacy greedy loop; uplift: qwen2 gains ar_generate's n-gram loop
     // guard). generate_qwen2 keeps its raw-prompt preamble (no framing) + capacity
     // guard, then hands the outputs to ar_generate (which prefills + decodes).
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
+    let prompt_ids = {
+        let tokenizer = match m.tokenizer.as_ref() {
+            Some(t) => t,
+            None => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
+                    id
+                );
+                let _ = stdout.flush();
+                return GenerateResult::Complete;
+            }
+        };
+        tokenizer.encode(prompt)
     };
-    let state_ref = match m.state.as_mut() {
-        Some(ModelState::Qwen2(b)) => b,
-        _ => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"qwen2 state missing on arch_id=7 generate"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let state = &mut state_ref.state;
-
-    let prompt_ids = tokenizer.encode(prompt);
     if prompt_ids.is_empty() {
         let _ = writeln!(
             stdout,
@@ -14453,24 +14416,35 @@ fn generate_qwen2(
             id
         );
         let _ = stdout.flush();
-        return;
+        return GenerateResult::Complete;
     }
 
     // Capacity guard. No eviction on arch_id=7 yet — reset state when
     // the requested run would overflow the KV budget.
-    if state
-        .next_pos
+    let (next_pos, max_seq) = match m.state.as_ref() {
+        Some(ModelState::Qwen2(b)) => (b.state.next_pos, b.state.max_seq),
+        _ => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"qwen2 state missing on arch_id=7 generate"}}"#,
+                id
+            );
+            let _ = stdout.flush();
+            return GenerateResult::Complete;
+        }
+    };
+    if next_pos
         .saturating_add(prompt_ids.len())
         .saturating_add(max_tokens)
-        > state.max_seq
+        > max_seq
     {
         eprintln!(
             "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
-            state.next_pos, state.max_seq,
+            next_pos, max_seq,
         );
-        state.reset();
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        }
 
         // O2b-2 capacity guard (qwen2 single): the reset above (next_pos=0)
         // recovers a grown multi-turn conversation, but a SINGLE prompt larger
@@ -14479,8 +14453,8 @@ fn generate_qwen2(
         // the reset, if prompt + generation still overflows, emit a clean error.
         // saturating_add: an adversarially huge max_tokens must not wrap usize
         // and slip under the cap.
-        if prompt_ids.len().saturating_add(max_tokens) > state.max_seq {
-            let cap = state.max_seq;
+        if prompt_ids.len().saturating_add(max_tokens) > max_seq {
+            let cap = max_seq;
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
@@ -14490,7 +14464,7 @@ fn generate_qwen2(
                 cap
             );
             let _ = stdout.flush();
-            return;
+            return GenerateResult::Complete;
         }
     }
 
@@ -14502,7 +14476,7 @@ fn generate_qwen2(
     // borrows above have ended, so Qwen2Dispatch can take &mut m.
     let __prefill_tokens = prompt_ids.len();
     let mut __disp = Qwen2Dispatch { m: &mut *m };
-    ar_generate(
+    let ar_result = ar_generate(
         &mut __disp,
         ForwardCtx::Single(gpu),
         stdout,
@@ -14536,6 +14510,8 @@ fn generate_qwen2(
         t0,
         None,
     );
+    drop(__disp);
+    ar_result
 }
 
 fn generate_vl(
@@ -14543,7 +14519,7 @@ fn generate_vl(
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
-) {
+) -> GenerateResult {
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed. The VL path samples exclusively via sampler::sample_cpu, which
     // draws from this global; without the per-request reset it carried RNG state
@@ -14568,24 +14544,30 @@ fn generate_vl(
         repeat_window,
         max_think_tokens,
     } = *params;
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let vision_config = &m.vision.as_ref().unwrap().config;
+    let vision_config = m.vision.as_ref().unwrap().config.clone();
 
     // Vision special-token IDs resolved from the tokenizer rather than
     // hardcoded constants. Different VL-capable Qwen variants ship with
     // different IDs for these tokens; a hardcoded mismatch silently
-    // splices the wrong tokens into the prompt. Required at load time —
-    // panic loudly here so the failure is at first-VL-request, not after
-    // a successful but wrong forward pass.
-    let image_pad_id = tokenizer
-        .special_token_id("<|image_pad|>")
-        .unwrap_or_else(|| panic!("VL tokenizer missing <|image_pad|> special token"));
-    let vision_start_id = tokenizer
-        .special_token_id("<|vision_start|>")
-        .unwrap_or_else(|| panic!("VL tokenizer missing <|vision_start|> special token"));
-    let vision_end_id = tokenizer
-        .special_token_id("<|vision_end|>")
-        .unwrap_or_else(|| panic!("VL tokenizer missing <|vision_end|> special token"));
+    // splices the wrong tokens into the prompt. This is a request error, not
+    // a process-fatal invariant: keep the daemon lifecycle in control of the
+    // dirty-state reset path instead of panicking here.
+    let (image_pad_id, vision_start_id, vision_end_id) = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        match (
+            tokenizer.special_token_id("<|image_pad|>"),
+            tokenizer.special_token_id("<|vision_start|>"),
+            tokenizer.special_token_id("<|vision_end|>"),
+        ) {
+            (Some(image_pad), Some(vision_start), Some(vision_end)) => {
+                (image_pad, vision_start, vision_end)
+            }
+            _ => {
+                write_error(stdout, id, "VL tokenizer is missing a required vision token");
+                return GenerateResult::Complete;
+            }
+        }
+    };
 
     // Image preprocessing (CPU decode + smart resize). Cheap relative to
     // the GPU vision encoder, so we run it before the capacity check —
@@ -14602,7 +14584,7 @@ fn generate_vl(
                 Ok(result) => result,
                 Err(e) => {
                     write_error(stdout, id, &e);
-                    return;
+                    return GenerateResult::Complete;
                 }
             }
         }
@@ -14616,7 +14598,7 @@ fn generate_vl(
                     Some((_, after)) => after,
                     None => {
                         write_error(stdout, id, "malformed data URL: missing ',' separator");
-                        return;
+                        return GenerateResult::Complete;
                     }
                 }
             } else {
@@ -14634,7 +14616,7 @@ fn generate_vl(
                         id,
                         &format!("failed to decode base64 image data: {e}"),
                     );
-                    return;
+                    return GenerateResult::Complete;
                 }
             };
             match image::load_and_preprocess_from_bytes(
@@ -14645,12 +14627,23 @@ fn generate_vl(
                 Ok(result) => result,
                 Err(e) => {
                     write_error(stdout, id, &e);
-                    return;
+                    return GenerateResult::Complete;
                 }
             }
         }
     };
     eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
+
+    let image_state = vl_image_state(&pixels, img_h, img_w);
+    if prepare_vl_request_state(&mut m.session, image_state) {
+        eprintln!(
+            "[daemon/vl] replacing prior image turn (image_state={image_state:016x})"
+        );
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        }
+        m.session.vl_image_state = Some(image_state);
+    }
 
     let grid_h = img_h / vision_config.patch_size;
     let grid_w = img_w / vision_config.patch_size;
@@ -14662,10 +14655,13 @@ fn generate_vl(
     // on first turn would otherwise let an over-budget request through
     // the soft check, only to fail the hard check after the expensive
     // vision encoder runs.
-    let system_est = system_prompt
-        .map(|s| tokenizer.encode(s).len())
-        .unwrap_or(0);
-    let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
+    let prompt_est = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let system_est = system_prompt
+            .map(|s| tokenizer.encode(s).len())
+            .unwrap_or(0);
+        tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20
+    };
 
     if m.eviction.is_none()
         && m.session
@@ -14678,31 +14674,22 @@ fn generate_vl(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
             m.session.seq_pos, m.meta.max_seq
         );
-        m.session.seq_pos = 0;
-        m.session.conversation_tokens.clear();
-        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
-        // Free the speculator's (relocated) checkpoint ring on reset.
-        if let Some(s) = m.speculator.as_mut() {
-            s.reset(gpu);
-        }
-        reset_qwen35_recurrent_parts(&mut m.state, &mut m.parallel, gpu);
-        if let Some(ad) = m.session.kv_adaptive.as_mut() {
-            ad.reset();
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
         }
     }
 
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+
     if m.eviction.is_none() && prompt_est.saturating_add(max_tokens) > m.meta.max_seq {
-        write_error(
-            stdout,
-            id,
-            &format!(
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: format!(
                 "request size ({} tokens) exceeds loaded KV budget ({})",
                 prompt_est.saturating_add(max_tokens),
                 m.meta.max_seq,
             ),
-        );
-        return;
+        });
     }
 
     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
@@ -14765,10 +14752,9 @@ fn generate_vl(
             > m.meta.max_seq
     };
     if over_budget {
-        write_error(
-            stdout,
-            id,
-            &format!(
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: format!(
                 "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
                 m.session.seq_pos,
                 prompt_tokens.len(),
@@ -14780,11 +14766,16 @@ fn generate_vl(
                     m.meta.max_seq
                 },
             ),
-        );
-        return;
+        });
     }
 
     // Now safe to run the expensive GPU vision encoder.
+    if check_abort(id) {
+        return GenerateResult::Deferred(DeferredTerminal::Aborted {
+            id: id.to_string(),
+            generated: 0,
+        });
+    }
     let patches = hipfire_arch_qwen35_vl::image::extract_patches(
         &pixels,
         3,
@@ -14794,9 +14785,22 @@ fn generate_vl(
         vision_config.temporal_patch_size,
         vision_config.spatial_merge_size,
     );
-    let visual_tokens =
-        qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
-            .expect("vision forward failed");
+    let visual_tokens = match qwen35_vl::vision_forward(
+        gpu,
+        vision_weights,
+        &vision_config,
+        &patches,
+        grid_h,
+        grid_w,
+    ) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("vision forward failed: {error:?}"),
+            });
+        }
+    };
 
     let im_end_token = if im_end.len() == 1 {
         Some(im_end[0])
@@ -14824,9 +14828,15 @@ fn generate_vl(
     // advance m.session.seq_pos in-loop and call maybe_evict after every write.
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
+        if check_abort(id) {
+            return GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: id.to_string(),
+                generated: 0,
+            });
+        }
         if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
-            qwen35::forward_scratch_embed(
+            if let Err(error) = qwen35::forward_scratch_embed(
                 gpu,
                 weights,
                 config,
@@ -14835,11 +14845,15 @@ fn generate_vl(
                 kv,
                 dn,
                 scratch,
-            )
-            .expect("forward_scratch_embed failed");
+            ) {
+                return GenerateResult::Deferred(DeferredTerminal::Error {
+                    id: id.to_string(),
+                    message: format!("forward_scratch_embed failed: {error:?}"),
+                });
+            }
             visual_idx += 1;
         } else {
-            qwen35::forward_scratch(
+            if let Err(error) = qwen35::forward_scratch(
                 gpu,
                 weights,
                 config,
@@ -14848,15 +14862,27 @@ fn generate_vl(
                 kv,
                 dn,
                 scratch,
-            )
-            .expect("forward_scratch failed");
+            ) {
+                return GenerateResult::Deferred(DeferredTerminal::Error {
+                    id: id.to_string(),
+                    message: format!("forward_scratch failed: {error:?}"),
+                });
+            }
         }
         m.session.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
             if let Some(hipfire_runtime::triattn::EvictionResult {
                 new_physical: new_phys,
                 ..
-            }) = ev.maybe_evict(gpu, kv, m.session.seq_pos).unwrap()
+            }) = match ev.maybe_evict(gpu, kv, m.session.seq_pos) {
+                Ok(result) => result,
+                Err(error) => {
+                    return GenerateResult::Deferred(DeferredTerminal::Error {
+                        id: id.to_string(),
+                        message: format!("VL prefill eviction failed: {error:?}"),
+                    });
+                }
+            }
             {
                 m.session.seq_pos = new_phys;
             }
@@ -14884,7 +14910,15 @@ fn generate_vl(
     // Attractor-block uses CPU-side mutation of the downloaded logits
     // vector (`block_attractor_unclosed_cpu`) instead of the previous
     // GPU memcpy + redownload — saves a full vocab-sized DMA per token.
-    let mut logits = gpu.download_f32(&scratch.logits).unwrap();
+    let mut logits = match gpu.download_f32(&scratch.logits) {
+        Ok(logits) => logits,
+        Err(error) => {
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("VL logits download failed: {error:?}"),
+            });
+        }
+    };
     if let Some((open, close)) = think_pair {
         block_attractor_unclosed_cpu(
             &mut logits,
@@ -14938,6 +14972,12 @@ fn generate_vl(
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     while generated < max_tokens {
+        if check_abort(id) {
+            return GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: id.to_string(),
+                generated,
+            });
+        }
         generated += 1;
         m.session.conversation_tokens.push(next_token);
         emit_committed_event(
@@ -14990,7 +15030,7 @@ fn generate_vl(
             break;
         }
 
-        qwen35::forward_scratch(
+        if let Err(error) = qwen35::forward_scratch(
             gpu,
             weights,
             config,
@@ -14999,19 +15039,39 @@ fn generate_vl(
             kv,
             dn,
             scratch,
-        )
-        .unwrap();
+        ) {
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("VL decode failed: {error:?}"),
+            });
+        }
         m.session.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
             if let Some(hipfire_runtime::triattn::EvictionResult {
                 new_physical: new_phys,
                 ..
-            }) = ev.maybe_evict(gpu, kv, m.session.seq_pos).unwrap()
+            }) = match ev.maybe_evict(gpu, kv, m.session.seq_pos) {
+                Ok(result) => result,
+                Err(error) => {
+                    return GenerateResult::Deferred(DeferredTerminal::Error {
+                        id: id.to_string(),
+                        message: format!("VL eviction failed: {error:?}"),
+                    });
+                }
+            }
             {
                 m.session.seq_pos = new_phys;
             }
         }
-        logits = gpu.download_f32(&scratch.logits).unwrap();
+        logits = match gpu.download_f32(&scratch.logits) {
+            Ok(logits) => logits,
+            Err(error) => {
+                return GenerateResult::Deferred(DeferredTerminal::Error {
+                    id: id.to_string(),
+                    message: format!("VL decode logits download failed: {error:?}"),
+                });
+            }
+        };
         // hunt3 M-D: scope ngram-block + repeat-penalty history to generated-only.
         let vl_ngram_scope = &m.session.conversation_tokens[vl_ngram_scope_start..];
         llama::apply_ngram_block(&mut logits, vl_ngram_scope);
@@ -15049,7 +15109,7 @@ fn generate_vl(
                     let budget_left = max_tokens.saturating_sub(generated);
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {
-                        qwen35::forward_scratch(
+                        if let Err(error) = qwen35::forward_scratch(
                             gpu,
                             weights,
                             config,
@@ -15058,14 +15118,26 @@ fn generate_vl(
                             kv,
                             dn,
                             scratch,
-                        )
-                        .unwrap();
+                        ) {
+                            return GenerateResult::Deferred(DeferredTerminal::Error {
+                                id: id.to_string(),
+                                message: format!("VL think-close forward failed: {error:?}"),
+                            });
+                        }
                         m.session.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
                                 new_physical: new_phys,
                                 ..
-                            }) = ev.maybe_evict(gpu, kv, m.session.seq_pos).unwrap()
+                            }) = match ev.maybe_evict(gpu, kv, m.session.seq_pos) {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    return GenerateResult::Deferred(DeferredTerminal::Error {
+                                        id: id.to_string(),
+                                        message: format!("VL think-close eviction failed: {error:?}"),
+                                    });
+                                }
+                            }
                             {
                                 m.session.seq_pos = new_phys;
                             }
@@ -15113,7 +15185,15 @@ fn generate_vl(
                     if generated >= max_tokens {
                         break;
                     }
-                    logits = gpu.download_f32(&scratch.logits).unwrap();
+                    logits = match gpu.download_f32(&scratch.logits) {
+                        Ok(logits) => logits,
+                        Err(error) => {
+                            return GenerateResult::Deferred(DeferredTerminal::Error {
+                                id: id.to_string(),
+                                message: format!("VL think-close logits download failed: {error:?}"),
+                            });
+                        }
+                    };
                     block_attractor_unclosed_cpu(
                         &mut logits,
                         &m.session.conversation_tokens,
@@ -15136,14 +15216,35 @@ fn generate_vl(
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
     if im_end_token == Some(*m.session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
-            qwen35::forward_scratch(gpu, weights, config, t, m.session.seq_pos, kv, dn, scratch)
-                .unwrap();
+            if let Err(error) = qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                t,
+                m.session.seq_pos,
+                kv,
+                dn,
+                scratch,
+            ) {
+                return GenerateResult::Deferred(DeferredTerminal::Error {
+                    id: id.to_string(),
+                    message: format!("VL EOS-boundary forward failed: {error:?}"),
+                });
+            }
             m.session.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
                     ..
-                }) = ev.maybe_evict(gpu, kv, m.session.seq_pos).unwrap()
+                }) = match ev.maybe_evict(gpu, kv, m.session.seq_pos) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return GenerateResult::Deferred(DeferredTerminal::Error {
+                            id: id.to_string(),
+                            message: format!("VL EOS-boundary eviction failed: {error:?}"),
+                        });
+                    }
+                }
                 {
                     m.session.seq_pos = new_phys;
                 }
@@ -15184,6 +15285,7 @@ fn generate_vl(
         prefill_s * 1000.0
     );
     let _ = stdout.flush();
+    GenerateResult::Complete
 }
 
 /// dots.ocr (arch_id=8) VL generation. Single-image, greedy decode —
@@ -15203,7 +15305,7 @@ fn generate_vl_dots_ocr(
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
-) {
+) -> GenerateResult {
     use hipfire_arch_dots_ocr::image as dots_image;
     let t0 = Instant::now();
     let GenerateVLParams {
@@ -15227,7 +15329,7 @@ fn generate_vl_dots_ocr(
                     Some((_, after)) => after,
                     None => {
                         write_error(stdout, id, "malformed data URL: missing ',' separator");
-                        return;
+                        return GenerateResult::Complete;
                     }
                 },
                 None => &b64[..],
@@ -15240,7 +15342,7 @@ fn generate_vl_dots_ocr(
                 Ok(bytes) => dots_image::preprocess_image_bytes(&bytes),
                 Err(e) => {
                     write_error(stdout, id, &format!("dots.ocr: base64 decode failed: {e}"));
-                    return;
+                    return GenerateResult::Complete;
                 }
             }
         }
@@ -15253,23 +15355,41 @@ fn generate_vl_dots_ocr(
                 id,
                 &format!("dots.ocr image preprocess failed: {e}"),
             );
-            return;
+            return GenerateResult::Complete;
         }
     };
+    let image_state = vl_image_state(&img.patches, img.resized_h, img.resized_w);
+    if prepare_vl_request_state(&mut m.session, image_state) {
+        eprintln!(
+            "[daemon/vl] replacing prior image turn (image_state={image_state:016x})"
+        );
+        if let Err(error) = model_reset_context(m, gpu) {
+            return reset_failed(id, error);
+        }
+        m.session.vl_image_state = Some(image_state);
+    }
     let n_visual = img.n_visual_tokens();
     let n_patches = img.n_patches();
     eprintln!(
         "[dots-ocr] grid {}x{}, {} patches → {} visual tokens",
         img.grid_h, img.grid_w, n_patches, n_visual
     );
+    if check_abort(id) {
+        return GenerateResult::Deferred(DeferredTerminal::Aborted {
+            id: id.to_string(),
+            generated: 0,
+        });
+    }
 
     let max_seq = m.meta.max_seq;
 
     // 2. Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let Some(ModelState::DotsOcr(b)) = m.state.as_mut() else {
-        write_error(stdout, id, "dots-ocr bundle missing on arch_id=8");
-        return;
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: "dots-ocr bundle missing on arch_id=8".to_string(),
+        });
     };
     let config = &b.config;
     let weights = &b.weights;
@@ -15280,17 +15400,15 @@ fn generate_vl_dots_ocr(
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
     let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
     if prompt_ids.len().saturating_add(max_tokens) > max_seq {
-        write_error(
-            stdout,
-            id,
-            &format!(
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: format!(
                 "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
                 prompt_ids.len(),
                 max_tokens,
                 max_seq
             ),
-        );
-        return;
+        });
     }
 
     // 4. Vision encoder → merged visual tokens.
@@ -15298,8 +15416,10 @@ fn generate_vl_dots_ocr(
     let patches_gpu = match gpu.upload_f32(&img.patches, &[n_patches, patch_cols]) {
         Ok(t) => t,
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr patch upload failed: {e:?}"));
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("dots.ocr patch upload failed: {e:?}"),
+            });
         }
     };
     let merged_gpu = match dots_ocr::vision_forward(
@@ -15313,12 +15433,10 @@ fn generate_vl_dots_ocr(
         Ok(t) => t,
         Err(e) => {
             let _ = gpu.free_tensor(patches_gpu);
-            write_error(
-                stdout,
-                id,
-                &format!("dots.ocr vision_forward failed: {e:?}"),
-            );
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("dots.ocr vision_forward failed: {e:?}"),
+            });
         }
     };
     let _ = gpu.free_tensor(patches_gpu);
@@ -15326,30 +15444,26 @@ fn generate_vl_dots_ocr(
         Ok(v) => v,
         Err(e) => {
             let _ = gpu.free_tensor(merged_gpu);
-            write_error(
-                stdout,
-                id,
-                &format!("dots.ocr merger download failed: {e:?}"),
-            );
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("dots.ocr merger download failed: {e:?}"),
+            });
         }
     };
     let _ = gpu.free_tensor(merged_gpu);
     // Hard guard: merger output count MUST equal the imgpad-slot count, or
     // the splice silently corrupts the text context (PRD §"Vision token splicing").
     if merged.len() != n_visual * dim {
-        write_error(
-            stdout,
-            id,
-            &format!(
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: format!(
                 "dots.ocr: merger produced {} values but prompt has {} <|imgpad|> slots × {} dims = {}",
                 merged.len(),
                 n_visual,
                 dim,
                 n_visual * dim
             ),
-        );
-        return;
+        });
     }
 
     // 5. Prefill: build the [seq × dim] embedding matrix (token-embedding
@@ -15357,23 +15471,27 @@ fn generate_vl_dots_ocr(
     // and run it through the batched prefill in one pass. Only the ~215
     // text positions need a GPU embedding lookup; the 4880 visual rows are
     // already host-resident in `merged`.
-    state.reset();
     let t_prefill = Instant::now();
     let mut embeds = vec![0f32; prompt_ids.len() * dim];
     let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
         Ok(t) => t,
         Err(e) => {
-            write_error(
-                stdout,
-                id,
-                &format!("dots.ocr embed scratch alloc failed: {e:?}"),
-            );
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("dots.ocr embed scratch alloc failed: {e:?}"),
+            });
         }
     };
     let mut visual_idx = 0usize;
     let mut embed_err: Option<String> = None;
     for (pos, &token) in prompt_ids.iter().enumerate() {
+        if check_abort(id) {
+            let _ = gpu.free_tensor(emb_scratch);
+            return GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: id.to_string(),
+                generated: 0,
+            });
+        }
         if token == dots_ocr::IMGPAD_ID {
             embeds[pos * dim..(pos + 1) * dim]
                 .copy_from_slice(&merged[visual_idx * dim..(visual_idx + 1) * dim]);
@@ -15408,22 +15526,18 @@ fn generate_vl_dots_ocr(
     }
     let _ = gpu.free_tensor(emb_scratch);
     if let Some(e) = embed_err {
-        write_error(
-            stdout,
-            id,
-            &format!("dots.ocr prefill embed build failed: {e}"),
-        );
-        return;
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: format!("dots.ocr prefill embed build failed: {e}"),
+        });
     }
     if let Err(e) =
         qwen2::forward_prefill_batch_embeds(gpu, &weights.text, text_cfg, state, &embeds)
     {
-        write_error(
-            stdout,
-            id,
-            &format!("dots.ocr batched prefill failed: {e:?}"),
-        );
-        return;
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: format!("dots.ocr batched prefill failed: {e:?}"),
+        });
     }
     let prefill_tokens = prompt_ids.len();
     let prefill_s = t_prefill.elapsed().as_secs_f64();
@@ -15438,7 +15552,7 @@ fn generate_vl_dots_ocr(
     // released here so the speculative branch can take `&mut m`; the AR path
     // re-borrows them below.
     if m.speculator.is_some() {
-        decode_vl_dots_ocr_ngram(
+        return decode_vl_dots_ocr_ngram(
             m,
             gpu,
             stdout,
@@ -15449,12 +15563,13 @@ fn generate_vl_dots_ocr(
             prefill_tokens,
             prefill_s,
         );
-        return;
     }
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let Some(ModelState::DotsOcr(b)) = m.state.as_mut() else {
-        write_error(stdout, id, "dots-ocr bundle missing on arch_id=8");
-        return;
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: "dots-ocr bundle missing on arch_id=8".to_string(),
+        });
     };
     let config = &b.config;
     let text_cfg = &config.text;
@@ -15470,8 +15585,10 @@ fn generate_vl_dots_ocr(
     let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("dots.ocr argmax failed: {e:?}"),
+            });
         }
     };
     let t_gen = Instant::now();
@@ -15485,6 +15602,12 @@ fn generate_vl_dots_ocr(
     // straight to EOS without a guard; see DotsOcr::loop_guard_overrides.
 
     while generated < max_tokens {
+        if check_abort(id) {
+            return GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: id.to_string(),
+                generated,
+            });
+        }
         if eos_set.contains(&next) {
             break;
         }
@@ -15514,8 +15637,10 @@ fn generate_vl_dots_ocr(
         match qwen2::forward_step_greedy(gpu, &weights.text, text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
-                return;
+                return GenerateResult::Deferred(DeferredTerminal::Error {
+                    id: id.to_string(),
+                    message: format!("dots.ocr decode failed: {e:?}"),
+                });
             }
         }
     }
@@ -15550,6 +15675,7 @@ fn generate_vl_dots_ocr(
         prefill_s * 1000.0
     );
     let _ = stdout.flush();
+    GenerateResult::Complete
 }
 
 /// dots.ocr (arch_id=8) n-gram speculative decode, post-vision-prefill.
@@ -15575,15 +15701,17 @@ fn decode_vl_dots_ocr_ngram(
     t0: Instant,
     prefill_tokens: usize,
     prefill_s: f64,
-) {
+) -> GenerateResult {
     let Some(ModelState::DotsOcr(bundle)) = m.state.as_mut() else {
-        write_error(stdout, id, "dots-ocr bundle missing on arch_id=8");
-        return;
+        return GenerateResult::Deferred(DeferredTerminal::Error {
+            id: id.to_string(),
+            message: "dots-ocr bundle missing on arch_id=8".to_string(),
+        });
     };
     let mut spec = m.speculator.take().unwrap();
     // `m.tokenizer` is a disjoint field → coexists with the bundle borrow above.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    run_dots_ocr_ngram_loop(
+    let result = run_dots_ocr_ngram_loop(
         bundle,
         spec.as_mut(),
         tokenizer,
@@ -15597,6 +15725,7 @@ fn decode_vl_dots_ocr_ngram(
         prefill_s,
     );
     m.speculator = Some(spec);
+    result
 }
 
 /// The dots.ocr n-gram decode loop proper, factored out of
@@ -15617,7 +15746,7 @@ fn run_dots_ocr_ngram_loop(
     t0: Instant,
     prefill_tokens: usize,
     prefill_s: f64,
-) {
+) -> GenerateResult {
     let eos_set: Vec<u32> = if bundle.config.text.eos_token_ids.is_empty() {
         vec![bundle.config.text.eos_token_id]
     } else {
@@ -15629,7 +15758,7 @@ fn run_dots_ocr_ngram_loop(
     // Prime the n-gram drafter + fetch the first token WITHOUT re-running the
     // (vision-conditioned) target prefill. `cache_hit=true` + an empty suffix
     // makes `ChainSpeculator::prefill` skip the target advance —
-    // `spec_advance(&[], prompt_len, reset=false)` just argmaxes the live
+    // `spec_advance(&[], prompt_len)` just argmaxes the live
     // post-vision-prefill logits — and only `drafter.prefill_seed(prompt_ids)`.
     // It also lazily builds the verify scratch (required before the first `step`).
     let first_token = match spec.prefill(
@@ -15644,20 +15773,16 @@ fn run_dots_ocr_ngram_loop(
     ) {
         Ok(PrefillOutcome::Ready { first_token }) => first_token,
         Ok(PrefillOutcome::Aborted) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"done","id":"{}","tokens":0,"tok_s":0.0,"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":0.0,"decode_tok_s":0.0,"ttft_ms":{:.1}}}"#,
-                id,
-                prefill_tokens,
-                prefill_s * 1000.0,
-                prefill_s * 1000.0
-            );
-            let _ = stdout.flush();
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: id.to_string(),
+                generated: 0,
+            });
         }
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr spec prefill: {e}"));
-            return;
+            return GenerateResult::Deferred(DeferredTerminal::Error {
+                id: id.to_string(),
+                message: format!("dots.ocr spec prefill: {e}"),
+            });
         }
     };
 
@@ -15718,7 +15843,10 @@ fn run_dots_ocr_ngram_loop(
         // Decode-side cancel: stop early. The next request resets state at
         // prefill, so no cross-request bleed; the caller restores bundle/spec.
         if check_abort(id) {
-            break;
+            return GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: id.to_string(),
+                generated,
+            });
         }
         // Context-overflow guard (matches generate_spec): one window writes up
         // to `block_size` KV slots.
@@ -15728,8 +15856,10 @@ fn run_dots_ocr_ngram_loop(
         let step = match spec.step(gpu, bundle, position, seed_token, &emitted, None, 0.0) {
             Ok(s) => s,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr spec_step: {e}"));
-                break;
+                return GenerateResult::Deferred(DeferredTerminal::Error {
+                    id: id.to_string(),
+                    message: format!("dots.ocr spec_step: {e}"),
+                });
             }
         };
         spec_cycles += 1;
@@ -15779,6 +15909,7 @@ fn run_dots_ocr_ngram_loop(
         spec_cycles
     );
     let _ = stdout.flush();
+    GenerateResult::Complete
 }
 
 #[cfg(test)]
@@ -15930,10 +16061,104 @@ mod tool_call_parser_tests {
 mod ar_parser_lifecycle_tests {
     use super::{
         ar_sampled_eos, complete_ar_decode, decode_limit_reached, route_ar_decode_outcome,
-        stream_stop, ArDecodeOutcome, ArSampledEos,
+        reset_failed_message, stream_stop, ArDecodeOutcome, ArSampledEos, DeferredTerminal,
+        GenerateResult,
     };
     use hipfire_runtime::stream_parser::{EosDecision, StreamAction, StreamParser};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn generation_errors_are_deferred_with_request_context() {
+        assert_eq!(
+            GenerateResult::Deferred(DeferredTerminal::Error {
+                id: "r1".into(),
+                message: "token forward: bad state".into(),
+            }),
+            GenerateResult::Deferred(DeferredTerminal::Error {
+                id: "r1".into(),
+                message: "token forward: bad state".into(),
+            })
+        );
+        assert_ne!(
+            GenerateResult::Deferred(DeferredTerminal::Aborted {
+                id: "r1".into(),
+                generated: 3,
+            }),
+            GenerateResult::Complete
+        );
+    }
+
+    fn assert_reset_failure_is_untouched(result: GenerateResult, expected_id: &str) {
+        match result {
+            GenerateResult::ResetFailed { id, message } => {
+                assert_eq!(id, expected_id);
+                assert_eq!(message, "reset exploded");
+            }
+            GenerateResult::Deferred(_) => panic!("reset failure was converted to Deferred"),
+            GenerateResult::Complete => panic!("reset failure was swallowed"),
+            GenerateResult::PpCompletion { .. } => {
+                panic!("reset failure was converted to PP completion")
+            }
+        }
+    }
+
+    #[test]
+    fn pp_completion_requires_at_most_one_outer_reset() {
+        let completion = GenerateResult::PpCompletion {
+            generated: 2,
+            prefill_tokens: 4,
+            tok_s: 1.0,
+            prefill_ms: 2.0,
+            prefill_tok_s: 2.0,
+            decode_tok_s: 1.0,
+            reset_required: true,
+        };
+        match completion {
+            GenerateResult::PpCompletion { reset_required, .. } => {
+                assert!(reset_required, "only the outer PP wrapper may reset")
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn text_reset_failure_propagates_untouched() {
+        assert_reset_failure_is_untouched(
+            reset_failed_message("text-id", "reset exploded".into()),
+            "text-id",
+        );
+    }
+
+    #[test]
+    fn vl_reset_failure_propagates_untouched() {
+        assert_reset_failure_is_untouched(
+            reset_failed_message("vl-id", "reset exploded".into()),
+            "vl-id",
+        );
+    }
+
+    #[test]
+    fn spec_reset_failure_propagates_untouched() {
+        assert_reset_failure_is_untouched(
+            reset_failed_message("spec-id", "reset exploded".into()),
+            "spec-id",
+        );
+    }
+
+    #[test]
+    fn pp_reset_failure_propagates_untouched() {
+        assert_reset_failure_is_untouched(
+            reset_failed_message("pp-id", "reset exploded".into()),
+            "pp-id",
+        );
+    }
+
+    #[test]
+    fn deferred_terminal_ids_are_json_escaped() {
+        let id = "deferred\"\\\n";
+        let encoded = serde_json::to_string(id).expect("request id is serializable");
+        assert_eq!(encoded, "\"deferred\\\"\\\\\\n\"");
+    }
 
     struct LifecycleParser {
         finish_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -16691,5 +16916,108 @@ mod mtp_k_tests {
         assert!(!mtp_metadata_requested("auto", false));
         assert!(mtp_metadata_requested("auto", true));
         assert!(mtp_metadata_requested("on", false));
+    }
+}
+
+#[cfg(test)]
+mod vl_request_state_tests {
+    use super::{prepare_vl_request_state, vl_image_state};
+    use hipfire_loader::SessionState;
+
+    #[test]
+    fn image_turn_cold_reset_clears_model_turn_state() {
+        let mut session = SessionState::default();
+        let image = vl_image_state(&[0.0, 1.0, 2.0], 1, 3);
+        assert!(!prepare_vl_request_state(&mut session, image));
+        session.seq_pos = 17;
+        session.conversation_tokens = vec![11, 12, 13];
+        let other_image = vl_image_state(&[0.0, 1.0, 3.0], 1, 3);
+        assert_ne!(image, other_image);
+        assert!(prepare_vl_request_state(&mut session, other_image));
+        assert_eq!(session.seq_pos, 0);
+        assert!(session.conversation_tokens.is_empty());
+        assert_eq!(session.vl_image_state, Some(other_image));
+    }
+
+    #[test]
+    fn first_image_turn_preserves_empty_start_state() {
+        let mut session = SessionState::default();
+        let image = vl_image_state(&[0.0, 1.0, 2.0], 1, 3);
+        assert!(!prepare_vl_request_state(&mut session, image));
+        assert_eq!(session.seq_pos, 0);
+        assert!(session.conversation_tokens.is_empty());
+        assert_eq!(session.vl_image_state, Some(image));
+    }
+
+    #[test]
+    fn prior_image_turn_requires_reset_even_when_position_was_rewound() {
+        let mut session = SessionState::default();
+        let image_a = vl_image_state(&[0.0, 1.0, 2.0], 1, 3);
+        let image_b = vl_image_state(&[3.0, 2.0, 1.0], 1, 3);
+
+        assert!(!prepare_vl_request_state(&mut session, image_a));
+        // A failed/short turn can leave seq_pos at zero while the image-turn
+        // sentinel still identifies model state that must not be reused.
+        session.seq_pos = 0;
+        session.conversation_tokens.extend_from_slice(&[11, 12]);
+
+        assert!(prepare_vl_request_state(&mut session, image_b));
+        assert_eq!(session.seq_pos, 0);
+        assert!(session.conversation_tokens.is_empty());
+        assert_eq!(session.vl_image_state, Some(image_b));
+    }
+
+    #[test]
+    fn image_a_to_image_b_transition_matches_fresh_image_b_state() {
+        let image_a = vl_image_state(&[0.0, 1.0, 2.0], 1, 3);
+        let image_b = vl_image_state(&[3.0, 2.0, 1.0], 1, 3);
+        let mut reused = SessionState::default();
+        let mut fresh = SessionState::default();
+
+        assert!(!prepare_vl_request_state(&mut reused, image_a));
+        reused.seq_pos = 0;
+        reused.conversation_tokens.extend_from_slice(&[11, 12]);
+        assert!(prepare_vl_request_state(&mut reused, image_b));
+        assert!(!prepare_vl_request_state(&mut fresh, image_b));
+
+        assert_eq!(
+            (reused.seq_pos, reused.conversation_tokens, reused.vl_image_state),
+            (fresh.seq_pos, fresh.conversation_tokens, fresh.vl_image_state)
+        );
+    }
+}
+
+#[cfg(test)]
+mod qwen_cache_capacity_tests {
+    use super::qwen_cache_guard_position;
+
+    #[test]
+    fn cache_miss_is_reset_before_effective_zero_capacity_check() {
+        // A dirty session can be at the physical end while the new prompt fits
+        // in a freshly reset context. This is the regression that used to be
+        // rejected because the guard ran before the cold reset.
+        assert_eq!(qwen_cache_guard_position(128, true), 0);
+        assert_eq!(qwen_cache_guard_position(128, false), 128);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_matrix_tests {
+    use super::reset_domain_cache_capable;
+
+    #[test]
+    fn production_cache_lifecycle_matrix_is_explicit() {
+        for arch_id in [5, 6, 9, 10, 12] {
+            assert!(
+                reset_domain_cache_capable(arch_id),
+                "cache-capable AR path missing from lifecycle matrix: arch_id={arch_id}"
+            );
+        }
+        for arch_id in [7, 8, 11] {
+            assert!(
+                !reset_domain_cache_capable(arch_id),
+                "non-cache-capable path unexpectedly admitted: arch_id={arch_id}"
+            );
+        }
     }
 }

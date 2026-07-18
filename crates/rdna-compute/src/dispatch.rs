@@ -1648,6 +1648,19 @@ impl Gpu {
         Ok(())
     }
 
+    /// Fallibly free an optional tensor without losing ownership when the
+    /// device bind fails. Reset paths use this for retryable request state.
+    pub fn free_tensor_checked(
+        &mut self,
+        tensor: &mut Option<GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if let Some(tensor) = tensor.take() {
+            self.pool.free(tensor.buf);
+        }
+        Ok(())
+    }
+
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
@@ -1690,12 +1703,33 @@ impl Gpu {
     ///   * replay_graph_cache + replay_warmed_up + replay_capturing_n:
     ///     DFlash per-n_steps tape-replay graphs.
     pub fn invalidate_graph_state(&mut self) {
-        self.bind_thread_or_warn();
-        self.graphs.graph_destroy(&self.hip, self.device_id);
-        self.graphs
-            .verify_graph_destroy_all(&self.hip, self.device_id);
-        self.graphs
-            .replay_graph_destroy_all(&self.hip, self.device_id);
+        let _ = self.invalidate_graph_state_checked();
+    }
+
+    /// Fallible graph invalidation for reset owners that must report HIP
+    /// graph-destruction failures.
+    pub fn invalidate_graph_state_checked(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        let mut first_error = None;
+        if let Err(error) = self
+            .graphs
+            .graph_destroy_checked(&self.hip, self.device_id)
+        {
+            first_error = Some(error);
+        }
+        if let Err(error) = self
+            .graphs
+            .verify_graph_destroy_all_checked(&self.hip, self.device_id)
+        {
+            first_error.get_or_insert(error);
+        }
+        if let Err(error) = self
+            .graphs
+            .replay_graph_destroy_all_checked(&self.hip, self.device_id)
+        {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Drop captured graph state after a live KV layout switch so the next

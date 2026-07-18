@@ -127,13 +127,13 @@ them toward completion.
 
 ### COR-002 Make Reset Total
 
-- **Status:** ready
+- **Status:** in-progress
 - **Dependencies:** COR-004
 - **Goal:** Define and implement the single authoritative reset contract: request-owned state is cleared by `SessionState`, architecture-owned state is reset through exhaustive dispatch, and speculative state is reset by the same entry point.
 - **Acceptance criteria:** One reset entry point and ownership contract cover abort, overflow, reset command, normal completion, VL, single, PP, TP, EP, speculative, recurrent, and conv state; adding a model-state variant cannot silently omit its reset arm. Integration tasks do not redefine reset semantics: they only implement their architecture adapter and prove conformance to COR-002.
 - **Validation:** Run reset-contract unit tests, exhaustiveness/ownership checks, `serve-multiturn-gate.sh`, architecture-specific multi-turn tests, and abort/overflow/reset-command regressions for single and mesh paths.
 - **Hardware:** A supported AMD GPU; distinct GPUs are additionally required for integration proof, not for defining or implementing the reset contract.
-- **Evidence:** Pending
+- **Evidence:** Reset ownership and lifecycle coverage includes dense TP/PP cache-miss routing, MiniMax EP cache-miss routing, Cohere cold-prefill routing, DSpark retry-safe hidden-buffer freeing, VL cold-reset behavior, and the two-row DFlash prompt-cache miss regression. Qwen cache misses now reset before capacity validation; VL/dots.ocr dirty abort/error paths defer their terminal envelope until fallible reset completes, and reset failures poison/terminate the daemon rather than serving on unknown GPU state. On this workspace's gfx1151, the updated Cohere cold + one-token warm-prefix parity gate passed with retained evidence at `/tmp/hipfire-cor-002/cohere-OhH5hG/`, and the updated DFlash two-row gate passed with retained evidence at `/tmp/hipfire-cor-002/dflash-joTHnh/`. After those focused gates, serialized `./scripts/serve-multiturn-gate.sh` passed at `/tmp/serve-multiturn-20260717-220023.md`, and serialized `./scripts/coherence-gate-dflash.sh` reported no hard errors at `/tmp/coherence-dflash-20260717-220054.md`. The reports are retained for review; no separate physical distinct-device TP/PP/EP proof or full physical VL/dots.ocr multi-turn proof was available in this environment and neither is claimed. Focused CPU tests and the workspace suite passed.
 
 ### COR-003 Finalize Parser On Pending EOS
 
@@ -277,7 +277,15 @@ them toward completion.
 - **Acceptance criteria:** Image encoding and custom prompt framing remain dots.ocr-owned; post-prefill AR and existing n-gram selection, parser finalization, accounting, COR-002 reset conformance, and unload use shared orchestration; OCR output preserves the canonical fixture quality; image state is request-local. Target/draft and native-MTP VL speculation are out of scope and require a separate follow-up with a dots.ocr quality oracle.
 - **Validation:** Run the canonical dots.ocr image fixture and F1 comparison in AR and existing n-gram modes, repeated-image isolation, text-decoder parity, COR-002 reset/abort conformance, and unload tests; verify other speculative modes are rejected explicitly.
 - **Hardware:** A supported AMD GPU for the canonical dots.ocr fixture.
-- **Evidence:** Pending
+- **Evidence:** The request-state transition now records the preprocessed image
+  sentinel and requires a cold reset when a prior image turn exists even if
+  `seq_pos == 0`; daemon unit coverage includes image-A→image-B versus fresh-B
+  state parity. The daemon-level
+  `scripts/dots-ocr-image-reset-gate.sh` compares image-A→image-B output with
+  fresh-B output when distinct image fixtures are supplied. The canonical
+  dots.ocr F1 oracle and physical VL gate remain pending because this
+  environment has only one dots.ocr image fixture and no distinct-device VL
+  hardware; those gaps are intentionally not claimed closed.
 
 ### STEP-001 Adopt Step/Manifest For DeltaNet
 

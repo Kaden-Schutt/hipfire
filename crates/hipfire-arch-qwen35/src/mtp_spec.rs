@@ -776,9 +776,9 @@ impl MtpSpecState {
     /// (stale absolute positions from the prior turn must not be re-read) and
     /// destroys any captured proposal graph (its node positions are turn-stale).
     /// The trunk's KV + DeltaNet reset is the daemon's concern (it owns the
-    /// bundle and calls `reset_recurrent`); this clears only head-local state.
+    /// bundle through the central model reset); this clears only head-local state.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        destroy_mtp_proposal_graph(gpu, self);
+        destroy_mtp_proposal_graph(gpu, self)?;
         self.mtp_proposal_graph_warmed = false;
         self.mtp_proposal_graph_seq_cap = 0;
         self.mtp_kv.reset(gpu)?;
@@ -1050,15 +1050,23 @@ fn abort_mtp_proposal_graph_capture(gpu: &mut Gpu) {
     gpu.graphs.capture_blobs.clear();
 }
 
-fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) {
+fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) -> HipResult<()> {
+    let mut first_error = None;
     if let Some(exec) = state.mtp_proposal_graph_exec.take() {
-        let _ = gpu.hip.graph_exec_destroy(exec);
+        if let Err(error) = gpu.hip.graph_exec_destroy(exec) {
+            first_error = Some(error);
+        }
     }
     if let Some(graph) = state.mtp_proposal_graph.take() {
-        let _ = gpu.hip.graph_destroy(graph);
+        if let Err(error) = gpu.hip.graph_destroy(graph) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
     }
     state.mtp_proposal_graph_blobs.clear();
     state.mtp_proposal_graph_seq_cap = 0;
+    first_error.map_or(Ok(()), Err)
 }
 
 fn greedy_trunk_spine_accept(
@@ -2536,7 +2544,7 @@ pub fn spec_step_mtp_compressed_serial(
         && state.mtp_proposal_graph_exec.is_some()
         && proposal_graph_seq_cap > state.mtp_proposal_graph_seq_cap
     {
-        destroy_mtp_proposal_graph(gpu, state);
+        destroy_mtp_proposal_graph(gpu, state)?;
         state.mtp_proposal_graph_warmed = true;
     }
     if use_device_token_chain {

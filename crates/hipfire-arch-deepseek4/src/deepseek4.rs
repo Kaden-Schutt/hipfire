@@ -1389,12 +1389,10 @@ impl DeepseekV4State {
     /// reset and uses `start_pos = lcp_len` instead.
     pub fn reset(&mut self) {
         self.n_tokens = 0;
-        // mtp_last_hidden carries the prior decode's full HC residual
-        // stream and is only consumed by `mtp_forward` (spec decode).
-        // Leaving it populated would let the first MTP step of a new
-        // turn read stale data; drop the handle so the next request's
-        // first spec step takes the alloc-then-fill path again.
-        self.mtp_last_hidden = None;
+        // `mtp_last_hidden` is GPU-owned. Call `reset_with_gpu` from a reset
+        // path that owns a GPU so it is returned to the pool before this
+        // handle is cleared. Keeping the plain reset GPU-free avoids silently
+        // leaking that allocation.
         // Force the next decode loop to retrace the warmup path
         // (`decode_step` direct dispatch) before re-entering capture.
         // Pairs with `gpu.invalidate_graph_state()` in the daemon's
@@ -1424,6 +1422,18 @@ impl DeepseekV4State {
         // are overwritten on first use and don't need explicit zeroing.
     }
 
+    /// Reset request state and release the MTP chaining buffer first.
+    pub fn reset_with_gpu(&mut self, gpu: &mut rdna_compute::Gpu) -> hip_bridge::HipResult<()> {
+        // Free the old chaining allocation before reset clears its handle.
+        if let Err(error) = gpu.free_tensor_checked(&mut self.mtp_last_hidden) {
+            // The optional handle remains populated when binding/freeing fails,
+            // so a later reset or unload can retry the release.
+            return Err(error);
+        }
+        self.reset();
+        Ok(())
+    }
+
     /// Zero the persistent per-layer decode caches (SWA ring, full + compressed
     /// KV, indexer/compressor scratch) so a fresh conversation starts from the
     /// same clean state as a freshly-launched daemon.
@@ -1436,41 +1446,59 @@ impl DeepseekV4State {
     /// Must be called where `gpu` is available (the daemon's lcp==0 fresh-
     /// conversation handler), not from `reset()` (no gpu there).
     pub fn zero_decode_caches(&mut self, gpu: &mut rdna_compute::Gpu) {
-        fn z(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+        let _ = self.zero_decode_caches_checked(gpu);
+    }
+
+    /// Fallible variant of [`Self::zero_decode_caches`] for reset paths that
+    /// must report GPU failures to their owner.
+    pub fn zero_decode_caches_checked(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> hip_bridge::HipResult<()> {
+        fn z(
+            gpu: &mut rdna_compute::Gpu,
+            t: &Option<rdna_compute::GpuTensor>,
+        ) -> hip_bridge::HipResult<()> {
             if let Some(t) = t {
-                let _ = gpu.hip.memset(&t.buf, 0, t.byte_size());
+                gpu.hip.memset(&t.buf, 0, t.byte_size())?;
             }
+            Ok(())
         }
         // The compressor `score_state` ring must reset to -inf, NOT 0 (matches
         // the reference `torch.full(-inf)`): a fresh conversation's first
         // compressed block has no overlap prev-window, and those unfilled slots
         // must get zero softmax weight in the pooling. Reset to 0 would instead
         // pool the prior turn's stale window (or dilute block 0 with zeros).
-        fn zinf(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+        fn zinf(
+            gpu: &mut rdna_compute::Gpu,
+            t: &Option<rdna_compute::GpuTensor>,
+        ) -> hip_bridge::HipResult<()> {
             if let Some(t) = t {
-                let _ = gpu.fill_f32(t, f32::NEG_INFINITY);
+                gpu.fill_f32(t, f32::NEG_INFINITY)?;
             }
+            Ok(())
         }
         for l in &self._indexer {
-            z(gpu, &l.main_kv_cache);
-            z(gpu, &l.main_kv_state);
-            zinf(gpu, &l.main_score_state);
-            z(gpu, &l.indexer_kv_cache);
-            z(gpu, &l.indexer_kv_state);
-            zinf(gpu, &l.indexer_score_state);
-            z(gpu, &l.comp_kv_buf);
-            z(gpu, &l.comp_score_buf);
-            z(gpu, &l.comp_concat_kv);
-            z(gpu, &l.comp_concat_score);
+            z(gpu, &l.main_kv_cache)?;
+            z(gpu, &l.main_kv_state)?;
+            zinf(gpu, &l.main_score_state)?;
+            z(gpu, &l.indexer_kv_cache)?;
+            z(gpu, &l.indexer_kv_state)?;
+            zinf(gpu, &l.indexer_score_state)?;
+            z(gpu, &l.comp_kv_buf)?;
+            z(gpu, &l.comp_score_buf)?;
+            z(gpu, &l.comp_concat_kv)?;
+            z(gpu, &l.comp_concat_score)?;
         }
         for l in &self._attention {
-            z(gpu, &l.swa_k);
-            z(gpu, &l.swa_v);
-            z(gpu, &l.full_k_cache);
-            z(gpu, &l.full_v_cache);
-            z(gpu, &l.gathered_k);
-            z(gpu, &l.gathered_v);
+            z(gpu, &l.swa_k)?;
+            z(gpu, &l.swa_v)?;
+            z(gpu, &l.full_k_cache)?;
+            z(gpu, &l.full_v_cache)?;
+            z(gpu, &l.gathered_k)?;
+            z(gpu, &l.gathered_v)?;
         }
+        Ok(())
     }
 
     /// Release every GPU buffer this state owns back to the pool.

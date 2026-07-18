@@ -93,6 +93,22 @@ fn main() {
         }
     }
 
+    /// Standalone DFlash has no daemon/loader façade around it. Keep the
+    /// target reset explicit at the row boundary instead of relying on the
+    /// prefill helper to happen to start from position zero.
+    fn reset_standalone_dflash_target(
+        target: &mut ModelSlot,
+        gpu: &mut rdna_compute::Gpu,
+        row_idx: usize,
+    ) {
+        target.reset_state(gpu);
+        gpu.invalidate_graph_state();
+        eprintln!(
+            "[dflash-reset] standalone target row={row_idx} seq_pos=0 compact_offset={}",
+            target.kv_cache.compact_offset
+        );
+    }
+
     // ── Parse args ─────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -820,6 +836,7 @@ fn main() {
 
         // ── Per-row state reset ────────────────────────────────────
         // Required for correctness on row 2+. See plan §"Per-row reset".
+        reset_standalone_dflash_target(&mut target, &mut gpu, row_idx);
         target_hidden_host.clear();
         // KV write head + RoPE compaction. seed_target_hidden_from_prompt
         // calls target.reset_state but that only zeros DN buffers;
@@ -1077,6 +1094,9 @@ fn main() {
                 }
             })
             .0;
+        eprintln!(
+            "[dflash-reset-check] row={row_idx} first_token={first_token} target_pos=0"
+        );
 
         // ── Decode loop ───────────────────────────────────────────────────
         let mut emitted: Vec<u32> = vec![first_token];
@@ -1917,6 +1937,10 @@ fn main() {
 
         // ── Report ────────────────────────────────────────────────────────
         let text = tokenizer.decode(&emitted);
+        eprintln!(
+            "[dflash-reset-check] row={row_idx} tokens={:?} target_pos=0",
+            emitted
+        );
         eprintln!("--- OUTPUT ---");
         println!("{text}");
         eprintln!("--------------");

@@ -197,13 +197,6 @@ impl SpecTarget for Deepseek4Bundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
-        // n_tokens → 0 + mtp_last_hidden cleared; the position-indexed KV / SWA /
-        // compressed-KV rings are overwritten by the next prefill, never read
-        // beyond n_tokens (see `DeepseekV4State::reset`). No GPU work needed.
-        self.state.reset();
-    }
-
     fn eos_token(&self) -> u32 {
         self.eos_tok
     }
@@ -221,15 +214,14 @@ impl SpecTarget for Deepseek4Bundle {
     /// argmax at the last position. Used by `DsparkDrafter::mtp_prefill` to
     /// run the prompt through the trunk in a single pass.
     ///
-    /// `reset` is always `false` here — the caller (`DsparkDrafter::mtp_prefill`)
-    /// calls `reset_recurrent` separately on cache miss. The abort callback is
-    /// checked between prefill chunks and before/after the final head pass.
+    /// `reset` is always `false` here — the central model reset has already run
+    /// on a cache miss. The abort callback is checked between prefill chunks and
+    /// before/after the final head pass.
     fn spec_advance(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
-        _reset: bool,
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {

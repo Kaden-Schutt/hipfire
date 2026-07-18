@@ -708,6 +708,20 @@ impl HipRuntime {
         self.check(code, "hipFree")
     }
 
+    /// Free a buffer while returning it together with the error when hipFree
+    /// fails. Callers that own retryable GPU state must use this variant so a
+    /// failed release does not silently consume the last handle to the buffer.
+    pub fn free_preserving(
+        &self,
+        buf: DeviceBuffer,
+    ) -> Result<(), (DeviceBuffer, HipError)> {
+        let code = unsafe { (self.fn_free)(buf.ptr) };
+        match self.check(code, "hipFree") {
+            Ok(()) => Ok(()),
+            Err(error) => Err((buf, error)),
+        }
+    }
+
     /// Copy host data into GPU buffer at a byte offset.
     pub fn memcpy_htod_offset(
         &self,
