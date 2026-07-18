@@ -2217,8 +2217,7 @@ impl Gpu {
                 x, weight, x_rot, k, eps,
             );
         }
-        let gfx1151_radiowave_fusions = self.arch_caps.is_gfx1151()
-            && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1");
+        let gfx1151_radiowave_fusions = self.arch_caps.is_gfx1151();
         let vecsum = k == 2048
             && ((self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_vecsum)
                 || gfx1151_radiowave_fusions);
@@ -4973,14 +4972,9 @@ impl Gpu {
             && *GFX1151_LM_HEAD_DOT2.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_LM_HEAD_DOT2").as_deref() == Ok("1")
             });
-        static GFX1151_LM_HEAD_R1_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_lm_head_r1_hybrid_buffer = self.arch_caps.is_gfx1151()
             && m == 248_320
-            && k == 2_048
-            && *GFX1151_LM_HEAD_R1_HYBRID_BUFFER.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_LM_HEAD_R1_HYBRID_BUFFER").as_deref() == Ok("1")
-                    || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
-            });
+            && k == 2_048;
         let use_lm_head_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_lm_head_k2048
             && m == 248_320
@@ -5232,12 +5226,7 @@ impl Gpu {
             && *GFX1151_RESIDUAL_HYBRID_BUFFER.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER").as_deref() == Ok("1")
             });
-        static GFX1151_RESIDUAL_RT_LOW: OnceLock<bool> = OnceLock::new();
-        let gfx1151_rt_low = self.arch_caps.is_gfx1151()
-            && *GFX1151_RESIDUAL_RT_LOW.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_RESIDUAL_RT_LOW").as_deref() == Ok("1")
-                    || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
-            });
+        let gfx1151_rt_low = self.arch_caps.is_gfx1151();
         static GFX1151_RESIDUAL_ROW1: OnceLock<bool> = OnceLock::new();
         let gfx1151_row1 = self.arch_caps.is_gfx1151()
             && *GFX1151_RESIDUAL_ROW1.get_or_init(|| {

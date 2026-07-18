@@ -2358,11 +2358,7 @@ impl ReplayController {
         let gfx11_vmem_acquire =
             match std::env::var("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE") {
                 Ok(value) => matches!(value.as_str(), "1" | "true" | "on"),
-                Err(_) => {
-                    device.name().eq_ignore_ascii_case("gfx1151")
-                        && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref()
-                            == Ok("1")
-                }
+                Err(_) => device.name().eq_ignore_ascii_case("gfx1151"),
             };
         let mut wait_audit = Pm4WaitAudit::default();
         let mut audit_frontier = ResourceFrontier::default();

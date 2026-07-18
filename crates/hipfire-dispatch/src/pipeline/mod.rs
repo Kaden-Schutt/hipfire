@@ -445,8 +445,7 @@ pub fn run_moe_decode(
         }
     }
     let gfx1100_router_mode = std::env::var("HIPFIRE_GFX1100_ROUTER_W64").ok();
-    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151()
-        && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1");
+    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151();
     let exact_wave64_router = p.n_exp == 256
         && ((ctx.arch.is_gfx1100()
             // The exact fused router is the production gfx1100 path. `0` retains

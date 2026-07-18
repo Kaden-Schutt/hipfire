@@ -18,7 +18,6 @@ fn q8_flash_default_tile_size(
     n_kv_heads: usize,
     head_dim: usize,
     max_seq: usize,
-    gfx1151_radiowave_enabled: bool,
 ) -> usize {
     // Qwen3.5-0.8B's small full-attention shape is under-parallelized at
     // the generic gfx12 tile of 128. Keep this independently certified
@@ -26,7 +25,6 @@ fn q8_flash_default_tile_size(
     let gfx12_small_dense_shape =
         arch.starts_with("gfx12") && n_heads == 8 && n_kv_heads == 2 && head_dim == 256;
     let gfx1151_radiowave_shape = arch == "gfx1151"
-        && gfx1151_radiowave_enabled
         && n_heads == 16
         && n_kv_heads == 2
         && head_dim == 256
@@ -64,14 +62,7 @@ pub fn q8_flash_tile_size(
                 .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
         })
         .unwrap_or_else(|| {
-            q8_flash_default_tile_size(
-                arch,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_seq,
-                std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1"),
-            )
+            q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq)
         })
 }
 
@@ -10426,39 +10417,35 @@ mod tests {
     #[test]
     fn q8_flash_gfx12_small_dense_shape_uses_tile16_only() {
         assert_eq!(
-            q8_flash_default_tile_size("gfx1201", 8, 2, 256, 2_048, false),
+            q8_flash_default_tile_size("gfx1201", 8, 2, 256, 2_048),
             16
         );
         assert_eq!(
-            q8_flash_default_tile_size("gfx1201", 16, 2, 256, 2_048, false),
+            q8_flash_default_tile_size("gfx1201", 16, 2, 256, 2_048),
             128
         );
         assert_eq!(
-            q8_flash_default_tile_size("gfx1201", 8, 2, 128, 2_048, false),
+            q8_flash_default_tile_size("gfx1201", 8, 2, 128, 2_048),
             128
         );
     }
 
     #[test]
-    fn gfx1151_tile32_default_is_exact_shape_and_admission_only() {
+    fn gfx1151_tile32_default_is_exact_shape_and_arch_only() {
         assert_eq!(
-            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048, true),
+            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048),
             32
         );
         assert_eq!(
-            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048, false),
+            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 8_192),
             128
         );
         assert_eq!(
-            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 8_192, true),
-            128
-        );
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192, false),
+            q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192),
             32
         );
         assert_eq!(
-            q8_flash_default_tile_size("gfx1200", 16, 2, 256, 2_048, true),
+            q8_flash_default_tile_size("gfx1200", 16, 2, 256, 2_048),
             128
         );
     }

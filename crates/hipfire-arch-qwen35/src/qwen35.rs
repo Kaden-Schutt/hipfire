@@ -14382,16 +14382,11 @@ fn forward_lowered_enabled() -> bool {
     *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
-/// Exact gfx1151 admission gate for the already-exact gfx1100 decode
-/// super-kernels.  Keep this separate from the broad RDNA3 capability checks:
-/// gfx1151 has a different cache hierarchy and occupancy balance, so each
-/// schedule must earn its own stationary product result before defaulting on.
+/// Exact gfx1151 admission gate for its certified Radiowave decode bundle.
+/// Keep this separate from broad RDNA3 capability checks so no neighboring
+/// architecture can inherit the gfx1151 schedules.
 fn gfx1151_radiowave_fusions_enabled(gpu: &Gpu) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     gpu.arch_caps.is_gfx1151()
-        && *ENABLED.get_or_init(|| {
-            std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
-        })
 }
 
 /// Decode path that keeps DeltaNet Q/K at their native head count and
