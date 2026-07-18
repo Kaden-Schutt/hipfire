@@ -113,18 +113,12 @@ impl Deepseek4MtpDrafter {
         bundle: &mut Deepseek4Bundle,
         fill_tokens: &[u32],
         start_pos: usize,
-        cache_hit: bool,
+        _cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<Option<u32>, String> {
         if abort() {
             return Ok(None);
         }
-        // Cold start: reset recurrent state (n_tokens → 0, mtp_last_hidden → None).
-        // DeepseekV4State::reset() does no GPU work.
-        if !cache_hit {
-            bundle.state.reset();
-        }
-
         let Deepseek4Bundle {
             config,
             weights,
@@ -299,8 +293,8 @@ impl MtpDrafter for Deepseek4MtpDrafter {
 
     fn mtp_reset(&mut self, _gpu: &mut Gpu) {
         // deepseek4's drafter has no drafter-local GPU state besides `pbs`
-        // (scratch, not conversation state). The target bundle's recurrent
-        // reset (state.reset()) is the daemon's job, per trait contract.
+        // (scratch, not conversation state). The target bundle's request reset
+        // is owned by LoadedModel::reset_context.
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {

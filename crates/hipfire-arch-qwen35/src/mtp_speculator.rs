@@ -135,11 +135,16 @@ impl MtpDrafter for Qwen35MtpDrafter {
     }
 
     fn mtp_reset(&mut self, gpu: &mut Gpu) {
+        let _ = self.mtp_reset_checked(gpu);
+    }
+
+    fn mtp_reset_checked(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         if let Some(state) = self.state.as_mut() {
-            if let Err(e) = state.reset(gpu) {
-                eprintln!("[qwen35-mtp] drafter reset failed: {e}");
-            }
+            state
+                .reset(gpu)
+                .map_err(|e| format!("qwen35 MTP reset: {e}"))?;
         }
+        Ok(())
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
@@ -169,16 +174,11 @@ impl Qwen35MtpDrafter {
         target: &mut dyn SpecTarget,
         fill_tokens: &[u32],
         start_pos: usize,
-        cache_hit: bool,
+        _cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<Option<u32>, String> {
         if abort() {
             return Ok(None);
-        }
-        // Cold start: reset the trunk recurrent state (target owns it) BEFORE
-        // borrowing the concrete slot, so positions start at 0.
-        if !cache_hit {
-            target.reset_recurrent(gpu);
         }
         if abort() {
             return Ok(None);
@@ -186,12 +186,6 @@ impl Qwen35MtpDrafter {
         let slot = Self::slot(target)?;
         self.ensure_state(gpu, slot)?;
         let state = self.state.as_mut().expect("ensure_state set it");
-        if !cache_hit {
-            // Clear the head KV so its absolute positions start clean too.
-            state
-                .reset(gpu)
-                .map_err(|e| format!("mtp state reset: {e}"))?;
-        }
 
         if abort() {
             return Ok(None);

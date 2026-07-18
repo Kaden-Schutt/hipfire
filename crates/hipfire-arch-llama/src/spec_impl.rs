@@ -41,12 +41,6 @@ impl SpecTarget for LlamaBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
-        // Pure attention: no recurrent state to zero. Drop the KV eviction offset
-        // so the next conversation rotates from absolute 0.
-        self.kv.compact_offset = 0;
-    }
-
     fn new_spec_scratch(
         &mut self,
         gpu: &mut Gpu,
@@ -70,15 +64,9 @@ impl SpecTarget for LlamaBundle {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
-        reset: bool,
         abort: &dyn Fn() -> bool,
         mut hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
-        // Pure attention: "reset" just rewinds the eviction offset; the prefill
-        // forward overwrites KV at the absolute positions it writes.
-        if reset {
-            self.kv.compact_offset = 0;
-        }
         // DFlash hidden capture: only when the drafter configured extract layers
         // AND the caller passed a sink. The two together form the gate; either
         // missing → no capture (the `_hidden_out` ignored default of Task 1).
@@ -94,7 +82,6 @@ impl SpecTarget for LlamaBundle {
         // position's `num_extract × dim` residual per call (extract order).
         for (i, &tok) in tokens.iter().enumerate() {
             if abort() {
-                self.kv.compact_offset = 0;
                 return Ok(SpecAdvance::Aborted);
             }
             let pos = start_pos + i;

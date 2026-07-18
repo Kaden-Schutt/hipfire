@@ -1051,11 +1051,8 @@ impl MtpDrafter for DsparkDrafter {
         target: &mut dyn SpecTarget,
         fill_tokens: &[u32],
         start_pos: usize,
-        cache_hit: bool,
+        _cache_hit: bool,
     ) -> Result<u32, String> {
-        if !cache_hit {
-            target.reset_recurrent(gpu);
-        }
         // Invalidate multi-slot context: mtp_step re-bootstraps for the first seed.
         // As in the deepseek4 drafter, we do NOT warm the DSpark stage rings
         // during prefill (measured LOSS on code prompts — see dspark_speculator.rs).
@@ -1077,11 +1074,11 @@ impl MtpDrafter for DsparkDrafter {
             return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
         }
 
-        // Run the full prefill through spec_advance (reset=false; recurrent was
-        // already reset above on cache_miss). Returns argmax at the last position,
+        // Run the full prefill through spec_advance (the central reset already
+        // ran on a cache miss). Returns argmax at the last position,
         // which is the seed for the first decode window.
         let abort = &|| false;
-        match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
+        match target.spec_advance(gpu, fill_tokens, start_pos, abort, None)? {
             crate::spec::SpecAdvance::Ready { last_argmax } => Ok(last_argmax),
             crate::spec::SpecAdvance::Aborted => {
                 Err("DsparkDrafter::mtp_prefill: spec_advance aborted".into())
@@ -1095,14 +1092,11 @@ impl MtpDrafter for DsparkDrafter {
         target: &mut dyn SpecTarget,
         fill_tokens: &[u32],
         start_pos: usize,
-        cache_hit: bool,
+        _cache_hit: bool,
         abort: Option<&dyn Fn() -> bool>,
     ) -> Result<Option<u32>, String> {
         if abort.is_some_and(|check| check()) {
             return Ok(None);
-        }
-        if !cache_hit {
-            target.reset_recurrent(gpu);
         }
         if let Some(dev) = self.main_hidden_dev.take() {
             let _ = gpu.free_tensor(dev);
@@ -1116,7 +1110,7 @@ impl MtpDrafter for DsparkDrafter {
         }
         let no_abort = || false;
         let abort = abort.unwrap_or(&no_abort);
-        match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
+        match target.spec_advance(gpu, fill_tokens, start_pos, abort, None)? {
             crate::spec::SpecAdvance::Ready { last_argmax } if !abort() => Ok(Some(last_argmax)),
             crate::spec::SpecAdvance::Ready { .. } | crate::spec::SpecAdvance::Aborted => Ok(None),
         }
@@ -1361,9 +1355,8 @@ impl MtpDrafter for DsparkDrafter {
                 .map_err(|e| format!("DsparkDrafter: alloc ctx hidden: {e:?}"))?;
             gpu.memcpy_dtod_at_auto(&dev.buf, 0, &capture_buf.buf, src_offset * 4, n_floats * 4)
                 .map_err(|e| format!("DsparkDrafter: d2d ctx hidden: {e:?}"))?;
-            if let Some(old) = self.main_hidden_dev.take() {
-                let _ = gpu.free_tensor(old);
-            }
+            gpu.free_tensor_checked(&mut self.main_hidden_dev)
+                .map_err(|e| format!("DsparkDrafter: free old ctx hidden: {e:?}"))?;
             self.main_hidden_dev = Some(dev);
             // ctx positions: position + start_slot .. position + start_slot + new_ctx_len
             self.ctx_positions = (start_slot..start_slot + new_ctx_len)
@@ -1378,9 +1371,8 @@ impl MtpDrafter for DsparkDrafter {
             // `capture_seed_main_hidden` advances the KV by exactly 1 for the
             // bonus, which is the right thing).  This is the Stage 1 behaviour
             // and is correct — just forfeits the multi-slot ctx for one window.
-            if let Some(old) = self.main_hidden_dev.take() {
-                let _ = gpu.free_tensor(old);
-            }
+            gpu.free_tensor_checked(&mut self.main_hidden_dev)
+                .map_err(|e| format!("DsparkDrafter: free stale ctx hidden: {e:?}"))?;
             self.ctx_positions.clear();
         }
         let _ = gpu.free_tensor(capture_buf);
@@ -1401,11 +1393,15 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     fn mtp_reset(&mut self, gpu: &mut Gpu) {
+        let _ = self.mtp_reset_checked(gpu);
+    }
+
+    fn mtp_reset_checked(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Clear multi-slot context so the next prefill re-bootstraps.
-        if let Some(dev) = self.main_hidden_dev.take() {
-            let _ = gpu.free_tensor(dev);
-        }
+        gpu.free_tensor_checked(&mut self.main_hidden_dev)
+            .map_err(|e| format!("DSpark reset main_hidden_dev: {e}"))?;
         self.ctx_positions.clear();
+        Ok(())
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {

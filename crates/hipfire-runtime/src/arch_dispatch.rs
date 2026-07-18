@@ -94,9 +94,6 @@ pub trait ArchDispatch {
     }
     fn sampling_defaults(&self) -> SamplingDefaults;
     fn features(&self) -> ArchFeatures;
-    /// TOTAL recurrent/KV reset for a fresh context. The #462 lever: a new arch
-    /// cannot ship without an impl, so no reset site can be forgotten.
-    fn reset(&mut self, gpu: &mut rdna_compute::Gpu);
     /// Bridge to the existing spec-decode verify seam; None for AR-only arches.
     fn as_spec_target(&mut self) -> Option<&mut dyn crate::spec::SpecTarget> {
         None
@@ -189,17 +186,6 @@ pub trait ArchDispatch {
     #[allow(dead_code)]
     fn take_prefill_checkpoint(&mut self, ctx: ForwardCtx<'_>, seq_pos: usize) {
         let _ = (ctx, seq_pos);
-    }
-
-    /// Zero the arch's recurrent decode state on abort (DeltaNet s/conv
-    /// buffers + KV `compact_offset`, plus a co-resident Llama KV's
-    /// `compact_offset`). The driver still owns the generic parts of abort
-    /// (`seq_pos=0`, `conversation_tokens.clear()`, `free_checkpoints`, event
-    /// emit, early return). Mirrors the two abort blocks (daemon.rs:8921,
-    /// 9233). Default: no recurrent state to zero.
-    #[allow(dead_code)]
-    fn abort_zero_recurrent(&mut self, ctx: ForwardCtx<'_>) {
-        let _ = ctx;
     }
 
     /// Sample one token from the arch's `scratch.logits`. When `grammar_mask`
@@ -308,12 +294,6 @@ pub trait ArchDispatch {
     #[allow(dead_code)]
     fn prefill_max_batch(&self) -> usize {
         256
-    }
-
-    /// Drain + free the prefill checkpoint ring (abort path).
-    #[allow(dead_code)]
-    fn free_prefill_checkpoints(&mut self, ctx: ForwardCtx<'_>) {
-        let _ = ctx;
     }
 
     /// Build (once, cached) + return the decoded-vocab table used for grammar

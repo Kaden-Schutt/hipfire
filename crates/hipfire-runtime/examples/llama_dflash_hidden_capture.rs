@@ -80,7 +80,7 @@ fn main() {
             let mut hidden_out: Vec<f32> = Vec::new();
             let no_abort = || false;
             let adv = bundle
-                .spec_advance(gpu, &prompt, 0, true, &no_abort, Some(&mut hidden_out))
+                .spec_advance(gpu, &prompt, 0, &no_abort, Some(&mut hidden_out))
                 .expect("spec_advance");
             match adv {
                 SpecAdvance::Ready { last_argmax } => {

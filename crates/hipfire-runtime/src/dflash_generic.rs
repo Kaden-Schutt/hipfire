@@ -426,10 +426,10 @@ impl Speculator for GenericDflashSpeculator {
         }
 
         // Advance the target AND capture its residual hidden into the cumulative
-        // host buffer in one pass. `reset = !cache_hit` zeroes the target's KV
-        // (and recurrent, for arches that have it) on a miss. Capture only fires
+        // host buffer in one pass. The daemon's central cache-miss lifecycle has
+        // already performed the authoritative total reset. Capture only fires
         // when the target's `dflash_extract_layers()` is `Some` (set at build).
-        let adv = target.spec_advance(
+        let adv = target.spec_advance_cold_start(
             gpu,
             fill_tokens,
             start_pos,
@@ -629,18 +629,22 @@ impl Speculator for GenericDflashSpeculator {
             gpu,
             tokens,
             position,
-            false,
             abort,
             Some(&mut self.target_hidden_host),
         )
     }
 
-    fn reset(&mut self, _gpu: &mut Gpu) {
+    fn reset(&mut self, gpu: &mut Gpu) {
+        let _ = self.reset_checked(gpu);
+    }
+
+    fn reset_checked(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         // Drafter-local reset: clear the cumulative host shadow + the draft's
         // upload/projection tracking. The target's KV/recurrent reset is the
         // daemon's job (it owns the bundle).
         self.target_hidden_host.clear();
         self.scratch.reset_upload_tracking();
+        Ok(())
     }
 
     fn block_size(&self) -> usize {

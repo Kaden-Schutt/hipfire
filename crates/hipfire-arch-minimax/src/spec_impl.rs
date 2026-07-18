@@ -50,13 +50,6 @@ impl SpecTarget for MiniMaxBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
-        // Pure attention: no recurrent state to zero. Rewind the position cursor
-        // so the next prefill writes from slot 0. Mirrors the daemon's
-        // arch_id=10 reset handler.
-        self.state.reset();
-    }
-
     fn new_spec_scratch(
         &mut self,
         _gpu: &mut Gpu,
@@ -70,20 +63,13 @@ impl SpecTarget for MiniMaxBundle {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
-        reset: bool,
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
-        // Pure attention: "reset" rewinds the position cursor; the per-token
-        // prefill then overwrites KV at the absolute positions it writes.
-        if reset {
-            self.state.reset();
-        }
         self.state.n_tokens = start_pos;
         let mut last_logits: Vec<f32> = Vec::new();
         for &tok in tokens {
             if abort() {
-                self.state.reset();
                 return Ok(SpecAdvance::Aborted);
             }
             let position = self.state.n_tokens as u32;

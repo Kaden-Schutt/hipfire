@@ -156,11 +156,6 @@ pub trait SpecTarget {
     /// Downcast hook: `target.as_any_mut().downcast_mut::<ModelSlot>()`.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
-    /// Zero the target's recurrent (DeltaNet) state and reset the KV eviction
-    /// offset — used by the daemon's mid-generation abort path in place of its
-    /// current inline memset loop.
-    fn reset_recurrent(&mut self, gpu: &mut Gpu);
-
     // ── Arch-generic speculation primitives ─────────────────────────────────
     //
     // These let a *model-free* speculator (n-gram / PLD) drive any arch's target
@@ -182,9 +177,9 @@ pub trait SpecTarget {
     ) -> Result<Box<dyn SpecScratch>, String>;
 
     /// Advance the target over `tokens` from absolute `start_pos` (chunked,
-    /// abortable), returning the greedy argmax at the LAST position. `reset`
-    /// zeroes recurrent + KV state first (cache-miss prefill); `false` continues
-    /// from the current state (cache-hit suffix, or the partial-accept replay).
+    /// abortable), returning the greedy argmax at the LAST position. The
+    /// central speculative lifecycle has already reset on a cache miss; this
+    /// hook only advances the selected full or suffix span.
     ///
     /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
     /// the target appends, per processed position, the concat of residual hidden
@@ -195,10 +190,27 @@ pub trait SpecTarget {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
-        reset: bool,
         abort: &dyn Fn() -> bool,
         hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String>;
+
+    /// Advance the target for speculative prefill with an explicit cold-start
+    /// signal. The signal is lifecycle metadata, not a second reset authority:
+    /// the model owner has already performed the total reset on a cache miss.
+    /// Targets that have a numerically distinct cold prefill may override this
+    /// hook; the default preserves the ordinary advance path.
+    fn spec_advance_cold_start(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+        cold_start: bool,
+        abort: &dyn Fn() -> bool,
+        hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<SpecAdvance, String> {
+        let _ = cold_start;
+        self.spec_advance(gpu, tokens, start_pos, abort, hidden_out)
+    }
 
     /// Run the target over `block` at absolute `position`, returning the greedy
     /// argmax at each of the `block.len()` positions (`argmax[i]` is the target's
@@ -639,7 +651,7 @@ pub trait Speculator {
         position: usize,
         abort: &dyn Fn() -> bool,
     ) -> Result<SpecAdvance, String> {
-        target.spec_advance(gpu, tokens, position, false, abort, None)
+        target.spec_advance(gpu, tokens, position, abort, None)
     }
 
     /// Compact drafter-local cached state after a target KV eviction the daemon
@@ -653,6 +665,14 @@ pub trait Speculator {
     /// recurrent state is the daemon's concern (it owns the bundle); this clears
     /// only the drafter's own scratch + checkpoint ring.
     fn reset(&mut self, gpu: &mut Gpu);
+
+    /// Fallible reset used by model-lifetime reset owners. The legacy
+    /// [`Self::reset`] hook remains for daemon compatibility; stateful
+    /// speculators override this when GPU teardown can fail.
+    fn reset_checked(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset(gpu);
+        Ok(())
+    }
 
     /// Snapshot drafter-local recurrent state at `position` for divergent-render
     /// prompt-cache reuse. Default no-op for stateless drafters (n-gram).
@@ -752,9 +772,10 @@ pub struct MtpWindow {
 pub trait MtpDrafter {
     /// Prefill `fill_tokens` from absolute `start_pos`: advance the target's
     /// KV/recurrent state AND the MTP head's position-aligned cache, returning
-    /// the greedy seed (argmax at the last prefilled position). `cache_hit=false`
-    /// ⇒ cold start (reset recurrent + MTP cache first); `true` ⇒ warm suffix
-    /// extension (preserve prior state).
+    /// the greedy seed (argmax at the last prefilled position). The central
+    /// speculative lifecycle performs the authoritative total reset before a
+    /// `cache_hit=false` call; implementations only choose full versus suffix
+    /// tokens here and must not reset target state again.
     fn mtp_prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -806,6 +827,13 @@ pub trait MtpDrafter {
     /// Reset drafter-local state for a fresh conversation (MTP cache + any
     /// captured graphs). The target's KV/recurrent reset is the daemon's job.
     fn mtp_reset(&mut self, gpu: &mut Gpu);
+
+    /// Fallible MTP reset used by model-owned context reset. Legacy MTP
+    /// implementations remain source-compatible through the default wrapper.
+    fn mtp_reset_checked(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.mtp_reset(gpu);
+        Ok(())
+    }
 
     /// Release all GPU buffers the drafter owns.
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
@@ -938,7 +966,11 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
     }
 
     fn reset(&mut self, gpu: &mut Gpu) {
-        self.arch.mtp_reset(gpu);
+        let _ = self.reset_checked(gpu);
+    }
+
+    fn reset_checked(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.arch.mtp_reset_checked(gpu)
     }
 
     fn block_size(&self) -> usize {
@@ -1488,7 +1520,6 @@ mod tests {
             fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
                 self
             }
-            fn reset_recurrent(&mut self, _gpu: &mut rdna_compute::Gpu) {}
             fn new_spec_scratch(
                 &mut self,
                 _gpu: &mut rdna_compute::Gpu,
@@ -1501,7 +1532,6 @@ mod tests {
                 _gpu: &mut rdna_compute::Gpu,
                 _tokens: &[u32],
                 _start_pos: usize,
-                _reset: bool,
                 _abort: &dyn Fn() -> bool,
                 _hidden_out: Option<&mut Vec<f32>>,
             ) -> Result<SpecAdvance, String> {

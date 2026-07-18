@@ -125,15 +125,6 @@ impl SpecTarget for Lfm2MoeBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, gpu: &mut Gpu) {
-        // Zero every conv-state ring buffer + reset the token count (the daemon's
-        // arch_id=11 reset path). KV is overwritten by absolute-position writes,
-        // so there is no separate KV cursor to rewind here; drop the eviction
-        // offset for symmetry with qwen35's reset.
-        let _ = self.state.reset(gpu);
-        self.state.kv.compact_offset = 0;
-    }
-
     fn new_spec_scratch(
         &mut self,
         gpu: &mut Gpu,
@@ -155,24 +146,14 @@ impl SpecTarget for Lfm2MoeBundle {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
-        reset: bool,
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
-        // Plain target advance: feed each token at its absolute position. `reset`
-        // zeroes the conv-states + token count first (cache-miss prefill); on a
-        // cache-hit suffix / replay we continue from current recurrent state.
-        if reset {
-            self.state
-                .reset(gpu)
-                .map_err(|e| format!("lfm2moe: spec_advance reset: {e}"))?;
-            self.state.kv.compact_offset = 0;
-        }
+        // Plain target advance: feed each token at its absolute position. The
+        // model owner performs the sole request reset before this hook runs.
         let mut last_logits: Vec<f32> = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             if abort() {
-                let _ = self.state.reset(gpu);
-                self.state.kv.compact_offset = 0;
                 return Ok(SpecAdvance::Aborted);
             }
             let pos = (start_pos + i) as u32;
