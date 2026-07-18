@@ -3433,16 +3433,6 @@ pub fn gemv_hfq4g256_for_arch(
     match arch {
         "gfx1030" | "gfx1031" => {
             let variant: u32 = rdna2_variant.unwrap_or(1);
-            let names = [
-                "",
-                "baseline-rdna2",
-                "high-occupancy",
-                "wide-unroll",
-                "dp4a-packed",
-                "cache-aggressive",
-            ];
-            let name = names.get(variant as usize).unwrap_or(&"baseline-rdna2");
-            eprintln!("  RDNA2 GEMV variant: v{variant} ({name})");
             match variant {
                 2 => (GEMV_HFQ4G256_GFX1030_V2_SRC, "gemv_hfq4g256_rdna2v2"),
                 3 => (GEMV_HFQ4G256_GFX1030_V3_SRC, "gemv_hfq4g256_rdna2v3"),
