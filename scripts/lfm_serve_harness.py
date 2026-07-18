@@ -88,17 +88,28 @@ def is_attractor(text):
     ) or _repeated_trigram_ratio(middle) > 0.50
 
 
-def validate_turn(row, expected_text):
+def validate_turn(row, expected_text, forbid_reasoning=False):
     errors = []
     if row.get("finish") != "stop":
         errors.append(f"finish_reason={row.get('finish')}")
+    content = row.get("content", "")
+    reasoning = row.get("reasoning_content", "")
     combined = row.get("combined_content", "")
     if not combined.strip():
         errors.append("empty reasoning_content + content")
     if row.get("attractor"):
         errors.append("token attractor detected")
-    if expected_text and expected_text.lower() not in combined.lower():
+    # Framing contract (UNCONDITIONAL): the answer must reach message.content,
+    # never be stranded in reasoning_content with content left empty (the
+    # daemon-authoritative think-framing bug). Checked on the content channel,
+    # not combined, so a reasoning-only completion is rejected on every run.
+    if expected_text and expected_text.lower() not in content.lower():
         errors.append(f"missing expected text: {expected_text}")
+    # --nothink: thinking was disabled at the request, so the reasoning row must
+    # be gone. (Thinking-on runs don't force reasoning present — the content
+    # guard above already catches the stranding bug.)
+    if forbid_reasoning and reasoning.strip():
+        errors.append("unexpected reasoning_content (--nothink)")
     return errors
 
 
@@ -242,15 +253,16 @@ def spawn_server(args):
     raise TimeoutError(f"serve did not warm within {args.warm_timeout}s\n{_log_tail(log_path)}")
 
 
-def request_turn(args, model, prompt, sampling):
+def request_turn(args, model, prompt, sampling, stream=True):
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": args.max_tokens,
-        "stream": True,
-        "stream_options": {"include_usage": True},
+        "stream": stream,
         **sampling,
     }
+    if stream:
+        body["stream_options"] = {"include_usage": True}
     if args.seed is not None:
         body["seed"] = args.seed
 
@@ -270,33 +282,51 @@ def request_turn(args, model, prompt, sampling):
     finish = None
     try:
         response = urllib.request.urlopen(request, timeout=args.request_timeout)
-        for raw in response:
-            line = raw.decode("utf-8", "ignore").strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if payload == "[DONE]":
-                break
-            try:
-                chunk = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            if chunk.get("usage"):
-                usage = chunk["usage"]
-            if chunk.get("timings"):
-                timings = chunk["timings"]
-            choice = (chunk.get("choices") or [{}])[0]
-            if choice.get("finish_reason"):
-                finish = choice["finish_reason"]
-            delta = choice.get("delta") or {}
-            for key, sink in (("reasoning_content", reasoning), ("content", content)):
-                value = delta.get(key)
-                if isinstance(value, str):
-                    if value and first_token is None:
-                        first_token = time.time() - started
-                    sink.append(value)
-            if delta.get("tool_calls"):
-                tools.append(json.dumps(delta["tool_calls"]))
+        if stream:
+            for raw in response:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                if chunk.get("timings"):
+                    timings = chunk["timings"]
+                choice = (chunk.get("choices") or [{}])[0]
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+                delta = choice.get("delta") or {}
+                for key, sink in (("reasoning_content", reasoning), ("content", content)):
+                    value = delta.get(key)
+                    if isinstance(value, str):
+                        if value and first_token is None:
+                            first_token = time.time() - started
+                        sink.append(value)
+                if delta.get("tool_calls"):
+                    tools.append(json.dumps(delta["tool_calls"]))
+        else:
+            resp_json = json.loads(response.read())
+            if resp_json.get("usage"):
+                usage = resp_json["usage"]
+            if resp_json.get("timings"):
+                timings = resp_json["timings"]
+            choice = (resp_json.get("choices") or [{}])[0]
+            finish = choice.get("finish_reason")
+            message = choice.get("message") or {}
+            rc = message.get("reasoning_content")
+            if isinstance(rc, str):
+                reasoning.append(rc)
+            cc = message.get("content")
+            if isinstance(cc, str):
+                content.append(cc)
+            if message.get("tool_calls"):
+                tools.append(json.dumps(message["tool_calls"]))
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")
         raise RuntimeError(f"HTTP {error.code}: {detail}") from error
@@ -353,23 +383,30 @@ def main():
     parser.add_argument("--out", default=None)
     parser.add_argument("--bun", default="/home/kaden/.bun/bin/bun")
     parser.add_argument("--daemon-bin", default=str(REPO / "target/release/examples/daemon"))
+    parser.add_argument("--nothink", action="store_true",
+                        help="disable thinking: sends reasoning_effort='none' (index.ts maps that "
+                             "to enable_thinking=false) and asserts the reasoning row is absent")
+    parser.add_argument("--no-stream", dest="stream", action="store_false",
+                        help="use the non-streaming /v1/chat/completions path")
+    parser.set_defaults(stream=True)
     args = parser.parse_args()
     args.home, args.serve_log, args.port = allocate_runtime_defaults(
         args.home, args.serve_log, args.port
     )
 
-    sampling = build_sampling(args.registry, args.tag, args.reasoning_effort)
+    effort = "none" if args.nothink else args.reasoning_effort
+    sampling = build_sampling(args.registry, args.tag, effort)
     prompt = load_prompt(args.prompt_file, args.prompt)
     print(f"LFM smoke: tag={args.tag} model={args.model} gpu={args.device} kv=q8", flush=True)
     print(f"runtime: port={args.port} home={args.home} log={args.serve_log}", flush=True)
-    print(f"thinking=ON reasoning_effort={args.reasoning_effort} sampling={sampling}", flush=True)
+    print(f"stream={args.stream} nothink={args.nothink} reasoning_effort={effort} sampling={sampling}", flush=True)
     try:
         model = spawn_server(args)
-        row = request_turn(args, model, prompt, sampling)
+        row = request_turn(args, model, prompt, sampling, stream=args.stream)
     finally:
         _kill_server()
 
-    errors = validate_turn(row, args.expect)
+    errors = validate_turn(row, args.expect, forbid_reasoning=args.nothink)
     row["errors"] = errors
     print(
         f"finish={row['finish']} gen={row['completion_tokens']} "

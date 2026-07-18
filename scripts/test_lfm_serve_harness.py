@@ -54,7 +54,10 @@ class LfmServeHarnessTests(unittest.TestCase):
     def test_reasoning_effort_choices_match_the_serve_api(self):
         self.assertNotIn("max", harness.EFFORTS)
 
-    def test_validate_accepts_reasoning_only_completion(self):
+    def test_validate_rejects_reasoning_only_completion(self):
+        # The framing bug: whole answer in reasoning_content, content empty.
+        # The content-channel guard (unconditional) must reject it — this shape
+        # used to be (wrongly) accepted.
         row = {
             "finish": "stop",
             "reasoning_content": "The capital of France is Paris.",
@@ -62,7 +65,10 @@ class LfmServeHarnessTests(unittest.TestCase):
             "combined_content": "The capital of France is Paris.",
             "attractor": False,
         }
-        self.assertEqual(harness.validate_turn(row, "Paris"), [])
+        self.assertEqual(
+            harness.validate_turn(row, "Paris"),
+            ["missing expected text: Paris"],
+        )
 
     def test_validate_accepts_content_only_completion(self):
         row = {
@@ -89,6 +95,41 @@ class LfmServeHarnessTests(unittest.TestCase):
             harness.validate_turn(row, "Paris"),
             ["finish_reason=length", "empty reasoning_content + content", "missing expected text: Paris"],
         )
+
+    def test_validate_nothink_rejects_reasoning(self):
+        # --nothink (forbid_reasoning): any reasoning row is a failure.
+        row = {
+            "finish": "stop",
+            "reasoning_content": "thinking...",
+            "content": "The capital of France is Paris.",
+            "combined_content": "thinking...\nThe capital of France is Paris.",
+            "attractor": False,
+        }
+        self.assertEqual(
+            harness.validate_turn(row, "Paris", forbid_reasoning=True),
+            ["unexpected reasoning_content (--nothink)"],
+        )
+
+    def test_validate_nothink_accepts_content_only(self):
+        row = {
+            "finish": "stop",
+            "reasoning_content": "",
+            "content": "The capital of France is Paris.",
+            "combined_content": "The capital of France is Paris.",
+            "attractor": False,
+        }
+        self.assertEqual(harness.validate_turn(row, "Paris", forbid_reasoning=True), [])
+
+    def test_validate_think_allows_reasoning_with_content(self):
+        # Thinking on: reasoning present AND the answer in content is valid.
+        row = {
+            "finish": "stop",
+            "reasoning_content": "Hmm, the capital is Paris.",
+            "content": "The capital of France is Paris.",
+            "combined_content": "Hmm, the capital is Paris.\nThe capital of France is Paris.",
+            "attractor": False,
+        }
+        self.assertEqual(harness.validate_turn(row, "Paris"), [])
 
 
 if __name__ == "__main__":
