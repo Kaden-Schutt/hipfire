@@ -20946,6 +20946,81 @@ impl Gpu {
         }
         result
     }
+    /// Exact-gfx1030 sdot4 MMQ Q8_0 probe. This is intentionally not selected
+    /// by any production dispatch path: it exists only for direct channel
+    /// validation while beta's model and Redline behavior remain immutable.
+    pub fn gemm_q8_0_mmq_gfx1030(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1030() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_q8_0_mmq_gfx1030 requires exact gfx1030; current arch = {}",
+                    self.arch
+                ),
+            ));
+        }
+        debug_assert_eq!(
+            k % 128,
+            0,
+            "gemm_q8_0_mmq_gfx1030: K must be multiple of 128"
+        );
+        let kernel_name = "gemm_q8_0_mmq_gfx1030";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_Q8_0_MMQ_GFX1030_SRC,
+            kernel_name,
+        )?;
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let ap = a.buf.as_ptr();
+        let xp = x_q8_ptr;
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let row_tiles = ((m + 31) / 32) as u32;
+        let col_tiles = ((batch_size + 127) / 128) as u32;
+        let bytes = m * (k / 32) * 34 + batch_size * (k / 128) * 144 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, col_tiles, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 64x64 4-warp tile (gfx1151).
     /// Takes F32 `x` (auto-quantized to Q8_1), int8 WMMA at ~2x. Drop-in for
     /// `gemm_q8_0_wmma_4w`. Requires M%64==0, N%64==0, K%128==0.

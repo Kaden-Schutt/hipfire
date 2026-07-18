@@ -2404,6 +2404,11 @@ pub const GEMM_Q8_0_WMMA_4W_SRC: &str = include_str!("../../../kernels/src/gemm_
 pub const GEMM_Q8_0_MMQ_4W_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_mmq_4w.gfx1151.hip");
 
+/// Exact-gfx1030 sdot4 MMQ probe for Q8_0 weights. This source is exposed to
+/// the dedicated channel test only; production dispatch remains unchanged.
+pub const GEMM_Q8_0_MMQ_GFX1030_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_mmq.gfx1030.hip");
+
 /// Path 2 combine for down: per (token, m) iterates K_TOP slots via
 /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
 /// x_residual. No atomic contention (each token's m column is owned by
