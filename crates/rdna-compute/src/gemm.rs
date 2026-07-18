@@ -11573,18 +11573,27 @@ impl Gpu {
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let bytes = (m_total * k) + (m_total * m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        // Probe-only raw HIP launch: never enter the Redline recording seam.
-        let func = &self.functions[kernel_name];
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles, slot_tiles, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b.push_i32(xsr_val);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -11651,27 +11660,18 @@ impl Gpu {
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let bytes = (m_total * k) + (m_total * m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
-            kernel_name,
-            [row_tiles, slot_tiles, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b.push_i32(xsr_val);
-                b
-            },
-        );
+        // Probe-only raw HIP launch: never enter the Redline recording seam.
+        let func = &self.functions[kernel_name];
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles, slot_tiles, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
