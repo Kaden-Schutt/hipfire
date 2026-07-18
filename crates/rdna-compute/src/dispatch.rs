@@ -1615,7 +1615,6 @@ impl Gpu {
             self.free_tensor(y_mmq).ok();
 
             // Per-row max error check
-            let mut worst_row = 0usize;
             let mut worst_err = 0f32;
             for r in 0..m {
                 let mut row_max = 0f32;
@@ -1628,17 +1627,10 @@ impl Gpu {
                 }
                 if row_max > worst_err {
                     worst_err = row_max;
-                    worst_row = r;
                 }
             }
 
             let safe = worst_err <= threshold;
-            if !safe {
-                eprintln!(
-                    "  MMQ screen: UNSAFE weight ptr={key:#x} m={m} k={k} \
-                     worst_row={worst_row} max_err={worst_err:.4} > threshold={threshold:.4} — falling back to WMMA"
-                );
-            }
             Ok(safe)
         })();
 
