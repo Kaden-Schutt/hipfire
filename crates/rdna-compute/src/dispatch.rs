@@ -1489,6 +1489,17 @@ impl Gpu {
         )
     }
 
+    /// Public FP16 activation staging for crate-local external WMMA launchers
+    /// (LFM2.5-350M-MQ4 gfx1201 BT wrappers). Same caching semantics as
+    /// `ensure_fp16_x`.
+    pub fn ensure_fp16_x_public(
+        &mut self,
+        x: &GpuTensor,
+        n_elems: usize,
+    ) -> HipResult<*mut c_void> {
+        self.ensure_fp16_x(x, n_elems)
+    }
+
     /// Ensure the deterministic-ksplit partials scratch is at least `n_bytes`.
     pub(crate) fn ensure_ksplit_det_partials(&mut self, n_bytes: usize) -> HipResult<*mut c_void> {
         self.scratch.ensure_ksplit_det_partials(&self.hip, n_bytes)

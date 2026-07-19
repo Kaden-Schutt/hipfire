@@ -669,7 +669,8 @@ fn forward_prefill_chunk_impl(
                 gpu.fill_f32(&conv_bcx_n, 0.0).map_err(|e| {
                     prefill_chunk_error("conv in_proj zero", Some(layer_idx), p, n, e)
                 })?;
-                gpu.gemm_hfq4g256_residual(
+                kernels::lfm2_350m_residual_wmma_gfx1201(
+                    gpu,
                     &conv.in_proj.buf,
                     &scratch.operator_x_rot_batch,
                     &scratch.conv_bcx_batch,
@@ -701,7 +702,8 @@ fn forward_prefill_chunk_impl(
                 .map_err(|e| {
                     prefill_chunk_error("conv out rotate", Some(layer_idx), p, n, e)
                 })?;
-                gpu.gemm_hfq4g256_residual(
+                kernels::lfm2_350m_residual_wmma_gfx1201(
+                    gpu,
                     &conv.out_proj.buf,
                     &scratch.conv_y_rot_batch,
                     &scratch.h_batch,
@@ -812,7 +814,8 @@ fn forward_prefill_chunk_impl(
                 .map_err(|e| {
                     prefill_chunk_error("attention out rotate", Some(layer_idx), p, n, e)
                 })?;
-                gpu.gemm_hfq4g256_residual(
+                kernels::lfm2_350m_residual_wmma_gfx1201(
+                    gpu,
                     &attn.wo.buf,
                     &scratch.fa_attn_out_rot_batch,
                     &scratch.h_batch,
@@ -851,7 +854,8 @@ fn forward_prefill_chunk_impl(
             n,
         )
         .map_err(|e| prefill_chunk_error("ffn rmsnorm+rotate", Some(layer_idx), p, n, e))?;
-        gpu.gemm_gate_up_hfq4g256(
+        kernels::lfm2_350m_gate_up_wmma_gfx1201(
+            gpu,
             &dense.w1.buf,
             &dense.w3.buf,
             &scratch.ffn_x_rot_batch,
@@ -873,7 +877,8 @@ fn forward_prefill_chunk_impl(
             n,
         )
         .map_err(|e| prefill_chunk_error("ffn silu_mul+rotate", Some(layer_idx), p, n, e))?;
-        gpu.gemm_hfq4g256_residual(
+        kernels::lfm2_350m_residual_wmma_gfx1201(
+            gpu,
             &dense.w2.buf,
             &dense_act_rot_n,
             &scratch.h_batch,
