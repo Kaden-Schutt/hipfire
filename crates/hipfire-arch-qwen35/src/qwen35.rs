@@ -1631,9 +1631,31 @@ fn load_weight_tensor_raw(
 /// the VL-friendly nested name) where qwen2 uses flat `model.{...}`.
 /// Pull into `hipfire_runtime::transformer::weights` with the prefix
 /// as a parameter during consolidation.
+fn attach_awq_scale_candidates(
+    mut wt: WeightTensor,
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    names: &[&str],
+    k: usize,
+) -> HipResult<WeightTensor> {
+    if !wt.gpu_dtype.supports_awq_sidecar() {
+        return Ok(wt);
+    }
+    for name in names {
+        match load_awq_scale_for(hfq, gpu, name, k)? {
+            Some(scale) => {
+                wt.awq_scale = Some(scale);
+                return Ok(wt);
+            }
+            None => {}
+        }
+    }
+    Ok(wt)
+}
+
 pub(crate) fn load_weight_tensor(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
@@ -1652,21 +1674,17 @@ pub(crate) fn load_weight_tensor(
                 break;
             }
         }
-        let mut wt = wt.unwrap_or_else(|| panic!("tensor not found: {name}"));
+        let wt = wt.unwrap_or_else(|| panic!("tensor not found: {name}"));
         // Phase A Stage A — populate awq_scale when the dtype is on
         // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
         // The pread call invalidates the prior pread_buf borrow, but
         // the weight bytes have already been uploaded to GPU (owned by
         // `wt.buf`) so the borrow no longer matters.
-        if wt.gpu_dtype.supports_awq_sidecar() {
-            if let Some(matched_name) = matched.as_deref() {
-                wt.awq_scale = load_awq_scale_for(hfq, gpu, matched_name, k)
-                    .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
-            } else {
-                wt.awq_scale = load_awq_scale_for(hfq, gpu, name, k);
-            }
-        }
-        return Ok(wt);
+        let names = matched
+            .as_deref()
+            .map(|matched_name| vec![matched_name, name])
+            .unwrap_or_else(|| vec![name]);
+        return attach_awq_scale_candidates(wt, hfq, gpu, &names, k);
     }
     #[cfg(not(unix))]
     {
@@ -1680,12 +1698,9 @@ pub(crate) fn load_weight_tensor(
             }
             found.unwrap_or_else(|| panic!("tensor not found: {name}"))
         };
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
-        if wt.gpu_dtype.supports_awq_sidecar() {
-            wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
-                .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
-        }
-        Ok(wt)
+        let wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
+        let names = vec![matched_name.as_str(), name];
+        attach_awq_scale_candidates(wt, hfq, gpu, &names, k)
     }
 }
 
@@ -1704,7 +1719,7 @@ pub(crate) fn load_weight_tensor(
 /// row selection does not touch it.
 fn load_weight_tensor_keep(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
@@ -1731,20 +1746,18 @@ fn load_weight_tensor_keep(
     // count (= bytes.len() / rowstride); gather_rows derives it from shape[0].
     let (_new_shape, sub) = hipfire_reap::gather::gather_rows(&[orig_rows], &bytes, keep)
         .map_err(|e| HipError::new(0, &format!("qwen35: router row-gather '{name}': {e}")))?;
-    let mut wt = load_weight_tensor_raw(gpu, quant_type, &sub, m, k)?;
-    if wt.gpu_dtype.supports_awq_sidecar() {
-        // Resolve the matched candidate name (metadata only) so the AWQ sidecar
-        // is looked up under the same prefix the weight resolved to; fall back
-        // to the bare `name`. Mirrors the non-keep `load_weight_tensor`.
-        let matched = qwen35_tensor_name_candidates(name)
-            .into_iter()
-            .find(|c| hfq.find_tensor_info(c).is_some());
-        wt.awq_scale = matched
-            .as_deref()
-            .and_then(|mn| load_awq_scale_for(hfq, gpu, mn, k))
-            .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
-    }
-    Ok(wt)
+    let wt = load_weight_tensor_raw(gpu, quant_type, &sub, m, k)?;
+    // Resolve the matched candidate name (metadata only) so the AWQ sidecar
+    // is looked up under the same prefix the weight resolved to; fall back
+    // to the bare `name`.
+    let matched = qwen35_tensor_name_candidates(name)
+        .into_iter()
+        .find(|c| hfq.find_tensor_info(c).is_some());
+    let names = matched
+        .as_deref()
+        .map(|mn| vec![mn, name])
+        .unwrap_or_else(|| vec![name]);
+    attach_awq_scale_candidates(wt, hfq, gpu, &names, k)
 }
 
 // ─── ParoQuant AWQ → HFQ4G128 repack ────────────────────────────────────────
@@ -3192,13 +3205,24 @@ fn warn_rdna2_unvalidated_dtypes(hfq: &HfqFile, gpu: &Gpu) {
 /// Attach the lm_head / tied-embed AWQ sidecar when the output dtype supports it.
 /// Byte-identical no-op on current files. MUST be called AFTER `output.gpu_dtype`
 /// is set (the gate reads it). See docs/plans/awq_fix_claude.md.
-fn attach_lm_head_awq_sidecar(hfq: &HfqFile, gpu: &Gpu, output: &mut WeightTensor, k: usize) {
+fn attach_lm_head_awq_sidecar(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    output: WeightTensor,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    let output = attach_awq_scale_candidates(
+        output,
+        hfq,
+        gpu,
+        &[
+            "lm_head.weight",
+            "model.language_model.lm_head.weight",
+            "model.language_model.embed_tokens.weight",
+        ],
+        k,
+    )?;
     if output.gpu_dtype.supports_awq_sidecar() {
-        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", k)
-            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", k))
-            .or_else(|| {
-                load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", k)
-            });
         eprintln!(
             "  lm_head AWQ sidecar: {}",
             if output.awq_scale.is_some() {
@@ -3208,6 +3232,7 @@ fn attach_lm_head_awq_sidecar(hfq: &HfqFile, gpu: &Gpu, output: &mut WeightTenso
             }
         );
     }
+    Ok(output)
 }
 
 // ── Layout (re-exported from runtime) ─────────────────────────────────────
@@ -3328,7 +3353,7 @@ impl WeightSource for HfqSource<'_> {
                 dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
             },
         )?;
-        attach_lm_head_awq_sidecar(self.hfq, gpu, &mut output, c.dim);
+        output = attach_lm_head_awq_sidecar(self.hfq, gpu, output, c.dim)?;
         Ok((output, aliases))
     }
 
@@ -6433,7 +6458,7 @@ fn forward_prefill_batch_with_pbs_opts_abortable(
             }
             if abort() {
                 return Ok(false);
-        }
+            }
         }
         return Ok(true);
     }

@@ -19,6 +19,10 @@ arch-dots-ocr = ["dep:hipfire-arch-dots-ocr"]
 # Test-only: compile the HIPFIRE_EP_FAIL_RANK partial-load fault injector. OFF by
 # default so production builds can never synthetically fail an EP load.
 ep-fault-inject = []
+dflash-fault-inject = [
+    "hipfire-runtime/dflash-fault-inject",
+    "hipfire-arch-llama/dflash-fault-inject",
+]
 
 [dependencies]
 rdna-compute = { path = "../rdna-compute" }

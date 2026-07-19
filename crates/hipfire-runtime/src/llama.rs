@@ -705,14 +705,14 @@ impl LlamaWeights {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
         if !self.lm_head_aliases_embd {
-            let _ = gpu.free_tensor(self.output.buf);
+            self.output.free_all(gpu);
         }
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
-            let _ = gpu.free_tensor(l.wq.buf);
-            let _ = gpu.free_tensor(l.wk.buf);
-            let _ = gpu.free_tensor(l.wv.buf);
-            let _ = gpu.free_tensor(l.wo.buf);
+            l.wq.free_all(gpu);
+            l.wk.free_all(gpu);
+            l.wv.free_all(gpu);
+            l.wo.free_all(gpu);
             if let Some(t) = l.q_norm {
                 let _ = gpu.free_tensor(t);
             }
@@ -720,9 +720,9 @@ impl LlamaWeights {
                 let _ = gpu.free_tensor(t);
             }
             let _ = gpu.free_tensor(l.ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate.buf);
-            let _ = gpu.free_tensor(l.w_up.buf);
-            let _ = gpu.free_tensor(l.w_down.buf);
+            l.w_gate.free_all(gpu);
+            l.w_up.free_all(gpu);
+            l.w_down.free_all(gpu);
         }
     }
 
@@ -736,16 +736,16 @@ impl LlamaWeights {
         let _ = gpus.devices[0].free_tensor(self.token_embd);
         let _ = gpus.devices[out_dev].free_tensor(self.output_norm);
         if !self.lm_head_aliases_embd {
-            let _ = gpus.devices[out_dev].free_tensor(self.output.buf);
+            self.output.free_all(&mut gpus.devices[out_dev]);
         }
         for (i, l) in self.layers.into_iter().enumerate() {
             let d = gpus.device_for_layer(i);
             let g = &mut gpus.devices[d];
             let _ = g.free_tensor(l.attn_norm);
-            let _ = g.free_tensor(l.wq.buf);
-            let _ = g.free_tensor(l.wk.buf);
-            let _ = g.free_tensor(l.wv.buf);
-            let _ = g.free_tensor(l.wo.buf);
+            l.wq.free_all(g);
+            l.wk.free_all(g);
+            l.wv.free_all(g);
+            l.wo.free_all(g);
             if let Some(t) = l.q_norm {
                 let _ = g.free_tensor(t);
             }
@@ -753,9 +753,9 @@ impl LlamaWeights {
                 let _ = g.free_tensor(t);
             }
             let _ = g.free_tensor(l.ffn_norm);
-            let _ = g.free_tensor(l.w_gate.buf);
-            let _ = g.free_tensor(l.w_up.buf);
-            let _ = g.free_tensor(l.w_down.buf);
+            l.w_gate.free_all(g);
+            l.w_up.free_all(g);
+            l.w_down.free_all(g);
         }
     }
 }
@@ -1909,6 +1909,12 @@ pub fn prefill_forward(
 /// largest physical_cap any consumer sets up.
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+const PREFILL_BATCH_SCRATCH_ALLOCATION_COUNT: usize = 13;
+
+#[cfg(feature = "dflash-fault-inject")]
+pub const GENERIC_DFLASH_VERIFY_SCRATCH_ALLOCATION_COUNT: usize =
+    PREFILL_BATCH_SCRATCH_ALLOCATION_COUNT;
+
 /// Is this dtype/arch combination eligible for the batched WMMA prefill
 /// kernels? Matches `qwen35::is_batchable_la` exactly so plain Qwen3 and
 /// hybrid Qwen3.5 share one rule and stay in lockstep when new dtypes or
@@ -1973,6 +1979,30 @@ pub struct PrefillBatchScratch {
     pub flash_partials: GpuTensor,
 }
 
+struct PrefillBatchScratchStaging {
+    tensors: Vec<GpuTensor>,
+}
+
+impl PrefillBatchScratchStaging {
+    fn allocate(&mut self, gpu: &mut Gpu, shape: &[usize]) -> HipResult<()> {
+        self.tensors.push(gpu.alloc_tensor(shape, DType::F32)?);
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::VerifyScratchAllocation(
+                self.tensors.len() - 1,
+            ),
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        Ok(())
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for tensor in self.tensors.into_iter().rev() {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
 impl PrefillBatchScratch {
     pub fn new(
         gpu: &mut Gpu,
@@ -1993,21 +2023,52 @@ impl PrefillBatchScratch {
             .unwrap_or(16);
         let partials_size = batch_mult * config.n_heads * max_tiles * (2 + config.head_dim);
 
+        let mut staged = PrefillBatchScratchStaging {
+            tensors: Vec::with_capacity(PREFILL_BATCH_SCRATCH_ALLOCATION_COUNT),
+        };
+        let allocation = (|| -> HipResult<()> {
+            for shape in [
+                vec![max_batch * dim],
+                vec![max_batch * dim],
+                vec![max_batch],
+                vec![max_batch],
+                vec![max_batch * q_dim],
+                vec![max_batch * kv_dim],
+                vec![max_batch * kv_dim],
+                vec![max_batch * q_dim],
+                vec![max_batch * q_dim],
+                vec![max_batch * hidden_dim],
+                vec![max_batch * hidden_dim],
+                vec![max_batch * hidden_dim],
+                vec![partials_size],
+            ] {
+                staged.allocate(gpu, &shape)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+
+        let mut tensors = staged.tensors.into_iter();
         Ok(Self {
             max_batch,
-            x_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            x_rot_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            positions: gpu.alloc_tensor(&[max_batch], DType::F32)?,
-            tokens: gpu.alloc_tensor(&[max_batch], DType::F32)?,
-            fa_q_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_k_batch: gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
-            fa_v_batch: gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
-            fa_attn_out_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_attn_out_rot_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            gate_ffn_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            up_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            ffn_hidden_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            flash_partials: gpu.alloc_tensor(&[partials_size], DType::F32)?,
+            x_batch: tensors.next().expect("staged prefill x_batch"),
+            x_rot_batch: tensors.next().expect("staged prefill x_rot_batch"),
+            positions: tensors.next().expect("staged prefill positions"),
+            tokens: tensors.next().expect("staged prefill tokens"),
+            fa_q_batch: tensors.next().expect("staged prefill fa_q_batch"),
+            fa_k_batch: tensors.next().expect("staged prefill fa_k_batch"),
+            fa_v_batch: tensors.next().expect("staged prefill fa_v_batch"),
+            fa_attn_out_batch: tensors.next().expect("staged prefill fa_attn_out_batch"),
+            fa_attn_out_rot_batch: tensors
+                .next()
+                .expect("staged prefill fa_attn_out_rot_batch"),
+            gate_ffn_batch: tensors.next().expect("staged prefill gate_ffn_batch"),
+            up_batch: tensors.next().expect("staged prefill up_batch"),
+            ffn_hidden_batch: tensors.next().expect("staged prefill ffn_hidden_batch"),
+            flash_partials: tensors.next().expect("staged prefill flash_partials"),
         })
     }
 
@@ -3484,6 +3545,22 @@ pub struct ForwardScratch {
     pub x_rot: GpuTensor,
 }
 
+struct ForwardScratchStaging {
+    tensors: Vec<GpuTensor>,
+    pos_buf: Option<hip_bridge::DeviceBuffer>,
+}
+
+impl ForwardScratchStaging {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        if let Some(pos_buf) = self.pos_buf {
+            let _ = gpu.hip.free(pos_buf);
+        }
+        for tensor in self.tensors.into_iter().rev() {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
 impl ForwardScratch {
     /// Allocate scratch sized for the model's declared context. Callers that
     /// know the runtime KV cap should prefer [`Self::new_with_max_seq`] so the
@@ -3511,24 +3588,60 @@ impl ForwardScratch {
         let max_chunks = max_seq.div_ceil(128);
         let partial_stride = 2 + config.head_dim;
         let partials_size = config.n_heads * max_chunks * partial_stride;
+        let mut staged = ForwardScratchStaging {
+            tensors: Vec::with_capacity(16),
+            pos_buf: None,
+        };
+        let allocation = (|| -> HipResult<()> {
+            for shape in [
+                vec![dim],
+                vec![dim],
+                vec![q_dim],
+                vec![kv_dim],
+                vec![kv_dim],
+                vec![q_dim],
+                vec![dim],
+                vec![config.hidden_dim],
+                vec![config.hidden_dim],
+                vec![config.hidden_dim],
+                vec![dim],
+                vec![config.vocab_size],
+                vec![2],
+                vec![64],
+                vec![partials_size],
+            ] {
+                staged.tensors.push(gpu.alloc_tensor(&shape, DType::F32)?);
+            }
+            staged.pos_buf = Some(gpu.hip.malloc(4)?);
+            staged
+                .tensors
+                .push(gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?);
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+
+        let mut tensors = staged.tensors.into_iter();
         Ok(Self {
-            x: gpu.alloc_tensor(&[dim], DType::F32)?,
-            tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
-            q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            o: gpu.alloc_tensor(&[dim], DType::F32)?,
-            gate: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            up: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            ffn_hidden: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
-            logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
-            sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
-            repeat_buf: gpu.alloc_tensor(&[64], DType::F32)?,
-            attn_partials: gpu.alloc_tensor(&[partials_size], DType::F32)?,
-            pos_buf: gpu.hip.malloc(4)?, // single i32
-            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
+            x: tensors.next().expect("staged forward x"),
+            tmp: tensors.next().expect("staged forward tmp"),
+            q: tensors.next().expect("staged forward q"),
+            k: tensors.next().expect("staged forward k"),
+            v: tensors.next().expect("staged forward v"),
+            attn_out: tensors.next().expect("staged forward attn_out"),
+            o: tensors.next().expect("staged forward o"),
+            gate: tensors.next().expect("staged forward gate"),
+            up: tensors.next().expect("staged forward up"),
+            ffn_hidden: tensors.next().expect("staged forward ffn_hidden"),
+            ffn_out: tensors.next().expect("staged forward ffn_out"),
+            logits: tensors.next().expect("staged forward logits"),
+            sample_buf: tensors.next().expect("staged forward sample_buf"),
+            repeat_buf: tensors.next().expect("staged forward repeat_buf"),
+            attn_partials: tensors.next().expect("staged forward attn_partials"),
+            pos_buf: staged.pos_buf.expect("staged forward pos_buf"),
+            x_rot: tensors.next().expect("staged forward x_rot"),
         })
     }
 
@@ -5856,6 +5969,110 @@ pub enum KvTarget<'a> {
     Multi(&'a mut Gpus),
 }
 
+struct KvTensorStaging {
+    tensors: Vec<GpuTensor>,
+}
+
+impl KvTensorStaging {
+    fn allocate_f32_kv(&mut self, gpu: &mut Gpu, elems: usize, allocation: usize) -> HipResult<()> {
+        self.tensors.push(gpu.zeros(&[elems], DType::F32)?);
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::F32KvAllocation(allocation),
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        Ok(())
+    }
+
+    fn allocate(&mut self, gpu: &mut Gpu, elems: usize) -> HipResult<()> {
+        self.tensors.push(gpu.zeros(&[elems], DType::F32)?);
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::TargetKvAllocation(0),
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::DsparkAllocation(
+                self.tensors.len() - 1,
+            ),
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        Ok(())
+    }
+
+    fn upload_f32(&mut self, gpu: &mut Gpu, data: &[f32]) -> HipResult<()> {
+        self.tensors.push(gpu.upload_f32(data, &[data.len()])?);
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::TargetKvAllocation(
+                self.tensors.len() - 1,
+            ),
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::DsparkAllocation(
+                self.tensors.len() - 1,
+            ),
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        Ok(())
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for tensor in self.tensors.into_iter().rev() {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
+fn alloc_kv_with_rotation(
+    gpu: &mut Gpu,
+    n_layers: usize,
+    k_elems: usize,
+    v_elems: usize,
+    is_kv_layer: Option<&[bool]>,
+    rotation: Option<(&[f32], &[f32])>,
+) -> HipResult<(
+    Vec<GpuTensor>,
+    Vec<GpuTensor>,
+    Option<GpuTensor>,
+    Option<GpuTensor>,
+)> {
+    let slots = is_kv_layer.map_or(n_layers, <[bool]>::len);
+    let mut staged = KvTensorStaging {
+        tensors: Vec::with_capacity(slots * 2 + rotation.map_or(0, |_| 2)),
+    };
+    let allocation = (|| -> HipResult<()> {
+        for i in 0..slots {
+            let allocate_full = is_kv_layer.map_or(true, |mask| mask[i]);
+            staged.allocate(gpu, if allocate_full { k_elems } else { 1 })?;
+            staged.allocate(gpu, if allocate_full { v_elems } else { 1 })?;
+        }
+        if let Some((first, second)) = rotation {
+            staged.upload_f32(gpu, first)?;
+            staged.upload_f32(gpu, second)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = allocation {
+        staged.free_gpu(gpu);
+        return Err(error);
+    }
+
+    let mut tensors = staged.tensors.into_iter();
+    let mut k_gpu = Vec::with_capacity(slots);
+    let mut v_gpu = Vec::with_capacity(slots);
+    for _ in 0..slots {
+        k_gpu.push(tensors.next().expect("staged KV K tensor"));
+        v_gpu.push(tensors.next().expect("staged KV V tensor"));
+    }
+    let first_rotation = rotation.map(|_| tensors.next().expect("staged KV rotation"));
+    let second_rotation = rotation.map(|_| tensors.next().expect("staged KV rotation"));
+    Ok((k_gpu, v_gpu, first_rotation, second_rotation))
+}
+
 impl KvCache {
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
@@ -5994,11 +6211,26 @@ impl KvCache {
     ) -> HipResult<Self> {
         let kv_dim = n_kv_heads * head_dim;
         let cache_size = max_seq_len * kv_dim;
+        let mut staged = KvTensorStaging {
+            tensors: Vec::with_capacity(n_layers * 2),
+        };
+        let allocation = (|| -> HipResult<()> {
+            for layer in 0..n_layers {
+                staged.allocate_f32_kv(gpu, cache_size, layer * 2)?;
+                staged.allocate_f32_kv(gpu, cache_size, layer * 2 + 1)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+        let mut tensors = staged.tensors.into_iter();
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
+            k_gpu.push(tensors.next().expect("staged F32 KV K tensor"));
+            v_gpu.push(tensors.next().expect("staged F32 KV V tensor"));
         }
         Ok(Self {
             k_gpu,
@@ -6113,12 +6345,8 @@ impl KvCache {
         let total_blocks = n_kv_heads * blocks_per_head;
         let cache_bytes = physical_cap * total_blocks * 34;
         let cache_elems = (cache_bytes + 3) / 4;
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-        }
+        let (k_gpu, v_gpu, _, _) =
+            alloc_kv_with_rotation(gpu, n_layers, cache_elems, cache_elems, None, None)?;
         Ok(Self {
             k_gpu,
             v_gpu,
@@ -6144,33 +6372,6 @@ impl KvCache {
             compact_offset: 0,
             v_mode: VMode::Q8,
         })
-    }
-
-    /// Helper: allocate K/V Vecs, skipping layers where is_kv_layer[i] is false
-    /// by inserting a 1-element placeholder. Saves VRAM for hybrid arches
-    /// (Qwen 3.5 DeltaNet + FullAttention) where 75% of layers don't carry
-    /// KV in this cache — their state lives in [`crate::qwen35::DeltaNetState`].
-    /// Per-layer index is preserved so downstream code can index by absolute
-    /// layer_idx unchanged.
-    fn alloc_k_v_filtered(
-        gpu: &mut Gpu,
-        k_elems: usize,
-        v_elems: usize,
-        is_kv_layer: &[bool],
-    ) -> HipResult<(Vec<GpuTensor>, Vec<GpuTensor>)> {
-        let n = is_kv_layer.len();
-        let mut k_gpu = Vec::with_capacity(n);
-        let mut v_gpu = Vec::with_capacity(n);
-        for &is_kv in is_kv_layer {
-            if is_kv {
-                k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-                v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-            } else {
-                k_gpu.push(gpu.zeros(&[1], DType::F32)?);
-                v_gpu.push(gpu.zeros(&[1], DType::F32)?);
-            }
-        }
-        Ok((k_gpu, v_gpu))
     }
 
     /// Bytes of V-cache per token-position (all heads) for a given V mode.
@@ -6819,7 +7020,8 @@ impl KvCache {
         let total_blocks = n_kv_heads * blocks_per_head;
         let cache_bytes = physical_cap * total_blocks * 34;
         let cache_elems = (cache_bytes + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
+        let (k_gpu, v_gpu, _, _) =
+            alloc_kv_with_rotation(gpu, 0, cache_elems, cache_elems, Some(is_kv_layer), None)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
             "KV cache: q8 ({n_kv}/{} layers carry KV, others placeholder)",
@@ -7097,15 +7299,16 @@ impl KvCache {
         let v_blocks_per_head = head_dim / 32;
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let (k_gpu, v_gpu, ct, st) = alloc_kv_with_rotation(
+            gpu,
+            0,
+            k_elems,
+            v_elems,
+            Some(is_kv_layer),
+            Some((&cos_vals, &sin_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
@@ -7132,8 +7335,8 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
+            givens_cos: ct,
+            givens_sin: st,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7164,19 +7367,20 @@ impl KvCache {
         let v_blocks_per_head = head_dim / 32;
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
         // fwht_shfl_forward operates on 128 elements regardless of head_dim;
         // signs are shared across the hd=256 two-half rotation. Seeds (42,
         // 1042) match the MQ4 weight-FWHT convention.
         let n_signs = 128;
         let s1_vals = Self::gen_fwht_signs(42, n_signs);
         let s2_vals = Self::gen_fwht_signs(1042, n_signs);
-        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
-        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
-        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
-        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let (k_gpu, v_gpu, s1, s2) = alloc_kv_with_rotation(
+            gpu,
+            0,
+            k_elems,
+            v_elems,
+            Some(is_kv_layer),
+            Some((&s1_vals, &s2_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
@@ -7203,8 +7407,8 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             boundary_layers: 0,
-            givens_cos: Some(s1),
-            givens_sin: Some(s2),
+            givens_cos: s1,
+            givens_sin: s2,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7236,20 +7440,16 @@ impl KvCache {
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
 
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-        }
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let (k_gpu, v_gpu, ct, st) = alloc_kv_with_rotation(
+            gpu,
+            n_layers,
+            k_elems,
+            v_elems,
+            None,
+            Some((&cos_vals, &sin_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
             "KV cache: asym4 (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
@@ -7275,8 +7475,8 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
+            givens_cos: ct,
+            givens_sin: st,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7329,12 +7529,6 @@ impl KvCache {
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
 
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-        }
         // fwht_shfl_forward operates on 128 elements regardless of head_dim
         // (hd=256 is processed as 2 halves with the same signs reused).
         // Seeds (42, 1042) match the established MQ4 weight-FWHT convention
@@ -7343,12 +7537,14 @@ impl KvCache {
         let n_signs = 128;
         let s1_vals = Self::gen_fwht_signs(42, n_signs);
         let s2_vals = Self::gen_fwht_signs(1042, n_signs);
-        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
-        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
-        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
-        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let (k_gpu, v_gpu, s1, s2) = alloc_kv_with_rotation(
+            gpu,
+            n_layers,
+            k_elems,
+            v_elems,
+            None,
+            Some((&s1_vals, &s2_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
             "KV cache: fwht4 (K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
@@ -7374,8 +7570,8 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             boundary_layers: 0,
-            givens_cos: Some(s1),
-            givens_sin: Some(s2),
+            givens_cos: s1,
+            givens_sin: s2,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7404,7 +7600,7 @@ impl KvCache {
 
     /// Filtered variant of [`new_gpu_asym3`]: skips KV allocation for layers
     /// flagged as non-KV (LinearAttention/DeltaNet in hybrid arches). See
-    /// [`alloc_k_v_filtered`].
+    /// filtered allocation helper.
     pub fn new_gpu_asym3_filtered(
         gpu: &mut Gpu,
         is_kv_layer: &[bool],
@@ -7446,15 +7642,16 @@ impl KvCache {
         let v_blocks_per_head = head_dim / 32;
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let (k_gpu, v_gpu, ct, st) = alloc_kv_with_rotation(
+            gpu,
+            0,
+            k_elems,
+            v_elems,
+            Some(is_kv_layer),
+            Some((&cos_vals, &sin_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
@@ -7481,8 +7678,8 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
+            givens_cos: ct,
+            givens_sin: st,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7536,17 +7733,18 @@ impl KvCache {
         let v_blocks_per_head = head_dim / 32;
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
         // fwht_shfl_forward_256 reads signs[tid*8..tid*8+7], so 256 floats each.
         let n_signs = 256;
         let s1_vals = Self::gen_fwht_signs(42, n_signs);
         let s2_vals = Self::gen_fwht_signs(1042, n_signs);
-        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
-        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
-        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
-        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let (k_gpu, v_gpu, s1, s2) = alloc_kv_with_rotation(
+            gpu,
+            0,
+            k_elems,
+            v_elems,
+            Some(is_kv_layer),
+            Some((&s1_vals, &s2_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
@@ -7573,8 +7771,8 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             boundary_layers: 0,
-            givens_cos: Some(s1),
-            givens_sin: Some(s2),
+            givens_cos: s1,
+            givens_sin: s2,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7610,20 +7808,16 @@ impl KvCache {
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
 
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-        }
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let (k_gpu, v_gpu, ct, st) = alloc_kv_with_rotation(
+            gpu,
+            n_layers,
+            k_elems,
+            v_elems,
+            None,
+            Some((&cos_vals, &sin_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!("KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
             k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
@@ -7646,8 +7840,8 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
+            givens_cos: ct,
+            givens_sin: st,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7694,15 +7888,16 @@ impl KvCache {
         let v_blocks_per_head = head_dim / 32;
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let (k_gpu, v_gpu, ct, st) = alloc_kv_with_rotation(
+            gpu,
+            0,
+            k_elems,
+            v_elems,
+            Some(is_kv_layer),
+            Some((&cos_vals, &sin_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
@@ -7729,8 +7924,8 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: false,
             boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
+            givens_cos: ct,
+            givens_sin: st,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7782,16 +7977,17 @@ impl KvCache {
         let v_blocks_per_head = head_dim / 32;
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
         let n_signs = 128;
         let s1_vals = Self::gen_fwht_signs(42, n_signs);
         let s2_vals = Self::gen_fwht_signs(1042, n_signs);
-        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
-        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
-        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
-        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let (k_gpu, v_gpu, s1, s2) = alloc_kv_with_rotation(
+            gpu,
+            0,
+            k_elems,
+            v_elems,
+            Some(is_kv_layer),
+            Some((&s1_vals, &s2_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
@@ -7818,8 +8014,8 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: true,
             boundary_layers: 0,
-            givens_cos: Some(s1),
-            givens_sin: Some(s2),
+            givens_cos: s1,
+            givens_sin: s2,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -7851,20 +8047,16 @@ impl KvCache {
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
 
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-        }
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let (k_gpu, v_gpu, ct, st) = alloc_kv_with_rotation(
+            gpu,
+            n_layers,
+            k_elems,
+            v_elems,
+            None,
+            Some((&cos_vals, &sin_vals)),
+        )?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
             "KV cache: asym2 (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
@@ -7890,8 +8082,8 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: false,
             boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
+            givens_cos: ct,
+            givens_sin: st,
             layer_is_boundary: vec![],
             compact_offset: 0,
             v_mode: VMode::Q8,

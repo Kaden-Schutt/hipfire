@@ -703,13 +703,11 @@ fn hfq_weight(
         // caller's staging owner until this function returns. Preserve an
         // unexpected sidecar-loader panic after freeing that local resource;
         // the outer DflashWeights transaction then drains earlier weights.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            load_awq_scale(hfq, gpu, name, k)
-        })) {
+        match load_awq_scale(hfq, gpu, name, k) {
             Ok(awq_scale) => wt.awq_scale = awq_scale,
-            Err(payload) => {
+            Err(error) => {
                 wt.free_all(gpu);
-                std::panic::resume_unwind(payload);
+                return Err(error);
             }
         }
     }

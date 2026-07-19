@@ -1579,7 +1579,10 @@ impl Gpu {
         let tensor = self.alloc_tensor(shape, DType::F32)?;
         let bytes =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        if let Err(error) = self.hip.memcpy_htod(&tensor.buf, bytes) {
+            let _ = self.free_tensor(tensor);
+            return Err(error);
+        }
         Ok(tensor)
     }
 
@@ -1594,7 +1597,10 @@ impl Gpu {
         let data = vec![value; tensor.numel()];
         let bytes =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        if let Err(error) = self.hip.memcpy_htod(&tensor.buf, bytes) {
+            let _ = self.free_tensor(tensor);
+            return Err(error);
+        }
         Ok(tensor)
     }
 
@@ -1621,11 +1627,15 @@ impl Gpu {
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, dtype)?;
-        match self.active_stream.as_ref() {
+        let result = match self.active_stream.as_ref() {
             Some(stream) => self
                 .hip
-                .memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
-            None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
+                .memset_async(&tensor.buf, 0, tensor.byte_size(), stream),
+            None => self.hip.memset(&tensor.buf, 0, tensor.byte_size()),
+        };
+        if let Err(error) = result {
+            let _ = self.free_tensor(tensor);
+            return Err(error);
         }
         Ok(tensor)
     }
@@ -1634,7 +1644,10 @@ impl Gpu {
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let buf = self.hip.malloc(data.len())?;
-        self.hip.memcpy_htod(&buf, data)?;
+        if let Err(error) = self.hip.memcpy_htod(&buf, data) {
+            let _ = self.hip.free(buf);
+            return Err(error);
+        }
         Ok(GpuTensor {
             buf,
             shape: shape.to_vec(),
@@ -1650,10 +1663,7 @@ impl Gpu {
 
     /// Fallibly free an optional tensor without losing ownership when the
     /// device bind fails. Reset paths use this for retryable request state.
-    pub fn free_tensor_checked(
-        &mut self,
-        tensor: &mut Option<GpuTensor>,
-    ) -> HipResult<()> {
+    pub fn free_tensor_checked(&mut self, tensor: &mut Option<GpuTensor>) -> HipResult<()> {
         self.bind_thread()?;
         if let Some(tensor) = tensor.take() {
             self.pool.free(tensor.buf);
@@ -1711,10 +1721,7 @@ impl Gpu {
     pub fn invalidate_graph_state_checked(&mut self) -> HipResult<()> {
         self.bind_thread()?;
         let mut first_error = None;
-        if let Err(error) = self
-            .graphs
-            .graph_destroy_checked(&self.hip, self.device_id)
-        {
+        if let Err(error) = self.graphs.graph_destroy_checked(&self.hip, self.device_id) {
             first_error = Some(error);
         }
         if let Err(error) = self

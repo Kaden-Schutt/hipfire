@@ -124,7 +124,7 @@ pub fn paro_text_prefix(source: &dyn ModelSource) -> HipResult<&'static str> {
 /// rotation sidecars to GPU.
 pub fn load_paro_weight(
     source: &dyn ModelSource,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     tensor_prefix: &str, // e.g. "model.language_model.layers.0.mlp.gate_proj"
     out_dim: usize,      // M
     in_dim: usize,       // K
@@ -157,22 +157,62 @@ pub fn load_paro_weight(
         in_dim,
         group_size as usize,
     );
-    let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
+    let mut staged = Vec::with_capacity(4);
+    staged.push(gpu.upload_raw(&hfq_data, &[hfq_data.len()])?);
+    #[cfg(feature = "dflash-fault-inject")]
+    crate::dflash_generic::generic_dflash_allocation_boundary(
+        crate::dflash_generic::GenericDflashConstructionStage::ParoWeightUpload(0),
+    )
+    .map_err(|e| {
+        let tensor = staged.pop().expect("staged Paro weight buffer");
+        let _ = gpu.free_tensor(tensor);
+        HipError::new(0, &e)
+    })?;
 
-    // Load rotation metadata
-    let (_, pairs_data) = source
-        .tensor_data(&pairs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
-    let (_, theta_data) = source
-        .tensor_data(&theta_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
-    let (_, cs_data) = source
-        .tensor_data(&cs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
+    let result = (|| -> HipResult<()> {
+        // Load rotation metadata
+        let (_, pairs_data) = source.tensor_data(&pairs_name).ok_or_else(|| {
+            HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}"))
+        })?;
+        staged.push(gpu.upload_raw(pairs_data, &[pairs_data.len()])?);
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::ParoWeightUpload(1),
+        )
+        .map_err(|e| HipError::new(0, &e))?;
 
-    let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
-    let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
-    let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
+        let (_, theta_data) = source.tensor_data(&theta_name).ok_or_else(|| {
+            HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}"))
+        })?;
+        staged.push(gpu.upload_raw(theta_data, &[theta_data.len()])?);
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::ParoWeightUpload(2),
+        )
+        .map_err(|e| HipError::new(0, &e))?;
+
+        let (_, cs_data) = source
+            .tensor_data(&cs_name)
+            .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
+        staged.push(gpu.upload_raw(cs_data, &[cs_data.len()])?);
+        #[cfg(feature = "dflash-fault-inject")]
+        crate::dflash_generic::generic_dflash_allocation_boundary(
+            crate::dflash_generic::GenericDflashConstructionStage::ParoWeightUpload(3),
+        )
+        .map_err(|e| HipError::new(0, &e))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for tensor in staged.into_iter().rev() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        return Err(error);
+    }
+    let mut tensors = staged.into_iter();
+    let buf = tensors.next().expect("staged Paro weight buffer");
+    let pairs = tensors.next().expect("staged Paro pairs");
+    let theta = tensors.next().expect("staged Paro theta");
+    let channel_scales = tensors.next().expect("staged Paro channel scales");
 
     Ok(WeightTensor {
         buf,
