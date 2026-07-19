@@ -1,15 +1,17 @@
 # Hipfire graft provenance and enablement boundary
 
 This crate is copied from the standalone Redline repository at commit
-`50f59ca` after local gfx1201 and remote R9700 certification. The low-level
-public ROCr ABI provenance is retained in `../redline-rocr/PROVENANCE.md`.
+`50f59ca` after its historical local gfx1201 and remote R9700 acceptance
+campaign. The low-level public ROCr ABI provenance is retained in
+`../redline-rocr/PROVENANCE.md`.
 
 This file preserves graft provenance and dated evidence. The current normative
 workflow is the canonical [Redline contributor guide](../../docs/REDLINE.md).
 
-The graft is default-off except for the product-certified single-GPU Qwen A3B
-`.mq4r` route on gfx12, which defaults to `auto` with the retained PM4
-transport. An explicit `HIPFIRE_REPLAY_BACKEND` bypasses that automatic model
+The graft is default-off except for the productized automatic admission of the
+single-GPU Qwen A3B `.mq4r` route on gfx12, where the product default requests
+`auto` with the retained PM4 transport. An explicit `HIPFIRE_REPLAY_BACKEND`
+bypasses that automatic model
 default; `HIPFIRE_REPLAY_TRANSPORT` changes only the transport and does not
 enable replay by itself.
 
@@ -24,7 +26,7 @@ current call, poisons the controller, and permits fallback only on later calls;
 there is no same-call HIP retry. A successful model swap resets the
 process-local controller so a prior tape cannot bleed into a new model.
 
-The source repository's certified results are:
+The source repository's results accepted under that historical campaign were:
 
 - real token DAG: 1.076x local and 1.059-1.060x R9700 on GPU timestamps;
 - expanded independent set: 1.378-1.381x local and 1.265-1.292x R9700 by
@@ -50,7 +52,7 @@ its launch-sequence fingerprint. That fingerprint is discovery evidence only:
 these diagnostics neither install nor route a plan, and product route proof is
 separately required by the [canonical guide](../../docs/REDLINE.md).
 
-## Local gfx1201 certification (2026-07-11, automatic clocks)
+## Local gfx1201 dated evidence (2026-07-11, automatic clocks)
 
 - Qwen3.5 0.8B: 356 dispatches / 21 kernels, sequence hash
   `55f99a58cb4b9363`.
@@ -82,9 +84,12 @@ omit their intermediate compute-idle wait and fan in at the next dependent
 boundary. Fifteen consecutive positions remain bit-exact for logits, KV, and
 recurrent state on both models.
 
-Matched resident product measurements at automatic clocks (10 runs, 100 decode
-positions per run, median) compare the existing HipGraph route with the normal
-auto-capture PM4 route:
+Matched resident product reports at automatic clocks (10 runs, 100 decode
+positions per run, median) compared the requested HipGraph arm with the
+requested `auto`/PM4 arm. Those reports lack the controller `Ready`, fallback,
+observed-replay, packet/queue/dword, and anti-HIP/HipGraph fields required by
+the current guide. These rows are therefore nominal/requested-PM4 dated
+evidence, not proof that the timed arm executed retained replay:
 
 - Qwen3.5 0.8B: 363.682 -> 392.248 tok/s, **1.07855x**.
 - Qwen3.5 9B: 97.727 -> 98.775 tok/s, **1.01073x**.
@@ -100,12 +105,14 @@ code objects: the shared residual-scale GEMV and the indexed K=8 MoE gate/up
 GEMV.
 
 The A3B tape contains 26 kernels and has sequence hash `8d5620ca2ca8a536`.
-The initial conservative PM4 policy measured 164.220 tok/s through HipGraph and
-174.087 tok/s through retained replay (**1.06009x**). The shared-expert down and
-routed-expert gate/up launches are independent: they read distinct activation
-buffers, write distinct result buffers, and join only at the later MoE combine.
-Removing their intermediate compute-idle wait at all 40 layer boundaries raised
-the matched 10-by-100 median to 165.839 -> 178.320 tok/s (**1.07526x**).
+The initial conservative requested-PM4 arm measured 174.087 tok/s against
+164.220 tok/s for the requested HipGraph arm (**1.06009x** nominally). The
+shared-expert down and routed-expert gate/up launches are independent: they
+read distinct activation buffers, write distinct result buffers, and join only
+at the later MoE combine. Removing their intermediate compute-idle wait at all
+40 layer boundaries raised the matched requested-route 10-by-100 median to
+165.839 -> 178.320 tok/s (**1.07526x** nominally). These timed rows have the
+same missing controller and anti-fallback ledger described above.
 
 The expanded policy remained bit-exact for logits, KV, recurrent state, and the
 captured HIP kernarg blobs across 15 consecutive positions. It uses automatic
@@ -120,14 +127,15 @@ and correctly triggers fail-closed artifact validation. Reproduce with
 `scripts/redline_product_bench.py --transport pm4`; `.redline-work/` holds the
 local raw JSON and daemon logs and is not a source artifact.
 
-The user-facing `serve_harness.py` transport/performance gate also completed at
-automatic clocks without replay faults. A five-prompt greedy battery reported
-no runaways and averaged 384.7 decode tok/s for Qwen3.5 0.8B and 99.3 tok/s for
-Qwen3.5 9B; prompt prefill ranged from 4.7-7.4 ms and 18.3-33.3 ms respectively.
-The response-coherence gate did not pass: the current Qwen thinking/content
-split yielded empty visible `content` after valid `stop` finishes. That failure
-reproduces outside the retained transport and remains a separate response-
-framing issue.
+The user-facing `serve_harness.py` was also run with PM4 requested and produced
+dated transport/performance evidence at automatic clocks without reported
+replay faults. It does not add the missing timed-arm controller or anti-fallback
+ledger. A five-prompt greedy battery reported no runaways and averaged 384.7
+decode tok/s for Qwen3.5 0.8B and 99.3 tok/s for Qwen3.5 9B; prompt prefill
+ranged from 4.7-7.4 ms and 18.3-33.3 ms respectively. The response-coherence
+gate did not pass: the current Qwen thinking/content split yielded empty visible
+`content` after valid `stop` finishes. That failure reproduces outside the
+requested retained transport and remains a separate response-framing issue.
 
 ## MTP boundary
 
@@ -143,6 +151,6 @@ The existing HipGraph proposal executor is now permitted to capture the same
 full-vocabulary Q8 head. It is token-identical at K=3 (tau 3.4737 and matching
 output), but remains neutral/slightly negative at 186.06 vs 187.95 tok/s, so it
 stays behind the existing explicit `HIPFIRE_MTP_PROPOSAL_GRAPH=on` opt-in. The
-product combination is consequently Redline PM4 for certified ordinary decode
-and the established HIP MTP path for speculative decode; there is no unsafe
-automatic crossover.
+product default consequently requests `auto`/PM4 for eligible ordinary
+decode and uses the established HIP MTP path for speculative decode; there is
+no unsafe automatic crossover.

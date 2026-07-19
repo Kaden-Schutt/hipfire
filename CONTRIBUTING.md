@@ -109,17 +109,20 @@ python3 scripts/serve_harness.py --model /path/to/model --mode battery --samplin
 
 For retained AQL/PM4 work, keep using the harnesses above and follow the
 canonical [Redline certification and evidence procedure](docs/REDLINE.md).
-A stable fingerprint from a manually delimited capture is discovery evidence,
-not proof that the product selected or executed a retained route. Product-route
-proof must be collected separately for the actual timed and serving paths.
+A stable fingerprint or shadow result from the manual harness is discovery and
+correctness evidence, not proof that the timed product arm selected or executed
+a retained route. The current manual and product reports cannot be joined to
+prove that routing. Full Redline-attributed promotion remains blocked until a
+route-proof-capable product report supplies the positive timed-arm ledger
+required by the guide.
 
 **Don't bypass with `--no-verify`.** A regression the gate catches is
 information. Authorized exceptions need explicit written sign-off from
 the maintainer for that specific change. Read
 [docs/methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md)
-before claiming any perf win — within-session A/B noise is ±10–15% on
-gfx1100, and the bench harness has a stale-binary trap that's bitten
-us before.
+before claiming any perf win. Follow its current warmup, fresh-process,
+repeat/run aggregation, noise, and stale-binary policy rather than copying a
+numeric noise band here.
 
 ### New kernel files
 

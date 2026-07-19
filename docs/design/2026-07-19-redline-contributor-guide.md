@@ -53,13 +53,13 @@ This file owns the architecture, porting recipe, certification ladder, performan
 
 ### Agent hook: `docs/skills/redline-retained-replay.md`
 
-This is a short trigger-oriented index, not a second manual. It states:
+This is a short discovery index, not a second manual. It contains only:
 
-- when the guide is mandatory;
-- the inputs a contributor must collect before editing;
-- the non-negotiable correctness and route-proof gates;
+- triggers for when the canonical guide applies;
+- examples that are not Redline;
 - the distinction among the three Redline crates;
-- the canonical guide link.
+- a mandatory read-first link and direct links to the relevant guide sections;
+- one tooling-gap warning that blocks promotion when timed-arm route proof is unavailable.
 
 `CLAUDE.md` will index the hook in its existing `docs/skills/` section.
 
@@ -67,7 +67,7 @@ This is a short trigger-oriented index, not a second manual. It states:
 
 - `README.md`: retain the short user-facing overview and link to `docs/REDLINE.md` for architecture and contributor procedure.
 - `CONTRIBUTING.md`: retain the mandatory harness commands and link to the guide's certification ladder and evidence contract.
-- `crates/redline-dispatch/HIPFIRE-GRAFT.md`: remain the graft/provenance and dated certification record; link to the canonical guide and remove or clarify claims that conflict with current runtime behavior.
+- `crates/redline-dispatch/HIPFIRE-GRAFT.md`: remain the graft/provenance and dated evidence record; link to the canonical guide and remove or clarify claims that conflict with current runtime behavior.
 - `CLAUDE.md`: identify all three crates and their distinct roles, then add the skill-index entry.
 
 ### Source-of-truth precedence
@@ -242,7 +242,7 @@ Include diagnosis and required response for:
 
 ### 10. Worked cases
 
-Every case must use the same schema: intent, baseline route, candidate route, architecture/model/quant/topology, immutable retained contract, validation evidence, route proof, matched performance comparison, disposition, and reusable lesson. Rejected cases require falsification evidence, not merely a neutral result. Dated raw evidence remains in its performance checkpoint or report and is linked rather than duplicated wholesale.
+Every case must use the same schema: intent, baseline route, candidate route, architecture/model/quant/topology, immutable retained contract, validation evidence, route proof, matched performance comparison, disposition, and reusable lesson. Rejected cases require evidence-bounded falsification: state exactly which gate the available evidence fails and do not promote a non-diagnostic artifact into a contract violation. A neutral result alone is insufficient. Dated raw evidence remains in its performance checkpoint or report and is linked rather than duplicated wholesale.
 
 Any architecture/model matrix must separate **implementation capability**, **model-route evidence**, **explicit-opt-in availability**, **retained-route certification**, and **automatic-default admission**. An architecture register map, successful model benchmark, or README performance row does not by itself prove that Redline routed.
 
@@ -250,7 +250,7 @@ Required cases:
 
 1. **Qwen3.5 0.8B dense on gfx1201:** compact known-good opt-in capture/parity example. Clearly state that this `.mq4`, `arch_id=5` model requires explicit replay selection and is not the product-default `.mq4r` admission route.
 2. **Qwen3.6 35B-A3B MQ4R on gfx1100, gfx1151, and gfx1201:** primary production-model example. Separate the cross-architecture MQ4R model route and its evidence from the narrower current automatic Redline predicate: gfx12, `arch_id=6`, single GPU, `pp=tp=1`, and `.mq4r`. Each architecture row must cite positive route proof before it is labeled retained-replay certified.
-3. **Rejected gfx1030 MQ2 lowering:** identify the exact immutable contract that was clobbered—launch identity/order, owning HSACO, kernarg ABI, resource effects, dynamic binding, capture boundary, or output/state parity—and why rejection was correct. Cite the exact branch/commit and observed violation; do not reconstruct missing details from memory.
+3. **Rejected gfx1030 MQ2 lowering:** cite the exact branch/commit and preserve the rejection on the matched product regression and incomplete timed-arm route proof. The off/on reports were separate processes, the daemon hashed raw padded kernarg bytes, the first three pointer fields shifted uniformly by `0x9ef98000000`, and the scalar tails matched. Treat the resulting 942/942 hash drift as non-diagnostic pointer relocation. Require pointer-normalized field comparison or a within-session same-allocation comparison before concluding that an unexpected kernarg mutation violated the immutable tape.
 4. **Rejected LFM Stage A:** distinguish serial-HIP activation-preparation fusion from Redline. Record the reconciled launch accounting and failed wall-time gates, then show that the recorder→prepared-plan→`Ready`→observed-replay chain was absent and that recorder completeness, model state, replay-stable attention geometry, shadow support, and PM4 routing remain prerequisites.
 
 ### 11. New-route checklist
@@ -293,7 +293,7 @@ The documentation work is complete only when:
 5. The evidence ladder requires multi-position state parity and positive route proof before any performance claim.
 6. Performance methodology prohibits cross-harness, cross-binary, cross-prompt, or silent-fallback comparisons.
 7. The post-Redline loop requires PM4-versus-PM4-plus-overlay experiments for kernel and hazard-policy improvements.
-8. The four required worked cases are included and source-grounded. The gfx1030 MQ2 case cites exact recoverable evidence rather than relying on recollection.
+8. The four required worked cases are included and source-grounded. The gfx1030 MQ2 case uses evidence-bounded falsification, preserves the proven performance and route-proof failures, and requires pointer-normalized or within-session comparison before attributing raw cross-process hash drift to tape mutation.
 9. `docs/skills/redline-retained-replay.md` is concise, links to the canonical guide, and contains no competing procedure.
 10. `CLAUDE.md` identifies `redline`, `redline-dispatch`, and `redline-rocr` accurately and indexes the skill hook.
 11. `README.md`, `CONTRIBUTING.md`, and `HIPFIRE-GRAFT.md` link to the canonical guide and contain no contradictory lifecycle or transport claims.

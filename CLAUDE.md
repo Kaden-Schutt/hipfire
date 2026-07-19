@@ -128,11 +128,9 @@ one-shell A/B but measured as no-op or regression on fresh probe —
 check it before starting a new kernel experiment.
 
 **Δ ≥ 5% investigation rule (mandatory).** Any perf delta whose
-magnitude crosses ±5% warrants investigation. Do NOT shrug it off as
-"within the ±10–15 % session noise band" — that band describes
-worst-case spread, not the expected center, and a ±5% point estimate
-is most likely real signal partly masked by noise. Walk the rule
-cheapest-step first:
+magnitude crosses ±5% warrants investigation. Do NOT dismiss it under a
+stale, inflated session-noise claim; a ±5% point estimate is most likely real
+signal partly masked by noise. Walk the rule cheapest-step first:
 
 1. **Warming first (always cheapest, always required).** Re-run 3–5
    times with the established protocol — one `--max 16` warmup per
@@ -148,13 +146,11 @@ cheapest-step first:
    sccache, mold, DPM governor), flag state (`HIPFIRE_*` env vars,
    `--kv-mode`, `--no-chatml`, `prompt_normalize`, prompt md5), then
    code-change bisect via `scripts/probe_commits.sh`.
-3. **If real GAIN: validate the actual runtime path before ANY claim.**
-   Use `scripts/redline_daemon_harness.py` for retained-launch capture,
-   contract checks, and multi-position HIP/PM4 output parity. Use
-   `scripts/serve_harness.py` for sampled, chained, or session-level output
-   checks through the user-facing serve path. The retired
-   `scripts/coherence-gate*.sh` family is stale and MUST NOT be used as
-   acceptance evidence.
+3. **If real GAIN: validate the executable path that produced the result before
+   ANY claim.** Follow the path-specific evidence rules in **Runtime validation**
+   below; a generic harness pass does not prove that a requested retained route
+   executed. The retired `scripts/coherence-gate*.sh` family is stale and MUST
+   NOT be used as acceptance evidence.
 
 **Diagnosing memset pressure:** run with `HIPFIRE_MEMSET_DUMP=1` — the
 gpu layer's memset helper is `#[track_caller]` and prints `file:line`
@@ -215,16 +211,24 @@ mislabel both regressions and valid numerical changes.
 Choose validation by the path under test:
 
 - Kernel, dispatch, graph, or Redline replay changes: run
-  `scripts/redline_daemon_harness.py`. Require stable capture, valid AQL
-  contracts, and multi-position HIP/PM4 output parity. Record the JSON report.
+  `scripts/redline_daemon_harness.py` for manual retained-launch capture,
+  contract checks, and multi-position HIP/PM4 output parity. Record the JSON
+  report; it is not timed product-arm route proof.
 - User-facing generation or state-lifecycle changes: run
   `scripts/serve_harness.py` against the exact model and settings under test.
   Use `battery` for varied prompts, `chain` for related turns, and `session`
   for recurrent-state/reset behavior. Record the per-turn JSON and decoded
   text.
-- Performance claims: combine the applicable harness above with the matched,
+- Performance claims: use the applicable correctness harness and the matched,
   fresh-process timing protocol in this file. A microbenchmark alone is not
   acceptance evidence.
+
+For Redline specifically, the current manual shadow/capture report plus the
+product timing report do not jointly prove that the timed arm routed and must
+not be stitched together as route proof. Full Redline-attributed promotion is
+blocked until a route-proof-capable product report itself records the
+controller, observed-replay, transport, and anti-fallback ledger required by
+[`docs/REDLINE.md` §7](docs/REDLINE.md#7-certification-and-route-proof-ladder).
 
 First-time setup (once per clone):
 ```
