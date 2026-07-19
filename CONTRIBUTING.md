@@ -107,6 +107,12 @@ python3 scripts/serve_harness.py --model /path/to/model --mode battery --samplin
 ./scripts/speed-gate.sh --fast          # 4B prefill+decode regression vs tests/speed-baselines/<arch>.txt
 ```
 
+For retained AQL/PM4 work, keep using the harnesses above and follow the
+canonical [Redline certification and evidence procedure](docs/REDLINE.md).
+A stable fingerprint from a manually delimited capture is discovery evidence,
+not proof that the product selected or executed a retained route. Product-route
+proof must be collected separately for the actual timed and serving paths.
+
 **Don't bypass with `--no-verify`.** A regression the gate catches is
 information. Authorized exceptions need explicit written sign-off from
 the maintainer for that specific change. Read

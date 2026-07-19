@@ -38,8 +38,15 @@ and cached as `.hsaco` per GPU arch.
   multi-GPU EP), minimax (10), lfm2moe (11), cohere2moe (12). `toy` (0xFF) is the
   new-port template; the daemon refuses to dispatch it.
 - Support crates: hipfire-loader, hipfire-atlas (perf corpus), hipfire-reap (MoE
-  expert pruning), hipfire-tui (chat/settings TUI), redline (experimental
-  direct-KMD compute, not wired into serving).
+  expert pruning), and hipfire-tui (chat/settings TUI).
+- **redline** — experimental direct-KMD/bare-libdrm device, memory, queue, PM4,
+  and synchronization machinery; it is not the product serving transport.
+- **redline-dispatch** — dispatch-DAG recording and validation, artifact and
+  kernarg identity, dependency policy, plan selection, and retained AQL/PM4
+  graph construction.
+- **redline-rocr** — dynamically loaded public ROCr/HSA ABI; agent, queue,
+  memory, packet, signal, doorbell, and completion lifetimes; AQL packet
+  encoding; and architecture-specific PM4 command builders.
 
 ## Building, testing & gates
 
@@ -191,6 +198,10 @@ matches. Index of currently-available skills:
   learning (`scripts/mem.sh remember <slug> "<title>" tags`). Project findings go
   here (shared, diffable, travel with the code); personal/fleet notes stay in global
   memory. See `docs/skills/agent-memory.md`.
+
+- **`redline-retained-replay`** — discovery hook for retained AQL/PM4 changes
+  and claims. Start at [`docs/skills/redline-retained-replay.md`](docs/skills/redline-retained-replay.md);
+  [`docs/REDLINE.md`](docs/REDLINE.md) is the only normative procedure.
 
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.

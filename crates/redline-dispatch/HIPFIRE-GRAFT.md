@@ -4,16 +4,25 @@ This crate is copied from the standalone Redline repository at commit
 `50f59ca` after local gfx1201 and remote R9700 certification. The low-level
 public ROCr ABI provenance is retained in `../redline-rocr/PROVENANCE.md`.
 
+This file preserves graft provenance and dated evidence. The current normative
+workflow is the canonical [Redline contributor guide](../../docs/REDLINE.md).
+
 The graft is default-off except for the product-certified single-GPU Qwen A3B
 `.mq4r` route on gfx12, which defaults to `auto` with the retained PM4
-transport. Explicit `HIPFIRE_REPLAY_BACKEND` and `HIPFIRE_REPLAY_TRANSPORT`
-settings take precedence. No replay mode may replace a HIP launch until warmup
-shadow validation proves shared-artifact identity, byte-exact output, intact
-guards, automatic clocks, GPU timing, and two independent speedup samples above
-the configured threshold. Any ABI, capability, parity, timeout, queue-fault,
-or cache-poison failure falls back to HIP for the process. A successful model
-swap resets the process-local controller; non-MQ4R and non-gfx12 models return
-to ordinary HIP rather than inheriting a prior retained tape.
+transport. An explicit `HIPFIRE_REPLAY_BACKEND` bypasses that automatic model
+default; `HIPFIRE_REPLAY_TRANSPORT` changes only the transport and does not
+enable replay by itself.
+
+On the automatic product path, the first eligible ordinary-HIP forward records
+the tape and successful preparation moves the controller from `Captured` to
+`Ready`; it does not traverse `ShadowValidated`. Manual shadow observations and
+their observation threshold are pre-promotion evidence, not a durable automatic
+admission threshold. Preparation failure occurs after the warmup HIP forward
+has completed, poisons retained routing, and allows later eligible calls to use
+the HIP-side policy. A retained replay execution failure instead errors the
+current call, poisons the controller, and permits fallback only on later calls;
+there is no same-call HIP retry. A successful model swap resets the
+process-local controller so a prior tape cannot bleed into a new model.
 
 The source repository's certified results are:
 
@@ -31,14 +40,15 @@ sequence to one public-HSA queue after the first eligible forward. Speculative,
 MTP re-seed, and verify forwards share HipGraph's one-shot
 `ar_graph_eligible` contract and can neither populate nor consume the plain-AR
 replay. Dynamic position stays in `pos_buf`; the stochastic GDN frame scalar is
-patched between replays. Any queue or preparation failure poisons the controller
-and fails closed.
+patched between replays.
 
-For adapter development, `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` arms the recorder
-without collecting model load or repeated decode traffic. The daemon's
-`bench_prefill` and `bench_decode` probes may then delimit one phase and return
-its launch-sequence fingerprint. These diagnostics do not install or route a
-plan; see `scripts/redline_daemon_harness.py` and the phase-capture checkpoint.
+For adapter development, pair `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` with an
+explicit non-HIP backend such as `shadow`. This bypasses the automatic model
+default and lifecycle; the daemon's `bench_prefill` and `bench_decode` probes
+may then delimit one phase and return
+its launch-sequence fingerprint. That fingerprint is discovery evidence only:
+these diagnostics neither install nor route a plan, and product route proof is
+separately required by the [canonical guide](../../docs/REDLINE.md).
 
 ## Local gfx1201 certification (2026-07-11, automatic clocks)
 

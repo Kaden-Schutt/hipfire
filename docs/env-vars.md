@@ -2,13 +2,13 @@
 
 **Generated:** 2026-05-07. Auto-extracted from source via `git ls-files | grep -E '\.(rs|ts)$'`. See `Maintenance` at the bottom for re-generation.
 
-This document is the single canonical reference for every environment variable hipfire reads. It supersedes the fragmented mentions across `docs/`, `AGENTS.md`, and inline source comments.
+This document is the canonical reference for hipfire's supported environment-variable surface. The generated inventory is a dated snapshot; experimental source-only tuning knobs are not promoted here merely because they exist. It supersedes the fragmented mentions across `docs/`, `AGENTS.md`, and inline source comments.
 
 ## Governance summary
 
 | Layer | Count | Notes |
 |---|---|---|
-| `HIPFIRE_*` env vars | 116 | 14 plumbed through TUI, 46 mentioned in some doc, 56 silent |
+| `HIPFIRE_*` env vars | 119 | 14 plumbed through TUI, 49 mentioned in some doc, 56 silent; includes the 3 core Redline controls added after the generated snapshot |
 | Non-`HIPFIRE_*` project env vars | 21 | Test/example/diag scaffolding. Should be renamed `HIPFIRE_*` for consistency. |
 | `config.json` schema (`HipfireConfig`) | ~40 keys | Validated by `validateConfigValue()` in `cli/index.ts`. Some keys map 1:1 to env vars set at daemon spawn. |
 | `per_model_config.json` overrides | same surface | Sparse overrides on top of the base config, applied per model tag. |
@@ -159,7 +159,10 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_QUANT_THREADS` | LIB | — | `crates/hipfire-quantize/src/main.rs:2053` |
 | `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` | DRAFT/SPEC | env tier of the DSpark conf ladder; unset → qwen3 default 0.1 | `crates/hipfire-loader/src/carriers.rs:675` |
 | `HIPFIRE_RDNA2_VARIANT` | KERNEL-SELECTOR | — | `cli/index.ts:2593` |
+| `HIPFIRE_REPLAY_BACKEND` | REDLINE | contextual: `auto` for the eligible model default; otherwise `hip` | `crates/rdna-compute/src/replay.rs:1569` |
 | `HIPFIRE_REPLAY_GRAPH` | GRAPH-DIAG | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/speculative.rs:630` |
+| `HIPFIRE_REPLAY_MANUAL_CAPTURE` | REDLINE | off (`1`, `true`, or `on` enable) | `crates/rdna-compute/src/replay.rs:1586` |
+| `HIPFIRE_REPLAY_TRANSPORT` | REDLINE | contextual: `pm4` for the eligible automatic default; otherwise `aql` | `crates/rdna-compute/src/replay.rs:1057` |
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/dispatch.rs:690` |
 | `HIPFIRE_ROCBLAS_MIN_BATCH` | KERNEL-SELECTOR | — | `crates/rdna-compute/src/dispatch.rs:1413` |
 | `HIPFIRE_ROCBLAS_OFF` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/dispatch.rs:1410` |
@@ -384,6 +387,29 @@ Per-event dumps for debugging. All `=1` to enable.
 - `HIPFIRE_CALIB_PROFILE` — triattn calibration profiling.
 - `HIPFIRE_PREFILL_PROFILE=1` — PFlash scoring profile (also covered under PFLASH).
 
+### `REDLINE` (3)
+
+Core retained-replay controls are documented here. They do not replace the
+certification and evidence procedure in the canonical
+[Redline contributor guide](REDLINE.md). Experimental `HIPFIRE_REPLAY_PM4_*`
+policy and tuning knobs remain research-only and are intentionally not
+enumerated as supported operator controls.
+
+- `HIPFIRE_REPLAY_BACKEND` — selects `hip`/`off` (ordinary HIP), `shadow`
+  (never routes retained work), or `auto` (may route a prepared eligible
+  forward). Unknown values warn and use HIP. An explicit value bypasses the
+  model default. When unset, a successful model load selects `auto` only for
+  gfx12, model `arch_id == 6`, single-GPU `pp=tp=1`, and a case-insensitive
+  `.mq4r` extension; all other models use HIP.
+- `HIPFIRE_REPLAY_TRANSPORT` — `pm4`, `pm4_ib`, and `ib` select retained PM4;
+  every other value selects retained AQL packets. This changes only transport:
+  it does not enable replay or widen model admission. The eligible automatic
+  default uses PM4 when this variable is unset.
+- `HIPFIRE_REPLAY_MANUAL_CAPTURE` — `1`, `true`, or `on` enables manually
+  delimited capture and disables the automatic lifecycle/model default. Pair it
+  with a non-HIP backend such as `shadow`. A resulting phase fingerprint is
+  discovery evidence only and neither installs nor routes a retained plan.
+
 ### `GRAPH-DIAG` (5)
 
 hipGraph capture/replay diagnostics.
@@ -583,4 +609,4 @@ Note the `(_os)?` group — `compiler.rs:100` uses `std::env::var_os("HIPFIRE_KE
 
 A future pass should ship `scripts/regen-env-vars-doc.sh` that mechanically rebuilds the quick-reference table while preserving the prose category guide.
 
-Last manual pass: 2026-05-07.
+Last manual pass: 2026-07-19.

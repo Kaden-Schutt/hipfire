@@ -48,10 +48,16 @@ records the actual kernel graph, derives resource dependencies, retains
 invariant command state, and lowers validated paths through public ROCr
 queue interfaces.
 
-Redline supports the RDNA architecture family from RDNA1 through RDNA4.
-Optimized routes remain architecture- and workload-specific. Unsupported
-graphs, failed shadow validation, ABI mismatches, queue faults, and model
-changes fail closed to ordinary HIP dispatch.
+The lowering implementation has architecture-specific capability from RDNA1
+through RDNA4. Capability is not blanket route certification or automatic
+admission: the current automatic default is limited to single-GPU Qwen A3B
+`.mq4r` on gfx12. Pre-promotion shadow evidence remains a certification
+requirement, but the admitted automatic lifecycle does not wait for the
+controller's `ShadowValidated` state. A preparation failure poisons retained
+routing only after the HIP warmup has completed successfully. A retained-replay
+execution failure errors that call, poisons retained routing for later calls,
+and does not retry the same call through HIP; later eligible calls may use the
+HIP-side policy. See the canonical [Redline contributor guide](docs/REDLINE.md).
 
 ### Qwen 3.6 35B-A3B MQ4R performance
 
@@ -78,8 +84,9 @@ the three recorded sessions did not all terminate at exactly 22K.
 
 The gfx1201 campaign raised ordinary MQ4R autoregressive decode from
 approximately 110 tok/s to 203.9 tok/s. See the
-[gfx1201 campaign report](docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md)
-and [Redline integration boundary](crates/redline-dispatch/HIPFIRE-GRAFT.md).
+[gfx1201 campaign report](docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md),
+the [Redline integration boundary](crates/redline-dispatch/HIPFIRE-GRAFT.md),
+and the canonical [Redline contributor guide](docs/REDLINE.md).
 
 ## Curated model registry
 
@@ -117,11 +124,11 @@ bring-your-own-model flows through `hipfire quantize`.
 | Family | Representative architectures | Notes |
 |---|---|---|
 | Vega/CDNA | `gfx906`, `gfx908`, `gfx940`-`gfx942` | Native wave64 HIP paths |
-| RDNA1 | `gfx1010`-`gfx1013` | Portable HIP and Redline dispatch support |
-| RDNA2 | `gfx1030`-`gfx1032` | Portable HIP and Redline dispatch support |
-| RDNA3 | `gfx1100`-`gfx1103` | Architecture-tuned kernels and validated MQ4R route |
-| RDNA3.5 | `gfx1150`-`gfx1152` | Architecture-tuned kernels and validated MQ4R route |
-| RDNA4 | `gfx1200`, `gfx1201` | WMMA paths and validated retained-PM4 MQ4R route |
+| RDNA1 | `gfx1010`-`gfx1013` | Portable HIP paths; retained lowering is implementation capability, not automatic admission |
+| RDNA2 | `gfx1030`-`gfx1032` | Portable HIP paths; retained lowering is implementation capability, not automatic admission |
+| RDNA3 | `gfx1100`-`gfx1103` | Architecture-tuned kernels; retained-route certification remains workload-specific |
+| RDNA3.5 | `gfx1150`-`gfx1152` | Architecture-tuned kernels; retained-route certification remains workload-specific |
+| RDNA4 | `gfx1200`, `gfx1201` | WMMA paths; automatic retained PM4 only for the narrow certified single-GPU A3B `.mq4r` route |
 
 Architecture-specific kernels are selected through typed dispatch tables.
 Unsupported specializations return to the correct portable or architecture
@@ -137,9 +144,9 @@ formats, dispatch layer, and HIP kernels. ROCm is loaded dynamically; there
 is no Python, PyTorch, CUDA translation layer, or third-party inference
 engine in the hot path.
 
-Redline removes launch overhead after the ordinary graph has been proven
-safe. It does not replace the model implementation or bypass hipfire's
-correctness gates.
+A retained Redline route changes how an eligible forward is submitted; it does
+not replace the model implementation or make implementation capability proof
+of certification.
 
 ## Performance snapshots
 
@@ -285,6 +292,7 @@ the prefill MMQ redesign log is at
 | [CONTAINER.md](docs/CONTAINER.md) | Runtime and GPU gate-runner containers |
 | [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |
+| [REDLINE.md](docs/REDLINE.md) | Canonical retained AQL/PM4 contributor procedure and evidence policy |
 | [HIPFIRE-GRAFT.md](crates/redline-dispatch/HIPFIRE-GRAFT.md) | Redline integration and enablement boundary |
 
 ## License
