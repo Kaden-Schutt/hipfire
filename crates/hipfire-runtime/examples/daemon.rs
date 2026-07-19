@@ -1801,7 +1801,7 @@ fn main() {
                         // `cache_capable`: the daemon implements LCP prompt-cache
                         // reuse for these arches' AR generate path (qwen3.5/3.6
                         // = 5/6, deepseek4 = 9, minimax-m2 = 10, Cohere2-MoE
-                        // = 12). The serve layer keys its
+                        // = 12, LFM2.5 = 11). The serve layer keys its
                         // per-request `reset` decision off THIS flag rather than
                         // a hardcoded arch-string allowlist, so a new
                         // cache-capable arch (or an arch-string rename) can't
@@ -1809,7 +1809,21 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
+                        //
+                        // Arch 11 (LFM): only advertise when eviction is off,
+                        // a Jinja chat template exists, and no speculator is
+                        // loaded. The n-gram/DFlash route uses the arch-generic
+                        // planner, not the LFM strict-extension planner, so it
+                        // must stay stateless until that route is lowered too.
+                        let cache_capable = match m.arch_id {
+                            5 | 6 | 9 | 10 | 12 => true,
+                            11 => m.speculator.is_none()
+                                && lfm2moe::lfm_cache_capable_advertised(
+                                    m.eviction.is_none(),
+                                    m.chat_template.is_some(),
+                                ),
+                            _ => false,
+                        };
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#,
@@ -2618,7 +2632,17 @@ fn main() {
                     // rationale as the qwen2/deepseek4 resets above — without
                     // it, prior-turn KV/conv residue leaks into the new turn.
                     if let Some(b) = m.lfm2moe_mut() {
-                        let _ = b.state.reset(&mut gpu);
+                        if let Err(e) = b.state.reset(&mut gpu) {
+                            m.seq_pos = 0;
+                            m.conversation_tokens.clear();
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","message":"lfm2moe reset failed: {}"}}"#,
+                                e
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
                     }
                     // arch_id=10 (MiniMax-M2): clear the KV cursor between turns.
                     // No captured hipGraph on this path by default, so no graph
@@ -8308,6 +8332,19 @@ fn generate(
             pflash_state,
             pflash_cfg,
         );
+        // The generic spec route does not implement the LFM strict-extension
+        // cache contract (it uses the arch-generic planner/rewind semantics).
+        // Keep it stateless: clear any AR cache bookkeeping and force a cold
+        // recurrent state before generate_dflash's own prefill logic. Reset
+        // failure is terminal; never acknowledge a partially-reset state.
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        if let Some(b) = m.lfm2moe_mut() {
+            if let Err(e) = b.state.reset(gpu) {
+                emit_error_with_id(stdout, id, format!("lfm2moe spec cold reset failed: {e}"));
+                return;
+            }
+        }
         generate_dflash(
             m,
             gpu,
@@ -12294,6 +12331,24 @@ fn sample_lfm_token(
     deepseek4::sampling::sample_token(logits, temp, top_k, top_p, rng)
 }
 
+/// Invalidate LFM host/GPU conversation bookkeeping after a failed prefill or
+/// decode so the next request cannot LCP against a partially-advanced cursor.
+/// Clears `conversation_tokens` + `seq_pos` and best-effort resets conv/KV
+/// state. Must run BEFORE returning an error from `generate_lfm2moe` once the
+/// plan has been applied (hit truncate or miss reset) or any token has been
+/// forwarded — otherwise a reusable-looking prior survives beside a drifted
+/// Reset is attempted to stop the current turn's poisoned state from being
+/// reused; its failure is returned so the caller can make the reset failure,
+/// not just the original forward error, visible.
+fn invalidate_lfm_cache_state(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    if let Some(b) = m.lfm2moe_mut() {
+        b.state.reset(gpu)?;
+    }
+    Ok(())
+}
+
 fn generate_lfm2moe(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -12330,9 +12385,25 @@ fn generate_lfm2moe(
         return;
     }
 
-    // ── Prompt build (same two-path branch as the minimax AR path) ──
+    // ── Canonical prompt render + strict forward-extension plan ─────────
+    // asst_turn_cache replay is HIT-path only: it is consulted solely when
+    // cache is enabled, eviction is off, and a non-empty prior exists (so LCP
+    // can possibly hit). HIPFIRE_QWEN_PROMPT_CACHE=0 and first-turn / empty
+    // prior always plain-render. If a replayed render still misses, we
+    // re-render plain for the cold full-prefill so a stale/cross-conversation
+    // fingerprint collision cannot inject hidden <think> tokens into the
+    // prompt (fingerprint strips think; cache stores raw ids).
+    let cache_disabled =
+        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_enabled = !cache_disabled;
+    let may_replay_asst = cache_enabled
+        && m.eviction.is_none()
+        && !m.conversation_tokens.is_empty()
+        && messages_history.is_some();
+
     let mut started_in_think = false;
-    let prompt_ids: Vec<u32> = {
+    let mut used_asst_replay = false;
+    let rendered_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
         // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
@@ -12353,52 +12424,98 @@ fn generate_lfm2moe(
                 enable_thinking: enable_thinking,
                 bos_token: None,
             };
-            let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
+            // Multi-turn HIT path only: history + eligible prior →
+            // build_cached_history_jinja with asst_turn_cache replay.
+            let cache_render: Option<Vec<u32>> = if may_replay_asst {
+                let history = messages_history.unwrap();
+                let cache_ref = &mut m.asst_turn_cache;
+                let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
+                    &frame,
+                    history,
+                    tools,
+                    |msg| {
+                        let stripped = strip_think_for_fingerprint(&msg.content);
+                        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(
+                            &stripped,
+                        )
+                        .into_owned();
+                        let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                        cache_ref.get(&fp).cloned()
+                    },
+                );
+                match built {
+                    Ok(t) => {
+                        used_asst_replay = true;
+                        Some(t)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[daemon] lfm2moe cached-history jinja failed ({e}) — falling back to plain jinja render"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(ids) = cache_render {
+                // Best-effort think-open detection from decoded tail.
+                let tail = {
+                    let n = ids.len().min(16);
+                    tokenizer.decode(&ids[ids.len() - n..])
+                };
+                started_in_think = render_tail_opens_think(&tail);
+                ids
+            } else {
+                let render_result = if tools.is_some() || messages_history.is_some() {
+                    let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                    let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                        match messages_history {
+                            Some(h) => h,
+                            None => {
+                                let mut v = Vec::new();
+                                if let Some(sys) = system_prompt {
+                                    v.push(hipfire_runtime::prompt_frame::Message {
+                                        role: hipfire_runtime::prompt_frame::Role::System,
+                                        content: sys.to_string(),
+                                        tool_calls: Vec::new(),
+                                        tool_call_id: None,
+                                        tool_plan: String::new(),
+                                    });
+                                }
                                 v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
+                                    role: hipfire_runtime::prompt_frame::Role::User,
+                                    content: prompt.to_string(),
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
                                 });
+                                synthesized = v;
+                                &synthesized
                             }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                            synthesized = v;
-                            &synthesized
-                        }
-                    };
-                frame.render_messages(messages_slice, tools, None)
-            } else {
-                frame.render()
-            };
-            match render_result {
-                Ok(rendered) => {
-                    started_in_think = render_tail_opens_think(&rendered);
-                    tokenizer.encode(&rendered)
-                }
-                Err(e) => {
-                    eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
-                        tokenizer,
-                        system: system_prompt,
-                        user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
+                        };
+                    frame.render_messages(messages_slice, tools, None)
+                } else {
+                    frame.render()
+                };
+                match render_result {
+                    Ok(rendered) => {
+                        started_in_think = render_tail_opens_think(&rendered);
+                        tokenizer.encode(&rendered)
                     }
-                    .build()
+                    Err(e) => {
+                        eprintln!(
+                            "[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain"
+                        );
+                        hipfire_runtime::prompt_frame::ChatFrame {
+                            tokenizer,
+                            system: system_prompt,
+                            user: prompt,
+                            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                            raw: false,
+                        }
+                        .build()
+                    }
                 }
             }
         } else {
@@ -12413,7 +12530,7 @@ fn generate_lfm2moe(
         }
     };
 
-    if prompt_ids.is_empty() {
+    if rendered_ids.is_empty() {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#,
@@ -12448,42 +12565,223 @@ fn generate_lfm2moe(
         v
     };
 
-    // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
-    // prior design only reset on capacity overflow, so every request APPENDED to
-    // the KV at the growing `n_tokens` and the model attended to all prior
-    // requests' tokens at offset RoPE positions — benign for a couple of short
-    // turns (RoPE decay + the prompt re-establishes context) but it bloats the KV
-    // and degrades quality over a real multi-request serve session, only
-    // recovering at overflow. LFM2.5's hybrid conv+GQA state can't be cheaply
-    // rewound to an arbitrary prefix (the conv window chains back to token 0, like
-    // ds4's SWA ring), so partial prefix-reuse is unsafe → cold-rebuild every
-    // turn. This is NOT a perf regression: the path already re-prefills the full
-    // prompt each turn; it now does so from position 0 with no stale KV. A
-    // continuing conversation re-prefills its whole history from the prompt, so
-    // multi-turn is preserved (validated: Bjorn/axolotl recall).
-    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-
-    // After the reset the KV starts at 0, so the only overflow risk is a SINGLE
-    // prompt+generation larger than the whole context — the prefill decode_step
-    // loop would write past the KV (sized for state.max_seq) and panic, taking
-    // down serve. Emit a clean error BEFORE prefill — mirror the minimax/qwen2
-    // guard. saturating_add: an adversarially huge max_tokens must not wrap usize
-    // and slip under the cap.
+    // HIT only when lcp == prior.len() == state.n_tokens and the suffix is
+    // nonempty. Exact full-match and any divergence are misses: reset GPU
+    // recurrent state and full-prefill. No partial prefix reuse (conv window
+    // chains to token 0). Planning lives in hipfire-arch-lfm2moe; daemon only
+    // renders, calls the plan, applies reset/suffix, and reports telemetry.
+    let state_n_tokens = m.lfm2moe().unwrap().state.n_tokens;
     let cap = m.lfm2moe().unwrap().state.max_seq;
-    if prompt_ids.len().saturating_add(max_tokens) > cap {
+    let mut plan = lfm2moe::plan_lfm_prompt_cache(
+        rendered_ids,
+        &m.conversation_tokens,
+        state_n_tokens,
+        m.eviction.is_none(),
+        cache_enabled,
+        cap,
+        max_tokens,
+    );
+
+    // Miss after asst-turn replay: drop the replayed stream and plain-render
+    // for the cold full-prefill. Replay is only sound when LCP proves the
+    // prior GPU state matches; otherwise a fingerprint collision on visible
+    // text can smuggle a different conversation's raw (think-bearing) ids.
+    // NEVER fall back to plan.rendered (the replay stream) here — on renderer
+    // failure prefer ChatFrame Plain, then hard-error rather than cold-prefilling
+    // collision-prone ids.
+    if !plan.cache_hit && used_asst_replay {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let plain_ids: Result<Vec<u32>, String> = {
+            let jinja_enabled =
+                std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+            let try_jinja = jinja_enabled && m.chat_template.is_some();
+            let mut ids: Option<Vec<u32>> = None;
+            if try_jinja {
+                let template = m.chat_template.as_ref().unwrap();
+                let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                    tokenizer,
+                    template,
+                    system: system_prompt,
+                    user: prompt,
+                    enable_thinking: enable_thinking,
+                    bos_token: None,
+                };
+                let render_result = if tools.is_some() || messages_history.is_some() {
+                    let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                    let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                        match messages_history {
+                            Some(h) => h,
+                            None => {
+                                let mut v = Vec::new();
+                                if let Some(sys) = system_prompt {
+                                    v.push(hipfire_runtime::prompt_frame::Message {
+                                        role: hipfire_runtime::prompt_frame::Role::System,
+                                        content: sys.to_string(),
+                                        tool_calls: Vec::new(),
+                                        tool_call_id: None,
+                                        tool_plan: String::new(),
+                                    });
+                                }
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::User,
+                                    content: prompt.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                                synthesized = v;
+                                &synthesized
+                            }
+                        };
+                    frame.render_messages(messages_slice, tools, None)
+                } else {
+                    frame.render()
+                };
+                match render_result {
+                    Ok(rendered) => {
+                        started_in_think = render_tail_opens_think(&rendered);
+                        let enc = tokenizer.encode(&rendered);
+                        if !enc.is_empty() {
+                            ids = Some(enc);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[daemon] lfm2moe miss plain-jinja re-render failed ({e}) — trying ChatFrame Plain"
+                        );
+                    }
+                }
+            }
+            if ids.is_none() {
+                // Last-resort non-replay path: hand-rolled Plain ChatML. Off-
+                // distribution for LFM but never contains asst_turn_cache ids.
+                let plain = hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                    raw: false,
+                }
+                .build();
+                if plain.is_empty() {
+                    Err(
+                        "lfm2moe miss after asst-replay: plain re-render produced empty tokens; refusing to cold-prefill replayed ids"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(plain)
+                }
+            } else {
+                Ok(ids.unwrap())
+            }
+        };
+        match plain_ids {
+            Ok(plain_ids) => {
+                if plain_ids.is_empty() {
+                    let reset_err = invalidate_lfm_cache_state(m, gpu).err();
+                    let msg = "lfm2moe miss after asst-replay: plain re-render produced empty tokens; refusing to cold-prefill replayed ids".to_string();
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        match reset_err {
+                            Some(e) => format!("{msg}; cache-state reset failed: {e}"),
+                            None => msg,
+                        },
+                    );
+                    return;
+                }
+                if std::env::var("HIPFIRE_LFM_CACHE_TRACE").ok().as_deref() == Some("1")
+                    || std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1")
+                {
+                    eprintln!(
+                        "[lfm-cache] miss after asst-replay — plain re-render for cold prefill (replayed_len={} plain_len={})",
+                        plan.rendered.len(),
+                        plain_ids.len(),
+                    );
+                }
+                // Capacity + miss decision stay planner-owned: replan the actual
+                // plain stream (forced miss because cache_enabled still holds
+                // but we pass empty prior / will miss LCP against cleared state
+                // after the miss arm below). Using plan_lfm_prompt_cache keeps
+                // over_capacity in lockstep with the real token count.
+                plan = lfm2moe::plan_lfm_prompt_cache(
+                    plain_ids,
+                    &[], // no prior — cold full-prefill after miss
+                    0,
+                    m.eviction.is_none(),
+                    cache_enabled,
+                    cap,
+                    max_tokens,
+                );
+                debug_assert!(!plan.cache_hit);
+            }
+            Err(msg) => {
+                // Do not prefill the collision-prone replay stream.
+                let reset_err = invalidate_lfm_cache_state(m, gpu).err();
+                emit_error_with_id(
+                    stdout,
+                    id,
+                    match reset_err {
+                        Some(e) => format!("{msg}; cache-state reset failed: {e}"),
+                        None => msg,
+                    },
+                );
+                return;
+            }
+        }
+    }
+
+    if std::env::var("HIPFIRE_LFM_CACHE_TRACE").ok().as_deref() == Some("1")
+        || std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1")
+    {
+        eprintln!(
+            "[lfm-cache] prior_len={} rendered_len={} state_n={} hit={} start_pos={} suffix={} over_cap={} replay={}",
+            m.conversation_tokens.len(),
+            plan.rendered.len(),
+            state_n_tokens,
+            plan.cache_hit,
+            plan.start_pos,
+            plan.new_tokens.len(),
+            plan.over_capacity,
+            used_asst_replay,
+        );
+    }
+
+    if plan.over_capacity {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
             id,
-            prompt_ids.len(),
+            plan.rendered.len(),
             max_tokens,
             cap
         );
         let _ = stdout.flush();
         return;
     }
+
+    // Plan-driven reset: miss → cold rebuild; hit → keep GPU state, prefill suffix.
+    if !plan.cache_hit {
+        if let Err(e) = m.lfm2moe_mut().unwrap().state.reset(gpu) {
+            // Reset itself failed: still clear host bookkeeping so the next
+            // plan sees empty prior (forced miss) rather than a stale prefix.
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            emit_error_with_id(stdout, id, format!("lfm2moe cache-miss state reset failed: {e}"));
+            return;
+        }
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    } else {
+        // Defensive: on a hit the cursor must already equal start_pos.
+        debug_assert_eq!(m.lfm2moe().unwrap().state.n_tokens, plan.start_pos);
+        m.seq_pos = plan.start_pos;
+        m.conversation_tokens.truncate(plan.start_pos);
+    }
+
+    let prefill_ids = &plan.new_tokens;
+    let cached_tokens = plan.cached_tokens;
+    let prefill_tokens = prefill_ids.len();
 
     emit_gen_start(stdout, id, started_in_think);
 
@@ -12492,9 +12790,25 @@ fn generate_lfm2moe(
     // ── Prefill: batched forward_prefill_batch when gfx1201 + the exact
     // opt-in flag are set (frozen §9 routing); otherwise the eager Phase-0
     // decode_step loop. Either way `last_logits` ends as the final prompt
-    // token's logits — the predictions for the first generated token. ──
+    // token's logits — the predictions for the first generated token.
+    // start_pos comes from the plan (0 on miss, state.n_tokens on hit). ──
     let mut last_logits: Vec<f32> = Vec::new();
-    {
+    if prefill_ids.is_empty() {
+        // Exact-match was forced to a miss upstream, so this should not fire
+        // on a healthy path. Guard anyway so we never sample from empty logits.
+        let reset_err = invalidate_lfm_cache_state(m, gpu).err();
+        let msg = "lfm2moe prefill has empty suffix after cache plan".to_string();
+        emit_error_with_id(
+            stdout,
+            id,
+            match reset_err {
+                Some(e) => format!("{msg}; cache-state reset failed: {e}"),
+                None => msg,
+            },
+        );
+        return;
+    }
+    let prefill_err: Option<String> = {
         let b = m.lfm2moe_mut().unwrap();
         let cfg = &b.config;
         let weights = &b.weights;
@@ -12508,24 +12822,26 @@ fn generate_lfm2moe(
             && std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref() == Some("1");
         if use_batched {
             eprintln!(
-                "[daemon] lfm2moe prefill: batched gfx1201 path (HIPFIRE_LFM2_PREFILL_BATCH=1), tokens={}",
-                prompt_ids.len()
+                "[daemon] lfm2moe prefill: batched gfx1201 path (HIPFIRE_LFM2_PREFILL_BATCH=1), tokens={} start_pos={}",
+                prefill_ids.len(),
+                state.n_tokens,
             );
             let start_pos = state.n_tokens as u32;
             match lfm2moe::forward::forward_prefill_batch(
-                cfg, weights, state, gpu, &prompt_ids, start_pos,
+                cfg, weights, state, gpu, prefill_ids, start_pos,
             ) {
-                Ok(logits) => last_logits = logits,
-                Err(e) => {
-                    emit_error_with_id(stdout, id, format!("lfm2moe batched prefill failed: {e}"));
-                    return;
+                Ok(logits) => {
+                    last_logits = logits;
+                    None
                 }
+                Err(e) => Some(format!("lfm2moe batched prefill failed: {e}")),
             }
         } else {
             let mut position = state.n_tokens as u32;
             let gfx1201 = gpu.arch_caps.is_gfx1201();
-            let last_idx = prompt_ids.len().saturating_sub(1);
-            for (i, &tok) in prompt_ids.iter().enumerate() {
+            let last_idx = prefill_ids.len().saturating_sub(1);
+            let mut err: Option<String> = None;
+            for (i, &tok) in prefill_ids.iter().enumerate() {
                 // Phase 0 head-elision (gfx1201-only): non-final prompt tokens skip
                 // the lm_head + full-vocab logits D2H; their logits are never read.
                 let step = if gfx1201 && i != last_idx {
@@ -12537,20 +12853,44 @@ fn generate_lfm2moe(
                 match step {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));
-                        return;
+                        err = Some(format!("lfm2moe prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
+            err
         }
+    };
+    if let Some(msg) = prefill_err {
+        // Prefill may have partially advanced KV/conv (batched contract §1, or
+        // eager path after 0..i tokens). Invalidate so the next request cannot
+        // LCP against a reusable-looking host prior beside a drifted cursor.
+        let reset_err = invalidate_lfm_cache_state(m, gpu).err();
+        emit_error_with_id(
+            stdout,
+            id,
+            match reset_err {
+                Some(e) => format!("{msg}; cache-state reset failed: {e}"),
+                None => msg,
+            },
+        );
+        return;
     }
-    for &tok in &prompt_ids {
+    // Commit the canonical full render as conversation_tokens base, then the
+    // decode loop appends generated ids. On a hit we truncated to start_pos
+    // above, so extending by the suffix rebuilds rendered[..].
+    for &tok in prefill_ids {
         m.conversation_tokens.push(tok);
     }
+    // Sanity: after suffix push, conversation_tokens should equal plan.rendered.
+    debug_assert_eq!(m.conversation_tokens, plan.rendered);
+
+    let decode_start_tokens_idx = m.conversation_tokens.len();
     let mut seen_tokens: std::collections::HashSet<u32> =
         m.conversation_tokens.iter().copied().collect();
     let prefill_ms = t0.elapsed().as_millis();
+    let prefill_s = t0.elapsed().as_secs_f64();
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
     let seed = std::time::SystemTime::now()
@@ -12560,6 +12900,7 @@ fn generate_lfm2moe(
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
+    let mut emit_text_buf = String::new();
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
@@ -12598,6 +12939,7 @@ fn generate_lfm2moe(
         });
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
+        emit_text_buf.push_str(&frag);
         m.conversation_tokens.push(next_tok);
         seen_tokens.insert(next_tok);
         generated_count += 1;
@@ -12613,8 +12955,55 @@ fn generate_lfm2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("lfm2moe decode failed: {e:?}"));
+                // Decode advanced n_tokens for this token's step failure path
+                // is implementation-defined; conversation_tokens already has
+                // the sampled id. Invalidate rather than leave a divergent
+                // prior/cursor pair that looks reusable.
+                let reset_err = invalidate_lfm_cache_state(m, gpu).err();
+                let msg = format!("lfm2moe decode failed: {e:?}");
+                emit_error_with_id(
+                    stdout,
+                    id,
+                    match reset_err {
+                        Some(e) => format!("{msg}; cache-state reset failed: {e}"),
+                        None => msg,
+                    },
+                );
                 return;
+            }
+        }
+    }
+
+    // Populate asst_turn_cache only when cache is enabled. Kill-switch
+    // (HIPFIRE_QWEN_PROMPT_CACHE=0) must not seed entries that a later
+    // enabled turn could replay. Same fingerprint logic as neighboring arches.
+    if cache_enabled
+        && generated_count > 0
+        && m.conversation_tokens.len() > decode_start_tokens_idx
+    {
+        let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
+        if !cached_seq.is_empty() {
+            let stripped = strip_think_for_fingerprint(&emit_text_buf);
+            let emit_text =
+                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+            // Skip empty visible payload (pure-think with nothing left after strip)
+            // — fingerprint collides across empty turns.
+            if !emit_text.trim().is_empty() {
+                // LFM AR path has no tool-call parser yet — fingerprint pure text.
+                let empty_tools: &[hipfire_runtime::prompt_frame::ToolCall] = &[];
+                let fp = asst_turn_fingerprint(&emit_text, empty_tools);
+                if std::env::var("HIPFIRE_LFM_CACHE_TRACE").ok().as_deref() == Some("1")
+                    || std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1")
+                {
+                    eprintln!(
+                        "[lfm-cache store] fp={:#018x} cached_seq={} emit_text.len={} preview={:?}",
+                        fp,
+                        cached_seq.len(),
+                        emit_text.len(),
+                        emit_text.chars().take(60).collect::<String>(),
+                    );
+                }
+                m.asst_turn_cache.insert(fp, cached_seq);
             }
         }
     }
@@ -12628,11 +13017,25 @@ fn generate_lfm2moe(
     } else {
         0.0
     };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
-    );
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prefill_tokens as f64 / prefill_s
+    } else {
+        0.0
+    };
+    // Telemetry: prefill_tokens = newly prefilled suffix; cached_tokens = hit
+    // prefix. Sum equals the full rendered prompt length.
+    let done_envelope = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": tok_s,
+        "prefill_tokens": prefill_tokens,
+        "cached_tokens": cached_tokens,
+        "prefill_ms": prefill_ms,
+        "prefill_tok_s": prefill_tok_s,
+        "total_ms": total_ms,
+    });
+    let _ = writeln!(stdout, "{}", done_envelope);
     let _ = stdout.flush();
 }
 

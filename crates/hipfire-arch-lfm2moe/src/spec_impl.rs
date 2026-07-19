@@ -129,8 +129,12 @@ impl SpecTarget for Lfm2MoeBundle {
         // Zero every conv-state ring buffer + reset the token count (the daemon's
         // arch_id=11 reset path). KV is overwritten by absolute-position writes,
         // so there is no separate KV cursor to rewind here; drop the eviction
-        // offset for symmetry with qwen35's reset.
-        let _ = self.state.reset(gpu);
+        // offset for symmetry with qwen35's reset. The trait is infallible, so a
+        // GPU reset failure is terminal: panic rather than acknowledge a
+        // partially-reset recurrent state as clean.
+        if let Err(e) = self.state.reset(gpu) {
+            panic!("lfm2moe: reset_recurrent failed: {e}");
+        }
         self.state.kv.compact_offset = 0;
     }
 
@@ -171,7 +175,9 @@ impl SpecTarget for Lfm2MoeBundle {
         let mut last_logits: Vec<f32> = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             if abort() {
-                let _ = self.state.reset(gpu);
+                self.state
+                    .reset(gpu)
+                    .map_err(|e| format!("lfm2moe: spec_advance abort reset: {e}"))?;
                 self.state.kv.compact_offset = 0;
                 return Ok(SpecAdvance::Aborted);
             }
