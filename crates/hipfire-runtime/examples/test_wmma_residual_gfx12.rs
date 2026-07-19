@@ -62,6 +62,12 @@ fn main() {
         (32, 512, 32),    // multi-tile in every dim
         (64, 1024, 32),   // larger but still tractable
         (4096, 1024, 16), // 9B-shape band: exercises real M/N ratio at small K
+        (3072, 1024, 2),   // LFM2.5-350M conv-in partial batch tile
+        (1024, 1024, 2),   // LFM2.5-350M conv/attention-out partial tile
+        (1024, 4608, 2),   // LFM2.5-350M dense-down partial tile
+        (1024, 4608, 64),  // LFM2.5-350M dense-down BT4
+        (1024, 4608, 128), // LFM2.5-350M dense-down BT8
+        (1024, 4608, 192), // LFM2.5-350M dense-down BT12
     ];
 
     for &(m, k, n) in shapes {
@@ -106,7 +112,7 @@ fn run_one_lmhead(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), Str
         0,
         "K must be multiple of 256 (HFQ4G256 group size)"
     );
-    assert_eq!(n % 16, 0, "N must be multiple of 16 (WMMA batch tile)");
+    assert!(n > 0, "N must be non-zero");
 
     let a_bytes = build_hfq4g256(m, k, 0xB4);
     let a = gpu
@@ -166,7 +172,7 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), String> {
         0,
         "K must be multiple of 256 (HFQ4G256 group size)"
     );
-    assert_eq!(n % 16, 0, "N must be multiple of 16 (WMMA batch tile)");
+    assert!(n > 0, "N must be non-zero");
 
     // ── Build synthetic HFQ4G256 weight bytes ──────────────────────────────
     let a_bytes = build_hfq4g256(m, k, 0xD7);
@@ -278,7 +284,7 @@ fn compare(
             if rel > max_rel {
                 max_rel = rel;
             }
-            if abs > abs_tol && rel > rel_tol {
+            if !a.is_finite() || !b.is_finite() || (abs > abs_tol && rel > rel_tol) {
                 n_bad += 1;
                 hist_row_mod16[row % 16] += 1;
                 hist_batch_mod16[batch % 16] += 1;

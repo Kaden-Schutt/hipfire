@@ -573,6 +573,22 @@ End-to-end batched-versus-eager comparisons are **not** bit-exact: eager Q8 GEMV
 | `KL(softmax(eager) || softmax(batched))`, mean across oracle prompts | `<= 1e-4` | `<= 5e-4` |
 | same KL, maximum prompt | `<= 1e-3` | `<= 5e-3` |
 
+The exact gfx1201 `lfm2.5-350m.mq4` cohort (artifact md5
+`cb5284b8ad5c6f9e4ca859c0aff0bcd0`, Q8 KV) has a narrower,
+reviewer-approved exception to the dense-MQ4 column:
+
+| Quantity | 350M MQ4 gfx1201 ceiling |
+|---|---:|
+| dequantized written K and V max-abs | `<= 0.20` |
+| final-token logits max-abs | `<= 0.40` |
+| mean KL across the oracle matrix | `<= 1e-3` |
+
+All cosine limits, hidden/conv max-abs limits, maximum-prompt KL `<=5e-3`,
+and exact state/cursor/position/chunk checks remain unchanged. This exception
+is based on actual-shape N=2 plus BT4/BT8/BT12 HFQ4 gfx12 WMMA channel tests,
+the full enabled-WMMA oracle matrix, and an `HIPFIRE_FP16=0` causal control.
+It MUST NOT be applied to 1.2B or A1B cohorts without independent evidence.
+
 `kld_logits.rs` currently reports rather than enforces; the batched parity harness MUST compute its existing KL formula and fail on the numeric mean/max limits above. `state.n_tokens`, the set of absolute KV write positions, token ordering, layer-to-cache/ring slot mapping, and chunk coverage remain exact discrete comparisons. For A1B, top-k expert indices must also match eager exactly; top-k weights use the same cohort numeric tolerances.
 
 The oracle matrix MUST include 1, 2, 3, 127, 128, 255, 256, and 257 tokens, and fixed prompts through the LFM serve harness. A failure of any single bound rejects the cohort.

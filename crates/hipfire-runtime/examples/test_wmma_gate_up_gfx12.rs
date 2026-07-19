@@ -46,6 +46,10 @@ fn main() {
         (32, 16, 256, 16),
         (32, 32, 512, 32),
         (48, 16, 256, 16),
+        (4608, 4608, 1024, 2),   // LFM2.5-350M partial batch tile
+        (4608, 4608, 1024, 64),  // LFM2.5-350M BT4
+        (4608, 4608, 1024, 128), // LFM2.5-350M BT8
+        (4608, 4608, 1024, 192), // LFM2.5-350M BT12
     ];
 
     for &(g_m, u_m, k, n) in shapes {
@@ -76,7 +80,7 @@ fn run_one(gpu: &mut Gpu, gate_m: usize, up_m: usize, k: usize, n: usize) -> Res
     assert_eq!(gate_m % 16, 0);
     assert_eq!(up_m % 16, 0);
     assert_eq!(k % 256, 0);
-    assert_eq!(n % 16, 0);
+    assert!(n > 0, "N must be non-zero");
 
     let a_gate_bytes = build_hfq4g256(gate_m, k, 0xD4);
     let a_up_bytes = build_hfq4g256(up_m, k, 0xE5);
@@ -184,7 +188,7 @@ fn compare_proj(
             if rel > max_rel {
                 max_rel = rel;
             }
-            if abs > abs_tol && rel > rel_tol {
+            if !a.is_finite() || !b.is_finite() || (abs > abs_tol && rel > rel_tol) {
                 n_bad += 1;
                 hist_row_mod16[row % 16] += 1;
                 if first_bad.is_none() {

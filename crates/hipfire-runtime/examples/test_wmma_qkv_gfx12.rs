@@ -56,6 +56,7 @@ fn main() {
         (32, 16, 16, 256, 16), // q has 2 row-tiles
         (32, 32, 32, 512, 32), // multi-tile in every dim
         (48, 16, 16, 256, 16), // tile straddles projection boundary
+        (1024, 512, 512, 1024, 2), // LFM2.5-350M partial batch tile
     ];
 
     for &(q_m, k_m, v_m, k, n) in shapes {
@@ -98,7 +99,7 @@ fn run_one(
         0,
         "K must be multiple of 256 (HFQ4G256 group size)"
     );
-    assert_eq!(n % 16, 0, "N must be multiple of 16 (WMMA batch tile)");
+    assert!(n > 0, "N must be non-zero");
 
     // ── Build synthetic HFQ4G256 weights for q, k, v ───────────────────────
     //
@@ -255,7 +256,7 @@ fn compare_proj(
             if rel > max_rel {
                 max_rel = rel;
             }
-            if abs > abs_tol && rel > rel_tol {
+            if !a.is_finite() || !b.is_finite() || (abs > abs_tol && rel > rel_tol) {
                 n_bad += 1;
                 hist_row_mod16[row % 16] += 1;
                 if first_bad.is_none() {
