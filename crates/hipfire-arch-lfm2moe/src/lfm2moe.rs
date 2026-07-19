@@ -1140,6 +1140,327 @@ pub fn load_weights_from_source(
     })
 }
 
+const LFM2_PREFILL_MAX_BATCH: usize = 256;
+const LFM2_PREFILL_MAX_BATCH_LIMIT: usize = 512;
+const LFM2_FLASH_PARTIALS_BATCH: usize = 16;
+const LFM2_MOE_GROUPED_BLOCK_M: usize = 16;
+
+fn checked_product(label: &str, factors: &[usize]) -> Result<usize, String> {
+    factors.iter().try_fold(1usize, |product, &factor| {
+        product
+            .checked_mul(factor)
+            .ok_or_else(|| format!("lfm2moe: {label} size overflow"))
+    })
+}
+
+fn lfm2_moe_grouped_m_total_bound(
+    rows: usize,
+    n_exp: usize,
+    k_top: usize,
+) -> Result<usize, String> {
+    let total_slots = rows
+        .checked_mul(k_top.max(1))
+        .ok_or_else(|| "lfm2moe: grouped slot count overflow".to_string())?;
+    let live_experts = total_slots.min(n_exp.max(1));
+    let padding = live_experts
+        .checked_mul(LFM2_MOE_GROUPED_BLOCK_M - 1)
+        .ok_or_else(|| "lfm2moe: grouped padding overflow".to_string())?;
+    let unaligned = total_slots
+        .checked_add(padding)
+        .ok_or_else(|| "lfm2moe: grouped m_total overflow".to_string())?;
+    let rounded = unaligned
+        .checked_add(LFM2_MOE_GROUPED_BLOCK_M - 1)
+        .ok_or_else(|| "lfm2moe: grouped alignment overflow".to_string())?;
+    Ok((rounded / LFM2_MOE_GROUPED_BLOCK_M) * LFM2_MOE_GROUPED_BLOCK_M)
+}
+
+pub(crate) fn lfm2_prefill_batch_capacity(
+    cfg: &Lfm2MoeConfig,
+    max_seq: usize,
+) -> Result<usize, String> {
+    let candidate = match std::env::var("HIPFIRE_LFM2_PREFILL_MAX_BATCH") {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(parsed) if parsed > LFM2_PREFILL_MAX_BATCH_LIMIT => {
+                return Err(format!(
+                    "lfm2moe: HIPFIRE_LFM2_PREFILL_MAX_BATCH={parsed} exceeds limit {LFM2_PREFILL_MAX_BATCH_LIMIT}"
+                ));
+            }
+            Ok(parsed) if parsed >= 2 => parsed,
+            _ => LFM2_PREFILL_MAX_BATCH,
+        },
+        Err(_) => LFM2_PREFILL_MAX_BATCH,
+    };
+    let abi_divisor = cfg
+        .num_attention_heads
+        .max(cfg.num_key_value_heads)
+        .max(cfg.num_experts_per_tok.max(1))
+        .max(1);
+    let abi_batch_cap = (i32::MAX as usize) / abi_divisor;
+    let max_batch = candidate.min(max_seq.max(1)).min(abi_batch_cap);
+    if max_batch == 0 {
+        return Err("lfm2moe: prefill batch ABI capacity is zero".to_string());
+    }
+    Ok(max_batch)
+}
+
+pub(crate) struct Lfm2PrefillBatchScratch {
+    pub(crate) max_batch: usize,
+    pub(crate) flash_partials_batch: usize,
+    pub(crate) token_ids_batch: GpuTensor,
+    pub(crate) positions_batch: GpuTensor,
+    pub(crate) h_batch: GpuTensor,
+    pub(crate) tmp_batch: GpuTensor,
+    pub(crate) operator_x_rot_batch: GpuTensor,
+    pub(crate) fa_q_batch: GpuTensor,
+    pub(crate) fa_k_batch: GpuTensor,
+    pub(crate) fa_v_batch: GpuTensor,
+    pub(crate) fa_attn_out_batch: GpuTensor,
+    pub(crate) fa_attn_out_rot_batch: GpuTensor,
+    pub(crate) fa_partials_batch: GpuTensor,
+    pub(crate) conv_bcx_batch: GpuTensor,
+    pub(crate) conv_y_batch: GpuTensor,
+    pub(crate) conv_y_rot_batch: GpuTensor,
+    pub(crate) ffn_tmp_batch: GpuTensor,
+    pub(crate) ffn_x_rot_batch: GpuTensor,
+    pub(crate) dense_gate_batch: GpuTensor,
+    pub(crate) dense_up_batch: GpuTensor,
+    pub(crate) dense_act_batch: GpuTensor,
+    pub(crate) dense_act_rot_batch: GpuTensor,
+    pub(crate) router_logits_batch: GpuTensor,
+    pub(crate) topk_indices_batch: GpuTensor,
+    pub(crate) topk_weights_batch: GpuTensor,
+    pub(crate) moe_gate_batch: GpuTensor,
+    pub(crate) moe_up_batch: GpuTensor,
+    pub(crate) moe_rot_batch: GpuTensor,
+    pub(crate) moe_down_expanded_batch: GpuTensor,
+    pub(crate) moe_expert_counts: GpuTensor,
+    pub(crate) moe_expert_offsets: GpuTensor,
+    pub(crate) moe_sorted_slot_index: GpuTensor,
+    pub(crate) moe_expert_tile_ids: GpuTensor,
+    pub(crate) moe_inverse_perm: GpuTensor,
+    pub(crate) moe_grouped_gate_up: GpuTensor,
+    pub(crate) moe_grouped_down: GpuTensor,
+}
+
+impl Lfm2PrefillBatchScratch {
+    fn new(gpu: &mut Gpu, cfg: &Lfm2MoeConfig, max_seq: usize) -> Result<Self, String> {
+        let max_batch = lfm2_prefill_batch_capacity(cfg, max_seq)?;
+        let flash_partials_batch = LFM2_FLASH_PARTIALS_BATCH.min(max_batch).max(1);
+        let hidden = cfg.hidden_size;
+        let q_dim = cfg.q_dim();
+        let kv_dim = cfg.kv_dim();
+        let dense_inter = cfg.intermediate_size;
+        let moe_inter = cfg.moe_intermediate_size.max(1);
+        let n_exp = cfg.num_experts.max(1);
+        let k_top = cfg.num_experts_per_tok.max(1);
+        let flash_tiles = max_seq
+            .checked_add(127)
+            .ok_or_else(|| "lfm2moe: flash tile count overflow".to_string())?
+            / 128;
+        let flash_stride = cfg
+            .head_dim
+            .checked_add(2)
+            .ok_or_else(|| "lfm2moe: flash stride overflow".to_string())?;
+        let m_total_capacity = lfm2_moe_grouped_m_total_bound(max_batch, n_exp, k_top)?;
+        let alloc = |gpu: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+            gpu.alloc_tensor(&[n.max(1)], DType::F32)
+                .map_err(|e| format!("lfm2moe: alloc prefill {label}: {e:?}"))
+        };
+        let size = |label: &str, factors: &[usize]| checked_product(label, factors);
+
+        Ok(Self {
+            max_batch,
+            flash_partials_batch,
+            token_ids_batch: alloc(gpu, max_batch, "token_ids_batch")?,
+            positions_batch: alloc(gpu, max_batch, "positions_batch")?,
+            h_batch: alloc(gpu, size("h_batch", &[max_batch, hidden])?, "h_batch")?,
+            tmp_batch: alloc(gpu, size("tmp_batch", &[max_batch, hidden])?, "tmp_batch")?,
+            operator_x_rot_batch: alloc(
+                gpu,
+                size("operator_x_rot_batch", &[max_batch, hidden])?,
+                "operator_x_rot_batch",
+            )?,
+            fa_q_batch: alloc(gpu, size("fa_q_batch", &[max_batch, q_dim])?, "fa_q_batch")?,
+            fa_k_batch: alloc(gpu, size("fa_k_batch", &[max_batch, kv_dim])?, "fa_k_batch")?,
+            fa_v_batch: alloc(gpu, size("fa_v_batch", &[max_batch, kv_dim])?, "fa_v_batch")?,
+            fa_attn_out_batch: alloc(
+                gpu,
+                size("fa_attn_out_batch", &[max_batch, q_dim])?,
+                "fa_attn_out_batch",
+            )?,
+            fa_attn_out_rot_batch: alloc(
+                gpu,
+                size("fa_attn_out_rot_batch", &[max_batch, q_dim])?,
+                "fa_attn_out_rot_batch",
+            )?,
+            fa_partials_batch: alloc(
+                gpu,
+                size(
+                    "fa_partials_batch",
+                    &[
+                        flash_partials_batch,
+                        cfg.num_attention_heads,
+                        flash_tiles,
+                        flash_stride,
+                    ],
+                )?,
+                "fa_partials_batch",
+            )?,
+            conv_bcx_batch: alloc(
+                gpu,
+                size("conv_bcx_batch", &[max_batch, 3, hidden])?,
+                "conv_bcx_batch",
+            )?,
+            conv_y_batch: alloc(
+                gpu,
+                size("conv_y_batch", &[max_batch, hidden])?,
+                "conv_y_batch",
+            )?,
+            conv_y_rot_batch: alloc(
+                gpu,
+                size("conv_y_rot_batch", &[max_batch, hidden])?,
+                "conv_y_rot_batch",
+            )?,
+            ffn_tmp_batch: alloc(
+                gpu,
+                size("ffn_tmp_batch", &[max_batch, hidden])?,
+                "ffn_tmp_batch",
+            )?,
+            ffn_x_rot_batch: alloc(
+                gpu,
+                size("ffn_x_rot_batch", &[max_batch, hidden])?,
+                "ffn_x_rot_batch",
+            )?,
+            dense_gate_batch: alloc(
+                gpu,
+                size("dense_gate_batch", &[max_batch, dense_inter])?,
+                "dense_gate_batch",
+            )?,
+            dense_up_batch: alloc(
+                gpu,
+                size("dense_up_batch", &[max_batch, dense_inter])?,
+                "dense_up_batch",
+            )?,
+            dense_act_batch: alloc(
+                gpu,
+                size("dense_act_batch", &[max_batch, dense_inter])?,
+                "dense_act_batch",
+            )?,
+            dense_act_rot_batch: alloc(
+                gpu,
+                size("dense_act_rot_batch", &[max_batch, dense_inter])?,
+                "dense_act_rot_batch",
+            )?,
+            router_logits_batch: alloc(
+                gpu,
+                size("router_logits_batch", &[max_batch, n_exp])?,
+                "router_logits_batch",
+            )?,
+            topk_indices_batch: alloc(
+                gpu,
+                size("topk_indices_batch", &[max_batch, k_top])?,
+                "topk_indices_batch",
+            )?,
+            topk_weights_batch: alloc(
+                gpu,
+                size("topk_weights_batch", &[max_batch, k_top])?,
+                "topk_weights_batch",
+            )?,
+            moe_gate_batch: alloc(
+                gpu,
+                size("moe_gate_batch", &[max_batch, k_top, moe_inter])?,
+                "moe_gate_batch",
+            )?,
+            moe_up_batch: alloc(
+                gpu,
+                size("moe_up_batch", &[max_batch, k_top, moe_inter])?,
+                "moe_up_batch",
+            )?,
+            moe_rot_batch: alloc(
+                gpu,
+                size("moe_rot_batch", &[max_batch, k_top, moe_inter])?,
+                "moe_rot_batch",
+            )?,
+            moe_down_expanded_batch: alloc(
+                gpu,
+                size("moe_down_expanded_batch", &[max_batch, k_top, hidden])?,
+                "moe_down_expanded_batch",
+            )?,
+            moe_expert_counts: alloc(gpu, n_exp, "moe_expert_counts")?,
+            moe_expert_offsets: alloc(
+                gpu,
+                n_exp
+                    .checked_add(1)
+                    .ok_or_else(|| "lfm2moe: moe_expert_offsets size overflow".to_string())?,
+                "moe_expert_offsets",
+            )?,
+            moe_sorted_slot_index: alloc(gpu, m_total_capacity, "moe_sorted_slot_index")?,
+            moe_expert_tile_ids: alloc(
+                gpu,
+                m_total_capacity / LFM2_MOE_GROUPED_BLOCK_M,
+                "moe_expert_tile_ids",
+            )?,
+            moe_inverse_perm: alloc(
+                gpu,
+                size("moe_inverse_perm", &[max_batch, k_top])?,
+                "moe_inverse_perm",
+            )?,
+            moe_grouped_gate_up: alloc(
+                gpu,
+                size("moe_grouped_gate_up", &[m_total_capacity, 2, moe_inter])?,
+                "moe_grouped_gate_up",
+            )?,
+            moe_grouped_down: alloc(
+                gpu,
+                size("moe_grouped_down", &[m_total_capacity, hidden])?,
+                "moe_grouped_down",
+            )?,
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let tensors = [
+            self.token_ids_batch,
+            self.positions_batch,
+            self.h_batch,
+            self.tmp_batch,
+            self.operator_x_rot_batch,
+            self.fa_q_batch,
+            self.fa_k_batch,
+            self.fa_v_batch,
+            self.fa_attn_out_batch,
+            self.fa_attn_out_rot_batch,
+            self.fa_partials_batch,
+            self.conv_bcx_batch,
+            self.conv_y_batch,
+            self.conv_y_rot_batch,
+            self.ffn_tmp_batch,
+            self.ffn_x_rot_batch,
+            self.dense_gate_batch,
+            self.dense_up_batch,
+            self.dense_act_batch,
+            self.dense_act_rot_batch,
+            self.router_logits_batch,
+            self.topk_indices_batch,
+            self.topk_weights_batch,
+            self.moe_gate_batch,
+            self.moe_up_batch,
+            self.moe_rot_batch,
+            self.moe_down_expanded_batch,
+            self.moe_expert_counts,
+            self.moe_expert_offsets,
+            self.moe_sorted_slot_index,
+            self.moe_expert_tile_ids,
+            self.moe_inverse_perm,
+            self.moe_grouped_gate_up,
+            self.moe_grouped_down,
+        ];
+        for tensor in tensors {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
 /// Per-decode GPU scratch + KV cache (attention layers) + conv-state cache
 /// (conv layers). Buffers are eager-allocated.
 pub struct Lfm2MoeState {
@@ -1185,6 +1506,9 @@ pub struct Lfm2MoeState {
     // head
     pub final_norm_buf: GpuTensor, // [hidden]
     pub logits: GpuTensor,         // [vocab]
+
+    /// Lazy gfx1201 batched-prefill scratch. None unless the opt-in path allocates.
+    pub(crate) prefill_batch: Option<Lfm2PrefillBatchScratch>,
 }
 
 impl Lfm2MoeState {
@@ -1285,6 +1609,7 @@ impl Lfm2MoeState {
             down_expanded: alloc(gpu, k * hidden, "down_expanded")?,
             final_norm_buf: alloc(gpu, hidden, "final_norm_buf")?,
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
+            prefill_batch: None,
         })
     }
 
@@ -1300,7 +1625,34 @@ impl Lfm2MoeState {
         Ok(())
     }
 
+    pub(crate) fn ensure_prefill_batch(
+        &mut self,
+        gpu: &mut Gpu,
+        cfg: &Lfm2MoeConfig,
+    ) -> Result<&mut Lfm2PrefillBatchScratch, String> {
+        if !gpu.arch_caps.is_gfx1201() {
+            return Err(format!(
+                "lfm2moe: batched prefill requires gfx1201, got {}",
+                gpu.arch
+            ));
+        }
+        if std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref() != Some("1") {
+            return Err(
+                "lfm2moe: batched prefill requires HIPFIRE_LFM2_PREFILL_BATCH=1".to_string(),
+            );
+        }
+        if self.prefill_batch.is_none() {
+            self.prefill_batch = Some(Lfm2PrefillBatchScratch::new(gpu, cfg, self.max_seq)?);
+        }
+        self.prefill_batch
+            .as_mut()
+            .ok_or_else(|| "lfm2moe: prefill scratch missing after allocation".to_string())
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        if let Some(prefill_batch) = self.prefill_batch {
+            prefill_batch.free_gpu(gpu);
+        }
         self.kv.free_gpu(gpu);
         for t in self.conv_states {
             let _ = gpu.free_tensor(t);

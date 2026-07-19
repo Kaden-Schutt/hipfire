@@ -27,7 +27,7 @@ pub mod spec_impl;
 
 pub use arch::Lfm2Moe;
 pub use config::{config_from_source, Lfm2MoeConfig, MixerKind};
-pub use forward::{decode_step, decode_step_capture};
+pub use forward::{decode_step, decode_step_capture, forward_prefill_batch};
 pub use lfm2moe::{load_weights_from_source, Lfm2MoeState, Lfm2MoeWeights};
 pub use spec_impl::Lfm2MoeBundle;
 
