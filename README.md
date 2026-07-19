@@ -128,7 +128,7 @@ bring-your-own-model flows through `hipfire quantize`.
 | RDNA2 | `gfx1030`-`gfx1032` | Portable HIP paths; retained lowering is implementation capability, not automatic admission |
 | RDNA3 | `gfx1100`-`gfx1103` | Architecture-tuned kernels; retained-route certification remains workload-specific |
 | RDNA3.5 | `gfx1150`-`gfx1152` | Architecture-tuned kernels; retained-route certification remains workload-specific |
-| RDNA4 | `gfx1200`, `gfx1201` | WMMA paths; automatic retained PM4 only for the narrow certified single-GPU A3B `.mq4r` route |
+| RDNA4 | `gfx1200`, `gfx1201` | WMMA paths; retained PM4 is product-default only for the narrow single-GPU A3B `.mq4r` route, while certification still requires the guide's route-proof ledger |
 
 Architecture-specific kernels are selected through typed dispatch tables.
 Unsupported specializations return to the correct portable or architecture
