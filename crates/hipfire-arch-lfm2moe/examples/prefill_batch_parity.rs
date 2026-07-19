@@ -679,7 +679,7 @@ fn main() {
             .zip(eager.kv.v_gpu.iter().zip(&batched.kv.v_gpu))
             .enumerate()
         {
-            for (which, (lhs, rhs)) in [("K", eager_k, batched_k), ("V", eager_v, batched_v)] {
+            for (which, lhs, rhs) in [("K", eager_k, batched_k), ("V", eager_v, batched_v)] {
                 let eager_values = dequant_q8(&download_prefix(
                     &gpu,
                     lhs,

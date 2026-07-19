@@ -2816,14 +2816,17 @@ fn main() {
                 if let Some(b) = m.cohere2moe_mut() {
                     let _ = b.state.reset(&mut gpu);
                 }
-                // LFM2.5 (arch_id=11): reset its KV + conv-state cursors as
-                // well. The batched arm below routes start_pos=0 into
-                // forward_prefill_batch, whose core admission requires
-                // start_pos == state.n_tokens; the eager arm must not inherit
-                // stale conv tails from a prior generate either — the setup
-                // contract here is cold prefill for every arch.
-                if let Some(b) = m.lfm2moe_mut() {
-                    let _ = b.state.reset(&mut gpu);
+                // LFM2.5 batched prefill starts from position zero and requires
+                // a cold KV/conv state. Keep the flag-off/non-gfx eager bench
+                // behavior unchanged.
+                let use_lfm2_batched = m.arch_id == 11
+                    && gpu.arch_caps.is_gfx1201()
+                    && std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref()
+                        == Some("1");
+                if use_lfm2_batched {
+                    if let Some(b) = m.lfm2moe_mut() {
+                        let _ = b.state.reset(&mut gpu);
+                    }
                 }
 
                 // Flush any residual GPU work so it doesn't bleed into the
@@ -2899,10 +2902,7 @@ fn main() {
                     let config = &b.config;
                     let weights = &b.weights;
                     let state = &mut b.state;
-                    let use_batched = gpu.arch_caps.is_gfx1201()
-                        && std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref()
-                            == Some("1");
-                    if use_batched {
+                    if use_lfm2_batched {
                         // State was reset above, so start_pos=0 satisfies the
                         // core's start_pos == n_tokens admission check.
                         eprintln!(
