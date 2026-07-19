@@ -2816,6 +2816,15 @@ fn main() {
                 if let Some(b) = m.cohere2moe_mut() {
                     let _ = b.state.reset(&mut gpu);
                 }
+                // LFM2.5 (arch_id=11): reset its KV + conv-state cursors as
+                // well. The batched arm below routes start_pos=0 into
+                // forward_prefill_batch, whose core admission requires
+                // start_pos == state.n_tokens; the eager arm must not inherit
+                // stale conv tails from a prior generate either — the setup
+                // contract here is cold prefill for every arch.
+                if let Some(b) = m.lfm2moe_mut() {
+                    let _ = b.state.reset(&mut gpu);
+                }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
@@ -2879,38 +2888,67 @@ fn main() {
                     }
                     ok
                 } else if m.arch_id == 11 {
-                    // LFM2.5-MoE warm-pass: per-token decode_step over the
-                    // synthetic prompt. Saturates the conv + GQA + QK-norm +
-                    // RoPE + top-4 MoE kernel set before any user-facing
-                    // generate. This IS the production prefill shape (no
-                    // batched kernel).
+                    // LFM2.5 warm-pass. Frozen control-plane selection (design
+                    // doc §9), made before any synthetic token is processed:
+                    // gfx1201 + the exact opt-in flag routes the whole prompt
+                    // through forward_prefill_batch; every other case runs the
+                    // eager Phase-0 loop. Cohort/dtype admission is decided by
+                    // the core (§8) — the daemon does not inspect weights. No
+                    // post-selection fallback: a batched error fails the run.
                     let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
                     let config = &b.config;
                     let weights = &b.weights;
                     let state = &mut b.state;
-                    let mut ok = true;
-                    let gfx1201 = gpu.arch_caps.is_gfx1201();
-                    let last_idx = synthetic.len().saturating_sub(1);
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        // Phase 0 head-elision (gfx1201-only): non-final prefill
-                        // tokens skip the lm_head + full-vocab logits D2H, matching
-                        // the production generate_lfm2moe prefill shape.
-                        let r = if gfx1201 && i != last_idx {
-                            lfm2moe::forward::decode_step_prefill(
-                                config, weights, state, &mut gpu, tok, i as u32,
-                            )
-                        } else {
-                            lfm2moe::forward::decode_step(
-                                config, weights, state, &mut gpu, tok, i as u32,
-                            )
-                            .map(|_| ())
-                        };
-                        if r.is_err() {
-                            ok = false;
-                            break;
+                    let use_batched = gpu.arch_caps.is_gfx1201()
+                        && std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref()
+                            == Some("1");
+                    if use_batched {
+                        // State was reset above, so start_pos=0 satisfies the
+                        // core's start_pos == n_tokens admission check.
+                        eprintln!(
+                            "[daemon] bench_prefill lfm2moe: batched gfx1201 path, tokens={}",
+                            synthetic.len()
+                        );
+                        match lfm2moe::forward::forward_prefill_batch(
+                            config, weights, state, &mut gpu, &synthetic, 0,
+                        ) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                eprintln!(
+                                    "[daemon] bench_prefill lfm2moe batched prefill failed: {e}"
+                                );
+                                false
+                            }
                         }
+                    } else {
+                        // Eager Phase-0 warm-pass: per-token decode_step over
+                        // the synthetic prompt. Saturates the conv + GQA +
+                        // QK-norm + RoPE + MoE kernel set before any
+                        // user-facing generate.
+                        let mut ok = true;
+                        let gfx1201 = gpu.arch_caps.is_gfx1201();
+                        let last_idx = synthetic.len().saturating_sub(1);
+                        for (i, &tok) in synthetic.iter().enumerate() {
+                            // Phase 0 head-elision (gfx1201-only): non-final prefill
+                            // tokens skip the lm_head + full-vocab logits D2H, matching
+                            // the production generate_lfm2moe prefill shape.
+                            let r = if gfx1201 && i != last_idx {
+                                lfm2moe::forward::decode_step_prefill(
+                                    config, weights, state, &mut gpu, tok, i as u32,
+                                )
+                            } else {
+                                lfm2moe::forward::decode_step(
+                                    config, weights, state, &mut gpu, tok, i as u32,
+                                )
+                                .map(|_| ())
+                            };
+                            if r.is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        ok
                     }
-                    ok
                 } else if m.arch_id == 10 {
                     // MiniMax-M2 warm-pass: per-token decode_step over the
                     // synthetic prompt. Saturates the GQA + QK-norm + RoPE +
@@ -12451,34 +12489,60 @@ fn generate_lfm2moe(
 
     let t0 = Instant::now();
 
-    // ── Prefill: decode_step per prompt token. The LAST decode_step's logits
-    // are the predictions for the first generated token. ──
+    // ── Prefill: batched forward_prefill_batch when gfx1201 + the exact
+    // opt-in flag are set (frozen §9 routing); otherwise the eager Phase-0
+    // decode_step loop. Either way `last_logits` ends as the final prompt
+    // token's logits — the predictions for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
     {
         let b = m.lfm2moe_mut().unwrap();
         let cfg = &b.config;
         let weights = &b.weights;
         let state = &mut b.state;
-        let mut position = state.n_tokens as u32;
-        let gfx1201 = gpu.arch_caps.is_gfx1201();
-        let last_idx = prompt_ids.len().saturating_sub(1);
-        for (i, &tok) in prompt_ids.iter().enumerate() {
-            // Phase 0 head-elision (gfx1201-only): non-final prompt tokens skip
-            // the lm_head + full-vocab logits D2H; their logits are never read.
-            let step = if gfx1201 && i != last_idx {
-                lfm2moe::forward::decode_step_prefill(cfg, weights, state, gpu, tok, position)
-                    .map(|()| Vec::new())
-            } else {
-                lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position)
-            };
-            match step {
+        // Frozen control-plane selection (design doc §9), made once before any
+        // prompt token is processed. Cohort/dtype admission is decided by the
+        // core (§8) — the daemon does not inspect weights. No post-selection
+        // fallback: a batched error is terminal for this request because model
+        // state may already be partially advanced (contract §1).
+        let use_batched = gpu.arch_caps.is_gfx1201()
+            && std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref() == Some("1");
+        if use_batched {
+            eprintln!(
+                "[daemon] lfm2moe prefill: batched gfx1201 path (HIPFIRE_LFM2_PREFILL_BATCH=1), tokens={}",
+                prompt_ids.len()
+            );
+            let start_pos = state.n_tokens as u32;
+            match lfm2moe::forward::forward_prefill_batch(
+                cfg, weights, state, gpu, &prompt_ids, start_pos,
+            ) {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));
+                    emit_error_with_id(stdout, id, format!("lfm2moe batched prefill failed: {e}"));
                     return;
                 }
             }
-            position += 1;
+        } else {
+            let mut position = state.n_tokens as u32;
+            let gfx1201 = gpu.arch_caps.is_gfx1201();
+            let last_idx = prompt_ids.len().saturating_sub(1);
+            for (i, &tok) in prompt_ids.iter().enumerate() {
+                // Phase 0 head-elision (gfx1201-only): non-final prompt tokens skip
+                // the lm_head + full-vocab logits D2H; their logits are never read.
+                let step = if gfx1201 && i != last_idx {
+                    lfm2moe::forward::decode_step_prefill(cfg, weights, state, gpu, tok, position)
+                        .map(|()| Vec::new())
+                } else {
+                    lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position)
+                };
+                match step {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));
+                        return;
+                    }
+                }
+                position += 1;
+            }
         }
     }
     for &tok in &prompt_ids {
