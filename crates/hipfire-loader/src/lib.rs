@@ -1666,6 +1666,7 @@ fn finish_qwen35_load(
                                         ))
                                         }
                                         Err(e) => {
+                                            dspark_weights.free_gpu(ctx.gpu);
                                             eprintln!(
                                                 "  qwen35: DSpark body build failed: {e} — AR/other"
                                             );
@@ -2819,9 +2820,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.dn_state.free_gpu(gpu);
             }
             ModelState::Llama(b) => {
-                b.scratch.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-                b.kv.free_gpu(gpu);
+                b.free_gpu(gpu);
             }
             ModelState::Lfm2Moe(b) => {
                 b.state.free_gpu(gpu);
@@ -3263,16 +3262,770 @@ mod registry_tests {
             "sidecar read failure leaked unpublished Qwen35 bundle: baseline={baseline}, after={after}"
         );
     }
+
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    #[ignore = "requires an AMD GPU plus generic DFlash target and draft fixtures"]
+    fn generic_dflash_load_rolls_back_each_completed_resource() {
+        use std::path::Path;
+
+        let target_path = std::env::var("HIPFIRE_GENERIC_DFLASH_TARGET")
+            .expect("HIPFIRE_GENERIC_DFLASH_TARGET is required");
+        let draft_path = std::env::var("HIPFIRE_GENERIC_DFLASH_DRAFT")
+            .expect("HIPFIRE_GENERIC_DFLASH_DRAFT is required");
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}"
+        );
+        assert!(
+            Path::new(&draft_path).is_file(),
+            "draft fixture not found: {draft_path}"
+        );
+
+        fn free_vram(gpu: &rdna_compute::Gpu, context: &str) -> Result<usize, String> {
+            gpu.hip
+                .device_synchronize()
+                .map_err(|e| format!("synchronize before {context}: {e}"))?;
+            gpu.hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .map_err(|e| format!("measure {context}: {e}"))
+        }
+
+        fn assert_free_vram_not_below_baseline(
+            gpu: &rdna_compute::Gpu,
+            baseline: usize,
+            context: &str,
+        ) {
+            const DRIVER_VRAM_DRIFT_BYTES: usize = 64 * 1024 * 1024;
+            let after = free_vram(gpu, context).expect("post-cleanup VRAM");
+            assert!(
+                after.saturating_add(DRIVER_VRAM_DRIFT_BYTES) >= baseline,
+                "post-cleanup free VRAM exceeded the {DRIVER_VRAM_DRIFT_BYTES}-byte ROCm driver-accounting envelope for {context}: baseline={baseline}, after={after}"
+            );
+        }
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let cask = super::CaskConfig::default();
+        let load = |gpu: &mut rdna_compute::Gpu| {
+            super::load_model(
+                &target_path,
+                64,
+                Some(&draft_path),
+                Some("q8"),
+                None,
+                None,
+                &cask,
+                &mesh,
+                None,
+                super::SpecLoadCfg {
+                    dspark: Some(false),
+                    ..Default::default()
+                },
+                gpu,
+            )
+        };
+
+        let mut warmup = load(&mut gpu).expect("warmup generic DFlash load");
+        assert!(warmup.speculator.is_some());
+        {
+            use hipfire_runtime::spec::PrefillOutcome;
+
+            let bos = match warmup.state.as_ref().expect("loaded model state") {
+                super::ModelState::Llama(bundle) => bundle.config.bos_token,
+                _ => panic!("generic DFlash test loaded a non-LLaMA target"),
+            };
+            let bundle = match warmup.state.as_mut().expect("loaded model state") {
+                super::ModelState::Llama(bundle) => bundle,
+                _ => unreachable!(),
+            };
+            let speculator = warmup.speculator.as_mut().expect("published DFlash");
+            let block_size = speculator.block_size();
+            assert!(
+                bundle.kv.physical_cap >= 1 + block_size,
+                "generic DFlash block does not fit target KV capacity: block={block_size}, cap={}",
+                bundle.kv.physical_cap
+            );
+            let prefill = speculator
+                .prefill(&mut gpu, bundle, &[bos], &[bos], 0, false, None, &|| false)
+                .expect("generic DFlash warmup prefill");
+            let seed = match prefill {
+                PrefillOutcome::Ready { first_token } => first_token,
+                PrefillOutcome::Aborted => panic!("generic DFlash warmup prefill aborted"),
+            };
+            speculator
+                .step(&mut gpu, bundle, 1, seed, &[bos], None, 0.0)
+                .expect("generic DFlash warmup generation step");
+        }
+        super::unload_model(warmup, &mut gpu);
+        gpu.drain_pool();
+        let baseline = free_vram(&gpu, "after warmup unload").expect("baseline VRAM");
+
+        let has_awq_scale = [target_path.as_str(), draft_path.as_str()]
+            .iter()
+            .any(|path| {
+                hipfire_runtime::hfq::HfqFile::open(Path::new(path))
+                    .map(|hfq| {
+                        hfq.tensors()
+                            .iter()
+                            .any(|t| t.name.ends_with(".awq_scale.weight"))
+                    })
+                    .unwrap_or(false)
+            });
+        if has_awq_scale {
+            let error =
+                match hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+                    hipfire_runtime::dflash_generic::GenericDflashConstructionStage::AwqScaleUpload(
+                        0,
+                    ),
+                    || load(&mut gpu),
+                ) {
+                    Ok(model) => {
+                        super::unload_model(model, &mut gpu);
+                        panic!("faulted AWQ scale upload unexpectedly succeeded");
+                    }
+                    Err(error) => error,
+                };
+            assert!(error.contains("test fault after generic DFlash"), "{error}");
+            gpu.drain_pool();
+            assert_free_vram_not_below_baseline(&gpu, baseline, "after AWQ scale rollback");
+        }
+
+        for stage in [
+            hipfire_runtime::dflash_generic::GenericDflashConstructionStage::DraftWeights,
+            hipfire_runtime::dflash_generic::GenericDflashConstructionStage::DraftScratch,
+            hipfire_runtime::dflash_generic::GenericDflashConstructionStage::VerifyScratch,
+            hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetWeights,
+            hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetKv,
+        ] {
+            let error =
+                match hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+                    stage,
+                    || load(&mut gpu),
+                ) {
+                    Ok(model) => {
+                        super::unload_model(model, &mut gpu);
+                        panic!("faulted generic DFlash load unexpectedly succeeded");
+                    }
+                    Err(error) => error,
+                };
+            assert!(error.contains("test fault after generic DFlash"), "{error}");
+            gpu.drain_pool();
+            assert_free_vram_not_below_baseline(
+                &gpu,
+                baseline,
+                &format!("after generic DFlash rollback ({})", stage.label()),
+            );
+        }
+
+        const MAX_ALLOCATION_FAULT_DEPTH: usize = 4096;
+        macro_rules! exercise_allocation_faults {
+            ($variant:ident, $limit:expr, $label:literal) => {{
+                let mut success = false;
+                for allocation in 0..=$limit {
+                    let stage =
+                        hipfire_runtime::dflash_generic::GenericDflashConstructionStage::$variant(
+                            allocation,
+                        );
+                    match hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+                        stage,
+                        || load(&mut gpu),
+                    ) {
+                        Ok(model) => {
+                            super::unload_model(model, &mut gpu);
+                            gpu.drain_pool();
+                            assert_free_vram_not_below_baseline(
+                                &gpu,
+                                baseline,
+                                &format!(
+                                    "after {} success sentinel at allocation {allocation}",
+                                    $label
+                                ),
+                            );
+                            success = true;
+                            break;
+                        }
+                        Err(error) => {
+                            assert!(error.contains("test fault after generic DFlash"), "{error}");
+                            gpu.drain_pool();
+                            assert_free_vram_not_below_baseline(
+                                &gpu,
+                                baseline,
+                                &format!("after {} rollback at allocation {allocation}", $label),
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    success,
+                    "{} allocation fault loop did not reach a constructor-success sentinel",
+                    $label
+                );
+            }};
+        }
+
+        exercise_allocation_faults!(
+            VerifyScratchAllocation,
+            hipfire_runtime::llama::GENERIC_DFLASH_VERIFY_SCRATCH_ALLOCATION_COUNT,
+            "verify-scratch"
+        );
+        exercise_allocation_faults!(
+            TargetWeightsAllocation,
+            MAX_ALLOCATION_FAULT_DEPTH,
+            "target-weights"
+        );
+        exercise_allocation_faults!(TargetKvAllocation, MAX_ALLOCATION_FAULT_DEPTH, "target-kv");
+
+        for cycle in 0..3 {
+            let mut model = load(&mut gpu).expect("successful generic DFlash load");
+            assert!(
+                model.speculator.is_some(),
+                "cycle {cycle} did not publish DFlash"
+            );
+            if cycle == 0 {
+                use hipfire_runtime::spec::PrefillOutcome;
+
+                let bos = match model.state.as_ref().expect("loaded model state") {
+                    super::ModelState::Llama(bundle) => bundle.config.bos_token,
+                    _ => panic!("generic DFlash test loaded a non-LLaMA target"),
+                };
+                let bundle = match model.state.as_mut().expect("loaded model state") {
+                    super::ModelState::Llama(bundle) => bundle,
+                    _ => unreachable!(),
+                };
+                let speculator = model.speculator.as_mut().expect("published DFlash");
+                let block_size = speculator.block_size();
+                assert!(
+                    bundle.kv.physical_cap >= 1 + block_size,
+                    "generic DFlash block does not fit target KV capacity: block={block_size}, cap={}",
+                    bundle.kv.physical_cap
+                );
+                let prefill = speculator
+                    .prefill(&mut gpu, bundle, &[bos], &[bos], 0, false, None, &|| false)
+                    .expect("generic DFlash prefill");
+                let seed = match prefill {
+                    PrefillOutcome::Ready { first_token } => first_token,
+                    PrefillOutcome::Aborted => panic!("generic DFlash prefill aborted"),
+                };
+                speculator
+                    .step(&mut gpu, bundle, 1, seed, &[bos], None, 0.0)
+                    .expect("generic DFlash generation step");
+            }
+            super::unload_model(model, &mut gpu);
+            gpu.drain_pool();
+            assert_free_vram_not_below_baseline(
+                &gpu,
+                baseline,
+                &format!("after generic DFlash unload (cycle {cycle})"),
+            );
+        }
+    }
+
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    #[ignore = "requires an AMD GPU and a directory LLaMA fixture supporting q8/asym3/asym4"]
+    fn directory_llama_kv_modes_roll_back_each_allocation() {
+        use std::path::Path;
+
+        let target_path = std::env::var("HIPFIRE_LLAMA_KV_ROLLBACK_TARGET")
+            .expect("HIPFIRE_LLAMA_KV_ROLLBACK_TARGET is required");
+        assert!(
+            Path::new(&target_path).is_dir(),
+            "directory fixture not found: {target_path}"
+        );
+
+        fn free_vram(gpu: &rdna_compute::Gpu, context: &str) -> Result<usize, String> {
+            gpu.hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .map_err(|e| format!("measure {context}: {e}"))
+        }
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let cask = super::CaskConfig::default();
+        let load = |mode: &str, gpu: &mut rdna_compute::Gpu| {
+            super::load_model(
+                &target_path,
+                64,
+                None,
+                Some(mode),
+                None,
+                None,
+                &cask,
+                &mesh,
+                None,
+                super::SpecLoadCfg::default(),
+                gpu,
+            )
+        };
+
+        const MAX_ALLOCATION_FAULT_DEPTH: usize = 4096;
+        for mode in ["q8", "asym3", "asym4"] {
+            let warmup = load(mode, &mut gpu).expect("warmup directory LLaMA KV load");
+            super::unload_model(warmup, &mut gpu);
+            gpu.drain_pool();
+            let baseline = free_vram(&gpu, "after KV warmup unload").expect("baseline VRAM");
+            let mut success = false;
+            for allocation in 0..=MAX_ALLOCATION_FAULT_DEPTH {
+                let result =
+                    hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+                        hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetKvAllocation(
+                            allocation,
+                        ),
+                        || load(mode, &mut gpu),
+                    );
+                match result {
+                    Ok(model) => {
+                        super::unload_model(model, &mut gpu);
+                        gpu.drain_pool();
+                        assert_eq!(
+                            free_vram(&gpu, "after KV success sentinel").expect("sentinel VRAM"),
+                            baseline,
+                            "{mode} KV success sentinel leaked at allocation {allocation}"
+                        );
+                        success = true;
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(
+                            error.contains("test fault after generic DFlash"),
+                            "{mode}: {error}"
+                        );
+                        gpu.drain_pool();
+                        assert_eq!(
+                            free_vram(&gpu, "after KV rollback").expect("post-error VRAM"),
+                            baseline,
+                            "{mode} KV rollback leaked at allocation {allocation}"
+                        );
+                    }
+                }
+            }
+            assert!(
+                success,
+                "{mode} KV allocation loop did not reach a success sentinel"
+            );
+        }
+    }
+
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    #[ignore = "requires an AMD GPU and a ParoQuant directory fixture"]
+    fn paro_weight_uploads_roll_back_each_upload() {
+        use std::path::Path;
+
+        let target_path = std::env::var("HIPFIRE_PARO_ROLLBACK_TARGET")
+            .expect("HIPFIRE_PARO_ROLLBACK_TARGET is required");
+        assert!(
+            Path::new(&target_path).is_dir(),
+            "ParoQuant directory fixture not found: {target_path}"
+        );
+
+        fn free_vram(gpu: &rdna_compute::Gpu, context: &str) -> Result<usize, String> {
+            gpu.hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .map_err(|e| format!("measure {context}: {e}"))
+        }
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let cask = super::CaskConfig::default();
+        let load = |gpu: &mut rdna_compute::Gpu| {
+            super::load_model(
+                &target_path,
+                64,
+                None,
+                Some("q8"),
+                None,
+                None,
+                &cask,
+                &mesh,
+                None,
+                super::SpecLoadCfg::default(),
+                gpu,
+            )
+        };
+
+        let warmup = load(&mut gpu).expect("warmup ParoQuant load");
+        super::unload_model(warmup, &mut gpu);
+        gpu.drain_pool();
+        let baseline = free_vram(&gpu, "after Paro warmup unload").expect("baseline VRAM");
+
+        const MAX_ALLOCATION_FAULT_DEPTH: usize = 4096;
+        let mut success = false;
+        for upload in 0..=MAX_ALLOCATION_FAULT_DEPTH {
+            let result = hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+                hipfire_runtime::dflash_generic::GenericDflashConstructionStage::ParoWeightUpload(
+                    upload,
+                ),
+                || load(&mut gpu),
+            );
+            match result {
+                Ok(model) => {
+                    super::unload_model(model, &mut gpu);
+                    gpu.drain_pool();
+                    assert_eq!(
+                        free_vram(&gpu, "after Paro success sentinel").expect("sentinel VRAM"),
+                        baseline,
+                        "Paro success sentinel leaked at upload {upload}"
+                    );
+                    success = true;
+                    break;
+                }
+                Err(error) => {
+                    assert!(error.contains("test fault after generic DFlash"), "{error}");
+                    gpu.drain_pool();
+                    assert_eq!(
+                        free_vram(&gpu, "after Paro rollback").expect("post-error VRAM"),
+                        baseline,
+                        "Paro rollback leaked at upload {upload}"
+                    );
+                }
+            }
+        }
+        assert!(success, "Paro upload loop did not reach a success sentinel");
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU plus a LLaMA target and adjacent DSpark sidecar"]
+    fn dspark_load_unload_reclaims_baseline() {
+        use std::path::Path;
+
+        let target_path =
+            std::env::var("HIPFIRE_DSPARK_TARGET").expect("HIPFIRE_DSPARK_TARGET is required");
+        let sidecar_path =
+            std::env::var("HIPFIRE_DSPARK_SIDECAR").expect("HIPFIRE_DSPARK_SIDECAR is required");
+        assert!(
+            Path::new(&target_path).is_file(),
+            "DSpark target fixture not found: {target_path}"
+        );
+        assert!(
+            Path::new(&sidecar_path).is_file(),
+            "DSpark sidecar fixture not found: {sidecar_path}"
+        );
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let cask = super::CaskConfig::default();
+        let load = |gpu: &mut rdna_compute::Gpu| {
+            super::load_model(
+                &target_path,
+                64,
+                None,
+                Some("q8"),
+                None,
+                None,
+                &cask,
+                &mesh,
+                None,
+                super::SpecLoadCfg {
+                    dspark: Some(true),
+                    ..Default::default()
+                },
+                gpu,
+            )
+        };
+
+        fn exercise_dspark_window(model: &mut super::LoadedModel, gpu: &mut rdna_compute::Gpu) {
+            use hipfire_runtime::spec::PrefillOutcome;
+
+            let bos = match model.state.as_ref().expect("loaded model state") {
+                super::ModelState::Llama(bundle) => bundle.config.bos_token,
+                _ => panic!("DSpark test loaded a non-LLaMA target"),
+            };
+            let bundle = match model.state.as_mut().expect("loaded model state") {
+                super::ModelState::Llama(bundle) => bundle,
+                _ => unreachable!(),
+            };
+            let speculator = model.speculator.as_mut().expect("published DSpark");
+            let block_size = speculator.block_size();
+            assert!(
+                bundle.kv.physical_cap >= 1 + block_size,
+                "DSpark block does not fit target KV capacity: block={block_size}, cap={}",
+                bundle.kv.physical_cap
+            );
+            let prefill = speculator
+                .prefill(gpu, bundle, &[bos], &[bos], 0, false, None, &|| false)
+                .expect("DSpark prefill");
+            let seed = match prefill {
+                PrefillOutcome::Ready { first_token } => first_token,
+                PrefillOutcome::Aborted => panic!("DSpark prefill aborted"),
+            };
+            speculator
+                .step(gpu, bundle, 1, seed, &[bos], None, 0.0)
+                .expect("DSpark generation step");
+        }
+
+        let mut warmup = load(&mut gpu).expect("warmup DSpark load");
+        assert!(warmup.speculator.is_some(), "DSpark was not published");
+        exercise_dspark_window(&mut warmup, &mut gpu);
+        super::unload_model(warmup, &mut gpu);
+        gpu.drain_pool();
+        let baseline = gpu.hip.get_vram_info().expect("baseline VRAM");
+
+        for cycle in 0..3 {
+            let mut model = load(&mut gpu).expect("successful DSpark load");
+            assert!(
+                model.speculator.is_some(),
+                "cycle {cycle} did not publish DSpark"
+            );
+            exercise_dspark_window(&mut model, &mut gpu);
+            super::unload_model(model, &mut gpu);
+            gpu.drain_pool();
+            assert_eq!(
+                gpu.hip.get_vram_info().expect("post-unload VRAM"),
+                baseline,
+                "DSpark load/prefill/step/unload leaked on cycle {cycle}"
+            );
+        }
+    }
+
+    #[cfg(feature = "dflash-fault-inject")]
+    #[test]
+    #[ignore = "requires an AMD GPU plus a LLaMA target and adjacent DSpark sidecar"]
+    fn dspark_sidecar_rolls_back_each_staging_milestone() {
+        use std::path::Path;
+
+        let target_path =
+            std::env::var("HIPFIRE_DSPARK_TARGET").expect("HIPFIRE_DSPARK_TARGET is required");
+        assert!(Path::new(&target_path).is_file());
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let cask = super::CaskConfig::default();
+        let load = |gpu: &mut rdna_compute::Gpu| {
+            super::load_model(
+                &target_path,
+                64,
+                None,
+                Some("q8"),
+                None,
+                None,
+                &cask,
+                &mesh,
+                None,
+                super::SpecLoadCfg {
+                    dspark: Some(true),
+                    ..Default::default()
+                },
+                gpu,
+            )
+        };
+
+        let warmup = load(&mut gpu).expect("warmup DSpark load");
+        super::unload_model(warmup, &mut gpu);
+        gpu.drain_pool();
+        let baseline = gpu.hip.get_vram_info().expect("baseline VRAM");
+
+        let error = match hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+            hipfire_runtime::dflash_generic::GenericDflashConstructionStage::F32KvAllocation(2),
+            || load(&mut gpu),
+        ) {
+            Ok(model) => {
+                super::unload_model(model, &mut gpu);
+                panic!("faulted DSpark F32 KV construction unexpectedly succeeded");
+            }
+            Err(error) => error,
+        };
+        assert!(error.contains("F32 KV allocation"), "{error}");
+        gpu.drain_pool();
+        assert_eq!(
+            gpu.hip.get_vram_info().expect("F32 KV rollback VRAM"),
+            baseline,
+            "F32 KV construction leaked after a later allocation failed"
+        );
+
+        const MAX_ALLOCATION_FAULT_DEPTH: usize = 4096;
+        let mut success = false;
+        for allocation in 0..=MAX_ALLOCATION_FAULT_DEPTH {
+            let result = hipfire_runtime::dflash_generic::with_generic_dflash_construction_fault(
+                hipfire_runtime::dflash_generic::GenericDflashConstructionStage::DsparkAllocation(
+                    allocation,
+                ),
+                || load(&mut gpu),
+            );
+            match result {
+                Ok(model) => {
+                    super::unload_model(model, &mut gpu);
+                    gpu.drain_pool();
+                    assert_eq!(
+                        gpu.hip.get_vram_info().expect("DSpark success VRAM"),
+                        baseline,
+                        "DSpark success sentinel leaked at allocation {allocation}"
+                    );
+                    success = true;
+                    break;
+                }
+                Err(error) => {
+                    assert!(error.contains("DSpark allocation"), "{error}");
+                    gpu.drain_pool();
+                    assert_eq!(
+                        gpu.hip.get_vram_info().expect("DSpark rollback VRAM"),
+                        baseline,
+                        "DSpark rollback leaked at allocation {allocation}"
+                    );
+                }
+            }
+        }
+        assert!(success, "DSpark allocation loop did not reach success");
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU plus valid and malformed DSpark sidecar fixtures"]
+    fn malformed_dspark_norm_rolls_back_after_sidecar_allocations() {
+        use std::path::Path;
+
+        let valid_sidecar =
+            std::env::var("HIPFIRE_DSPARK_SIDECAR").expect("HIPFIRE_DSPARK_SIDECAR is required");
+        let malformed_sidecar = std::env::var("HIPFIRE_DSPARK_MALFORMED_NORM_SIDECAR")
+            .expect("HIPFIRE_DSPARK_MALFORMED_NORM_SIDECAR is required");
+        assert!(Path::new(&valid_sidecar).is_file());
+        assert!(Path::new(&malformed_sidecar).is_file());
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let load = |path: &str, gpu: &mut rdna_compute::Gpu| {
+            let mut sidecar = hipfire_runtime::hfq::HfqFile::open(Path::new(path))
+                .map_err(|e| format!("open DSpark sidecar {path}: {e}"))?;
+            sidecar.drop_mmap();
+            hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, gpu)
+        };
+        let free_loaded = |(weights, assets): (
+            hipfire_runtime::dspark_core::DsparkWeights,
+            hipfire_arch_llama::dspark_body::Qwen3DrafterAssets,
+        ),
+                           gpu: &mut rdna_compute::Gpu| {
+            assets.weights.free_gpu(gpu);
+            assets.kv.free_gpu(gpu);
+            assets.scratch.free_gpu(gpu);
+            assets.pbs.free_gpu(gpu);
+            weights.free_gpu(gpu);
+        };
+
+        let warmup = load(&valid_sidecar, &mut gpu)
+            .expect("valid DSpark warmup")
+            .expect("valid sidecar metadata");
+        free_loaded(warmup, &mut gpu);
+        gpu.drain_pool();
+        let baseline = gpu.hip.get_vram_info().expect("baseline VRAM");
+
+        let error = match load(&malformed_sidecar, &mut gpu) {
+            Ok(Some(loaded)) => {
+                free_loaded(loaded, &mut gpu);
+                panic!("malformed DSpark norm unexpectedly loaded");
+            }
+            Ok(None) => panic!("malformed DSpark sidecar was not recognized"),
+            Err(error) => error,
+        };
+        assert!(error.contains("norm"), "{error}");
+        gpu.drain_pool();
+        assert_eq!(
+            gpu.hip.get_vram_info().expect("post-malformed VRAM"),
+            baseline,
+            "malformed DSpark norm leaked sidecar allocations"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU plus valid and malformed dequant_f32 DSpark sidecar fixtures"]
+    fn malformed_dspark_dequant_f32_rolls_back_after_sidecar_allocations() {
+        use std::path::Path;
+
+        let valid_sidecar =
+            std::env::var("HIPFIRE_DSPARK_SIDECAR").expect("HIPFIRE_DSPARK_SIDECAR is required");
+        let malformed_sidecar = std::env::var("HIPFIRE_DSPARK_MALFORMED_DEQUANT_SIDECAR")
+            .expect("HIPFIRE_DSPARK_MALFORMED_DEQUANT_SIDECAR is required");
+        assert!(Path::new(&valid_sidecar).is_file());
+        assert!(Path::new(&malformed_sidecar).is_file());
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let load = |path: &str, gpu: &mut rdna_compute::Gpu| {
+            let mut sidecar = hipfire_runtime::hfq::HfqFile::open(Path::new(path))
+                .map_err(|e| format!("open DSpark sidecar {path}: {e}"))?;
+            sidecar.drop_mmap();
+            hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, gpu)
+        };
+        let free_loaded = |(weights, assets): (
+            hipfire_runtime::dspark_core::DsparkWeights,
+            hipfire_arch_llama::dspark_body::Qwen3DrafterAssets,
+        ),
+                           gpu: &mut rdna_compute::Gpu| {
+            assets.weights.free_gpu(gpu);
+            assets.kv.free_gpu(gpu);
+            assets.scratch.free_gpu(gpu);
+            assets.pbs.free_gpu(gpu);
+            weights.free_gpu(gpu);
+        };
+
+        let warmup = load(&valid_sidecar, &mut gpu)
+            .expect("valid DSpark warmup")
+            .expect("valid sidecar metadata");
+        free_loaded(warmup, &mut gpu);
+        gpu.drain_pool();
+        let baseline = gpu.hip.get_vram_info().expect("baseline VRAM");
+
+        let error = match load(&malformed_sidecar, &mut gpu) {
+            Ok(Some(loaded)) => {
+                free_loaded(loaded, &mut gpu);
+                panic!("malformed DSpark dequant_f32 tensor unexpectedly loaded");
+            }
+            Ok(None) => panic!("malformed DSpark sidecar was not recognized"),
+            Err(error) => error,
+        };
+        assert!(error.contains("dequant_f32"), "{error}");
+        gpu.drain_pool();
+        assert_eq!(
+            gpu.hip.get_vram_info().expect("post-malformed VRAM"),
+            baseline,
+            "malformed DSpark dequant_f32 leaked prior sidecar allocations"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU plus a malformed HFQ target with a broken final norm"]
+    fn malformed_hfq_final_norm_rolls_back_after_embedding_allocation() {
+        use std::path::Path;
+
+        let target_path = std::env::var("HIPFIRE_MALFORMED_HFQ_FINAL_NORM_TARGET")
+            .expect("HIPFIRE_MALFORMED_HFQ_FINAL_NORM_TARGET is required");
+        assert!(Path::new(&target_path).is_file());
+
+        let mut hfq = hipfire_runtime::hfq::HfqFile::open(Path::new(&target_path))
+            .expect("open malformed HFQ target");
+        let config = hipfire_runtime::hfq::config_from_hfq(&hfq)
+            .expect("malformed final norm fixture has valid config metadata");
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let baseline = gpu.hip.get_vram_info().expect("baseline VRAM");
+
+        let error = match hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu) {
+            Ok(weights) => {
+                weights.free_gpu(&mut gpu);
+                panic!("malformed HFQ final norm unexpectedly loaded");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.message.contains("model.norm.weight")
+                || error.message.contains("expected F16/F32"),
+            "{error:?}"
+        );
+        hfq.drop_mmap();
+        gpu.drain_pool();
+        assert_eq!(
+            gpu.hip.get_vram_info().expect("post-malformed VRAM"),
+            baseline,
+            "malformed HFQ final norm leaked the prior embedding allocation"
+        );
+    }
 }
 
 #[cfg(test)]
 mod reset_ownership_tests {
     use super::{
-        architecture_error,
-        ep_owner_visitation, qwen35_pp_owner_visitation, reject_qwen35_single_pipeline_metadata,
-        require_qwen35_pipeline_metadata, reset_each_owner, reset_ownership_kind, validate_ep_layout,
-        validate_qwen35_recurrent_cardinality, EpArchKind, ModelParallelKind, ModelStateKind,
-        ResetError,
+        architecture_error, ep_owner_visitation, qwen35_pp_owner_visitation,
+        reject_qwen35_single_pipeline_metadata, require_qwen35_pipeline_metadata, reset_each_owner,
+        reset_ownership_kind, validate_ep_layout, validate_qwen35_recurrent_cardinality,
+        EpArchKind, ModelParallelKind, ModelStateKind, ResetError,
     };
 
     #[test]

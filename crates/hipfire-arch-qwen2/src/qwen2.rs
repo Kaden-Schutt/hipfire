@@ -464,7 +464,7 @@ fn load_norm_weight_raw(
 /// implementation.
 fn load_weight_tensor(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,

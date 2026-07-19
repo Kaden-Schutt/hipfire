@@ -226,6 +226,34 @@ pub struct DsparkWeights {
     pub d2t: Option<Vec<u32>>,
 }
 
+impl DsparkWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Self {
+            cfg: _,
+            main_proj,
+            main_norm,
+            markov_w1,
+            markov_w2,
+            confidence_proj,
+            confidence_bias,
+            d2t: _,
+        } = self;
+        for tensor in [
+            main_proj,
+            main_norm,
+            markov_w1,
+            markov_w2,
+            confidence_proj,
+            confidence_bias,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
 /// The arch-specific seam: draft one window's block given the assembled
 /// multi-slot context, returning the per-slot post-final-norm hidden (`x_head`).
 ///
@@ -777,22 +805,22 @@ pub fn run_heads(
     // full-target-vocab markov chain — the on-GPU chain kernel can't do that gather.
     let chain_bufs: Option<(GpuTensor, GpuTensor)> =
         if markov_w1_device_embeddable(markov_w1) && weights.d2t.is_none() {
-        let chain = gpu
-            .alloc_tensor(&[block + 1], DType::F32)
-            .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
-        let seed_i32 = prev_token as i32;
-        let seed_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
-        gpu.hip
-            .memcpy_htod(&chain.buf, seed_bytes)
-            .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
-        let argmax_scratch = gpu
-            .alloc_tensor(&[1], DType::F32)
-            .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
-        Some((chain, argmax_scratch))
-    } else {
-        None
-    };
+            let chain = gpu
+                .alloc_tensor(&[block + 1], DType::F32)
+                .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
+            let seed_i32 = prev_token as i32;
+            let seed_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
+            gpu.hip
+                .memcpy_htod(&chain.buf, seed_bytes)
+                .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
+            let argmax_scratch = gpu
+                .alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
+            Some((chain, argmax_scratch))
+        } else {
+            None
+        };
 
     // Confidence head buffers (ON GPU per slot inside the loop):
     // `conf_batch[block]` holds the per-slot confidence logit.
@@ -1409,6 +1437,7 @@ impl MtpDrafter for DsparkDrafter {
         if let Some(dev) = self.main_hidden_dev {
             let _ = gpu.free_tensor(dev);
         }
+        self.weights.free_gpu(gpu);
         self.body.free(gpu);
     }
 

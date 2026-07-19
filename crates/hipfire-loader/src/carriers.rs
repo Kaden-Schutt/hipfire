@@ -15,6 +15,14 @@ use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
 
+fn dspark_lm_head_vocab(draft_vocab_size: usize, asset_vocab_size: usize) -> usize {
+    if draft_vocab_size != 0 {
+        draft_vocab_size
+    } else {
+        asset_vocab_size
+    }
+}
+
 // The ChatML/Hermes per-token emitter (`Qwen35Emit`) is shared by every
 // ChatML-family spec arm — qwen35 DFlash AND the llama/qwen2 n-gram paths all
 // drive it (they already share qwen35's tool-call grammar). It physically lives
@@ -535,16 +543,31 @@ impl Carrier for LlamaCarrier {
         // ── source-varying seam: yields a LlamaBundle ──
         let mut bundle = match src {
             ModelSource::Hfq(hfq) => {
-                hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx)?
+                match hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx) {
+                    Ok(bundle) => bundle,
+                    Err(error) => return Err(error),
+                }
             }
             ModelSource::Dir(source) => {
                 let config =
                     hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
                         format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
                     })?;
-                let weights =
-                    hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
-                        .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+                let weights = match hipfire_runtime::hfq::load_weights_paroquant_llama(
+                    &source, &config, ctx.gpu,
+                ) {
+                    Ok(weights) => weights,
+                    Err(error) => {
+                        return Err(format!("load_weights_paroquant_llama: {error:?}"));
+                    }
+                };
+                #[cfg(feature = "dflash-fault-inject")]
+                if let Err(error) = hipfire_runtime::dflash_generic::generic_dflash_construction_boundary(
+                    hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetWeights,
+                ) {
+                    weights.free_gpu(ctx.gpu);
+                    return Err(error);
+                }
                 let mode = resolve_kv_mode(
                     ctx,
                     &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
@@ -557,18 +580,39 @@ impl Carrier for LlamaCarrier {
                     max_seq: ctx.max_seq,
                     physical_cap: Some(ctx.max_seq),
                 };
-                let kv = hipfire_runtime::llama::KvCache::from_mode(
+                let kv = match hipfire_runtime::llama::KvCache::from_mode(
                     mode,
                     hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
                     &dims,
-                )
-                .map_err(|e| format!("KvCache: {e}"))?;
-                let scratch = hipfire_runtime::llama::ForwardScratch::new_with_max_seq(
+                ) {
+                    Ok(kv) => kv,
+                    Err(error) => {
+                        weights.free_gpu(ctx.gpu);
+                        return Err(format!("KvCache: {error}"));
+                    }
+                };
+                #[cfg(feature = "dflash-fault-inject")]
+                if let Err(error) =
+                    hipfire_runtime::dflash_generic::generic_dflash_construction_boundary(
+                        hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetKv,
+                    )
+                {
+                    kv.free_gpu(ctx.gpu);
+                    weights.free_gpu(ctx.gpu);
+                    return Err(error);
+                }
+                let scratch = match hipfire_runtime::llama::ForwardScratch::new_with_max_seq(
                     ctx.gpu,
                     &config,
                     ctx.max_seq,
-                )
-                .map_err(|e| format!("ForwardScratch::new_with_max_seq: {e:?}"))?;
+                ) {
+                    Ok(scratch) => scratch,
+                    Err(error) => {
+                        kv.free_gpu(ctx.gpu);
+                        weights.free_gpu(ctx.gpu);
+                        return Err(format!("ForwardScratch::new_with_max_seq: {error:?}"));
+                    }
+                };
                 hipfire_arch_llama::LlamaBundle {
                     config,
                     weights,
@@ -662,7 +706,10 @@ impl Carrier for LlamaCarrier {
             let dspark_weights = bundle.dspark_weights.take().unwrap();
             let assets = bundle.dspark_assets.take().unwrap();
             let block = dspark_weights.cfg.block_size;
-            let vocab = assets.config.vocab_size;
+            let vocab = dspark_lm_head_vocab(
+                dspark_weights.cfg.draft_vocab_size,
+                assets.config.vocab_size,
+            );
 
             // stage_norm = drafter's final `norm.weight` (output_norm in the sidecar).
             // Shallow-clone so the LlamaWeights (assets) owns the primary GpuTensor;
@@ -690,12 +737,18 @@ impl Carrier for LlamaCarrier {
                 "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
                 block, conf_threshold
             );
-            let body = hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+            let body = match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
                 assets,
                 &dspark_weights.cfg,
                 ctx.gpu,
-            )
-            .map_err(|e| format!("llama DSpark body build failed: {e}"))?;
+            ) {
+                Ok(body) => body,
+                Err(error) => {
+                    dspark_weights.free_gpu(ctx.gpu);
+                    bundle.free_gpu(ctx.gpu);
+                    return Err(format!("llama DSpark body build failed: {error}"));
+                }
+            };
             Some(hipfire_runtime::dspark_core::build_dspark_speculator(
                 body,
                 dspark_weights,
@@ -718,31 +771,46 @@ impl Carrier for LlamaCarrier {
                 Ok(draft_hfq) if draft_hfq.arch_id == 20 => {
                     // Parse DflashConfig to validate the cross-attention concat invariant
                     // (review finding L4): the drafter's hidden must equal the target dim.
-                    let draft_cfg = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
-                        .ok_or_else(|| {
-                            format!(
-                                "DFlash draft '{}' has arch_id=20 but missing or malformed \
-                                 'dflash' metadata block",
-                                dp
-                            )
-                        })?;
+                    let draft_cfg =
+                        match hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq) {
+                            Some(config) => config,
+                            None => {
+                                let error = format!(
+                                    "DFlash draft '{}' has arch_id=20 but missing or malformed \
+                                     'dflash' metadata block",
+                                    dp
+                                );
+                                bundle.free_gpu(ctx.gpu);
+                                return Err(error);
+                            }
+                        };
                     if bundle.config.dim != draft_cfg.hidden {
-                        return Err(format!(
+                        let error = format!(
                             "DFlash draft '{}' hidden={} != target dim={} \
                                  (cross-attention concat invariant L4: drafter hidden \
                                  must equal target residual dim)",
                             dp, draft_cfg.hidden, bundle.config.dim
-                        ));
+                        );
+                        bundle.free_gpu(ctx.gpu);
+                        return Err(error);
                     }
                     // Drop the peek handle before the builder reopens it.
                     drop(draft_hfq);
-                    let spec = hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
-                        ctx.gpu,
-                        dp,
-                        &mut bundle,
-                        ctx.max_seq,
-                    )
-                    .map_err(|e| format!("DFlash generic speculator build failed: {e}"))?;
+                    let spec =
+                        match hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
+                            ctx.gpu,
+                            dp,
+                            &mut bundle,
+                            ctx.max_seq,
+                        ) {
+                            Ok(spec) => spec,
+                            Err(error) => {
+                                bundle.free_gpu(ctx.gpu);
+                                return Err(format!(
+                                    "DFlash generic speculator build failed: {error}"
+                                ));
+                            }
+                        };
                     eprintln!(
                         "  DFlash generic speculator loaded for arch {} target: {}",
                         meta.arch_id, dp
@@ -795,6 +863,17 @@ impl Carrier for LlamaCarrier {
                 ctx.mtp_k,
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dspark_lm_head_vocab;
+
+    #[test]
+    fn dspark_lm_head_vocab_preserves_reduced_and_fallback_shapes() {
+        assert_eq!(dspark_lm_head_vocab(151_936, 152_064), 151_936);
+        assert_eq!(dspark_lm_head_vocab(0, 152_064), 152_064);
     }
 }
 

@@ -69,6 +69,159 @@ use std::path::Path;
 const DEFAULT_TREE_BUDGET: usize = 8;
 const DEFAULT_TREE_TOPK: usize = 2;
 
+/// Allocation boundaries exposed for deterministic generic-DFlash rollback tests.
+#[cfg(feature = "dflash-fault-inject")]
+#[derive(Clone, Copy)]
+pub enum GenericDflashConstructionStage {
+    DraftWeights,
+    DraftScratch,
+    VerifyScratch,
+    TargetWeights,
+    TargetKv,
+    VerifyScratchAllocation(usize),
+    TargetWeightsAllocation(usize),
+    TargetKvAllocation(usize),
+    ParoWeightUpload(usize),
+    DsparkAllocation(usize),
+    AwqScaleUpload(usize),
+    F32KvAllocation(usize),
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+impl GenericDflashConstructionStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DraftWeights => "draft weights",
+            Self::DraftScratch => "draft scratch",
+            Self::VerifyScratch => "verify scratch",
+            Self::TargetWeights => "target weights",
+            Self::TargetKv => "target KV",
+            Self::VerifyScratchAllocation(_) => "verify scratch allocation",
+            Self::TargetWeightsAllocation(_) => "target weights allocation",
+            Self::TargetKvAllocation(_) => "target KV allocation",
+            Self::ParoWeightUpload(_) => "Paro weight upload",
+            Self::DsparkAllocation(_) => "DSpark allocation",
+            Self::AwqScaleUpload(_) => "AWQ scale upload",
+            Self::F32KvAllocation(_) => "F32 KV allocation",
+        }
+    }
+
+    fn code(self) -> usize {
+        match self {
+            Self::DraftWeights => 1,
+            Self::DraftScratch => 2,
+            Self::VerifyScratch => 3,
+            Self::TargetWeights => 4,
+            Self::TargetKv => 5,
+            Self::VerifyScratchAllocation(_) => 6,
+            Self::TargetWeightsAllocation(_) => 7,
+            Self::TargetKvAllocation(_) => 8,
+            Self::ParoWeightUpload(_) => 9,
+            Self::DsparkAllocation(_) => 10,
+            Self::AwqScaleUpload(_) => 11,
+            Self::F32KvAllocation(_) => 12,
+        }
+    }
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+mod generic_dflash_fault_inject {
+    use super::GenericDflashConstructionStage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    static STAGE: AtomicUsize = AtomicUsize::new(0);
+    static ALLOCATION_TARGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STAGE.store(0, Ordering::SeqCst);
+            ALLOCATION_TARGET.store(usize::MAX, Ordering::SeqCst);
+            ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn with_fault<T>(stage: GenericDflashConstructionStage, f: impl FnOnce() -> T) -> T {
+        let _lock = LOCK.lock().expect("generic DFlash fault lock poisoned");
+        STAGE.store(stage.code(), Ordering::SeqCst);
+        ALLOCATION_TARGET.store(
+            match stage {
+                GenericDflashConstructionStage::VerifyScratchAllocation(allocation)
+                | GenericDflashConstructionStage::TargetWeightsAllocation(allocation)
+                | GenericDflashConstructionStage::TargetKvAllocation(allocation)
+                | GenericDflashConstructionStage::ParoWeightUpload(allocation)
+                | GenericDflashConstructionStage::DsparkAllocation(allocation)
+                | GenericDflashConstructionStage::AwqScaleUpload(allocation)
+                | GenericDflashConstructionStage::F32KvAllocation(allocation) => allocation,
+                _ => usize::MAX,
+            },
+            Ordering::SeqCst,
+        );
+        ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+        let _reset = Reset;
+        f()
+    }
+
+    pub(super) fn after_stage(stage: GenericDflashConstructionStage) -> Result<(), String> {
+        if matches!(
+            stage,
+            GenericDflashConstructionStage::VerifyScratchAllocation(_)
+                | GenericDflashConstructionStage::TargetWeightsAllocation(_)
+                | GenericDflashConstructionStage::TargetKvAllocation(_)
+                | GenericDflashConstructionStage::ParoWeightUpload(_)
+                | GenericDflashConstructionStage::DsparkAllocation(_)
+                | GenericDflashConstructionStage::AwqScaleUpload(_)
+                | GenericDflashConstructionStage::F32KvAllocation(_)
+        ) {
+            return Ok(());
+        }
+        if STAGE.load(Ordering::SeqCst) == stage.code() {
+            return Err(format!("test fault after generic DFlash {}", stage.label()));
+        }
+        Ok(())
+    }
+
+    pub(super) fn after_allocation(stage: GenericDflashConstructionStage) -> Result<(), String> {
+        if STAGE.load(Ordering::SeqCst) == stage.code()
+            && ALLOCATION_COUNT.fetch_add(1, Ordering::SeqCst)
+                == ALLOCATION_TARGET.load(Ordering::SeqCst)
+        {
+            return Err(format!("test fault after generic DFlash {}", stage.label()));
+        }
+        Ok(())
+    }
+}
+
+/// Run `f` with a deterministic fault injected at one generic-DFlash
+/// construction boundary. Available only in builds with
+/// `dflash-fault-inject` enabled.
+#[cfg(feature = "dflash-fault-inject")]
+pub fn with_generic_dflash_construction_fault<T>(
+    stage: GenericDflashConstructionStage,
+    f: impl FnOnce() -> T,
+) -> T {
+    generic_dflash_fault_inject::with_fault(stage, f)
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+pub fn generic_dflash_construction_boundary(
+    stage: GenericDflashConstructionStage,
+) -> Result<(), String> {
+    generic_dflash_fault_inject::after_stage(stage)?;
+    Ok(())
+}
+
+#[cfg(feature = "dflash-fault-inject")]
+pub fn generic_dflash_allocation_boundary(
+    stage: GenericDflashConstructionStage,
+) -> Result<(), String> {
+    generic_dflash_fault_inject::after_allocation(stage)
+}
+
 /// Effective tree node budget for this config, clamped so the linearized tree
 /// (`budget` nodes + 1 seed) can never exceed the dense verify kernel's batch
 /// ceiling. Single source of truth shared by the tree builder ([`TreeMode`])
@@ -144,6 +297,53 @@ pub struct GenericDflashSpeculator {
     /// Xorshift64* RNG state for the temp>0 chain naive sampler. Bit-compatible
     /// with the qwen35 spec sampler's seed so the chain draws are deterministic.
     rng_state: u64,
+}
+
+/// Constructor-local owner for generic DFlash resources. GPU buffers have no
+/// Drop, so this keeps each completed allocation published until construction
+/// succeeds and frees them explicitly on every error path.
+struct GenericDflashStaging {
+    weights: Option<DflashWeights>,
+    scratch: Option<DflashScratch>,
+    verify_scratch: Option<Box<dyn SpecScratch>>,
+}
+
+impl GenericDflashStaging {
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        if let Some(verify_scratch) = self.verify_scratch.take() {
+            verify_scratch.free(gpu);
+        }
+        if let Some(scratch) = self.scratch.take() {
+            scratch.free_gpu(gpu);
+        }
+        if let Some(weights) = self.weights.take() {
+            weights.free_gpu(gpu);
+        }
+    }
+
+    fn into_speculator(
+        mut self,
+        config: DflashConfig,
+        block_size: usize,
+        ctx_capacity: usize,
+        tree: TreeMode,
+    ) -> Box<dyn Speculator> {
+        Box::new(GenericDflashSpeculator {
+            weights: self.weights.take().expect("staged generic DFlash weights"),
+            scratch: self.scratch.take().expect("staged generic DFlash scratch"),
+            config,
+            target_hidden_host: Vec::new(),
+            verify_scratch: Some(
+                self.verify_scratch
+                    .take()
+                    .expect("staged generic DFlash verify scratch"),
+            ),
+            block_size,
+            ctx_capacity,
+            tree,
+            rng_state: 0x13579BDF,
+        })
+    }
 }
 
 impl GenericDflashSpeculator {
@@ -702,35 +902,85 @@ pub fn build_generic_dflash_speculator(
     let draft_hfq = HfqFile::open(Path::new(draft_hfq_path)).map_err(|e| format!("{e}"))?;
     let config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
-    let weights = DflashWeights::load(gpu, &draft_hfq, &config).map_err(|e| format!("{e}"))?;
+    let mut staged = GenericDflashStaging {
+        weights: None,
+        scratch: None,
+        verify_scratch: None,
+    };
+    let weights = match DflashWeights::load(gpu, &draft_hfq, &config) {
+        Ok(weights) => weights,
+        Err(error) => return Err(format!("{error}")),
+    };
+    staged.weights = Some(weights);
+    #[cfg(feature = "dflash-fault-inject")]
+    {
+        if let Err(error) =
+            generic_dflash_construction_boundary(GenericDflashConstructionStage::DraftWeights)
+        {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+    }
     let block_size = config.block_size;
     // L3: F16 drafts (dflash_convert) → has_mq=false → DflashScratch::new.
     // new_with_mq only for an MQ-quantized draft.
-    let scratch = if weights.has_mq {
+    let scratch = if staged
+        .weights
+        .as_ref()
+        .expect("staged generic DFlash weights")
+        .has_mq
+    {
         DflashScratch::new_with_mq(gpu, &config, block_size, ctx_capacity, true)
-            .map_err(|e| format!("{e}"))?
+            .map_err(|e| format!("{e}"))
     } else {
-        DflashScratch::new(gpu, &config, block_size, ctx_capacity).map_err(|e| format!("{e}"))?
+        DflashScratch::new(gpu, &config, block_size, ctx_capacity).map_err(|e| format!("{e}"))
     };
+    let scratch = match scratch {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+    };
+    staged.scratch = Some(scratch);
+    #[cfg(feature = "dflash-fault-inject")]
+    {
+        if let Err(error) =
+            generic_dflash_construction_boundary(GenericDflashConstructionStage::DraftScratch)
+        {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+    }
     let _ = draft_hfq;
 
     // Tell the target which residual-hidden layers to capture (the drafter's
     // target_layer_ids), and mint the per-target verify scratch.
     target.set_dflash_extract_layers(config.target_layer_ids.clone());
-    let verify_scratch = target.new_spec_scratch(gpu, block_size)?;
+    let verify_scratch = match target.new_spec_scratch(gpu, block_size) {
+        Ok(verify_scratch) => verify_scratch,
+        Err(error) => {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+    };
+    staged.verify_scratch = Some(verify_scratch);
+    #[cfg(feature = "dflash-fault-inject")]
+    {
+        if let Err(error) =
+            generic_dflash_construction_boundary(GenericDflashConstructionStage::VerifyScratch)
+        {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
+    }
 
-    Ok(Box::new(GenericDflashSpeculator {
-        weights,
-        scratch,
+    Ok(staged.into_speculator(
         config,
-        target_hidden_host: Vec::new(),
-        verify_scratch: Some(verify_scratch),
         block_size,
         ctx_capacity,
-        tree: TreeMode::from_flags(&gpu.flags),
-        // Fixed deterministic seed (matches the qwen35 dflash_spec default).
-        rng_state: 0x13579BDF,
-    }))
+        TreeMode::from_flags(&gpu.flags),
+    ))
 }
 
 #[cfg(test)]

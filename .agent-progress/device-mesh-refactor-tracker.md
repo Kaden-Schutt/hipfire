@@ -174,7 +174,7 @@ them toward completion.
 
 ### COR-005 Transactional LLaMA Spec-Target Loading
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Make generic LLaMA/Qwen3 speculative-target loading and DFlash
   construction transactional so every fallible load path returns a normal error
@@ -190,7 +190,21 @@ them toward completion.
   success/unload and repeated load/generate/unload cycles on a supported GPU.
 - **Hardware:** A supported AMD GPU with a generic LLaMA/Qwen3 target and
   compatible DFlash draft fixture.
-- **Evidence:** Pending
+- **Evidence:** 2026-07-19 on UMA gfx1151 (HIP 7.2), using
+  `~/.hipfire/models/qwen3-8b.q8f16.hfq` with
+  `~/.hipfire/models/qwen3-8b-dflash.hfq`:
+  `HIPFIRE_GENERIC_DFLASH_TARGET=...qwen3-8b.q8f16.hfq
+  HIPFIRE_GENERIC_DFLASH_DRAFT=...qwen3-8b-dflash.hfq cargo test -p
+  hipfire-loader --lib --features dflash-fault-inject
+  registry_tests::generic_dflash_load_rolls_back_each_completed_resource --
+  --ignored --exact` passed in 1154.75s. The gate exercised every generic
+  target/DFlash fault stage, allocation sweep, and repeated load/prefill/step/
+  unload cycles. It synchronizes before measurement and drains the pool; ROCm
+  driver graph/allocation accounting varied by up to 24.5 MiB across equivalent
+  histories, so it rejects post-cleanup free VRAM more than 64 MiB below the
+  warm baseline rather than requiring byte-exact `hipMemGetInfo` equality.
+  Feature-gated runtime tests: 401 passed, 3 ignored; loader tests: 28 passed,
+  11 ignored. Final adversarial review approved.
 
 ### COR-006 Align Eviction Physical-Cap Allocation
 
