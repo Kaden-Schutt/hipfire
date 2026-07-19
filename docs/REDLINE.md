@@ -105,9 +105,9 @@ AND tensor parallelism == 1
 AND model extension is .mq4r, case-insensitive
 ```
 
-An explicit `HIPFIRE_REPLAY_BACKEND` selection or `HIPFIRE_REPLAY_MANUAL_CAPTURE` selection overrides the model default. When the narrow model default applies and no transport override is present, the controller requests `Auto` with `Pm4Ib`. Otherwise the default backend is ordinary HIP. Explicit opt-in can exercise broader implementation capability, but opt-in availability is not certification.
+An explicit `HIPFIRE_REPLAY_BACKEND` selection or enabled `HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses the model default. `HIPFIRE_REPLAY_TRANSPORT` does not: it changes only the transport. Therefore an eligible gfx12 MQ4R model still requests `Auto` when only the transport is explicit, using that transport; with transport unset, it uses `Pm4Ib`. When the narrow predicate is false and no backend/manual selection applies, the backend remains ordinary HIP. Explicit opt-in can exercise broader implementation capability, but opt-in availability is not certification.
 
-A successful reconfiguration or model swap clears recorded launches, certified observations, prepared AQL/PM4 objects, fallback reason, and forward eligibility before admission restarts. This reset is required because model allocation identity is part of the replay contract.
+The controller's model reset clears recorded launches, certified observations, prepared AQL/PM4 objects, and the fallback reason, then sets `forward_eligible = true` before admission restarts. This reset is required because model allocation identity is part of the replay contract.
 
 ### Eligible forward boundary
 
@@ -388,83 +388,99 @@ Launch-count reduction alone is not proof of a wall-time win. Under retained PM4
 
 The following cases use the same classification fields. Historical measurements are quoted only with their dates and fixtures.
 
-### 11.1 Qwen3.5 0.8B dense `.mq4` on gfx1201: positive explicit opt-in
+### 11.1 Qwen3.5 0.8B dense `.mq4` on gfx1201: positive explicit opt-in evidence
 
 | Field | Evidence |
 |---|---|
 | Intent | Establish a compact dense-model capture, exact-state parity, and retained-PM4 example. |
-| Baseline route | HipGraph ordinary AR for the dated matched transport comparison. |
+| Baseline route | HipGraph ordinary AR for the dated comparison. |
 | Candidate route | Explicitly selected retained PM4. This `arch_id=5`, `.mq4` model is not the automatic `.mq4r`, `arch_id=6` product default. |
 | Fixture | Qwen3.5 0.8B dense on gfx1201; dated 2026-07-11 in `crates/redline-dispatch/HIPFIRE-GRAFT.md`. The recoverable row does not pin the full model digest or daemon binary digest. |
 | Immutable contract | 356 retained dispatches, 21 unique kernels, ordered sequence hash `55f99a58cb4b9363`; exact artifacts/kernargs and ordinary-AR state. |
 | Validation | Fifteen consecutive positions were bit exact for logits, KV, and recurrent state against ordinary HIP and the exact HIP-kernarg-blob oracle. |
-| Route proof | Dated retained-PM4 evidence includes the fingerprint, PM4 transport, multi-position parity, and a matched HipGraph-versus-PM4 product comparison. Per-dispatch AQL was measured separately and was neutral. |
-| Matched performance | On 2026-07-11, automatic clocks, resident 10×100 comparison: HipGraph 363.682 tok/s versus PM4 392.248 tok/s, `1.07855×`. This is fixture-bound evidence, not a floor. |
-| Serve | A five-prompt greedy battery had no runaways and averaged 384.7 decode tok/s; a response-framing gate failed independently. Numerical route parity must not be relabeled as framing success. |
-| Disposition | Positive retained-PM4 certification example for explicit opt-in; **not** automatic-default admission. |
-| Reusable lesson | Capability, opt-in certification, and product default are separate classifications. |
+| PM4 and route evidence | The dated record preserves the retained-PM4 fingerprint, PM4 shadow/parity evidence, and a nominal HipGraph-versus-PM4 product comparison. The recoverable timed-arm report does **not** contain the full Section 7 ledger: per-arm preparation and `Ready`, fallback reason, observed replay positions, and proof against silent HIP/HipGraph are missing. |
+| Performance observation | On 2026-07-11, automatic clocks, resident 10×100 comparison: HipGraph 363.682 tok/s versus requested PM4 392.248 tok/s, `1.07855×`. Because the timed-arm route ledger is incomplete, this remains fixture-bound positive performance evidence rather than a fully certified direct-transport A/B under this guide. Per-dispatch AQL was measured separately and was neutral. |
+| Serve | A five-prompt greedy battery had no runaways and averaged 384.7 decode tok/s, but the response-framing gate failed. That failure is independent of the PM4 capture/parity evidence, yet it still fails the full production-serve gate. |
+| Disposition | Preserve as positive explicit-opt-in capture, parity, PM4, and performance evidence. **Not fully certified under this guide**, not a passed full serve case, and not automatic-default admission. |
+| Reusable lesson | Capability, positive transport evidence, guide certification, production-serve health, and product default are separate classifications. |
 
-Evidence limitation: the recoverable graft row lacks the full artifact/binary identity now required by Section 8. Use it as a known-good historical example, not as a complete modern benchmark manifest.
+Evidence limitations: the recoverable graft row lacks the full artifact/binary identity and raw timed-arm route-proof ledger now required by Section 8. Use it as positive historical evidence, not as a complete modern certification manifest.
 
 ### 11.2 Qwen3.6 35B-A3B MQ4R across gfx1100, gfx1151, and gfx1201
 
-The current automatic predicate is narrower than implementation capability: gfx12, `arch_id=6`, single GPU (`pp=tp=1`), and `.mq4r`. Explicit backend/transport selections can request broader implemented paths, but they do not confer certification.
+The current automatic predicate is narrower than implementation capability: gfx12, `arch_id=6`, single GPU (`pp=tp=1`), and `.mq4r`. An explicit backend selection can request broader implemented paths. An explicit transport selection changes only the transport and does not by itself enable replay or bypass the model-default predicate.
 
-| Architecture | Implementation capability | Model performance evidence | Explicit opt-in | Positive retained-PM4 certification in recoverable docs | Automatic default |
+| Architecture | Implementation capability | Model performance evidence | Explicit opt-in | Recoverable retained-PM4 evidence under Section 7 | Automatic default |
 |---|---|---|---|---|---|
-| gfx1100 | Yes: gfx11 PM4 lowering exists. | Yes: the dated README/CHANGELOG MQ4R row reports TG128 median 253.3 tok/s, route unspecified. | Available. | **No positive retained-route proof recovered.** A stationarity-test comment is insufficient. | No; runtime tests reject gfx1100 for the gfx12 default. |
-| gfx1151 | Yes: gfx11 PM4 lowering and gfx1151 experiment knobs exist. | Yes: the dated README/CHANGELOG MQ4R row reports TG128 median 115.1 tok/s, route unspecified. | Available. | **No positive retained-route proof recovered.** Experiment knobs are capability, not certification. | No. |
-| gfx1201 | Yes: gfx12 PM4 lowering and Qwen adapter. | Yes, with dated model and serve checkpoints. | Available. | **Yes**, including retained-PM4 route proof and multi-position parity. | Yes when the complete narrow predicate holds and no explicit override wins. |
+| gfx1100 | Yes: gfx11 PM4 lowering exists. | Yes: the dated README/CHANGELOG MQ4R row reports TG128 median 253.3 tok/s, route unspecified. | Available through an explicit backend request. | **No positive retained-route proof recovered.** A stationarity-test comment is insufficient. | No; runtime tests reject gfx1100 for the gfx12 default. |
+| gfx1151 | Yes: gfx11 PM4 lowering and gfx1151 experiment knobs exist. | Yes: the dated README/CHANGELOG MQ4R row reports TG128 median 115.1 tok/s, route unspecified. | Available through an explicit backend request. | **No positive retained-route proof recovered.** Experiment knobs are capability, not certification. | No. |
+| gfx1201 | Yes: gfx12 PM4 lowering and Qwen adapter. | Yes, with dated model and serve checkpoints. | Available. | Positive capture, retained-PM4 shadow/parity, submission-identity, and product-performance evidence is recoverable. The timed product arm lacks the full modern route-proof ledger, so this case is **not fully certified under this guide**. | Yes when the complete narrow predicate holds and no explicit backend/manual-capture bypass wins; a transport override changes only the selected transport. |
 
 Primary gfx1201 case:
 
 | Field | Evidence |
 |---|---|
-| Intent | Certify and productize the single-GPU ordinary-AR Qwen3.6 35B-A3B MQ4R retained-PM4 route. |
-| Baseline route | HipGraph ordinary AR for the initial fixed-stack transport comparison. |
-| Candidate route | `redline-dispatch`/`redline-rocr` PM4-IB through the Qwen adapter. |
+| Intent | Establish and productize the single-GPU ordinary-AR Qwen3.6 35B-A3B MQ4R retained-PM4 route. |
+| Baseline route | Tuned HipGraph ordinary AR. |
+| Candidate route | `redline-dispatch`/`redline-rocr` PM4-IB through the Qwen adapter, first with conservative synchronization and then with a selective fence/wait overlay. |
 | Fixture | `qwen3.6-35b-a3b.mq4r`, `arch_id=6`, Q8 KV, no MTP/DFlash, gfx1201 Radeon AI PRO R9700; see `docs/perf-checkpoints/2026-07-11-redline-qwen36-a3b-ar.md`. |
 | Immutable contract | Initial tape: 833 launches, 26 kernels, sequence hash `8d5620ca2ca8a536`; PM4 body 34,563 dwords; one vendor AQL packet. Later graph reshapes have checkpoint-specific fingerprints and must not reuse this hash. |
 | Validation | Fifteen-position bit-exact logits hash `9874244965e2c7d6`, KV hash `fa5f3bb2b32fffcd`, recurrent hash `609db41ffad8ceb6`; `bit_exact`, `blob_bit_exact`, logits/KV/recurrent equality all passed. |
-| Route proof | Positive gfx1201 PM4 preparation, one-packet submission identity, command dwords, matched product arm, and multi-position shadow evidence are recorded in the 2026-07-11 checkpoint. |
-| Matched performance | On the initial 2026-07-11 fixed-stack fixture, HipGraph 165.839 tok/s versus PM4 178.320 tok/s, `1.07526×`, after independently justified boundary-wait removal. Dated, not a universal floor. |
-| Later progression | `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` records the later productized no-env campaign, including a TG128 median 203.93 tok/s and long-turn serve evidence. That progression changed kernel stack and graph shape; it is not the direct transport A/B above. |
-| Disposition | Positive retained-PM4 certification and automatic default only under the narrow runtime predicate. |
-| Reusable lesson | Separate architecture capability, model performance, opt-in availability, retained-route certification, and automatic admission in every matrix. |
+| PM4 and route evidence | The dated shadow record proves successful retained-PM4 execution, one-packet submission identity, command dwords, and multi-position parity. The recoverable product benchmark records requested `transport=pm4` and HipGraph/`auto` throughput, but not per-timed-arm preparation, `Ready`, fallback reason, observed replay positions, or anti-fallback proof. It therefore does not satisfy the complete Section 7 timed-arm route ledger. |
+| Conservative PM4 observation | The earlier conservative policy measured HipGraph 164.220 tok/s versus requested retained PM4 174.087 tok/s, `1.06009×`. This is the closest recoverable conservative PM4-versus-HipGraph observation. Without the timed-arm route ledger, it is not a fully certified direct-transport A/B under this guide. |
+| Selective fence/wait composition | Tuned HipGraph 165.839 tok/s versus retained PM4 plus removal of one proven-independent boundary wait 178.320 tok/s, `1.07526×`. This is a **combined retained-PM4 plus selective fence/wait-policy observation**, not direct transport alone. |
+| Later progression | `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` records the later productized no-env campaign, including a TG128 median 203.93 tok/s and long-turn serve evidence. That progression changed kernel stack and graph shape; it is not a direct transport A/B. |
+| Automatic admission | Runtime automatically requests `Auto` on the complete gfx12/`arch_id=6`/`pp=tp=1`/`.mq4r` predicate unless an explicit backend or enabled manual capture bypasses the model default. An explicit transport overrides only the transport. Runtime admission is not guide certification. |
+| Disposition | Preserve as the strongest recoverable gfx1201 PM4 capture, parity, submission, performance, and productization evidence. **Do not call it fully certified under this guide** until a positive timed-arm route-proof ledger satisfying Section 7 is archived. |
+| Reusable lesson | Separate architecture capability, model performance, opt-in availability, dated PM4 evidence, guide certification, and automatic admission in every matrix. |
 
-Evidence limitations: initial raw `.redline-work` JSON is referenced by dated markdown but is not checked into the repository. The initial checkpoint also records a composition/transplant provenance caveat; later product measurements supersede it for the productized path but do not turn the full historical progression into a pure transport experiment. The recoverable gfx1100 and gfx1151 performance rows do not state whether HIP, HipGraph, or retained PM4 was selected.
+Evidence limitations: initial raw `.redline-work` JSON is referenced by dated markdown but is not checked into the repository. The timed product-harness schema does not expose the controller fields required to exclude silent fallback. The initial checkpoint also records a composition/transplant provenance caveat; later product measurements supersede it for the productized path but do not turn the historical progression or the selective-fence result into pure transport experiments. The recoverable gfx1100 and gfx1151 performance rows do not state whether HIP, HipGraph, or retained PM4 was selected.
 
 ### 11.3 Rejected gfx1030 Qwen3.6 MQ2 lowering
+
+This subsection is the repository-visible rejection record; the archived performance-checkpoint tree is not extended for this case.
 
 | Field | Evidence |
 |---|---|
 | Intent | Port Qwen3.6 35B-A3B MQ2G256Lloyd prefill and retained-PM4 decode to an RX 6950 XT gfx1030 and earn a product wall-time win. |
 | Baseline route | Ordinary HIP decode. |
 | Candidate route | Product `auto` with `transport=pm4`, plus a Radiowave off/on overlay. |
-| Fixture | Branch `feat/mq2g256-gfx1030-prefill-redline`; prefill commit `0f3444f8cecf9976ced483237a8fc26028f3b94d`; measured candidate `e017f83ceb9d41d4be0d6665161615c9ae74d89b`; daemon SHA-256 `47585859295f44a5cc2aab090e7fc43ef342d2932e1d7d402a4d569cbf53acaf`; model SHA-256 `48b3f84614c46eb8b5ffb494f7a75c15216664afcbb47c3e78dd80c4ce7eb0a3`; dated 2026-07-18 on host hipx. |
+| Source identity | Host `hipx`; branch `feat/mq2g256-gfx1030-prefill-redline`; remote worktree `/home/kaden/hipfire-mq2-gfx1030`; prefill commit `0f3444f8cecf9976ced483237a8fc26028f3b94d`; measured candidate `e017f83ceb9d41d4be0d6665161615c9ae74d89b`; daemon `/home/kaden/hipfire-mq2-gfx1030/target/release/examples/daemon`, SHA-256 `47585859295f44a5cc2aab090e7fc43ef342d2932e1d7d402a4d569cbf53acaf`. |
+| Model and device fixture | `/home/kaden/bench/models/qwen3.6-35b-a3b.mq2`, 11,610,560,768 bytes, SHA-256 `48b3f84614c46eb8b5ffb494f7a75c15216664afcbb47c3e78dd80c4ce7eb0a3`; RX 6950 XT gfx1030; `ROCR_VISIBLE_DEVICES=2`; Q8 KV; automatic clocks. |
+| Product fixture | Context 32, 32 measured iterations per row, 10 warmups, 8 measured runs, requested `transport=pm4`; dated 2026-07-18. |
 | Immutable contract | Launch identity/order, owning HSACO, exact padded kernargs, effects, bindings, capture boundary, output/state parity, and positive product-arm route proof. |
-| Validation | Exact harness off/on reported 942 launches, 24 kernels, sequence hash `becff4a4f1849d1e`, one PM4-IB packet, 21,783 command dwords, and bit-exact logits/KV/recurrent/blob parity. Owning artifact paths and kernel names matched. Intermediate `HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS` HSACO-load errors occurred during bring-up but were not the final exact-report failure. |
-| Falsification | Radiowave-on changed every captured kernarg hash, 942/942, despite stable launch-name sequence and artifact paths. This clobbered the exact padded-kernarg/dynamic-binding tape surface for the overlay comparison. |
-| Route-proof limitation | Exact shadow proves that PM4-IB could execute bit exactly. Product JSON records `transport=pm4` but omits controller `Ready`, fallback reason, and observed multi-position replay fields, so it does not independently exclude silent HIP for the timed arm. |
-| Matched performance | Same e017 binary/model, automatic clocks, ctx 32, 32 iterations, 10 warmups, 8 runs: Radiowave-off HIP 101.431 versus auto 83.711 tok/s (`0.82529×`); Radiowave-on HIP 101.460 versus auto 83.653 (`0.82449×`). The candidate was about 17.5% slower. |
+| Exact PM4 evidence | Radiowave-off and -on exact reports each recorded 942 launches, 24 kernels, sequence hash `becff4a4f1849d1e`, one PM4-IB packet, queue id 2, and 21,783 command dwords. `bit_exact`, `blob_bit_exact`, logits/KV/recurrent equality, and the overall exact-harness result all passed. Owning artifact paths and kernel names matched across arms. |
+| Falsification | Radiowave-on changed every captured kernarg hash, 942/942, despite the stable ordered launch-name sequence and artifact paths. This clobbered the exact padded-kernarg/dynamic-binding tape surface for the overlay comparison. |
+| Matched product result | Same e017 binary/model: Radiowave-off HIP median 101.431 versus `auto` median 83.711 tok/s (`0.82529×`); Radiowave-on HIP 101.460 versus `auto` 83.653 tok/s (`0.82449×`). The nominal candidate arm was about 17.5% slower, and the overlay did not recover it. |
+| Pre-contract control | At commit `0f3444f8cecf9976ced483237a8fc26028f3b94d` with a different daemon, HIP and `auto` were approximately neutral: off `102.345→102.340`, on `102.608→102.512`, and ctx2048 `97.973→98.026` tok/s. These are controls, not retained-PM4 wins. |
+| Route-proof limitation | Exact shadow proves that PM4-IB could execute bit exactly. Product JSON records requested `transport=pm4` but omits controller `Ready`, fallback reason, and observed multi-position replay fields, so it does not independently exclude silent HIP for the timed arm. |
+| Intermediate bring-up evidence | Earlier session logs recorded `HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS` while loading `rmsnorm.hsaco`. The later exact reports loaded successfully and passed parity; those earlier errors are bring-up hazards, not the final rejection mode. |
+| Raw remote evidence | `ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-ab-20260718/` contains `off-exact.json`, `on-exact.json`, `off-product.json`, and `on-product.json`; `ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-precontract-ab-20260718/` contains the three control product reports. |
+| Evidence limitations | The raw reports are remote rather than checked in. The product reports lack the complete timed-arm controller ledger required by Section 7. No source-grounded record defines a single official enum for the rejection, and no final exact evidence shows an artifact-path, launch-order, or output-state failure. |
+| Certification-ladder classification | Positive capture and exact PM4 shadow/parity evidence is preserved, but the timed-arm route-proof gate is incomplete, the Radiowave kernarg-identity contract is clobbered, and the matched wall-time gate fails. This case is not certified. |
 | Disposition | **Rejected** as a retained-route/Radiowave product promotion. A commit-message or alternate-bench `+3.1%` is not the matched product result. |
 | Reusable lesson | Stable sequence hash plus bit-exact shadow can hide full kernarg mutation and cannot replace product-arm route proof plus matched wall time. |
 
-Authoritative raw evidence is recoverable under `ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-ab-20260718/` and the corresponding `gfx1030-radiowave-precontract-ab-20260718/` directory. No checked-in performance checkpoint defines an official single-enum rejection label. Therefore this guide states only the established clobber surfaces: universal Radiowave kernarg-hash drift and the matched product wall regression. It does not claim that final HSACO identity, launch order, or output parity failed; the final exact reports show the opposite.
-
 ### 11.4 Rejected LFM Stage A
+
+This subsection is the repository-visible rejection record; the archived performance-checkpoint tree is not extended for this case.
 
 | Field | Evidence |
 |---|---|
 | Intent | Reduce LFM2.5-350M MQ4 gfx1201 serial-HIP decode launches by fusing RMSNorm plus MQ rotation activation preparation. |
-| Baseline route | Serial HIP lowered decode, fusion disabled, graph off, Q8 KV. |
-| Candidate route | Serial HIP with `HIPFIRE_LFM2_DECODE_FUSION=1`; not Redline, AQL, or PM4. |
-| Fixture | Baseline `e8831ae8347f04ac821077ee159c86423b4bf88a`; candidate `518c221756a1065a7560449165bc8817c2ad6176`; model `lfm2.5-350m.mq4` MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`; dated 2026-07-19. See `docs/design/lfm2moe-gfx1201-decode-architecture.md` and the archived measurement ledger named in the campaign. |
+| Baseline route | Serial HIP lowered decode, `HIPFIRE_LFM2_DECODE_FUSION=0`, graph off, Q8 KV. |
+| Candidate route | The same serial-HIP path with `HIPFIRE_LFM2_DECODE_FUSION=1`; not Redline, AQL, or PM4. |
+| Source identity | Baseline tree `/home/kaden/ClaudeCode/autorocm/hipfire`, branch `lfm-redline`, commit `e8831ae8347f04ac821077ee159c86423b4bf88a`, daemon MD5 `9ee43d2673866775786d8075fb5b6e76`; candidate tree `/home/kaden/ClaudeCode/autorocm/hipfire-lfm-gfx1201-pm4`, branch `feat/lfm-gfx1201-mq4-decode-fusion`, commit `518c221756a1065a7560449165bc8817c2ad6176`, daemon MD5 `07d62bbd915416b07ce7783969126dd7`. |
+| Model and prompt fixture | `/home/kaden/.hipfire/models/lfm2.5-350m.mq4`, MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`; candidate `benchmarks/prompts/lfm_stage_a_five_prompt.json`, MD5 `18cb45e00d424bef16fa9b097d02caf3`; Q8 KV, no DFlash/MTP/spec path. |
+| Device fixture | gfx1201 UUID `GPU-6125bfcd5e216e52`; daemon HIP 7.2; `hipcc 7.2.26015-fc0010cf6a`; ROCm clang `roc-7.2.0 26014`; dated 2026-07-19. |
 | Immutable contract | Bit-exact production decode; fail-closed non-admission on prefill/spec/graph/capture/default; campaign structural targets; predeclared campaign wall gates. PM4 was an explicit non-goal. |
-| Validation | Correctness and five-prompt serve checks passed. Rocprof count moved 281→221. Recorder-visible tape was 204 launches, 9 kernels, hash `67dcc9e17e00ed8f`. |
-| Launch reconciliation | Baseline recorder target 264 = 281 compute − 1 embedding − 10 direct-HIP conv − 6 direct-HIP attention. Stage A tape 204 = 221 − 1 − 10 − 6. The value 220 = 221 − 1 is a **future** full-tape target after conv/attention recorder migration, not a Stage A pass bar. |
-| Route proof | Absent by design: no PM4 command, shadow, prepared plan, `Ready`, or observed replay was run. The LFM harness reached a Qwen-only shadow endpoint and could not install an LFM route. |
-| Matched performance | Authoritative fresh-process ABBA: tg128 `+2.114%`, tg512 `+1.041%`; both missed that campaign's predeclared `≥5%` wall gates, and low-sample guards also failed. The 5% value belongs to this dated campaign, not a timeless Redline floor. |
+| Correctness and serve evidence | Frozen twelve-step decode parity was exact for logits, conv state, KV state, argmax, and token count. Default, eager-prefill, spec, graph, and capture/batched-prefill negatives did not admit Stage A. Five reference and five candidate serve prompts had exact assistant-content equality, no empty/runaway/attractor flags, and readable on-topic output. |
+| Launch reconciliation | Baseline 281 compute launches/token. Baseline recorder target 264 = 281 − 1 embedding − 10 direct-HIP conv − 6 direct-HIP attention. Stage A measured 221 compute launches and a stable recorder-visible tape of 204 launches, 9 kernels, hash `67dcc9e17e00ed8f`; 204 = 221 − 1 − 10 − 6. The value 220 = 221 − 1 is a **future** full-tape target after conv/attention recorder migration, not a Stage A pass bar. |
+| Fresh-process ABBA | Pooled tg128 medians were 489.892172→500.248379 tok/s (`+2.113977%`); pooled tg512 medians were 483.856115→488.890740 (`+1.040521%`). Both missed the campaign's predeclared `≥5%` wall gates. The lowest candidate sample also failed the `0.97 ×` pooled-baseline guard in each bucket. |
+| Route proof | Absent by design: no PM4 command, shadow, prepared plan, `Ready`, or observed replay was run. The recorder harness completed capture, then stopped at `redline_shadow_aql requires a loaded single-GPU Qwen3.5 model`; no LFM plan was installed. |
+| Raw local evidence | Source ledger `local://lfm-stage-a-measurement-report.md`; artifact root `/home/kaden/ClaudeCode/autorocm/lfm-stage-a-measurement-20260719/`; phase directories `preflight/`, `serve/`, `abba/`, `recorder/`, and `rocprof/`; command ledgers `run_preflight.sh`, `run_serve_gate.sh`, `run_abba.sh`, `run_recorder.sh`, `run_direct_capture.sh`, and `run_rocprof.sh`. |
+| Evidence limitations | The source ledger is session-local and the raw artifact root is workstation-local; no remote or checked-in raw copy was recovered. This guide therefore preserves the exact identities, fixture, accounting, measured values, and paths, but does not invent product controller fields for a PM4 route that was never run. |
+| Certification-ladder classification | Serial-HIP baseline correctness and serve health passed, but complete retained capture, ABI/artifact validation, PM4 shadow parity, timed-arm route proof, and retained-route lifecycle evidence were not attempted. The campaign wall-time gate failed. This case is not Redline-certified. |
 | Disposition | **Rejected** as a standalone Stage A promotion despite exactness and structural launch reduction. Classified as serial-HIP activation-preparation fusion, not Redline. |
 | Reusable lesson | Fewer launches are neither retained replay nor a wall-time win. Complete recorder coverage, replay-stable attention geometry, LFM mutable-state shadow support, prepared-plan installation, and positive PM4 route proof remain prerequisites. |
 
