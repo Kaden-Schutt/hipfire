@@ -249,7 +249,9 @@ python3 scripts/redline_product_bench.py \
   --out .redline-work/product/report.json
 ```
 
-Set `MODEL` to the exact digested fixture before running. The manual harness is a fingerprint/shadow diagnostic; it does not establish that the user-facing product arm selected retained PM4. The product benchmark must therefore be paired with the explicit route-proof record below.
+Set `MODEL` to the exact digested fixture before running. These commands are diagnostics only. They do **not** emit the full Section 7 timed-arm route-proof ledger.
+
+**Current tooling gap (route proof).** `scripts/redline_product_bench.py` records requested backend/transport and throughput, but not controller `Ready`, fallback reason, observed replay positions, packet/queue/dword identity, or anti-HIP/HipGraph proof. `scripts/redline_daemon_harness.py --pm4` can supply separate manual shadow/capture evidence, but it does not prove that the timed user-facing product arm actually routed. The two reports cannot be inferred or joined into positive timed-arm route proof. A route-proof-capable product harness/report must be implemented before any new or widened route can satisfy full certification under this guide; until then, such routes remain experiments, not fully certified promotions. Do not present the commands above as producing unavailable fields.
 
 ## 6. PM4 lowering and hazard policy
 
@@ -298,6 +300,8 @@ Pass these gates in order. Failure at a gate blocks promotion even if a later-lo
 | 8. Long-context and lifecycle | Dynamic position, geometry, KV growth, recurrent/convolution state, request reset, failure behavior, and model swap pass throughout the supported range. | Context drift, state leak, stale pointer, wrong reset, or same-forward fallback claim. |
 
 Harness success without route proof is insufficient. A ratio from two nominal arms that both executed ordinary HIP is invalid evidence. A stable manual-capture fingerprint is discovery evidence; it does not install a plan or prove that a user-facing forward selected retained AQL or PM4.
+
+**Current tooling gap.** Full certification still requires the Minimum route-proof record below, but current product tooling cannot produce it end-to-end. `redline_product_bench.py` reports requested backend/transport and throughput only; it omits controller `Ready`, fallback reason, observed replay positions, packet/queue/dword identity, and proof the timed arm was not ordinary HIP or HipGraph. `redline_daemon_harness.py --pm4` is a separate manual shadow/capture path and does not prove the timed product arm routed. Those two outputs cannot be stitched into positive timed-arm route proof. Until a route-proof-capable product harness/report exists, new and widened routes cannot clear Gate 5 as fully certified product evidence and must remain experiments. Preserve the runtime-versus-certification distinction: runtime `Ready` is not repository certification, and missing report fields are not optional.
 
 ### Minimum route-proof record per arm
 
@@ -512,6 +516,7 @@ Copy this checklist into the route's dated evidence record.
 - [ ] The first route is single-queue and conservatively ordered.
 - [ ] Ordinary HIP, exact HIP-kernarg-blob, and retained PM4 pass multi-position state parity.
 - [ ] Route proof records request, transport, preparation, `Ready`, observed replay positions, dispatches, packets, queues/phases, dwords, faults, and fallback reason.
+- [ ] A route-proof-capable product harness/report recorded the timed-arm ledger (not only requested backend/transport + throughput). Until that tooling exists, treat the route as an experiment, not a fully certified promotion.
 - [ ] The timed retained arm is proven not to be ordinary HIP or HipGraph.
 - [ ] Production serve output, finish state, repetition/attractor health, and response framing pass.
 - [ ] Dynamic position, growing context, request reset, failure behavior, and model swap pass.
