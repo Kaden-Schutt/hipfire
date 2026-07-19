@@ -106,6 +106,38 @@ class ReviewCapsule:
         return canonical_json(self.to_mapping(), max_bytes=MAX_CANONICAL_BYTES)
 
 
+def capsule_coverage(capsule: ReviewCapsule) -> dict[str, Any]:
+    """Derive the exact protocol coverage evidence from an authenticated capsule."""
+    if not isinstance(capsule, ReviewCapsule):
+        raise ValueError("coverage requires a typed review capsule")
+    expected_file_count = len(capsule.manifest)
+    retrieved_file_count = len(capsule.files)
+    expected_blob_count = sum(
+        int(entry.base_blob_oid is not None) + int(entry.head_blob_oid is not None)
+        for entry in capsule.manifest
+    )
+    retrieved_content_count = sum(
+        int(item.base_source is not None) + int(item.head_source is not None)
+        for item in capsule.files
+    )
+    retrieved_blob_count = retrieved_content_count
+    expected_content_count = expected_blob_count
+    return {
+        "retrieved_file_count": retrieved_file_count,
+        "expected_file_count": expected_file_count,
+        "retrieved_blob_count": retrieved_blob_count,
+        "expected_blob_count": expected_blob_count,
+        "retrieved_content_count": retrieved_content_count,
+        "expected_content_count": expected_content_count,
+        "coverage_complete": (
+            capsule.complete
+            and retrieved_file_count == expected_file_count
+            and retrieved_blob_count == expected_blob_count
+            and retrieved_content_count == expected_content_count
+        ),
+    }
+
+
 def _data(response: Any) -> Mapping[str, Any]:
     value = getattr(response, "data", response)
     if not isinstance(value, Mapping):

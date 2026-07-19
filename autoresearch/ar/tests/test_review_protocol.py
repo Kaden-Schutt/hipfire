@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from autoresearch.ar.review.canonical import canonical_digest, canonical_json, canonical_loads, metadata_digest
-from autoresearch.ar.review.models import ReviewTarget
+from autoresearch.ar.review.capsule import ReviewCapsule, ReviewFile, ReviewManifestEntry, capsule_coverage
+from autoresearch.ar.review.config import AuthenticatedConfigSource, load_review_configuration
+from autoresearch.ar.review.models import ReviewScope, ReviewTarget, ValidationLedgerRow, ValidationProfile, capability_contract_digest
 from autoresearch.ar.review.models import GitHubEnvelope
 from autoresearch.ar.review.protocol import (
     elect_canonical_attempt,
@@ -18,13 +20,30 @@ from autoresearch.ar.review.protocol import (
     validate_report,
     validate_review_metadata,
     validate_revocation,
+    validate_validation_ledger,
 )
+from autoresearch.ar.review.validation import render_validation_section
 
 
 VECTORS = json.loads((Path(__file__).parent / "fixtures" / "review_protocol_vectors.json").read_text())
 TARGET = ReviewTarget("owner/repo", 42, "owner/repo", "head-sha", "main", "base-sha", "merge-sha")
 TRUSTED = {"review-bot"}
 SCHEMA = "agentic-review/v1"
+
+
+def _test_capsule() -> ReviewCapsule:
+    values = {
+        "target": TARGET, "target_key": TARGET.target_key(),
+        "merge_base_tree_oid": "merge-tree", "head_tree_oid": "head-tree",
+        "manifest": (ReviewManifestEntry("src/main.py", "100644", "100644", "a" * 40, "b" * 40, 1, 1),),
+        "files": (ReviewFile("src/main.py", "x\n", "y\n"),), "complete": True,
+        "coverage": ("trees", "1 changed paths represented", "2 source bytes inspected"),
+        "rejections": (),
+    }
+    return ReviewCapsule(
+        **values,
+        digest="sha256:" + canonical_digest({"schema": "agentic-review/review-capsule-v1", **values}),
+    )
 
 
 def _self_digest(payload, field):
@@ -121,6 +140,12 @@ def _metadata(intent, report, node_id="gh-metadata-a", *, created_at="2026-01-01
         "canonical_intent_node_id": intent["node_id"],
         "metadata_digest": "",
     }
+    coverage_fields = (
+        "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
+        "retrieved_content_count", "expected_content_count", "coverage_complete",
+    )
+    if all(field in report_payload for field in coverage_fields):
+        payload.update({field: report_payload[field] for field in coverage_fields})
     return _envelope(_self_digest(payload, "metadata_digest"), node_id, created_at=created_at)
 
 
@@ -142,6 +167,12 @@ def _completion(intent, report, metadata, node_id="gh-completion-a", *, created_
         "metadata_record_id": metadata["payload"]["record_id"],
         "metadata_digest": metadata["payload"]["metadata_digest"],
     }
+    coverage_fields = (
+        "retrieved_file_count", "expected_file_count", "retrieved_blob_count", "expected_blob_count",
+        "retrieved_content_count", "expected_content_count", "coverage_complete",
+    )
+    if all(field in metadata["payload"] for field in coverage_fields):
+        payload.update({field: metadata["payload"][field] for field in coverage_fields})
     return _envelope(payload, node_id, created_at=created_at)
 
 
@@ -632,3 +663,150 @@ def test_append_only_rejects_duplicate_ids_in_previous_snapshot_before_lookup():
     duplicate_node = _intent(record_id="other-record", node_id=intent.node_id)
     with pytest.raises(ValueError, match="duplicate authenticated"):
         validate_append_only([], previous=[intent, duplicate_node])
+
+
+def _protected_configuration():
+    root = Path(__file__).parents[3]
+    paths = (
+        root / ".github/agentic-review/providers.json",
+        root / ".github/agentic-review/capabilities-v1.json",
+        root / ".github/agentic-review/trusted-publishers.json",
+    )
+    from autoresearch.ar.review.config import configuration_source_digest, _SOURCE_PROOF
+
+    source = AuthenticatedConfigSource._from_authenticated_boundary(
+        _SOURCE_PROOF, TARGET.repository, "main", "config-sha", configuration_source_digest(*(path.read_bytes() for path in paths)), root
+    )
+    configuration = load_review_configuration(root, source=source)
+    assert configuration.source is not None
+    return configuration
+
+
+def test_validation_ledger_is_typed_policy_bound_and_has_exact_report_fields():
+    configuration = _protected_configuration()
+    assert configuration.source is not None
+    profile_mapping = configuration.capabilities["profiles"][0]
+    profile = ValidationProfile.from_mapping(profile_mapping)
+    capability = next(item for item in configuration.capabilities["capabilities"] if item["id"] == profile.capability_id)
+    row = ValidationLedgerRow(profile, capability_contract_digest(capability), "representative")
+    capsule = _test_capsule()
+    capsule = _test_capsule()
+    payload = {"validation_ledger": [row.to_mapping()], "configuration_source_digest": configuration.source.config_digest,
+               "scope": ReviewScope((row.model_architecture,), row.covered_hardware).to_mapping(),
+               "capsule_digest": capsule.digest,
+               "capsule_paths": ["src/main.py"], "capsule_target_key": TARGET.target_key(),
+               **capsule_coverage(capsule)}
+    with pytest.raises(ValueError, match="capsule"):
+        validate_validation_ledger(payload, configuration=configuration)
+    validate_validation_ledger(payload, configuration=configuration, capsule=capsule)
+    with pytest.raises(ValueError, match="capsule"):
+        validate_validation_ledger({**payload, "capsule_digest": "sha256:" + "f" * 64}, configuration=configuration)
+    with pytest.raises(ValueError, match="paths"):
+        validate_validation_ledger({**payload, "capsule_paths": ["src/other.py"]}, configuration=configuration, capsule=capsule)
+    with pytest.raises(ValueError, match="coverage"):
+        validate_validation_ledger(
+            {**payload, "retrieved_file_count": 0}, configuration=configuration, capsule=capsule,
+        )
+    incomplete_values = {key: value for key, value in capsule.to_mapping().items() if key != "digest"}
+    incomplete_values["complete"] = False
+    incomplete = replace(
+        capsule,
+        complete=False,
+        digest="sha256:" + canonical_digest(incomplete_values),
+    )
+    with pytest.raises(ValueError, match="complete"):
+        validate_validation_ledger(payload, configuration=configuration, capsule=incomplete)
+    with pytest.raises(ValueError, match="configuration source digest"):
+        validate_validation_ledger({**payload, "configuration_source_digest": "sha256:" + "0" * 64}, configuration=configuration, capsule=capsule)
+    with pytest.raises(ValueError, match="scope"):
+        validate_validation_ledger(
+            {**payload, "scope": {"model_architectures": [profile.model_architecture], "hardware_architectures": ["gfx1100"]}},
+            configuration=configuration, capsule=capsule,
+        )
+
+    with pytest.raises(ValueError, match="protected|profile|malformed"):
+        validate_validation_ledger({**payload, "validation_ledger": [{**row.to_mapping(), "profile_digest": "sha256:" + "0" * 64}]}, configuration=configuration, capsule=capsule)
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_validation_ledger({"validation_ledger": []}, configuration=configuration)
+
+
+def test_validation_ledger_bounds_and_rows_remain_free_of_report_metadata_digests():
+    configuration = _protected_configuration()
+    assert configuration.source is not None
+    profile = ValidationProfile.from_mapping(configuration.capabilities["profiles"][0])
+    capability = next(item for item in configuration.capabilities["capabilities"] if item["id"] == profile.capability_id)
+    row = ValidationLedgerRow(profile, capability_contract_digest(capability), "representative").to_mapping()
+    capsule = _test_capsule()
+    assert "report_digest" not in row and "metadata_digest" not in row
+    with pytest.raises(ValueError, match="64"):
+        validate_validation_ledger({
+            "validation_ledger": [row] * 65,
+            "configuration_source_digest": configuration.source.config_digest,
+            "scope": {"model_architectures": [profile.model_architecture], "hardware_architectures": list(profile.covered_hardware)},
+            "capsule_digest": capsule.digest,
+            "capsule_paths": ["src/main.py"], "capsule_target_key": TARGET.target_key(),
+            **capsule_coverage(capsule),
+        }, configuration=configuration, capsule=capsule)
+
+
+def test_report_rejects_visible_validation_table_divergence_from_hidden_ledger():
+    configuration = _protected_configuration()
+    assert configuration.source is not None
+    intent = _intent()
+    profile = ValidationProfile.from_mapping(configuration.capabilities["profiles"][0])
+    capability = next(item for item in configuration.capabilities["capabilities"] if item["id"] == profile.capability_id)
+    row = ValidationLedgerRow(profile, capability_contract_digest(capability), "representative")
+    capsule = _test_capsule()
+    scope = ReviewScope((row.model_architecture,), row.covered_hardware)
+    body = "## Agentic review\n\nNo findings.\n\n" + render_validation_section([row.to_mapping()], scope=scope)
+    report = _report(intent, body=body)
+    report_payload = dict(report.payload)
+    report_payload.update(
+        validation_ledger=[row.to_mapping()],
+        configuration_source_digest=configuration.source.config_digest,
+        scope=scope.to_mapping(),
+        capsule_digest=capsule.digest,
+        capsule_paths=["src/main.py"], capsule_target_key=TARGET.target_key(),
+        **capsule_coverage(capsule),
+    )
+    valid = replace(report, payload=report_payload)
+    validate_report(valid, intent, canonical_intent=intent, trusted_authors=TRUSTED, configuration=configuration, capsule=capsule)
+    altered_body = body.replace("| pending |", "| changed |", 1)
+    altered = replace(valid, payload={**report_payload, "report_body": altered_body, "report_body_sha256": hashlib.sha256(altered_body.encode()).hexdigest()})
+    with pytest.raises(ValueError, match="validation section|ledger"):
+        validate_report(altered, intent, canonical_intent=intent, trusted_authors=TRUSTED, configuration=configuration, capsule=capsule)
+    padded = " " + body
+    padded_report = replace(valid, payload={
+        **report_payload, "report_body": padded,
+        "report_body_sha256": hashlib.sha256(padded.encode()).hexdigest(),
+    })
+    with pytest.raises(ValueError, match="whitespace"):
+        validate_report(padded_report, intent, canonical_intent=intent, trusted_authors=TRUSTED, configuration=configuration, capsule=capsule)
+
+
+def test_pending_ledger_still_allows_static_completion():
+    configuration = _protected_configuration()
+    assert configuration.source is not None
+    intent = _intent()
+    profile = ValidationProfile.from_mapping(configuration.capabilities["profiles"][0])
+    capability = next(item for item in configuration.capabilities["capabilities"] if item["id"] == profile.capability_id)
+    row = ValidationLedgerRow(profile, capability_contract_digest(capability), "representative")
+    capsule = _test_capsule()
+    scope = ReviewScope((row.model_architecture,), row.covered_hardware)
+    body = "## Agentic review\n\nNo findings.\n\n" + render_validation_section([row.to_mapping()], scope=scope)
+    report_payload = dict(_report(intent, body=body).payload)
+    report_payload.update(
+        validation_ledger=[row.to_mapping()],
+        configuration_source_digest=configuration.source.config_digest,
+        scope=scope.to_mapping(),
+        capsule_digest=capsule.digest,
+        capsule_paths=["src/main.py"], capsule_target_key=TARGET.target_key(),
+        **capsule_coverage(capsule),
+    )
+    report = replace(_report(intent, body=body), payload=report_payload)
+    metadata = _metadata(intent, report)
+    completion = _completion(intent, report, metadata)
+    validate_completion(
+        completion, intent, report, metadata, canonical_intent=intent,
+        trusted_authors=TRUSTED, configuration=configuration, capsule=capsule,
+    )

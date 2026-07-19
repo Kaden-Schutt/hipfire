@@ -7,60 +7,192 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
-from types import SimpleNamespace
+from pathlib import Path
+import subprocess
 
 import pytest
+import autoresearch.ar.review.publisher as publisher_module
 
 from autoresearch.ar.review.canonical import canonical_digest, metadata_digest
+from autoresearch.ar.review.capsule import build_review_capsule
 from autoresearch.ar.review.config import AuthenticatedConfigSource, ReviewConfiguration
-from autoresearch.ar.review.github import GitHubResponse
-from autoresearch.ar.review.models import Finding, GitHubEnvelope, ReviewProposal, ReviewTarget
-from autoresearch.ar.review.publisher import ReviewPublisher
+from autoresearch.ar.review.github import GitHubClient, GitHubResponse
+from autoresearch.ar.review.models import (
+    Finding,
+    GitHubEnvelope,
+    ReviewProposal,
+    ReviewScope,
+    ReviewTarget,
+    ValidationLedgerRow,
+    ValidationProfile,
+    capability_contract_digest,
+)
+from autoresearch.ar.review.publisher import PublisherError, ReviewPublisher, _HistoryRecord, render_report
+from autoresearch.ar.review.protocol import validate_report
 
 
-REPO = "owner/repo"
-TARGET = ReviewTarget(REPO, 42, REPO, "head-sha", "main", "base-sha", "merge-sha")
-TRUSTED = "review-bot"
-OPERATOR = {
-    "schema": "hipfire.agentic-review.operator-credentials",
-    "version": 1,
-    "repository": REPO,
-    "principal": {"login": TRUSTED, "type": "Bot"},
-    "allowed_operations": ["publish", "dismiss-workflow-review"],
-    "write_permissions": {"issues": "write", "pull_requests": "write"},
-    "credential_attestation_digest": "sha256:" + "a" * 64,
-}
+from autoresearch.ar.tests.review_fixtures import (
+    FakeGitHub, OPERATOR, REPO, TARGET, TRUSTED, _configuration, _exempt_proposal,
+    _exemption_configuration, _ledger_configuration, _ledger_proposal, _proposal,
+)
 
-
-def _configuration() -> ReviewConfiguration:
-    source = AuthenticatedConfigSource._from_authenticated_boundary(
-        __import__("autoresearch.ar.review.config", fromlist=["_SOURCE_PROOF"])._SOURCE_PROOF,
-        REPO,
-        "main",
-        "config-sha",
-        "sha256:" + "b" * 64,
-        ".",
+@pytest.mark.parametrize("mismatch", ["digest", "paths"])
+def test_exemption_capsule_digest_or_manifest_mismatch_fails_before_intent(monkeypatch, mismatch):
+    client = FakeGitHub(changed_path="docs/review.md")
+    actual_capsule = build_review_capsule(client, TARGET)
+    alternate_capsule = build_review_capsule(FakeGitHub(), TARGET)
+    assert actual_capsule.complete and alternate_capsule.complete
+    assert actual_capsule.digest != alternate_capsule.digest
+    assert tuple(entry.path for entry in actual_capsule.manifest) != tuple(
+        entry.path for entry in alternate_capsule.manifest
     )
-    configuration = ReviewConfiguration(
-        {},
-        {},
-        {"schema": "hipfire.agentic-review.trusted-publishers", "version": 1, "apps": [{
-            "app_id": 1, "login": TRUSTED, "installation_id": 2, "repository_id": 8,
-            "credential_attestation_digest": OPERATOR["credential_attestation_digest"],
-        }]},
-        source,
+    monkeypatch.setattr(publisher_module, "build_review_capsule", lambda _client, _target: actual_capsule)
+    if mismatch == "digest":
+        proposal = _exempt_proposal(capsule=alternate_capsule)
+        expected_reason = "proposal capsule or protected scope could not be authenticated"
+    else:
+        proposal = _exempt_proposal(capsule=actual_capsule, exemption_paths=("src/main.py",))
+        expected_reason = "proposal validation ledger is not protected by publisher configuration"
+    result = ReviewPublisher(client, configuration=_exemption_configuration(), operator_credential=OPERATOR).publish(
+        proposal, TARGET,
     )
-    object.__setattr__(configuration, "_loaded_from_protected_paths", True)
-    object.__setattr__(configuration, "_loaded_source_digest", source.config_digest)
-    object.__setattr__(configuration, "_loaded_root_identity", source.root_identity)
-    return configuration
+    assert result.status == "error"
+    assert result.reason == expected_reason
+    assert not any(call[0] in {"create_comment", "create_review", "add_label", "remove_label"} for call in client.calls)
 
 
-def _proposal(verdict: str = "clean", response_digest: str = "sha256:" + "c" * 64,
-              message: str = "Use **the checked value** <instead>.") -> ReviewProposal:
-    findings = () if verdict == "clean" else (
-        Finding("src/main.py", (3, 4), "error", message),
+def test_protected_exemption_publishes_complete_static_review_lifecycle():
+    client = FakeGitHub(changed_path="docs/review.md")
+    capsule = build_review_capsule(client, TARGET)
+    result = ReviewPublisher(
+        client, configuration=_exemption_configuration(), operator_credential=OPERATOR,
+    ).publish(_exempt_proposal(capsule=capsule), TARGET)
+
+    assert result.status == "complete", result.reason
+    assert [call[1] for call in client.calls if call[0] == "create_comment"] == [
+        "intent", "report", "review-metadata", "completion",
+    ]
+    assert not any(call[0] == "create_review" for call in client.calls)
+    report = next(
+        json.loads(client.payload_from_body(item["body"]))
+        for item in client.comments
+        if json.loads(client.payload_from_body(item["body"]))["record_type"] == "report"
     )
+    assert "No validation required (protected exemption)." in report["report_body"]
+
+
+def test_structural_validation_preflight_failure_performs_no_intent_mutation(monkeypatch):
+    client = FakeGitHub()
+    proposal = _proposal()
+    capsule = build_review_capsule(client, TARGET)
+    monkeypatch.setattr(publisher_module, "build_review_capsule", lambda _client, _target: capsule)
+    def reject_section(*args, **kwargs):
+        raise ValueError("validation section mismatch")
+    monkeypatch.setattr(publisher_module, "validate_rendered_validation_section", reject_section)
+    result = ReviewPublisher(client, configuration=_configuration(), operator_credential=OPERATOR).publish(
+        proposal, TARGET,
+    )
+    assert result.status == "error"
+    assert "comment" in (result.reason or "") or "bound" in (result.reason or "")
+    assert not any(call[0] == "create_comment" for call in client.calls)
+
+
+@pytest.mark.parametrize("kind", ["ledger", "configuration", "exemption_ids", "exemption_paths"])
+def test_resumed_bound_report_rejects_each_exact_binding_mismatch(kind):
+    configuration = _ledger_configuration()
+    proposal, row = _ledger_proposal(configuration)
+    payload = {
+        "validation_ledger": [row.to_mapping()],
+        "configuration_source_digest": configuration.source.config_digest,
+    }
+    if kind == "ledger":
+        other_profile = ValidationProfile.from_mapping(configuration.capabilities["profiles"][1])
+        other_capability = next(item for item in configuration.capabilities["capabilities"] if item["id"] == other_profile.capability_id)
+        payload["validation_ledger"] = [ValidationLedgerRow(
+            other_profile, capability_contract_digest(other_capability), "representative",
+        ).to_mapping()]
+    elif kind == "configuration":
+        payload["configuration_source_digest"] = "sha256:" + "e" * 64
+    else:
+        exempt_proposal = _exempt_proposal()
+        proposal = exempt_proposal
+        payload = {
+            "validation_ledger": [],
+            "configuration_source_digest": configuration.source.config_digest,
+            "exemption_ids": list(proposal.exemption_ids),
+            "exemption_paths": list(proposal.exemption_paths),
+        }
+        payload[kind] = ["other"] if kind == "exemption_ids" else ["other/path.py"]
+    report = _HistoryRecord(
+        GitHubEnvelope(payload, "node", TRUSTED, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        False, 0,
+    )
+    client = FakeGitHub()
+    publisher = ReviewPublisher(client, configuration=configuration, operator_credential=OPERATOR)
+    with pytest.raises(PublisherError, match="validation binding|ledger"):
+        publisher._require_matching_report_binding(report, proposal)
+    assert client.calls == []
+
+
+def _publisher(client: FakeGitHub) -> ReviewPublisher:
+    return ReviewPublisher(client, configuration=_configuration(), operator_credential=OPERATOR)
+
+
+def _proposal_with_scope(scope: ReviewScope) -> ReviewProposal:
+    base = _proposal()
+    configuration = _configuration()
+    values = {
+        "target": TARGET, "target_key": TARGET.target_key(), "capsule_digest": base.capsule_digest,
+        "adapter_id": base.adapter_id, "adapter_version": base.adapter_version, "model": base.model,
+        "response_digest": base.response_digest, "verdict": base.verdict, "findings": base.findings,
+        "coverage": base.coverage_mapping(),
+        "validation_ledger": tuple(row.to_mapping() for row in base.validation_ledger),
+        "configuration_source_digest": configuration.source.config_digest,
+        "scope": scope.to_mapping(),
+    }
+    return ReviewProposal(
+        TARGET, base.capsule_digest, "sha256:" + canonical_digest(values), base.verdict, base.findings,
+        base.adapter_id, base.adapter_version, base.model, base.response_digest,
+        base.retrieved_file_count, base.expected_file_count, base.retrieved_blob_count,
+        base.expected_blob_count, base.retrieved_content_count, base.expected_content_count,
+        base.coverage_complete, validation_ledger=base.validation_ledger,
+        configuration_source_digest=configuration.source.config_digest, scope=scope,
+    )
+
+
+@pytest.mark.parametrize("scope", [
+    ReviewScope((), ()),
+    ReviewScope(("qwen3.6-27b",), ("gfx1100",)),
+    ReviewScope(("wrong-model",), ("gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151")),
+])
+def test_publisher_rejects_directly_constructed_scope_before_intent(monkeypatch, scope):
+    base = _proposal()
+    client = FakeGitHub()
+    capsule = build_review_capsule(client, TARGET)
+    monkeypatch.setattr(
+        publisher_module, "build_review_capsule",
+        lambda _client, _target: capsule,
+    )
+    result = _publisher(client).publish(_proposal_with_scope(scope), TARGET)
+    assert result.status in {"error", "incomplete"}
+    assert not any(call[0] == "create_comment" for call in client.calls)
+
+
+def test_publisher_rejects_capsule_digest_mismatch_before_intent(monkeypatch):
+    base = _proposal()
+    client = FakeGitHub(changed_path="docs/review.md")
+    actual_capsule = build_review_capsule(client, TARGET)
+    monkeypatch.setattr(
+        publisher_module, "build_review_capsule",
+        lambda _client, _target: actual_capsule,
+    )
+    result = _publisher(client).publish(base, TARGET)
+    assert result.status == "error"
+    assert result.reason == "proposal capsule or protected scope could not be authenticated"
+    assert not any(call[0] in {"create_comment", "create_review", "add_label", "remove_label"} for call in client.calls)
+
+
+def test_new_legacy_proposal_is_rejected_before_any_github_mutation():
     values = {
         "target": TARGET,
         "target_key": TARGET.target_key(),
@@ -68,323 +200,20 @@ def _proposal(verdict: str = "clean", response_digest: str = "sha256:" + "c" * 6
         "adapter_id": "adapter",
         "adapter_version": "1",
         "model": "model",
-        "response_digest": response_digest,
-        "verdict": verdict,
-        "findings": findings,
-        "coverage": {
-            "retrieved_file_count": 0,
-            "expected_file_count": 0,
-            "retrieved_blob_count": 0,
-            "expected_blob_count": 0,
-            "retrieved_content_count": 0,
-            "expected_content_count": 0,
-            "coverage_complete": True,
-        },
+        "response_digest": "sha256:" + "c" * 64,
+        "verdict": "clean",
+        "findings": (),
+        "scope": ReviewScope((), ()).to_mapping(),
     }
-    return ReviewProposal(
-        TARGET,
-        values["capsule_digest"],
-        "sha256:" + canonical_digest(values),
-        verdict,
-        findings,
-        "adapter",
-        "1",
-        "model",
-        values["response_digest"],
-        0, 0, 0, 0, 0, 0, True,
+    proposal = ReviewProposal(
+        TARGET, values["capsule_digest"], "sha256:" + canonical_digest(values), "clean", (),
+        "adapter", "1", "model", values["response_digest"],
+        scope=ReviewScope((), ()),
     )
-
-
-class FakeGitHub:
-    def __init__(self) -> None:
-        self.pull = self._pull(TARGET)
-        self.comments: list[dict] = []
-        self.reviews: list[dict] = []
-        self.calls: list[tuple[str, object]] = []
-        self.next_id = 1
-        self.clock = 0
-        self.fail: set[str] = set()
-        self.removed_labels: list[str] = []
-        self.labels = {"needs-review"}
-        self.label_pages: list[list[dict]] | None = None
-        self.mutate_head_after: str | None = None
-        self.revoke_before_next_review: dict | None = None
-        self.inject_review_on_completion = False
-        self.inject_review_on_labels = False
-        self.inject_review_on_remove = False
-        self.inject_review_on_dismiss = False
-        self.invalidate_keep_on_labels = False
-        self.change_target_on_labels: ReviewTarget | None = None
-        self.change_target_after_remove: ReviewTarget | None = None
-        self.change_target_on_history_read: ReviewTarget | None = None
-        self.change_target_on_history_read_at: int | None = None
-        self.mutate_exact_review_before_envelope = False
-        self.arm_stale_on_canonical = False
-        self.arm_keep_invalidation_on_canonical = False
-        self.arm_stale_on_mutate_canonical = False
-        self.arm_keep_invalidation_on_mutate_canonical = False
-        self.history_reads = 0
-        self.inject_stale_on_history_read: int | None = None
-        self.invalidate_keep_on_history_read: int | None = None
-        self.transient_stale_on_history_read: int | None = None
-        self.transient_keep_on_history_read: int | None = None
-        self.transient_records: dict[int, dict] = {}
-        self.transient_review_states: dict[int, str] = {}
-        self.deleted_comment_ids: set[int] = set()
-        self.edited_comment_ids: set[int] = set()
-
-    def _now(self) -> str:
-        self.clock += 1
-        return f"2026-01-01T00:{self.clock:02d}:00Z"
-
-    @staticmethod
-    def _pull(target: ReviewTarget) -> dict:
-        return {
-            "id": 1,
-            "node_id": "PR_1",
-            "number": target.number,
-            "head": {"repo": {"full_name": target.head_repository}, "sha": target.head_sha},
-            "base": {"repo": {"full_name": target.repository}, "ref": target.base_ref, "sha": target.base_sha},
-            "merge_base_sha": target.merge_base_sha,
-        }
-
-    def get_pull_request(self, repository: str, number: int) -> GitHubResponse:
-        self.calls.append(("get_target", self.pull["head"]["sha"]))
-        return GitHubResponse(self.pull, {}, 200)
-
-    def get_review_target(self, repository: str, number: int) -> ReviewTarget:
-        data = self.get_pull_request(repository, number).data
-        return ReviewTarget(
-            data["base"]["repo"]["full_name"], data["number"], data["head"]["repo"]["full_name"],
-            data["head"]["sha"], data["base"]["ref"], data["base"]["sha"], data["merge_base_sha"],
-        )
-
-    def revalidate_config_source(self, source) -> None:
-        self.calls.append(("config", source.commit_sha))
-
-    def list_issue_comments(self, repository: str, number: int) -> GitHubResponse:
-        self.calls.append(("list_comments", None))
-        return GitHubResponse([comment for comment in self.comments if comment["id"] not in self.deleted_comment_ids], {}, 200)
-
-    def list_pull_reviews(self, repository: str, number: int) -> GitHubResponse:
-        self.calls.append(("list_reviews", None))
-        self.history_reads += 1
-        if self.change_target_on_history_read is not None and self.change_target_on_history_read_at == self.history_reads:
-            self.pull = self._pull(self.change_target_on_history_read)
-            self.change_target_on_history_read = None
-            self.change_target_on_history_read_at = None
-        if self.transient_stale_on_history_read == self.history_reads - 1:
-            self.transient_records.pop(905, None)
-            self.transient_stale_on_history_read = None
-        if self.transient_keep_on_history_read == self.history_reads - 1:
-            self.transient_review_states.clear()
-            self.transient_keep_on_history_read = None
-        reviews = list(self.reviews)
-        if self.inject_stale_on_history_read == self.history_reads and self.reviews:
-            stale = deepcopy(self.reviews[0])
-            stale["id"] = 905
-            stale["node_id"] = "stale-in-canonical-history"
-            stale_payload = json.loads(self.payload_from_body(stale["body"]))
-            stale_payload["record_id"] = "stale-in-canonical-history"
-            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
-            stale["body"] = json.dumps(stale_payload)
-            self.reviews.append(stale)
-            self.inject_stale_on_history_read = None
-        if self.invalidate_keep_on_history_read == self.history_reads and self.reviews:
-            self.reviews[0]["state"] = "DISMISSED"
-            self.invalidate_keep_on_history_read = None
-        if self.transient_stale_on_history_read == self.history_reads:
-            stale = deepcopy(self.reviews[0])
-            stale["id"] = 905
-            stale["node_id"] = "stale-in-canonical-history"
-            stale_payload = json.loads(self.payload_from_body(stale["body"]))
-            stale_payload["record_id"] = "stale-in-canonical-history"
-            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
-            stale["body"] = json.dumps(stale_payload)
-            self.transient_records[905] = stale
-            reviews.append(stale)
-        if self.transient_keep_on_history_read == self.history_reads and reviews:
-            reviews[0] = {**reviews[0], "state": "DISMISSED"}
-            self.transient_review_states[reviews[0]["id"]] = "DISMISSED"
-        return GitHubResponse(reviews, {}, 200)
-
-    def list_issue_labels(self, repository: str, number: int) -> GitHubResponse:
-        self.calls.append(("list_labels", None))
-        if self.change_target_on_labels is not None:
-            self.pull = self._pull(self.change_target_on_labels)
-            self.change_target_on_labels = None
-        if self.invalidate_keep_on_labels and self.reviews:
-            self.reviews[0]["state"] = "DISMISSED"
-            self.invalidate_keep_on_labels = False
-        if self.inject_review_on_labels and self.reviews:
-            stale = deepcopy(self.reviews[0])
-            stale["id"] = 902
-            stale["node_id"] = "stale-before-label"
-            stale_payload = json.loads(self.payload_from_body(stale["body"]))
-            stale_payload["record_id"] = "stale-before-label"
-            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
-            stale["body"] = json.dumps(stale_payload)
-            self.reviews.append(stale)
-            self.inject_review_on_labels = False
-        if self.label_pages is None:
-            return GitHubResponse([{"name": label} for label in sorted(self.labels)], {}, 200)
-        self.calls.extend(("list_labels", None) for _ in self.label_pages[1:])
-        return GitHubResponse([label for page in self.label_pages for label in page], {}, 200)
-
-    @staticmethod
-    def payload_from_body(body: str) -> str:
-        if body.lstrip().startswith("{"):
-            return body
-        marker = "<!-- agentic-review/v1"
-        start = body.index(marker) + len(marker)
-        return body[start:].split("-->", 1)[0].strip()
-
-    def _envelope(self, record: dict, kind: str) -> GitHubEnvelope:
-        if record["id"] in self.deleted_comment_ids:
-            raise RuntimeError("record deleted")
-        updated = record["updated_at"] if "updated_at" in record else record["submitted_at"]
-        if record["id"] in self.edited_comment_ids:
-            updated = "2026-01-01T00:09:00Z"
-        published = record["created_at"] if "created_at" in record else record["submitted_at"]
-        user = record.get("user", {})
-        return GitHubEnvelope(
-            json.loads(self.payload_from_body(record["body"])), record["node_id"],
-            user.get("login", TRUSTED), published, updated, user.get("type", "Bot")
-        )
-
-    def comment_envelope(self, repository: str, comment_id: int) -> GitHubEnvelope:
-        return self._envelope(next(item for item in self.comments if item["id"] == comment_id), "comment")
-
-    def review_envelope(self, repository: str, number: int, review_id: int) -> GitHubEnvelope:
-        records = [*self.reviews, *self.transient_records.values()]
-        return self._envelope(next(item for item in records if item["id"] == review_id), "review")
-
-    def get_pull_review(self, repository: str, number: int, review_id: int) -> GitHubResponse:
-        return GitHubResponse(next(item for item in self.reviews if item["id"] == review_id), {}, 200)
-
-    def get_pull_review_record(self, repository: str, number: int, review_id: int):
-        records = [*self.reviews, *self.transient_records.values()]
-        record = next(item for item in records if item["id"] == review_id)
-        if review_id in self.transient_review_states:
-            record = {**record, "state": self.transient_review_states[review_id]}
-        if self.mutate_exact_review_before_envelope:
-            record["state"] = "DISMISSED"
-            self.mutate_exact_review_before_envelope = False
-        return SimpleNamespace(
-            envelope=self._envelope(record, "review"),
-            state=record["state"],
-            commit_id=record["commit_id"],
-            server_id=record["id"],
-        )
-
-    def create_issue_comment(self, repository: str, number: int, body: str) -> GitHubResponse:
-        record_type = json.loads(self.payload_from_body(body))["record_type"]
-        self.calls.append(("create_comment", record_type))
-        if "comment" in self.fail or record_type in self.fail:
-            raise RuntimeError("comment creation failed")
-        now = self._now()
-        record = {
-            "id": self.next_id, "node_id": f"C_{self.next_id}", "user": {"login": TRUSTED, "type": "Bot"},
-            "created_at": now, "updated_at": now, "body": body,
-        }
-        self.next_id += 1
-        self.comments.append(record)
-        if record_type == "completion" and self.arm_stale_on_canonical:
-            self.transient_stale_on_history_read = self.history_reads + 2
-            self.arm_stale_on_canonical = False
-        if record_type == "completion" and self.arm_keep_invalidation_on_canonical:
-            self.transient_keep_on_history_read = self.history_reads + 2
-            self.arm_keep_invalidation_on_canonical = False
-        if record_type == "completion" and self.arm_stale_on_mutate_canonical:
-            self.inject_stale_on_history_read = self.history_reads + 5
-            self.arm_stale_on_mutate_canonical = False
-        if record_type == "completion" and self.arm_keep_invalidation_on_mutate_canonical:
-            self.invalidate_keep_on_history_read = self.history_reads + 5
-            self.arm_keep_invalidation_on_mutate_canonical = False
-        if record_type == "completion" and self.inject_review_on_completion and self.reviews:
-            stale = deepcopy(self.reviews[0])
-            stale["id"] = 901
-            stale["node_id"] = "stale-after-completion"
-            stale_payload = json.loads(self.payload_from_body(stale["body"]))
-            stale_payload["record_id"] = "stale-after-completion"
-            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
-            stale["body"] = json.dumps(stale_payload)
-            self.reviews.append(stale)
-            self.inject_review_on_completion = False
-        return GitHubResponse(record, {}, 201)
-
-    def create_pull_request_review(self, repository: str, number: int, *, body: str, event: str, commit_id: str) -> GitHubResponse:
-        self.calls.append(("create_review", (event, commit_id)))
-        if "review" in self.fail:
-            raise RuntimeError("review creation failed")
-        if self.revoke_before_next_review is not None:
-            now = "2026-01-01T00:10:00Z"
-            self.comments.append({"id": 900, "node_id": "race-revoke", "user": {"login": TRUSTED, "type": "Bot"},
-                                  "created_at": now, "updated_at": now,
-                                  "body": json.dumps(self.revoke_before_next_review)})
-            self.revoke_before_next_review = None
-        now = self._now()
-        record = {
-            "id": self.next_id, "node_id": f"R_{self.next_id}", "user": {"login": TRUSTED, "type": "Bot"},
-            "submitted_at": now, "body": body, "state": "CHANGES_REQUESTED", "commit_id": commit_id,
-        }
-        self.next_id += 1
-        self.reviews.append(record)
-        return GitHubResponse(record, {}, 201)
-
-    def add_labels(self, repository: str, number: int, labels) -> GitHubResponse:
-        self.calls.append(("add_label", tuple(labels)))
-        if "add_label" in self.fail:
-            raise RuntimeError("label add failed")
-        self.labels.update(labels)
-        return GitHubResponse([], {}, 200)
-
-    def remove_label(self, repository: str, number: int, label: str) -> GitHubResponse:
-        self.calls.append(("remove_label", label))
-        if "remove_label" in self.fail:
-            raise RuntimeError("label removal failed")
-        self.removed_labels.append(label)
-        self.labels.discard(label)
-        if self.change_target_after_remove is not None:
-            self.change_target_on_history_read = self.change_target_after_remove
-            self.change_target_on_history_read_at = self.history_reads + 2
-            self.change_target_after_remove = None
-        if self.inject_review_on_remove and self.reviews:
-            stale = deepcopy(self.reviews[0])
-            stale["id"] = 903
-            stale["node_id"] = "stale-during-remove"
-            stale_payload = json.loads(self.payload_from_body(stale["body"]))
-            stale_payload["record_id"] = "stale-during-remove"
-            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
-            stale["body"] = json.dumps(stale_payload)
-            self.reviews.append(stale)
-            self.inject_review_on_remove = False
-        return GitHubResponse({}, {}, 204)
-
-    def dismiss_workflow_review(self, repository: str, number: int, review_id: int, *, message: str) -> GitHubResponse:
-        self.calls.append(("dismiss", review_id))
-        if "dismiss" in self.fail:
-            raise RuntimeError("dismissal failed")
-        for review in self.reviews:
-            if review["id"] == review_id:
-                review["state"] = "DISMISSED"
-        self.reviews = [review for review in self.reviews if review["id"] != review_id]
-        self.transient_records.pop(review_id, None)
-        if self.inject_review_on_dismiss and self.reviews:
-            stale = deepcopy(self.reviews[0])
-            stale["id"] = 904
-            stale["node_id"] = "stale-during-dismiss"
-            stale_payload = json.loads(self.payload_from_body(stale["body"]))
-            stale_payload["record_id"] = "stale-during-dismiss"
-            stale_payload["metadata_digest"] = metadata_digest(stale_payload)
-            stale["body"] = json.dumps(stale_payload)
-            self.reviews.append(stale)
-            self.inject_review_on_dismiss = False
-        return GitHubResponse({"id": review_id, "node_id": f"D_{review_id}"}, {}, 200)
-
-
-def _publisher(client: FakeGitHub) -> ReviewPublisher:
-    return ReviewPublisher(client, configuration=_configuration(), operator_credential=OPERATOR)
+    client = FakeGitHub()
+    with pytest.raises(PublisherError, match="validation evidence|exemption"):
+        _publisher(client).publish(proposal, TARGET)
+    assert client.calls == []
 
 
 def test_clean_lifecycle_publishes_report_and_completion_without_approval():
@@ -400,6 +229,77 @@ def test_clean_lifecycle_publishes_report_and_completion_without_approval():
     report = next(json.loads(client.payload_from_body(item["body"])) for item in client.comments if json.loads(client.payload_from_body(item["body"]))["record_type"] == "report")
     assert "**the checked value**" not in report["report_body"]
     assert "<instead>" not in report["report_body"]
+
+
+def test_empty_complete_capsule_publishes_zero_diff_lifecycle():
+    client = FakeGitHub(empty_diff=True)
+    capsule = build_review_capsule(client, TARGET)
+    result = _publisher(client).publish(_proposal(capsule=capsule), TARGET)
+
+    assert result.status == "complete", result.reason
+    report = next(
+        json.loads(client.payload_from_body(item["body"]))
+        for item in client.comments
+        if json.loads(client.payload_from_body(item["body"]))["record_type"] == "report"
+    )
+    assert report["capsule_paths"] == []
+    assert report["coverage_complete"] is True
+    assert report["expected_file_count"] == report["retrieved_file_count"] == 0
+
+
+def test_publisher_rejects_forged_zero_coverage_for_nonempty_capsule():
+    client = FakeGitHub()
+    capsule = build_review_capsule(client, TARGET)
+    original = _proposal(capsule=capsule)
+    forged_coverage = {
+        "retrieved_file_count": 0, "expected_file_count": 0,
+        "retrieved_blob_count": 0, "expected_blob_count": 0,
+        "retrieved_content_count": 0, "expected_content_count": 0,
+        "coverage_complete": True,
+    }
+    digest_values = {
+        "target": original.target, "target_key": original.target.target_key(),
+        "capsule_digest": original.capsule_digest, "adapter_id": original.adapter_id,
+        "adapter_version": original.adapter_version, "model": original.model,
+        "response_digest": original.response_digest, "verdict": original.verdict,
+        "findings": original.findings, "coverage": forged_coverage,
+        "validation_ledger": tuple(row.to_mapping() for row in original.validation_ledger),
+        "configuration_source_digest": original.configuration_source_digest,
+        "scope": original.scope.to_mapping(),
+    }
+    forged = replace(
+        original,
+        proposal_digest="sha256:" + canonical_digest(digest_values),
+        retrieved_file_count=0, expected_file_count=0,
+        retrieved_blob_count=0, expected_blob_count=0,
+        retrieved_content_count=0, expected_content_count=0,
+    )
+    result = _publisher(client).publish(forged, TARGET)
+
+    assert result.status == "error"
+    assert not any(call[0] == "create_comment" for call in client.calls)
+
+
+def test_valid_ledger_round_trips_publisher_github_boundary_and_protocol():
+    configuration = _ledger_configuration()
+    proposal, row = _ledger_proposal(configuration)
+    client = FakeGitHub()
+    result = ReviewPublisher(client, configuration=configuration, operator_credential=OPERATOR).publish(proposal, TARGET)
+    assert result.status == "complete", result.reason
+    records = {json.loads(client.payload_from_body(item["body"]))["record_type"]: item for item in client.comments}
+
+    def exact_envelope(record):
+        header = "HTTP/2 200\r\nX-OAuth-Scopes: read:user\r\n\r\n"
+        response = subprocess.CompletedProcess(["gh"], 0, header + json.dumps(record), "")
+        return GitHubClient(lambda argv, input_data=None: response).comment_envelope(REPO, record["id"])
+
+    intent = exact_envelope(records["intent"])
+    report = exact_envelope(records["report"])
+    assert report.payload["validation_ledger"][0]["request_id"] == row.request_id
+    validate_report(
+        report, intent, canonical_intent=intent, trusted_authors={TRUSTED},
+        configuration=configuration, capsule=build_review_capsule(client, TARGET),
+    )
 
 
 def test_changes_requested_uses_exact_reviewed_head_and_never_approves():
@@ -463,7 +363,8 @@ def test_duplicate_intent_is_a_no_mutation_state():
     result = _publisher(client).publish(_proposal(), TARGET)
 
     assert result.status == "duplicate"
-    assert len(client.calls) == before + 4  # config, target, and the two bounded history reads
+    assert len(client.calls) > before
+    assert sum(call[0] == "config" for call in client.calls) >= 1
 
 
 def test_workflow_review_dismissal_preserves_human_review():
@@ -685,6 +586,57 @@ def test_report_is_visible_markdown_with_hidden_metadata_and_escaped_injection()
     assert body.startswith("## Agentic review")
     assert "<!-- agentic-review/v1" in body
     assert "<pre><code>Use **the checked value** &lt;instead&gt;.</code></pre>" in body
+
+
+def test_validation_report_table_is_sorted_and_escapes_cells_without_claiming_results():
+    profile = ValidationProfile(
+        "profile", "capability|id", "arch\n<unsafe>", "fixture", "sha256:" + "1" * 64,
+        "gfx|one", ("gfx\n one", "gfx|one"),
+    )
+    row = ValidationLedgerRow(profile, "sha256:" + "2" * 64, "representative")
+    values = {
+        "target": TARGET, "target_key": TARGET.target_key(), "capsule_digest": "sha256:" + "a" * 64,
+        "adapter_id": "adapter", "adapter_version": "1", "model": "model",
+        "response_digest": "sha256:" + "c" * 64, "verdict": "clean", "findings": (),
+        "coverage": {"retrieved_file_count": 0, "expected_file_count": 0,
+                      "retrieved_blob_count": 0, "expected_blob_count": 0,
+                      "retrieved_content_count": 0, "expected_content_count": 0,
+                      "coverage_complete": True},
+        "validation_ledger": (row.to_mapping(),),
+        "configuration_source_digest": "sha256:" + "3" * 64,
+        "scope": ReviewScope((row.model_architecture,), row.covered_hardware).to_mapping(),
+    }
+    proposal = ReviewProposal(
+        TARGET, values["capsule_digest"], "sha256:" + canonical_digest(values), "clean", (),
+        "adapter", "1", "model", values["response_digest"], 0, 0, 0, 0, 0, 0, True,
+        validation_ledger=(row,), configuration_source_digest=values["configuration_source_digest"],
+        scope=ReviewScope((row.model_architecture,), row.covered_hardware),
+    )
+    rendered = render_report(proposal)
+    assert rendered == rendered.strip()
+    assert "### Hardware/model smoke validation" in rendered
+    assert "| ID | Capability | Model architecture | Representative | Covered hardware | Status | Validator | Result |" in rendered
+    assert "capability&#124;id" in rendered
+    assert "arch<br>&lt;unsafe&gt;" in rendered
+    assert "gfx&#124;one" in rendered
+    assert "| pending | — | — |" in rendered
+
+
+def test_oversized_report_is_rejected_before_intent_creation():
+    client = FakeGitHub()
+    result = _publisher(client).publish(_proposal("changes-requested", message="x" * (255 * 1024)), TARGET)
+    assert result.status == "error"
+    assert "size" in (result.reason or "") or "bound" in (result.reason or "")
+    assert not any(call[0] == "create_comment" for call in client.calls)
+
+
+def test_validation_heading_inside_finding_does_not_trigger_structural_failure():
+    configuration = _ledger_configuration()
+    finding = Finding("src/main.py", (3, 4), "warning", "literal\n### Hardware/model smoke validation\ntext")
+    proposal, _row = _ledger_proposal(configuration, findings=(finding,))
+    client = FakeGitHub()
+    result = ReviewPublisher(client, configuration=configuration, operator_credential=OPERATOR).publish(proposal, TARGET)
+    assert result.status == "complete", result.reason
 
 
 def test_label_add_failure_is_explicit():

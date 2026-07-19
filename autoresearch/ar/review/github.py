@@ -26,7 +26,19 @@ from .config import (
     configuration_source_digest,
     validate_operator_credential_manifest,
 )
-from .models import GitHubEnvelope, IntentPayload, ReviewTarget, validate_trusted_publishers_policy
+from .models import (
+    GitHubEnvelope,
+    IntentPayload,
+    ReviewTarget,
+    ReviewScope,
+    ValidationLedgerRow,
+    validate_trusted_publishers_policy,
+)
+from .validation import (
+    MAX_VALIDATION_FIELD_BYTES,
+    validate_ledger_payload_shape,
+    validate_rendered_validation_section,
+)
 
 
 class GitHubBoundaryError(RuntimeError):
@@ -174,6 +186,9 @@ _MAX_PAGINATED_ITEMS = 4096
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_STDERR_BYTES = 1 << 20
 _MAX_REQUEST_BYTES = 1 << 20
+_MAX_RENDERED_REPORT_BYTES = 256 * 1024
+_MAX_ENCODED_COMMENT_BYTES = 65_536
+_MAX_NODE_ID_BYTES = 128
 _MAX_TREE_ENTRIES = 65536
 _PAGE_SIZE = 100
 _PROBE_PAGE_SIZE = 1
@@ -232,31 +247,63 @@ _LIST_PATHS = {pattern.pattern for _, pattern, paginated in _ENDPOINTS if pagina
 _PRINCIPAL_TYPES = {"User", "Bot", "Organization"}
 _PERMISSIONS = ("admin", "maintain", "push", "triage", "pull")
 _PROTOCOL_COMMENT_MARKER = "<!-- agentic-review/v1\n"
+_VALIDATION_FIELDS = {"validation_ledger", "configuration_source_digest"}
+_EXEMPTION_FIELDS = {"exemption_ids", "exemption_paths"}
+_SCOPE_FIELDS = {"scope"}
+_CAPSULE_FIELDS = {"capsule_digest", "capsule_paths", "capsule_target_key"}
 
 
 def encode_protocol_body(payload: Mapping[str, Any], *, visible_body: str | None = None) -> str:
+    if payload.get("record_type") == "report" and "validation_ledger" in payload and visible_body is None:
+        raise GitHubBoundaryError("ledger-bearing reports require a visible protocol body")
     encoded = canonical_json(payload).decode("utf-8")
     if visible_body is None:
-        return encoded
-    if not isinstance(visible_body, str) or not visible_body.strip():
-        raise GitHubBoundaryError("visible protocol body must be non-empty")
-    return f"{visible_body.rstrip()}\n\n{_PROTOCOL_COMMENT_MARKER}{encoded}\n-->"
+        result = encoded
+    else:
+        if not isinstance(visible_body, str) or not visible_body:
+            raise GitHubBoundaryError("visible protocol body must be non-empty")
+        if payload.get("record_type") == "report" and payload.get("report_body") != visible_body:
+            raise GitHubBoundaryError("visible protocol body does not match report_body")
+        result = f"{visible_body}\n\n{_PROTOCOL_COMMENT_MARKER}{encoded}\n-->"
+    if len(result.encode("utf-8")) > _MAX_ENCODED_COMMENT_BYTES:
+        raise GitHubBoundaryError("encoded protocol comment exceeds 65,536 UTF-8 bytes")
+    return result
 
 
 def decode_protocol_body(body: str) -> Mapping[str, Any]:
-    if not isinstance(body, str) or not body.strip():
+    if not isinstance(body, str) or not body:
         raise GitHubBoundaryError("protocol body is empty")
-    raw = body.strip()
-    if raw.startswith("{"):
-        decoded = canonical_loads(raw.encode("utf-8"))
+    if len(body.encode("utf-8")) > _MAX_ENCODED_COMMENT_BYTES:
+        raise GitHubBoundaryError("encoded protocol comment exceeds 65,536 UTF-8 bytes")
+    visible_body: str | None = None
+    marker_position = body.rfind(_PROTOCOL_COMMENT_MARKER)
+    has_metadata = (
+        marker_position >= 2
+        and body.endswith("-->")
+        and body[marker_position - 2:marker_position] == "\n\n"
+    )
+    if not has_metadata and body.startswith("{"):
+        decoded = canonical_loads(body.encode("utf-8"))
     else:
-        prefix = raw.rfind(_PROTOCOL_COMMENT_MARKER)
-        if prefix < 0 or not raw.endswith("-->"):
+        prefix = marker_position
+        if prefix < 2 or body[:prefix].endswith(_PROTOCOL_COMMENT_MARKER) or not body.endswith("-->"):
             raise GitHubBoundaryError("protocol metadata block is missing")
-        encoded = raw[prefix + len(_PROTOCOL_COMMENT_MARKER):-3].strip()
+        if body[prefix - 2:prefix] != "\n\n":
+            raise GitHubBoundaryError("protocol visible prefix is malformed")
+        visible_body = body[:prefix - 2]
+        encoded_block = body[prefix + len(_PROTOCOL_COMMENT_MARKER):-3]
+        if not encoded_block.endswith("\n"):
+            raise GitHubBoundaryError("protocol metadata block has unexpected whitespace")
+        encoded = encoded_block[:-1]
+        if not encoded or encoded != encoded.strip():
+            raise GitHubBoundaryError("protocol metadata block has unexpected whitespace")
         decoded = canonical_loads(encoded.encode("utf-8"))
     if not isinstance(decoded, Mapping):
         raise GitHubBoundaryError("protocol body is not an object")
+    if decoded.get("record_type") == "report" and "validation_ledger" in decoded and visible_body is None:
+        raise GitHubBoundaryError("ledger-bearing reports require a visible protocol body")
+    if visible_body is not None and decoded.get("record_type") == "report" and decoded.get("report_body") != visible_body:
+        raise GitHubBoundaryError("visible protocol prefix does not match report_body")
     return decoded
 
 
@@ -313,12 +360,50 @@ def _safe_path(path: str) -> bool:
     )
 
 
-def _validate_protocol_payload(payload: Mapping[str, Any]) -> None:
+def _validate_protocol_payload(payload: Mapping[str, Any], *, report_body: str | None = None) -> None:
     record_type = payload.get("record_type")
     schema = payload.get("schema")
     if schema not in _PROTOCOL_SCHEMAS or record_type not in _PROTOCOL_RECORD_TYPES:
         raise ValueError("protocol body has an invalid schema or record type")
     expected_fields = set(_PROTOCOL_FIELDS[record_type])
+    validation_fields = {"validation_ledger", "configuration_source_digest"} & set(payload)
+    exemption_fields = _EXEMPTION_FIELDS & set(payload)
+    scope_fields = _SCOPE_FIELDS & set(payload)
+    if validation_fields and validation_fields != {"validation_ledger", "configuration_source_digest"}:
+        raise ValueError("protocol validation binding is incomplete")
+    if exemption_fields and exemption_fields != _EXEMPTION_FIELDS:
+        raise ValueError("protocol exemption evidence is incomplete")
+    if exemption_fields and validation_fields != _VALIDATION_FIELDS:
+        raise ValueError("protocol exemption evidence lacks validation binding")
+    if record_type != "report" and validation_fields:
+        raise ValueError("validation ledger is only valid on report records")
+    if record_type != "report" and exemption_fields:
+        raise ValueError("exemption evidence is only valid on report records")
+    if record_type != "report" and scope_fields:
+        raise ValueError("review scope is only valid on report records")
+    if record_type == "report":
+        expected_fields |= validation_fields | exemption_fields | scope_fields
+        if scope_fields and not validation_fields:
+            raise ValueError("scope-bearing reports require an authenticated capsule")
+        if validation_fields and not scope_fields:
+            raise ValueError("protocol validation report is missing review scope")
+        if validation_fields:
+            expected_fields |= _CAPSULE_FIELDS
+        if scope_fields:
+            try:
+                ReviewScope.from_mapping(payload["scope"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("protocol review scope is malformed") from exc
+        if validation_fields:
+            if (
+                not isinstance(payload.get("capsule_digest"), str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", payload["capsule_digest"])
+                or payload.get("capsule_target_key") != payload.get("target_key")
+                or not isinstance(payload.get("capsule_paths"), list)
+                or tuple(payload["capsule_paths"]) != tuple(sorted(set(payload["capsule_paths"])))
+                or any(not isinstance(path, str) for path in payload["capsule_paths"])
+            ):
+                raise ValueError("protocol capsule binding is malformed")
     if _COVERAGE_FIELDS & set(payload) and record_type in {"report", "review-metadata", "completion"}:
         expected_fields |= _COVERAGE_FIELDS
     if _APP_FIELDS & set(payload):
@@ -331,9 +416,44 @@ def _validate_protocol_payload(payload: Mapping[str, Any]) -> None:
         IntentPayload.from_mapping(payload)
     elif record_type == "report":
         body = payload["report_body"]
+        if (
+            not isinstance(body, str)
+            or (validation_fields and body != body.strip())
+            or len(body.encode("utf-8")) > _MAX_RENDERED_REPORT_BYTES
+        ):
+            raise ValueError("protocol rendered report exceeds 256 KiB")
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest() if isinstance(body, str) else ""
         if payload["report_body_sha256"] not in {digest, "sha256:" + digest}:
             raise ValueError("protocol report body digest does not match")
+        if validation_fields:
+            ledger = payload["validation_ledger"]
+            try:
+                rows = validate_ledger_payload_shape(ledger)
+                for item in rows:
+                    row = ValidationLedgerRow.from_mapping(item)
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise ValueError("protocol validation ledger is malformed") from exc
+            if not isinstance(payload["configuration_source_digest"], str) or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", payload["configuration_source_digest"]
+            ):
+                raise ValueError("protocol configuration source digest is malformed")
+            if exemption_fields:
+                if payload["validation_ledger"] != [] or not isinstance(payload["exemption_ids"], list) \
+                        or not isinstance(payload["exemption_paths"], list):
+                    raise ValueError("protocol exemption evidence is malformed")
+                if not payload["exemption_paths"] or any(
+                    not isinstance(path, str) or len(path.encode("utf-8")) > MAX_VALIDATION_FIELD_BYTES
+                    for path in payload["exemption_paths"]
+                ) or not payload["exemption_ids"] or any(
+                    not isinstance(item, str) or len(item.encode("utf-8")) > MAX_VALIDATION_FIELD_BYTES
+                    for item in payload["exemption_ids"]
+                ) or tuple(payload["exemption_ids"]) != tuple(sorted(set(payload["exemption_ids"]))):
+                    raise ValueError("protocol exemption evidence exceeds bounds")
+            if report_body is not None:
+                validate_rendered_validation_section(
+                    report_body, payload["validation_ledger"], exempt=bool(exemption_fields),
+                    scope=payload.get("scope"),
+                )
     elif record_type == "review-metadata" and payload["metadata_digest"] != metadata_digest(payload):
         raise ValueError("protocol metadata digest does not match")
     else:
@@ -1103,6 +1223,8 @@ class GitHubClient:
             or author["type"] not in _PRINCIPAL_TYPES
         ):
             raise GitHubBoundaryError("authenticated author has unsupported principal type")
+        if len(record["node_id"].encode("utf-8")) > _MAX_NODE_ID_BYTES:
+            raise GitHubBoundaryError("GitHub node ID exceeds the fixed size bound")
         if record_kind == "comment" and record["updated_at"] != record["created_at"]:
             raise GitHubBoundaryError("edited GitHub record is not admissible")
         if record_kind == "review" and record["state"] == "PENDING":
@@ -1112,7 +1234,10 @@ class GitHubClient:
             raise GitHubBoundaryError(f"GitHub {record_name} body is missing")
         try:
             payload = decode_protocol_body(body)
-            _validate_protocol_payload(payload)
+            _validate_protocol_payload(
+                payload,
+                report_body=payload.get("report_body") if payload.get("record_type") == "report" else None,
+            )
         except (GitHubBoundaryError, TypeError, ValueError, RecursionError) as exc:
             raise GitHubBoundaryError(f"GitHub {record_name} body is not a valid protocol payload") from exc
         publication_time = record["created_at"] if record_kind == "comment" else record["submitted_at"]

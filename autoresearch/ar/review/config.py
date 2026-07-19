@@ -52,6 +52,11 @@ def _root_identity(root: str | Path) -> str:
 
 
 def configuration_source_digest(*contents: bytes) -> str:
+    """Digest the complete protected policy files in fixed repository order.
+
+    The capabilities argument is the raw, complete ``capabilities-v1.json``
+    byte stream; callers must not digest a parsed or field-filtered policy.
+    """
     digest = hashlib.sha256()
     for content in contents:
         if not isinstance(content, bytes):

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from .config import ReviewConfiguration, validate_operator_credential_manifest
+from .capsule import ReviewCapsule, build_review_capsule, capsule_coverage
 from .github import GitHubBoundaryError, decode_protocol_body
 from .models import GitHubEnvelope, ReviewTarget, validate_trusted_publishers_policy
 from .protocol import validate_protocol
@@ -286,7 +287,7 @@ def _target_from_record(record: _Record) -> ReviewTarget | None:
 
 
 def _current_completion(
-    records: Sequence[_Record], target: ReviewTarget, trust: _TrustContext
+    records: Sequence[_Record], target: ReviewTarget, trust: _TrustContext, capsule: Any = None,
 ) -> tuple[_Record, _Record, GitHubEnvelope] | str:
     current = []
     for record in records:
@@ -300,13 +301,25 @@ def _current_completion(
     if not current:
         return "no complete current-target history"
     try:
+        if isinstance(capsule, ReviewCapsule) and capsule.complete:
+            expected_coverage = capsule_coverage(capsule)
+            for record in current:
+                if record.envelope.payload.get("record_type") in {"report", "review-metadata", "completion"}:
+                    actual_coverage = {
+                        key: record.envelope.payload.get(key) for key in expected_coverage
+                    }
+                    if actual_coverage != expected_coverage:
+                        raise ValueError("history coverage does not match authenticated capsule")
         canonical = cast(
             GitHubEnvelope,
             validate_protocol(
-                [record.envelope for record in current], expected_target=target, trusted_authors=trust.authors
+                [record.envelope for record in current], expected_target=target,
+                trusted_authors=trust.authors, configuration=trust.configuration, capsule=capsule,
             ),
         )
     except Exception as exc:
+        # A changed authenticated configuration source deliberately
+        # invalidates ledger-bearing history; leave needs-review set.
         return _reason(f"current review history is incomplete or invalid: {exc}")
     attempt_id = canonical.payload.get("attempt_id")
     completion = next(
@@ -350,6 +363,9 @@ def discover_pull_requests(
     """
     try:
         trust = _trust(client, repository, configuration, operator_credential)
+        if configuration.source is None or not configuration.source.authenticated:
+            raise ValueError("discovery requires an authenticated configuration source")
+        client.revalidate_config_source(configuration.source)
     except Exception as exc:
         item = DiscoveryItem(0, _reason(f"incomplete scan: {exc}"))
         return DiscoverySummary(incomplete=(item,), errors=(item,))
@@ -384,8 +400,27 @@ def discover_pull_requests(
             completion = None
             metadata = None
             canonical = None
+            capsule = None
             if reason is None:
-                result = _current_completion(records, target, trust)
+                # This is the acceptance boundary: history is only accepted
+                # against the authenticated default-branch configuration that
+                # is live at this instant.
+                if configuration.source is None:
+                    raise GitHubBoundaryError("authenticated configuration source is missing")
+                client.revalidate_config_source(configuration.source)
+                ledger_history = any(
+                    record.envelope.payload.get("record_type") == "report"
+                    and "validation_ledger" in record.envelope.payload
+                    for record in records
+                )
+                if ledger_history:
+                    capsule = build_review_capsule(client, target)
+                    if not isinstance(capsule, ReviewCapsule) or not capsule.complete or capsule.target != target:
+                        raise GitHubBoundaryError("current review capsule is incomplete or target-mismatched")
+                    # Close the source race between the first history read and
+                    # accepting the capsule-bound ledger history.
+                    client.revalidate_config_source(configuration.source)
+                result = _current_completion(records, target, trust, capsule)
                 if isinstance(result, str):
                     reason = result
                 else:
@@ -398,7 +433,7 @@ def discover_pull_requests(
                         client, configuration=configuration, operator_credential=operator_credential,
                         trusted_authors=trust.authors,
                         author_authorizer=trust.authorize_publisher,
-                    ).reconcile_discovery(target)
+                    ).reconcile_discovery(target, capsule=capsule)
                     if labelled_now:
                         labelled.append(item)
                 except Exception as exc:
@@ -425,6 +460,7 @@ def discover_pull_requests(
                     intent_node=canonical.node_id,
                     keep_node=metadata.envelope.node_id,
                     keep_is_review=metadata.is_review,
+                    capsule=capsule,
                 )
                 if client.get_review_target(repository, number) != target:
                     raise GitHubBoundaryError("target changed after clean reconciliation")
@@ -434,7 +470,7 @@ def discover_pull_requests(
                         client, configuration=configuration, operator_credential=operator_credential,
                         trusted_authors=trust.authors,
                         author_authorizer=trust.authorize_publisher,
-                    ).reconcile_discovery(target)
+                    ).reconcile_discovery(target, capsule=capsule)
                 except Exception as label_exc:
                     exc = RuntimeError(f"{exc}; label recovery failed: {label_exc}")
                 item = DiscoveryItem(number, _reason(f"clean reconciliation failed: {exc}"))

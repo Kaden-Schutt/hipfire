@@ -3,6 +3,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import fnmatch
 import hashlib
 import json
 import math
@@ -13,6 +14,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .canonical import DEFAULT_MAX_BYTES, canonical_digest, canonical_json
+from .validation import (
+    MAX_VALIDATION_FIELD_BYTES,
+    MAX_VALIDATION_RATIONALE_BYTES,
+    validate_ledger_payload_shape,
+    validate_ledger_row_mapping,
+)
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _RAW_SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -32,7 +39,16 @@ _CAPABILITY_KEYS = frozenset(
         "pass_criteria",
     }
 )
-_CAPABILITY_ROOT_KEYS = frozenset({"schema", "version", "capabilities"})
+_CAPABILITY_ROOT_KEYS = frozenset({"schema", "version", "capabilities", "profiles", "fixtures", "exemptions"})
+_FIXTURE_KEYS = frozenset({
+    "fixture_id", "model_architecture", "artifact_identity", "source_identity",
+    "suite_revision", "digest_semantics", "fixture_digest",
+})
+_PROFILE_KEYS = frozenset({
+    "id", "capability_id", "model_architecture", "fixture_id", "fixture_digest",
+    "representative_hardware", "covered_hardware",
+})
+_EXEMPTION_KEYS = frozenset({"id", "path_globs"})
 _PROVIDER_KEYS = frozenset(
     {
         "id",
@@ -83,6 +99,13 @@ def _require_string_list(name: str, value: Any, *, nonempty: bool = True) -> Non
         raise ValueError(f"{name} must contain non-empty strings")
     if len(value) != len(set(value)):
         raise ValueError(f"{name} must not contain duplicates")
+
+
+def _normalize_rationale(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", value).strip()
+    if len(normalized.encode("utf-8")) > MAX_VALIDATION_RATIONALE_BYTES:
+        raise ValueError("rationale exceeds the maximum length")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -296,6 +319,223 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class ReviewScope:
+    """The exact model/hardware scope selected by the review model."""
+
+    model_architectures: tuple[str, ...]
+    hardware_architectures: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("model_architectures", self.model_architectures),
+            ("hardware_architectures", self.hardware_architectures),
+        ):
+            _require_string_list(name, value, nonempty=False)
+            if tuple(sorted(value)) != value:
+                raise ValueError(f"{name} must be lexicographically ordered")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "model_architectures": list(self.model_architectures),
+            "hardware_architectures": list(self.hardware_architectures),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ReviewScope":
+        if not isinstance(value, Mapping) or set(value) != {"model_architectures", "hardware_architectures"}:
+            raise ValueError("review scope has unexpected or missing keys")
+        model_architectures = value["model_architectures"]
+        hardware_architectures = value["hardware_architectures"]
+        if isinstance(model_architectures, list):
+            model_architectures = tuple(model_architectures)
+        if isinstance(hardware_architectures, list):
+            hardware_architectures = tuple(hardware_architectures)
+        return cls(model_architectures, hardware_architectures)
+
+
+def fixture_descriptor_digest(fixture: Mapping[str, Any]) -> str:
+    """Digest the complete protected fixture descriptor, excluding its digest."""
+    if not isinstance(fixture, Mapping) or frozenset(fixture) != _FIXTURE_KEYS:
+        raise ValueError("fixture has unexpected or missing keys")
+    descriptor = {key: fixture[key] for key in fixture if key != "fixture_digest"}
+    return "sha256:" + hashlib.sha256(canonical_json(descriptor)).hexdigest()
+
+
+@dataclass(frozen=True)
+class ValidationProfile:
+    """Protected validation identity, not provenance for an artifact file.
+
+    ``fixture_digest`` is protected descriptor/artifact provenance only when
+    the authenticated policy has a protected digest source.  It must not be
+    interpreted as proof that fixture bytes were retrieved or executed when
+    no such source is available.
+    """
+
+    id: str
+    capability_id: str
+    model_architecture: str
+    fixture_id: str
+    fixture_digest: str
+    representative_hardware: str
+    covered_hardware: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("id", self.id),
+            ("capability_id", self.capability_id),
+            ("model_architecture", self.model_architecture),
+            ("fixture_id", self.fixture_id),
+            ("representative_hardware", self.representative_hardware),
+        ):
+            _require_text(name, value)
+        _require_digest("fixture_digest", self.fixture_digest)
+        _require_string_list("covered_hardware", self.covered_hardware)
+        if tuple(sorted(self.covered_hardware)) != self.covered_hardware:
+            raise ValueError("covered_hardware must be lexicographically ordered")
+        if self.representative_hardware not in self.covered_hardware:
+            raise ValueError("representative_hardware must be covered")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "capability_id": self.capability_id,
+            "model_architecture": self.model_architecture,
+            "fixture_id": self.fixture_id,
+            "fixture_digest": self.fixture_digest,
+            "representative_hardware": self.representative_hardware,
+            "covered_hardware": list(self.covered_hardware),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ValidationProfile":
+        if not isinstance(value, Mapping):
+            raise ValueError("validation profile must be an object")
+        _require_exact_keys(value, _PROFILE_KEYS, "validation profile")
+        covered = value["covered_hardware"]
+        if isinstance(covered, list):
+            covered = tuple(covered)
+        return cls(
+            id=value["id"],
+            capability_id=value["capability_id"],
+            model_architecture=value["model_architecture"],
+            fixture_id=value["fixture_id"],
+            fixture_digest=value["fixture_digest"],
+            representative_hardware=value["representative_hardware"],
+            covered_hardware=covered,
+        )
+
+
+@dataclass(frozen=True)
+class ProposedValidationObligation:
+    profile_id: str
+    rationale: str
+
+    def __post_init__(self) -> None:
+        _require_text("profile_id", self.profile_id)
+        _require_text("rationale", self.rationale)
+        object.__setattr__(self, "rationale", _normalize_rationale(self.rationale))
+
+
+@dataclass(frozen=True, init=False)
+class ValidationLedgerRow:
+    """Typed, pending validation row serialized into a review proposal."""
+
+    request_id: str
+    profile_snapshot: Mapping[str, Any]
+    profile_digest: str
+    capability_id: str
+    contract_digest: str
+    model_architecture: str
+    fixture_id: str
+    fixture_digest: str
+    representative_hardware: str
+    covered_hardware: tuple[str, ...]
+    coverage_kind: str
+    status: str
+    validator_snapshot: Mapping[str, Any]
+    result_snapshot: Mapping[str, Any]
+    rationales: tuple[str, ...]
+
+    def __init__(
+        self,
+        profile: ValidationProfile,
+        contract_digest: str,
+        coverage_kind: str,
+        obligations: tuple[ProposedValidationObligation, ...] | ProposedValidationObligation = (),
+    ) -> None:
+        if not isinstance(profile, ValidationProfile):
+            raise ValueError("profile must be a ValidationProfile")
+        _require_digest("contract_digest", contract_digest)
+        _require_text("coverage_kind", coverage_kind)
+        if isinstance(obligations, ProposedValidationObligation):
+            obligations = (obligations,)
+        if not isinstance(obligations, tuple) or any(
+            not isinstance(obligation, ProposedValidationObligation) for obligation in obligations
+        ):
+            raise ValueError("obligations must be a tuple of ProposedValidationObligation values")
+        if any(obligation.profile_id != profile.id for obligation in obligations):
+            raise ValueError("obligation profile does not match ledger profile")
+        snapshot = profile.to_mapping()
+        object.__setattr__(self, "request_id", "vr-" + hashlib.sha256(profile.id.encode("utf-8")).hexdigest()[:16])
+        object.__setattr__(self, "profile_snapshot", _freeze_payload(snapshot))
+        object.__setattr__(self, "profile_digest", profile_digest(snapshot))
+        object.__setattr__(self, "capability_id", profile.capability_id)
+        object.__setattr__(self, "contract_digest", contract_digest)
+        object.__setattr__(self, "model_architecture", profile.model_architecture)
+        object.__setattr__(self, "fixture_id", profile.fixture_id)
+        object.__setattr__(self, "fixture_digest", profile.fixture_digest)
+        object.__setattr__(self, "representative_hardware", profile.representative_hardware)
+        object.__setattr__(self, "covered_hardware", profile.covered_hardware)
+        object.__setattr__(self, "coverage_kind", coverage_kind)
+        object.__setattr__(self, "status", "pending")
+        object.__setattr__(self, "validator_snapshot", MappingProxyType({}))
+        object.__setattr__(self, "result_snapshot", MappingProxyType({}))
+        object.__setattr__(self, "rationales", tuple(obligation.rationale for obligation in obligations))
+
+    def to_mapping(self) -> dict[str, Any]:
+        profile_snapshot = dict(self.profile_snapshot)
+        profile_snapshot["covered_hardware"] = list(self.profile_snapshot["covered_hardware"])
+        return {
+            "request_id": self.request_id,
+            "profile_snapshot": profile_snapshot,
+            "profile_digest": self.profile_digest,
+            "capability_id": self.capability_id,
+            "contract_digest": self.contract_digest,
+            "model_architecture": self.model_architecture,
+            "fixture_id": self.fixture_id,
+            "fixture_digest": self.fixture_digest,
+            "representative_hardware": self.representative_hardware,
+            "covered_hardware": list(self.covered_hardware),
+            "coverage_kind": self.coverage_kind,
+            "status": self.status,
+            "validator_snapshot": {},
+            "result_snapshot": {},
+            "rationales": list(self.rationales),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ValidationLedgerRow":
+        validate_ledger_row_mapping(value)
+        profile = ValidationProfile.from_mapping(value["profile_snapshot"])
+        rationales = value["rationales"]
+        row = cls(
+            profile,
+            value["contract_digest"],
+            value["coverage_kind"],
+            tuple(ProposedValidationObligation(profile.id, rationale) for rationale in rationales),
+        )
+        normalized_value = dict(value)
+        normalized_value["covered_hardware"] = list(value["covered_hardware"])
+        normalized_value["rationales"] = list(value["rationales"])
+        profile_snapshot = dict(value["profile_snapshot"])
+        profile_snapshot["covered_hardware"] = list(profile_snapshot["covered_hardware"])
+        normalized_value["profile_snapshot"] = profile_snapshot
+        if row.to_mapping() != normalized_value:
+            raise ValueError("validation ledger row is not canonical")
+        return row
+
+
+@dataclass(frozen=True)
 class ReviewProposal:
     target: ReviewTarget
     capsule_digest: str
@@ -313,6 +553,11 @@ class ReviewProposal:
     retrieved_content_count: int | None = None
     expected_content_count: int | None = None
     coverage_complete: bool | None = None
+    validation_ledger: tuple[ValidationLedgerRow, ...] = ()
+    configuration_source_digest: str | None = None
+    exemption_ids: tuple[str, ...] = ()
+    exemption_paths: tuple[str, ...] = ()
+    scope: ReviewScope | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, ReviewTarget):
@@ -330,6 +575,45 @@ class ReviewProposal:
             raise ValueError("verdict is not supported")
         if not isinstance(self.findings, tuple) or any(not isinstance(finding, Finding) for finding in self.findings):
             raise ValueError("findings must be a tuple of Finding values")
+        if self.scope is not None and not isinstance(self.scope, ReviewScope):
+            raise ValueError("scope must be a ReviewScope")
+        if not isinstance(self.validation_ledger, tuple) or any(
+            not isinstance(row, ValidationLedgerRow) for row in self.validation_ledger
+        ):
+            raise ValueError("validation_ledger must be a tuple of ValidationLedgerRow values")
+        validate_ledger_payload_shape(tuple(row.to_mapping() for row in self.validation_ledger))
+        if not isinstance(self.exemption_paths, tuple) or any(not isinstance(path, str) for path in self.exemption_paths):
+            raise ValueError("exemption_paths must be a tuple of strings")
+        if not isinstance(self.exemption_ids, tuple) or any(not isinstance(item, str) for item in self.exemption_ids):
+            raise ValueError("exemption_ids must be a tuple of strings")
+        if not self.exemption_ids:
+            if self.exemption_paths:
+                raise ValueError("exemption IDs are required for exemption paths")
+        else:
+            if tuple(sorted(set(self.exemption_ids))) != self.exemption_ids:
+                raise ValueError("exemption IDs must be sorted and unique")
+            for exemption_id in self.exemption_ids:
+                _require_text("exemption_id", exemption_id)
+            if not self.exemption_paths:
+                raise ValueError("exemption paths are required for an exemption")
+            normalized_paths = tuple(normalize_repository_path(path) for path in self.exemption_paths)
+            if normalized_paths != self.exemption_paths or normalized_paths != tuple(sorted(set(normalized_paths))):
+                raise ValueError("exemption paths must be normalized, sorted, and unique")
+            if any(len(exemption_id.encode("utf-8")) > MAX_VALIDATION_FIELD_BYTES for exemption_id in self.exemption_ids) or any(
+                len(path.encode("utf-8")) > MAX_VALIDATION_FIELD_BYTES for path in self.exemption_paths
+            ):
+                raise ValueError(f"exemption evidence fields exceed {MAX_VALIDATION_FIELD_BYTES} bytes")
+            if self.validation_ledger:
+                raise ValueError("exemption evidence cannot accompany validation rows")
+        has_validation = bool(self.validation_ledger) or self.configuration_source_digest is not None
+        if has_validation:
+            if self.configuration_source_digest is None:
+                raise ValueError("configuration_source_digest is required for validation binding")
+            _require_digest("configuration_source_digest", self.configuration_source_digest)
+        if self.exemption_ids and self.configuration_source_digest is None:
+            raise ValueError("exemption evidence requires a configuration source digest")
+        if self.configuration_source_digest is not None and not self.validation_ledger and not self.exemption_ids:
+            raise ValueError("empty validation ledger requires protected exemption evidence")
         has_actionable_finding = any(finding.severity in ACTIONABLE_SEVERITIES for finding in self.findings)
         if self.verdict == "clean" and has_actionable_finding:
             raise ValueError("clean proposals cannot contain actionable findings")
@@ -387,6 +671,14 @@ class ReviewProposal:
         }
         if bind_coverage:
             digest_values["coverage"] = coverage
+        if has_validation:
+            digest_values["validation_ledger"] = tuple(row.to_mapping() for row in self.validation_ledger)
+            digest_values["configuration_source_digest"] = self.configuration_source_digest
+            if self.exemption_ids:
+                digest_values["exemption_ids"] = self.exemption_ids
+                digest_values["exemption_paths"] = self.exemption_paths
+        if self.scope is not None:
+            digest_values["scope"] = self.scope.to_mapping()
         expected = "sha256:" + canonical_digest(digest_values)
         if self.proposal_digest != expected:
             raise ValueError("proposal digest is not bound to target, capsule, provider, and response")
@@ -407,7 +699,6 @@ class ReviewProposal:
             "expected_content_count": self.expected_content_count,
             "coverage_complete": self.coverage_complete,
         }
-
 
 @dataclass(frozen=True)
 class ValidationRequest:
@@ -519,6 +810,134 @@ def capability_contract_digest(capability: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(without_digest)).hexdigest()
 
 
+def profile_digest(profile: ValidationProfile | Mapping[str, Any]) -> str:
+    """Return the digest of the complete profile snapshot."""
+    snapshot = profile.to_mapping() if isinstance(profile, ValidationProfile) else profile
+    if not isinstance(snapshot, Mapping) or frozenset(snapshot) != _PROFILE_KEYS:
+        raise ValueError("profile has unexpected or missing keys")
+    return "sha256:" + hashlib.sha256(canonical_json(snapshot)).hexdigest()
+
+
+def normalize_repository_path(path: str) -> str:
+    """Validate, but do not rewrite, a repository-relative path or glob."""
+    if not isinstance(path, str) or not path:
+        raise ValueError("repository path must be a non-empty string")
+    if path.startswith("/") or any(part == ".." for part in path.split("/")):
+        raise ValueError("repository path must be repository-relative")
+    return path
+
+
+def _repository_glob_matches(path: str, pattern: str) -> bool:
+    """Match repository segments with bounded iterative glob semantics."""
+    path_parts = path.split("/")
+    pattern_parts = pattern.split("/")
+    reachable = [True] + [False] * len(path_parts)
+    for pattern_part in pattern_parts:
+        next_reachable = [False] * (len(path_parts) + 1)
+        if pattern_part == "**":
+            # A globstar consumes zero or more complete path segments.  The
+            # left-to-right prefix propagation is linear and cannot recurse.
+            for path_index in range(len(path_parts) + 1):
+                next_reachable[path_index] = reachable[path_index] or (
+                    path_index > 0 and next_reachable[path_index - 1]
+                )
+        else:
+            for path_index, is_reachable in enumerate(reachable[:-1]):
+                if is_reachable and fnmatch.fnmatchcase(path_parts[path_index], pattern_part):
+                    next_reachable[path_index + 1] = True
+        reachable = next_reachable
+    return reachable[-1]
+
+
+def protected_exemption_matches(exemptions: Any, path: str) -> bool:
+    """Return whether ``path`` matches a normalized protected exemption glob."""
+    normalized = normalize_repository_path(path)
+    if not isinstance(exemptions, (list, tuple)):
+        raise ValueError("protected exemptions must be a list")
+    for exemption in exemptions:
+        if not isinstance(exemption, Mapping) or frozenset(exemption) != _EXEMPTION_KEYS:
+            raise ValueError("exemption has unexpected or missing keys")
+        globs = exemption["path_globs"]
+        _require_string_list("path_globs", globs)
+        if any(_repository_glob_matches(normalized, normalize_repository_path(pattern)) for pattern in globs):
+            return True
+    return False
+
+
+def protected_exemption_evidence(
+    exemptions: Any, capsule_paths: Any,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Return deterministic protected exemption evidence for exact paths."""
+    if not isinstance(capsule_paths, (list, tuple)) or not capsule_paths:
+        return None
+    normalized = tuple(normalize_repository_path(path) for path in capsule_paths)
+    if len(normalized) != len(set(normalized)):
+        return None
+    normalized = tuple(sorted(normalized))
+    if not isinstance(exemptions, (list, tuple)):
+        raise ValueError("protected exemptions must be a list")
+    covered_paths: set[str] = set()
+    matches: set[str] = set()
+    for exemption in exemptions:
+        if not isinstance(exemption, Mapping) or frozenset(exemption) != _EXEMPTION_KEYS:
+            raise ValueError("exemption has unexpected or missing keys")
+        globs = exemption["path_globs"]
+        _require_string_list("path_globs", globs)
+        normalized_globs = tuple(normalize_repository_path(pattern) for pattern in globs)
+        matching_paths = {
+            path for path in normalized
+            if any(_repository_glob_matches(path, pattern) for pattern in normalized_globs)
+        }
+        if matching_paths:
+            _require_text("exemption id", exemption["id"])
+            matches.add(exemption["id"])
+            covered_paths.update(matching_paths)
+    if covered_paths != set(normalized):
+        return None
+    return (tuple(sorted(matches)), normalized) if matches else None
+
+
+def capsule_paths_are_exempt(exemptions: Any, capsule_paths: Any) -> bool:
+    """Require every capsule path to match a protected exemption glob."""
+    if not isinstance(capsule_paths, (list, tuple)):
+        raise ValueError("capsule paths must be a list")
+    return protected_exemption_evidence(exemptions, capsule_paths) is not None
+
+
+def derive_protected_review_scope(capsule: Any, policy: Mapping[str, Any]) -> ReviewScope:
+    """Derive the conservative v1 scope from an immutable capsule and policy.
+
+    A fully protected exemption has no validation scope.  Every other capsule
+    receives the complete registered model inventory and the union of all
+    registered covered hardware.  Unknown capsule shapes or incomplete policy
+    data fail closed rather than guessing from paths or source contents.
+    """
+    manifest = getattr(capsule, "manifest", capsule)
+    if not isinstance(manifest, (list, tuple)):
+        raise ValueError("capsule manifest is required for scope derivation")
+    paths: list[str] = []
+    for entry in manifest:
+        path = (
+            entry if isinstance(entry, str)
+            else entry.get("path") if isinstance(entry, Mapping)
+            else getattr(entry, "path", None)
+        )
+        if not isinstance(path, str):
+            raise ValueError("capsule manifest contains an invalid path")
+        paths.append(path)
+    validate_capability_policy(policy)
+    if protected_exemption_evidence(policy["exemptions"], paths) is not None:
+        return ReviewScope((), ())
+    profiles = policy.get("profiles")
+    if not isinstance(profiles, (list, tuple)) or not profiles:
+        raise ValueError("non-exempt scope has no protected profiles")
+    typed_profiles = tuple(ValidationProfile.from_mapping(profile) for profile in profiles)
+    return ReviewScope(
+        tuple(sorted({profile.model_architecture for profile in typed_profiles})),
+        tuple(sorted({hardware for profile in typed_profiles for hardware in profile.covered_hardware})),
+    )
+
+
 def _load_json(path: str | Path) -> dict[str, Any]:
     with Path(path).open(encoding="utf-8") as stream:
         value = json.load(stream)
@@ -560,6 +979,76 @@ def validate_capability_policy(policy: Mapping[str, Any]) -> None:
             raise ValueError("capability contract digest does not match capability")
     if len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != expected_ids:
         raise ValueError("capability policy has the wrong capability IDs")
+    profiles = policy["profiles"]
+    if not isinstance(profiles, (list, tuple)) or not profiles:
+        raise ValueError("capability policy must contain profiles")
+    profile_ids: list[str] = []
+    profile_capability_ids: list[str] = []
+    for profile in profiles:
+        if not isinstance(profile, Mapping):
+            raise ValueError("profile must be an object")
+        _require_exact_keys(profile, _PROFILE_KEYS, "profile")
+        typed_profile = ValidationProfile.from_mapping(profile)
+        profile_ids.append(typed_profile.id)
+        profile_capability_ids.append(typed_profile.capability_id)
+        if typed_profile.capability_id not in expected_ids:
+            raise ValueError("profile references an unknown capability")
+        capability = next(item for item in capabilities if item["id"] == typed_profile.capability_id)
+        eligible = tuple(capability["eligible_hardware"])
+        if typed_profile.representative_hardware not in eligible:
+            raise ValueError("representative_hardware is not eligible for capability")
+        if any(hardware not in eligible for hardware in typed_profile.covered_hardware):
+            raise ValueError("covered_hardware contains ineligible hardware")
+    if len(profile_ids) != len(set(profile_ids)):
+        raise ValueError("profile IDs must be unique")
+    if set(profile_capability_ids) != set(actual_ids):
+        raise ValueError("profiles must cover each capability at least once")
+    fixtures = policy["fixtures"]
+    if not isinstance(fixtures, (list, tuple)) or not fixtures:
+        raise ValueError("capability policy must contain fixtures")
+    fixture_ids: list[str] = []
+    fixture_map: dict[str, Mapping[str, Any]] = {}
+    for fixture in fixtures:
+        if not isinstance(fixture, Mapping):
+            raise ValueError("fixture must be an object")
+        _require_exact_keys(fixture, _FIXTURE_KEYS, "fixture")
+        for field in ("fixture_id", "model_architecture", "artifact_identity", "source_identity", "suite_revision", "digest_semantics"):
+            _require_text(f"fixture {field}", fixture[field])
+        _require_digest("fixture_digest", fixture["fixture_digest"])
+        if fixture["fixture_digest"] != fixture_descriptor_digest(fixture):
+            raise ValueError("fixture descriptor digest does not match fixture fields")
+        fixture_ids.append(fixture["fixture_id"])
+        fixture_map[fixture["fixture_id"]] = fixture
+    if len(fixture_ids) != len(set(fixture_ids)):
+        raise ValueError("fixture IDs must be unique")
+    for profile in profiles:
+        fixture = fixture_map.get(profile["fixture_id"])
+        if fixture is None:
+            raise ValueError("profile references an unknown fixture")
+        if profile["model_architecture"] != fixture["model_architecture"]:
+            raise ValueError("profile and fixture model architecture do not match")
+        if profile["fixture_digest"] != fixture["fixture_digest"]:
+            raise ValueError("profile fixture digest does not match fixture manifest")
+        capability = next(item for item in capabilities if item["id"] == profile["capability_id"])
+        if fixture["suite_revision"] not in capability["allowed_suite_revisions"]:
+            raise ValueError("fixture suite revision is not allowed by capability")
+        if fixture["artifact_identity"] not in capability["artifacts"]:
+            raise ValueError("fixture artifact is not allowed by capability")
+    exemptions = policy["exemptions"]
+    if not isinstance(exemptions, (list, tuple)):
+        raise ValueError("exemptions must be a list")
+    exemption_ids: list[str] = []
+    for exemption in exemptions:
+        if not isinstance(exemption, Mapping):
+            raise ValueError("exemption must be an object")
+        _require_exact_keys(exemption, _EXEMPTION_KEYS, "exemption")
+        _require_text("exemption id", exemption["id"])
+        exemption_ids.append(exemption["id"])
+        _require_string_list("path_globs", exemption["path_globs"])
+        for path_glob in exemption["path_globs"]:
+            normalize_repository_path(path_glob)
+    if len(exemption_ids) != len(set(exemption_ids)):
+        raise ValueError("exemption IDs must be unique")
 
 
 def load_capability_policy(path: str | Path) -> dict[str, Any]:

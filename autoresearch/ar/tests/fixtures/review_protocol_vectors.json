@@ -47,5 +47,81 @@
       {"value": 1e21, "canonical_utf8": "1e+21", "sha256": "241c4643fa70b1dcde1205b71be4e3bebb17e9f880c8e1a33d0ead6c27271d3c"},
       {"value": -0.0, "canonical_utf8": "0", "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"}
     ]
+  },
+  "validation": {
+    "valid_ledger": {
+      "configuration_source_digest": "sha256:f50fac7baf709a3546c934ef9a691ceea5e192895fa7a078dedc30c5b91b99cb",
+      "capsule_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capsule_paths": ["src/main.py"],
+      "capsule_target_key": "target-vector",
+      "scope": {
+        "model_architectures": ["qwen3.6-27b"],
+        "hardware_architectures": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+      },
+      "validation_ledger": [
+        {
+          "request_id": "vr-03fbaa4bfe42cff0",
+          "profile_snapshot": {
+            "id": "rdna3-smoke",
+            "capability_id": "hipfire/rdna3-smoke@1",
+            "model_architecture": "qwen3.6-27b",
+            "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+            "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+            "representative_hardware": "gfx1100",
+            "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+          },
+          "profile_digest": "sha256:283a5d190ff873c7dd4d7892998baa01940587ddbe1bad7c40dde4d61f162489",
+          "capability_id": "hipfire/rdna3-smoke@1",
+          "contract_digest": "sha256:a3399687fc211d9073ed52daa02162cc052c63c79f923fce25acf5409c9852d9",
+          "model_architecture": "qwen3.6-27b",
+          "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+          "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+          "representative_hardware": "gfx1100",
+          "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
+          "coverage_kind": "representative",
+          "status": "pending",
+          "validator_snapshot": {},
+          "result_snapshot": {},
+          "rationales": ["run the protected smoke validation"]
+        }
+      ]
+    },
+    "invalid_profile_config_binding": {
+      "configuration_source_digest": "sha256:f50fac7baf709a3546c934ef9a691ceea5e192895fa7a078dedc30c5b91b99cb",
+      "capsule_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capsule_paths": ["src/main.py"],
+      "capsule_target_key": "target-vector",
+      "scope": {
+        "model_architectures": ["qwen3.6-27b"],
+        "hardware_architectures": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+      },
+      "validation_ledger": [
+        {
+          "request_id": "vr-03fbaa4bfe42cff0",
+          "profile_snapshot": {
+            "id": "rdna3-smoke",
+            "capability_id": "hipfire/rdna3-smoke@1",
+            "model_architecture": "qwen3.6-27b-mutated",
+            "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+            "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+            "representative_hardware": "gfx1100",
+            "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+          },
+          "profile_digest": "sha256:fcca6017e6086b92352fe4461dd25de654f478e064be59e50feeb9e7122140ef",
+          "capability_id": "hipfire/rdna3-smoke@1",
+          "contract_digest": "sha256:a3399687fc211d9073ed52daa02162cc052c63c79f923fce25acf5409c9852d9",
+          "model_architecture": "qwen3.6-27b-mutated",
+          "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+          "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+          "representative_hardware": "gfx1100",
+          "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
+          "coverage_kind": "representative",
+          "status": "pending",
+          "validator_snapshot": {},
+          "result_snapshot": {},
+          "rationales": ["run the protected smoke validation"]
+        }
+      ]
+    }
   }
 }

@@ -8,18 +8,17 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import autoresearch.ar.review.discovery as discovery_module
 
 from autoresearch.ar.review.discovery import DiscoverySummary, discover_pull_requests
-from autoresearch.ar.review.github import GitHubBoundaryError
+from autoresearch.ar.review.github import GitHubBoundaryError, encode_protocol_body
 from autoresearch.ar.review.canonical import canonical_digest, metadata_digest
-from autoresearch.ar.review.models import GitHubEnvelope, ReviewProposal, ReviewTarget
-from autoresearch.ar.review.publisher import ReviewPublisher
-from autoresearch.ar.tests.test_review_publisher import (
-    FakeGitHub,
-    OPERATOR as BOT_OPERATOR,
-    TARGET as PUBLISH_TARGET,
-    _configuration,
-    _proposal,
+from autoresearch.ar.review.capsule import build_review_capsule
+from autoresearch.ar.review.models import GitHubEnvelope, ReviewProposal, ReviewScope, ReviewTarget
+from autoresearch.ar.review.publisher import PublisherError, ReviewPublisher
+from autoresearch.ar.tests.review_fixtures import (
+    FakeGitHub, OPERATOR as BOT_OPERATOR, TARGET as PUBLISH_TARGET,
+    _configuration, _ledger_configuration, _ledger_proposal, _proposal,
 )
 
 
@@ -58,6 +57,9 @@ class Client:
     def get_review_target(self, repository, number):
         self.calls.append(("target", number))
         return getattr(self, "targets", {}).get(number, self.target)
+
+    def revalidate_config_source(self, source):
+        self.calls.append(("config", source.commit_sha))
 
     def list_issue_comments(self, repository, number):
         self.calls.append(("comments", number))
@@ -159,6 +161,17 @@ def completed_client(verdict="clean"):
     return client
 
 
+def ledger_completed_client():
+    client = FakeGitHub()
+    config = _ledger_configuration()
+    proposal, _row = _ledger_proposal(config)
+    result = ReviewPublisher(client, configuration=config, operator_credential=BOT_OPERATOR).publish(
+        proposal, PUBLISH_TARGET,
+    )
+    assert result.status == "complete", result.reason
+    return client, config
+
+
 def legacy_completed_client():
     client = completed_client()
     payloads = {
@@ -185,7 +198,10 @@ def legacy_completed_client():
     completion["metadata_digest"] = metadata["metadata_digest"]
     for item in client.comments:
         payload = payloads[item["id"]]
-        item["body"] = json.dumps(payload)
+        item["body"] = encode_protocol_body(
+            payload, visible_body=payload.get("report_body")
+            if payload.get("record_type") == "report" else None,
+        )
     return client
 
 
@@ -199,6 +215,34 @@ def test_no_report_is_needing_review_and_labelled_idempotently():
     assert [item.number for item in second.needs_review] == [42]
     assert [item.number for item in second.labelled] == []
     assert sorted(client.labels) == ["needs-review"]
+
+
+def test_completed_history_validation_receives_authenticated_configuration(monkeypatch):
+    client, config = ledger_completed_client()
+    trust = discovery_module._TrustContext(client, REPO, config)
+    trust.authors.add(BOT_OPERATOR["principal"]["login"])
+    trust._repository_id = 8
+    trust._app_scope[BOT_OPERATOR["principal"]["login"]] = True
+    records, error = discovery_module._history(client, PUBLISH_TARGET, trust)
+    assert error is None
+    captured = {}
+    original = discovery_module.validate_protocol
+
+    def wrapped(records, *, expected_target, trusted_authors=None, configuration=None, capsule=None):
+        captured["configuration"] = configuration
+        captured["capsule"] = capsule
+        return original(
+            records, expected_target=expected_target,
+            trusted_authors=trusted_authors, configuration=configuration,
+            capsule=capsule,
+        )
+
+    monkeypatch.setattr(discovery_module, "validate_protocol", wrapped)
+    capsule = build_review_capsule(client, PUBLISH_TARGET)
+    outcome = discovery_module._current_completion(records, PUBLISH_TARGET, trust, capsule)
+    assert not isinstance(outcome, str)
+    assert captured["configuration"] is trust.configuration
+    assert captured["capsule"] is not None
 
 
 def test_drafts_and_fork_heads_are_not_filtered():
@@ -257,7 +301,11 @@ def test_each_configured_app_record_is_checked_against_installation_scope():
     completion["report_digest"] = canonical_digest(report)
     completion["metadata_digest"] = metadata["metadata_digest"]
     for item in client.comments:
-        item["body"] = json.dumps(payloads[json.loads(client.payload_from_body(item["body"]))["record_type"]])
+        payload = payloads[json.loads(client.payload_from_body(item["body"]))["record_type"]]
+        item["body"] = encode_protocol_body(
+            payload, visible_body=payload.get("report_body")
+            if payload.get("record_type") == "report" else None,
+        )
     summary = discover_pull_requests(
         client, REPO, configuration=multi_app_configuration(), operator_credential=DISCOVERY_BOT
     )
@@ -319,16 +367,16 @@ def test_publisher_rejects_proposal_without_explicit_coverage():
         "adapter_id": "adapter", "adapter_version": "1", "model": "model",
         "response_digest": "sha256:" + "c" * 64,
         "verdict": "clean", "findings": (),
+        "scope": {"model_architectures": [], "hardware_architectures": []},
     }
     legacy = ReviewProposal(
         PUBLISH_TARGET, values["capsule_digest"], "sha256:" + canonical_digest(values), "clean", (),
-        "adapter", "1", "model", values["response_digest"],
+        "adapter", "1", "model", values["response_digest"], scope=ReviewScope((), ()),
     )
-    result = ReviewPublisher(client, configuration=configuration(), operator_credential=BOT_OPERATOR).publish(
-        legacy, PUBLISH_TARGET
-    )
-
-    assert result.status in {"error", "incomplete"}
+    with pytest.raises(PublisherError, match="validation evidence|exemption"):
+        ReviewPublisher(client, configuration=configuration(), operator_credential=BOT_OPERATOR).publish(
+            legacy, PUBLISH_TARGET
+        )
     assert not any(item["record_type"] == "completion" for item in [
         json.loads(client.payload_from_body(comment["body"])) for comment in client.comments
     ])
@@ -341,7 +389,10 @@ def test_resuming_app_attempt_does_not_copy_app_provenance_to_human_record():
     intent_payload = app_publisher._intent_payload(PUBLISH_TARGET, "attempt-app")
     intent = GitHubEnvelope(intent_payload, "intent-node", "review-bot", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "Bot")
 
-    report = human_publisher._report_payload(_proposal(), PUBLISH_TARGET, intent)
+    report = human_publisher._report_payload(
+        _proposal(), PUBLISH_TARGET, intent,
+        build_review_capsule(client, PUBLISH_TARGET),
+    )
 
     assert not any(field in report for field in ("app_id", "installation_id", "repository_id", "credential_attestation_digest"))
 

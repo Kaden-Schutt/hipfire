@@ -12,10 +12,25 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 import re
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from .canonical import canonical_digest, canonical_json, metadata_digest
-from .models import GitHubEnvelope, ReviewTarget
+from .capsule import ReviewCapsule, capsule_coverage
+from .models import (
+    GitHubEnvelope,
+    ReviewTarget,
+    ReviewScope,
+    ValidationLedgerRow,
+    capability_contract_digest,
+    derive_protected_review_scope,
+    profile_digest,
+    protected_exemption_evidence,
+    validate_capability_policy,
+)
+from .validation import validate_ledger_payload_shape, validate_rendered_validation_section
+
+if TYPE_CHECKING:
+    from .config import ReviewConfiguration
 
 
 _RECORD_TYPES = {"intent", "report", "completion", "review-metadata", "revocation"}
@@ -30,6 +45,12 @@ _SERVER_FIELDS = {"node_id", "author", "created_at", "payload_digest", "intent_n
 _TARGET_KEYS = {
     "repository", "number", "head_repository", "head_sha", "base_ref", "base_sha", "merge_base_sha"
 }
+_VALIDATION_FIELDS = {"validation_ledger", "configuration_source_digest"}
+_EXEMPTION_FIELDS = {"exemption_ids", "exemption_paths"}
+_SCOPE_FIELDS = {"scope"}
+_CAPSULE_FIELDS = {"capsule_digest", "capsule_paths", "capsule_target_key"}
+_MAX_RENDERED_REPORT_BYTES = 256 * 1024
+_MAX_NODE_ID_BYTES = 128
 
 
 def _plain(value: Any) -> Any:
@@ -178,6 +199,153 @@ def _required(payload: Mapping[str, Any], fields: set[str]) -> set[str]:
     )
 
 
+def _validation_fields(payload: Mapping[str, Any]) -> set[str]:
+    present = _VALIDATION_FIELDS & set(payload)
+    if present and present != _VALIDATION_FIELDS:
+        raise ValueError("validation ledger binding is incomplete")
+    return _VALIDATION_FIELDS if present else set()
+
+
+def _scope(payload: Mapping[str, Any]) -> ReviewScope | None:
+    if "scope" not in payload:
+        return None
+    try:
+        return ReviewScope.from_mapping(payload["scope"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("review scope is malformed") from exc
+
+
+def _validate_scope_coverage(scope: ReviewScope | None, rows: Sequence[ValidationLedgerRow]) -> None:
+    if scope is None:
+        raise ValueError("validation report is missing review scope")
+    models = {row.model_architecture for row in rows}
+    hardware = {item for row in rows for item in row.covered_hardware}
+    if not set(scope.model_architectures).issubset(models):
+        raise ValueError("declared model architecture is not covered by a selected profile")
+    if not set(scope.hardware_architectures).issubset(hardware):
+        raise ValueError("declared hardware architecture is not covered by a selected profile")
+
+
+def _validate_capsule_scope(
+    payload: Mapping[str, Any], *, configuration: "ReviewConfiguration", capsule: Any = None,
+) -> None:
+    if not configuration.is_protected or configuration.source is None or not configuration.source.authenticated:
+        raise ValueError("protected configuration is required for capsule scope validation")
+    if not isinstance(capsule, ReviewCapsule) or not capsule.complete:
+        raise ValueError("complete authenticated review capsule is required for ledger history")
+    target = _target(payload.get("target")) if "target" in payload else capsule.target
+    capsule_digest = payload.get("capsule_digest")
+    capsule_target_key = payload.get("capsule_target_key")
+    if (
+        not isinstance(capsule_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", capsule_digest)
+        or capsule_target_key != target.target_key()
+    ):
+        raise ValueError("report capsule binding is malformed")
+    if capsule.target != target or capsule.digest != capsule_digest:
+        raise ValueError("report capsule binding does not match authenticated capsule")
+    if _coverage(payload) != capsule_coverage(capsule):
+        raise ValueError("report coverage does not match authenticated capsule")
+    paths = payload.get("capsule_paths")
+    manifest_paths = tuple(entry.path for entry in capsule.manifest)
+    if not isinstance(paths, (list, tuple)) or tuple(paths) != manifest_paths:
+        raise ValueError("report capsule paths do not match authenticated capsule")
+    expected = derive_protected_review_scope(capsule, configuration.capabilities)
+    if _scope(payload) != expected:
+        raise ValueError("report scope does not match protected capsule scope")
+
+
+def _exemption_fields(payload: Mapping[str, Any]) -> set[str]:
+    present = _EXEMPTION_FIELDS & set(payload)
+    if present and present != _EXEMPTION_FIELDS:
+        raise ValueError("exemption evidence is incomplete")
+    return _EXEMPTION_FIELDS if present else set()
+
+
+def validate_validation_ledger(
+    payload: Mapping[str, Any], *, configuration: "ReviewConfiguration | None" = None,
+    capsule: Any = None,
+) -> None:
+    """Validate a report ledger against the live authenticated policy binding.
+
+    Configuration changes intentionally invalidate historical ledger-bearing
+    completions; discovery must then requeue the pull request for review.
+    """
+    fields = _validation_fields(payload)
+    if not fields:
+        return
+    ledger = payload.get("validation_ledger")
+    source_digest = payload.get("configuration_source_digest")
+    if not isinstance(source_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", source_digest):
+        raise ValueError("configuration source digest is malformed")
+    rows_raw = validate_ledger_payload_shape(ledger)
+    rows: list[ValidationLedgerRow] = []
+    for item in rows_raw:
+        try:
+            row = ValidationLedgerRow.from_mapping(item)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise ValueError("validation ledger row is malformed") from exc
+        rows.append(row)
+    if configuration is None:
+        raise ValueError("protected configuration is required for a validation ledger")
+    if not configuration.is_protected or configuration.source is None or not configuration.source.authenticated:
+        raise ValueError("validation ledger requires an authenticated protected configuration")
+    if source_digest != configuration.source.config_digest:
+        raise ValueError("configuration source digest does not match authenticated configuration")
+    if "target" in payload and configuration.source.repository != _target(payload.get("target")).repository:
+        raise ValueError("configuration source repository does not match report target")
+    try:
+        validate_capability_policy(configuration.capabilities)
+        profiles = {item["id"]: item for item in configuration.capabilities["profiles"]}
+        capabilities = {item["id"]: item for item in configuration.capabilities["capabilities"]}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("protected validation policy is malformed") from exc
+    for row in rows:
+        profile_mapping = profiles.get(row.profile_snapshot.get("id"))
+        if profile_mapping is None or canonical_json(row.profile_snapshot) != canonical_json(profile_mapping):
+            raise ValueError("validation ledger profile is not from protected policy")
+        capability = capabilities.get(row.capability_id)
+        if capability is None or row.profile_digest != profile_digest(profile_mapping):
+            raise ValueError("validation ledger profile digest does not match protected policy")
+        if row.contract_digest != capability_contract_digest(capability):
+            raise ValueError("validation ledger capability digest does not match protected policy")
+        if row.coverage_kind != "representative":
+            raise ValueError("validation ledger coverage kind is not protected")
+    _validate_scope_coverage(_scope(payload), rows)
+    _validate_capsule_scope(payload, configuration=configuration, capsule=capsule)
+
+
+def _validate_exemption_binding(
+    payload: Mapping[str, Any], *, configuration: "ReviewConfiguration | None", capsule: Any = None,
+) -> bool:
+    fields = _exemption_fields(payload)
+    ledger = payload.get("validation_ledger")
+    if not fields:
+        if isinstance(ledger, (list, tuple)) and not ledger:
+            raise ValueError("empty validation ledger lacks protected exemption evidence")
+        return False
+    if not isinstance(ledger, (list, tuple)) or ledger:
+        raise ValueError("exemption evidence cannot accompany validation rows")
+    if configuration is None or not configuration.is_protected or configuration.source is None:
+        raise ValueError("exemption evidence requires protected configuration")
+    source_digest = payload.get("configuration_source_digest")
+    if source_digest != configuration.source.config_digest:
+        raise ValueError("configuration source digest does not match authenticated configuration")
+    target = _target(payload.get("target"))
+    if configuration.source.repository != target.repository:
+        raise ValueError("exemption source repository does not match report target")
+    paths = payload.get("exemption_paths")
+    if not isinstance(payload.get("exemption_ids"), (list, tuple)) or not isinstance(paths, (list, tuple)):
+        raise ValueError("exemption evidence is malformed")
+    try:
+        expected = protected_exemption_evidence(configuration.capabilities["exemptions"], paths)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("protected exemption policy is malformed") from exc
+    if expected != (tuple(payload["exemption_ids"]), tuple(paths)):
+        raise ValueError("exemption evidence does not match protected policy")
+    _validate_capsule_scope(payload, configuration=configuration, capsule=capsule)
+    return True
+
+
 def _matching_schema(*payloads: Mapping[str, Any]) -> str:
     schemas = {payload.get("schema") for payload in payloads}
     schema = next(iter(schemas), None)
@@ -191,6 +359,8 @@ def _validate_envelope(envelope: Mapping[str, Any], trusted: frozenset[str]) -> 
         raise ValueError("protocol requires a typed GitHubEnvelope from an authenticated source")
     payload = _payload(envelope.payload)
     _text(envelope.node_id, "node_id")
+    if len(envelope.node_id.encode("utf-8")) > _MAX_NODE_ID_BYTES:
+        raise ValueError("node_id exceeds the maximum UTF-8 length")
     _require_author(envelope, trusted)
     if _parse_time(envelope.updated_at, "updated_at") != _time(envelope):
         raise ValueError("edited protocol records are not allowed: updated_at differs from created_at")
@@ -276,6 +446,8 @@ def validate_report(
     *,
     canonical_intent: Mapping[str, Any],
     trusted_authors: Iterable[str] | None = None,
+    configuration: "ReviewConfiguration | None" = None,
+    capsule: Any = None,
 ) -> str:
     trusted = _trust_policy(trusted_authors)
     payload = _validate_envelope(envelope, trusted)
@@ -287,9 +459,17 @@ def validate_report(
         "schema", "record_type", "record_id", "target", "target_key", "attempt_id", "intent_record_id", "head_sha",
         "canonical_intent_node_id", "canonical_intent_digest", "report_body", "report_body_sha256",
     }
-    if set(payload) != _required(payload, required) or payload["record_type"] != "report":
+    if set(payload) != (
+        _required(payload, required) | _validation_fields(payload) | _exemption_fields(payload)
+        | ({"scope"} if "scope" in payload else set())
+        | (_CAPSULE_FIELDS if _validation_fields(payload) else set())
+    ) or payload["record_type"] != "report":
         raise ValueError("invalid report payload")
+    if "scope" in payload and not _validation_fields(payload):
+        raise ValueError("scope-bearing reports require an authenticated capsule")
     _coverage(payload)
+    validate_validation_ledger(payload, configuration=configuration, capsule=capsule)
+    exempt = _validate_exemption_binding(payload, configuration=configuration, capsule=capsule)
     target = _same_binding(payload, intent)
     if payload["head_sha"] != target.head_sha:
         raise ValueError("report head SHA does not match target")
@@ -301,9 +481,19 @@ def validate_report(
     body = payload["report_body"]
     if not isinstance(body, str):
         raise ValueError("report body must be text")
+    if _validation_fields(payload) and body != body.strip():
+        raise ValueError("ledger-bearing report body must not have leading or trailing whitespace")
+    if len(body.encode("utf-8")) > _MAX_RENDERED_REPORT_BYTES:
+        raise ValueError("rendered report exceeds 256 KiB")
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     if payload["report_body_sha256"] not in {digest, "sha256:" + digest}:
         raise ValueError("report body digest does not match body")
+    if _validation_fields(payload):
+        if "scope" not in payload:
+            raise ValueError("validation report is missing review scope")
+        validate_rendered_validation_section(
+            body, payload["validation_ledger"], exempt=exempt, scope=_scope(payload),
+        )
     return _payload_digest(envelope)
 
 
@@ -314,6 +504,8 @@ def validate_review_metadata(
     *,
     canonical_intent: Mapping[str, Any],
     trusted_authors: Iterable[str] | None = None,
+    configuration: "ReviewConfiguration | None" = None,
+    capsule: Any = None,
 ) -> str:
     trusted = _trust_policy(trusted_authors)
     payload = _validate_envelope(envelope, trusted)
@@ -338,6 +530,8 @@ def validate_review_metadata(
         intent_envelope,
         canonical_intent=canonical_intent,
         trusted_authors=trusted,
+        configuration=configuration,
+        capsule=capsule,
     )
     if not _before(intent_envelope, envelope) or not _before(report_envelope, envelope):
         raise ValueError("review metadata was published before its dependency")
@@ -369,6 +563,8 @@ def validate_completion(
     *,
     canonical_intent: Mapping[str, Any],
     trusted_authors: Iterable[str] | None = None,
+    configuration: "ReviewConfiguration | None" = None,
+    capsule: Any = None,
 ) -> None:
     trusted = _trust_policy(trusted_authors)
     payload = _validate_envelope(envelope, trusted)
@@ -405,6 +601,8 @@ def validate_completion(
         report_envelope,
         canonical_intent=canonical_intent,
         trusted_authors=trusted,
+        configuration=configuration,
+        capsule=capsule,
     )
     if payload["report_record_id"] != report.get("record_id") or payload["report_node_id"] != report_envelope.get("node_id"):
         raise ValueError("completion report binding does not match")
@@ -485,6 +683,8 @@ def elect_canonical_attempt(
     reports: Sequence[Mapping[str, Any]] = (),
     review_metadata: Sequence[Mapping[str, Any]] = (),
     trusted_authors: Iterable[str] | None = None,
+    configuration: "ReviewConfiguration | None" = None,
+    capsule: Any = None,
 ) -> Mapping[str, Any]:
     trusted = _trust_policy(trusted_authors)
     expected = _expected_target(expected_target)
@@ -543,14 +743,18 @@ def elect_canonical_attempt(
         if payload.get("target_key") != current_payload.get("target_key") or payload.get("attempt_id") != current_payload.get("attempt_id"):
             raise ValueError(f"{event_type} does not target the current canonical intent")
         if event_type == "report":
-            validate_report(envelope, intent, canonical_intent=current, trusted_authors=trusted)
+            validate_report(
+                envelope, intent, canonical_intent=current, trusted_authors=trusted,
+                configuration=configuration, capsule=capsule,
+            )
             published_reports[_record_id(envelope)] = envelope
         elif event_type == "review-metadata":
             report = published_reports.get(payload.get("report_record_id"))
             if report is None:
                 raise ValueError("review metadata is before its referenced report")
             validate_review_metadata(
-                envelope, intent, report, canonical_intent=current, trusted_authors=trusted
+                envelope, intent, report, canonical_intent=current, trusted_authors=trusted,
+                configuration=configuration, capsule=capsule,
             )
             published_metadata[_record_id(envelope)] = envelope
         else:
@@ -563,6 +767,8 @@ def elect_canonical_attempt(
                 metadata,
                 canonical_intent=current,
                 trusted_authors=trusted,
+                configuration=configuration,
+                capsule=capsule,
             )
     if not active:
         raise ValueError("no valid non-revoked intent")
@@ -572,6 +778,8 @@ def elect_canonical_attempt(
 def validate_protocol(
     records: Sequence[Mapping[str, Any]], *, expected_target: ReviewTarget,
     trusted_authors: Iterable[str] | None = None,
+    configuration: "ReviewConfiguration | None" = None,
+    capsule: Any = None,
 ) -> Mapping[str, Any]:
     trusted = _trust_policy(trusted_authors)
     expected = _expected_target(expected_target)
@@ -591,4 +799,6 @@ def validate_protocol(
         review_metadata=grouped["review-metadata"],
         revocations=grouped["revocation"],
         trusted_authors=trusted,
+        configuration=configuration,
+        capsule=capsule,
     )

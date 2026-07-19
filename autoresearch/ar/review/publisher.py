@@ -13,14 +13,29 @@ import json
 from typing import Any, Callable
 
 from .canonical import canonical_digest, canonical_json, metadata_digest
+from .capsule import ReviewCapsule, build_review_capsule, capsule_coverage
 from .config import (
     ReviewConfiguration,
     validate_operator_credential_manifest,
     validate_publisher_operator_credential,
 )
-from .github import decode_protocol_body, encode_protocol_body
-from .models import GitHubEnvelope, ReviewProposal, ReviewTarget, validate_trusted_publishers_policy
-from .protocol import validate_intent, validate_protocol, validate_revocation
+from .github import GitHubBoundaryError, decode_protocol_body, encode_protocol_body
+from .models import (
+    GitHubEnvelope,
+    ReviewProposal,
+    ReviewTarget,
+    derive_protected_review_scope,
+    protected_exemption_evidence,
+    validate_trusted_publishers_policy,
+)
+from .protocol import (
+    validate_intent,
+    validate_protocol,
+    validate_report,
+    validate_revocation,
+    validate_validation_ledger,
+)
+from .validation import render_validation_section, validate_rendered_validation_section
 
 
 class PublisherError(RuntimeError):
@@ -68,10 +83,15 @@ class _UnsafeLabelSnapshot(RuntimeError):
     pass
 
 
+class _PreflightRejected(PublisherError):
+    """A proposal failed before any publication mutation was permitted."""
+
+
 _SCHEMA = "agentic-review/v1"
 _LABEL = "needs-review"
 _MAX_RECONCILIATION_ROUNDS = 4
 _APP_FIELDS = ("app_id", "installation_id", "repository_id", "credential_attestation_digest")
+_MAX_RENDERED_REPORT_BYTES = 256 * 1024
 
 
 def _target_from_payload(payload: Mapping[str, Any]) -> ReviewTarget:
@@ -111,7 +131,14 @@ def render_report(proposal: ReviewProposal) -> str:
             lines.append(f"  <pre><code>{message}</code></pre>")
     else:
         lines.extend(("", "No findings."))
-    return "\n".join(lines)
+    if proposal.validation_ledger or proposal.exemption_ids:
+        lines.extend(("", render_validation_section(
+            proposal.validation_ledger, exempt=bool(proposal.exemption_ids), scope=proposal.scope,
+        )))
+    body = "\n".join(lines)
+    if not body or body != body.strip() or len(body.encode("utf-8")) > _MAX_RENDERED_REPORT_BYTES:
+        raise PublisherError("rendered report is empty, padded, or exceeds 256 KiB")
+    return body
 
 
 class ReviewPublisher:
@@ -141,6 +168,7 @@ class ReviewPublisher:
         self._author_authorizer = author_authorizer
         self._discovery_authority_enabled = False
         self._discovery_requires_dismissal = False
+        self._history_capsule: Any | None = None
 
     @property
     def _trusted_authors(self) -> frozenset[str]:
@@ -325,6 +353,8 @@ class ReviewPublisher:
                             [record.envelope for record in historical],
                             expected_target=expected,
                             trusted_authors=self._trusted_authors,
+                            configuration=self._configuration,
+                            capsule=self._history_capsule,
                         )
                     except ValueError:
                         continue
@@ -335,6 +365,8 @@ class ReviewPublisher:
                         [record.envelope for record in attempt_group],
                         expected_target=expected,
                         trusted_authors=self._trusted_authors,
+                        configuration=self._configuration,
+                        capsule=self._history_capsule,
                     )
                 except ValueError as exc:
                     if expected == target and attempt == canonical_attempt and "no valid non-revoked intent" not in str(exc):
@@ -356,6 +388,8 @@ class ReviewPublisher:
                 [record.envelope for record in history.current],
                 expected_target=target,
                 trusted_authors=self._trusted_authors,
+                configuration=self._configuration,
+                capsule=self._history_capsule,
             )
         except ValueError as exc:
             raise _CanonicalChanged("canonical intent is no longer active") from exc
@@ -394,6 +428,13 @@ class ReviewPublisher:
         return value
 
     def _check_discovery_authority(self, target: ReviewTarget, *, require_cleanup: bool | None = None) -> None:
+        source = self._configuration.source
+        if source is None or not source.authenticated or source.repository != target.repository:
+            raise PublisherError("authenticated configuration source does not match target repository")
+        try:
+            self._client.revalidate_config_source(source)
+        except Exception as exc:
+            raise PublisherError("configuration provenance could not be revalidated") from exc
         if not self._discovery_authority_enabled:
             return
         try:
@@ -525,6 +566,8 @@ class ReviewPublisher:
                 [record.envelope for record in history.current],
                 expected_target=target,
                 trusted_authors=self._trusted_authors,
+                configuration=self._configuration,
+                capsule=self._history_capsule,
             )
             attempt_id = canonical.payload.get("attempt_id")
             for record in history.current:
@@ -549,12 +592,14 @@ class ReviewPublisher:
         intent_node: str | None = None,
         keep_node: str | None = None,
         keep_is_review: bool = False,
+        capsule: Any | None = None,
     ) -> bool:
         """Public, authority-checked discovery reconciliation operation."""
         source = self._configuration.source
         if not isinstance(target, ReviewTarget) or source is None or target.repository != source.repository:
             raise PublisherError("discovery reconciliation target is not bound to the configured repository")
         self._discovery_authority_enabled = True
+        self._history_capsule = capsule
         try:
             self._discovery_requires_dismissal = False
             self._check_discovery_authority(target, require_cleanup=False)
@@ -600,6 +645,7 @@ class ReviewPublisher:
         finally:
             self._discovery_requires_dismissal = False
             self._discovery_authority_enabled = False
+            self._history_capsule = None
 
     def _intent_payload(self, target: ReviewTarget, attempt_id: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -611,17 +657,170 @@ class ReviewPublisher:
         payload["canonical_digest"] = canonical_digest({key: value for key, value in payload.items() if key != "canonical_digest"})
         return payload
 
-    def _report_payload(self, proposal: ReviewProposal, target: ReviewTarget, intent: GitHubEnvelope) -> dict[str, Any]:
+    def _report_payload(
+        self, proposal: ReviewProposal, target: ReviewTarget, intent: GitHubEnvelope, capsule: Any,
+    ) -> dict[str, Any]:
         body = render_report(proposal)
-        return {
+        payload: dict[str, Any] = {
             "schema": _SCHEMA, "record_type": "report", "record_id": f"report-{intent.payload['attempt_id']}",
             "target": target, "target_key": target.target_key(), "attempt_id": intent.payload["attempt_id"],
             "intent_record_id": intent.payload["record_id"], "canonical_intent_node_id": intent.node_id,
             "canonical_intent_digest": intent.payload["canonical_digest"], "head_sha": target.head_sha,
             "report_body": body, "report_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            **proposal.coverage_mapping(),
+            **capsule_coverage(capsule),
             **self._app_provenance_payload(),
         }
+        payload.update({
+            "capsule_digest": capsule.digest,
+            "capsule_paths": [entry.path for entry in capsule.manifest],
+            "capsule_target_key": capsule.target_key,
+        })
+        if proposal.scope is not None:
+            payload["scope"] = proposal.scope.to_mapping()
+        if proposal.configuration_source_digest is not None:
+            payload.update({
+                "validation_ledger": [row.to_mapping() for row in proposal.validation_ledger],
+                "configuration_source_digest": proposal.configuration_source_digest,
+            })
+        if proposal.exemption_ids:
+            payload.update({
+                "exemption_ids": list(proposal.exemption_ids),
+                "exemption_paths": list(proposal.exemption_paths),
+            })
+        return payload
+
+    def _reconstruct_and_validate_capsule(
+        self, proposal: ReviewProposal, target: ReviewTarget,
+    ) -> Any:
+        try:
+            capsule = build_review_capsule(self._client, target)
+            if not isinstance(capsule, ReviewCapsule) or not capsule.complete:
+                raise ValueError("review capsule is incomplete")
+            if capsule.digest != proposal.capsule_digest:
+                raise ValueError("review capsule digest does not match proposal")
+            if proposal.coverage_mapping() != capsule_coverage(capsule):
+                raise ValueError("review proposal coverage does not match authenticated capsule")
+            expected_scope = derive_protected_review_scope(capsule, self._configuration.capabilities)
+            if proposal.scope != expected_scope:
+                raise ValueError("review proposal scope does not match protected capsule scope")
+            return capsule
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _PreflightRejected("proposal capsule or protected scope could not be authenticated") from exc
+        except Exception as exc:
+            raise _PreflightRejected("proposal capsule could not be reconstructed") from exc
+
+    def _validate_proposal_configuration(
+        self, proposal: ReviewProposal, target: ReviewTarget, capsule: Any,
+    ) -> None:
+        source = self._configuration.source
+        if proposal.validation_ledger or proposal.configuration_source_digest is not None:
+            if source is None or not source.authenticated:
+                raise PublisherError("validation proposal requires an authenticated configuration source")
+            if proposal.configuration_source_digest != source.config_digest:
+                raise PublisherError("proposal configuration source digest does not match publisher configuration")
+            ledger_payload = {
+                "validation_ledger": [row.to_mapping() for row in proposal.validation_ledger],
+                "configuration_source_digest": proposal.configuration_source_digest,
+                "target": target,
+                "scope": proposal.scope.to_mapping() if proposal.scope is not None else None,
+                "capsule_digest": capsule.digest,
+                "capsule_paths": [entry.path for entry in capsule.manifest],
+                "capsule_target_key": capsule.target_key,
+                **capsule_coverage(capsule),
+            }
+            if proposal.exemption_ids:
+                ledger_payload.update({
+                    "exemption_ids": list(proposal.exemption_ids),
+                    "exemption_paths": list(proposal.exemption_paths),
+                })
+            try:
+                validate_validation_ledger(
+                    ledger_payload, configuration=self._configuration, capsule=capsule,
+                )
+                if proposal.exemption_ids:
+                    expected = protected_exemption_evidence(
+                        self._configuration.capabilities["exemptions"], proposal.exemption_paths,
+                    )
+                    if expected != (proposal.exemption_ids, proposal.exemption_paths):
+                        raise ValueError("exemption evidence does not match protected policy")
+                    manifest_paths = tuple(item.path for item in capsule.manifest)
+                    actual = protected_exemption_evidence(
+                        self._configuration.capabilities["exemptions"], manifest_paths,
+                    )
+                    if (
+                        not capsule.complete
+                        or capsule.digest != proposal.capsule_digest
+                        or actual != (proposal.exemption_ids, proposal.exemption_paths)
+                    ):
+                        raise ValueError("protected exemption capsule evidence does not match proposal")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise _PreflightRejected("proposal validation ledger is not protected by publisher configuration") from exc
+
+    def _require_matching_report_binding(self, report: _HistoryRecord, proposal: ReviewProposal) -> None:
+        payload = report.envelope.payload
+        has_binding = "validation_ledger" in payload or "configuration_source_digest" in payload
+        expected_binding = proposal.configuration_source_digest is not None
+        if has_binding != expected_binding:
+            raise PublisherError("existing report validation binding does not match proposal")
+        if expected_binding and (
+            payload.get("configuration_source_digest") != proposal.configuration_source_digest
+            or canonical_json(payload.get("validation_ledger"))
+                != canonical_json([row.to_mapping() for row in proposal.validation_ledger])
+            or tuple(payload.get("exemption_ids", ())) != proposal.exemption_ids
+            or tuple(payload.get("exemption_paths", ())) != proposal.exemption_paths
+            or canonical_json(payload.get("scope"))
+                != canonical_json(proposal.scope.to_mapping() if proposal.scope is not None else None)
+            or payload.get("capsule_digest") != proposal.capsule_digest
+            or payload.get("capsule_target_key") != proposal.target.target_key()
+            or (
+                self._history_capsule is not None
+                and tuple(payload.get("capsule_paths", ()))
+                != tuple(entry.path for entry in self._history_capsule.manifest)
+            )
+        ):
+            raise PublisherError("existing report validation ledger does not match proposal")
+
+    def _preflight_report_comment(
+        self, proposal: ReviewProposal, target: ReviewTarget, attempt_id: str, capsule: ReviewCapsule,
+    ) -> None:
+        """Bound the exact report comment before the intent mutation.
+
+        GitHub node IDs are bounded at the authenticated boundary to 128 UTF-8
+        bytes.  A control-escape-filled placeholder therefore gives a
+        conservative upper bound for the only report field not known before
+        intent creation.
+        """
+        # JSON control escapes are larger than UTF-8 code points, so they are
+        # the conservative placeholder for a 128-byte authenticated node ID.
+        placeholder_node = "\x00" * 128
+        placeholder_intent = GitHubEnvelope(
+            self._intent_payload(target, attempt_id), placeholder_node,
+            self._operator["principal"]["login"], "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+            self._operator["principal"]["type"],
+        )
+        try:
+            visible_body = render_report(proposal)
+            if proposal.validation_ledger or proposal.exemption_ids:
+                validate_rendered_validation_section(
+                    visible_body, proposal.validation_ledger, exempt=bool(proposal.exemption_ids), scope=proposal.scope,
+                )
+            report_payload = self._report_payload(proposal, target, placeholder_intent, capsule)
+            report_envelope = GitHubEnvelope(
+                report_payload, placeholder_node, self._operator["principal"]["login"],
+                "2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z",
+                self._operator["principal"]["type"],
+            )
+            validate_report(
+                report_envelope, placeholder_intent, canonical_intent=placeholder_intent,
+                trusted_authors={self._operator["principal"]["login"]},
+                configuration=self._configuration, capsule=capsule,
+            )
+            encode_protocol_body(
+                report_payload,
+                visible_body=visible_body,
+            )
+        except (GitHubBoundaryError, TypeError, ValueError) as exc:
+            raise _PreflightRejected("report comment exceeds the pre-publication size bound") from exc
 
     def _metadata_payload(self, target: ReviewTarget, intent: GitHubEnvelope, report: GitHubEnvelope) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -661,10 +860,11 @@ class ReviewPublisher:
         self, target: ReviewTarget, payload: Mapping[str, Any], *, attempt_id: str | None = None,
         intent_node: str | None = None, visible_body: str | None = None,
     ) -> GitHubEnvelope:
+        encoded_body = encode_protocol_body(payload, visible_body=visible_body)
         response = self._mutate(
             target,
             lambda: self._client.create_issue_comment(
-                target.repository, target.number, encode_protocol_body(payload, visible_body=visible_body)
+                target.repository, target.number, encoded_body
             ),
             attempt_id=attempt_id,
             intent_node=intent_node,
@@ -847,6 +1047,10 @@ class ReviewPublisher:
             raise PublisherError("publish requires a validated ReviewProposal and complete ReviewTarget")
         if proposal.target != target:
             raise PublisherError("proposal and ReviewTarget do not match")
+        if proposal.scope is None:
+            raise PublisherError("new proposals require an explicit model/hardware scope")
+        if not proposal.validation_ledger and not proposal.exemption_ids:
+            raise PublisherError("new proposals require protected validation evidence or an authenticated exemption")
         if self._configuration.source is None or self._configuration.source.repository != target.repository:
             raise PublisherError("authenticated configuration source does not match target repository")
         try:
@@ -857,6 +1061,16 @@ class ReviewPublisher:
         try:
             self._client.revalidate_config_source(self._configuration.source)
             self._assert_target(target)
+            capsule = self._reconstruct_and_validate_capsule(proposal, target)
+            self._history_capsule = capsule
+            try:
+                render_report(proposal)
+                self._validate_proposal_configuration(proposal, target, capsule)
+                self._preflight_report_comment(proposal, target, attempt_id, capsule)
+            except _PreflightRejected:
+                raise
+            except PublisherError as exc:
+                raise _PreflightRejected(str(exc)) from exc
             if proposal.verdict == "incomplete":
                 self._reapply_label(target, attempt_id)
                 return PublishResult("incomplete", attempt_id, reason="proposal verdict is incomplete")
@@ -866,6 +1080,7 @@ class ReviewPublisher:
                 elected = validate_protocol(
                     [record.envelope for record in history.current],
                     expected_target=target, trusted_authors=self._trusted_authors,
+                    configuration=self._configuration, capsule=capsule,
                 ) if history.current else None
             except ValueError as exc:
                 if "no valid non-revoked intent" not in str(exc):
@@ -883,6 +1098,7 @@ class ReviewPublisher:
                 metadata = self._review_metadata(history, target, attempt_id, proposal.verdict)
                 if report is None or metadata is None:
                     raise PublisherError("completion dependencies are missing")
+                self._require_matching_report_binding(report, proposal)
                 self._remove_label(
                     target, attempt_id, canonical.node_id, metadata.envelope.node_id,
                     keep_is_review=metadata.is_review,
@@ -891,15 +1107,19 @@ class ReviewPublisher:
                                      "canonical attempt is already complete")
 
             report = self._find_record(history, target, attempt_id, "report")
+            if report is not None:
+                self._require_matching_report_binding(report, proposal)
             if report is None:
                 report_envelope = self._new_comment(
-                    target, self._report_payload(proposal, target, intent),
+                    target, self._report_payload(proposal, target, intent, capsule),
                     attempt_id=attempt_id, intent_node=canonical.node_id,
                     visible_body=render_report(proposal),
                 )
                 report = _HistoryRecord(report_envelope, False, 0)
             history = self._history(target)
             report = self._find_record(history, target, attempt_id, "report") or report
+            assert report is not None
+            self._require_matching_report_binding(report, proposal)
 
             metadata = self._review_metadata(history, target, attempt_id, proposal.verdict)
             if metadata is None:
@@ -930,6 +1150,8 @@ class ReviewPublisher:
                 keep_is_review=metadata.is_review,
             )
             return PublishResult("complete", attempt_id, report.envelope, metadata.envelope, completion.envelope)
+        except _PreflightRejected as exc:
+            return PublishResult("error", attempt_id, reason=str(exc))
         except _StaleTarget as exc:
             return self._recover(target, attempt_id, "stale", str(exc))
         except _CanonicalChanged as exc:

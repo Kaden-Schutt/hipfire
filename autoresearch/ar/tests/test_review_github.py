@@ -12,6 +12,8 @@ import pytest
 import autoresearch.ar.review.github as github
 from autoresearch.ar.review.canonical import canonical_digest
 from autoresearch.ar.review.github import (
+    decode_protocol_body,
+    encode_protocol_body,
     GitHubBoundaryError,
     GitHubClient,
     PreflightError,
@@ -440,6 +442,45 @@ def test_protocol_body_recursion_failure_is_a_bounded_boundary_error():
     hostile = dict(record(), body=nested)
     with pytest.raises(GitHubBoundaryError, match="protocol payload|body"):
         GitHubClient(FakeRunner([result(hostile)])).comment_envelope(REPO, 11)
+
+
+def test_protocol_body_round_trip_preserves_report_visible_prefix_exactly():
+    payload = body_payload("report-visible")
+    payload.update({
+        "record_type": "report",
+        "report_body": "Line | <tag>\r\nsecond",
+        "report_body_sha256": hashlib.sha256("Line | <tag>\r\nsecond".encode()).hexdigest(),
+    })
+    body = encode_protocol_body(payload, visible_body=payload["report_body"])
+    assert decode_protocol_body(body) == payload
+    with pytest.raises(GitHubBoundaryError, match="visible|report_body"):
+        encode_protocol_body(payload, visible_body="Line | <tag>\nsecond")
+    with pytest.raises(GitHubBoundaryError, match="visible|report_body"):
+        decode_protocol_body(body.replace("second", "tampered", 1))
+
+
+def test_protocol_body_preserves_pure_machine_readable_comments_without_stripping():
+    payload = body_payload("machine-only")
+    body = encode_protocol_body(payload)
+    assert body == json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    assert decode_protocol_body(body) == payload
+
+
+def test_ledger_bearing_machine_only_report_is_rejected_at_encode_but_legacy_report_is_allowed():
+    ledger_report = {"schema": "agentic-review/v1", "record_type": "report", "validation_ledger": []}
+    with pytest.raises(GitHubBoundaryError, match="visible|protocol body"):
+        encode_protocol_body(ledger_report)
+    legacy_report = {"schema": "agentic-review/v1", "record_type": "report", "report_body": "legacy"}
+    assert decode_protocol_body(encode_protocol_body(legacy_report)) == legacy_report
+
+
+def test_protocol_comment_size_bound_is_checked_before_mutation_boundary():
+    base = {"record_type": "intent", "blob": ""}
+    overhead = len(encode_protocol_body(base).encode("utf-8"))
+    exact = {"record_type": "intent", "blob": "x" * (65_536 - overhead)}
+    assert len(encode_protocol_body(exact).encode("utf-8")) == 65_536
+    with pytest.raises(GitHubBoundaryError, match="65,536|size|bound"):
+        encode_protocol_body({"record_type": "intent", "blob": "x" * 65_536})
 
 
 @pytest.mark.parametrize("include_http_headers", [False, True])

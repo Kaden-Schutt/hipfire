@@ -58,16 +58,19 @@ _LIVE_RUNNER = None
 X_OID = hashlib.sha1(b"blob 6\0x = 1\n").hexdigest()
 
 
-def protected_configuration(policy=None):
+def protected_configuration(policy=None, capability_policy=None):
     global _CONFIGURATION, _LIVE_CLIENT, _LIVE_RUNNER
-    if policy is None and _CONFIGURATION is not None:
+    if policy is None and capability_policy is None and _CONFIGURATION is not None:
         return _CONFIGURATION
     root = Path(tempfile.mkdtemp())
     config_dir = root / ".github" / "agentic-review"
     config_dir.mkdir(parents=True)
     (config_dir / "providers.json").write_text(json.dumps(policy or POLICY), encoding="utf-8")
-    for name in ("capabilities-v1.json", "trusted-publishers.json"):
-        shutil.copy(ROOT / ".github" / "agentic-review" / name, config_dir / name)
+    if capability_policy is None:
+        shutil.copy(ROOT / ".github" / "agentic-review" / "capabilities-v1.json", config_dir / "capabilities-v1.json")
+    else:
+        (config_dir / "capabilities-v1.json").write_text(json.dumps(capability_policy), encoding="utf-8")
+    shutil.copy(ROOT / ".github" / "agentic-review" / "trusted-publishers.json", config_dir / "trusted-publishers.json")
     contents = tuple((config_dir / name).read_bytes() for name in (
         "providers.json", "capabilities-v1.json", "trusted-publishers.json",
     ))
@@ -102,22 +105,22 @@ def protected_configuration(policy=None):
         "owner/repo", commit_sha="c" * 40, repository_root=str(root)
     )
     loaded = load_review_configuration(root, source=source)
-    if policy is None:
+    if policy is None and capability_policy is None:
         _CONFIGURATION = loaded
-        class LiveRunner:
-            def __init__(self):
-                self.head = "c" * 40
+    class LiveRunner:
+        def __init__(self):
+            self.head = "c" * 40
 
-            def __call__(self, argv, input_data=None):
-                path = argv[-1].split("?", 1)[0]
-                if "/git/ref/heads/" in path:
-                    payload = {"ref": "refs/heads/main", "object": {"sha": self.head, "type": "commit"}}
-                else:
-                    payload = {"id": 1, "full_name": "owner/repo", "default_branch": "main"}
-                return subprocess.CompletedProcess(argv, 0, header + json.dumps(payload), "")
+        def __call__(self, argv, input_data=None):
+            path = argv[-1].split("?", 1)[0]
+            if "/git/ref/heads/" in path:
+                payload = {"ref": "refs/heads/main", "object": {"sha": self.head, "type": "commit"}}
+            else:
+                payload = {"id": 1, "full_name": "owner/repo", "default_branch": "main"}
+            return subprocess.CompletedProcess(argv, 0, header + json.dumps(payload), "")
 
-        _LIVE_RUNNER = LiveRunner()
-        _LIVE_CLIENT = GitHubClient(_LIVE_RUNNER)
+    _LIVE_RUNNER = LiveRunner()
+    _LIVE_CLIENT = GitHubClient(_LIVE_RUNNER)
     return loaded
 
 
@@ -184,10 +187,19 @@ def Transport(response):
 
 
 def valid_response(**changes):
-    content = {"verdict": "clean", "findings": []}
+    content = {
+        "verdict": "clean",
+        "findings": [],
+        "validation_requests": [{"profile_id": "rdna3-smoke", "rationale": "run the protected smoke fixture"}],
+        "scope": {
+            "model_architectures": ["qwen3.6-27b"],
+            "hardware_architectures": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
+        },
+    }
     value = {"choices": [{"index": 0, "message": {"role": "assistant", "content": json.dumps(content)}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}, "cost_usd": 0.01}
-    if "verdict" in changes or "findings" in changes:
-        content.update({key: changes.pop(key) for key in tuple(changes) if key in {"verdict", "findings"}})
+    response_keys = {"verdict", "findings", "validation_requests", "scope"}
+    if response_keys.intersection(changes):
+        content.update({key: changes.pop(key) for key in tuple(changes) if key in response_keys})
         value["choices"][0]["message"]["content"] = json.dumps(content)
     value.update(changes)
     return HttpResponse(200, {"content-type": "application/json"}, json.dumps(value).encode())
@@ -227,6 +239,17 @@ def test_exactly_one_toolless_https_request_and_bound_proposal():
     assert request_json["max_output_tokens"] == 128
     assert request_json["response_format"]["type"] == "json_schema"
     assert "x.py" in request_json["messages"][1]["content"]
+
+
+@pytest.mark.parametrize("missing", ["validation_requests", "scope"])
+def test_live_provider_parser_rejects_legacy_two_field_proposals(missing):
+    response = valid_response()
+    payload = json.loads(response.body)
+    content = json.loads(payload["choices"][0]["message"]["content"])
+    content.pop(missing)
+    payload["choices"][0]["message"]["content"] = json.dumps(content)
+    with pytest.raises(ToollessInferenceError, match="unknown or missing"):
+        adapter(Transport(HttpResponse(200, response.headers, json.dumps(payload).encode()))).review(capsule())
 
 
 def test_configuration_repository_must_match_capsule_target():
@@ -478,3 +501,242 @@ def test_citations_and_findings_must_be_inside_capsule(finding):
     response = valid_response(verdict="changes-requested", findings=[finding])
     with pytest.raises(ToollessInferenceError, match="finding|citation|range|path|severity"):
         adapter(Transport(response)).review(capsule())
+
+
+def test_provider_request_contains_only_protected_validation_profile_catalogue():
+    transport = Transport(valid_response())
+    adapter(transport).review(capsule())
+    request = json.loads(transport.calls[0].data)
+
+    assert "validation_catalogue" not in request
+    user_content = request["messages"][1]["content"]
+    catalogue_json = user_content.split("VALIDATION_PROFILE_CATALOGUE_JSON=", 1)[1].split(
+        "\nCAPSULE_JSON_STRING=", 1
+    )[0]
+    catalogue = json.loads(catalogue_json)
+    assert [profile["id"] for profile in catalogue] == sorted(profile["id"] for profile in catalogue)
+    assert catalogue
+    assert all(set(profile) == {
+        "id", "model_architecture", "fixture_id",
+        "representative_hardware", "covered_hardware",
+    } for profile in catalogue)
+    assert len(catalogue_json.encode("utf-8")) <= 64 * 1024
+    assert not any(field in json.dumps(catalogue) for field in ("commands", "paths", "environment", "secret", "policy"))
+
+    schema = request["response_format"]["json_schema"]["schema"]
+    validation_schema = schema["properties"]["validation_requests"]
+    assert "validation_requests" in schema["required"]
+    assert "scope" in schema["required"]
+    assert validation_schema["maxItems"] == 64
+    assert validation_schema["items"]["additionalProperties"] is False
+    assert validation_schema["items"]["required"] == ["profile_id", "rationale"]
+    assert set(validation_schema["items"]["properties"]) == {"profile_id", "rationale"}
+
+
+def test_trusted_instruction_requires_authoritative_profile_selection_requests():
+    transport = Transport(valid_response())
+    adapter(transport).review(capsule())
+    instruction = json.loads(transport.calls[0].data)["messages"][0]["content"].lower()
+
+    for semantic in (
+        "inspect only the supplied immutable capsule",
+        "validation_profile_catalogue_json",
+        "authoritative protected selection data",
+        "select every relevant protected profile",
+        "one validation_requests item per selected profile",
+        "only profile_id and a concise rationale",
+        "no invented hardware, fixture, or commands",
+        "empty validation_requests array only when no profile is relevant",
+        "required for hardware/model smoke validation",
+        "complete touched model_architectures",
+        "complete touched hardware_architectures",
+    ):
+        assert semantic in instruction
+
+
+def test_oversized_protected_profile_catalogue_is_rejected_before_request():
+    custom_capabilities = json.loads(
+        (ROOT / ".github" / "agentic-review" / "capabilities-v1.json").read_text(encoding="utf-8")
+    )
+    custom_capabilities["profiles"][0]["model_architecture"] = "x" * (64 * 1024)
+    configuration = protected_configuration(capability_policy=custom_capabilities)
+    review_adapter = configured_adapter(
+        configuration, Transport(valid_response()), {"REVIEW_API_KEY": "secret"}
+    )
+
+    with pytest.raises(ToollessInferenceError, match="catalogue|byte"):
+        review_adapter._request_body(capsule())
+
+
+def test_provider_hardware_override_is_rejected():
+    response = valid_response(validation_requests=[{
+        "profile_id": "rdna3-smoke",
+        "rationale": "run the protected smoke fixture",
+        "hardware": "provider-selected-hardware",
+    }])
+    with pytest.raises(ToollessInferenceError, match="unknown|missing|validation request"):
+        adapter(Transport(response)).review(capsule())
+
+
+def test_validation_request_is_enriched_from_protected_profile_and_capability():
+    configuration = protected_configuration()
+    profile = next(item for item in configuration.capabilities["profiles"] if item["id"] == "rdna3-smoke")
+    capability = next(item for item in configuration.capabilities["capabilities"] if item["id"] == profile["capability_id"])
+    transport = Transport(valid_response(validation_requests=[{
+        "profile_id": "rdna3-smoke",
+        "rationale": "  inspect\n  the smoke result  ",
+    }], scope={
+        "model_architectures": ["qwen3.6-27b"],
+        "hardware_architectures": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
+    }))
+
+    proposal = adapter(transport).review(capsule())
+
+    assert len(proposal.validation_ledger) == 1
+    row = proposal.validation_ledger[0]
+    assert row.rationales == ("inspect the smoke result",)
+    assert row.model_architecture == profile["model_architecture"]
+    assert row.representative_hardware == profile["representative_hardware"]
+    assert row.covered_hardware == tuple(profile["covered_hardware"])
+    assert row.fixture_id == profile["fixture_id"]
+    assert row.fixture_digest == profile["fixture_digest"]
+    assert row.contract_digest == capability["contract_digest"]
+    assert row.profile_snapshot == profile
+    assert proposal.configuration_source_digest == configuration.source.config_digest
+    assert proposal.scope.model_architectures == ("qwen3.6-27b",)
+    assert proposal.scope.hardware_architectures == ("gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151")
+
+
+def test_unapproved_scope_is_rejected_for_non_exempt_capsule():
+    with pytest.raises(ToollessInferenceError, match="scope|protected"):
+        adapter(Transport(valid_response(
+            validation_requests=[{"profile_id": "rdna3-smoke", "rationale": "check it"}],
+            scope={"model_architectures": ["qwen3.6-27b"], "hardware_architectures": ["gfx9999"]},
+        ))).review(capsule())
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"model_architectures": [], "hardware_architectures": []},
+        {"model_architectures": ["qwen3.6-27b"], "hardware_architectures": ["gfx1100"]},
+    ],
+)
+def test_scope_must_exactly_match_protected_capsule_scope(scope):
+    with pytest.raises(ToollessInferenceError, match="scope"):
+        adapter(Transport(valid_response(
+            validation_requests=[{"profile_id": "rdna3-smoke", "rationale": "check it"}],
+            scope=scope,
+        ))).review(capsule())
+
+
+@pytest.mark.parametrize(
+    "requests, message",
+    [
+        ([{"profile_id": "unknown-profile", "rationale": "not protected"}], "unknown"),
+        ([
+            {"profile_id": "rdna3-smoke", "rationale": "first"},
+            {"profile_id": "rdna3-smoke", "rationale": "second"},
+        ], "duplicate"),
+    ],
+)
+def test_validation_request_profile_ids_must_be_known_and_unique(requests, message):
+    with pytest.raises(ToollessInferenceError, match=message):
+        adapter(Transport(valid_response(validation_requests=requests))).review(capsule())
+
+
+def test_validation_rationale_is_normalized_and_bounded():
+    proposal = adapter(Transport(valid_response(validation_requests=[{
+        "profile_id": "rdna3-smoke",
+        "rationale": "  first\nsecond  ",
+    }]))).review(capsule())
+    assert proposal.validation_ledger[0].rationales == ("first second",)
+
+    with pytest.raises(ToollessInferenceError, match="rationale|limit"):
+        adapter(Transport(valid_response(validation_requests=[{
+            "profile_id": "rdna3-smoke",
+            "rationale": "x" * 1025,
+        }]))).review(capsule())
+
+    accepted = adapter(Transport(valid_response(validation_requests=[{
+        "profile_id": "rdna3-smoke",
+        "rationale": "😀" * 256,
+    }]))).review(capsule())
+    assert len(accepted.validation_ledger[0].rationales[0].encode("utf-8")) == 1024
+
+    with pytest.raises(ToollessInferenceError, match="rationale|limit"):
+        adapter(Transport(valid_response(validation_requests=[{
+            "profile_id": "rdna3-smoke",
+            "rationale": "😀" * 257,
+        }]))).review(capsule())
+
+
+def test_empty_validation_requests_are_incomplete_for_non_exempt_changes():
+    proposal = adapter(Transport(valid_response(validation_requests=[]))).review(capsule())
+    assert proposal.verdict == "incomplete"
+    assert proposal.validation_ledger == ()
+    assert proposal.configuration_source_digest is None
+
+
+def test_reverse_ordered_validation_selections_are_serialized_by_request_id():
+    profile_ids = ["dflash-coherence", "rdna3-smoke"]
+    profile_ids.sort(key=lambda profile_id: "vr-" + hashlib.sha256(profile_id.encode()).hexdigest()[:16])
+    requests = [{"profile_id": profile_id, "rationale": "check it"} for profile_id in reversed(profile_ids)]
+    proposal = adapter(Transport(valid_response(validation_requests=requests))).review(capsule())
+    assert tuple(row.request_id for row in proposal.validation_ledger) == tuple(
+        sorted(row.request_id for row in proposal.validation_ledger)
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"verdict": "not-a-verdict", "findings": []},
+        {"verdict": "clean", "findings": [{"path": "x.py", "range": [1, 1], "severity": "error", "message": "bad"}]},
+        {"verdict": "changes-requested", "findings": []},
+    ],
+)
+def test_original_verdict_and_finding_consistency_are_validated_before_downgrade(content):
+    with pytest.raises(ToollessInferenceError, match="verdict|actionable|finding"):
+        adapter(Transport(valid_response(**content))).review(capsule())
+
+
+def test_policy_exempt_empty_ledger_is_clean_and_binds_configuration_digest():
+    custom_capabilities = json.loads(
+        (ROOT / ".github" / "agentic-review" / "capabilities-v1.json").read_text(encoding="utf-8")
+    )
+    custom_capabilities["exemptions"] = [{"id": "test-exempt", "path_globs": ["x.py"]}]
+    configuration = protected_configuration(capability_policy=custom_capabilities)
+    proposal = configured_adapter(
+        configuration,
+        Transport(valid_response(
+            validation_requests=[],
+            scope={"model_architectures": [], "hardware_architectures": []},
+        )),
+        {"REVIEW_API_KEY": "secret"},
+    ).review(capsule())
+
+    assert proposal.verdict == "clean"
+    assert proposal.validation_ledger == ()
+    assert proposal.configuration_source_digest == configuration.source.config_digest
+    assert proposal.exemption_ids == ("test-exempt",)
+    assert proposal.exemption_paths == ("x.py",)
+    with pytest.raises(ValueError, match="proposal digest"):
+        replace(proposal, configuration_source_digest="sha256:" + "0" * 64)
+
+
+def test_validation_request_id_collision_is_rejected(monkeypatch):
+    real_row = inference_module.ValidationLedgerRow
+
+    def colliding_row(*args, **kwargs):
+        row = real_row(*args, **kwargs)
+        object.__setattr__(row, "request_id", "vr-collision")
+        return row
+
+    monkeypatch.setattr(inference_module, "ValidationLedgerRow", colliding_row)
+    requests = [
+        {"profile_id": "rdna3-smoke", "rationale": "check smoke"},
+        {"profile_id": "dflash-coherence", "rationale": "check coherence"},
+    ]
+    with pytest.raises(ToollessInferenceError, match="collision"):
+        adapter(Transport(valid_response(validation_requests=requests))).review(capsule())

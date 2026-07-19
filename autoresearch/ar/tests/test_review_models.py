@@ -9,6 +9,8 @@ import pytest
 
 from autoresearch.ar.review.models import (
     AttemptIntentConfig,
+    ValidationLedgerRow,
+    ValidationProfile,
     Finding,
     GitHubEnvelope,
     IntentPayload,
@@ -18,7 +20,10 @@ from autoresearch.ar.review.models import (
     TrustedApp,
     TrustedPublisher,
     ValidationRequest,
+    ProposedValidationObligation,
     capability_contract_digest,
+    profile_digest,
+    protected_exemption_evidence,
     load_capability_policy,
     load_provider_policy,
     load_trusted_publishers_policy,
@@ -26,7 +31,8 @@ from autoresearch.ar.review.models import (
     validate_provider_policy,
     validate_trusted_publishers_policy,
 )
-from autoresearch.ar.review.canonical import canonical_digest, canonical_json
+from autoresearch.ar.review.canonical import canonical_digest, canonical_json, canonical_loads
+from autoresearch.ar.review.validation import MAX_VALIDATION_LEDGER_BYTES
 
 
 ROOT = Path(__file__).parents[3]
@@ -92,15 +98,18 @@ def test_contracts_are_frozen():
             ProviderPolicy,
             TrustedApp,
             TrustedPublisher,
+            ValidationProfile,
+            ProposedValidationObligation,
+            ValidationLedgerRow,
         )
     )
 
 
 def test_empty_capability_policy_is_rejected():
+    policy = json.loads((POLICY_DIR / "capabilities-v1.json").read_text())
+    policy["capabilities"] = []
     with pytest.raises(ValueError, match="capabilit"):
-        validate_capability_policy(
-            {"schema": "hipfire.agentic-review.capabilities", "version": 1, "capabilities": []}
-        )
+        validate_capability_policy(policy)
 
 
 @pytest.mark.parametrize(
@@ -163,6 +172,7 @@ def test_capability_policy_shape_and_loader():
 
     assert policy["schema"] == "hipfire.agentic-review.capabilities"
     assert policy["version"] == 1
+    assert policy["fixtures"]
     capabilities = policy["capabilities"]
     assert {capability["id"] for capability in capabilities} == {
         "hipfire/rdna3-smoke@1",
@@ -484,3 +494,176 @@ def test_review_proposal_rejects_arbitrary_verdict(verdict):
     with pytest.raises(ValueError, match="verdict"):
         ReviewProposal(TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, verdict, (),
                        "openai-compatible", "1", "review-model-v1", "sha256:" + "c" * 64)
+
+
+PROFILE = ValidationProfile(
+    id="rdna3-smoke",
+    capability_id="hipfire/rdna3-smoke@1",
+    model_architecture="qwen3.6-27b",
+    fixture_id="qwen3.6-27b-rdna3-smoke-v1",
+    fixture_digest="sha256:" + "f" * 64,
+    representative_hardware="gfx1100",
+    covered_hardware=("gfx1100", "gfx1101"),
+)
+
+
+def test_exemption_evidence_derives_sorted_ids_across_separate_entries():
+    exemptions = [
+        {"id": "docs", "path_globs": ["docs/**"]},
+        {"id": "src", "path_globs": ["src/**"]},
+    ]
+    assert protected_exemption_evidence(exemptions, ["src/main.py", "docs/review.md"]) == (
+        ("docs", "src"), ("docs/review.md", "src/main.py"),
+    )
+
+
+def test_profile_identifier_128_bytes_is_allowed_but_129_is_rejected():
+    valid = ValidationProfile("p" * 128, PROFILE.capability_id, PROFILE.model_architecture,
+                              PROFILE.fixture_id, PROFILE.fixture_digest,
+                              PROFILE.representative_hardware, PROFILE.covered_hardware)
+    row = ValidationLedgerRow(valid, "sha256:" + "2" * 64, "representative")
+    values = {
+        "target": TARGET, "target_key": TARGET.target_key(), "capsule_digest": "sha256:" + "a" * 64,
+        "adapter_id": "adapter", "adapter_version": "1", "model": "model",
+        "response_digest": "sha256:" + "c" * 64, "verdict": "clean", "findings": (),
+        "validation_ledger": (row.to_mapping(),), "configuration_source_digest": "sha256:" + "d" * 64,
+    }
+    ReviewProposal(TARGET, values["capsule_digest"], "sha256:" + canonical_digest(values), "clean", (),
+                   "adapter", "1", "model", values["response_digest"], validation_ledger=(row,),
+                   configuration_source_digest=values["configuration_source_digest"])
+    invalid_profile = ValidationProfile("p" * 129, PROFILE.capability_id, PROFILE.model_architecture,
+                                        PROFILE.fixture_id, PROFILE.fixture_digest,
+                                        PROFILE.representative_hardware, PROFILE.covered_hardware)
+    invalid_row = ValidationLedgerRow(invalid_profile, "sha256:" + "2" * 64, "representative")
+    with pytest.raises(ValueError, match="128|malformed"):
+        ReviewProposal(TARGET, values["capsule_digest"], values["response_digest"], "clean", (),
+                       "adapter", "1", "model", values["response_digest"],
+                       validation_ledger=(invalid_row,), configuration_source_digest=values["configuration_source_digest"])
+
+
+def test_serialized_ledger_over_64_kib_is_rejected():
+    def rows(first_rationale_length):
+        return tuple(sorted((
+            ValidationLedgerRow(
+                ValidationProfile(f"profile-{index}", "capability", "arch", f"fixture-{index}",
+                                   "sha256:" + "f" * 64, "gfx1100", ("gfx1100",)),
+                "sha256:" + "2" * 64, "representative",
+                ProposedValidationObligation(f"profile-{index}", "x" * (
+                    first_rationale_length if index == 0 else 1024
+                )),
+            ) for index in range(35)), key=lambda row: row.request_id))
+    measured_base = len(canonical_json(tuple(row.to_mapping() for row in rows(1))))
+    exact_first_rationale_length = MAX_VALIDATION_LEDGER_BYTES - measured_base + 1
+    exact_rows = rows(exact_first_rationale_length)
+    assert len(canonical_json(tuple(row.to_mapping() for row in exact_rows))) == MAX_VALIDATION_LEDGER_BYTES
+    values = {
+        "target": TARGET, "target_key": TARGET.target_key(), "capsule_digest": "sha256:" + "a" * 64,
+        "adapter_id": "adapter", "adapter_version": "1", "model": "model",
+        "response_digest": "sha256:" + "c" * 64, "verdict": "clean", "findings": (),
+        "validation_ledger": tuple(row.to_mapping() for row in exact_rows),
+        "configuration_source_digest": "sha256:" + "d" * 64,
+    }
+    ReviewProposal(TARGET, values["capsule_digest"], "sha256:" + canonical_digest(values), "clean", (),
+                   "adapter", "1", "model", values["response_digest"], validation_ledger=exact_rows,
+                   configuration_source_digest=values["configuration_source_digest"])
+    over_rows = rows(exact_first_rationale_length + 1)
+    assert len(canonical_json(tuple(row.to_mapping() for row in over_rows))) == MAX_VALIDATION_LEDGER_BYTES + 1
+    with pytest.raises(ValueError, match="64 KiB"):
+        ReviewProposal(TARGET, values["capsule_digest"], values["response_digest"], "clean", (),
+                       "adapter", "1", "model", values["response_digest"], validation_ledger=over_rows,
+                       configuration_source_digest=values["configuration_source_digest"])
+
+
+def test_validation_profile_and_obligation_are_immutable_and_exact():
+    obligation = ProposedValidationObligation("rdna3-smoke", "  run the smoke suite\n  once ")
+
+    assert obligation.rationale == "run the smoke suite once"
+    assert PROFILE.fixture_digest != "sha256:" + hashlib.sha256(PROFILE.fixture_id.encode()).hexdigest()
+    assert set(ValidationProfile.__dataclass_fields__) == {
+        "id", "capability_id", "model_architecture", "fixture_id", "fixture_digest",
+        "representative_hardware", "covered_hardware",
+    }
+    assert set(ProposedValidationObligation.__dataclass_fields__) == {"profile_id", "rationale"}
+    with pytest.raises(FrozenInstanceError):
+        obligation.profile_id = "changed"
+
+
+def test_validation_ledger_row_derives_request_id_and_serializes_typed_snapshot():
+    obligation = ProposedValidationObligation("rdna3-smoke", "run it")
+    row = ValidationLedgerRow(PROFILE, "sha256:" + "2" * 64, "representative", (obligation,))
+    serialized = row.to_mapping()
+
+    assert row.request_id == "vr-" + hashlib.sha256(PROFILE.id.encode()).hexdigest()[:16]
+    assert len(row.request_id) == 19
+    assert serialized["profile_snapshot"] == PROFILE.to_mapping()
+    assert serialized["profile_digest"] == profile_digest(PROFILE.to_mapping())
+    assert isinstance(serialized["profile_snapshot"]["covered_hardware"], list)
+    assert serialized["status"] == "pending"
+    assert serialized["validator_snapshot"] == {}
+    assert serialized["result_snapshot"] == {}
+    decoded = canonical_loads(canonical_json(serialized))
+    assert ValidationLedgerRow.from_mapping(decoded).to_mapping() == serialized
+    with pytest.raises(TypeError):
+        ValidationLedgerRow(PROFILE, "sha256:" + "2" * 64, "representative", (), request_id="provider-id")
+
+
+@pytest.mark.parametrize("field", ["request_id", "status", "validator_snapshot", "result_snapshot", "capability_id"])
+def test_validation_ledger_row_rejects_provider_or_caller_fields(field):
+    with pytest.raises(TypeError):
+        ValidationLedgerRow(
+            PROFILE, "sha256:" + "2" * 64, "representative",
+            (ProposedValidationObligation("rdna3-smoke", "required"),), **{field: "caller-value"},
+        )
+
+
+def test_review_proposal_digest_binds_enriched_rows_and_config_source():
+    obligation = ProposedValidationObligation("rdna3-smoke", "required")
+    row = ValidationLedgerRow(PROFILE, "sha256:" + "2" * 64, "representative", (obligation,))
+    config_digest = "sha256:" + "d" * 64
+    values = {
+        "target": TARGET, "target_key": TARGET.target_key(),
+        "capsule_digest": "sha256:" + "a" * 64,
+        "adapter_id": "adapter", "adapter_version": "1", "model": "model",
+        "response_digest": "sha256:" + "c" * 64, "verdict": "clean", "findings": (),
+        "validation_ledger": (row.to_mapping(),), "configuration_source_digest": config_digest,
+    }
+    proposal = ReviewProposal(
+        TARGET, values["capsule_digest"], "sha256:" + canonical_digest(values), "clean", (),
+        "adapter", "1", "model", values["response_digest"],
+        validation_ledger=(row,), configuration_source_digest=config_digest,
+    )
+
+    assert proposal.proposal_digest == "sha256:" + canonical_digest(values)
+    with pytest.raises(ValueError, match="proposal digest"):
+        ReviewProposal(
+            TARGET, values["capsule_digest"], "sha256:" + canonical_digest({**values, "validation_ledger": ()}),
+            "clean", (), "adapter", "1", "model", values["response_digest"],
+            validation_ledger=(row,), configuration_source_digest=config_digest,
+        )
+
+
+def test_review_proposal_rejects_duplicate_and_noncanonical_ledger_order():
+    duplicate = ValidationLedgerRow(PROFILE, "sha256:" + "2" * 64, "representative", ())
+    with pytest.raises(ValueError, match="unique"):
+        ReviewProposal(
+            TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (),
+            "adapter", "1", "model", "sha256:" + "c" * 64,
+            validation_ledger=(duplicate, duplicate), configuration_source_digest="sha256:" + "d" * 64,
+        )
+
+    other_profile = ValidationProfile(
+        "another-profile", PROFILE.capability_id, PROFILE.model_architecture, "another-fixture",
+        "sha256:" + hashlib.sha256(b"another-fixture").hexdigest(),
+        PROFILE.representative_hardware, PROFILE.covered_hardware,
+    )
+    first = ValidationLedgerRow(PROFILE, "sha256:" + "2" * 64, "representative", ())
+    second = ValidationLedgerRow(other_profile, "sha256:" + "2" * 64, "representative", ())
+    rows = (first, second)
+    if tuple(row.request_id for row in rows) == tuple(sorted(row.request_id for row in rows)):
+        rows = (second, first)
+    with pytest.raises(ValueError, match="order"):
+        ReviewProposal(
+            TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (),
+            "adapter", "1", "model", "sha256:" + "c" * 64,
+            validation_ledger=rows, configuration_source_digest="sha256:" + "d" * 64,
+        )
