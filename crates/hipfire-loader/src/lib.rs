@@ -49,6 +49,11 @@ pub trait Carrier: Send + Sync {
         matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+    /// True when this carrier must derive author-recommended sampling only
+    /// after it has prepared the source it will load.
+    fn owns_recommended_sampling(&self) -> bool {
+        false
+    }
 
     /// Borrow this model's spec-decode target out of `state`, arch-erased as a
     /// [`SpecTargetGuard`]. This is the daemon's single dispatch for the
@@ -738,7 +743,8 @@ fn finish_qwen35_load(
                 match hipfire_runtime::hfq::HfqFile::open(&p) {
                     Ok(mut sidecar) => {
                         sidecar.drop_mmap();
-                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu) {
+                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu)
+                        {
                             Ok(Some((dspark_weights, assets))) => {
                                 let block = dspark_weights.cfg.block_size;
                                 // Reduced-vocab drafters (ORNITH) ship a compressed
@@ -784,7 +790,9 @@ fn finish_qwen35_load(
                                         ))
                                     }
                                     Err(e) => {
-                                        eprintln!("  qwen35: DSpark body build failed: {e} — AR/other");
+                                        eprintln!(
+                                            "  qwen35: DSpark body build failed: {e} — AR/other"
+                                        );
                                         None
                                     }
                                 }
@@ -1008,20 +1016,6 @@ pub fn load_model(
 ) -> Result<LoadedModel, String> {
     let src = ModelSource::from_path(path)?;
 
-    // Author-recommended sampling defaults (temp/top_p/top_k from the .hfq's baked
-    // `generation_config`). Extract HERE, from the already-open source, BEFORE the
-    // carrier allocates any GPU buffers. The `metadata_json` parse churns the host
-    // heap; doing it AFTER allocation but BEFORE the first-warmup AR hipGraph
-    // capture perturbs buffer placement and — on gfx12 / ROCm 7.2, which snapshots
-    // kernarg/buffer addresses at graph-instantiate — makes the captured graph
-    // replay ~2× slower (gfx12 MoE A3B 99→50; bisected to config-inheritance commit
-    // 2a7a1c8b). Parsing pre-allocation lets the heap settle. HFQ sources only;
-    // raw-safetensors PP carries no generation_config.
-    let rec_sampling = match &src {
-        ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
-        _ => None,
-    };
-
     // DFlash lm_head quant check — only for HFQ sources
     if draft_path.is_some() {
         if let ModelSource::Hfq(ref hfq) = src {
@@ -1121,13 +1115,26 @@ pub fn load_model(
             other.name()
         ));
     }
+    // Most carriers read author-recommended sampling from the already-open HFQ
+    // here, before carrier-owned GPU allocation. LFM owns this step because its
+    // retained route first rebinds the HFQ to an authenticated sealed snapshot;
+    // reading here would let sampling metadata and loaded weights come from
+    // different file versions.
+    let rec_sampling = if carrier.owns_recommended_sampling() {
+        None
+    } else {
+        match &src {
+            ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
+            ModelSource::Dir(_) => None,
+        }
+    };
     let mut result = carrier.load(src, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
-    // Apply the author-recommended sampling extracted pre-allocation (see above).
-    // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
-    // is the gfx12 hipGraph-replay regression root-caused above.
+    // Carrier-owned metadata has already been applied by that carrier. For all
+    // others, apply the pre-allocation parse without reparsing after allocation;
+    // that ordering avoids the gfx12 hipGraph replay regression.
     if let Some(rec) = rec_sampling {
         result.rec_temperature = rec.temperature;
         result.rec_top_p = rec.top_p;
@@ -1772,10 +1779,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.weights.free_gpu(gpu);
                 b.kv.free_gpu(gpu);
             }
-            ModelState::Lfm2Moe(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
+            ModelState::Lfm2Moe(b) => b.free_gpu(gpu),
             ModelState::Minimax(b) => {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
@@ -1876,6 +1880,18 @@ mod registry_tests {
                 got,
                 vec![want],
                 "arch_id={id} is_dir={is_dir} should route to exactly [{want}]"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm_carrier_owns_recommended_sampling_after_source_preparation() {
+        for carrier in REGISTRY {
+            assert_eq!(
+                carrier.owns_recommended_sampling(),
+                carrier.name() == "lfm2moe",
+                "carrier '{}' sampling-metadata ownership mismatch",
+                carrier.name()
             );
         }
     }

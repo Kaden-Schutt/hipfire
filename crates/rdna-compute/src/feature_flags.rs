@@ -350,18 +350,13 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_hfq4_qkvza_2wave: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_wavepack4: std::env::var(
-                "HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4",
-            )
-            .as_deref()
-                == Ok("1"),
-            rdna3_hfq4_qkvza_ldsx8: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8")
+            rdna3_hfq4_qkvza_wavepack4: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4")
                 .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_reduce_chain: std::env::var(
-                "HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN",
-            )
-            .as_deref()
+            rdna3_hfq4_qkvza_ldsx8: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_reduce_chain: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN")
+                .as_deref()
                 == Ok("1"),
             rdna3_hfq4_qkvza_hoist_x32: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
                 .as_deref()
@@ -373,27 +368,17 @@ impl FeatureFlags {
             rdna3_hfq4_residual_k2048: std::env::var("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048")
                 .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_sigmoid_tight_grid: std::env::var(
-                "HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID",
-            )
-            .as_deref()
+            rdna3_hfq4_sigmoid_tight_grid: std::env::var("HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID")
+                .as_deref()
                 == Ok("1"),
             rdna3_hfq4_sigmoid_buffer: parse_bool("HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER")
                 .unwrap_or(arch == "gfx1100"),
-            rdna3_hfq4_sigmoid_rows4: std::env::var(
-                "HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4",
-            )
-            .as_deref()
+            rdna3_hfq4_sigmoid_rows4: std::env::var("HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_lm_head_k2048: std::env::var(
-                "HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048",
-            )
-            .as_deref()
+            rdna3_hfq4_lm_head_k2048: std::env::var("HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_moe_gate_up_k2048: std::env::var(
-                "HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048",
-            )
-            .as_deref()
+            rdna3_hfq4_moe_gate_up_k2048: std::env::var("HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048")
+                .as_deref()
                 == Ok("1"),
             mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
@@ -440,18 +425,14 @@ impl FeatureFlags {
                 && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
             rmsnorm_mq_tight_lds: std::env::var("HIPFIRE_RMSNORM_MQ_TIGHT_LDS").as_deref()
                 == Ok("1"),
-            rdna3_rmsnorm_wavegrid: std::env::var("HIPFIRE_RDNA3_RMSNORM_WAVEGRID")
-                .as_deref()
+            rdna3_rmsnorm_wavegrid: std::env::var("HIPFIRE_RDNA3_RMSNORM_WAVEGRID").as_deref()
                 == Ok("1"),
-            rdna3_rmsnorm_split: std::env::var("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref()
-                == Ok("1"),
+            rdna3_rmsnorm_split: std::env::var("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref() == Ok("1"),
             rdna3_rmsnorm_vecsum: parse_bool("HIPFIRE_RDNA3_RMSNORM_VECSUM")
                 .unwrap_or(arch == "gfx1100"),
-            rdna3_rmsnorm_sign_lds: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS")
-                .as_deref()
+            rdna3_rmsnorm_sign_lds: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS").as_deref()
                 == Ok("1"),
-            rdna3_rmsnorm_sign_const: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST")
-                .as_deref()
+            rdna3_rmsnorm_sign_const: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST").as_deref()
                 == Ok("1"),
             gfx942_mfma_prefill: std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
             moe_grouped_i8: match std::env::var("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {

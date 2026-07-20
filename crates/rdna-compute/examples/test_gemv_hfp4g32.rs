@@ -15,11 +15,10 @@
 //! Sweeps groups_per_row ∈ {2, 4, 5, 6, 7, 8} (K = groups_per_row × 256) to
 //! exercise quad-clean and all 3 tail-by-g%4 paths in the kernel.
 
-use rdna_compute::{Gpu, DType};
+use rdna_compute::{DType, Gpu};
 
 const E2M1_LUT: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 fn e2m1_round(x: f32) -> u8 {
@@ -67,10 +66,15 @@ fn f16_le_bits_to_f32(h: u16) -> f32 {
     let exp = ((h >> 10) & 0x1f) as i32;
     let mant = (h & 0x3ff) as u32;
     let bits = if exp == 0 {
-        if mant == 0 { sign << 31 }
-        else {
-            let mut m = mant; let mut e = -1i32;
-            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+        if mant == 0 {
+            sign << 31
+        } else {
+            let mut m = mant;
+            let mut e = -1i32;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             (sign << 31) | (((e + 127 - 14) as u32) << 23) | ((m & 0x3ff) << 13)
         }
     } else if exp == 0x1f {
@@ -92,13 +96,22 @@ fn quantize_row(row: &[f32]) -> Vec<u8> {
     let mut out = vec![0u8; row_bytes];
 
     let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-    let inv_row = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+    let row_scale_a = if row_max_abs > 0.0 {
+        row_max_abs / 6.0
+    } else {
+        1.0
+    };
+    let inv_row = if row_max_abs > 0.0 {
+        1.0 / row_scale_a
+    } else {
+        0.0
+    };
 
     out[0..2].copy_from_slice(&f32_to_f16_le_bits(row_scale_a).to_le_bytes());
     out[2..4].copy_from_slice(&0u16.to_le_bytes());
     out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes());
-    out[6] = 0u8; out[7] = 0u8;
+    out[6] = 0u8;
+    out[7] = 0u8;
 
     for b in 0..n_blocks {
         let block = &row[b * 32..(b + 1) * 32];
@@ -108,10 +121,16 @@ fn quantize_row(row: &[f32]) -> Vec<u8> {
             let log_ratio = (block_max_normalized / 6.0).log2();
             let e_signed = log_ratio.ceil() as i32 + 127;
             e_signed.clamp(0, 254) as u8
-        } else { 0u8 };
+        } else {
+            0u8
+        };
 
         let block_scale_factor = ((block_e as i32 - 127) as f32).exp2();
-        let inv_block = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+        let inv_block = if block_scale_factor > 0.0 {
+            1.0 / block_scale_factor
+        } else {
+            0.0
+        };
 
         let off = 16 + b * 17;
         out[off] = block_e;
@@ -145,7 +164,7 @@ fn dequant_row(packed: &[u8], k: usize) -> Vec<f32> {
             let byte = packed[off + 1 + i];
             let lo = (byte & 0x0F) as usize;
             let hi = ((byte >> 4) & 0x0F) as usize;
-            out[b * 32 + 2 * i]     = scale * E2M1_LUT[lo];
+            out[b * 32 + 2 * i] = scale * E2M1_LUT[lo];
             out[b * 32 + 2 * i + 1] = scale * E2M1_LUT[hi];
         }
     }
@@ -162,9 +181,13 @@ fn build_test_matrix(m: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
         // Gaussian-ish row data via Box-Muller from xorshift.
         let mut row = Vec::with_capacity(k);
         for _ in 0..(k / 2) {
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
             let u1 = ((state & 0xFFFFFF) as f32 / 0x1000000 as f32).max(1e-7);
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
             let u2 = ((state & 0xFFFFFF) as f32 / 0x1000000 as f32).max(1e-7);
             let r_mag = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f32::consts::PI * u2;
@@ -201,7 +224,9 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize) -> (usize, f32, f32) {
     let (packed, seen_w) = build_test_matrix(m, k, 0xdead_beef_dead_beefu64.wrapping_add(k as u64));
 
     // x in [-0.5, 0.5)
-    let x: Vec<f32> = (0..k).map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05)
+        .collect();
 
     let d_a = gpu.upload_raw(&packed, &[packed.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
@@ -216,10 +241,14 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize) -> (usize, f32, f32) {
     let mut max_rel = 0.0f32;
     for r in 0..m {
         let abs = (y_gpu[r] - y_ref[r]).abs();
-        if abs > max_abs { max_abs = abs; }
+        if abs > max_abs {
+            max_abs = abs;
+        }
         let denom = y_ref[r].abs().max(1.0);
         let rel = abs / denom;
-        if rel > max_rel { max_rel = rel; }
+        if rel > max_rel {
+            max_rel = rel;
+        }
     }
     (k, max_abs, max_rel)
 }
@@ -236,9 +265,13 @@ fn main() {
         // absorb FP16-row-scale rounding interaction.
         let pass = max_abs < 5e-3 && max_rel < 5e-3;
         let tag = if pass { "PASS" } else { "FAIL" };
-        println!("[{}] groups_per_row={} K={} max_abs={:.6e} max_rel={:.6e}",
-                 tag, groups_per_row, k, max_abs, max_rel);
-        if !pass { any_fail = true; }
+        println!(
+            "[{}] groups_per_row={} K={} max_abs={:.6e} max_rel={:.6e}",
+            tag, groups_per_row, k, max_abs, max_rel
+        );
+        if !pass {
+            any_fail = true;
+        }
     }
 
     if any_fail {

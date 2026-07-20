@@ -512,8 +512,9 @@ impl PhasedMultiQueuePm4Ib {
             .any(|commands| !commands.ends_with_compute_idle())
         {
             return Err(ReplayError::PolicyShapeMismatch {
-                detail: "native PM4 semaphore publication requires every phase lane to end compute-idle"
-                    .to_owned(),
+                detail:
+                    "native PM4 semaphore publication requires every phase lane to end compute-idle"
+                        .to_owned(),
             });
         }
         let queue_count = phases.iter().map(Vec::len).max().unwrap();
@@ -525,15 +526,19 @@ impl PhasedMultiQueuePm4Ib {
         let parallel_phase_count = phases.iter().filter(|phase| phase.len() > 1).count();
         if parallel_phase_count == 1 {
             return Err(ReplayError::PolicyShapeMismatch {
-                detail: "native PM4 retained epochs require either zero or at least two parallel phases"
-                    .to_owned(),
+                detail:
+                    "native PM4 retained epochs require either zero or at least two parallel phases"
+                        .to_owned(),
             });
         }
-        let semaphore_bytes = (queue_count - 1)
-            .checked_mul(8)
-            .ok_or_else(|| ReplayError::PolicyShapeMismatch {
-                detail: format!("native PM4 semaphore count for {queue_count} queues overflowed"),
-            })?;
+        let semaphore_bytes =
+            (queue_count - 1)
+                .checked_mul(8)
+                .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                    detail: format!(
+                        "native PM4 semaphore count for {queue_count} queues overflowed"
+                    ),
+                })?;
         let mut semaphores = pool.allocate_executable_bytes(semaphore_bytes)?;
         semaphores.as_mut_bytes().fill(0);
         let semaphore_base = semaphores.address() as usize as u64;
@@ -549,11 +554,12 @@ impl PhasedMultiQueuePm4Ib {
                 streams[0].append_stream(&phase[0]);
                 continue;
             }
-            parallel_epoch = parallel_epoch.checked_add(1).ok_or_else(|| {
-                ReplayError::PolicyShapeMismatch {
-                    detail: "native PM4 parallel phase count exceeds u32".to_owned(),
-                }
-            })?;
+            parallel_epoch =
+                parallel_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                        detail: "native PM4 parallel phase count exceeds u32".to_owned(),
+                    })?;
             for lane in 1..phase.len() {
                 let (start, _) = semaphore_addresses(lane);
                 streams[lane].wait_memory_value(start, parallel_epoch);
@@ -601,11 +607,8 @@ impl PhasedMultiQueuePm4Ib {
             let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
             indirect.write_exact(&bytes)?;
             let completion = CompletionSignal::new(device)?;
-            let packet = PacketImage::pm4_indirect_buffer(
-                indirect.address(),
-                dwords,
-                completion.raw(),
-            )?;
+            let packet =
+                PacketImage::pm4_indirect_buffer(indirect.address(), dwords, completion.raw())?;
             timestamps.push(timestamp);
             indirects.push(indirect);
             completions.push(completion);

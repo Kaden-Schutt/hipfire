@@ -15,7 +15,7 @@ Bring-up narrative is historical:
 | PP load path | `crates/hipfire-loader/src/carriers.rs` (`load_qwen35_pp`) |
 | Daemon load / refusals | `crates/hipfire-runtime/examples/daemon.rs` |
 | Supporting multi-GPU script | [`scripts/pp-gate.sh`](../scripts/pp-gate.sh) (not a VALIDATION selector minimum route) |
-| Admissions | [`admissions.yml`](admissions.yml) — `records: []` (fail closed; none inferred) |
+| Admissions | [`admissions.yml`](admissions.yml) — schema v2, exactly one single-GPU retained-PM4 record; no multi-GPU records (fail closed; none inferred) |
 
 ## Modes
 
@@ -30,7 +30,7 @@ Two multi-device modes exist. They are **mutually exclusive** at load
 `pp = 1` and `tp = 1` are single-GPU. Behavior matches the pre-multi-GPU paths.
 
 **None of the listed PP/EP routes is an admission or product default.**
-[`admissions.yml`](admissions.yml) has no multi-GPU records at schema v1.
+[`admissions.yml`](admissions.yml) has no multi-GPU records at schema v2 (the sole earned row is single-GPU `pp=tp=1`).
 Source-wired means the load path exists in runtime at the audited ref — not that
 it is promoted.
 
@@ -223,7 +223,7 @@ Map claims through the selector’s classes:
 | Forward / serve **user-facing semantics** | `scripts/serve_harness.py` with the exact model (after parity if numbers/state can break) | Semantics only |
 | Perf improvement under PP or EP | [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) + stationary matched runs; `speed-gate.sh` / `gates.sh` perf arm when applicable | Bench numbers without protocol/identity are not promotion evidence. Historical appendix rows are not floors. |
 | Arch port (new device family behavior) | [`methodology/arch-port-validation.md`](methodology/arch-port-validation.md) | Channel + speed; no retired coherence battery as acceptance |
-| Model/route **admission** | Row in [`admissions.yml`](admissions.yml) | Empty / fail closed — multi-GPU PP/EP are **not** admitted |
+| Model/route **admission** | Row in [`admissions.yml`](admissions.yml) | Schema v2 exact-row only — multi-GPU PP/EP are **not** admitted |
 | Docs-only edits | No-GPU CI / `scripts/no-gpu-ci.sh` | Never substitutes for GPU parity |
 | Unknown multi-device surface | **Blocked** until VALIDATION grows a row | Fail closed |
 

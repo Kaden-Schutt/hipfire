@@ -58,7 +58,10 @@ fn main() {
     for (m, k, label) in &shapes {
         let (m, k) = (*m, *k);
         assert!(k % 32 == 0, "K must be a multiple of 32 (Q8_0 block size)");
-        assert!(m % 16 == 0, "M should be a multiple of 16 for WMMA tile (got {m})");
+        assert!(
+            m % 16 == 0,
+            "M should be a multiple of 16 for WMMA tile (got {m})"
+        );
         eprintln!("\n--- {label} ---");
 
         // Synthetic Q8_0 weights: [M, K/32 * 34]. Random int8 + per-block fp16 scale.
@@ -171,14 +174,20 @@ fn main() {
             let mut close_count = 0usize;
             for (a, b) in y_sub_host.iter().zip(y_wmma_host.iter()) {
                 let d = (a - b).abs();
-                if d > max_abs { max_abs = d; }
+                if d > max_abs {
+                    max_abs = d;
+                }
                 sum_abs += d as f64;
                 if a.abs() > threshold {
                     let rel = d / a.abs();
-                    if rel > max_rel_gated { max_rel_gated = rel; }
+                    if rel > max_rel_gated {
+                        max_rel_gated = rel;
+                    }
                     sum_rel_gated += rel as f64;
                     gated_count += 1;
-                    if rel < 0.05 { close_count += 1; }
+                    if rel < 0.05 {
+                        close_count += 1;
+                    }
                 }
             }
             let total = y_sub_host.len();

@@ -12,7 +12,7 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_grouped_wmma_m2
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1103515245).wrapping_add(12345);
@@ -28,9 +28,8 @@ fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len()], DType::F32)
         .expect("alloc_tensor f32");
@@ -39,9 +38,8 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len() * 4], DType::Raw)
         .expect("alloc_tensor i32");
@@ -50,9 +48,8 @@ fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     let t = gpu
         .alloc_tensor(&[data.len() * 8], DType::Raw)
         .expect("alloc_tensor u64");
@@ -68,10 +65,11 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 
 fn download_f32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh f32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh f32");
     data
 }
 
@@ -119,15 +117,29 @@ fn build_x_f32(n: usize, k: usize, seed: u32) -> Vec<f32> {
     out
 }
 
-fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize, seed_w: u32, seed_x: u32) {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+fn run_case(
+    label: &str,
+    m: usize,
+    k: usize,
+    m_total: usize,
+    num_experts: usize,
+    seed_w: u32,
+    seed_x: u32,
+) {
+    println!(
+        "=== {} | M={} K={} m_total={} E={} ===",
+        label, m, k, m_total, num_experts
+    );
     assert!(m % 32 == 0, "M must be a multiple of 32 (m2 stride)");
     assert!(m_total % 16 == 0, "m_total must be a multiple of 16");
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
     if !arch.starts_with("gfx12") {
-        println!("  SKIP — arch {} is not gfx12; m2 kernel only registered for gfx12", arch);
+        println!(
+            "  SKIP — arch {} is not gfx12; m2 kernel only registered for gfx12",
+            arch
+        );
         return;
     }
 
@@ -170,7 +182,8 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
         1, // x_row_div
         m_total,
         m_total, // x_src_rows
-    ).expect("base kernel launch");
+    )
+    .expect("base kernel launch");
     gpu.hip.device_synchronize().expect("sync after base");
 
     // Run m2 kernel (env set).
@@ -186,7 +199,8 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
         1,
         m_total,
         m_total,
-    ).expect("m2 kernel launch");
+    )
+    .expect("m2 kernel launch");
     gpu.hip.device_synchronize().expect("sync after m2");
     std::env::remove_var("HIPFIRE_MOE_GROUPED_M2");
 
@@ -202,8 +216,13 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     for (i, (a, b)) in y_base_v.iter().zip(y_m2_v.iter()).enumerate() {
         let d = (a - b).abs();
         let r = if a.abs() > 1e-6 { d / a.abs() } else { d };
-        if d > max_abs { max_abs = d; argmax_abs = i; }
-        if r > max_rel { max_rel = r; }
+        if d > max_abs {
+            max_abs = d;
+            argmax_abs = i;
+        }
+        if r > max_rel {
+            max_rel = r;
+        }
     }
     let base_sample = &y_base_v[argmax_abs];
     let m2_sample = &y_m2_v[argmax_abs];

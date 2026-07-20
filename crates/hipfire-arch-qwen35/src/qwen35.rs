@@ -5225,7 +5225,7 @@ pub fn forward_scratch(
     if gpu.replay.should_route_aql() {
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        let replay = unsafe { gpu.replay.replay_linear_aql() };
+        let replay = unsafe { gpu.replay.replay_linear_aql(pos) };
         return match replay {
             Ok(_) => Ok(()),
             Err(reason) => {
@@ -12337,17 +12337,9 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                let fused_epilogue =
-                    kv_cache_attention_dispatch(
-                        &ctx,
-                        gpu,
-                        kv_cache,
-                        s,
-                        config,
-                        &layer.wo,
-                        layer_idx,
-                        pos,
-                    )?;
+                let fused_epilogue = kv_cache_attention_dispatch(
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                )?;
 
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -12643,17 +12635,9 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                let fused_epilogue =
-                    kv_cache_attention_dispatch(
-                        &ctx,
-                        gpu,
-                        kv_cache,
-                        s,
-                        config,
-                        &layer.wo,
-                        layer_idx,
-                        pos,
-                    )?;
+                let fused_epilogue = kv_cache_attention_dispatch(
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                )?;
 
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -14108,12 +14092,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     w_alpha,
                 );
                 let conv_scalar_prep = !qkvza_scalar_prep
-                    && conv_scalar_prep_enabled(
-                        gpu,
-                        config,
-                        self.n_v_heads,
-                        self.dn_state.quant,
-                    );
+                    && conv_scalar_prep_enabled(gpu, config, self.n_v_heads, self.dn_state.quant);
                 if !qkvza_scalar_prep && !conv_scalar_prep {
                     gpu.fused_sigmoid_alpha_gate_f32(
                         &s.dn_beta,
@@ -14450,12 +14429,8 @@ fn gated_norm_mq_rotate_enabled(
 /// the established multi-dispatch path.
 fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_QWEN35_FA_PREP_FUSE")
-            .ok()
-            .as_deref()
-            != Some("0")
-    });
+    let enabled = *ENABLED
+        .get_or_init(|| std::env::var("HIPFIRE_QWEN35_FA_PREP_FUSE").ok().as_deref() != Some("0"));
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     enabled
         && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
@@ -14501,12 +14476,8 @@ fn qkvza_scalar_prep_enabled(
     w_alpha: &WeightTensor,
 ) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_QKVZA_SCALAR_PREP")
-            .ok()
-            .as_deref()
-            == Some("1")
-    });
+    let enabled = *ENABLED
+        .get_or_init(|| std::env::var("HIPFIRE_QKVZA_SCALAR_PREP").ok().as_deref() == Some("1"));
     let dtype = wqkv.gpu_dtype;
     enabled
         && gpu.arch_caps.is_gfx1100()
@@ -14530,12 +14501,8 @@ fn conv_scalar_prep_enabled(
     quant: StateQuant,
 ) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_CONV_SCALAR_PREP")
-            .ok()
-            .as_deref()
-            == Some("1")
-    });
+    let enabled = *ENABLED
+        .get_or_init(|| std::env::var("HIPFIRE_CONV_SCALAR_PREP").ok().as_deref() == Some("1"));
     let shape = std::env::var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
         && gpu.arch_caps.is_gfx1100()
@@ -14657,15 +14624,7 @@ fn forward_scratch_layers_lowered(
                 config.num_experts_per_tok,
                 config.norm_eps,
             )?;
-            dump_hidden_localize(
-                gpu,
-                &s.x,
-                1,
-                pos,
-                config.dim,
-                layer_idx - 1,
-                "pertoken",
-            );
+            dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx - 1, "pertoken");
         }
         let program = lower_variant(variant_of(layer));
         {

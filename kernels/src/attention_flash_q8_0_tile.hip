@@ -133,10 +133,12 @@ __global__ void attention_flash_q8_0_tile(
     const float* q_head = q + h * head_dim;
     for (int half = 0; half < n_halves; half++) {
         const int d_base = half * 128 + tid * 4;
-        q_lds[d_base + 0] = q_head[d_base + 0];
-        q_lds[d_base + 1] = q_head[d_base + 1];
-        q_lds[d_base + 2] = q_head[d_base + 2];
-        q_lds[d_base + 3] = q_head[d_base + 3];
+        if (d_base < head_dim) {
+            q_lds[d_base + 0] = q_head[d_base + 0];
+            q_lds[d_base + 1] = q_head[d_base + 1];
+            q_lds[d_base + 2] = q_head[d_base + 2];
+            q_lds[d_base + 3] = q_head[d_base + 3];
+        }
     }
     __syncthreads();
 
@@ -166,6 +168,7 @@ __global__ void attention_flash_q8_0_tile(
         float partial3 = 0.0f;
         for (int half = 0; half < n_halves; half++) {
             const int k_bi = half * 4 + tid / 8;
+            if (k_bi >= blocks_per_head) continue;
             const int k_blk_off = (kv_head_block_start + k_bi) * 34;
             const unsigned char* kb0 = k_cache + (size_t)t0 * row_stride + k_blk_off;
             const unsigned char* kb1 = k_cache + (size_t)t1 * row_stride + k_blk_off;
@@ -234,6 +237,7 @@ __global__ void attention_flash_q8_0_tile(
         float partial = 0.0f;
         for (int half = 0; half < n_halves; half++) {
             const int k_bi = half * 4 + tid / 8;
+            if (k_bi >= blocks_per_head) continue;
             const int k_blk_off = (kv_head_block_start + k_bi) * 34;
             const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off;
             float ks = (float)*((const _Float16*)kb);
@@ -306,6 +310,7 @@ __global__ void attention_flash_q8_0_tile(
     //              head_dim output dims are written, not just first 128) ═══
     for (int half = 0; half < n_halves; half++) {
         const int d_base = half * 128 + tid * 4;
+        if (d_base >= head_dim) continue;
         const int bi = d_base / 32;
         const int bj_base = d_base % 32;
         const int v_blk_off = (kv_head_block_start + bi) * 34;

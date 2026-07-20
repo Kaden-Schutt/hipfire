@@ -25,7 +25,10 @@ use crate::hipfire::cli_command;
 pub enum PullEvent {
     /// A progress update: parsed percent (None if not yet sampled) + the raw
     /// CLI progress line (bar / rate / ETA / bytes) for display.
-    Progress { percent: Option<f64>, line: String },
+    Progress {
+        percent: Option<f64>,
+        line: String,
+    },
     Done,
     Failed(String),
 }
@@ -217,7 +220,10 @@ mod tests {
             parse_percent("[████▏      ]  45.2%   8.1 MB/s   ETA 1m12s   123/272 MB"),
             Some(45.2)
         );
-        assert_eq!(parse_percent("[          ]   0.0%   —   123/272 MB"), Some(0.0));
+        assert_eq!(
+            parse_percent("[          ]   0.0%   —   123/272 MB"),
+            Some(0.0)
+        );
         assert_eq!(parse_percent("[██████████] 100.0% done"), Some(100.0));
         // Unknown-total downloads render "?%" — must yield None (drives the
         // PullEvent::Progress { percent: None } path).

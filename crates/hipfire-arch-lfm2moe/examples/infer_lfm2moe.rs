@@ -15,6 +15,7 @@ fn main() {
     use hipfire_arch_lfm2moe::config::Lfm2MoeConfig;
     use hipfire_arch_lfm2moe::forward::decode_step;
     use hipfire_arch_lfm2moe::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
+    use hipfire_arch_lfm2moe::redline_plan::{DecodeExecutionMode, RetainedFixtureEvidence};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::path::PathBuf;
@@ -81,8 +82,16 @@ fn main() {
     } else {
         tok.encode(&prompt)
     };
-    eprintln!("prompt {:?} → {} tokens (src: {})", prompt, prompt_ids.len(),
-        if tokens_path.is_some() { "--tokens" } else { "embedded tokenizer" });
+    eprintln!(
+        "prompt {:?} → {} tokens (src: {})",
+        prompt,
+        prompt_ids.len(),
+        if tokens_path.is_some() {
+            "--tokens"
+        } else {
+            "embedded tokenizer"
+        }
+    );
     let max_seq = prompt_ids.len() + max + 16;
     let mut state = Lfm2MoeState::new_with_max_seq(&mut gpu, &cfg, max_seq).expect("state");
 
@@ -102,7 +111,17 @@ fn main() {
     let t0 = std::time::Instant::now();
     let mut logits = Vec::new();
     for (pos, &t) in prompt_ids.iter().enumerate() {
-        logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos as u32).expect("prefill");
+        logits = decode_step(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            t,
+            pos as u32,
+            RetainedFixtureEvidence::ABSENT,
+            DecodeExecutionMode::Prefill,
+        )
+        .expect("prefill");
     }
     eprintln!(
         "prefill {} tok in {:.2}s",
@@ -121,8 +140,20 @@ fn main() {
         if matches!(next, 124900 | 124899 | 2) || Some(next) == eos_extra {
             break;
         }
-        logits =
-            decode_step(&cfg, &weights, &mut state, &mut gpu, next, pos as u32).expect("decode");
+        logits = decode_step(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            next,
+            pos as u32,
+            RetainedFixtureEvidence::ABSENT,
+            DecodeExecutionMode::PlainAr {
+                pipeline_parallel: 1,
+                tensor_parallel: 1,
+            },
+        )
+        .expect("decode");
         pos += 1;
     }
     let dt = t1.elapsed().as_secs_f64();

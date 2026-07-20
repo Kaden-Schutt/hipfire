@@ -652,6 +652,141 @@ impl Gpu {
         )
     }
 
+    /// Precompute full-RoPE cosine and sine rows on the active GPU stream.
+    /// The expression order matches `rope_f32`, so cached application remains
+    /// bit-exact with the uncached decode path.
+    pub fn init_rope_cache_f32(
+        &mut self,
+        cos_cache: &GpuTensor,
+        sin_cache: &GpuTensor,
+        max_seq: usize,
+        head_dim: usize,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "lfm_decode_prep",
+            kernels::LFM_DECODE_PREP_SRC,
+            "rope_cache_init_f32",
+        )?;
+        let mut cos_ptr = cos_cache.buf.as_ptr();
+        let mut sin_ptr = sin_cache.buf.as_ptr();
+        let mut max_seq_val = max_seq as i32;
+        let mut head_dim_val = head_dim as i32;
+        let mut freq_base_val = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut cos_ptr as *mut _ as *mut c_void,
+            &mut sin_ptr as *mut _ as *mut c_void,
+            &mut max_seq_val as *mut _ as *mut c_void,
+            &mut head_dim_val as *mut _ as *mut c_void,
+            &mut freq_base_val as *mut _ as *mut c_void,
+        ];
+        let n = max_seq * (head_dim / 2);
+        let block = 256u32;
+        self.launch_maybe_blob(
+            "rope_cache_init_f32",
+            [((n as u32) + block - 1) / block, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cos_ptr);
+                b.push_ptr(sin_ptr);
+                b.push_i32(max_seq_val);
+                b.push_i32(head_dim_val);
+                b.push_f32(freq_base_val);
+                b
+            },
+        )
+    }
+
+    /// Normalize all Q/K heads and apply cached full RoPE in one launch.
+    /// This is the exact LFM decode-preparation route: each head retains the
+    /// same RMS reduction and RoPE operation order as the unfused kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lfm_qk_norm_rope_cached_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        cos_cache: &GpuTensor,
+        sin_cache: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "lfm_decode_prep",
+            kernels::LFM_DECODE_PREP_SRC,
+            "lfm_qk_norm_rope_cached_f32",
+        )?;
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k.buf.as_ptr();
+        let mut qw_ptr = q_weight.buf.as_ptr();
+        let mut kw_ptr = k_weight.buf.as_ptr();
+        let mut cos_ptr = cos_cache.buf.as_ptr();
+        let mut sin_ptr = sin_cache.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut eps_val = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut qw_ptr as *mut _ as *mut c_void,
+            &mut kw_ptr as *mut _ as *mut c_void,
+            &mut cos_ptr as *mut _ as *mut c_void,
+            &mut sin_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut eps_val as *mut _ as *mut c_void,
+        ];
+        let block = 256u32.min(head_dim as u32);
+        let shared_mem = (head_dim * 4) as u32;
+        let bytes = crate::profile::rmsnorm_bytes((n_heads_q + n_heads_k) * head_dim)
+            + crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "rmsnorm_rope",
+            "lfm_qk_norm_rope_cached_f32",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "lfm_qk_norm_rope_cached_f32",
+            [(n_heads_q + n_heads_k) as u32, 1, 1],
+            [block, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(qw_ptr);
+                b.push_ptr(kw_ptr);
+                b.push_ptr(cos_ptr);
+                b.push_ptr(sin_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_f32(eps_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched RoPE: apply to [batch_size] positions in one launch.
     /// q: [batch_size × q_dim], k: [batch_size × kv_dim].
     /// positions: GPU buffer of [batch_size] i32 position indices.
@@ -856,13 +991,8 @@ impl Gpu {
         ];
         let bytes = (16 * 256 * 3 + 2 * 256 * 2 + 18 * 256) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
-        let result = self.launch_maybe_blob(
-            kernel,
-            [18, 1, 1],
-            [256, 1, 1],
-            0,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(kernel, [18, 1, 1], [256, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qip);
                 b.push_ptr(qp);
@@ -874,8 +1004,7 @@ impl Gpu {
                 b.push_f32(ep);
                 b.push_f32(fb);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -2007,7 +2136,6 @@ impl Gpu {
             kernels::CONV1D_GATED_DECODE_SRC,
             "conv1d_gated_decode_f32",
         )?;
-        let func = &self.functions["conv1d_gated_decode_f32"];
         let mut bp = bcx.buf.as_ptr();
         let mut sp = state.buf.as_ptr();
         let mut wp = weight.buf.as_ptr();
@@ -2026,16 +2154,98 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid = (((batch * channels) as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
+        // Recorder-aware launch: fixed 256-block geometry is tape-stable, so no
+        // PositionCeilDiv binding is needed. Records into the retained tape only
+        // when replay.is_recording(); the else-branch preserves the exact prior
+        // direct-HIP launch for ordinary decode.
+        self.launch_maybe_blob(
+            "conv1d_gated_decode_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(wp);
+                b.push_ptr(oyp);
+                b.push_i32(bb);
+                b.push_i32(cc);
+                b.push_i32(kk);
+                b
+            },
+        )
+    }
+
+    /// LFM2 single-token gated short-conv with the exact MQ4-G256 activation
+    /// rotation folded into its epilogue. The output is pre-rotated for a
+    /// following MQ4 out projection. This bounded path requires batch=1 and a
+    /// channel count divisible by 256.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_gated_decode_mq_rotate_f32(
+        &mut self,
+        bcx: &GpuTensor,
+        state: &GpuTensor,
+        weight: &GpuTensor,
+        out_rot: &GpuTensor,
+        batch: usize,
+        channels: usize,
+        kernel_size: usize,
+    ) -> HipResult<()> {
+        if batch != 1 || channels % 256 != 0 || !(1..=8).contains(&kernel_size) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "conv1d_gated_decode_mq_rotate_f32 shape",
+            ));
         }
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "conv1d_gated_decode_mq_rotate",
+            kernels::CONV1D_GATED_DECODE_MQ_ROTATE_SRC,
+            "conv1d_gated_decode_mq_rotate_f32",
+        )?;
+        let mut bp = bcx.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut op = out_rot.buf.as_ptr();
+        let mut s1p = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2p = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut bb = batch as i32;
+        let mut cc = channels as i32;
+        let mut kk = kernel_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut bb as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "conv1d_gated_decode_mq_rotate_f32",
+            [(channels / 256) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(wp);
+                b.push_ptr(op);
+                b.push_ptr(s1p);
+                b.push_ptr(s2p);
+                b.push_i32(bb);
+                b.push_i32(cc);
+                b.push_i32(kk);
+                b
+            },
+        )
     }
 
     /// Gated output norm: rmsnorm(x) * silu(z). Fused kernel.
@@ -3649,30 +3859,30 @@ impl Gpu {
         let qk_blocks = (n_heads as u32 + heads_per_wg - 1) / heads_per_wg;
         let v_blocks = (v_dim as u32 + BLOCK - 1) / BLOCK;
         let grid = qk_blocks + v_blocks + 1;
-        let bytes = crate::profile::conv1d_silu_bytes(2 * k_dim + v_dim)
-            + n_v_heads * 4 * 4;
+        let bytes = crate::profile::conv1d_silu_bytes(2 * k_dim + v_dim) + n_v_heads * 4 * 4;
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
-        let result = self.launch_maybe_blob(KERNEL, [grid, 1, 1], [BLOCK, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(qp);
-            b.push_ptr(kp);
-            b.push_ptr(vp);
-            b.push_ptr(ip);
-            b.push_ptr(wp);
-            b.push_ptr(sp);
-            b.push_ptr(bp);
-            b.push_ptr(ap);
-            b.push_ptr(dp);
-            b.push_ptr(lp);
-            b.push_i32(kd);
-            b.push_i32(vd);
-            b.push_i32(nh);
-            b.push_i32(hd);
-            b.push_f32(qs);
-            b.push_f32(ep);
-            b.push_i32(nvh);
-            b
-        });
+        let result =
+            self.launch_maybe_blob(KERNEL, [grid, 1, 1], [BLOCK, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_ptr(dp);
+                b.push_ptr(lp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b.push_i32(nvh);
+                b
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

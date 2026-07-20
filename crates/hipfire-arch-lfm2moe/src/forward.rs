@@ -24,18 +24,49 @@ use crate::lfm2moe::{
     lfm2_prefill_batch_capacity, AttnWeights, ConvWeights, DenseFfn, Ffn, Lfm2MoeLayerWeights,
     Lfm2MoeState, Lfm2MoeWeights, Mixer, MoeFfn,
 };
+use crate::redline_plan::{DecodeExecutionMode, RetainedFixtureEvidence};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::llama::{
-    fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
-    rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual, WeightTensor,
+    fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
+    weight_gemv_prerotated, weight_gemv_prerotated_residual, weight_gemv_residual,
+    weight_gemv_swiglu_residual, WeightTensor,
 };
-use rdna_compute::{DType, Gpu};
+use rdna_compute::{replay::ReplayBackendRequest, DType, Gpu};
 
 const MQ4_GROUP_BYTES: usize = 136;
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedDecodeRoute {
+    Hip,
+    Aql,
+    Pm4,
+}
+
+fn retained_decode_route(
+    eligible: bool,
+    should_route_aql: bool,
+    should_route_pm4: bool,
+) -> RetainedDecodeRoute {
+    if !eligible {
+        RetainedDecodeRoute::Hip
+    } else if should_route_aql {
+        RetainedDecodeRoute::Aql
+    } else if should_route_pm4 {
+        RetainedDecodeRoute::Pm4
+    } else {
+        RetainedDecodeRoute::Hip
+    }
+}
+
+fn complete_retained_replay(n_tokens: &mut usize, position: u32) {
+    *n_tokens = position as usize + 1;
+}
 
 fn prefill_chunk_error(
     stage: &str,
@@ -48,18 +79,13 @@ fn prefill_chunk_error(
         Some(layer) => format!(
             "lfm2moe prefill L{layer} chunk base={chunk_base} len={chunk_len} {stage}: {error:?}"
         ),
-        None => format!(
-            "lfm2moe prefill chunk base={chunk_base} len={chunk_len} {stage}: {error:?}"
-        ),
+        None => {
+            format!("lfm2moe prefill chunk base={chunk_base} len={chunk_len} {stage}: {error:?}")
+        }
     }
 }
 
-fn require_q8_weight(
-    weight: &WeightTensor,
-    m: usize,
-    k: usize,
-    name: &str,
-) -> Result<(), String> {
+fn require_q8_weight(weight: &WeightTensor, m: usize, k: usize, name: &str) -> Result<(), String> {
     if weight.gpu_dtype != DType::Q8_0 || weight.m != m || weight.k != k {
         return Err(format!(
             "lfm2moe: 350m.mq4 admission requires {name} Q8_0 [{m},{k}], got {:?} [{},{}]",
@@ -69,16 +95,16 @@ fn require_q8_weight(
     Ok(())
 }
 
-fn require_mq4_proj(
-    weight: &WeightTensor,
-    m: usize,
-    k: usize,
-    name: &str,
-) -> Result<(), String> {
+fn require_mq4_proj(weight: &WeightTensor, m: usize, k: usize, name: &str) -> Result<(), String> {
     if weight.gpu_dtype != DType::MQ4G256 || weight.m != m || weight.k != k {
         return Err(format!(
             "lfm2moe: 350m.mq4 admission requires {name} MQ4G256 [{m},{k}], got {:?} [{},{}]",
             weight.gpu_dtype, weight.m, weight.k
+        ));
+    }
+    if weight.awq_scale.is_some() {
+        return Err(format!(
+            "lfm2moe: 350m.mq4 admission requires {name} without an AWQ sidecar"
         ));
     }
     if k == 0 || k % 256 != 0 {
@@ -114,9 +140,26 @@ fn require_f32_tensor(
     Ok(())
 }
 
-/// Exact 350M dense MQ4 fixture (md5 cb5284b8 provenance): hidden1024, heads16/8,
-/// hd64, q_dim1024, kv_dim512, inter4608, vocab65536, theta1e6, 16 dense layers.
-fn validate_350m_mq4_admission(
+/// One-time structural validation for the exact LFM2.5-350M dense-MQ4 fixture
+/// (md5 cb5284b8 provenance): arch11, hidden1024, heads16/8, hd64, q_dim1024,
+/// kv_dim512, inter4608, vocab65536, theta1e6, and 16 dense layers.
+pub fn validate_lfm_retained_fixture(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &Lfm2MoeState,
+    arch_id: u32,
+) -> Result<(), String> {
+    if arch_id != crate::ARCH_ID {
+        return Err(format!(
+            "lfm2moe: retained fixture requires arch_id {}, got {arch_id}",
+            crate::ARCH_ID
+        ));
+    }
+    validate_350m_mq4_model(cfg, weights, state)?;
+    validate_350m_retained_state(state)
+}
+
+fn validate_350m_mq4_model(
     cfg: &Lfm2MoeConfig,
     weights: &Lfm2MoeWeights,
     state: &Lfm2MoeState,
@@ -157,8 +200,7 @@ fn validate_350m_mq4_admission(
         && cfg.layer_types.as_slice() == MIXERS;
     if !shape_ok {
         return Err(
-            "lfm2moe: batched prefill admits only the frozen 350m.mq4 dense fixture shape"
-                .to_string(),
+            "lfm2moe: 350m.mq4 admission requires the frozen dense fixture shape".to_string(),
         );
     }
     if weights.layers.len() != cfg.num_hidden_layers {
@@ -189,12 +231,8 @@ fn validate_350m_mq4_admission(
     {
         return Err("lfm2moe: 350m.mq4 admission requires matching Q8 KV capacity".to_string());
     }
-    require_q8_weight(
-        &weights.lm_head,
-        cfg.vocab_size,
-        cfg.hidden_size,
-        "lm_head",
-    )?;
+
+    require_q8_weight(&weights.lm_head, cfg.vocab_size, cfg.hidden_size, "lm_head")?;
     let embed_bytes = cfg
         .vocab_size
         .checked_mul(cfg.hidden_size / 32)
@@ -206,11 +244,7 @@ fn validate_350m_mq4_admission(
             weights.embed.buf.size()
         ));
     }
-    require_f32_tensor(
-        &weights.embedding_norm,
-        cfg.hidden_size,
-        "embedding_norm",
-    )?;
+    require_f32_tensor(&weights.embedding_norm, cfg.hidden_size, "embedding_norm")?;
 
     let mut conv_slots = vec![false; cfg.num_conv_layers()];
     let mut kv_slots = vec![false; cfg.num_attention_layers()];
@@ -270,12 +304,7 @@ fn validate_350m_mq4_admission(
                     } else {
                         cfg.hidden_size
                     };
-                    require_mq4_proj(
-                        weight,
-                        m,
-                        k,
-                        &format!("L{layer_idx}.attention.{name}"),
-                    )?;
+                    require_mq4_proj(weight, m, k, &format!("L{layer_idx}.attention.{name}"))?;
                 }
                 require_f32_tensor(
                     &attn.q_norm,
@@ -288,10 +317,7 @@ fn validate_350m_mq4_admission(
                     &format!("L{layer_idx}.attention.k_norm"),
                 )?;
                 let occupied = kv_slots.get_mut(attn.kv_idx).ok_or_else(|| {
-                    format!(
-                        "lfm2moe: L{layer_idx} kv_idx {} out of range",
-                        attn.kv_idx
-                    )
+                    format!("lfm2moe: L{layer_idx} kv_idx {} out of range", attn.kv_idx)
                 })?;
                 if *occupied {
                     return Err(format!("lfm2moe: duplicate kv_idx {}", attn.kv_idx));
@@ -328,9 +354,7 @@ fn validate_350m_mq4_admission(
             &format!("L{layer_idx}.ffn.w2"),
         )?;
     }
-    if conv_slots.iter().any(|occupied| !occupied)
-        || kv_slots.iter().any(|occupied| !occupied)
-    {
+    if conv_slots.iter().any(|occupied| !occupied) || kv_slots.iter().any(|occupied| !occupied) {
         return Err("lfm2moe: incomplete conv/KV slot coverage".to_string());
     }
     for (index, conv_state) in state.conv_states.iter().enumerate() {
@@ -341,6 +365,22 @@ fn validate_350m_mq4_admission(
         )?;
     }
     Ok(())
+}
+
+fn validate_350m_retained_state(state: &Lfm2MoeState) -> Result<(), String> {
+    // Exact retained flash surface: max_seq/physical_cap 2048, always-flash
+    // mode, and decode partials F32 length 16*ceil(2048/128)*(2+64)=16896.
+    // HIPFIRE_ATTN_FLASH=never stays ordinary-HIP A/B but is retained-ineligible.
+    if state.max_seq != 2048 {
+        return Err("lfm2moe: 350m.mq4 admission requires max_seq 2048".to_string());
+    }
+    if state.kv.physical_cap != 2048 {
+        return Err("lfm2moe: 350m.mq4 admission requires physical_cap 2048".to_string());
+    }
+    if state.flash_mode != 2 {
+        return Err("lfm2moe: 350m.mq4 admission requires frozen flash_mode 2".to_string());
+    }
+    require_f32_tensor(&state.flash_partials, 16_896, "flash_partials")
 }
 
 fn checked_prefill_i32_product(label: &str, factors: &[usize]) -> Result<usize, String> {
@@ -355,10 +395,7 @@ fn checked_prefill_i32_product(label: &str, factors: &[usize]) -> Result<usize, 
     Ok(value)
 }
 
-fn validate_prefill_launch_dimensions(
-    cfg: &Lfm2MoeConfig,
-    chunk_len: usize,
-) -> Result<(), String> {
+fn validate_prefill_launch_dimensions(cfg: &Lfm2MoeConfig, chunk_len: usize) -> Result<(), String> {
     for (label, factors) in [
         ("N*n_heads", vec![chunk_len, cfg.num_attention_heads]),
         ("N*n_kv_heads", vec![chunk_len, cfg.num_key_value_heads]),
@@ -401,6 +438,7 @@ pub fn forward_prefill_batch(
     token_ids: &[u32],
     start_pos: u32,
 ) -> Result<Vec<f32>, String> {
+    gpu.replay.set_forward_eligible(false);
     forward_prefill_batch_impl(cfg, weights, state, gpu, token_ids, start_pos, None)
 }
 
@@ -414,6 +452,7 @@ pub fn forward_prefill_batch_capture(
     start_pos: u32,
     capture: &mut [Vec<f32>],
 ) -> Result<Vec<f32>, String> {
+    gpu.replay.set_forward_eligible(false);
     forward_prefill_batch_impl(
         cfg,
         weights,
@@ -444,9 +483,7 @@ fn forward_prefill_batch_impl(
         ));
     }
     if std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref() != Some("1") {
-        return Err(
-            "lfm2moe: batched prefill requires HIPFIRE_LFM2_PREFILL_BATCH=1".to_string(),
-        );
+        return Err("lfm2moe: batched prefill requires HIPFIRE_LFM2_PREFILL_BATCH=1".to_string());
     }
     if start_pos as usize != state.n_tokens {
         return Err(format!(
@@ -476,7 +513,7 @@ fn forward_prefill_batch_impl(
             state.max_seq, state.kv.max_seq, state.kv.physical_cap
         ));
     }
-    validate_350m_mq4_admission(cfg, weights, state)?;
+    validate_350m_mq4_model(cfg, weights, state)?;
     let prospective_max_batch = match state.prefill_batch.as_ref() {
         Some(scratch) => scratch.max_batch,
         None => lfm2_prefill_batch_capacity(cfg, state.max_seq)?,
@@ -603,9 +640,7 @@ fn forward_prefill_chunk_impl(
         .iter()
         .map(|&id| i32::try_from(id).unwrap())
         .collect();
-    let positions_i32: Vec<i32> = (0..n)
-        .map(|i| i32::try_from(p + i).unwrap())
-        .collect();
+    let positions_i32: Vec<i32> = (0..n).map(|i| i32::try_from(p + i).unwrap()).collect();
     let token_bytes = unsafe {
         std::slice::from_raw_parts(
             token_ids_i32.as_ptr().cast::<u8>(),
@@ -644,21 +679,23 @@ fn forward_prefill_chunk_impl(
         .sub_offset(0, n * cfg.intermediate_size);
 
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        // Operator-norm + exactly-once FWHT into operator_x_rot_batch for MQ4 projections.
-        fused_rmsnorm_rotate_mq_batched_for(
-            gpu,
-            &scratch.h_batch,
-            &layer.operator_norm,
-            match &layer.mixer {
-                Mixer::Conv(c) => &c.in_proj,
-                Mixer::Attention(a) => &a.wq,
-            },
-            &scratch.operator_x_rot_batch,
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            n,
-        )
-        .map_err(|e| prefill_chunk_error("operator rmsnorm+rotate", Some(layer_idx), p, n, e))?;
+            // Operator-norm + exactly-once FWHT into operator_x_rot_batch for MQ4 projections.
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu,
+                &scratch.h_batch,
+                &layer.operator_norm,
+                match &layer.mixer {
+                    Mixer::Conv(c) => &c.in_proj,
+                    Mixer::Attention(a) => &a.wq,
+                },
+                &scratch.operator_x_rot_batch,
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                n,
+            )
+            .map_err(|e| {
+                prefill_chunk_error("operator rmsnorm+rotate", Some(layer_idx), p, n, e)
+            })?;
 
         match &layer.mixer {
             Mixer::Conv(conv) => {
@@ -678,9 +715,7 @@ fn forward_prefill_chunk_impl(
                     cfg.hidden_size,
                     n,
                 )
-                .map_err(|e| {
-                    prefill_chunk_error("conv in_proj", Some(layer_idx), p, n, e)
-                })?;
+                .map_err(|e| prefill_chunk_error("conv in_proj", Some(layer_idx), p, n, e))?;
                 kernels::conv1d_gated_scan_n(
                     gpu,
                     &scratch.conv_bcx_batch,
@@ -699,9 +734,7 @@ fn forward_prefill_chunk_impl(
                     cfg.hidden_size,
                     n,
                 )
-                .map_err(|e| {
-                    prefill_chunk_error("conv out rotate", Some(layer_idx), p, n, e)
-                })?;
+                .map_err(|e| prefill_chunk_error("conv out rotate", Some(layer_idx), p, n, e))?;
                 kernels::lfm2_350m_residual_wmma_gfx1201(
                     gpu,
                     &conv.out_proj.buf,
@@ -711,9 +744,7 @@ fn forward_prefill_chunk_impl(
                     cfg.hidden_size,
                     n,
                 )
-                .map_err(|e| {
-                    prefill_chunk_error("conv out_proj", Some(layer_idx), p, n, e)
-                })?;
+                .map_err(|e| prefill_chunk_error("conv out_proj", Some(layer_idx), p, n, e))?;
             }
             Mixer::Attention(attn) => {
                 gpu.gemm_qkv_hfq4g256(
@@ -800,9 +831,7 @@ fn forward_prefill_chunk_impl(
                     0,
                     0,
                 )
-                .map_err(|e| {
-                    prefill_chunk_error("attention flash", Some(layer_idx), p, n, e)
-                })?;
+                .map_err(|e| prefill_chunk_error("attention flash", Some(layer_idx), p, n, e))?;
                 rotate_x_mq_batched_for(
                     gpu,
                     &attn.wo,
@@ -823,9 +852,7 @@ fn forward_prefill_chunk_impl(
                     cfg.q_dim(),
                     n,
                 )
-                .map_err(|e| {
-                    prefill_chunk_error("attention out_proj", Some(layer_idx), p, n, e)
-                })?;
+                .map_err(|e| prefill_chunk_error("attention out_proj", Some(layer_idx), p, n, e))?;
             }
         }
         if capture_postmixer {
@@ -889,9 +916,9 @@ fn forward_prefill_chunk_impl(
         .map_err(|e| prefill_chunk_error("ffn down", Some(layer_idx), p, n, e))?;
         if !capture_postmixer {
             if let Some(capture) = capture.as_deref_mut() {
-                let hidden = gpu.download_f32(&scratch.h_batch).map_err(|e| {
-                    prefill_chunk_error("capture hidden", Some(layer_idx), p, n, e)
-                })?;
+                let hidden = gpu
+                    .download_f32(&scratch.h_batch)
+                    .map_err(|e| prefill_chunk_error("capture hidden", Some(layer_idx), p, n, e))?;
                 capture[layer_idx].extend_from_slice(&hidden[..n * cfg.hidden_size]);
             }
         }
@@ -906,14 +933,8 @@ fn forward_prefill_chunk_impl(
         let row_offset = (n - 1)
             .checked_mul(row_bytes)
             .ok_or_else(|| "lfm2moe: final row offset overflow".to_string())?;
-        gpu.memcpy_dtod_at_auto(
-            &state.h.buf,
-            0,
-            &scratch.h_batch.buf,
-            row_offset,
-            row_bytes,
-        )
-        .map_err(|e| prefill_chunk_error("final row copy", None, p, n, e))?;
+        gpu.memcpy_dtod_at_auto(&state.h.buf, 0, &scratch.h_batch.buf, row_offset, row_bytes)
+            .map_err(|e| prefill_chunk_error("final row copy", None, p, n, e))?;
         gpu.rmsnorm_f32(
             &state.h,
             &weights.embedding_norm,
@@ -921,22 +942,16 @@ fn forward_prefill_chunk_impl(
             cfg.rms_norm_eps,
         )
         .map_err(|e| prefill_chunk_error("final rmsnorm", None, p, n, e))?;
-        weight_gemv(
-            gpu,
-            &weights.lm_head,
-            &state.final_norm_buf,
-            &state.logits,
-        )
-        .map_err(|e| prefill_chunk_error("lm_head", None, p, n, e))?;
+        weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
+            .map_err(|e| prefill_chunk_error("lm_head", None, p, n, e))?;
     }
     Ok(())
 }
 
-/// Decode one token; returns the full logits vector.
+/// Decode one token and return the full host logits vector.
 ///
-/// `HIPFIRE_LFM2_GRAPH=1` selects the experimental graph path. It is default
-/// OFF and not safe for production: Q8 attention launch geometry is captured
-/// at the initial sequence length and does not grow during replay.
+/// Product paths that consume logits on-device should call
+/// [`decode_step_device`] and avoid the 256 KiB full-vocabulary readback.
 pub fn decode_step(
     cfg: &Lfm2MoeConfig,
     weights: &Lfm2MoeWeights,
@@ -944,13 +959,131 @@ pub fn decode_step(
     gpu: &mut Gpu,
     token_id: u32,
     position: u32,
+    retained_fixture_evidence: RetainedFixtureEvidence,
+    mode: DecodeExecutionMode,
 ) -> Result<Vec<f32>, String> {
     if graph_enabled() {
         return decode_step_with_graph(cfg, weights, state, gpu, token_id, position);
     }
-    decode_step_inner(cfg, weights, state, gpu, token_id, position, true, None)?;
+    decode_step_device(
+        cfg,
+        weights,
+        state,
+        gpu,
+        token_id,
+        position,
+        retained_fixture_evidence,
+        mode,
+    )?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("lfm2moe: download logits: {e:?}"))
+}
+
+/// Decode one token while leaving the full logits vector device-resident.
+///
+/// The retained tape starts with the pointer-driven n=1 Q8 embedding, so the
+/// only per-token work outside AQL/PM4 is two synchronous 4-byte scalar uploads.
+/// `HIPFIRE_LFM2_GRAPH=1` remains an experimental compatibility path and still
+/// uses its legacy logits readback internally.
+pub fn decode_step_device(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+    retained_fixture_evidence: RetainedFixtureEvidence,
+    mode: DecodeExecutionMode,
+) -> Result<(), String> {
+    let graph = graph_enabled();
+    if graph {
+        return decode_step_with_graph(cfg, weights, state, gpu, token_id, position).map(drop);
+    }
+    let lowered = lfm2_forward_lowered_enabled();
+    let fusion_enabled = lfm2_decode_fusion_enabled(retained_fixture_evidence, &gpu.arch);
+    let retained_eligible = state.flash_mode == 2
+        && crate::redline_plan::retained_route_eligible(
+            retained_fixture_evidence,
+            &gpu.arch,
+            gpu.replay.request() != ReplayBackendRequest::Hip,
+            mode,
+            position,
+            state.n_tokens,
+            graph,
+            lowered,
+            fusion_enabled,
+        );
+
+    stage_decode_inputs(state, gpu, token_id, position)?;
+
+    gpu.replay.set_forward_eligible(retained_eligible);
+    if retained_eligible {
+        gpu.replay
+            .begin_auto_capture_if_armed()
+            .map_err(|reason| format!("lfm2moe: begin replay capture: {reason}"))?;
+    }
+    let route = retained_decode_route(
+        retained_eligible,
+        gpu.replay.should_route_aql(),
+        gpu.replay.should_route_pm4(),
+    );
+
+    match route {
+        RetainedDecodeRoute::Aql => {
+            if let Err(reason) = unsafe { gpu.replay.replay_linear_aql(position as usize) } {
+                gpu.replay
+                    .poison(format!("prepared AQL replay failed: {reason}"));
+                return Err(format!("lfm2moe: prepared AQL replay failed: {reason}"));
+            }
+            complete_retained_replay(&mut state.n_tokens, position);
+        }
+        RetainedDecodeRoute::Pm4 => {
+            if let Err(reason) = unsafe { gpu.replay.replay_pm4(position as usize) } {
+                gpu.replay
+                    .poison(format!("prepared PM4 replay failed: {reason}"));
+                return Err(format!("lfm2moe: prepared PM4 replay failed: {reason}"));
+            }
+            complete_retained_replay(&mut state.n_tokens, position);
+        }
+        RetainedDecodeRoute::Hip => {
+            run_decode_embedding(cfg, weights, state, gpu)?;
+            decode_step_layers_and_head(
+                cfg,
+                weights,
+                state,
+                gpu,
+                position,
+                true,
+                fusion_enabled,
+                None,
+            )?;
+        }
+    }
+
+    if retained_eligible && gpu.replay.should_auto_finalize_capture() {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("lfm2moe: synchronize replay capture: {e:?}"))?;
+        gpu.replay
+            .finish_capture()
+            .map_err(|reason| format!("lfm2moe: finish replay capture: {reason}"))?;
+        let prepare = if gpu.replay.uses_pm4_transport() {
+            let launches = gpu.replay.recorded_launches().len();
+            gpu.replay
+                .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                .map(|_| ())
+        } else {
+            gpu.replay
+                .prepare_linear_aql(gpu.device_id as usize)
+                .map(|_| ())
+        };
+        if let Err(reason) = prepare {
+            gpu.replay
+                .poison(format!("Redline prepare after warmup failed: {reason}"));
+            eprintln!("[redline] falling back to HIP: {reason}");
+        }
+    }
+    Ok(())
 }
 
 /// Prefill a single non-final prompt token: full mixer/FFN layer stack + state
@@ -968,11 +1101,22 @@ pub fn decode_step_prefill(
     token_id: u32,
     position: u32,
 ) -> Result<(), String> {
+    gpu.replay.set_forward_eligible(false);
     if graph_enabled() {
         // Explicit graph mode: do not bypass the user-selected path. Run the
         // full decode (graph) and discard the logits; head-elision is a
         // non-graph optimization.
-        return decode_step(cfg, weights, state, gpu, token_id, position).map(|_| ());
+        return decode_step(
+            cfg,
+            weights,
+            state,
+            gpu,
+            token_id,
+            position,
+            RetainedFixtureEvidence::ABSENT,
+            DecodeExecutionMode::Prefill,
+        )
+        .map(|_| ());
     }
     decode_step_inner(cfg, weights, state, gpu, token_id, position, false, None)
 }
@@ -989,6 +1133,40 @@ fn graph_enabled() -> bool {
         )
     })
 }
+fn resolve_lfm2_decode_fusion_request(value: Option<&std::ffi::OsStr>) -> bool {
+    match value {
+        None => true,
+        Some(value) => matches!(value.to_str(), Some("1")),
+    }
+}
+
+fn lfm2_decode_fusion_requested() -> bool {
+    use std::sync::LazyLock;
+    static REQUESTED: LazyLock<bool> = LazyLock::new(|| {
+        resolve_lfm2_decode_fusion_request(
+            std::env::var_os("HIPFIRE_LFM2_GFX1201_DECODE_FUSION").as_deref(),
+        )
+    });
+    *REQUESTED
+}
+
+pub(crate) fn lfm2_decode_fusion_enabled(
+    fixture_evidence: RetainedFixtureEvidence,
+    gpu_arch: &str,
+) -> bool {
+    let graph = graph_enabled();
+    let lowered = lfm2_forward_lowered_enabled();
+    let enabled = lfm2_decode_fusion_requested()
+        && crate::redline_plan::decode_fusion_eligible(fixture_evidence, gpu_arch, graph, lowered);
+    if enabled {
+        use std::sync::Once;
+        static ANNOUNCE: Once = Once::new();
+        ANNOUNCE.call_once(|| {
+            eprintln!("[lfm2moe] exact gfx1201 350m decode fusion active: shared RMSNorm+FWHT");
+        });
+    }
+    enabled
+}
 
 /// Decode one token, appending each layer's post-residual hidden state
 /// (after the full layer, before the final norm) to `capture[layer]` — used by
@@ -1003,7 +1181,17 @@ pub fn decode_step_capture(
     position: u32,
     capture: &mut [Vec<f32>],
 ) -> Result<(), String> {
-    decode_step_inner(cfg, weights, state, gpu, token_id, position, true, Some(capture))
+    gpu.replay.set_forward_eligible(false);
+    decode_step_inner(
+        cfg,
+        weights,
+        state,
+        gpu,
+        token_id,
+        position,
+        true,
+        Some(capture),
+    )
 }
 
 fn decode_step_inner(
@@ -1016,18 +1204,123 @@ fn decode_step_inner(
     emit_head: bool,
     capture: Option<&mut [Vec<f32>]>,
 ) -> Result<(), String> {
-    let hidden = cfg.hidden_size;
+    prepare_decode_inputs(cfg, weights, state, gpu, token_id, position)?;
+    decode_step_layers_and_head(
+        cfg, weights, state, gpu, position, emit_head, false, capture,
+    )
+}
 
-    // Device position scalar (i32) for rope / kv-write / attention.
+/// Upload the per-token position and token-id scalars outside retained capture.
+///
+/// `hipMemcpy` is synchronous, so a prepared AQL/PM4 replay can consume these
+/// stable buffers without a separate device-wide synchronization.
+pub fn stage_decode_inputs(
+    state: &Lfm2MoeState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<(), String> {
+    gpu.replay.set_forward_eligible(false);
     gpu.hip
         .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|e| format!("lfm2moe: htod pos: {e:?}"))?;
+    gpu.hip
+        .memcpy_htod(&state.token_buf.buf, &token_id.to_ne_bytes())
+        .map_err(|e| format!("lfm2moe: htod token: {e:?}"))
+}
 
-    // Embedding lookup → residual stream h (Q8 table).
-    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
-        .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
+fn run_decode_embedding(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &Lfm2MoeState,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    gpu.embedding_lookup_q8_batched(
+        &weights.embed,
+        &state.h,
+        &state.token_buf,
+        1,
+        cfg.hidden_size,
+    )
+    .map_err(|e| format!("lfm2moe: batched embed lookup: {e:?}"))
+}
 
-    decode_step_layers_and_head(cfg, weights, state, gpu, position, emit_head, capture)
+/// Stage scalars and run the embedding directly. Used by non-retained prefill
+/// and the experimental hipGraph path, where embedding remains outside capture.
+pub fn prepare_decode_inputs(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &Lfm2MoeState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<(), String> {
+    stage_decode_inputs(state, gpu, token_id, position)?;
+    run_decode_embedding(cfg, weights, state, gpu)
+}
+
+fn validate_lfm_speculative_graph(graph: Option<&std::ffi::OsStr>) -> Result<(), String> {
+    if graph == Some(std::ffi::OsStr::new("1")) {
+        return Err(
+            "lfm2moe: speculative direct-HIP execution rejects HIPFIRE_LFM2_GRAPH=1"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Run one full-model speculative target token through direct HIP. This entry
+/// rejects hipGraph and never enters retained replay.
+pub(crate) fn decode_step_speculative_device(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+    retained_fixture_evidence: RetainedFixtureEvidence,
+) -> Result<(), String> {
+    validate_lfm_speculative_graph(std::env::var_os("HIPFIRE_LFM2_GRAPH").as_deref())?;
+    let fusion_enabled = lfm2_decode_fusion_enabled(retained_fixture_evidence, &gpu.arch);
+    gpu.replay.set_forward_eligible(false);
+    prepare_decode_inputs(cfg, weights, state, gpu, token_id, position)?;
+    decode_step_layers_and_head(
+        cfg,
+        weights,
+        state,
+        gpu,
+        position,
+        true,
+        fusion_enabled,
+        None,
+    )
+}
+
+/// Execute the scalar-staged embedding + layer/head region directly through HIP.
+///
+/// This bypasses retained routing and lifecycle transitions so shadow
+/// validation can compare direct HIP with the full prepared replay.
+pub fn run_prepared_decode_layers_and_head(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    position: u32,
+    emit_head: bool,
+    fusion_enabled: bool,
+) -> Result<(), String> {
+    gpu.replay.set_forward_eligible(false);
+    run_decode_embedding(cfg, weights, state, gpu)?;
+    decode_step_layers_and_head(
+        cfg,
+        weights,
+        state,
+        gpu,
+        position,
+        emit_head,
+        fusion_enabled,
+        None,
+    )
 }
 
 /// Per-layer mixer/FFN stack + final norm + lm_head. Reads the residual
@@ -1050,6 +1343,7 @@ fn decode_step_layers_and_head(
     gpu: &mut Gpu,
     position: u32,
     emit_head: bool,
+    fusion_enabled: bool,
     mut capture: Option<&mut [Vec<f32>]>,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
@@ -1063,103 +1357,125 @@ fn decode_step_layers_and_head(
     let seq_len = position as usize + 1;
     let capture_postmixer = std::env::var_os("HIPFIRE_LFM2_CAPTURE_POSTMIXER").is_some();
 
-    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
-    // per-layer decode through the super-op executor (run_layer_program). Skipped
-    // when capturing (the oracle dumper needs the per-layer hand path) — that path
-    // stays byte-identical. Default off (opt-in) until fleet byte-parity validated.
+    // #397 Ship 6 — the default-on lowered route runs the per-layer decode
+    // through run_layer_program. Oracle capture keeps the byte-identical hand
+    // path because it downloads each layer; HIPFIRE_FORWARD_LOWERED=0 remains
+    // the explicit legacy escape hatch.
     if lfm2_forward_lowered_enabled() && capture.is_none() {
-        return decode_step_layers_and_head_lowered(cfg, weights, state, gpu, position, emit_head);
+        return decode_step_layers_and_head_lowered(
+            cfg,
+            weights,
+            state,
+            gpu,
+            position,
+            emit_head,
+            fusion_enabled,
+        );
     }
 
     for (l, layer) in weights.layers.iter().enumerate() {
-        // ── Mixer block (pre-norm) ──────────────────────────────────────────
-        gpu.rmsnorm_f32(&state.h, &layer.operator_norm, &state.tmp, eps)
-            .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
+            // ── Mixer block (pre-norm) ──────────────────────────────────────
+            gpu.rmsnorm_f32(&state.h, &layer.operator_norm, &state.tmp, eps)
+                .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
 
-        match &layer.mixer {
-            Mixer::Conv(c) => {
-                // in_proj → [3*hidden] (B | C_gate | x), Q8 plain.
-                weight_gemv(gpu, &c.in_proj, &state.tmp, &state.conv_bcx)
-                    .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e}"))?;
-                // double-gated depthwise causal short-conv (advances conv state).
-                gpu.conv1d_gated_decode_f32(
-                    &state.conv_bcx,
-                    &state.conv_states[c.conv_state_idx],
-                    &c.conv_weight,
-                    &state.conv_y,
-                    1,
-                    hidden,
-                    cfg.conv_kernel_size,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: conv gated decode: {e:?}"))?;
-                // out_proj + residual: h += W_out · y (Q8).
-                weight_gemv_residual(gpu, &c.out_proj, &state.conv_y, &state.h)
-                    .map_err(|e| format!("lfm2moe L{l}: conv out_proj: {e}"))?;
-            }
-            Mixer::Attention(a) => {
-                weight_gemv(gpu, &a.wq, &state.tmp, &state.fa_q)
-                    .map_err(|e| format!("lfm2moe L{l}: q_proj: {e}"))?;
-                weight_gemv(gpu, &a.wk, &state.tmp, &state.fa_k)
-                    .map_err(|e| format!("lfm2moe L{l}: k_proj: {e}"))?;
-                weight_gemv(gpu, &a.wv, &state.tmp, &state.fa_v)
-                    .map_err(|e| format!("lfm2moe L{l}: v_proj: {e}"))?;
+            match &layer.mixer {
+                Mixer::Conv(c) => {
+                    // in_proj → [3*hidden] (B | C_gate | x), Q8 plain.
+                    weight_gemv(gpu, &c.in_proj, &state.tmp, &state.conv_bcx)
+                        .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e}"))?;
+                    // double-gated depthwise causal short-conv (advances conv state).
+                    gpu.conv1d_gated_decode_f32(
+                        &state.conv_bcx,
+                        &state.conv_states[c.conv_state_idx],
+                        &c.conv_weight,
+                        &state.conv_y,
+                        1,
+                        hidden,
+                        cfg.conv_kernel_size,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: conv gated decode: {e:?}"))?;
+                    // out_proj + residual: h += W_out · y (Q8).
+                    weight_gemv_residual(gpu, &c.out_proj, &state.conv_y, &state.h)
+                        .map_err(|e| format!("lfm2moe L{l}: conv out_proj: {e}"))?;
+                }
+                Mixer::Attention(a) => {
+                    weight_gemv(gpu, &a.wq, &state.tmp, &state.fa_q)
+                        .map_err(|e| format!("lfm2moe L{l}: q_proj: {e}"))?;
+                    weight_gemv(gpu, &a.wk, &state.tmp, &state.fa_k)
+                        .map_err(|e| format!("lfm2moe L{l}: k_proj: {e}"))?;
+                    weight_gemv(gpu, &a.wv, &state.tmp, &state.fa_v)
+                        .map_err(|e| format!("lfm2moe L{l}: v_proj: {e}"))?;
 
-                // Per-HEAD QK-norm: RMSNorm over each head's head_dim slice,
-                // sharing the [head_dim] weight across heads (batch = n_heads).
-                gpu.rmsnorm_batched(&state.fa_q, &a.q_norm, &state.fa_q, n_heads, head_dim, eps)
+                    // Per-HEAD QK-norm: RMSNorm over each head's head_dim slice,
+                    // sharing the [head_dim] weight across heads (batch = n_heads).
+                    gpu.rmsnorm_batched(
+                        &state.fa_q,
+                        &a.q_norm,
+                        &state.fa_q,
+                        n_heads,
+                        head_dim,
+                        eps,
+                    )
                     .map_err(|e| format!("lfm2moe L{l}: q_norm: {e:?}"))?;
-                gpu.rmsnorm_batched(&state.fa_k, &a.k_norm, &state.fa_k, n_kv, head_dim, eps)
+                    gpu.rmsnorm_batched(
+                        &state.fa_k,
+                        &a.k_norm,
+                        &state.fa_k,
+                        n_kv,
+                        head_dim,
+                        eps,
+                    )
                     .map_err(|e| format!("lfm2moe L{l}: k_norm: {e:?}"))?;
 
-                // Full-dim rotate_half RoPE (no partial rotary).
-                gpu.rope_f32(
-                    &state.fa_q,
-                    &state.fa_k,
-                    &state.pos_buf,
-                    n_heads,
-                    n_kv,
-                    head_dim,
-                    cfg.rope_theta,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
+                    // Full-dim rotate_half RoPE (no partial rotary).
+                    gpu.rope_f32(
+                        &state.fa_q,
+                        &state.fa_k,
+                        &state.pos_buf,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        cfg.rope_theta,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
 
-                // KV cache write (Q8) + GQA flash attention.
-                let kv_idx = a.kv_idx;
-                gpu.kv_cache_write_q8_0(
-                    &state.kv.k_gpu[kv_idx],
-                    &state.fa_k,
-                    &state.pos_buf,
-                    n_kv,
-                    head_dim,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: kv write k: {e:?}"))?;
-                gpu.kv_cache_write_q8_0(
-                    &state.kv.v_gpu[kv_idx],
-                    &state.fa_v,
-                    &state.pos_buf,
-                    n_kv,
-                    head_dim,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: kv write v: {e:?}"))?;
-                gpu.attention_q8_0_kv(
-                    &state.fa_q,
-                    &state.kv.k_gpu[kv_idx],
-                    &state.kv.v_gpu[kv_idx],
-                    &state.fa_attn_out,
-                    &state.pos_buf,
-                    seq_len,
-                    n_heads,
-                    n_kv,
-                    head_dim,
-                    state.kv.physical_cap,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: attention: {e:?}"))?;
+                    // KV cache write (Q8) + GQA flash attention.
+                    let kv_idx = a.kv_idx;
+                    gpu.kv_cache_write_q8_0(
+                        &state.kv.k_gpu[kv_idx],
+                        &state.fa_k,
+                        &state.pos_buf,
+                        n_kv,
+                        head_dim,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: kv write k: {e:?}"))?;
+                    gpu.kv_cache_write_q8_0(
+                        &state.kv.v_gpu[kv_idx],
+                        &state.fa_v,
+                        &state.pos_buf,
+                        n_kv,
+                        head_dim,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: kv write v: {e:?}"))?;
+                    gpu.attention_q8_0_kv(
+                        &state.fa_q,
+                        &state.kv.k_gpu[kv_idx],
+                        &state.kv.v_gpu[kv_idx],
+                        &state.fa_attn_out,
+                        &state.pos_buf,
+                        seq_len,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        state.kv.physical_cap,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: attention: {e:?}"))?;
 
-                // out_proj + residual: h += W_out · attn_out (Q8).
-                weight_gemv_residual(gpu, &a.wo, &state.fa_attn_out, &state.h)
-                    .map_err(|e| format!("lfm2moe L{l}: out_proj: {e}"))?;
+                    // out_proj + residual: h += W_out · attn_out (Q8).
+                    weight_gemv_residual(gpu, &a.wo, &state.fa_attn_out, &state.h)
+                        .map_err(|e| format!("lfm2moe L{l}: out_proj: {e}"))?;
+                }
             }
-        }
 
         if capture_postmixer {
             if let Some(cap) = capture.as_deref_mut() {
@@ -1331,6 +1647,16 @@ fn decode_step_layers_and_head(
 //   Moe          = ffn_norm + rotate + router + top-k + experts + combine
 // ─────────────────────────────────────────────────────────────────────────
 
+fn use_lfm2_350m_conv_wide_hfq4(
+    is_gfx1201: bool,
+    fusion_enabled: bool,
+    dtype: DType,
+    m: usize,
+    k: usize,
+) -> bool {
+    is_gfx1201 && fusion_enabled && dtype == DType::MQ4G256 && m == 3 * 1024 && k == 1024
+}
+
 /// Conv mixer block (operator-norm folded in). Mirrors the hand-loop Conv arm.
 fn conv_mixer_block(
     gpu: &mut Gpu,
@@ -1339,24 +1665,81 @@ fn conv_mixer_block(
     c: &ConvWeights,
     state: &Lfm2MoeState,
     l: usize,
+    fusion_enabled: bool,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
-    gpu.rmsnorm_f32(&state.h, op_norm, &state.tmp, cfg.rms_norm_eps)
-        .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &c.in_proj, &state.tmp, &state.conv_bcx)
-        .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e}"))?;
-    gpu.conv1d_gated_decode_f32(
-        &state.conv_bcx,
-        &state.conv_states[c.conv_state_idx],
-        &c.conv_weight,
-        &state.conv_y,
-        1,
-        hidden,
-        cfg.conv_kernel_size,
-    )
-    .map_err(|e| format!("lfm2moe L{l}: conv gated decode: {e:?}"))?;
-    weight_gemv_residual(gpu, &c.out_proj, &state.conv_y, &state.h)
+    if fusion_enabled {
+        let x_rot = fused_rmsnorm_rotate_for_mq(
+            gpu,
+            &c.in_proj,
+            &state.h,
+            op_norm,
+            &state.tmp,
+            &state.ffn_x_rot,
+            cfg.rms_norm_eps,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: fused operator norm+rotate: {e:?}"))?;
+        if use_lfm2_350m_conv_wide_hfq4(
+            gpu.arch_caps.is_gfx1201(),
+            fusion_enabled,
+            c.in_proj.gpu_dtype,
+            c.in_proj.m,
+            c.in_proj.k,
+        ) {
+            let x_rot = x_rot.ok_or_else(|| {
+                format!("lfm2moe L{l}: exact fusion expected MQ4 conv projection")
+            })?;
+            gpu.gemv_hfq4g256_wide(
+                &c.in_proj.buf,
+                x_rot,
+                &state.conv_bcx,
+                c.in_proj.m,
+                c.in_proj.k,
+            )
+            .map_err(|e| format!("lfm2moe L{l}: conv in_proj wide: {e:?}"))?;
+        } else {
+            weight_gemv_prerotated(gpu, &c.in_proj, &state.tmp, x_rot, &state.conv_bcx)
+                .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e}"))?;
+        }
+    } else {
+        gpu.rmsnorm_f32(&state.h, op_norm, &state.tmp, cfg.rms_norm_eps)
+            .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
+        weight_gemv(gpu, &c.in_proj, &state.tmp, &state.conv_bcx)
+            .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e}"))?;
+    }
+    if fusion_enabled {
+        gpu.conv1d_gated_decode_mq_rotate_f32(
+            &state.conv_bcx,
+            &state.conv_states[c.conv_state_idx],
+            &c.conv_weight,
+            &state.ffn_x_rot,
+            1,
+            hidden,
+            cfg.conv_kernel_size,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: fused conv decode+rotate: {e:?}"))?;
+        weight_gemv_prerotated_residual(
+            gpu,
+            &c.out_proj,
+            &state.conv_y,
+            Some(&state.ffn_x_rot),
+            &state.h,
+        )
         .map_err(|e| format!("lfm2moe L{l}: conv out_proj: {e}"))
+    } else {
+        gpu.conv1d_gated_decode_f32(
+            &state.conv_bcx,
+            &state.conv_states[c.conv_state_idx],
+            &c.conv_weight,
+            &state.conv_y,
+            1,
+            hidden,
+            cfg.conv_kernel_size,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: conv gated decode: {e:?}"))?;
+        weight_gemv_residual(gpu, &c.out_proj, &state.conv_y, &state.h)
+            .map_err(|e| format!("lfm2moe L{l}: conv out_proj: {e}"))
+    }
 }
 
 /// Attention mixer block (operator-norm folded in). Mirrors the hand-loop Attn arm.
@@ -1368,48 +1751,97 @@ fn attn_mixer_block(
     state: &Lfm2MoeState,
     l: usize,
     seq_len: usize,
+    fusion_enabled: bool,
 ) -> Result<(), String> {
     let head_dim = cfg.head_dim;
     let n_heads = cfg.num_attention_heads;
     let n_kv = cfg.num_key_value_heads;
     let eps = cfg.rms_norm_eps;
-    gpu.rmsnorm_f32(&state.h, op_norm, &state.tmp, eps)
-        .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &a.wq, &state.tmp, &state.fa_q)
-        .map_err(|e| format!("lfm2moe L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &a.wk, &state.tmp, &state.fa_k)
-        .map_err(|e| format!("lfm2moe L{l}: k_proj: {e}"))?;
-    weight_gemv(gpu, &a.wv, &state.tmp, &state.fa_v)
-        .map_err(|e| format!("lfm2moe L{l}: v_proj: {e}"))?;
-    gpu.rmsnorm_batched(&state.fa_q, &a.q_norm, &state.fa_q, n_heads, head_dim, eps)
-        .map_err(|e| format!("lfm2moe L{l}: q_norm: {e:?}"))?;
-    gpu.rmsnorm_batched(&state.fa_k, &a.k_norm, &state.fa_k, n_kv, head_dim, eps)
-        .map_err(|e| format!("lfm2moe L{l}: k_norm: {e:?}"))?;
-    gpu.rope_f32(
-        &state.fa_q,
-        &state.fa_k,
-        &state.pos_buf,
-        n_heads,
-        n_kv,
-        head_dim,
-        cfg.rope_theta,
-    )
-    .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
+    if fusion_enabled {
+        let x_rot = fused_rmsnorm_rotate_for_mq(
+            gpu,
+            &a.wq,
+            &state.h,
+            op_norm,
+            &state.tmp,
+            &state.ffn_x_rot,
+            eps,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: fused operator norm+rotate: {e:?}"))?;
+        let x_rot = x_rot.ok_or_else(|| {
+            format!("lfm2moe L{l}: exact fusion expected MQ4 attention projections")
+        })?;
+        gpu.fused_qkv_hfq4g256(
+            &a.wq.buf,
+            &a.wk.buf,
+            &a.wv.buf,
+            x_rot,
+            &state.fa_q,
+            &state.fa_k,
+            &state.fa_v,
+            a.wq.m,
+            a.wk.m,
+            a.wv.m,
+            a.wq.k,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: fused qkv: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_f32(&state.h, op_norm, &state.tmp, eps)
+            .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
+        weight_gemv(gpu, &a.wq, &state.tmp, &state.fa_q)
+            .map_err(|e| format!("lfm2moe L{l}: q_proj: {e}"))?;
+        weight_gemv(gpu, &a.wk, &state.tmp, &state.fa_k)
+            .map_err(|e| format!("lfm2moe L{l}: k_proj: {e}"))?;
+        weight_gemv(gpu, &a.wv, &state.tmp, &state.fa_v)
+            .map_err(|e| format!("lfm2moe L{l}: v_proj: {e}"))?;
+    }
+    if fusion_enabled {
+        gpu.lfm_qk_norm_rope_cached_f32(
+            &state.fa_q,
+            &state.fa_k,
+            &a.q_norm,
+            &a.k_norm,
+            &state.rope_cos_cache,
+            &state.rope_sin_cache,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            eps,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: fused q/k norm+cached rope: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_batched(&state.fa_q, &a.q_norm, &state.fa_q, n_heads, head_dim, eps)
+            .map_err(|e| format!("lfm2moe L{l}: q_norm: {e:?}"))?;
+        gpu.rmsnorm_batched(&state.fa_k, &a.k_norm, &state.fa_k, n_kv, head_dim, eps)
+            .map_err(|e| format!("lfm2moe L{l}: k_norm: {e:?}"))?;
+        gpu.rope_f32(
+            &state.fa_q,
+            &state.fa_k,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            cfg.rope_theta,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
+    }
     let kv_idx = a.kv_idx;
-    // KV write (Q8) + attention via the shared KV-usage abstraction. lfm2moe is
-    // Q8 non-flash unconditional → derive's q8_attend_key returns AttnQ8_0Kv at
-    // pos+1<=15000 (byte-identical; needs no partials, hence flash_partials:
-    // None). It flips to AttnFlashQ8_0 at pos+1>15000 (the documented
-    // Q8-fidelity edge — rare for this decode model). capture_mode is NOT
-    // threaded: the non-flash kernel is capture-safe and lfm2moe captures it.
+    // KV write (Q8) + attention via the shared Qwen-style KvTierPlan flash
+    // policy. flash_mode is frozen at state construction (HIPFIRE_ATTN_FLASH);
+    // capture_mode forces flash while graph/replay recording so the variable-
+    // LDS non-flash Q8 kernel is never retained. Partials are always threaded;
+    // the non-flash arm ignores them when HIPFIRE_ATTN_FLASH=never.
+    let capture_mode = gpu.graphs.capture_mode || gpu.replay.is_recording();
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-    let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
-        hipfire_dispatch::families::kv_tier::KvTierInputs {
-            pos: seq_len - 1,
-            ..state.kv.tier_inputs()
-        },
-    )
-    .map_err(|e| format!("lfm2moe L{l}: kv tier: {e}"))?;
+    let tier_inputs = hipfire_dispatch::families::kv_tier::KvTierInputs {
+        pos: seq_len - 1,
+        flash_mode: state.flash_mode as usize,
+        capture_mode,
+        ..state.kv.tier_inputs()
+    };
+    let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(tier_inputs)
+        .map_err(|e| format!("lfm2moe L{l}: kv tier: {e}"))?;
     let io = hipfire_dispatch::families::attention::AttnParams {
         q: &state.fa_q,
         k: &state.fa_k,
@@ -1427,7 +1859,7 @@ fn attn_mixer_block(
         physical_cap: state.kv.physical_cap,
         batch_size: 1,
         max_ctx_len: 0,
-        flash_partials: None,
+        flash_partials: Some(&state.flash_partials),
         givens_cos: None,
         givens_sin: None,
         tree_bias: None,
@@ -1454,13 +1886,41 @@ fn dense_gate_up_block(
     d: &DenseFfn,
     state: &Lfm2MoeState,
     l: usize,
+    fusion_enabled: bool,
 ) -> Result<(), String> {
-    gpu.rmsnorm_f32(&state.h, ffn_norm, &state.ffn_tmp, cfg.rms_norm_eps)
-        .map_err(|e| format!("lfm2moe L{l}: ffn rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &d.w1, &state.ffn_tmp, &state.dense_gate)
-        .map_err(|e| format!("lfm2moe L{l}: dense w1: {e}"))?;
-    weight_gemv(gpu, &d.w3, &state.ffn_tmp, &state.dense_up)
-        .map_err(|e| format!("lfm2moe L{l}: dense w3: {e}"))
+    if fusion_enabled {
+        let x_rot = fused_rmsnorm_rotate_for_mq(
+            gpu,
+            &d.w1,
+            &state.h,
+            ffn_norm,
+            &state.ffn_tmp,
+            &state.ffn_x_rot,
+            cfg.rms_norm_eps,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: fused ffn norm+rotate: {e:?}"))?;
+        let x_rot =
+            x_rot.ok_or_else(|| format!("lfm2moe L{l}: exact fusion expected MQ4 dense FFN"))?;
+        gpu.fused_gate_up_hfq4g256(
+            &d.w1.buf,
+            &d.w3.buf,
+            x_rot,
+            &state.dense_gate,
+            &state.dense_up,
+            d.w1.m,
+            d.w3.m,
+            d.w1.k,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: fused dense gate/up: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_f32(&state.h, ffn_norm, &state.ffn_tmp, cfg.rms_norm_eps)
+            .map_err(|e| format!("lfm2moe L{l}: ffn rmsnorm: {e:?}"))?;
+        weight_gemv(gpu, &d.w1, &state.ffn_tmp, &state.dense_gate)
+            .map_err(|e| format!("lfm2moe L{l}: dense w1: {e}"))?;
+        weight_gemv(gpu, &d.w3, &state.ffn_tmp, &state.dense_up)
+            .map_err(|e| format!("lfm2moe L{l}: dense w3: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Dense FFN down half (silu·mul + w2 residual). Mirrors the hand-loop Dense tail.
@@ -1469,11 +1929,24 @@ fn dense_down_block(
     d: &DenseFfn,
     state: &Lfm2MoeState,
     l: usize,
+    fusion_enabled: bool,
 ) -> Result<(), String> {
-    gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
-        .map_err(|e| format!("lfm2moe L{l}: dense silu_mul: {e:?}"))?;
-    weight_gemv_residual(gpu, &d.w2, &state.dense_act, &state.h)
-        .map_err(|e| format!("lfm2moe L{l}: dense w2: {e}"))
+    if fusion_enabled {
+        weight_gemv_swiglu_residual(
+            gpu,
+            &d.w2,
+            &state.dense_gate,
+            &state.dense_up,
+            &state.dense_act,
+            &state.h,
+        )
+        .map_err(|e| format!("lfm2moe L{l}: fused dense w2: {e}"))
+    } else {
+        gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
+            .map_err(|e| format!("lfm2moe L{l}: dense silu_mul: {e:?}"))?;
+        weight_gemv_residual(gpu, &d.w2, &state.dense_act, &state.h)
+            .map_err(|e| format!("lfm2moe L{l}: dense w2: {e}"))
+    }
 }
 
 fn hfq4_moe_down_expanded(
@@ -1662,20 +2135,23 @@ fn lfm2_superop(kind: SuperOpKind, code: u32) -> SuperOp {
 fn lfm2_lower_variant(v: Lfm2Variant) -> superop::LayerProgram {
     use lfm2_op::{DENSE_DOWN, DENSE_GATE_UP};
     use SuperOpKind::{Attend, Conv, Moe, Proj, ResidualGemv};
+
+    let mixer = match v {
+        Lfm2Variant::ConvDense | Lfm2Variant::ConvMoe => Conv,
+        Lfm2Variant::AttnDense | Lfm2Variant::AttnMoe => Attend,
+    };
+    let mut program = Vec::with_capacity(3);
+    program.push(lfm2_superop(mixer, 0));
     match v {
-        Lfm2Variant::ConvDense => vec![
-            lfm2_superop(Conv, 0),
-            lfm2_superop(Proj, DENSE_GATE_UP),
-            lfm2_superop(ResidualGemv, DENSE_DOWN),
-        ],
-        Lfm2Variant::AttnDense => vec![
-            lfm2_superop(Attend, 0),
-            lfm2_superop(Proj, DENSE_GATE_UP),
-            lfm2_superop(ResidualGemv, DENSE_DOWN),
-        ],
-        Lfm2Variant::ConvMoe => vec![lfm2_superop(Conv, 0), lfm2_superop(Moe, 0)],
-        Lfm2Variant::AttnMoe => vec![lfm2_superop(Attend, 0), lfm2_superop(Moe, 0)],
+        Lfm2Variant::ConvDense | Lfm2Variant::AttnDense => {
+            program.push(lfm2_superop(Proj, DENSE_GATE_UP));
+            program.push(lfm2_superop(ResidualGemv, DENSE_DOWN));
+        }
+        Lfm2Variant::ConvMoe | Lfm2Variant::AttnMoe => {
+            program.push(lfm2_superop(Moe, 0));
+        }
     }
+    program
 }
 
 /// Per-layer execution context for the lowered decode path (rebuilt each layer).
@@ -1685,6 +2161,7 @@ struct Lfm2MoeBindings<'a> {
     state: &'a Lfm2MoeState,
     l: usize,
     seq_len: usize,
+    fusion_enabled: bool,
 }
 
 impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
@@ -1702,6 +2179,7 @@ impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
                 c,
                 self.state,
                 self.l,
+                self.fusion_enabled,
             ),
             _ => Err("run_conv on non-Conv layer".to_string()),
         }
@@ -1723,6 +2201,7 @@ impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
                 self.state,
                 self.l,
                 self.seq_len,
+                self.fusion_enabled,
             ),
             _ => Err("run_attend on non-Attention layer".to_string()),
         }
@@ -1737,9 +2216,15 @@ impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
     ) -> Result<(), DispatchError> {
         let code = op.weights.first().map(|w| w.0).unwrap_or(u32::MAX);
         match (code, &self.layer.ffn) {
-            (lfm2_op::DENSE_GATE_UP, Ffn::Dense(d)) => {
-                dense_gate_up_block(gpu, self.cfg, &self.layer.ffn_norm, d, self.state, self.l)
-            }
+            (lfm2_op::DENSE_GATE_UP, Ffn::Dense(d)) => dense_gate_up_block(
+                gpu,
+                self.cfg,
+                &self.layer.ffn_norm,
+                d,
+                self.state,
+                self.l,
+                self.fusion_enabled,
+            ),
             _ => Err(format!("run_proj bad opcode {code} / non-Dense ffn")),
         }
         .map_err(DispatchError::Hip)
@@ -1753,7 +2238,9 @@ impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
     ) -> Result<(), DispatchError> {
         let code = op.weights.first().map(|w| w.0).unwrap_or(u32::MAX);
         match (code, &self.layer.ffn) {
-            (lfm2_op::DENSE_DOWN, Ffn::Dense(d)) => dense_down_block(gpu, d, self.state, self.l),
+            (lfm2_op::DENSE_DOWN, Ffn::Dense(d)) => {
+                dense_down_block(gpu, d, self.state, self.l, self.fusion_enabled)
+            }
             _ => Err(format!(
                 "run_residual_gemv bad opcode {code} / non-Dense ffn"
             )),
@@ -1828,6 +2315,7 @@ fn decode_step_layers_and_head_lowered(
     gpu: &mut Gpu,
     position: u32,
     emit_head: bool,
+    fusion_enabled: bool,
 ) -> Result<(), String> {
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
@@ -1841,6 +2329,7 @@ fn decode_step_layers_and_head_lowered(
                 state,
                 l,
                 seq_len,
+                fusion_enabled,
             };
             superop::run_layer_program(gpu, &ctx, &program, &mut bind)
                 .map_err(|e| format!("lfm2moe L{l}: lowered run_layer_program: {e}"))?;
@@ -1897,7 +2386,7 @@ pub fn decode_step_with_graph(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    let hidden = cfg.hidden_size;
+    gpu.replay.set_forward_eligible(false);
 
     // ── Warmup phase: direct dispatch, no capture ──────────────────────────
     // Run the legacy path once so inline JIT / lazy scratch alloc happen
@@ -1919,21 +2408,14 @@ pub fn decode_step_with_graph(
         gpu.active_stream = Some(s);
     }
 
-    // Per-token-varying ops, DIRECT (outside the captured region).
-    // pos_buf: refreshed each token; the captured kernels re-read it on replay.
-    gpu.hip
-        .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
-        .map_err(|e| format!("lfm2moe: htod pos (graph): {e:?}"))?;
-    // embedding lookup: token_id is a kernarg → must run per-token, not captured.
-    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
-        .map_err(|e| format!("lfm2moe: embed lookup (graph): {e:?}"))?;
+    prepare_decode_inputs(cfg, weights, state, gpu, token_id, position)?;
 
     if gpu.graphs.graph_exec.is_none() {
         // ── Capture phase ──────────────────────────────────────────────────
         gpu.graphs
             .begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("lfm2moe: begin_graph_capture: {e:?}"))?;
-        decode_step_layers_and_head(cfg, weights, state, gpu, position, true, None)?;
+        decode_step_layers_and_head(cfg, weights, state, gpu, position, true, false, None)?;
         gpu.graphs
             .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("lfm2moe: end_graph_capture: {e:?}"))?;
@@ -1967,6 +2449,28 @@ mod ship6_lower_tests {
     use super::*;
     use superop::SuperOpKind::{Attend, Conv, Moe, Proj, ResidualGemv};
 
+    #[test]
+    fn fusion_request_defaults_on_and_fails_closed_for_malformed_values() {
+        use std::ffi::OsStr;
+
+        assert!(resolve_lfm2_decode_fusion_request(None));
+        assert!(resolve_lfm2_decode_fusion_request(Some(OsStr::new("1"))));
+        assert!(!resolve_lfm2_decode_fusion_request(Some(OsStr::new("0"))));
+        assert!(!resolve_lfm2_decode_fusion_request(Some(OsStr::new("true"))));
+        assert!(!resolve_lfm2_decode_fusion_request(Some(OsStr::new(""))));
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            let non_unicode = OsString::from_vec(vec![0xff]);
+            assert!(!resolve_lfm2_decode_fusion_request(Some(
+                non_unicode.as_os_str(),
+            )));
+        }
+    }
+
     // #397 Ship 6 — lfm2 lowered LayerProgram shapes must mirror the hand-loop
     // order (mixer block, then FFN). CPU-pure (no GPU).
     #[test]
@@ -1990,5 +2494,92 @@ mod ship6_lower_tests {
         let p = lfm2_lower_variant(Lfm2Variant::ConvDense);
         assert_eq!(p[1].binding.weights[0].0, lfm2_op::DENSE_GATE_UP);
         assert_eq!(p[2].binding.weights[0].0, lfm2_op::DENSE_DOWN);
+    }
+
+    #[test]
+    fn retained_route_requires_current_eligibility_and_prefers_aql() {
+        assert_eq!(
+            retained_decode_route(false, true, true),
+            RetainedDecodeRoute::Hip
+        );
+        assert_eq!(
+            retained_decode_route(true, true, true),
+            RetainedDecodeRoute::Aql
+        );
+        assert_eq!(
+            retained_decode_route(true, false, true),
+            RetainedDecodeRoute::Pm4
+        );
+        assert_eq!(
+            retained_decode_route(true, false, false),
+            RetainedDecodeRoute::Hip
+        );
+    }
+
+    #[test]
+    fn gfx1201_350m_conv_uses_wide_hfq4_decode_gemv_only() {
+        assert!(use_lfm2_350m_conv_wide_hfq4(
+            true,
+            true,
+            DType::MQ4G256,
+            3072,
+            1024
+        ));
+        assert!(!use_lfm2_350m_conv_wide_hfq4(
+            false,
+            true,
+            DType::MQ4G256,
+            3072,
+            1024
+        ));
+        assert!(!use_lfm2_350m_conv_wide_hfq4(
+            true,
+            false,
+            DType::MQ4G256,
+            3072,
+            1024
+        ));
+        assert!(!use_lfm2_350m_conv_wide_hfq4(
+            true,
+            true,
+            DType::Q8_0,
+            3072,
+            1024
+        ));
+        assert!(!use_lfm2_350m_conv_wide_hfq4(
+            true,
+            true,
+            DType::MQ4G256,
+            1024,
+            1024
+        ));
+        assert!(!use_lfm2_350m_conv_wide_hfq4(
+            true,
+            true,
+            DType::MQ4G256,
+            3072,
+            4608
+        ));
+    }
+
+    #[test]
+    fn successful_replay_advances_exactly_to_the_next_position() {
+        let mut n_tokens = 7;
+        complete_retained_replay(&mut n_tokens, 7);
+        assert_eq!(n_tokens, 8);
+        complete_retained_replay(&mut n_tokens, 7);
+        assert_eq!(n_tokens, 8);
+    }
+
+
+    #[test]
+    fn lfm_speculative_route_fails_closed_when_graph_is_requested() {
+        use std::ffi::OsStr;
+
+        assert!(validate_lfm_speculative_graph(None).is_ok());
+        assert!(validate_lfm_speculative_graph(Some(OsStr::new("0"))).is_ok());
+        let error = validate_lfm_speculative_graph(Some(OsStr::new("1"))).unwrap_err();
+        assert!(error.contains("HIPFIRE_LFM2_GRAPH"));
+        assert!(error.contains("speculative"));
     }
 }

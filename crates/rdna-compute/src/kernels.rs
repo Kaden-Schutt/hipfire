@@ -1958,22 +1958,20 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW2_CLUSTERED_GFX1
 /// gfx1151 K=512 eight-row schedule. One wave amortizes each activation load
 /// across eight output rows, targeting the APU's bandwidth ceiling without
 /// changing the routed-down ABI or any other architecture's code object.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW8_GFX1151_SRC: &str =
-    include_str!(
-        "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8.gfx1151.hip"
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW8_GFX1151_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8.gfx1151.hip"
+);
 
 /// Radiowave gfx1100 cache-policy probe for the atomic-free MoE down stream.
 /// Keep this replay-visible and opt-in until exact-shadow and product-level
 /// certification establish whether SLC helps this access pattern.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC: &str =
-    concat!(
-        "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
-        "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc\n",
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
 
 /// gfx1100 expert-wave-preserving down+combine experiment. Every workgroup
 /// still computes one expert rank; the last arriving rank for each four-row
@@ -3653,6 +3651,9 @@ pub const SOFTMAX_SRC: &str = include_str!("../../../kernels/src/softmax.hip");
 /// RoPE (Rotary Positional Embedding)
 pub const ROPE_SRC: &str = include_str!("../../../kernels/src/rope.hip");
 
+/// LFM decode preparation: cached full RoPE plus one-launch Q/K RMSNorm.
+pub const LFM_DECODE_PREP_SRC: &str = include_str!("../../../kernels/src/lfm_decode_prep.hip");
+
 /// Batched RoPE: apply RoPE to [batch_size] positions at once.
 /// q: [batch_size × n_heads_q × head_dim], k: [batch_size × n_heads_k × head_dim]
 /// positions: [batch_size] int array of position indices.
@@ -3854,9 +3855,8 @@ pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str =
 /// gfx1100-only Qwen attention reduce/gate/MQ epilogue. Kept in a separate
 /// translation unit so its dormant body cannot perturb portable/gfx12 reducer
 /// codegen.
-pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC: &str = include_str!(
-    "../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip"
-);
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip");
 pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151\n",
     include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
@@ -4301,6 +4301,8 @@ pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_de
 /// false for LFM2. See kernels/src/conv1d_gated_decode.hip.
 pub const CONV1D_GATED_DECODE_SRC: &str =
     include_str!("../../../kernels/src/conv1d_gated_decode.hip");
+pub const CONV1D_GATED_DECODE_MQ_ROTATE_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_gated_decode_mq_rotate.hip");
 
 /// Gated output norm: rmsnorm(x) * silu(z). Fused single kernel.
 /// x and z are [n_heads × head_dim]. weight is [head_dim] (shared across heads).
@@ -4504,6 +4506,11 @@ pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top
 /// kernel for distinct logits; recovers ~290 us/token on gfx1100 A3B decode.
 pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
     include_str!("../../../kernels/src/sample_top_p_parallel.hip");
+
+/// Exact Hugging Face once-per-unique-token multiplicative repetition penalty.
+/// The caller supplies a deduplicated token-id list.
+pub const APPLY_HF_REPETITION_PENALTY_SRC: &str =
+    include_str!("../../../kernels/src/apply_hf_repetition_penalty.hip");
 
 /// Per-row temperature-scaled softmax probability gather. For each row r,
 /// returns the softmax prob of `indices[r]` under temp-scaled row logits.
@@ -5326,22 +5333,19 @@ mod dispatch_tests {
     #[test]
     fn qwen2_bias_symbols_are_isolated_from_existing_qkv_modules() {
         assert!(!FUSED_QKV_HFQ4G256_SRC.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
-        assert!(FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC
-            .contains("fused_qkv_hfq4g256_qwen2_bias"));
+        assert!(FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC.contains("fused_qkv_hfq4g256_qwen2_bias"));
         assert!(FUSED_QKV_Q4K_QWEN2_BIAS_SRC.contains("fused_qkv_q4k_qwen2_bias"));
         assert!(FUSED_QKV_Q8_0_QWEN2_BIAS_SRC.contains("fused_qkv_q8_0_qwen2_bias"));
 
         for arch in ["gfx1030", "gfx1100", "gfx1151", "gfx1201"] {
             let caps = make_caps(arch);
             let (_, old_mq4) = fused_qkv_mq4g256_lloyd_for_arch(&caps, false);
-            let (mq4_src, bias_mq4) =
-                fused_qkv_mq4g256_lloyd_qwen2_bias_for_arch(&caps, false);
+            let (mq4_src, bias_mq4) = fused_qkv_mq4g256_lloyd_qwen2_bias_for_arch(&caps, false);
             assert_ne!(old_mq4, bias_mq4);
             assert!(mq4_src.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
 
             let (_, old_mq3) = fused_qkv_mq3g256_lloyd_for_arch(&caps, false);
-            let (mq3_src, bias_mq3) =
-                fused_qkv_mq3g256_lloyd_qwen2_bias_for_arch(&caps, false);
+            let (mq3_src, bias_mq3) = fused_qkv_mq3g256_lloyd_qwen2_bias_for_arch(&caps, false);
             assert_ne!(old_mq3, bias_mq3);
             assert!(mq3_src.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
         }

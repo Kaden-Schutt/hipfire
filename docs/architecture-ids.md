@@ -13,8 +13,8 @@ dispatch.
 **Routing availability ≠ product admission.** A primary id, source derivation, or
 carrier match means the loader can route that artifact — not that any model is
 product-admitted. The sole admission owner is [`admissions.yml`](admissions.yml)
-(currently empty). Product-use and admission claims remain fail-closed until an
-explicit admission record exists; source-derived routing capability is independent.
+(schema v2; exactly one evidence-bound record). Product-use and admission claims
+remain fail-closed for every route outside that exact row; source-derived routing capability is independent.
 
 ## Primary model ids
 

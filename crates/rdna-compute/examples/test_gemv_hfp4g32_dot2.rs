@@ -11,7 +11,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
 const PEAK_GBPS_GFX1100: f64 = 960.0; // 7900 XTX GDDR6 384-bit @ 20 Gbps
-const PEAK_GBPS_GFX12: f64 = 800.0;   // R9700 spec
+const PEAK_GBPS_GFX12: f64 = 800.0; // R9700 spec
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
@@ -20,17 +20,21 @@ fn main() {
         eprintln!("=== SKIP === dot2 path needs gfx11+ (arch={arch})");
         return;
     }
-    let peak_gbps = if arch.starts_with("gfx12") { PEAK_GBPS_GFX12 } else { PEAK_GBPS_GFX1100 };
+    let peak_gbps = if arch.starts_with("gfx12") {
+        PEAK_GBPS_GFX12
+    } else {
+        PEAK_GBPS_GFX1100
+    };
     eprintln!("=== gemv_hfp4g32_dot2_gfx11 vs fallback ===");
     eprintln!("  arch={arch}  peak_bw_gbps={peak_gbps}");
 
     let shapes: Vec<(usize, usize, &str)> = vec![
-        (2048,  2048,  "qkv-q     M=2048 K=2048"),
-        (512,   2048,  "qkv-kv    M=512  K=2048"),
-        (11008, 2048,  "gate_up   M=11008 K=2048"),
-        (2048,  11008, "w_down    M=2048  K=11008"),
-        (4096,  2048,  "med       M=4096 K=2048"),
-        (1024,  2048,  "small     M=1024 K=2048"),
+        (2048, 2048, "qkv-q     M=2048 K=2048"),
+        (512, 2048, "qkv-kv    M=512  K=2048"),
+        (11008, 2048, "gate_up   M=11008 K=2048"),
+        (2048, 11008, "w_down    M=2048  K=11008"),
+        (4096, 2048, "med       M=4096 K=2048"),
+        (1024, 2048, "small     M=1024 K=2048"),
     ];
 
     let trials = 200;
@@ -42,7 +46,12 @@ fn main() {
         let row_bytes = 16 + (k / 32) * 17;
         let total_w_bytes = m * row_bytes;
 
-        let w = gpu.upload_raw(&synth(m, k, 0xAA00 | (m as u64) ^ (k as u64)), &[total_w_bytes]).unwrap();
+        let w = gpu
+            .upload_raw(
+                &synth(m, k, 0xAA00 | (m as u64) ^ (k as u64)),
+                &[total_w_bytes],
+            )
+            .unwrap();
         let x = gpu.alloc_tensor(&[k], DType::F32).unwrap();
         let y_ref = gpu.alloc_tensor(&[m], DType::F32).unwrap();
         let y_dot2 = gpu.alloc_tensor(&[m], DType::F32).unwrap();
@@ -105,8 +114,12 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_dot2: &GpuTensor, m: usize, label
         let r_v = r[i] as f64;
         let k_v = k[i] as f64;
         let abs = (r_v - k_v).abs();
-        if abs > max_abs { max_abs = abs; }
-        if r_v.abs() > max_abs_ref { max_abs_ref = r_v.abs(); }
+        if abs > max_abs {
+            max_abs = abs;
+        }
+        if r_v.abs() > max_abs_ref {
+            max_abs_ref = r_v.abs();
+        }
         sum_sq_err += (r_v - k_v) * (r_v - k_v);
         sum_sq_ref += r_v * r_v;
     }
@@ -114,7 +127,9 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_dot2: &GpuTensor, m: usize, label
     // 3% relative tol on element max (dot2 uses FP16 multiply intermediate,
     // a touch less precise than F32 mul). Plus 1e-3 abs floor.
     let tol_abs = 0.03 * max_abs_ref.max(1e-3);
-    let bad: usize = (0..m).filter(|&i| ((r[i] as f64) - (k[i] as f64)).abs() > tol_abs).count();
+    let bad: usize = (0..m)
+        .filter(|&i| ((r[i] as f64) - (k[i] as f64)).abs() > tol_abs)
+        .count();
     if bad > 0 {
         eprintln!(
             "  {label}: FAIL  {bad}/{m}  max_abs={:.3e}  tol={:.3e}  max_|y|={:.3e}  NRMSE={:.3e}",
@@ -127,7 +142,16 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_dot2: &GpuTensor, m: usize, label
 }
 
 fn make_x(n: usize, seed: i64) -> Vec<f32> {
-    (0..n).map(|i| ((i as i64).wrapping_mul(seed.wrapping_add(0x91c2_a73d)).wrapping_add(seed) & 0xFFFFFF) as f32 * 1e-7 - 0.5).collect()
+    (0..n)
+        .map(|i| {
+            ((i as i64)
+                .wrapping_mul(seed.wrapping_add(0x91c2_a73d))
+                .wrapping_add(seed)
+                & 0xFFFFFF) as f32
+                * 1e-7
+                - 0.5
+        })
+        .collect()
 }
 
 fn synth(m: usize, k: usize, seed: u64) -> Vec<u8> {
@@ -136,7 +160,9 @@ fn synth(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; m * row_bytes];
     let mut state = seed;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     for row in 0..m {
@@ -163,9 +189,15 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7F_FFFF;
-    if exp == 0 { return sign; }
-    if exp >= 143 { return sign | 0x7C00; }
-    if exp <= 112 { return sign; }
+    if exp == 0 {
+        return sign;
+    }
+    if exp >= 143 {
+        return sign | 0x7C00;
+    }
+    if exp <= 112 {
+        return sign;
+    }
     let new_exp = (exp - 127 + 15) as u16;
     let new_mant = (mant >> 13) as u16;
     sign | (new_exp << 10) | new_mant

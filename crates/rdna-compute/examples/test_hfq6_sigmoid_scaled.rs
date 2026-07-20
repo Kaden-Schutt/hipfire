@@ -30,7 +30,10 @@ fn main() {
     let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(512);
     let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4);
 
-    assert!(k % 256 == 0, "K must be a multiple of 256 (HFQ6 group size)");
+    assert!(
+        k % 256 == 0,
+        "K must be a multiple of 256 (HFQ6 group size)"
+    );
 
     let groups_per_row = k / 256;
     let row_bytes = groups_per_row * 200;
@@ -61,7 +64,9 @@ fn main() {
     // c_batch: scalar per token, centered around 0 (sigmoid ~0.5).
     let c_host: Vec<f32> = (0..n)
         .map(|i| {
-            let v = ((i as i64).wrapping_mul(2654435761).wrapping_add(0x9E37_79B9_u32 as i64)) as f32;
+            let v = ((i as i64)
+                .wrapping_mul(2654435761)
+                .wrapping_add(0x9E37_79B9_u32 as i64)) as f32;
             ((v * 1e-9) % 4.0) - 2.0
         })
         .collect();
@@ -132,7 +137,10 @@ fn main() {
     eprintln!("rms_ref      = {:.6e}", rms_ref);
     eprintln!("NRMSE        = {:.4}%", nrmse * 100.0);
     eprintln!("worst (bid,row) = ({worst_bid}, {worst_row})");
-    eprintln!("                  cpu={:.6e}  gpu={:.6e}", worst_pair.0, worst_pair.1);
+    eprintln!(
+        "                  cpu={:.6e}  gpu={:.6e}",
+        worst_pair.0, worst_pair.1
+    );
     eprintln!("cpu range: [{ref_min:.4e}, {ref_max:.4e}]");
     eprintln!("gpu range: [{g_min:.4e}, {g_max:.4e}]");
 
@@ -284,7 +292,7 @@ fn synth_hfq6g256_weights(m: usize, groups_per_row: usize, seed: u64) -> Vec<u8>
                 let q2 = (next_u32() & 63) as u8;
                 let q3 = (next_u32() & 63) as u8;
                 let byte_off = 8 + (i / 4) * 3;
-                out[gp + byte_off]     = q0 | (q1 << 6);
+                out[gp + byte_off] = q0 | (q1 << 6);
                 out[gp + byte_off + 1] = (q1 >> 2) | (q2 << 4);
                 out[gp + byte_off + 2] = (q2 >> 4) | (q3 << 2);
             }

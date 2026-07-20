@@ -34,7 +34,9 @@ impl Detector for WhitespaceOnly {
 
     fn observe(&mut self, ev: &Event<'_>) -> Option<Verdict> {
         match ev {
-            Event::Token { text, synthetic, .. } => {
+            Event::Token {
+                text, synthetic, ..
+            } => {
                 if !synthetic {
                     self.buf.push_str(text);
                 }
@@ -55,10 +57,7 @@ impl Detector for WhitespaceOnly {
             return Verdict::skip("0 visible bytes (covered by eos_immediate)");
         }
         if self.buf.chars().all(char::is_whitespace) {
-            return Verdict::fail(format!(
-                "{} visible bytes, all whitespace",
-                self.buf.len()
-            ));
+            return Verdict::fail(format!("{} visible bytes, all whitespace", self.buf.len()));
         }
         Verdict::Ok
     }

@@ -144,14 +144,14 @@ pub fn parse_diag_json(body: &str) -> DoctorReport {
     // Loose match: any non-empty string means a daemon was located (tolerates a
     // future "present"/path value); null/empty is the only failure.
     let daemon = v["daemon"].as_str().filter(|s| !s.is_empty());
-    checks.push(check("daemon binary", daemon.is_some(), daemon.unwrap_or("missing")));
+    checks.push(check(
+        "daemon binary",
+        daemon.is_some(),
+        daemon.unwrap_or("missing"),
+    ));
 
     let n_gpus = v["gpus"].as_array().map(|a| a.len()).unwrap_or(0);
-    checks.push(check(
-        "GPU (PCI)",
-        n_gpus > 0,
-        format!("{n_gpus} detected"),
-    ));
+    checks.push(check("GPU (PCI)", n_gpus > 0, format!("{n_gpus} detected")));
 
     let n_models = v["models"].as_array().map(|a| a.len()).unwrap_or(0);
     checks.push(check(
@@ -260,7 +260,10 @@ mod tests {
         let body = r#"{"daemon": "/home/u/.hipfire/bin/daemon", "gpu": "disabled"}"#;
         let r = parse_diag_json(body);
         let c = |n: &str| r.checks.iter().find(|c| c.name == n).unwrap();
-        assert!(c("daemon binary").ok, "any non-empty daemon string is found");
+        assert!(
+            c("daemon binary").ok,
+            "any non-empty daemon string is found"
+        );
         assert!(!c("live GPU probe").ok);
         assert_eq!(c("live GPU probe").detail, "disabled");
     }

@@ -39,8 +39,13 @@ fn main() {
     let ib_bytes: Vec<u8> = pm4.iter().flat_map(|d| d.to_le_bytes()).collect();
     dev.upload(&ib, &ib_bytes).unwrap();
 
-    eprintln!("Submitting WRITE_DATA(0xCAFEBABE → 0x{:x})...", target.gpu_addr);
-    queue.submit_and_wait(&dev, &ib, pm4.len() as u32, &[&ib, &target]).unwrap();
+    eprintln!(
+        "Submitting WRITE_DATA(0xCAFEBABE → 0x{:x})...",
+        target.gpu_addr
+    );
+    queue
+        .submit_and_wait(&dev, &ib, pm4.len() as u32, &[&ib, &target])
+        .unwrap();
 
     // Read back
     let mut readback = vec![0u8; 16];
@@ -53,7 +58,10 @@ fn main() {
     } else if val == 0xADADADAD {
         eprintln!("FAILED — buffer unchanged. PM4 packets not executing.");
     } else {
-        eprintln!("UNEXPECTED — got 0x{:08x}, neither 0xCAFEBABE nor 0xADADADAD", val);
+        eprintln!(
+            "UNEXPECTED — got 0x{:08x}, neither 0xCAFEBABE nor 0xADADADAD",
+            val
+        );
     }
 
     queue.destroy(&dev);

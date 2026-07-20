@@ -17,7 +17,10 @@ fn main() {
 
     let count = hip.device_count().expect("failed to get device count");
     println!("Visible devices: {count}");
-    assert!(count >= 2, "peer_smoke requires ≥2 devices (got {count}). Set HIP_VISIBLE_DEVICES=0,1");
+    assert!(
+        count >= 2,
+        "peer_smoke requires ≥2 devices (got {count}). Set HIP_VISIBLE_DEVICES=0,1"
+    );
 
     for id in 0..count {
         hip.set_device(id).expect("set_device");
@@ -39,7 +42,9 @@ fn main() {
     println!("  can 0→1: {can_0_to_1}");
     println!("  can 1→0: {can_1_to_0}");
     if !can_0_to_1 || !can_1_to_0 {
-        eprintln!("WARN: peer access not bidirectional — Stage 3 host-stage fallback path applies.");
+        eprintln!(
+            "WARN: peer access not bidirectional — Stage 3 host-stage fallback path applies."
+        );
     }
 
     // ── Bidirectional enable (idempotent) ────────────────────────
@@ -89,7 +94,8 @@ fn main() {
 
     // ── memcpy_peer: dev_0 → dev_1 ───────────────────────────────
     let t0 = std::time::Instant::now();
-    hip.memcpy_peer(&buf1, 1, &buf0, 0, SIZE).expect("memcpy_peer");
+    hip.memcpy_peer(&buf1, 1, &buf0, 0, SIZE)
+        .expect("memcpy_peer");
     hip.device_synchronize().expect("device_synchronize");
     let elapsed_us = t0.elapsed().as_micros();
     let mb_per_s = (SIZE as f64 / 1e6) / (elapsed_us as f64 / 1e6);
@@ -123,7 +129,8 @@ fn main() {
     let stream0 = hip.stream_create().expect("stream create");
     hip.memcpy_peer_async(&buf1, 1, &buf0, 0, SIZE, &stream0)
         .expect("memcpy_peer_async");
-    hip.stream_synchronize(&stream0).expect("stream_synchronize");
+    hip.stream_synchronize(&stream0)
+        .expect("stream_synchronize");
     println!("memcpy_peer_async on dev_0 stream: ok");
     hip.stream_destroy(stream0).expect("stream_destroy");
 

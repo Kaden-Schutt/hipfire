@@ -32,8 +32,8 @@ identity, and date manifest required by [`docs/INDEX.md`](../INDEX.md) and
 **exploratory**. Neither class admits routes, replaces Tier C/P/S in
 [`arch-port-validation.md`](arch-port-validation.md), or certifies Redline.
 Promotion still follows VALIDATION + (when applicable)
-[`REDLINE.md`](../REDLINE.md) and empty-fail-closed
-[`admissions.yml`](../admissions.yml). Collector `status: error` records
+[`REDLINE.md`](../REDLINE.md) and fail-closed
+[`admissions.yml`](../admissions.yml) (schema v2; exact earned rows only). Collector `status: error` records
 are **not** observations (see Phases).
 
 ---

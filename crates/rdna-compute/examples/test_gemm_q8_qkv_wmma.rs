@@ -36,8 +36,8 @@ fn main() {
 
     // (q_m, k_m, v_m, K, label) — all dims chosen multiples of 16 for clean WMMA tiles.
     let shapes: Vec<(usize, usize, usize, usize, &str)> = vec![
-        ( 64,  32,  32,  128, "tiny    (q=64 k=v=32 K=128)"),
-        (256,  64,  64,  512, "medium  (q=256 k=v=64 K=512)"),
+        (64, 32, 32, 128, "tiny    (q=64 k=v=32 K=128)"),
+        (256, 64, 64, 512, "medium  (q=256 k=v=64 K=512)"),
         (4096, 1024, 1024, 4096, "9B FA   (q=4096 k=v=1024 K=4096)"),
     ];
     let batches: Vec<usize> = vec![1, 4, 16, 32, 64, 128, 256];
@@ -74,7 +74,7 @@ fn main() {
         let d_yv_ref = gpu.zeros(&[max_n * v_m], DType::F32).unwrap();
 
         for &n in &batches {
-            let x_n  = d_x.sub_offset(0, n * k);
+            let x_n = d_x.sub_offset(0, n * k);
             let yq_w = d_yq_wmma.sub_offset(0, n * q_m);
             let yk_w = d_yk_wmma.sub_offset(0, n * k_m);
             let yv_w = d_yv_wmma.sub_offset(0, n * v_m);
@@ -86,24 +86,23 @@ fn main() {
             // gfx12 routes to the _w32_gfx12 sibling (half8_t lane-grp split).
             if arch.starts_with("gfx12") {
                 gpu.gemm_qkv_q8_0_wmma_gfx12(
-                    &d_aq, &d_ak, &d_av,
-                    &x_n,
-                    &yq_w, &yk_w, &yv_w,
-                    q_m, k_m, v_m, k, n,
-                ).unwrap();
+                    &d_aq, &d_ak, &d_av, &x_n, &yq_w, &yk_w, &yv_w, q_m, k_m, v_m, k, n,
+                )
+                .unwrap();
             } else {
                 gpu.gemm_qkv_q8_0_wmma(
-                    &d_aq, &d_ak, &d_av,
-                    &x_n,
-                    &yq_w, &yk_w, &yv_w,
-                    q_m, k_m, v_m, k, n,
-                ).unwrap();
+                    &d_aq, &d_ak, &d_av, &x_n, &yq_w, &yk_w, &yv_w, q_m, k_m, v_m, k, n,
+                )
+                .unwrap();
             }
 
             // Reference: 3 separate substrate calls (single-output each).
-            gpu.gemm_q8_0_batched_chunked(&d_aq, &x_n, &yq_r, q_m, k, n).unwrap();
-            gpu.gemm_q8_0_batched_chunked(&d_ak, &x_n, &yk_r, k_m, k, n).unwrap();
-            gpu.gemm_q8_0_batched_chunked(&d_av, &x_n, &yv_r, v_m, k, n).unwrap();
+            gpu.gemm_q8_0_batched_chunked(&d_aq, &x_n, &yq_r, q_m, k, n)
+                .unwrap();
+            gpu.gemm_q8_0_batched_chunked(&d_ak, &x_n, &yk_r, k_m, k, n)
+                .unwrap();
+            gpu.gemm_q8_0_batched_chunked(&d_av, &x_n, &yv_r, v_m, k, n)
+                .unwrap();
 
             let yq_w_host = gpu.download_f32(&yq_w).unwrap();
             let yk_w_host = gpu.download_f32(&yk_w).unwrap();
@@ -119,17 +118,29 @@ fn main() {
             // Gate: mean_rel < 2e-3 AND max_rel < 3.5e-2 — fp16 WMMA precision.
             // Threshold tightened 2026-05-13 from 5e-2 → 3.5e-2 (see
             // test_gemm_q8_gate_up_wmma.rs for the full rationale).
-            let pass = stats_q.mean_rel < 2e-3 && stats_k.mean_rel < 2e-3 && stats_v.mean_rel < 2e-3
-                   && stats_q.max_rel  < 3.5e-2 && stats_k.max_rel  < 3.5e-2 && stats_v.max_rel  < 3.5e-2;
-            let mark = if pass { "PASS" } else { total_fail += 1; "FAIL" };
+            let pass = stats_q.mean_rel < 2e-3
+                && stats_k.mean_rel < 2e-3
+                && stats_v.mean_rel < 2e-3
+                && stats_q.max_rel < 3.5e-2
+                && stats_k.max_rel < 3.5e-2
+                && stats_v.max_rel < 3.5e-2;
+            let mark = if pass {
+                "PASS"
+            } else {
+                total_fail += 1;
+                "FAIL"
+            };
             eprintln!(
                 "  N={n:4}  {mark}   \
                  Q: mean_rel={:.3e} max_rel={:.3e}  \
                  K: mean_rel={:.3e} max_rel={:.3e}  \
                  V: mean_rel={:.3e} max_rel={:.3e}",
-                stats_q.mean_rel, stats_q.max_rel,
-                stats_k.mean_rel, stats_k.max_rel,
-                stats_v.mean_rel, stats_v.max_rel,
+                stats_q.mean_rel,
+                stats_q.max_rel,
+                stats_k.mean_rel,
+                stats_k.max_rel,
+                stats_v.mean_rel,
+                stats_v.max_rel,
             );
         }
     }
@@ -170,22 +181,34 @@ fn main() {
     let d_yq_ref = gpu.zeros(&[n * q_m], DType::F32).unwrap();
 
     if arch.starts_with("gfx12") {
-        gpu.gemm_qkv_q8_0_wmma_gfx12(&d_aq, &d_ak, &d_av, &d_x, &d_yq, &d_yk, &d_yv,
-                                     q_m, k_m, v_m, k, n).unwrap();
+        gpu.gemm_qkv_q8_0_wmma_gfx12(
+            &d_aq, &d_ak, &d_av, &d_x, &d_yq, &d_yk, &d_yv, q_m, k_m, v_m, k, n,
+        )
+        .unwrap();
     } else {
-        gpu.gemm_qkv_q8_0_wmma(&d_aq, &d_ak, &d_av, &d_x, &d_yq, &d_yk, &d_yv,
-                               q_m, k_m, v_m, k, n).unwrap();
+        gpu.gemm_qkv_q8_0_wmma(
+            &d_aq, &d_ak, &d_av, &d_x, &d_yq, &d_yk, &d_yv, q_m, k_m, v_m, k, n,
+        )
+        .unwrap();
     }
-    gpu.gemm_q8_0_batched_chunked(&d_aq, &d_x, &d_yq_ref, q_m, k, n).unwrap();
+    gpu.gemm_q8_0_batched_chunked(&d_aq, &d_x, &d_yq_ref, q_m, k, n)
+        .unwrap();
 
     let yq = gpu.download_f32(&d_yq).unwrap();
     let yq_ref = gpu.download_f32(&d_yq_ref).unwrap();
     let stats = compare(&yq, &yq_ref);
     let pass = stats.mean_rel < 2e-3 && stats.max_rel < 5e-2;
-    let mark = if pass { "PASS" } else { total_fail += 1; "FAIL" };
+    let mark = if pass {
+        "PASS"
+    } else {
+        total_fail += 1;
+        "FAIL"
+    };
     eprintln!(
         "  N={n}  {mark}   Q: mean_rel={:.3e} max_rel={:.3e}  |ref|_max={:.2}",
-        stats.mean_rel, stats.max_rel, yq_ref.iter().map(|v| v.abs()).fold(0.0f32, f32::max)
+        stats.mean_rel,
+        stats.max_rel,
+        yq_ref.iter().map(|v| v.abs()).fold(0.0f32, f32::max)
     );
 
     eprintln!("\n=== {} failure(s) ===", total_fail);
@@ -207,11 +230,16 @@ fn compare(wmma: &[f32], reference: &[f32]) -> Stats {
         if r.abs() > threshold {
             let rel = ((w - r).abs() / r.abs()) as f64;
             sum_rel += rel;
-            if rel > max_rel { max_rel = rel; }
+            if rel > max_rel {
+                max_rel = rel;
+            }
             count += 1;
         }
     }
-    let mean_rel = if count == 0 { 0.0 } else { sum_rel / count as f64 };
+    let mean_rel = if count == 0 {
+        0.0
+    } else {
+        sum_rel / count as f64
+    };
     Stats { mean_rel, max_rel }
 }
-

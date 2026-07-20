@@ -84,29 +84,30 @@ fn test_attention_v5(gpu: &mut Gpu) {
     gpu.attention_dflash_f32(&d_q, &d_k, &d_v, &out_scalar, b, l, n_heads, n_kv_heads, hd)
         .unwrap();
 
-    let d_k_f16 = gpu.alloc_tensor(&[l * n_kv_heads * hd], DType::F16).unwrap();
-    let d_v_f16 = gpu.alloc_tensor(&[l * n_kv_heads * hd], DType::F16).unwrap();
+    let d_k_f16 = gpu
+        .alloc_tensor(&[l * n_kv_heads * hd], DType::F16)
+        .unwrap();
+    let d_v_f16 = gpu
+        .alloc_tensor(&[l * n_kv_heads * hd], DType::F16)
+        .unwrap();
     gpu.cast_f32_to_f16(&d_k, &d_k_f16).unwrap();
     gpu.cast_f32_to_f16(&d_v, &d_v_f16).unwrap();
 
     let out_wmma = gpu.zeros(&[b * n_heads * hd], DType::F32).unwrap();
     gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
-        &d_q,
-        &d_k_f16,
-        &d_v_f16,
-        &out_wmma,
-        b,
-        l,
-        n_heads,
-        n_kv_heads,
-        hd,
+        &d_q, &d_k_f16, &d_v_f16, &out_wmma, b, l, n_heads, n_kv_heads, hd,
     )
     .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     let scalar_host = gpu.download_f32(&out_scalar).unwrap();
     let wmma_host = gpu.download_f32(&out_wmma).unwrap();
-    assert_close("attention_dflash_wmma_m64_n32_f16kv_v5_f32", &wmma_host, &scalar_host, 5.0e-3);
+    assert_close(
+        "attention_dflash_wmma_m64_n32_f16kv_v5_f32",
+        &wmma_host,
+        &scalar_host,
+        5.0e-3,
+    );
 }
 
 fn main() {
@@ -114,7 +115,10 @@ fn main() {
     println!("GPU initialized: {}", gpu.arch);
 
     if !(gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12()) {
-        println!("SKIP dots.ocr WMMA channel test: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP dots.ocr WMMA channel test: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 

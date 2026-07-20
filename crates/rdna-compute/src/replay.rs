@@ -19,9 +19,9 @@ use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
-    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy,
-    KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy,
-    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
+    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
+    QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,11 +180,7 @@ impl Pm4Commands {
         }
     }
 
-    fn acquire_entry(
-        &mut self,
-        gfx12_gcr_trim: bool,
-        gfx11_policy: Gfx11EntryAcquirePolicy,
-    ) {
+    fn acquire_entry(&mut self, gfx12_gcr_trim: bool, gfx11_policy: Gfx11EntryAcquirePolicy) {
         match self {
             Self::Legacy { commands, .. } => match gfx11_policy {
                 Gfx11EntryAcquirePolicy::System => commands.acquire_system(),
@@ -310,6 +306,8 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecordedAccessMode {
     Read,
+    /// In-place rolling state and other true RMW pointers. Conflicts like Write.
+    ReadWrite,
     Write,
 }
 
@@ -331,13 +329,17 @@ impl RecordedResourceAccess {
 
     fn conflicts(self, other: Self) -> bool {
         let overlaps = self.allocation_base < other.end() && other.allocation_base < self.end();
-        overlaps
-            && (self.mode == RecordedAccessMode::Write || other.mode == RecordedAccessMode::Write)
+        overlaps && (self.mode.writes() || other.mode.writes())
     }
 
     fn same_start_conflicts(self, other: Self) -> bool {
-        self.access_base == other.access_base
-            && (self.mode == RecordedAccessMode::Write || other.mode == RecordedAccessMode::Write)
+        self.access_base == other.access_base && (self.mode.writes() || other.mode.writes())
+    }
+}
+
+impl RecordedAccessMode {
+    const fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
     }
 }
 
@@ -358,6 +360,13 @@ const fn write(offset: usize) -> PointerEffect {
     PointerEffect {
         offset,
         mode: RecordedAccessMode::Write,
+    }
+}
+
+const fn read_write(offset: usize) -> PointerEffect {
+    PointerEffect {
+        offset,
+        mode: RecordedAccessMode::ReadWrite,
     }
 }
 
@@ -568,9 +577,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
-        "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => {
-            Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)])
-        }
+        "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
         "qwen35_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => Some(vec![
             read(0),
             write(8),
@@ -580,9 +594,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        "kv_cache_write_q8_0_pair" => {
-            Some(vec![write(0), write(8), read(16), read(24), read(32)])
-        }
+        "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
@@ -653,7 +665,17 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(48),
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
+        "embedding_q8_batched" => Some(vec![read(0), write(8), read(16)]),
         "rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
+        "lfm_qk_norm_rope_cached_f32" => Some(vec![
+            read_write(0),
+            read_write(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            read(48),
+        ]),
         "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
@@ -668,19 +690,30 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        "attention_flash_q8_0_tile" => Some(vec![
+        "attention_flash_q8_0_tile" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
+        "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
+        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151" => Some(vec![
             read(0),
-            read(8),
+            write(8),
+            read(16),
+            read(24),
+            read(32),
+            read(48),
+        ]),
+        "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
+        "conv1d_gated_decode_f32" => Some(vec![read(0), read_write(8), read(16), write(24)]),
+        "conv1d_gated_decode_mq_rotate_f32" => Some(vec![
+            read(0),
+            read_write(8),
             read(16),
             write(24),
             read(32),
+            read(40),
         ]),
-        "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
-        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
-        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151" => {
-            Some(vec![read(0), write(8), read(16), read(24), read(32), read(48)])
-        }
-        "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
+        "silu_mul_f32" => Some(vec![read(0), read(8), write(16)]),
+        "rope_f32" => Some(vec![read_write(0), read_write(8), read(16)]),
+        "gemv_q8_0" | "gemv_q8_0_wide" => Some(vec![read(0), read(8), write(16)]),
         _ => None,
     }
 }
@@ -761,6 +794,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     match kernel {
         "softmax_f32" => Some(16),
         "fused_qk_l2_norm_scale_f32"
+        | "embedding_q8_batched"
         | "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
@@ -785,7 +819,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "moe_topk_renorm_k8"
         | "rmsnorm_f32"
         | "rmsnorm_reduce_gfx1100"
-        | "sigmoid_mul_f32" => Some(32),
+        | "sigmoid_mul_f32"
+        | "silu_mul_f32"
+        | "gemv_q8_0"
+        | "gemv_q8_0_wide" => Some(32),
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
@@ -810,7 +847,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
-        | "rope_partial_halfsplit_f32" => Some(48),
+        | "rope_partial_halfsplit_f32"
+        | "conv1d_gated_decode_f32"
+        | "rope_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
@@ -820,11 +859,13 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100" => Some(64),
+        "conv1d_gated_decode_mq_rotate_f32" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
+        | "lfm_qk_norm_rope_cached_f32"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
@@ -870,8 +911,14 @@ fn recorded_resource_accesses(
         if entry.0 != size {
             return None;
         }
-        if effect.mode == RecordedAccessMode::Write {
-            entry.1 = RecordedAccessMode::Write;
+        if effect.mode.writes() {
+            // Preserve explicit RMW when both sides write; otherwise promote to Write.
+            entry.1 = match (entry.1, effect.mode) {
+                (RecordedAccessMode::ReadWrite, _) | (_, RecordedAccessMode::ReadWrite) => {
+                    RecordedAccessMode::ReadWrite
+                }
+                _ => RecordedAccessMode::Write,
+            };
         }
     }
     Some(
@@ -984,10 +1031,9 @@ fn pm4_phase_plan(
     for indices in antichains {
         let workgroups = indices.iter().fold(0_u64, |total, index| {
             let launch = &recorded[*index];
-            let launch_workgroups = launch
-                .grid
-                .iter()
-                .fold(1_u64, |product, axis| product.saturating_mul(u64::from(*axis)));
+            let launch_workgroups = launch.grid.iter().fold(1_u64, |product, axis| {
+                product.saturating_mul(u64::from(*axis))
+            });
             total.saturating_add(launch_workgroups)
         });
         let parallel = indices.len() >= min_parallel_width
@@ -1243,16 +1289,11 @@ fn gfx1151_resource_limits_policy_from_value(
     }
 }
 
-fn gfx1151_cu_mask(
-    architecture: Pm4Architecture,
-    device_name: &str,
-) -> Option<[u32; 2]> {
+fn gfx1151_cu_mask(architecture: Pm4Architecture, device_name: &str) -> Option<[u32; 2]> {
     let value =
         std::env::var("HIPFIRE_GFX1151_REDLINE_CU_COUNT").unwrap_or_else(|_| "all".to_owned());
     let mask = gfx1151_cu_mask_from_value(architecture, device_name, &value).unwrap_or_else(|| {
-        eprintln!(
-            "WARNING: unknown HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?}; retaining all CUs"
-        );
+        eprintln!("WARNING: unknown HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?}; retaining all CUs");
         None
     });
     if let Some(mask) = mask {
@@ -1298,8 +1339,8 @@ fn gfx1151_entry_acquire_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx11EntryAcquirePolicy {
-    let value = std::env::var("HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE")
-        .unwrap_or_else(|_| "system".to_owned());
+    let value =
+        std::env::var("HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE").unwrap_or_else(|_| "system".to_owned());
     let policy = gfx1151_entry_acquire_policy_from_value(architecture, device_name, &value)
         .unwrap_or_else(|| {
             eprintln!(
@@ -1456,6 +1497,13 @@ impl Pm4MidAcquirePolicy {
     }
 }
 
+fn fused_rmsnorm_consumer_requires_acquire(previous: &str, current: &str) -> bool {
+    previous.starts_with("fused_rmsnorm_mq_rotate")
+        && (current.starts_with("gemv_")
+            || current.starts_with("fused_qkv_")
+            || current.starts_with("fused_gate_up_"))
+}
+
 fn required_mid_acquire(previous: &str, current: &str) -> bool {
     if previous.starts_with("gated_delta_net_q8_compact2_")
         || current.starts_with("gated_delta_net_q8_compact2_")
@@ -1467,9 +1515,22 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     // still needs the vector-cache acquire before the GEMV reads that buffer.
     // Without it the first divergent launch in the 0.8B tape is this exact
     // pair (launches 12 -> 13); logits, KV, and recurrent state then drift.
-    if previous == "fused_silu_mul_mq_rotate"
+    if previous == "fused_silu_mul_mq_rotate" && current.starts_with("gemv_hfq4g256_residual") {
+        return true;
+    }
+    // LFM's fused conv publishes the pre-rotated projection input consumed by
+    // the residual GEMV. A compute-idle packet orders waves but does not
+    // invalidate gfx12 vector-cache lines for that producer/consumer handoff.
+    if previous == "conv1d_gated_decode_mq_rotate_f32"
         && current.starts_with("gemv_hfq4g256_residual")
     {
+        return true;
+    }
+    // LFM's exact gfx1201 decode fusion writes the shared pre-rotated
+    // activation here. The following GEMV consumes that buffer immediately;
+    // compute-idle alone did not make the vector-cache contents visible in
+    // retained PM4 replay.
+    if fused_rmsnorm_consumer_requires_acquire(previous, current) {
         return true;
     }
     matches!(
@@ -1482,6 +1543,9 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
 }
 
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
+    if fused_rmsnorm_consumer_requires_acquire(previous, current) {
+        return true;
+    }
     if previous.starts_with("gated_delta_net_q8_compact2_")
         || current.starts_with("gated_delta_net_q8_compact2_")
     {
@@ -1623,11 +1687,7 @@ pub struct RecordedHipLaunch {
 /// The recorded grid remains the hard maximum; replay may only narrow it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayGridBinding {
-    PositionCeilDiv {
-        axis: u8,
-        addend: u32,
-        divisor: u32,
-    },
+    PositionCeilDiv { axis: u8, addend: u32, divisor: u32 },
 }
 
 impl ReplayGridBinding {
@@ -1648,8 +1708,8 @@ impl ReplayGridBinding {
             .checked_add(u64::from(addend))
             .ok_or_else(|| "dynamic replay extent overflow".to_owned())?;
         let units = extent.div_ceil(u64::from(divisor)).max(1);
-        let units = u32::try_from(units)
-            .map_err(|_| format!("dynamic replay grid {units} exceeds u32"))?;
+        let units =
+            u32::try_from(units).map_err(|_| format!("dynamic replay grid {units} exceeds u32"))?;
         let mut bound = recorded;
         bound[axis] = units.min(recorded[axis]);
         Ok(bound)
@@ -1661,6 +1721,25 @@ pub struct ReplayCaptureSummary {
     pub launch_count: usize,
     pub unique_kernel_count: usize,
     pub sequence_hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReplayObservation {
+    pub count: u64,
+    pub first_position: Option<usize>,
+    pub last_position: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedReplayIdentity {
+    pub dispatch_count: usize,
+    pub packet_count: Option<usize>,
+    pub queue_id: u64,
+    pub command_dwords: Option<u32>,
+}
+
+fn pm4_packet_identity(queue_count: usize, phase_count: usize) -> Option<usize> {
+    (queue_count == 1 && phase_count == 1).then_some(1)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1754,9 +1833,9 @@ impl PreparedPm4Graph {
             Self::Single(graph) => graph
                 .patch_dispatch_dimensions(dispatch, dimensions)
                 .map_err(|error| error.to_string()),
-            Self::Phased(_) => Err(
-                "dynamic PM4 geometry requires the certified single-queue replay".to_owned(),
-            ),
+            Self::Phased(_) => {
+                Err("dynamic PM4 geometry requires the certified single-queue replay".to_owned())
+            }
         }
     }
 }
@@ -1796,14 +1875,15 @@ impl PreparedPm4Replay {
             let dimensions = if self.pm4_architecture == Pm4Architecture::Gfx12 {
                 let mut workitems = [0_u32; 3];
                 for axis in 0..3 {
-                    workitems[axis] = workgroups[axis]
-                        .checked_mul(workgroup[axis])
-                        .ok_or_else(|| {
-                            format!(
+                    workitems[axis] =
+                        workgroups[axis]
+                            .checked_mul(workgroup[axis])
+                            .ok_or_else(|| {
+                                format!(
                                 "dynamic PM4 grid overflow axis={axis} workgroups={} workgroup={}",
                                 workgroups[axis], workgroup[axis]
                             )
-                        })?;
+                            })?;
                 }
                 workitems
             } else {
@@ -1881,6 +1961,7 @@ pub struct ReplayController {
     prepared_pm4: Option<PreparedPm4Replay>,
     auto_lifecycle: bool,
     forward_eligible: bool,
+    replay_observation: ReplayObservation,
 }
 
 impl ReplayController {
@@ -1925,6 +2006,7 @@ impl ReplayController {
             prepared_pm4: None,
             auto_lifecycle: false,
             forward_eligible: true,
+            replay_observation: ReplayObservation::default(),
         }
     }
 
@@ -1994,6 +2076,7 @@ impl ReplayController {
         self.prepared_pm4 = None;
         self.auto_lifecycle = auto_lifecycle;
         self.forward_eligible = true;
+        self.replay_observation = ReplayObservation::default();
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -2023,6 +2106,43 @@ impl ReplayController {
         self.prepared_pm4
             .as_ref()
             .map(|prepared| (prepared.queue_count(), prepared.phase_count()))
+    }
+
+    pub fn prepared_route_identity(&self) -> Option<PreparedReplayIdentity> {
+        match self.transport {
+            ReplayTransport::AqlPackets => {
+                self.prepared
+                    .as_ref()
+                    .map(|prepared| PreparedReplayIdentity {
+                        dispatch_count: prepared.dispatch_count(),
+                        packet_count: Some(prepared.packet_count()),
+                        queue_id: prepared.queue_id(),
+                        command_dwords: None,
+                    })
+            }
+            ReplayTransport::Pm4Ib => {
+                self.prepared_pm4
+                    .as_ref()
+                    .map(|prepared| PreparedReplayIdentity {
+                        dispatch_count: prepared.dispatch_count(),
+                        packet_count: pm4_packet_identity(
+                            prepared.queue_count(),
+                            prepared.phase_count(),
+                        ),
+                        queue_id: prepared.queue_id(),
+                        command_dwords: Some(prepared.command_dwords()),
+                    })
+            }
+        }
+    }
+
+    pub fn replay_observation(&self) -> ReplayObservation {
+        self.replay_observation
+    }
+
+    /// Start a request-local route-proof window without changing replay state.
+    pub fn begin_replay_observation_window(&mut self) {
+        self.replay_observation = ReplayObservation::default();
     }
 
     pub fn is_recording(&self) -> bool {
@@ -2201,8 +2321,27 @@ impl ReplayController {
                 device.queue_size_range()
             ));
         }
-        let mut headers = vec![HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL; dispatches.len()];
-        headers[0] = HeaderPolicy::BATCH_BOUNDARY_FIRST_SERIAL;
+        // The fused LFM conv route reuses h/tmp/ffn_x_rot/conv_bcx across
+        // consecutive blocks. Prefix snapshots do not cover those scratches,
+        // and a narrower packet policy produced nondeterministic recurrent
+        // state at the second conv. Keep this exact cohort system-visible at
+        // every AQL handoff; product timing uses the separately audited PM4 IB.
+        let exact_lfm_conv_tape = self
+            .recorded
+            .iter()
+            .take(prefix)
+            .any(|launch| launch.kernel == "conv1d_gated_decode_mq_rotate_f32");
+        let mut headers = vec![
+            if exact_lfm_conv_tape {
+                HeaderPolicy::RECORDED_DISPATCH
+            } else {
+                HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL
+            };
+            dispatches.len()
+        ];
+        if !exact_lfm_conv_tape {
+            headers[0] = HeaderPolicy::BATCH_BOUNDARY_FIRST_SERIAL;
+        }
         for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
             if launch.kernel == "repeat_interleave_qk_f32" {
                 headers[index] = HeaderPolicy::RECORDED_DISPATCH;
@@ -2211,13 +2350,26 @@ impl ReplayController {
                 }
             } else if matches!(
                 launch.kernel.as_str(),
-                "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
+                "conv1d_gated_decode_mq_rotate_f32"
+                    | "fused_silu_mul_mq_rotate"
+                    | "mq_rotate_x"
+                    | "rope_partial_halfsplit_f32"
             ) {
+                let requires_system_handoff = matches!(
+                    launch.kernel.as_str(),
+                    "conv1d_gated_decode_mq_rotate_f32" | "mq_rotate_x"
+                );
+                if launch.kernel == "conv1d_gated_decode_mq_rotate_f32" && index > 0 {
+                    headers[index - 1] = HeaderPolicy::RECORDED_DISPATCH;
+                }
                 headers[index] = if launch.kernel == "mq_rotate_x" {
                     HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
                 } else {
                     HeaderPolicy::RECORDED_DISPATCH
                 };
+                if requires_system_handoff && index + 1 < headers.len() {
+                    headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+                }
             }
         }
         for index in 1..headers.len() {
@@ -2287,8 +2439,7 @@ impl ReplayController {
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
         let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
-        let entry_acquire_policy =
-            gfx1151_entry_acquire_policy(pm4_architecture, device.name());
+        let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -2355,15 +2506,13 @@ impl ReplayController {
         let gfx12_gcr_trim = std::env::var("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
-        let gfx11_vmem_acquire =
-            match std::env::var("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE") {
-                Ok(value) => matches!(value.as_str(), "1" | "true" | "on"),
-                Err(_) => {
-                    device.name().eq_ignore_ascii_case("gfx1151")
-                        && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref()
-                            == Ok("1")
-                }
-            };
+        let gfx11_vmem_acquire = match std::env::var("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE") {
+            Ok(value) => matches!(value.as_str(), "1" | "true" | "on"),
+            Err(_) => {
+                device.name().eq_ignore_ascii_case("gfx1151")
+                    && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
+            }
+        };
         let mut wait_audit = Pm4WaitAudit::default();
         let mut audit_frontier = ResourceFrontier::default();
         for index in 0..prefix {
@@ -2397,7 +2546,13 @@ impl ReplayController {
         // Dynamic direct-dispatch patching is intentionally limited to the
         // certified one-IB path. Multi-queue phases duplicate and reorder
         // command buffers, so a global capture index is not a safe patch key.
-        let queue_limit = if dynamic_grids.is_empty() {
+        let exact_lfm_conv_tape = pm4_architecture == Pm4Architecture::Gfx12
+            && self
+                .recorded
+                .iter()
+                .take(prefix)
+                .any(|launch| launch.kernel == "conv1d_gated_decode_mq_rotate_f32");
+        let queue_limit = if dynamic_grids.is_empty() && !exact_lfm_conv_tape {
             self.pm4_queue_policy.resolve(device.name(), usize::MAX)
         } else {
             1
@@ -2626,29 +2781,46 @@ impl ReplayController {
     ///
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
-    pub unsafe fn replay_linear_aql(&mut self) -> Result<GpuBatchTiming, String> {
-        let prepared = self
-            .prepared
-            .as_mut()
-            .ok_or_else(|| "no prepared AQL replay".to_owned())?;
-        // SAFETY: forwarded from the model owner.
-        unsafe { prepared.replay_and_wait() }
+    pub unsafe fn replay_linear_aql(&mut self, position: usize) -> Result<GpuBatchTiming, String> {
+        let result = {
+            let prepared = self
+                .prepared
+                .as_mut()
+                .ok_or_else(|| "no prepared AQL replay".to_owned())?;
+            // SAFETY: forwarded from the model owner.
+            unsafe { prepared.replay_and_wait() }
+        };
+        self.observe_replay_result(position, result)
     }
 
     /// # Safety
     ///
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
-    pub unsafe fn replay_pm4(
+    pub unsafe fn replay_pm4(&mut self, position: usize) -> Result<GpuMultiQueueTiming, String> {
+        let result = {
+            let prepared = self
+                .prepared_pm4
+                .as_mut()
+                .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
+            // SAFETY: forwarded from the model owner.
+            unsafe { prepared.replay_and_wait(position) }
+        };
+        self.observe_replay_result(position, result)
+    }
+
+    fn observe_replay_result<T>(
         &mut self,
         position: usize,
-    ) -> Result<GpuMultiQueueTiming, String> {
-        let prepared = self
-            .prepared_pm4
-            .as_mut()
-            .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
-        // SAFETY: forwarded from the model owner.
-        unsafe { prepared.replay_and_wait(position) }
+        result: Result<T, String>,
+    ) -> Result<T, String> {
+        let value = result?;
+        self.replay_observation.count = self.replay_observation.count.saturating_add(1);
+        self.replay_observation
+            .first_position
+            .get_or_insert(position);
+        self.replay_observation.last_position = Some(position);
+        Ok(value)
     }
 
     /// Start one explicitly delimited prefill or decode capture. This clears
@@ -3078,12 +3250,9 @@ mod tests {
     #[test]
     fn gfx1151_radiowave_symbols_keep_resource_contracts() {
         let gate = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151";
-        let gate_hybrid =
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
-        let gate_up_paired =
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151";
-        let gate_up_persistent =
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151";
+        let gate_hybrid = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
+        let gate_up_paired = "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151";
+        let gate_up_persistent = "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151";
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
         let qkvza_hybrid = "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151";
         let qkvza_r4 = "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151";
@@ -3134,16 +3303,8 @@ mod tests {
         for (symbol, kernarg_bytes, pointer_count) in [
             ("gated_norm_mq_rotate_gfx1151", 64, 6),
             ("qwen35_fa_prep_gfx1151", 64, 7),
-            (
-                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
-                64,
-                6,
-            ),
-            (
-                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
-                72,
-                7,
-            ),
+            ("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151", 64, 6),
+            ("moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151", 72, 7),
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(kernarg_bytes));
             assert_eq!(
@@ -3151,7 +3312,10 @@ mod tests {
                 Some(pointer_count)
             );
         }
-        assert_eq!(expected_kernarg_bytes("attention_flash_q8_0_tile"), Some(80));
+        assert_eq!(
+            expected_kernarg_bytes("attention_flash_q8_0_tile"),
+            Some(80)
+        );
         assert_eq!(
             pointer_effects("attention_flash_q8_0_tile").map(|effects| effects.len()),
             Some(5)
@@ -3183,12 +3347,10 @@ mod tests {
             Some(3)
         );
         assert!(radiowave_vmem_only_consumer(residual_rt_low));
-        let down =
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151";
+        let down = "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(down), Some(48));
         assert_eq!(pointer_effects(down).map(|effects| effects.len()), Some(4));
-        let down_row8 =
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151";
+        let down_row8 = "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151";
         assert_eq!(expected_kernarg_bytes(down_row8), Some(48));
         assert_eq!(
             pointer_effects(down_row8).map(|effects| effects.len()),
@@ -3278,16 +3440,26 @@ mod tests {
         );
         assert!(Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
-            "fused_silu_mul_mq_rotate",
-            "gemv_hfq4g256_residual"
-        ));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256_residual"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_silu_mul_mq_rotate",
             "gemv_hfq4g256_residual_k2048_gfx1201"
         ));
         assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("fused_rmsnorm_mq_rotate", "gemv_hfq4g256_multirow_r2"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("fused_rmsnorm_mq_rotate", "fused_qkv_hfq4g256"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+            "fused_rmsnorm_mq_rotate",
+            "fused_gate_up_hfq4g256_k1024_gfx1201"
+        ));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+            "conv1d_gated_decode_mq_rotate_f32",
+            "gemv_hfq4g256_residual"
+        ));
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "gated_delta_net_q8_compact2_b2"
@@ -3298,35 +3470,19 @@ mod tests {
     #[test]
     fn gfx1151_dispatch_initiator_policy_is_exact_arch_only() {
         assert_eq!(
-            gfx10_dispatch_initiator_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "order",
-            ),
+            gfx10_dispatch_initiator_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "order",),
             Some(Gfx10DispatchInitiatorPolicy::OrderMode)
         );
         assert_eq!(
-            gfx10_dispatch_initiator_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "radv",
-            ),
+            gfx10_dispatch_initiator_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "radv",),
             Some(Gfx10DispatchInitiatorPolicy::Radv)
         );
         assert_eq!(
-            gfx10_dispatch_initiator_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1100",
-                "radv",
-            ),
+            gfx10_dispatch_initiator_policy_from_value(Pm4Architecture::Gfx11, "gfx1100", "radv",),
             Some(Gfx10DispatchInitiatorPolicy::Legacy)
         );
         assert_eq!(
-            gfx10_dispatch_initiator_policy_from_value(
-                Pm4Architecture::Gfx10,
-                "gfx1030",
-                "radv",
-            ),
+            gfx10_dispatch_initiator_policy_from_value(Pm4Architecture::Gfx10, "gfx1030", "radv",),
             Some(Gfx10DispatchInitiatorPolicy::Legacy)
         );
         assert_eq!(
@@ -3350,11 +3506,7 @@ mod tests {
             Some(Some(Gfx11DispatchInterleave::Disabled))
         );
         assert_eq!(
-            gfx1151_dispatch_interleave_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "inherit",
-            ),
+            gfx1151_dispatch_interleave_from_value(Pm4Architecture::Gfx11, "gfx1151", "inherit",),
             Some(None)
         );
         assert_eq!(
@@ -3377,11 +3529,7 @@ mod tests {
             force_simd_dist_for_single_wave: false,
         };
         assert_eq!(
-            gfx1151_resource_limits_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "radv",
-            ),
+            gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "radv",),
             Some(radv)
         );
         assert_eq!(
@@ -3393,27 +3541,15 @@ mod tests {
             Some(Gfx11ComputeResourceLimitsPolicy::SimdDestAlways)
         );
         assert_eq!(
-            gfx1151_resource_limits_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1100",
-                "radv",
-            ),
+            gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx11, "gfx1100", "radv",),
             Some(Gfx11ComputeResourceLimitsPolicy::Legacy)
         );
         assert_eq!(
-            gfx1151_resource_limits_policy_from_value(
-                Pm4Architecture::Gfx12,
-                "gfx1201",
-                "radv",
-            ),
+            gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx12, "gfx1201", "radv",),
             Some(Gfx11ComputeResourceLimitsPolicy::Legacy)
         );
         assert_eq!(
-            gfx1151_resource_limits_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "invalid",
-            ),
+            gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "invalid",),
             None
         );
     }
@@ -3453,43 +3589,23 @@ mod tests {
     #[test]
     fn gfx1151_entry_acquire_is_exact_arch_only() {
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "agent",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "agent",),
             Some(Gfx11EntryAcquirePolicy::Agent)
         );
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "vmem",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "vmem",),
             Some(Gfx11EntryAcquirePolicy::Vmem)
         );
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1100",
-                "none",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1100", "none",),
             Some(Gfx11EntryAcquirePolicy::System)
         );
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx12,
-                "gfx1201",
-                "agent",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx12, "gfx1201", "agent",),
             Some(Gfx11EntryAcquirePolicy::System)
         );
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "invalid",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "invalid",),
             None
         );
     }
@@ -3511,9 +3627,7 @@ mod tests {
         );
         assert!(pointer_effects("conv1d_silu_split_qknorm_b256").is_some());
         assert_eq!(
-            expected_kernarg_bytes(
-                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
-            ),
+            expected_kernarg_bytes("moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"),
             Some(80)
         );
         assert_eq!(
@@ -3539,7 +3653,10 @@ mod tests {
             "fused_gate_up_hfq4g256_k1024_gfx1201",
         ] {
             assert_eq!(expected_kernarg_bytes(kernel), Some(64));
-            assert_eq!(pointer_effects(kernel).map(|effects| effects.len()), Some(5));
+            assert_eq!(
+                pointer_effects(kernel).map(|effects| effects.len()),
+                Some(5)
+            );
         }
         assert!(pointer_effects("unknown_kernel").is_none());
         assert!(expected_kernarg_bytes("unknown_kernel").is_none());
@@ -3553,6 +3670,216 @@ mod tests {
                     .iter()
                     .all(|effect| effect.offset + 8 <= kernarg_bytes),
                 "pointer offset exceeds kernarg ABI in {kernel}"
+            );
+            let offsets = effects
+                .iter()
+                .map(|effect| effect.offset)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                offsets.len(),
+                effects.len(),
+                "duplicate pointer offset in {kernel}"
+            );
+        }
+    }
+
+    #[test]
+    fn conv1d_gated_decode_f32_pointer_contract_is_exact() {
+        let kernel = "conv1d_gated_decode_f32";
+        assert_eq!(expected_kernarg_bytes(kernel), Some(48));
+        let effects = pointer_effects(kernel).expect("conv1d_gated_decode_f32 effects");
+        assert_eq!(effects.len(), 4);
+        assert_eq!(effects[0].offset, 0);
+        assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[1].offset, 8);
+        assert_eq!(effects[1].mode, RecordedAccessMode::ReadWrite);
+        assert_eq!(effects[2].offset, 16);
+        assert_eq!(effects[2].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[3].offset, 24);
+        assert_eq!(effects[3].mode, RecordedAccessMode::Write);
+        // State is an in-place rolling ring buffer: RMW must remain distinct from
+        // plain Write so retained-hazard audits can name the exact effect.
+        assert!(effects[1].mode.writes());
+        assert_ne!(effects[1].mode, RecordedAccessMode::Write);
+        assert!(
+            effects.iter().all(|effect| effect.offset + 8 <= 48),
+            "pointer offset exceeds padded 48-byte kernarg ABI"
+        );
+        let offsets = effects
+            .iter()
+            .map(|effect| effect.offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(offsets.len(), effects.len(), "duplicate pointer offset");
+    }
+
+    #[test]
+    fn conv1d_gated_decode_mq_rotate_pointer_contract_is_exact() {
+        let kernel = "conv1d_gated_decode_mq_rotate_f32";
+        assert_eq!(expected_kernarg_bytes(kernel), Some(64));
+        let effects = pointer_effects(kernel).expect("conv1d_gated_decode_mq_rotate_f32 effects");
+        let expected = [
+            (0, RecordedAccessMode::Read),
+            (8, RecordedAccessMode::ReadWrite),
+            (16, RecordedAccessMode::Read),
+            (24, RecordedAccessMode::Write),
+            (32, RecordedAccessMode::Read),
+            (40, RecordedAccessMode::Read),
+        ];
+        assert_eq!(effects.len(), expected.len());
+        for (effect, (offset, mode)) in effects.iter().zip(expected) {
+            assert_eq!(effect.offset, offset);
+            assert_eq!(effect.mode, mode);
+        }
+        assert!(
+            effects.iter().all(|effect| effect.offset + 8 <= 64),
+            "pointer offset exceeds padded 64-byte kernarg ABI"
+        );
+    }
+
+    #[test]
+    fn silu_mul_f32_pointer_contract_is_exact() {
+        let kernel = "silu_mul_f32";
+        assert_eq!(expected_kernarg_bytes(kernel), Some(32));
+        let effects = pointer_effects(kernel).expect("silu_mul_f32 effects");
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0].offset, 0);
+        assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[1].offset, 8);
+        assert_eq!(effects[1].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[2].offset, 16);
+        assert_eq!(effects[2].mode, RecordedAccessMode::Write);
+        assert!(
+            effects.iter().all(|effect| effect.offset + 8 <= 32),
+            "pointer offset exceeds padded 32-byte kernarg ABI"
+        );
+        let offsets = effects
+            .iter()
+            .map(|effect| effect.offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(offsets.len(), effects.len(), "duplicate pointer offset");
+    }
+
+    #[test]
+    fn rope_f32_pointer_contract_is_exact() {
+        let kernel = "rope_f32";
+        assert_eq!(expected_kernarg_bytes(kernel), Some(48));
+        let effects = pointer_effects(kernel).expect("rope_f32 effects");
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0].offset, 0);
+        assert_eq!(effects[0].mode, RecordedAccessMode::ReadWrite);
+        assert_eq!(effects[1].offset, 8);
+        assert_eq!(effects[1].mode, RecordedAccessMode::ReadWrite);
+        assert_eq!(effects[2].offset, 16);
+        assert_eq!(effects[2].mode, RecordedAccessMode::Read);
+        assert!(
+            effects.iter().all(|effect| effect.offset + 8 <= 48),
+            "pointer offset exceeds padded 48-byte kernarg ABI"
+        );
+        let offsets = effects
+            .iter()
+            .map(|effect| effect.offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(offsets.len(), effects.len(), "duplicate pointer offset");
+    }
+
+    #[test]
+    fn lfm_cached_qk_norm_rope_pointer_contract_is_exact() {
+        let kernel = "lfm_qk_norm_rope_cached_f32";
+        assert_eq!(expected_kernarg_bytes(kernel), Some(80));
+        let effects = pointer_effects(kernel).expect("lfm_qk_norm_rope_cached_f32 effects");
+        assert_eq!(effects.len(), 7);
+        assert_eq!(effects[0].mode, RecordedAccessMode::ReadWrite);
+        assert_eq!(effects[1].mode, RecordedAccessMode::ReadWrite);
+        assert!(effects[2..]
+            .iter()
+            .all(|effect| effect.mode == RecordedAccessMode::Read));
+        assert!(
+            effects.iter().all(|effect| effect.offset + 8 <= 80),
+            "pointer offset exceeds kernarg ABI"
+        );
+        let offsets = effects
+            .iter()
+            .map(|effect| effect.offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(offsets.len(), effects.len(), "duplicate pointer offset");
+    }
+
+    #[test]
+    fn embedding_q8_batched_pointer_contract_is_exact() {
+        let kernel = "embedding_q8_batched";
+        assert_eq!(expected_kernarg_bytes(kernel), Some(32));
+        let effects = pointer_effects(kernel).expect("embedding_q8_batched effects");
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0].offset, 0);
+        assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[1].offset, 8);
+        assert_eq!(effects[1].mode, RecordedAccessMode::Write);
+        assert_eq!(effects[2].offset, 16);
+        assert_eq!(effects[2].mode, RecordedAccessMode::Read);
+    }
+
+    #[test]
+    fn gemv_q8_0_wide_pointer_contract_is_exact() {
+        // Shared launch packing with gemv_q8_0: A@0, x@8, y@16 + M/K scalars.
+        for kernel in ["gemv_q8_0_wide", "gemv_q8_0"] {
+            assert_eq!(expected_kernarg_bytes(kernel), Some(32));
+            let effects = pointer_effects(kernel).unwrap_or_else(|| panic!("{kernel} effects"));
+            assert_eq!(effects.len(), 3);
+            assert_eq!(effects[0].offset, 0);
+            assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+            assert_eq!(effects[1].offset, 8);
+            assert_eq!(effects[1].mode, RecordedAccessMode::Read);
+            assert_eq!(effects[2].offset, 16);
+            assert_eq!(effects[2].mode, RecordedAccessMode::Write);
+            assert!(
+                effects.iter().all(|effect| effect.offset + 8 <= 32),
+                "pointer offset exceeds padded 32-byte kernarg ABI for {kernel}"
+            );
+            let offsets = effects
+                .iter()
+                .map(|effect| effect.offset)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                offsets.len(),
+                effects.len(),
+                "duplicate pointer offset in {kernel}"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm_gfx1201_retained_kernel_metadata_is_complete() {
+        // Exact retained LFM capture surface on gfx1201. Flash tile/reduce
+        // replace raw attention_q8_0_kv during recording — do not list it here.
+        const LFM_RETAINED_KERNELS: &[&str] = &[
+            "conv1d_gated_decode_f32",
+            "conv1d_gated_decode_mq_rotate_f32",
+            "gemv_hfq4g256_multirow_r2",
+            "gemv_hfq4g256_residual",
+            "gemv_q8_0_wide",
+            "kv_cache_write_q8_0",
+            "mq_rotate_x",
+            "rmsnorm_f32",
+            "rope_f32",
+            "silu_mul_f32",
+            "attention_flash_q8_0_tile",
+            "attention_flash_q8_0_reduce",
+        ];
+        assert!(
+            !LFM_RETAINED_KERNELS.contains(&"attention_q8_0_kv"),
+            "retained LFM records flash attention, not raw attention_q8_0_kv"
+        );
+        for kernel in LFM_RETAINED_KERNELS {
+            let effects = pointer_effects(kernel)
+                .unwrap_or_else(|| panic!("missing pointer effects for {kernel}"));
+            let kernarg_bytes = expected_kernarg_bytes(kernel)
+                .unwrap_or_else(|| panic!("missing ABI size for {kernel}"));
+            assert!(!effects.is_empty(), "empty pointer signature for {kernel}");
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| effect.offset + 8 <= kernarg_bytes),
+                "pointer offset exceeds padded kernarg ABI for {kernel}"
             );
             let offsets = effects
                 .iter()
@@ -3584,6 +3911,10 @@ mod tests {
             mode: RecordedAccessMode::Write,
             ..read_same
         };
+        let read_write_same = RecordedResourceAccess {
+            mode: RecordedAccessMode::ReadWrite,
+            ..read_same
+        };
         let write_other = RecordedResourceAccess {
             allocation_base: 0x3000,
             allocation_bytes: 0x100,
@@ -3592,6 +3923,9 @@ mod tests {
         };
         assert!(!read_a.conflicts(read_same));
         assert!(read_a.conflicts(write_same));
+        assert!(read_a.conflicts(read_write_same));
+        assert!(read_write_same.conflicts(read_same));
+        assert!(read_write_same.conflicts(write_same));
         assert!(!read_a.conflicts(write_other));
     }
 
@@ -3627,14 +3961,8 @@ mod tests {
         };
         assert_eq!(binding.bind(0, [16, 16, 1]).unwrap(), [16, 1, 1]);
         assert_eq!(binding.bind(128, [16, 16, 1]).unwrap(), [16, 2, 1]);
-        assert_eq!(
-            binding.bind(2047, [16, 16, 1]).unwrap(),
-            [16, 16, 1]
-        );
-        assert_eq!(
-            binding.bind(4095, [16, 16, 1]).unwrap(),
-            [16, 16, 1]
-        );
+        assert_eq!(binding.bind(2047, [16, 16, 1]).unwrap(), [16, 16, 1]);
+        assert_eq!(binding.bind(4095, [16, 16, 1]).unwrap(), [16, 16, 1]);
     }
 
     #[test]
@@ -3771,12 +4099,7 @@ mod tests {
             }]),
         };
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                2,
-                0,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 0, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: true,
@@ -3804,24 +4127,14 @@ mod tests {
             }]
         );
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                3,
-                0,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 3, 0, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
             }]
         );
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                2,
-                3,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 3, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
@@ -3860,6 +4173,65 @@ mod tests {
         assert_eq!(controller.state(), ReplayState::Hip);
         assert_eq!(controller.transport_name(), "aql");
         assert!(!controller.is_enabled());
+    }
+
+    #[test]
+    fn route_observation_records_only_success_and_resets() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        let failed: Result<(), String> = Err("dispatch failed".to_owned());
+        assert!(controller.observe_replay_result(127, failed).is_err());
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation::default()
+        );
+
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        controller.observe_replay_result(128, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation {
+                count: 2,
+                first_position: Some(127),
+                last_position: Some(128),
+            }
+        );
+
+        controller.apply_model_default(false, ReplayTransport::AqlPackets);
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation::default()
+        );
+    }
+
+    #[test]
+    fn route_observation_windows_are_request_local() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        controller.observe_replay_result(128, Ok(())).unwrap();
+
+        controller.begin_replay_observation_window();
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation::default()
+        );
+
+        controller.observe_replay_result(512, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation {
+                count: 1,
+                first_position: Some(512),
+                last_position: Some(512),
+            }
+        );
+    }
+
+    #[test]
+    fn pm4_packet_identity_fails_closed_for_phased_or_multiqueue() {
+        assert_eq!(pm4_packet_identity(1, 1), Some(1));
+        assert_eq!(pm4_packet_identity(1, 2), None);
+        assert_eq!(pm4_packet_identity(2, 1), None);
+        assert_eq!(pm4_packet_identity(2, 2), None);
     }
 
     #[test]

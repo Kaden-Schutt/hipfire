@@ -11,15 +11,15 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct GpuCapability {
     pub arch: String,
-    pub generation: &'static str,      // "RDNA1", "RDNA2", etc.
+    pub generation: &'static str, // "RDNA1", "RDNA2", etc.
     pub cu_count: u32,
     pub simds_per_cu: u32,
     pub max_waves_per_simd: u32,
     pub vgprs_per_simd: u32,
     pub lds_per_cu_bytes: u32,
     pub l2_cache_mb: f32,
-    pub infinity_cache_mb: f32,         // 0 for RDNA1
-    pub peak_bw_gbs: f32,              // theoretical peak memory BW
+    pub infinity_cache_mb: f32, // 0 for RDNA1
+    pub peak_bw_gbs: f32,       // theoretical peak memory BW
     pub boost_clock_mhz: u32,
     pub mem_clock_mhz: u32,
     pub mem_bus_width_bits: u32,
@@ -42,47 +42,84 @@ fn arch_spec(arch: &str) -> ArchSpec {
     match arch {
         // Vega 20 / GCN5
         "gfx906" => ArchSpec {
-            generation: "GCN5", simds_per_cu: 4, max_waves_per_simd: 10,
-            vgprs_per_simd: 1024, lds_per_cu: 65536,
-            l2_cache_mb: 4.0, infinity_cache_mb: 0.0, default_bus_width: 4096,
+            generation: "GCN5",
+            simds_per_cu: 4,
+            max_waves_per_simd: 10,
+            vgprs_per_simd: 1024,
+            lds_per_cu: 65536,
+            l2_cache_mb: 4.0,
+            infinity_cache_mb: 0.0,
+            default_bus_width: 4096,
         },
         // RDNA1
         "gfx1010" | "gfx1011" | "gfx1012" => ArchSpec {
-            generation: "RDNA1", simds_per_cu: 2, max_waves_per_simd: 20,
-            vgprs_per_simd: 1024, lds_per_cu: 65536,
-            l2_cache_mb: 4.0, infinity_cache_mb: 0.0, default_bus_width: 256,
+            generation: "RDNA1",
+            simds_per_cu: 2,
+            max_waves_per_simd: 20,
+            vgprs_per_simd: 1024,
+            lds_per_cu: 65536,
+            l2_cache_mb: 4.0,
+            infinity_cache_mb: 0.0,
+            default_bus_width: 256,
         },
         // RDNA2
-        "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036" => ArchSpec {
-            generation: "RDNA2", simds_per_cu: 2, max_waves_per_simd: 20,
-            vgprs_per_simd: 1024, lds_per_cu: 65536,
-            l2_cache_mb: 4.0, infinity_cache_mb: 128.0, default_bus_width: 256,
-        },
+        "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036" => {
+            ArchSpec {
+                generation: "RDNA2",
+                simds_per_cu: 2,
+                max_waves_per_simd: 20,
+                vgprs_per_simd: 1024,
+                lds_per_cu: 65536,
+                l2_cache_mb: 4.0,
+                infinity_cache_mb: 128.0,
+                default_bus_width: 256,
+            }
+        }
         // RDNA3
         "gfx1100" | "gfx1101" | "gfx1102" => ArchSpec {
-            generation: "RDNA3", simds_per_cu: 2, max_waves_per_simd: 16,
-            vgprs_per_simd: 1536, lds_per_cu: 65536,
-            l2_cache_mb: 6.0, infinity_cache_mb: 96.0, default_bus_width: 384,
+            generation: "RDNA3",
+            simds_per_cu: 2,
+            max_waves_per_simd: 16,
+            vgprs_per_simd: 1536,
+            lds_per_cu: 65536,
+            l2_cache_mb: 6.0,
+            infinity_cache_mb: 96.0,
+            default_bus_width: 384,
         },
         // RDNA3.5 — Strix Halo APUs. L2 verified at 2 MB via rocminfo on Radeon
         // 8060S (Cache Info: L2 2048 KB). No discrete Infinity Cache; LPDDR5x is
         // shared with the CPU at ~256 GB/s peak (~200 GB/s effective).
         "gfx1150" | "gfx1151" | "gfx1152" => ArchSpec {
-            generation: "RDNA3.5", simds_per_cu: 2, max_waves_per_simd: 16,
-            vgprs_per_simd: 1536, lds_per_cu: 65536,
-            l2_cache_mb: 2.0, infinity_cache_mb: 0.0, default_bus_width: 256,
+            generation: "RDNA3.5",
+            simds_per_cu: 2,
+            max_waves_per_simd: 16,
+            vgprs_per_simd: 1536,
+            lds_per_cu: 65536,
+            l2_cache_mb: 2.0,
+            infinity_cache_mb: 0.0,
+            default_bus_width: 256,
         },
         // RDNA4
         "gfx1200" | "gfx1201" => ArchSpec {
-            generation: "RDNA4", simds_per_cu: 2, max_waves_per_simd: 16,
-            vgprs_per_simd: 1536, lds_per_cu: 65536,
-            l2_cache_mb: 4.0, infinity_cache_mb: 64.0, default_bus_width: 256,
+            generation: "RDNA4",
+            simds_per_cu: 2,
+            max_waves_per_simd: 16,
+            vgprs_per_simd: 1536,
+            lds_per_cu: 65536,
+            l2_cache_mb: 4.0,
+            infinity_cache_mb: 64.0,
+            default_bus_width: 256,
         },
         // Unknown — conservative RDNA1 defaults
         _ => ArchSpec {
-            generation: "unknown", simds_per_cu: 2, max_waves_per_simd: 20,
-            vgprs_per_simd: 1024, lds_per_cu: 65536,
-            l2_cache_mb: 4.0, infinity_cache_mb: 0.0, default_bus_width: 256,
+            generation: "unknown",
+            simds_per_cu: 2,
+            max_waves_per_simd: 20,
+            vgprs_per_simd: 1024,
+            lds_per_cu: 65536,
+            l2_cache_mb: 4.0,
+            infinity_cache_mb: 0.0,
+            default_bus_width: 256,
         },
     }
 }
@@ -103,10 +140,13 @@ pub const HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 63;
 /// On RDNA wave32 (gfx10xx / gfx11xx / gfx12xx) HIP reports WGP count; one WGP holds two CUs.
 /// On wave64 archs (GCN5 gfx906 / CDNA) WGPs don't exist; HIP reports CU count directly.
 pub fn hip_mp_count_to_cu_count(arch: &str, mp_count: u32) -> u32 {
-    let is_rdna_wave32 = arch.starts_with("gfx10")
-        || arch.starts_with("gfx11")
-        || arch.starts_with("gfx12");
-    if is_rdna_wave32 { mp_count.saturating_mul(2) } else { mp_count }
+    let is_rdna_wave32 =
+        arch.starts_with("gfx10") || arch.starts_with("gfx11") || arch.starts_with("gfx12");
+    if is_rdna_wave32 {
+        mp_count.saturating_mul(2)
+    } else {
+        mp_count
+    }
 }
 
 impl GpuCapability {
@@ -130,10 +170,10 @@ impl GpuCapability {
             .or(cu_count_hint.filter(|&c| (4..=256).contains(&c)))
             .unwrap_or_else(|| {
                 match arch {
-                    "gfx906" => 60,    // Vega 20 / Radeon VII / MI50 class
-                    "gfx1010" => 40,   // RX 5700 XT
-                    "gfx1030" => 60,   // RX 6800
-                    "gfx1100" => 48,   // RX 7800 XT
+                    "gfx906" => 60,  // Vega 20 / Radeon VII / MI50 class
+                    "gfx1010" => 40, // RX 5700 XT
+                    "gfx1030" => 60, // RX 6800
+                    "gfx1100" => 48, // RX 7800 XT
                     // gfx1200: RX 9060 (28 CU) / RX 9060 XT (32 CU)
                     "gfx1200" => 28,
                     // gfx1201: RX 9070 (56 CU) / RX 9070 XT / Radeon AI PRO R9700 (64 CU)
@@ -152,9 +192,9 @@ impl GpuCapability {
         // GDDR6 data rate = clock * 2 (DDR) * 8 (prefetch) = 16x multiplier.
         // Peak BW = mem_clock * 16 * bus_width / 8 (bits→bytes) / 1000 (MHz→GHz)
         let gddr_multiplier: f32 = match spec.generation {
-            "GCN5" => 2.0,                         // HBM2 DDR
+            "GCN5" => 2.0,                       // HBM2 DDR
             "RDNA1" | "RDNA2" | "RDNA3" => 16.0, // GDDR6
-            "RDNA4" => 16.0,                       // GDDR6 (9070 series)
+            "RDNA4" => 16.0,                     // GDDR6 (9070 series)
             _ => 16.0,
         };
         let peak_bw = mem_mhz as f32 * gddr_multiplier * bus_width as f32 / 8.0 / 1000.0;
@@ -182,15 +222,24 @@ impl GpuCapability {
         // Peak FP32 FLOPS: CUs * SIMDs/CU * 32 lanes * 2 (FMA) * boost_clock
         let peak_flops = self.cu_count as f64
             * self.simds_per_cu as f64
-            * 32.0 * 2.0
+            * 32.0
+            * 2.0
             * self.boost_clock_mhz as f64
             * 1e6;
         let peak_bw = self.peak_bw_gbs as f64 * 1e9;
-        if peak_bw > 0.0 { (peak_flops / peak_bw) as f32 } else { 0.0 }
+        if peak_bw > 0.0 {
+            (peak_flops / peak_bw) as f32
+        } else {
+            0.0
+        }
     }
 
-    pub fn total_simds(&self) -> u32 { self.cu_count * self.simds_per_cu }
-    pub fn max_total_waves(&self) -> u32 { self.total_simds() * self.max_waves_per_simd }
+    pub fn total_simds(&self) -> u32 {
+        self.cu_count * self.simds_per_cu
+    }
+    pub fn max_total_waves(&self) -> u32 {
+        self.total_simds() * self.max_waves_per_simd
+    }
 }
 
 /// Parsed kernel ISA metadata from an .hsaco file.
@@ -209,7 +258,11 @@ pub struct KernelProfile {
 
 impl KernelProfile {
     pub fn occupancy_pct(&self) -> f32 {
-        if self.max_waves > 0 { self.occupancy_waves as f32 / self.max_waves as f32 * 100.0 } else { 0.0 }
+        if self.max_waves > 0 {
+            self.occupancy_waves as f32 / self.max_waves as f32 * 100.0
+        } else {
+            0.0
+        }
     }
 }
 
@@ -249,7 +302,8 @@ pub fn profile_kernels_with_hint(
 fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<KernelProfile> {
     // Skip offload bundle wrapper if present
     let elf = if data.len() > 24 && &data[0..24] == b"__CLANG_OFFLOAD_BUNDLE__" {
-        data.windows(4).position(|w| w == &[0x7f, b'E', b'L', b'F'])
+        data.windows(4)
+            .position(|w| w == &[0x7f, b'E', b'L', b'F'])
             .map(|pos| &data[pos..])
     } else {
         Some(data)
@@ -268,9 +322,16 @@ fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<
     let mut segments = Vec::new();
     for i in 0..phnum {
         let base = phoff + i * phentsize;
-        if base + phentsize > elf.len() { break; }
-        if u32_le(elf, base) == 1 { // PT_LOAD
-            segments.push((u64_le(elf, base + 16), u64_le(elf, base + 8), u64_le(elf, base + 32)));
+        if base + phentsize > elf.len() {
+            break;
+        }
+        if u32_le(elf, base) == 1 {
+            // PT_LOAD
+            segments.push((
+                u64_le(elf, base + 16),
+                u64_le(elf, base + 8),
+                u64_le(elf, base + 32),
+            ));
         }
     }
 
@@ -278,7 +339,9 @@ fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<
     let shentsize = u16_le(elf, 58) as usize;
     let shnum = u16_le(elf, 60) as usize;
     let shstrndx = u16_le(elf, 62) as usize;
-    if shstrndx >= shnum { return None; }
+    if shstrndx >= shnum {
+        return None;
+    }
     let _shstr_offset = u64_le(elf, shoff + shstrndx * shentsize + 24) as usize;
 
     let mut symtab_offset = 0usize;
@@ -288,8 +351,11 @@ fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<
 
     for i in 0..shnum {
         let base = shoff + i * shentsize;
-        if base + 40 > elf.len() { break; }
-        if u32_le(elf, base + 4) == 2 { // SHT_SYMTAB
+        if base + 40 > elf.len() {
+            break;
+        }
+        if u32_le(elf, base + 4) == 2 {
+            // SHT_SYMTAB
             symtab_offset = u64_le(elf, base + 24) as usize;
             symtab_size = u64_le(elf, base + 32) as usize;
             symtab_entsize = u64_le(elf, base + 56) as usize;
@@ -297,24 +363,32 @@ fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<
         }
     }
 
-    if symtab_entsize == 0 { return None; }
+    if symtab_entsize == 0 {
+        return None;
+    }
 
     let strtab_offset = if symtab_link < shnum {
         u64_le(elf, shoff + symtab_link * shentsize + 24) as usize
-    } else { return None; };
+    } else {
+        return None;
+    };
 
     // Find the first .kd symbol (most .hsaco have exactly one kernel)
     let num_syms = symtab_size / symtab_entsize;
     for i in 0..num_syms {
         let base = symtab_offset + i * symtab_entsize;
-        if base + symtab_entsize > elf.len() { break; }
+        if base + symtab_entsize > elf.len() {
+            break;
+        }
         let st_name = u32_le(elf, base) as usize;
         let st_value = u64_le(elf, base + 8);
         let sym_name = read_cstr(elf, strtab_offset + st_name);
 
         if sym_name.ends_with(".kd") {
             let kd_off = va_to_offset(&segments, st_value)? as usize;
-            if kd_off + 64 > elf.len() { continue; }
+            if kd_off + 64 > elf.len() {
+                continue;
+            }
 
             let meta = RawKernelMeta {
                 pgm_rsrc1: u32_le(elf, kd_off + 48),
@@ -328,7 +402,11 @@ fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<
             let sgprs = decode_sgprs(meta.pgm_rsrc1);
 
             let max_waves = cap.max_waves_per_simd;
-            let vgpr_waves = if vgprs > 0 { cap.vgprs_per_simd / vgprs } else { max_waves };
+            let vgpr_waves = if vgprs > 0 {
+                cap.vgprs_per_simd / vgprs
+            } else {
+                max_waves
+            };
             let lds_waves = if meta.group_segment_size > 0 {
                 (cap.lds_per_cu_bytes / meta.group_segment_size) / cap.simds_per_cu
             } else {
@@ -336,13 +414,18 @@ fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<
             };
 
             let occupancy = max_waves.min(vgpr_waves).min(lds_waves);
-            let limiter = if occupancy >= max_waves { "wave limit" }
-                else if vgpr_waves <= lds_waves { "VGPRs" }
-                else { "LDS" };
+            let limiter = if occupancy >= max_waves {
+                "wave limit"
+            } else if vgpr_waves <= lds_waves {
+                "VGPRs"
+            } else {
+                "LDS"
+            };
 
             return Some(KernelProfile {
                 name: module_name.to_string(),
-                vgprs, sgprs,
+                vgprs,
+                sgprs,
                 lds_bytes: meta.group_segment_size,
                 scratch_bytes: meta.private_segment_size,
                 kernarg_bytes: meta.kernarg_size,
@@ -363,7 +446,6 @@ struct RawKernelMeta {
     kernarg_size: u64,
 }
 
-
 /// Decode VGPR count from pgm_rsrc1. Granularity depends on arch.
 fn decode_vgprs(pgm_rsrc1: u32, cap: &GpuCapability) -> u32 {
     let field = pgm_rsrc1 & 0x3F;
@@ -371,7 +453,7 @@ fn decode_vgprs(pgm_rsrc1: u32, cap: &GpuCapability) -> u32 {
     // hipcc targets wave32 for RDNA, so granularity = 8
     let granularity = match cap.generation {
         "RDNA3" | "RDNA4" => 8, // confirmed wave32 granularity
-        _ => 8,                  // RDNA1/2 also wave32
+        _ => 8,                 // RDNA1/2 also wave32
     };
     (field + 1) * granularity
 }
@@ -400,7 +482,9 @@ fn read_sysfs_cu_count() -> Option<u32> {
                 // simd_count = total SIMDs, CUs = simd_count / 2
                 if let Some(val) = line.split_whitespace().last() {
                     if let Ok(simds) = val.parse::<u32>() {
-                        if simds > 0 { return Some(simds / 2); }
+                        if simds > 0 {
+                            return Some(simds / 2);
+                        }
                     }
                 }
             }
@@ -414,8 +498,11 @@ fn read_sysfs_clocks() -> Option<(u32, u32)> {
         for entry in std::fs::read_dir("/sys/class/drm/").ok()? {
             let name = entry.ok()?.file_name().into_string().ok()?;
             if name.starts_with("card") && !name.contains('-') {
-                let vendor = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/vendor")).ok()?;
-                if vendor.trim() == "0x1002" { return Some(name); }
+                let vendor =
+                    std::fs::read_to_string(format!("/sys/class/drm/{name}/device/vendor")).ok()?;
+                if vendor.trim() == "0x1002" {
+                    return Some(name);
+                }
             }
         }
         None
@@ -424,13 +511,17 @@ fn read_sysfs_clocks() -> Option<(u32, u32)> {
 
     // GPU boost clock: last entry in pp_dpm_sclk (highest P-state)
     let sclk = std::fs::read_to_string(format!("/sys/class/drm/{card}/device/pp_dpm_sclk")).ok()?;
-    let gpu_mhz = sclk.lines().last()
+    let gpu_mhz = sclk
+        .lines()
+        .last()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.trim_end_matches("Mhz").parse::<u32>().ok())?;
 
     // Memory clock: last entry in pp_dpm_mclk
     let mclk = std::fs::read_to_string(format!("/sys/class/drm/{card}/device/pp_dpm_mclk")).ok()?;
-    let mem_mhz = mclk.lines().last()
+    let mem_mhz = mclk
+        .lines()
+        .last()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.trim_end_matches("Mhz").parse::<u32>().ok())?;
 
@@ -445,7 +536,9 @@ fn read_sysfs_bus_width() -> Option<u32> {
             if let Some(line) = text.lines().find(|l| l.starts_with("width")) {
                 if let Some(val) = line.split_whitespace().last() {
                     if let Ok(w) = val.parse::<u32>() {
-                        if w > 0 { return Some(w); }
+                        if w > 0 {
+                            return Some(w);
+                        }
                     }
                 }
             }
@@ -456,14 +549,29 @@ fn read_sysfs_bus_width() -> Option<u32> {
 
 // ── Minimal ELF parsing helpers ────────────────────────────
 
-fn u16_le(d: &[u8], o: usize) -> u16 { u16::from_le_bytes([d[o], d[o+1]]) }
-fn u32_le(d: &[u8], o: usize) -> u32 { u32::from_le_bytes([d[o], d[o+1], d[o+2], d[o+3]]) }
+fn u16_le(d: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([d[o], d[o + 1]])
+}
+fn u32_le(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+}
 fn u64_le(d: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes([d[o], d[o+1], d[o+2], d[o+3], d[o+4], d[o+5], d[o+6], d[o+7]])
+    u64::from_le_bytes([
+        d[o],
+        d[o + 1],
+        d[o + 2],
+        d[o + 3],
+        d[o + 4],
+        d[o + 5],
+        d[o + 6],
+        d[o + 7],
+    ])
 }
 fn read_cstr(d: &[u8], o: usize) -> String {
     let mut e = o;
-    while e < d.len() && d[e] != 0 { e += 1; }
+    while e < d.len() && d[e] != 0 {
+        e += 1;
+    }
     String::from_utf8_lossy(&d[o..e]).into()
 }
 
@@ -472,11 +580,21 @@ impl GpuCapability {
     pub fn to_json(&self) -> String {
         format!(
             r#"{{"arch":"{}","generation":"{}","cu_count":{},"simds_per_cu":{},"max_waves_per_simd":{},"vgprs_per_simd":{},"lds_per_cu":{},"l2_cache_mb":{},"infinity_cache_mb":{},"peak_bw_gbs":{:.1},"boost_clock_mhz":{},"mem_clock_mhz":{},"mem_bus_width":{},"vram_mb":{},"ridge_point":{:.1}}}"#,
-            self.arch, self.generation, self.cu_count, self.simds_per_cu,
-            self.max_waves_per_simd, self.vgprs_per_simd, self.lds_per_cu_bytes,
-            self.l2_cache_mb, self.infinity_cache_mb, self.peak_bw_gbs,
-            self.boost_clock_mhz, self.mem_clock_mhz, self.mem_bus_width_bits,
-            self.vram_mb, self.ridge_point_flop_per_byte()
+            self.arch,
+            self.generation,
+            self.cu_count,
+            self.simds_per_cu,
+            self.max_waves_per_simd,
+            self.vgprs_per_simd,
+            self.lds_per_cu_bytes,
+            self.l2_cache_mb,
+            self.infinity_cache_mb,
+            self.peak_bw_gbs,
+            self.boost_clock_mhz,
+            self.mem_clock_mhz,
+            self.mem_bus_width_bits,
+            self.vram_mb,
+            self.ridge_point_flop_per_byte()
         )
     }
 }
@@ -485,8 +603,15 @@ impl KernelProfile {
     pub fn to_json(&self) -> String {
         format!(
             r#"{{"name":"{}","vgprs":{},"sgprs":{},"lds_bytes":{},"scratch_bytes":{},"occupancy":{{"waves":{},"max":{},"pct":{:.1},"limiter":"{}"}}}}"#,
-            self.name, self.vgprs, self.sgprs, self.lds_bytes, self.scratch_bytes,
-            self.occupancy_waves, self.max_waves, self.occupancy_pct(), self.occupancy_limiter
+            self.name,
+            self.vgprs,
+            self.sgprs,
+            self.lds_bytes,
+            self.scratch_bytes,
+            self.occupancy_waves,
+            self.max_waves,
+            self.occupancy_pct(),
+            self.occupancy_limiter
         )
     }
 }

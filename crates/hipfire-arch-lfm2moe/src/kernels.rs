@@ -19,8 +19,7 @@ const SOURCE: &str = include_str!("../kernels/lfm2_a1b_moe_down_hfq4g256_k1792_w
 
 const CONV_SCAN_MODULE: &str = "conv1d_gated_scan_n_gfx1201";
 const CONV_SCAN_SYMBOL: &str = "conv1d_gated_scan_n_f32";
-const CONV_SCAN_SOURCE: &str =
-    include_str!("../../../kernels/src/conv1d_gated_scan_n.gfx1201.hip");
+const CONV_SCAN_SOURCE: &str = include_str!("../../../kernels/src/conv1d_gated_scan_n.gfx1201.hip");
 
 fn validate_contract(
     arch: &str,
@@ -110,10 +109,7 @@ pub fn conv1d_gated_scan_n(
     if !gpu.arch_caps.is_gfx1201() {
         return Err(hip_bridge::HipError::new(
             0,
-            &format!(
-                "conv1d_gated_scan_n_f32 requires gfx1201, got {}",
-                gpu.arch
-            ),
+            &format!("conv1d_gated_scan_n_f32 requires gfx1201, got {}", gpu.arch),
         ));
     }
     let n_tokens_i32 = i32::try_from(n_tokens).map_err(|_| {
@@ -159,7 +155,6 @@ pub fn conv1d_gated_scan_n(
         blob,
     )
 }
-
 
 // ---------------------------------------------------------------------------
 // LFM2.5-350M-MQ4 / gfx1201 ONLY — HFQ4G256 WMMA batch-tiled gate_up + residual.
@@ -224,23 +219,18 @@ fn validate_lfm2_350m_gfx1201(gpu: &Gpu, batch_size: usize) -> Result<(), String
     Ok(())
 }
 
-fn validate_lfm2_350m_gate_up_shape(
-    gate_m: usize,
-    up_m: usize,
-    k: usize,
-) -> Result<(), String> {
+fn validate_lfm2_350m_gate_up_shape(gate_m: usize, up_m: usize, k: usize) -> Result<(), String> {
     // Dense FFN gate/up: [intermediate, hidden] = [4608, 1024].
-    if gate_m != LFM2_350M_INTERMEDIATE
-        || up_m != LFM2_350M_INTERMEDIATE
-        || k != LFM2_350M_HIDDEN
-    {
+    if gate_m != LFM2_350M_INTERMEDIATE || up_m != LFM2_350M_INTERMEDIATE || k != LFM2_350M_HIDDEN {
         return Err(format!(
             "lfm2_350m gate_up requires gate_m=up_m={LFM2_350M_INTERMEDIATE} k={LFM2_350M_HIDDEN}, \
              got gate_m={gate_m} up_m={up_m} k={k}"
         ));
     }
     if k % 256 != 0 {
-        return Err(format!("lfm2_350m gate_up requires K multiple of 256, got {k}"));
+        return Err(format!(
+            "lfm2_350m gate_up requires K multiple of 256, got {k}"
+        ));
     }
     Ok(())
 }
@@ -251,10 +241,7 @@ fn validate_lfm2_350m_gate_up_shape(
 /// - attn out:      M=hidden=1024,    K=q_dim=1024
 /// - ffn down:      M=hidden=1024,    K=intermediate=4608
 fn validate_lfm2_350m_residual_shape(m: usize, k: usize) -> Result<(), String> {
-    let ok = matches!(
-        (m, k),
-        (3072, 1024) | (1024, 1024) | (1024, 4608)
-    );
+    let ok = matches!((m, k), (3072, 1024) | (1024, 1024) | (1024, 4608));
     if !ok {
         return Err(format!(
             "lfm2_350m residual requires one of \
@@ -262,7 +249,9 @@ fn validate_lfm2_350m_residual_shape(m: usize, k: usize) -> Result<(), String> {
         ));
     }
     if k % 256 != 0 {
-        return Err(format!("lfm2_350m residual requires K multiple of 256, got {k}"));
+        return Err(format!(
+            "lfm2_350m residual requires K multiple of 256, got {k}"
+        ));
     }
     Ok(())
 }

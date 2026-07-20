@@ -44,7 +44,9 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
 
     // Load module from file
     println!("Loading module...");
-    let module = hip.module_load(obj_path.to_str().unwrap()).expect("module_load failed");
+    let module = hip
+        .module_load(obj_path.to_str().unwrap())
+        .expect("module_load failed");
 
     // Get kernel function
     let func = hip
@@ -64,10 +66,8 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
     let d_c = hip.malloc(size).unwrap();
 
     // Upload data
-    let a_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, size) };
-    let b_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u8, size) };
+    let a_bytes: &[u8] = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, size) };
+    let b_bytes: &[u8] = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u8, size) };
     hip.memcpy_htod(&d_a, a_bytes).unwrap();
     hip.memcpy_htod(&d_b, b_bytes).unwrap();
     println!("Data uploaded to GPU");

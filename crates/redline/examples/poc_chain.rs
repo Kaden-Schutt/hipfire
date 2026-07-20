@@ -7,7 +7,7 @@
 //! If E=[13,13,...], the barrier correctly serialized dependent dispatches.
 
 use redline::device::Device;
-use redline::dispatch::{CommandBuffer, FastDispatch, Kernel, KernargBuilder};
+use redline::dispatch::{CommandBuffer, FastDispatch, KernargBuilder, Kernel};
 
 fn main() {
     eprintln!("=== redline: chained dispatch with RELEASE_MEM barrier ===\n");
@@ -25,9 +25,16 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 "#;
     std::fs::write("/tmp/redline_chain.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1010", "-O3",
-               "-o", "/tmp/redline_chain.hsaco", "/tmp/redline_chain.hip"])
-        .output().expect("hipcc");
+        .args([
+            "--genco",
+            "--offload-arch=gfx1010",
+            "-O3",
+            "-o",
+            "/tmp/redline_chain.hsaco",
+            "/tmp/redline_chain.hip",
+        ])
+        .output()
+        .expect("hipcc");
     assert!(out.status.success());
 
     let module = dev.load_module_file("/tmp/redline_chain.hsaco").unwrap();
@@ -43,10 +50,31 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     let c_buf = dev.alloc_vram(nbytes as u64).unwrap();
     let d_buf = dev.alloc_vram(nbytes as u64).unwrap();
     let e_buf = dev.alloc_vram(nbytes as u64).unwrap();
-    dev.upload(&a_buf, &vec![1.0f32; n as usize].iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
-    dev.upload(&b_buf, &vec![2.0f32; n as usize].iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    dev.upload(
+        &a_buf,
+        &vec![1.0f32; n as usize]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    dev.upload(
+        &b_buf,
+        &vec![2.0f32; n as usize]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
     dev.upload(&c_buf, &vec![0u8; nbytes]).unwrap();
-    dev.upload(&d_buf, &vec![10.0f32; n as usize].iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    dev.upload(
+        &d_buf,
+        &vec![10.0f32; n as usize]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
     dev.upload(&e_buf, &vec![0u8; nbytes]).unwrap();
 
     // Fence buffer for barrier
@@ -54,19 +82,33 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     dev.upload(&fence_buf, &vec![0u8; 64]).unwrap(); // zero fence
 
     // FastDispatch with all buffers in persistent BO list
-    let fd = FastDispatch::new(&dev, &[
-        &module.code_buf, &a_buf, &b_buf, &c_buf, &d_buf, &e_buf, &fence_buf,
-    ]).unwrap();
+    let fd = FastDispatch::new(
+        &dev,
+        &[
+            &module.code_buf,
+            &a_buf,
+            &b_buf,
+            &c_buf,
+            &d_buf,
+            &e_buf,
+            &fence_buf,
+        ],
+    )
+    .unwrap();
 
     // Build kernarg for dispatch 1: C = A + B
     let mut ka1 = KernargBuilder::new(28);
-    ka1.write_ptr(0, a_buf.gpu_addr).write_ptr(8, b_buf.gpu_addr)
-       .write_ptr(16, c_buf.gpu_addr).write_u32(24, n);
+    ka1.write_ptr(0, a_buf.gpu_addr)
+        .write_ptr(8, b_buf.gpu_addr)
+        .write_ptr(16, c_buf.gpu_addr)
+        .write_u32(24, n);
 
     // Build kernarg for dispatch 2: E = C + D
     let mut ka2 = KernargBuilder::new(28);
-    ka2.write_ptr(0, c_buf.gpu_addr).write_ptr(8, d_buf.gpu_addr)
-       .write_ptr(16, e_buf.gpu_addr).write_u32(24, n);
+    ka2.write_ptr(0, c_buf.gpu_addr)
+        .write_ptr(8, d_buf.gpu_addr)
+        .write_ptr(16, e_buf.gpu_addr)
+        .write_u32(24, n);
 
     // Upload both kernargs to different offsets in the persistent KA buffer
     // Dispatch 1 kernarg at offset 0, dispatch 2 at offset 256
@@ -100,7 +142,11 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     cb.barrier(fence_buf.gpu_addr, 1);
     cb.dispatch(kernel, [groups, 1, 1], [256, 1, 1], ka_base + 256);
 
-    eprintln!("IB: {} dwords ({} bytes)", cb.len_dwords(), cb.len_dwords() * 4);
+    eprintln!(
+        "IB: {} dwords ({} bytes)",
+        cb.len_dwords(),
+        cb.len_dwords() * 4
+    );
     eprintln!("Submitting chained dispatch (1 ioctl)...");
 
     fd.submit_cmdbuf(&dev, &cb).unwrap();
@@ -113,18 +159,25 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     let bad = e.iter().filter(|&&v| (v - 13.0).abs() > 0.001).count();
     if bad == 0 {
         eprintln!("\n╔════════════════════════════════════════════════════════════╗");
-        eprintln!("║  CHAINED DISPATCH: {} elements = 13.0 (1+2+10)          ║", n);
+        eprintln!(
+            "║  CHAINED DISPATCH: {} elements = 13.0 (1+2+10)          ║",
+            n
+        );
         eprintln!("║  Two dependent dispatches in ONE amdgpu_cs_submit call    ║");
         eprintln!("║  RELEASE_MEM + WAIT_REG_MEM barrier works on gfx1010!     ║");
         eprintln!("╚════════════════════════════════════════════════════════════╝");
     } else {
         eprintln!("FAILED: {bad}/{n} wrong");
-        eprintln!("e[0]={} e[1]={} e[256]={} e[4095]={}", e[0], e[1], e[256], e[4095]);
+        eprintln!(
+            "e[0]={} e[1]={} e[256]={} e[4095]={}",
+            e[0], e[1], e[256], e[4095]
+        );
 
         // Also check C
         let mut c_raw = vec![0u8; nbytes];
         dev.download(&c_buf, &mut c_raw).unwrap();
-        let c: &[f32] = unsafe { std::slice::from_raw_parts(c_raw.as_ptr() as *const f32, n as usize) };
+        let c: &[f32] =
+            unsafe { std::slice::from_raw_parts(c_raw.as_ptr() as *const f32, n as usize) };
         eprintln!("c[0]={} (expect 3.0)", c[0]);
     }
 

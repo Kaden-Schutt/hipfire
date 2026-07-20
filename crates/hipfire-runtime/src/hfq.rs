@@ -176,6 +176,84 @@ impl HfqFile {
         self.overlay.is_some()
     }
 
+    /// Freeze the exact base HFQ bytes in a sealed anonymous snapshot and
+    /// return their MD5, but only when the already-open file has
+    /// `expected_len` bytes.
+    ///
+    /// On Linux, metadata parsing and all later tensor reads are rebound to
+    /// the same immutable memfd bytes covered by the digest. This closes both
+    /// path/inode races and mutation-after-digest races. The optional overlay
+    /// is intentionally excluded; callers that require an unmodified artifact
+    /// must also reject [`Self::has_overlay`].
+    ///
+    /// Other targets fail closed because the retained route currently has no
+    /// equivalent sealed-snapshot implementation there.
+    pub fn base_md5_if_len(&mut self, expected_len: u64) -> std::io::Result<Option<[u8; 16]>> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected_len;
+            Ok(None)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::io::{Read, Seek, SeekFrom, Write};
+            use std::os::fd::{AsRawFd, FromRawFd};
+
+            if self._file.metadata()?.len() != expected_len {
+                return Ok(None);
+            }
+
+            let name = CString::new("hipfire-hfq-snapshot").expect("literal has no NUL");
+            let fd = unsafe {
+                libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut snapshot = unsafe { File::from_raw_fd(fd) };
+
+            let mut source = self._file.try_clone()?;
+            source.seek(SeekFrom::Start(0))?;
+            let mut remaining = expected_len;
+            let mut context = md5::Context::new();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            while remaining != 0 {
+                let chunk_len = remaining.min(buffer.len() as u64) as usize;
+                source.read_exact(&mut buffer[..chunk_len])?;
+                snapshot.write_all(&buffer[..chunk_len])?;
+                context.consume(&buffer[..chunk_len]);
+                remaining -= chunk_len as u64;
+            }
+            snapshot.flush()?;
+
+            let seals =
+                libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+            if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let applied_seals = unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_GET_SEALS) };
+            if applied_seals < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if applied_seals & seals != seals {
+                return Err(std::io::Error::other(format!(
+                    "HFQ snapshot seal verification failed: applied=0x{applied_seals:x}, required=0x{seals:x}"
+                )));
+            }
+
+            let snapshot_path =
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", snapshot.as_raw_fd()));
+            let mut frozen = Self::open_at_offset(&snapshot_path, 0)?;
+            frozen.path =
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", frozen._file.as_raw_fd()));
+            *self = frozen;
+
+            Ok(Some(context.finalize().0))
+        }
+    }
+
     /// Open an HFQM container that lives inside a larger file, starting at
     /// `base_offset`. Used by the bundled `.mq4-mtp` loader to parse the
     /// MTP section embedded after the trunk's tensor data.
@@ -649,8 +727,14 @@ impl HfqFile {
                         (info.data_offset + total_read) as libc::off_t,
                     )
                 };
-                if n <= 0 {
-                    break;
+                if n < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return None;
+                }
+                if n == 0 {
+                    return None;
                 }
                 total_read += n as usize;
             }
@@ -709,8 +793,14 @@ impl HfqFile {
                         (info.data_offset + total_read) as libc::off_t,
                     )
                 };
-                if n <= 0 {
-                    break;
+                if n < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return None;
+                }
+                if n == 0 {
+                    return None;
                 }
                 total_read += n as usize;
             }
@@ -1758,7 +1848,15 @@ mod overlay_tests {
     ///   - tensor data, concatenated in index order (offsets are derived at
     ///     read time cumulatively from `data_offset`).
     fn write_min_hfq(path: &Path, arch_id: u32, tensors: &[(&str, u8, &[u32], &[u8])]) {
-        let metadata = b"{}"; // balanced JSON; brace-scan parser stops at the close brace
+        write_min_hfq_with_metadata(path, arch_id, b"{}", tensors);
+    }
+
+    fn write_min_hfq_with_metadata(
+        path: &Path,
+        arch_id: u32,
+        metadata: &[u8],
+        tensors: &[(&str, u8, &[u32], &[u8])],
+    ) {
         let header_size: u64 = 32;
         let metadata_offset = header_size;
         let index_offset = metadata_offset + metadata.len() as u64;
@@ -1774,7 +1872,7 @@ mod overlay_tests {
             for &d in *shape {
                 index.extend_from_slice(&d.to_le_bytes());
             }
-            index.extend_from_slice(&0u32.to_le_bytes()); // group_size
+            index.extend_from_slice(&0u32.to_le_bytes());
             index.extend_from_slice(&(data.len() as u64).to_le_bytes());
         }
 
@@ -1783,7 +1881,7 @@ mod overlay_tests {
 
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(b"HFQM").unwrap();
-        f.write_all(&1u32.to_le_bytes()).unwrap(); // version
+        f.write_all(&1u32.to_le_bytes()).unwrap();
         f.write_all(&arch_id.to_le_bytes()).unwrap();
         f.write_all(&(tensors.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&metadata_offset.to_le_bytes()).unwrap();
@@ -1893,5 +1991,74 @@ mod overlay_tests {
         let mut f = HfqFile::open(&base).unwrap();
         let err = f.attach_overlay(HfqFile::open(&ov).unwrap()).unwrap_err();
         assert!(err.contains("'Z' not present in base"), "got: {err}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn short_preads_fail_instead_of_zero_filling_tensor_bytes() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("short.hfq");
+        write_min_hfq(&base, 9, &[("A", 3, &[2, 4], &vec![7u8; 8])]);
+        let f = HfqFile::open(&base).unwrap();
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&base)
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+
+        assert!(f.tensor_data_vec("A").is_none());
+        assert!(f.tensor_data_pread("A").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn digest_identity_freezes_the_bytes_used_by_later_tensor_loads() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("frozen.hfq");
+        let original = vec![1u8; 8];
+        let original_metadata =
+            br#"{"generation_config":{"temperature":0.25,"top_p":0.9,"top_k":20}}"#;
+        write_min_hfq_with_metadata(&base, 9, original_metadata, &[("A", 3, &[2, 4], &original)]);
+        let mut f = HfqFile::open(&base).unwrap();
+        assert_eq!(f.recommended_sampling().unwrap().temperature, Some(0.25));
+        let len = std::fs::metadata(&base).unwrap().len();
+
+        assert!(f.base_md5_if_len(len).unwrap().is_some());
+        use std::os::fd::AsRawFd;
+
+        let required_seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        let applied_seals = unsafe { libc::fcntl(f._file.as_raw_fd(), libc::F_GET_SEALS) };
+        assert_eq!(applied_seals & required_seals, required_seals);
+        let replacement = 0_u8;
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    f._file.as_raw_fd(),
+                    (&replacement as *const u8).cast(),
+                    1,
+                    0,
+                )
+            },
+            -1,
+            "sealed snapshot accepted a write"
+        );
+        let replacement_metadata =
+            br#"{"generation_config":{"temperature":0.75,"top_p":0.8,"top_k":40}}"#;
+        write_min_hfq_with_metadata(
+            &base,
+            9,
+            replacement_metadata,
+            &[("A", 3, &[2, 4], &vec![9u8; 8])],
+        );
+
+        let (_, loaded) = f.tensor_data_vec("A").unwrap();
+        assert_eq!(loaded, original);
+        assert_eq!(f.recommended_sampling().unwrap().temperature, Some(0.25));
     }
 }

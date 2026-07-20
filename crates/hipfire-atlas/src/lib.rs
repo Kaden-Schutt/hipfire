@@ -26,6 +26,4 @@ pub mod suggest;
 pub mod task;
 
 pub use profile_report::{AtlasProfileReport, AtlasRocprofKernel};
-pub use schema::{
-    load_row, load_rows, truncate_jsonl, value_object, AtlasRow, ATLAS_SCHEMA,
-};
+pub use schema::{load_row, load_rows, truncate_jsonl, value_object, AtlasRow, ATLAS_SCHEMA};

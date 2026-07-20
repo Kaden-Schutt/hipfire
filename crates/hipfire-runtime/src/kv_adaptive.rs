@@ -152,8 +152,8 @@ impl KvAdaptive {
             // was set to the aggressive floor (fwht2/lloyd2), making the two presets
             // identical. K/V bit-gap stays ≤ 1 tier at every rung.
             Preset::Conservative => (KMode::Fwht4, VMode::Lloyd4),
-            Preset::Balanced     => (KMode::Fwht3, VMode::Lloyd3),
-            Preset::Aggressive   => (KMode::Fwht2, VMode::Lloyd2),
+            Preset::Balanced => (KMode::Fwht3, VMode::Lloyd3),
+            Preset::Aggressive => (KMode::Fwht2, VMode::Lloyd2),
         };
         Self::new(max_seq, n_kv_heads, head_dim, k_floor, v_floor)
     }
@@ -359,16 +359,38 @@ mod tests {
         // chain descends V to lloyd3, then K to fwht3 (no final lloyd2 step — that
         // belongs to aggressive).
         let a = KvAdaptive::from_preset(Preset::Balanced, 10_000, 4, 256);
-        assert_eq!(a.steps, vec![
-            Step::V(VMode::Lloyd4), Step::V(VMode::Lloyd3), Step::K(KMode::Fwht3),
-        ]);
+        assert_eq!(
+            a.steps,
+            vec![
+                Step::V(VMode::Lloyd4),
+                Step::V(VMode::Lloyd3),
+                Step::K(KMode::Fwht3),
+            ]
+        );
         // thresholds non-decreasing.
-        for w in a.thresholds.windows(2) { assert!(w[1] >= w[0], "thresholds {:?}", a.thresholds); }
+        for w in a.thresholds.windows(2) {
+            assert!(w[1] >= w[0], "thresholds {:?}", a.thresholds);
+        }
         // first threshold = start-tier cap - margin (computed at the new floors so
         // it can't drift to a stale magic number).
-        let start_cap = cap_min(10_000, 256, KMode::Fwht3, VMode::Lloyd3, KMode::Fwht4, VMode::Q8);
-        assert_eq!(a.current_cap(), start_cap, "current_cap at construction == start-tier cap");
-        assert_eq!(a.thresholds[0], start_cap - a.margin, "first threshold = start_cap - margin");
+        let start_cap = cap_min(
+            10_000,
+            256,
+            KMode::Fwht3,
+            VMode::Lloyd3,
+            KMode::Fwht4,
+            VMode::Q8,
+        );
+        assert_eq!(
+            a.current_cap(),
+            start_cap,
+            "current_cap at construction == start-tier cap"
+        );
+        assert_eq!(
+            a.thresholds[0],
+            start_cap - a.margin,
+            "first threshold = start_cap - margin"
+        );
     }
 
     #[test]

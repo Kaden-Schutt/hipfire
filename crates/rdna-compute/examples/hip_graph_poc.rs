@@ -138,7 +138,10 @@ fn main() {
         .expect("stream_end_capture");
     eprintln!("  capture succeeded");
 
-    let exec = gpu.hip.graph_instantiate(&graph).expect("graph_instantiate");
+    let exec = gpu
+        .hip
+        .graph_instantiate(&graph)
+        .expect("graph_instantiate");
     eprintln!("  instantiated");
 
     // First replay
@@ -158,7 +161,10 @@ fn main() {
 
     if bad > 0 {
         eprintln!("  FIRST 8 MISMATCHES:");
-        for i in (0..dim).filter(|&i| (graph_out[i] - reference[i]).abs() > 1e-6).take(8) {
+        for i in (0..dim)
+            .filter(|&i| (graph_out[i] - reference[i]).abs() > 1e-6)
+            .take(8)
+        {
             eprintln!(
                 "    [{i}] graph={} ref={} delta={}",
                 graph_out[i],

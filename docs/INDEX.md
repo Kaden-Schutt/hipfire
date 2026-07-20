@@ -49,7 +49,7 @@ Lack of authority is not an active truth state:
 `unknown`, do not treat any nearby doc, skill, measurement, or runtime default
 as authority. Open an explicit owner or keep the claim out of product language.
 
-Admissions are machine-recorded only in [`admissions.yml`](admissions.yml). An empty `records` list means no inferred admissions. Runtime gating or a passing measurement alone never admits a route.
+Admissions are machine-recorded only in [`admissions.yml`](admissions.yml) (schema v2). Exactly one evidence-bound row is admitted; every other route stays unadmitted. Runtime gating or a passing measurement alone never admits a route.
 
 ## How to use this index
 
@@ -66,7 +66,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 |---|---|---|---|
 | Docs navigation, lifecycle labels, ownership map | [`docs/INDEX.md`](INDEX.md) | branch-implemented | This file. Not yet on audited ref / integrated tree. |
 | Human validation route selection | [`docs/VALIDATION.md`](VALIDATION.md) | branch-implemented | Sole route selector. Not yet on audited ref / integrated tree. |
-| Machine admission registry | [`docs/admissions.yml`](admissions.yml) | branch-implemented | Schema only; `records: []`. Not yet on audited ref / integrated tree. |
+| Machine admission registry | [`docs/admissions.yml`](admissions.yml) | branch-implemented | Schema v2; exactly one earned record (LFM2.5-350M MQ4 gfx1201 retained-PM4). Not yet on audited ref / integrated tree. |
 | Product onboarding | [`docs/GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | |
 | CLI surface and model lifecycle commands | [`docs/CLI.md`](CLI.md) | shipped / ref-pinned | |
 | Daemon / user config keys | [`docs/CONFIG.md`](CONFIG.md) | shipped / ref-pinned | |
@@ -109,7 +109,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Lessons learned | [`docs/lessons_learned/`](lessons_learned/) | historical | Postmortems. |
 | Superpowers nested plans/specs | [`docs/superpowers/`](superpowers/) | planned | Nested plans/specs only. Not an executable skill root. |
 | Universal replacement gate for all GPU changes | — | **BLOCKED** | No universal gate. Route per [`VALIDATION.md`](VALIDATION.md). |
-| Inferred model/route admissions without registry rows | — | **BLOCKED** | [`admissions.yml`](admissions.yml) stays empty until earned records exist. |
+| Inferred model/route admissions without registry rows | — | **BLOCKED** | [`admissions.yml`](admissions.yml) schema v2 forbids inferred/wildcard rows; only the exact earned record is admitted. |
 | Stitching manual Redline capture to product timed-arm proof | — | **BLOCKED** | See `REDLINE.md` certification ladder; fail closed. |
 
 ## Top-level page classification
@@ -120,7 +120,7 @@ Every current top-level page, exactly once.
 |---|---|---|
 | [`INDEX.md`](INDEX.md) | branch-implemented | Navigation, lifecycle, ownership. |
 | [`VALIDATION.md`](VALIDATION.md) | branch-implemented | Validation route selector. |
-| [`admissions.yml`](admissions.yml) | branch-implemented | Admission registry (empty records). |
+| [`admissions.yml`](admissions.yml) | branch-implemented | Admission registry (schema v2; exactly one record). |
 | [`GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | Onboarding. |
 | [`CLI.md`](CLI.md) | shipped / ref-pinned | CLI. |
 | [`CONFIG.md`](CONFIG.md) | shipped / ref-pinned | Config keys. |

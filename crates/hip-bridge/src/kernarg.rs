@@ -52,13 +52,17 @@ pub struct KernargBlob {
 impl KernargBlob {
     /// Construct an empty blob.
     pub fn new() -> Self {
-        Self { buf: Vec::with_capacity(64) }
+        Self {
+            buf: Vec::with_capacity(64),
+        }
     }
 
     /// Construct with a pre-reserved capacity — avoids a realloc when the
     /// final size is known.
     pub fn with_capacity(cap: usize) -> Self {
-        Self { buf: Vec::with_capacity(cap) }
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
     }
 
     /// Current offset in bytes (useful for debugging alignment bugs).

@@ -7,6 +7,7 @@
 use hipfire_arch_lfm2moe::config::Lfm2MoeConfig;
 use hipfire_arch_lfm2moe::forward::{decode_step, decode_step_prefill};
 use hipfire_arch_lfm2moe::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
+use hipfire_arch_lfm2moe::redline_plan::{DecodeExecutionMode, RetainedFixtureEvidence};
 use hipfire_runtime::hfq::HfqFile;
 use std::path::PathBuf;
 
@@ -23,9 +24,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let tokens: Vec<u32> = (0..N_TOKENS)
-        .map(|i| 10 + (i % 1000) as u32)
-        .collect();
+    let tokens: Vec<u32> = (0..N_TOKENS).map(|i| 10 + (i % 1000) as u32).collect();
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     let mut hfq = HfqFile::open(&model).expect("open model");
@@ -45,6 +44,8 @@ fn main() {
             &mut gpu,
             token,
             position as u32,
+            RetainedFixtureEvidence::ABSENT,
+            DecodeExecutionMode::Prefill,
         )
         .expect("eager decode_step");
     }
@@ -77,6 +78,8 @@ fn main() {
         &mut gpu,
         tokens[last_position],
         last_position as u32,
+        RetainedFixtureEvidence::ABSENT,
+        DecodeExecutionMode::Prefill,
     )
     .expect("final elided-path decode_step");
     let n_tokens_elided = state_elided.n_tokens;
@@ -149,11 +152,7 @@ fn main() {
     println!("conv_bit_identical={conv_bit_identical}");
     println!("conv_finite={conv_finite}");
 
-    if logits_bit_identical
-        && logits_finite
-        && n_tokens_equal
-        && conv_bit_identical
-        && conv_finite
+    if logits_bit_identical && logits_finite && n_tokens_equal && conv_bit_identical && conv_finite
     {
         println!("PREFILL_HEAD_ELIDE_PARITY_PASS");
     } else {

@@ -25,7 +25,10 @@ fn main() {
     dev.upload(&code_buf, &code).unwrap();
     let code_va = code_buf.gpu_addr; // at offset 0, page-aligned
     eprintln!("code_va=0x{:x} (aligned? {})", code_va, code_va & 0xFF == 0);
-    eprintln!("code bytes: {:02x} {:02x} {:02x} {:02x}", code[0], code[1], code[2], code[3]);
+    eprintln!(
+        "code bytes: {:02x} {:02x} {:02x} {:02x}",
+        code[0], code[1], code[2], code[3]
+    );
 
     // Also prepare a "marker" buffer to verify execution
     let marker_buf = dev.alloc_vram(4096).unwrap();
@@ -232,16 +235,23 @@ fn main() {
         pm4.push(0);
         pm4.push(hdr(0x76, 4));
         pm4.push(0x0207);
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(hdr(0x76, 2));
         pm4.push(0x0215);
         pm4.push(0);
         // USER_DATA: 4 zeros for private segment buffer (USER_SGPR=4)
         pm4.push(hdr(0x76, 5));
         pm4.push(0x0240);
-        pm4.push(0); pm4.push(0); pm4.push(0); pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
         pm4.push(hdr(0x15, 4));
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(1u32); // CS_EN only, wave64
         let ib = dev.alloc_vram(4096).unwrap();
         let ib_bytes: Vec<u8> = pm4.iter().flat_map(|d| d.to_le_bytes()).collect();
@@ -257,12 +267,20 @@ fn main() {
     eprintln!("\nTest E: HSACO noop kernel code from ELF at offset 0x1600");
     {
         // Compile noop kernel
-        let hip_src = "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void noop_kernel() {}\n";
+        let hip_src =
+            "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void noop_kernel() {}\n";
         std::fs::write("/tmp/redline_noop.hip", hip_src).unwrap();
         let out = std::process::Command::new("hipcc")
-            .args(["--genco", "--offload-arch=gfx1010", "-O3",
-                   "-o", "/tmp/redline_noop.hsaco", "/tmp/redline_noop.hip"])
-            .output().expect("hipcc");
+            .args([
+                "--genco",
+                "--offload-arch=gfx1010",
+                "-O3",
+                "-o",
+                "/tmp/redline_noop.hsaco",
+                "/tmp/redline_noop.hip",
+            ])
+            .output()
+            .expect("hipcc");
         assert!(out.status.success(), "hipcc failed");
         let module = redline::hsaco::HsacoModule::from_file("/tmp/redline_noop.hsaco").unwrap();
         let k = &module.kernels[0];
@@ -270,7 +288,11 @@ fn main() {
         let elf_buf = dev.alloc_vram(module.elf.len() as u64).unwrap();
         dev.upload(&elf_buf, &module.elf).unwrap();
         let elf_code_va = elf_buf.gpu_addr + k.code_offset;
-        eprintln!("  elf_code_va=0x{:x} (aligned? {})", elf_code_va, elf_code_va & 0xFF == 0);
+        eprintln!(
+            "  elf_code_va=0x{:x} (aligned? {})",
+            elf_code_va,
+            elf_code_va & 0xFF == 0
+        );
 
         // Verify: dump first 16 bytes of code from the ELF
         let co = k.code_offset as usize;
@@ -297,15 +319,22 @@ fn main() {
         pm4.push(0);
         pm4.push(hdr(0x76, 4));
         pm4.push(0x0207);
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(hdr(0x76, 2));
         pm4.push(0x0215);
         pm4.push(0);
         pm4.push(hdr(0x76, 5));
         pm4.push(0x0240);
-        pm4.push(0); pm4.push(0); pm4.push(0); pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
         pm4.push(hdr(0x15, 4));
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(1u32);
 
         let ib = dev.alloc_vram(4096).unwrap();
@@ -328,7 +357,11 @@ fn main() {
         let fbuf = dev.alloc_vram(custom_buf.len() as u64).unwrap();
         dev.upload(&fbuf, &custom_buf).unwrap();
         let fcode_va = fbuf.gpu_addr + 0x1600;
-        eprintln!("  fcode_va=0x{:x} (aligned? {})", fcode_va, fcode_va & 0xFF == 0);
+        eprintln!(
+            "  fcode_va=0x{:x} (aligned? {})",
+            fcode_va,
+            fcode_va & 0xFF == 0
+        );
 
         let mut pm4: Vec<u32> = Vec::new();
         pm4.push(hdr(0x76, 3));
@@ -347,15 +380,22 @@ fn main() {
         pm4.push(0);
         pm4.push(hdr(0x76, 4));
         pm4.push(0x0207);
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(hdr(0x76, 2));
         pm4.push(0x0215);
         pm4.push(0);
         pm4.push(hdr(0x76, 5));
         pm4.push(0x0240);
-        pm4.push(0); pm4.push(0); pm4.push(0); pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
         pm4.push(hdr(0x15, 4));
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(1u32);
 
         let ib = dev.alloc_vram(4096).unwrap();
@@ -371,26 +411,49 @@ fn main() {
     // === Test G: HSACO noop kernel (same as poc_dispatch_noop, but in this process) ===
     eprintln!("\nTest G: HSACO noop kernel from ELF (full dispatch)");
     {
-        let hip_src = "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void noop_kernel() {}\n";
+        let hip_src =
+            "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void noop_kernel() {}\n";
         std::fs::write("/tmp/redline_noop.hip", hip_src).unwrap();
         let out = std::process::Command::new("hipcc")
-            .args(["--genco", "--offload-arch=gfx1010", "-O3",
-                   "-o", "/tmp/redline_noop.hsaco", "/tmp/redline_noop.hip"])
-            .output().expect("hipcc");
+            .args([
+                "--genco",
+                "--offload-arch=gfx1010",
+                "-O3",
+                "-o",
+                "/tmp/redline_noop.hsaco",
+                "/tmp/redline_noop.hip",
+            ])
+            .output()
+            .expect("hipcc");
         assert!(out.status.success());
         let module = redline::hsaco::HsacoModule::from_file("/tmp/redline_noop.hsaco").unwrap();
         let k = &module.kernels[0];
-        eprintln!("  kernel: {} rsrc1=0x{:08x} rsrc2=0x{:08x}", k.name, k.pgm_rsrc1, k.pgm_rsrc2);
-        eprintln!("  kd_offset=0x{:x} code_offset=0x{:x}", k.kd_offset, k.code_offset);
+        eprintln!(
+            "  kernel: {} rsrc1=0x{:08x} rsrc2=0x{:08x}",
+            k.name, k.pgm_rsrc1, k.pgm_rsrc2
+        );
+        eprintln!(
+            "  kd_offset=0x{:x} code_offset=0x{:x}",
+            k.kd_offset, k.code_offset
+        );
         eprintln!("  elf size={} bytes", module.elf.len());
 
         // Verify code bytes
         let co = k.code_offset as usize;
         if co + 4 <= module.elf.len() {
-            let instr = u32::from_le_bytes([module.elf[co], module.elf[co+1], module.elf[co+2], module.elf[co+3]]);
+            let instr = u32::from_le_bytes([
+                module.elf[co],
+                module.elf[co + 1],
+                module.elf[co + 2],
+                module.elf[co + 3],
+            ]);
             eprintln!("  code[0] = 0x{:08x} (expect 0xBF810000 = s_endpgm)", instr);
         } else {
-            eprintln!("  ERROR: code_offset 0x{:x} past ELF end 0x{:x}", co, module.elf.len());
+            eprintln!(
+                "  ERROR: code_offset 0x{:x} past ELF end 0x{:x}",
+                co,
+                module.elf.len()
+            );
         }
 
         let elf_buf = dev.alloc_vram(module.elf.len() as u64).unwrap();
@@ -416,20 +479,33 @@ fn main() {
         pm4.push(0);
         pm4.push(hdr(0x76, 4));
         pm4.push(0x0207);
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(hdr(0x76, 2));
         pm4.push(0x0215);
         pm4.push(0);
         pm4.push(hdr(0x76, 5));
         pm4.push(0x0240);
-        pm4.push(0); pm4.push(0); pm4.push(0); pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
         pm4.push(hdr(0x15, 4));
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(1u32); // CS_EN only, same as Test D
 
         // Print PM4 for comparison
-        eprintln!("  PM4 ({} dwords): {:08x} {:08x} {:08x} {:08x} ...",
-            pm4.len(), pm4[0], pm4[1], pm4[2], pm4[3]);
+        eprintln!(
+            "  PM4 ({} dwords): {:08x} {:08x} {:08x} {:08x} ...",
+            pm4.len(),
+            pm4[0],
+            pm4[1],
+            pm4[2],
+            pm4[3]
+        );
 
         let ib = dev.alloc_vram(4096).unwrap();
         let ib_bytes: Vec<u8> = pm4.iter().flat_map(|d| d.to_le_bytes()).collect();
@@ -452,13 +528,24 @@ fn main() {
         let mut clean = vec![0u8; 4096];
         let text_bytes = &module.elf[co..std::cmp::min(co + 256, module.elf.len())];
         clean[co..co + text_bytes.len()].copy_from_slice(text_bytes);
-        eprintln!("  Copied {} bytes to offset 0x{:x} in clean buffer", text_bytes.len(), co);
-        eprintln!("  code[0] = 0x{:08x}", u32::from_le_bytes([clean[co], clean[co+1], clean[co+2], clean[co+3]]));
+        eprintln!(
+            "  Copied {} bytes to offset 0x{:x} in clean buffer",
+            text_bytes.len(),
+            co
+        );
+        eprintln!(
+            "  code[0] = 0x{:08x}",
+            u32::from_le_bytes([clean[co], clean[co + 1], clean[co + 2], clean[co + 3]])
+        );
 
         let hbuf = dev.alloc_vram(4096).unwrap();
         dev.upload(&hbuf, &clean).unwrap();
         let hcode_va = hbuf.gpu_addr + co as u64;
-        eprintln!("  hcode_va=0x{:x} (aligned? {})", hcode_va, hcode_va & 0xFF == 0);
+        eprintln!(
+            "  hcode_va=0x{:x} (aligned? {})",
+            hcode_va,
+            hcode_va & 0xFF == 0
+        );
 
         let mut pm4: Vec<u32> = Vec::new();
         pm4.push(hdr(0x76, 3));
@@ -477,15 +564,22 @@ fn main() {
         pm4.push(0);
         pm4.push(hdr(0x76, 4));
         pm4.push(0x0207);
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(hdr(0x76, 2));
         pm4.push(0x0215);
         pm4.push(0);
         pm4.push(hdr(0x76, 5));
         pm4.push(0x0240);
-        pm4.push(0); pm4.push(0); pm4.push(0); pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
+        pm4.push(0);
         pm4.push(hdr(0x15, 4));
-        pm4.push(1); pm4.push(1); pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
+        pm4.push(1);
         pm4.push(1u32);
 
         let ib = dev.alloc_vram(4096).unwrap();

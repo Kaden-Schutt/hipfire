@@ -83,27 +83,71 @@ const PREFILL_COMPRESSION: &[&str] = &["off", "auto", "always"];
 /// The set of fields the TUI Settings tab can edit. Order is the display order
 /// in the editable-settings table.
 pub const EDITABLE_FIELDS: &[FieldSpec] = &[
-    FieldSpec { key: "kv_cache", kind: FieldKind::Enum(KV_CACHE) },
-    FieldSpec { key: "kv_adaptive", kind: FieldKind::Enum(KV_ADAPTIVE) },
-    FieldSpec { key: "mtp_mode", kind: FieldKind::Enum(MTP_MODE) },
-    FieldSpec { key: "dflash_mode", kind: FieldKind::Enum(DFLASH_MODE) },
-    FieldSpec { key: "thinking", kind: FieldKind::Enum(THINKING) },
-    FieldSpec { key: "thinking_budget", kind: FieldKind::Enum(THINKING_BUDGET) },
+    FieldSpec {
+        key: "kv_cache",
+        kind: FieldKind::Enum(KV_CACHE),
+    },
+    FieldSpec {
+        key: "kv_adaptive",
+        kind: FieldKind::Enum(KV_ADAPTIVE),
+    },
+    FieldSpec {
+        key: "mtp_mode",
+        kind: FieldKind::Enum(MTP_MODE),
+    },
+    FieldSpec {
+        key: "dflash_mode",
+        kind: FieldKind::Enum(DFLASH_MODE),
+    },
+    FieldSpec {
+        key: "thinking",
+        kind: FieldKind::Enum(THINKING),
+    },
+    FieldSpec {
+        key: "thinking_budget",
+        kind: FieldKind::Enum(THINKING_BUDGET),
+    },
     FieldSpec {
         key: "chat_template",
-        kind: FieldKind::FreeStr { require_existing_file: true },
+        kind: FieldKind::FreeStr {
+            require_existing_file: true,
+        },
     },
-    FieldSpec { key: "temperature", kind: FieldKind::Float { min: 0.0, max: 2.0 } },
+    FieldSpec {
+        key: "temperature",
+        kind: FieldKind::Float { min: 0.0, max: 2.0 },
+    },
     // top_p in bun is `> 0 && <= 1`; we approximate the open lower bound below
     // in `validate` (strict >0) — the spec's min is informational.
-    FieldSpec { key: "top_p", kind: FieldKind::Float { min: 0.0, max: 1.0 } },
-    FieldSpec { key: "max_tokens", kind: FieldKind::Int { min: 1, max: 131072 } },
+    FieldSpec {
+        key: "top_p",
+        kind: FieldKind::Float { min: 0.0, max: 1.0 },
+    },
+    FieldSpec {
+        key: "max_tokens",
+        kind: FieldKind::Int {
+            min: 1,
+            max: 131072,
+        },
+    },
     // KV cache capacity (tokens). Mirrors bun validateConfigValue `max_seq`:
     // int 512..=524288 (cli/index.ts:362). Backs the Easy "Context" row.
-    FieldSpec { key: "max_seq", kind: FieldKind::Int { min: 512, max: 524288 } },
+    FieldSpec {
+        key: "max_seq",
+        kind: FieldKind::Int {
+            min: 512,
+            max: 524288,
+        },
+    },
     // Extra fields surfaced read/write so the TUI matches the bun schema.
-    FieldSpec { key: "flash_mode", kind: FieldKind::Enum(FLASH_MODE) },
-    FieldSpec { key: "mmq_screen", kind: FieldKind::Enum(MMQ_SCREEN) },
+    FieldSpec {
+        key: "flash_mode",
+        kind: FieldKind::Enum(FLASH_MODE),
+    },
+    FieldSpec {
+        key: "mmq_screen",
+        kind: FieldKind::Enum(MMQ_SCREEN),
+    },
     FieldSpec {
         key: "prefill_compression",
         kind: FieldKind::Enum(PREFILL_COMPRESSION),
@@ -112,16 +156,39 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     // no existence check; "" disables). Required for compression to engage.
     FieldSpec {
         key: "prefill_drafter",
-        kind: FieldKind::FreeStr { require_existing_file: false },
+        kind: FieldKind::FreeStr {
+            require_existing_file: false,
+        },
     },
     // pflash auto-mode token cutoff. Mirrors bun int 0..=524288 (default 32768).
-    FieldSpec { key: "prefill_threshold", kind: FieldKind::Int { min: 0, max: 524288 } },
-    FieldSpec { key: "mtp_k", kind: FieldKind::Int { min: 1, max: 10 } },
+    FieldSpec {
+        key: "prefill_threshold",
+        kind: FieldKind::Int {
+            min: 0,
+            max: 524288,
+        },
+    },
+    FieldSpec {
+        key: "mtp_k",
+        kind: FieldKind::Int { min: 1, max: 10 },
+    },
     // Bool fields (cycled true/false via Left/Right/Space).
-    FieldSpec { key: "dflash_adaptive_b", kind: FieldKind::Bool },
-    FieldSpec { key: "cask", kind: FieldKind::Bool },
-    FieldSpec { key: "prompt_normalize", kind: FieldKind::Bool },
-    FieldSpec { key: "default_chatml", kind: FieldKind::Bool },
+    FieldSpec {
+        key: "dflash_adaptive_b",
+        kind: FieldKind::Bool,
+    },
+    FieldSpec {
+        key: "cask",
+        kind: FieldKind::Bool,
+    },
+    FieldSpec {
+        key: "prompt_normalize",
+        kind: FieldKind::Bool,
+    },
+    FieldSpec {
+        key: "default_chatml",
+        kind: FieldKind::Bool,
+    },
 ];
 
 /// Look up the spec for a key, if it is editable.
@@ -270,8 +337,8 @@ fn write_object(path: &Path, obj: &serde_json::Map<String, Value>) -> Result<(),
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| WriteError::Io(e.to_string()))?;
     }
-    let mut body =
-        serde_json::to_string_pretty(&Value::Object(obj.clone())).map_err(|e| WriteError::Io(e.to_string()))?;
+    let mut body = serde_json::to_string_pretty(&Value::Object(obj.clone()))
+        .map_err(|e| WriteError::Io(e.to_string()))?;
     body.push('\n');
 
     let tmp = tmp_path(path);
@@ -537,10 +604,7 @@ mod tests {
             "concurrent different-key write must survive the merge"
         );
         // And the original key is still intact.
-        assert_eq!(
-            obj.get("kv_cache").unwrap(),
-            &Value::String("auto".into())
-        );
+        assert_eq!(obj.get("kv_cache").unwrap(), &Value::String("auto".into()));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -580,8 +644,17 @@ mod tests {
         let dir = temp_dir();
         let cfg = dir.join("config.json");
         fs::write(&cfg, "{}\n").unwrap();
-        for m in ["off", "conservative", "balanced", "aggressive", "advanced:k=fwht3,v=lloyd3"] {
-            assert!(write_value(&cfg, "kv_adaptive", m).is_ok(), "{m} should validate");
+        for m in [
+            "off",
+            "conservative",
+            "balanced",
+            "aggressive",
+            "advanced:k=fwht3,v=lloyd3",
+        ] {
+            assert!(
+                write_value(&cfg, "kv_adaptive", m).is_ok(),
+                "{m} should validate"
+            );
         }
         // A garbage value is still rejected.
         assert!(write_value(&cfg, "kv_adaptive", "advanced:k=zzz").is_err());
@@ -591,7 +664,10 @@ mod tests {
             cycle_enum("kv_adaptive", "advanced:k=fwht4,v=lloyd4", true).unwrap(),
             "advanced:k=fwht4,v=lloyd3"
         );
-        assert_eq!(cycle_enum("kv_adaptive", "off", true).unwrap(), "conservative");
+        assert_eq!(
+            cycle_enum("kv_adaptive", "off", true).unwrap(),
+            "conservative"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -612,7 +688,10 @@ mod tests {
         assert!(write_value(&cfg, "prefill_threshold", "524289").is_err());
         assert!(write_value(&cfg, "prefill_threshold", "-1").is_err());
         // Compression enum unchanged.
-        assert_eq!(cycle_enum("prefill_compression", "off", true).unwrap(), "auto");
+        assert_eq!(
+            cycle_enum("prefill_compression", "off", true).unwrap(),
+            "auto"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -651,7 +730,10 @@ mod tests {
         let removed = delete_key(&cfg, "kv_cache").expect("noop ok");
         assert!(!removed, "absent key reports removed=false");
         // File content is byte-for-byte unchanged.
-        assert_eq!(fs::read_to_string(&cfg).unwrap(), "{\n  \"thinking\": \"off\"\n}\n");
+        assert_eq!(
+            fs::read_to_string(&cfg).unwrap(),
+            "{\n  \"thinking\": \"off\"\n}\n"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -662,7 +744,10 @@ mod tests {
         let dir = temp_dir();
         let cfg = dir.join("config.json");
         fs::write(&cfg, "{ not json").unwrap();
-        assert!(matches!(delete_key(&cfg, "kv_cache"), Err(WriteError::Parse(_))));
+        assert!(matches!(
+            delete_key(&cfg, "kv_cache"),
+            Err(WriteError::Parse(_))
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -671,10 +756,18 @@ mod tests {
         // 5a reset-all: everything reverts to defaults -> config.json = {}.
         let dir = temp_dir();
         let cfg = dir.join("config.json");
-        fs::write(&cfg, "{\n  \"kv_cache\": \"q8\",\n  \"dflash_mode\": \"auto\"\n}\n").unwrap();
+        fs::write(
+            &cfg,
+            "{\n  \"kv_cache\": \"q8\",\n  \"dflash_mode\": \"auto\"\n}\n",
+        )
+        .unwrap();
         reset_all(&cfg).expect("reset all ok");
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(parsed, serde_json::json!({}), "reset-all writes an empty object");
+        assert_eq!(
+            parsed,
+            serde_json::json!({}),
+            "reset-all writes an empty object"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

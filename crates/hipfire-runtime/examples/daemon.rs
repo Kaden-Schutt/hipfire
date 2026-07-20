@@ -30,6 +30,7 @@ use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
+use lfm2moe::redline_plan::DecodeExecutionMode;
 // Used by generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
 // it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
 use hipfire_arch_qwen35::Qwen35Bundle;
@@ -401,6 +402,263 @@ fn redline_prime_qwen(
         .map_err(|error| error.to_string())
 }
 
+fn redline_lfm_snapshot_json(
+    snapshot: &lfm2moe::spec_impl::Lfm2MoeRedlineSnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "logits_bytes": snapshot.logits.len(),
+        "logits_hash": format!("{:016x}", redline_hash(&snapshot.logits)),
+        "kv_bytes": snapshot.kv.len(),
+        "kv_hash": format!("{:016x}", redline_hash(&snapshot.kv)),
+        "recurrent_bytes": snapshot.recurrent.len(),
+        "recurrent_hash": format!("{:016x}", redline_hash(&snapshot.recurrent)),
+        "h_hash": format!("{:016x}", redline_hash(&snapshot.h)),
+        "tmp_hash": format!("{:016x}", redline_hash(&snapshot.tmp)),
+        "conv_bcx_hash": format!("{:016x}", redline_hash(&snapshot.conv_bcx)),
+        "ffn_x_rot_hash": format!("{:016x}", redline_hash(&snapshot.ffn_x_rot)),
+        "n_tokens": snapshot.n_tokens,
+        "compact_offset": snapshot.compact_offset,
+    })
+}
+
+fn redline_shadow_lfm(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut lfm2moe::Lfm2MoeBundle,
+    context: usize,
+    iterations: usize,
+    pm4: bool,
+    prepared: (usize, usize, u64, Option<u32>),
+) -> Result<serde_json::Value, String> {
+    if context
+        .checked_add(iterations)
+        .is_none_or(|end| end > bundle.max_seq())
+    {
+        return Err(format!(
+            "redline LFM shadow context {context} + iterations {iterations} exceeds max_seq {}",
+            bundle.max_seq()
+        ));
+    }
+
+    let (aql_snapshot, aql_host_us, aql_gpu_us) = {
+        bundle.redline_reset_state(gpu)?;
+        bundle.redline_prime(gpu, context)?;
+        let started = Instant::now();
+        let mut gpu_us = 0.0;
+        for i in 0..iterations {
+            let position = context + i;
+            bundle.redline_prepare_decode_inputs(gpu, 101 + i as u32, position as u32)?;
+            if pm4 {
+                let timing = unsafe { gpu.replay.replay_pm4(position) }?;
+                gpu_us += timing.span_microseconds();
+            } else {
+                let timing = unsafe { gpu.replay.replay_linear_aql(position) }?;
+                gpu_us += timing.span_microseconds();
+            }
+            bundle.redline_commit_replayed_position(position as u32)?;
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        (
+            bundle.redline_snapshot(gpu)?,
+            started.elapsed().as_secs_f64() * 1_000_000.0,
+            gpu_us,
+        )
+    };
+
+    let blob_snapshot = {
+        bundle.redline_reset_state(gpu)?;
+        bundle.redline_prime(gpu, context)?;
+        for i in 0..iterations {
+            let position = context + i;
+            bundle.redline_prepare_decode_inputs(gpu, 101 + i as u32, position as u32)?;
+            gpu.replay_recorded_hip_prefix(prepared.0)
+                .map_err(|error| error.to_string())?;
+            bundle.redline_commit_replayed_position(position as u32)?;
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        bundle.redline_snapshot(gpu)?
+    };
+
+    let (hip_snapshot, hip_host_us) = {
+        bundle.redline_reset_state(gpu)?;
+        bundle.redline_prime(gpu, context)?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        let started = Instant::now();
+        for i in 0..iterations {
+            let position = context + i;
+            bundle.redline_prepare_decode_inputs(gpu, 101 + i as u32, position as u32)?;
+            bundle.redline_run_prepared_hip(gpu, position as u32)?;
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        (
+            bundle.redline_snapshot(gpu)?,
+            started.elapsed().as_secs_f64() * 1_000_000.0,
+        )
+    };
+
+    let logits_equal = aql_snapshot.logits == hip_snapshot.logits;
+    let kv_equal = aql_snapshot.kv == hip_snapshot.kv;
+    let recurrent_equal = aql_snapshot.recurrent == hip_snapshot.recurrent;
+    let scratch_equal = aql_snapshot.h == hip_snapshot.h
+        && aql_snapshot.tmp == hip_snapshot.tmp
+        && aql_snapshot.conv_bcx == hip_snapshot.conv_bcx
+        && aql_snapshot.ffn_x_rot == hip_snapshot.ffn_x_rot;
+    let cursor_equal = aql_snapshot.n_tokens == hip_snapshot.n_tokens
+        && aql_snapshot.compact_offset == hip_snapshot.compact_offset;
+    let bit_exact = logits_equal && kv_equal && recurrent_equal && scratch_equal && cursor_equal;
+    let blob_bit_exact = aql_snapshot == blob_snapshot;
+    Ok(serde_json::json!({
+        "type": "redline_shadow_result",
+        "arch": "lfm2moe",
+        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+        "context_tokens": context,
+        "iterations": iterations,
+        "dispatches": prepared.0,
+        "packets": prepared.1,
+        "queue_id": prepared.2,
+        "command_dwords": prepared.3,
+        "bit_exact": bit_exact,
+        "blob_bit_exact": blob_bit_exact,
+        "logits_equal": logits_equal,
+        "kv_equal": kv_equal,
+        "recurrent_equal": recurrent_equal,
+        "scratch_equal": scratch_equal,
+        "cursor_equal": cursor_equal,
+        "aql_host_us": aql_host_us,
+        "aql_gpu_us": aql_gpu_us,
+        "hip_host_us": hip_host_us,
+        "aql": redline_lfm_snapshot_json(&aql_snapshot),
+        "hip": redline_lfm_snapshot_json(&hip_snapshot),
+        "blob": redline_lfm_snapshot_json(&blob_snapshot),
+    }))
+}
+
+fn redline_prefix_shadow_lfm(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut lfm2moe::Lfm2MoeBundle,
+    context: usize,
+    prefix: usize,
+    pm4: bool,
+    prepared: (usize, usize, u64, Option<u32>),
+) -> Result<serde_json::Value, String> {
+    if context >= bundle.max_seq() {
+        return Err(format!(
+            "redline LFM prefix context {context} exceeds max_seq {}",
+            bundle.max_seq()
+        ));
+    }
+
+    let (initial, retained, retained_host_us) = {
+        bundle.redline_reset_state(gpu)?;
+        bundle.redline_prime(gpu, context)?;
+        bundle.redline_prepare_decode_inputs(gpu, 101, context as u32)?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        let initial = bundle.redline_snapshot(gpu)?;
+        let started = Instant::now();
+        if pm4 {
+            unsafe { gpu.replay.replay_pm4(context) }?;
+        } else {
+            unsafe { gpu.replay.replay_linear_aql(context) }?;
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        (
+            initial,
+            bundle.redline_snapshot(gpu)?,
+            started.elapsed().as_secs_f64() * 1_000_000.0,
+        )
+    };
+
+    let (hip, hip_host_us) = {
+        bundle.redline_reset_state(gpu)?;
+        bundle.redline_prime(gpu, context)?;
+        bundle.redline_prepare_decode_inputs(gpu, 101, context as u32)?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        let started = Instant::now();
+        gpu.replay_recorded_hip_prefix(prefix)
+            .map_err(|error| error.to_string())?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        (
+            bundle.redline_snapshot(gpu)?,
+            started.elapsed().as_secs_f64() * 1_000_000.0,
+        )
+    };
+
+    let logits_equal = retained.logits == hip.logits;
+    let kv_equal = retained.kv == hip.kv;
+    let recurrent_equal = retained.recurrent == hip.recurrent;
+    let scratch_equal = retained.h == hip.h
+        && retained.tmp == hip.tmp
+        && retained.conv_bcx == hip.conv_bcx
+        && retained.ffn_x_rot == hip.ffn_x_rot;
+    let recurrent_first_difference = retained
+        .recurrent
+        .iter()
+        .zip(&hip.recurrent)
+        .enumerate()
+        .find(|(_, (retained, hip))| retained != hip)
+        .map(|(byte, (retained, hip))| {
+            serde_json::json!({
+                "byte": byte,
+                "initial": initial.recurrent[byte],
+                "retained": retained,
+                "hip": hip,
+            })
+        });
+    let cursor_equal =
+        retained.n_tokens == hip.n_tokens && retained.compact_offset == hip.compact_offset;
+    let equal = logits_equal && kv_equal && recurrent_equal && scratch_equal && cursor_equal;
+    let differing = [
+        (!logits_equal).then_some("logits"),
+        (!kv_equal).then_some("kv"),
+        (!recurrent_equal).then_some("recurrent"),
+        (!scratch_equal).then_some("scratch"),
+        (!cursor_equal).then_some("cursor"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "type": "redline_prefix_shadow",
+        "arch": "lfm2moe",
+        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+        "context_tokens": context,
+        "prefix": prefix,
+        "dispatches": prepared.0,
+        "packets": prepared.1,
+        "queue_id": prepared.2,
+        "command_dwords": prepared.3,
+        "bit_exact": equal,
+        "equal": equal,
+        "differing": differing,
+        "logits_equal": logits_equal,
+        "kv_equal": kv_equal,
+        "recurrent_equal": recurrent_equal,
+        "scratch_equal": scratch_equal,
+        "recurrent_first_difference": recurrent_first_difference,
+        "cursor_equal": cursor_equal,
+        "retained_host_us": retained_host_us,
+        "hip_host_us": hip_host_us,
+        "initial": redline_lfm_snapshot_json(&initial),
+        "retained": redline_lfm_snapshot_json(&retained),
+        "hip": redline_lfm_snapshot_json(&hip),
+    }))
+}
+
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
 ///
 /// On Unix: flock(2) is the kernel-level lock. The kernel releases it
@@ -700,7 +958,11 @@ fn emit_error_with_id(stdout: &mut std::io::Stdout, id: &str, message: impl std:
 }
 
 fn emit_gen_start(stdout: &mut std::io::Stdout, id: &str, started_in_think: bool) {
-    let _ = writeln!(stdout, r#"{{"type":"gen_start","id":"{}","started_in_think":{}}}"#, id, started_in_think);
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"gen_start","id":"{}","started_in_think":{}}}"#,
+        id, started_in_think
+    );
     let _ = stdout.flush();
 }
 
@@ -1703,12 +1965,36 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let redline_default = hipfire_runtime::config::gfx12_mq4r_redline_default(
-                            &gpu.arch, path, m.arch_id, pp, tp,
-                        );
-                        if gpu.replay.configure_model_default(redline_default) && redline_default {
+                        let qwen_redline_default =
+                            hipfire_runtime::config::gfx12_mq4r_redline_default(
+                                &gpu.arch, path, m.arch_id, pp, tp,
+                            );
+                        let lfm2_redline_default = match m.state.as_ref() {
+                            Some(ModelState::Lfm2Moe(bundle)) => {
+                                hipfire_runtime::config::lfm2_gfx1201_redline_default(
+                                    &gpu.arch,
+                                    m.arch_id,
+                                    bundle.retained_fixture_evidence(),
+                                    max_seq,
+                                    pp,
+                                    tp,
+                                    m.speculator.is_none(),
+                                )
+                            }
+                            _ => false,
+                        };
+                        let configured_redline_default = gpu
+                            .replay
+                            .configure_model_default(qwen_redline_default || lfm2_redline_default);
+                        if configured_redline_default && qwen_redline_default {
                             eprintln!(
                                 "[redline] enabling fail-closed gfx12 MQ4R default (transport={})",
+                                gpu.replay.transport_name()
+                            );
+                        }
+                        if configured_redline_default && lfm2_redline_default {
+                            eprintln!(
+                                "[redline] enabling fail-closed exact gfx1201 LFM2.5-350M default from verified fixture evidence (transport={})",
                                 gpu.replay.transport_name()
                             );
                         }
@@ -1730,6 +2016,7 @@ fn main() {
                                 b.config.num_hidden_layers,
                                 b.config.vocab_size,
                             ),
+                            Some(ModelState::Lfm2Moe(b)) => b.model_dimensions(),
                             _ => {
                                 if let Some(ref c) = m.dots_ocr_config {
                                     (
@@ -1817,11 +2104,13 @@ fn main() {
                         // must stay stateless until that route is lowered too.
                         let cache_capable = match m.arch_id {
                             5 | 6 | 9 | 10 | 12 => true,
-                            11 => m.speculator.is_none()
-                                && lfm2moe::lfm_cache_capable_advertised(
-                                    m.eviction.is_none(),
-                                    m.chat_template.is_some(),
-                                ),
+                            11 => {
+                                m.speculator.is_none()
+                                    && lfm2moe::lfm_cache_capable_advertised(
+                                        m.eviction.is_none(),
+                                        m.chat_template.is_some(),
+                                    )
+                            }
                             _ => false,
                         };
                         let _ = writeln!(
@@ -2314,8 +2603,12 @@ fn main() {
                     Some(true) => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
                     Some(false) => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
                     None => match wire_prefix {
-                        Some("open_think") => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
-                        Some("closed_think") => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
+                        Some("open_think") => {
+                            hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                        }
+                        Some("closed_think") => {
+                            hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
+                        }
                         _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
                     },
                 };
@@ -2632,7 +2925,7 @@ fn main() {
                     // rationale as the qwen2/deepseek4 resets above — without
                     // it, prior-turn KV/conv residue leaks into the new turn.
                     if let Some(b) = m.lfm2moe_mut() {
-                        if let Err(e) = b.state.reset(&mut gpu) {
+                        if let Err(e) = b.reset(&mut gpu) {
                             m.seq_pos = 0;
                             m.conversation_tokens.clear();
                             let _ = writeln!(
@@ -2845,11 +3138,10 @@ fn main() {
                 // behavior unchanged.
                 let use_lfm2_batched = m.arch_id == 11
                     && gpu.arch_caps.is_gfx1201()
-                    && std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref()
-                        == Some("1");
+                    && std::env::var("HIPFIRE_LFM2_PREFILL_BATCH").ok().as_deref() == Some("1");
                 if use_lfm2_batched {
                     if let Some(b) = m.lfm2moe_mut() {
-                        let _ = b.state.reset(&mut gpu);
+                        let _ = b.reset(&mut gpu);
                     }
                 }
 
@@ -2923,9 +3215,6 @@ fn main() {
                     // the core (§8) — the daemon does not inspect weights. No
                     // post-selection fallback: a batched error fails the run.
                     let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let state = &mut b.state;
                     if use_lfm2_batched {
                         // State was reset above, so start_pos=0 satisfies the
                         // core's start_pos == n_tokens admission check.
@@ -2933,9 +3222,7 @@ fn main() {
                             "[daemon] bench_prefill lfm2moe: batched gfx1201 path, tokens={}",
                             synthetic.len()
                         );
-                        match lfm2moe::forward::forward_prefill_batch(
-                            config, weights, state, &mut gpu, &synthetic, 0,
-                        ) {
+                        match b.forward_prefill_batch(&mut gpu, &synthetic, 0) {
                             Ok(_) => true,
                             Err(e) => {
                                 eprintln!(
@@ -2957,14 +3244,10 @@ fn main() {
                             // tokens skip the lm_head + full-vocab logits D2H, matching
                             // the production generate_lfm2moe prefill shape.
                             let r = if gfx1201 && i != last_idx {
-                                lfm2moe::forward::decode_step_prefill(
-                                    config, weights, state, &mut gpu, tok, i as u32,
-                                )
+                                b.decode_step_prefill(&mut gpu, tok, i as u32)
                             } else {
-                                lfm2moe::forward::decode_step(
-                                    config, weights, state, &mut gpu, tok, i as u32,
-                                )
-                                .map(|_| ())
+                                b.decode_step(&mut gpu, tok, i as u32, DecodeExecutionMode::Prefill)
+                                    .map(|_| ())
                             };
                             if r.is_err() {
                                 ok = false;
@@ -3023,7 +3306,9 @@ fn main() {
                     let weights = m.dots_ocr_weights.as_ref().unwrap();
                     let mut ok = true;
                     for &tok in &synthetic {
-                        if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok).is_err() {
+                        if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok)
+                            .is_err()
+                        {
                             ok = false;
                             break;
                         }
@@ -3063,7 +3348,7 @@ fn main() {
                 // LFM2.5-MoE state carries its own KV + conv-state cache;
                 // reset cursors (takes gpu) so the next request starts cold.
                 if let Some(b) = m.lfm2moe_mut() {
-                    let _ = b.state.reset(&mut gpu);
+                    let _ = b.reset(&mut gpu);
                 }
                 // MiniMax-M2 (arch_id=10): KV cache + scratch share MiniMaxState;
                 // reset its cursor (no gpu) for a cold prefill on the next request.
@@ -3132,10 +3417,23 @@ fn main() {
                     .get("redline_capture")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let product_route = msg
+                    .get("redline_product_route")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let capture_detail = msg
                     .get("redline_detail")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if capture && product_route {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        r#"{"type":"error","message":"redline_capture and redline_product_route are mutually exclusive"}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if context == 0 || iterations == 0 {
                     let _ = writeln!(
                         stdout,
@@ -3169,7 +3467,7 @@ fn main() {
                     // them so the prime writes from slot 0 (mirrors the
                     // bench_prefill arch-11 arm and the chat reset handler).
                     if let Some(b) = m.lfm2moe_mut() {
-                        let _ = b.state.reset(&mut gpu);
+                        let _ = b.reset(&mut gpu);
                     }
                 }
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
@@ -3178,15 +3476,10 @@ fn main() {
                     // prefill shape IS the eager per-token decode_step (see
                     // the bench_prefill arch-11 arm), so prime with it.
                     let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let state = &mut b.state;
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
-                        if lfm2moe::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
+                        if b.decode_step(&mut gpu, tok, i as u32, DecodeExecutionMode::Prefill)
+                            .is_err()
                         {
                             ok = false;
                             break;
@@ -3240,23 +3533,29 @@ fn main() {
                     }
                 }
 
+                if product_route {
+                    gpu.replay.begin_replay_observation_window();
+                }
+                let replay_before = gpu.replay.replay_observation();
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let run_ok = if m.arch_id == 11 {
                     let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let state = &mut b.state;
                     let mut ok = true;
                     for i in 0..iterations {
                         let token = 101 + (i as u32 % 1000);
-                        if lfm2moe::forward::decode_step(
-                            config,
-                            weights,
-                            state,
+                        if b.decode_step_device(
                             &mut gpu,
                             token,
                             (context + i) as u32,
+                            if capture || product_route {
+                                DecodeExecutionMode::PlainAr {
+                                    pipeline_parallel: 1,
+                                    tensor_parallel: 1,
+                                }
+                            } else {
+                                DecodeExecutionMode::Oracle
+                            },
                         )
                         .is_err()
                         {
@@ -3292,6 +3591,7 @@ fn main() {
                 };
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
+                let replay_after = gpu.replay.replay_observation();
                 let capture_summary = if capture {
                     match gpu.replay.finish_capture() {
                         Ok(summary) => Some(summary),
@@ -3316,7 +3616,7 @@ fn main() {
                 m.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
                 if let Some(b) = m.lfm2moe_mut() {
-                    let _ = b.state.reset(&mut gpu);
+                    let _ = b.reset(&mut gpu);
                 }
 
                 if run_ok {
@@ -3332,6 +3632,39 @@ fn main() {
                     if let Some(summary) = capture_summary {
                         response["redline_capture"] =
                             redline_capture_json(&gpu, summary, capture_detail);
+                    }
+                    if product_route {
+                        let prepared = gpu.replay.prepared_route_identity().map(|identity| {
+                            serde_json::json!({
+                                "dispatches": identity.dispatch_count,
+                                "packets": identity.packet_count,
+                                "queue_id": identity.queue_id,
+                                "command_dwords": identity.command_dwords,
+                            })
+                        });
+                        let sequence = gpu.replay.capture_summary();
+                        let replay_delta = replay_after.count.saturating_sub(replay_before.count);
+                        response["redline_route"] = serde_json::json!({
+                            "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
+                            "transport": gpu.replay.transport_name(),
+                            "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
+                            "fallback_reason": gpu.replay.fallback_reason(),
+                            "execution_mode": "plain_ar",
+                            "prepared": prepared,
+                            "sequence": {
+                                "launches": sequence.launch_count,
+                                "unique_kernels": sequence.unique_kernel_count,
+                                "hash": format!("{:016x}", sequence.sequence_hash),
+                            },
+                            "observed": {
+                                "count_before": replay_before.count,
+                                "count_after": replay_after.count,
+                                "count_delta": replay_delta,
+                                "first_position": replay_after.first_position,
+                                "last_position": replay_after.last_position,
+                            },
+                            "retained_replay_observed": replay_delta > 0,
+                        });
                     }
                     let _ = writeln!(stdout, "{response}");
                 } else {
@@ -3398,7 +3731,10 @@ fn main() {
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
-                        && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+                        && matches!(
+                            loaded.state.as_ref(),
+                            Some(ModelState::Qwen35(_) | ModelState::Lfm2Moe(_))
+                        )
                 });
                 if !eligible {
                     let _ = writeln!(
@@ -3406,7 +3742,7 @@ fn main() {
                         "{}",
                         serde_json::json!({
                             "type": "error",
-                            "message": "redline_shadow_aql requires a loaded single-GPU Qwen3.5 model",
+                            "message": "redline shadow requires a loaded single-GPU Qwen3.5 or LFM2.5 model",
                         })
                     );
                     let _ = stdout.flush();
@@ -3436,6 +3772,35 @@ fn main() {
                         continue;
                     }
                 };
+                if matches!(
+                    model.as_ref().and_then(|loaded| loaded.state.as_ref()),
+                    Some(ModelState::Lfm2Moe(_))
+                ) {
+                    let result = {
+                        let loaded = model.as_mut().expect("eligibility checked");
+                        let ModelState::Lfm2Moe(bundle) = loaded.state.as_mut().unwrap() else {
+                            unreachable!()
+                        };
+                        redline_shadow_lfm(&mut gpu, bundle, context, iterations, pm4, prepared)
+                    };
+                    match result {
+                        Ok(value) => {
+                            let _ = writeln!(stdout, "{value}");
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": format!("redline LFM shadow failed: {reason}"),
+                                })
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
 
                 let aql_result = (|| -> Result<(RedlineQwenSnapshot, f64, f64), String> {
@@ -3461,7 +3826,7 @@ fn main() {
                             let timing = unsafe { gpu.replay.replay_pm4(context + i) }?;
                             gpu_us += timing.span_microseconds();
                         } else {
-                            let timing = unsafe { gpu.replay.replay_linear_aql() }?;
+                            let timing = unsafe { gpu.replay.replay_linear_aql(context + i) }?;
                             gpu_us += timing.span_microseconds();
                         }
                     }
@@ -3671,9 +4036,7 @@ fn main() {
                     // resident model/cache state warm. It is timing-only: exact
                     // shadow remains a separate mandatory harness gate.
                     if steady_state {
-                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
-                            frame_checkpoint,
-                        );
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
                         let loaded = model.as_mut().expect("eligibility checked");
                         let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
                             unreachable!()
@@ -3777,7 +4140,10 @@ fn main() {
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
-                        && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+                        && matches!(
+                            loaded.state.as_ref(),
+                            Some(ModelState::Qwen35(_) | ModelState::Lfm2Moe(_))
+                        )
                 });
                 if !eligible {
                     let _ = writeln!(
@@ -3785,7 +4151,7 @@ fn main() {
                         "{}",
                         serde_json::json!({
                             "type": "error",
-                            "message": "redline_prefix_shadow requires single-GPU Qwen3.5",
+                            "message": "redline_prefix_shadow requires single-GPU Qwen3.5 or LFM2.5",
                         })
                     );
                     let _ = stdout.flush();
@@ -3811,6 +4177,35 @@ fn main() {
                         continue;
                     }
                 };
+                if matches!(
+                    model.as_ref().and_then(|loaded| loaded.state.as_ref()),
+                    Some(ModelState::Lfm2Moe(_))
+                ) {
+                    let result = {
+                        let loaded = model.as_mut().expect("eligibility checked");
+                        let ModelState::Lfm2Moe(bundle) = loaded.state.as_mut().unwrap() else {
+                            unreachable!()
+                        };
+                        redline_prefix_shadow_lfm(&mut gpu, bundle, context, prefix, pm4, prepared)
+                    };
+                    match result {
+                        Ok(value) => {
+                            let _ = writeln!(stdout, "{value}");
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": format!("LFM prefix failed: {reason}"),
+                                })
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let aql_hashes = (|| -> Result<_, String> {
                     let loaded = model.as_mut().unwrap();
                     let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
@@ -3835,7 +4230,7 @@ fn main() {
                     if pm4 {
                         unsafe { gpu.replay.replay_pm4(context) }?;
                     } else {
-                        unsafe { gpu.replay.replay_linear_aql() }?;
+                        unsafe { gpu.replay.replay_linear_aql(context) }?;
                     }
                     gpu.hip
                         .device_synchronize()
@@ -5256,6 +5651,7 @@ struct SpecRun {
     decode_s: f64,
 }
 
+
 fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -5410,8 +5806,7 @@ fn generate_dflash(
     // On a HIT we reuse target KV + DeltaNet[0..start_pos] and the draft's
     // cumulative target_hidden, prefilling only the suffix; on a MISS we
     // full-reset and prefill the whole conversation (legacy behaviour).
-    let cache_disabled =
-        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -5433,8 +5828,7 @@ fn generate_dflash(
         && messages_history.is_some()
     {
         let history = messages_history.unwrap();
-        let trace_cache =
-            std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+        let trace_cache = std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
         // Render the canonical full conversation so its LCP vs conversation_tokens
         // is byte-exact. Jinja path mirrors the AR generate() cache (item #37):
         // splice each cached assistant turn's VERBATIM tokens through the trained
@@ -5487,7 +5881,9 @@ fn generate_dflash(
             ) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("[qwen-cache] jinja cached-history build failed dflash ({e}) — cold render");
+                    eprintln!(
+                        "[qwen-cache] jinja cached-history build failed dflash ({e}) — cold render"
+                    );
                     prompt_tokens.clone()
                 }
             }
@@ -5716,8 +6112,8 @@ fn generate_dflash(
         pflash_done_field,
     );
     let _ = stdout.flush();
-    // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
     let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
+    // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
     eprintln!(
         "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({} tok, {} windows)",
         run.generated, run.spec_cycles
@@ -6831,10 +7227,7 @@ fn generate_qwen35_mtp(
             if max_think_tokens > 0 && !think_closed {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(
-                    raw_str,
-                    started_in_think,
-                );
+                let in_think = currently_in_think(raw_str, started_in_think);
                 if in_think && !prev_in_think {
                     think_count = 0;
                 }
@@ -7697,10 +8090,7 @@ fn generate_multi(
         if max_think_tokens > 0 || force_answer_now || force_answer_latched || max_total_think > 0 {
             let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(
-                raw_str,
-                started_in_think,
-            );
+            let in_think = currently_in_think(raw_str, started_in_think);
             if in_think {
                 total_think_tokens += 1;
             }
@@ -7823,10 +8213,7 @@ fn generate_multi(
             alert_fired = true;
             let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(
-                raw_str,
-                started_in_think,
-            );
+            let in_think = currently_in_think(raw_str, started_in_think);
             if !in_think {
                 let _ = writeln!(
                     stdout,
@@ -8340,7 +8727,7 @@ fn generate(
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         if let Some(b) = m.lfm2moe_mut() {
-            if let Err(e) = b.state.reset(gpu) {
+            if let Err(e) = b.reset(gpu) {
                 emit_error_with_id(stdout, id, format!("lfm2moe spec cold reset failed: {e}"));
                 return;
             }
@@ -10380,10 +10767,7 @@ fn generate(
             {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(
-                    raw_str,
-                    started_in_think,
-                );
+                let in_think = currently_in_think(raw_str, started_in_think);
                 // Total-think bound (re-arm-proof). Count every think token; at the
                 // cap, latch force-answer (force-close + block <think>); a margin
                 // past the cap, hard-EOS so a model that keeps re-opening <think>
@@ -10533,10 +10917,7 @@ fn generate(
                 // multi-token sequence in Qwen3.5's vocab.
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(
-                    raw_str,
-                    started_in_think,
-                );
+                let in_think = currently_in_think(raw_str, started_in_think);
                 if !in_think {
                     let _ = writeln!(
                         stdout,
@@ -12331,6 +12712,10 @@ fn sample_lfm_token(
     deepseek4::sampling::sample_token(logits, temp, top_k, top_p, rng)
 }
 
+fn lfm_gpu_greedy_sampling_enabled(exact_decode_fusion_enabled: bool, temperature: f32) -> bool {
+    exact_decode_fusion_enabled && temperature <= 1e-6
+}
+
 /// Invalidate LFM host/GPU conversation bookkeeping after a failed prefill or
 /// decode so the next request cannot LCP against a partially-advanced cursor.
 /// Clears `conversation_tokens` + `seq_pos` and best-effort resets conv/KV
@@ -12340,11 +12725,14 @@ fn sample_lfm_token(
 /// Reset is attempted to stop the current turn's poisoned state from being
 /// reused; its failure is returned so the caller can make the reset failure,
 /// not just the original forward error, visible.
-fn invalidate_lfm_cache_state(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+fn invalidate_lfm_cache_state(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     if let Some(b) = m.lfm2moe_mut() {
-        b.state.reset(gpu)?;
+        b.reset(gpu)?;
     }
     Ok(())
 }
@@ -12393,8 +12781,7 @@ fn generate_lfm2moe(
     // re-render plain for the cold full-prefill so a stale/cross-conversation
     // fingerprint collision cannot inject hidden <think> tokens into the
     // prompt (fingerprint strips think; cache stores raw ids).
-    let cache_disabled =
-        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     let cache_enabled = !cache_disabled;
     let may_replay_asst = cache_enabled
         && m.eviction.is_none()
@@ -12435,10 +12822,9 @@ fn generate_lfm2moe(
                     tools,
                     |msg| {
                         let stripped = strip_think_for_fingerprint(&msg.content);
-                        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(
-                            &stripped,
-                        )
-                        .into_owned();
+                        let normalized =
+                            hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped)
+                                .into_owned();
                         let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
                         cache_ref.get(&fp).cloned()
                     },
@@ -12540,7 +12926,7 @@ fn generate_lfm2moe(
         return;
     }
 
-    let eos_tok = m.lfm2moe().unwrap().eos_tok;
+    let eos_tok = m.lfm2moe().unwrap().eos_token_id();
 
     // LFM2.5 emits MULTIPLE EOS-class tokens inconsistently: the chat turn-end
     // `<|im_end|>` (which `eos_tok` resolves to) but ALSO the document-end
@@ -12570,8 +12956,8 @@ fn generate_lfm2moe(
     // recurrent state and full-prefill. No partial prefix reuse (conv window
     // chains to token 0). Planning lives in hipfire-arch-lfm2moe; daemon only
     // renders, calls the plan, applies reset/suffix, and reports telemetry.
-    let state_n_tokens = m.lfm2moe().unwrap().state.n_tokens;
-    let cap = m.lfm2moe().unwrap().state.max_seq;
+    let state_n_tokens = m.lfm2moe().unwrap().n_tokens();
+    let cap = m.lfm2moe().unwrap().max_seq();
     let mut plan = lfm2moe::plan_lfm_prompt_cache(
         rendered_ids,
         &m.conversation_tokens,
@@ -12592,8 +12978,7 @@ fn generate_lfm2moe(
     if !plan.cache_hit && used_asst_replay {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let plain_ids: Result<Vec<u32>, String> = {
-            let jinja_enabled =
-                std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+            let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
             let try_jinja = jinja_enabled && m.chat_template.is_some();
             let mut ids: Option<Vec<u32>> = None;
             if try_jinja {
@@ -12762,19 +13147,23 @@ fn generate_lfm2moe(
 
     // Plan-driven reset: miss → cold rebuild; hit → keep GPU state, prefill suffix.
     if !plan.cache_hit {
-        if let Err(e) = m.lfm2moe_mut().unwrap().state.reset(gpu) {
+        if let Err(e) = m.lfm2moe_mut().unwrap().reset(gpu) {
             // Reset itself failed: still clear host bookkeeping so the next
             // plan sees empty prior (forced miss) rather than a stale prefix.
             m.seq_pos = 0;
             m.conversation_tokens.clear();
-            emit_error_with_id(stdout, id, format!("lfm2moe cache-miss state reset failed: {e}"));
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("lfm2moe cache-miss state reset failed: {e}"),
+            );
             return;
         }
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     } else {
         // Defensive: on a hit the cursor must already equal start_pos.
-        debug_assert_eq!(m.lfm2moe().unwrap().state.n_tokens, plan.start_pos);
+        debug_assert_eq!(m.lfm2moe().unwrap().n_tokens(), plan.start_pos);
         m.seq_pos = plan.start_pos;
         m.conversation_tokens.truncate(plan.start_pos);
     }
@@ -12786,6 +13175,15 @@ fn generate_lfm2moe(
     emit_gen_start(stdout, id, started_in_think);
 
     let t0 = Instant::now();
+    let exact_decode_fusion_enabled = m.lfm2moe().unwrap().device_greedy_sampling_eligible(gpu);
+    let gpu_greedy_requested = std::env::var("HIPFIRE_LFM2_GPU_GREEDY")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    let use_gpu_greedy =
+        gpu_greedy_requested && lfm_gpu_greedy_sampling_enabled(exact_decode_fusion_enabled, temp);
+    if use_gpu_greedy {
+        eprintln!("[daemon] lfm2moe sampling: device greedy with exact HF repetition penalty");
+    }
 
     // ── Prefill: batched forward_prefill_batch when gfx1201 + the exact
     // opt-in flag are set (frozen §9 routing); otherwise the eager Phase-0
@@ -12810,9 +13208,6 @@ fn generate_lfm2moe(
     }
     let prefill_err: Option<String> = {
         let b = m.lfm2moe_mut().unwrap();
-        let cfg = &b.config;
-        let weights = &b.weights;
-        let state = &mut b.state;
         // Frozen control-plane selection (design doc §9), made once before any
         // prompt token is processed. Cohort/dtype admission is decided by the
         // core (§8) — the daemon does not inspect weights. No post-selection
@@ -12824,12 +13219,10 @@ fn generate_lfm2moe(
             eprintln!(
                 "[daemon] lfm2moe prefill: batched gfx1201 path (HIPFIRE_LFM2_PREFILL_BATCH=1), tokens={} start_pos={}",
                 prefill_ids.len(),
-                state.n_tokens,
+                b.n_tokens(),
             );
-            let start_pos = state.n_tokens as u32;
-            match lfm2moe::forward::forward_prefill_batch(
-                cfg, weights, state, gpu, prefill_ids, start_pos,
-            ) {
+            let start_pos = b.n_tokens() as u32;
+            match b.forward_prefill_batch(gpu, prefill_ids, start_pos) {
                 Ok(logits) => {
                     last_logits = logits;
                     None
@@ -12837,7 +13230,7 @@ fn generate_lfm2moe(
                 Err(e) => Some(format!("lfm2moe batched prefill failed: {e}")),
             }
         } else {
-            let mut position = state.n_tokens as u32;
+            let mut position = b.n_tokens() as u32;
             let gfx1201 = gpu.arch_caps.is_gfx1201();
             let last_idx = prefill_ids.len().saturating_sub(1);
             let mut err: Option<String> = None;
@@ -12845,10 +13238,10 @@ fn generate_lfm2moe(
                 // Phase 0 head-elision (gfx1201-only): non-final prompt tokens skip
                 // the lm_head + full-vocab logits D2H; their logits are never read.
                 let step = if gfx1201 && i != last_idx {
-                    lfm2moe::forward::decode_step_prefill(cfg, weights, state, gpu, tok, position)
+                    b.decode_step_prefill(gpu, tok, position)
                         .map(|()| Vec::new())
                 } else {
-                    lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position)
+                    b.decode_step(gpu, tok, position, DecodeExecutionMode::Prefill)
                 };
                 match step {
                     Ok(logits) => last_logits = logits,
@@ -12887,12 +13280,18 @@ fn generate_lfm2moe(
     debug_assert_eq!(m.conversation_tokens, plan.rendered);
 
     let decode_start_tokens_idx = m.conversation_tokens.len();
-    let mut seen_tokens: std::collections::HashSet<u32> =
-        m.conversation_tokens.iter().copied().collect();
+    let mut seen_tokens = std::collections::HashSet::new();
+    let mut seen_token_ids = Vec::new();
+    for &token in &m.conversation_tokens {
+        if seen_tokens.insert(token) {
+            seen_token_ids.push(token);
+        }
+    }
     let prefill_ms = t0.elapsed().as_millis();
     let prefill_s = t0.elapsed().as_secs_f64();
 
-    // ── Decode loop. Sample host-side from the running logits vector. ──
+    // ── Decode loop. Greedy gfx1201 fusion stays device-side; temperature
+    // sampling preserves the existing host policy and RNG exactly. ──
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -12902,19 +13301,48 @@ fn generate_lfm2moe(
     let mut generated_count: usize = 0;
     let mut emit_text_buf = String::new();
     let decode_t0 = Instant::now();
+    let plain_ar_mode = DecodeExecutionMode::PlainAr {
+        pipeline_parallel: m.pp,
+        tensor_parallel: m.ep.as_ref().map_or(1, |ep| ep.gpus.devices.len()),
+    };
     loop {
         if generated_count >= max_tokens {
             break;
         }
-        let next_tok = sample_lfm_token(
-            &mut last_logits,
-            &seen_tokens,
-            temp,
-            top_p,
-            top_k,
-            repeat_penalty,
-            &mut rng,
-        );
+        let next_tok = if use_gpu_greedy {
+            match m
+                .lfm2moe()
+                .unwrap()
+                .sample_device_greedy(gpu, &seen_token_ids, repeat_penalty)
+            {
+                Ok(token) => token,
+                Err(error) => {
+                    let reset_err = invalidate_lfm_cache_state(m, gpu).err();
+                    let msg = format!("lfm2moe device sampling failed: {error}");
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        match reset_err {
+                            Some(reset_error) => {
+                                format!("{msg}; cache-state reset failed: {reset_error}")
+                            }
+                            None => msg,
+                        },
+                    );
+                    return;
+                }
+            }
+        } else {
+            sample_lfm_token(
+                &mut last_logits,
+                &seen_tokens,
+                temp,
+                top_p,
+                top_k,
+                repeat_penalty,
+                &mut rng,
+            )
+        };
         if stop_toks.contains(&next_tok) {
             break;
         }
@@ -12941,19 +13369,25 @@ fn generate_lfm2moe(
         let _ = stdout.flush();
         emit_text_buf.push_str(&frag);
         m.conversation_tokens.push(next_tok);
-        seen_tokens.insert(next_tok);
+        if seen_tokens.insert(next_tok) {
+            seen_token_ids.push(next_tok);
+        }
         generated_count += 1;
 
         let step = {
             let b = m.lfm2moe_mut().unwrap();
-            let cfg = &b.config;
-            let weights = &b.weights;
-            let state = &mut b.state;
-            let position = state.n_tokens as u32;
-            lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            let position = b.n_tokens() as u32;
+            if use_gpu_greedy {
+                b.decode_step_device(gpu, next_tok, position, plain_ar_mode)
+                    .map(|()| None)
+            } else {
+                b.decode_step(gpu, next_tok, position, plain_ar_mode)
+                    .map(Some)
+            }
         };
         match step {
-            Ok(logits) => last_logits = logits,
+            Ok(Some(logits)) => last_logits = logits,
+            Ok(None) => {}
             Err(e) => {
                 // Decode advanced n_tokens for this token's step failure path
                 // is implementation-defined; conversation_tokens already has
@@ -12977,9 +13411,7 @@ fn generate_lfm2moe(
     // Populate asst_turn_cache only when cache is enabled. Kill-switch
     // (HIPFIRE_QWEN_PROMPT_CACHE=0) must not seed entries that a later
     // enabled turn could replay. Same fingerprint logic as neighboring arches.
-    if cache_enabled
-        && generated_count > 0
-        && m.conversation_tokens.len() > decode_start_tokens_idx
+    if cache_enabled && generated_count > 0 && m.conversation_tokens.len() > decode_start_tokens_idx
     {
         let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
         if !cached_seq.is_empty() {
@@ -13008,7 +13440,7 @@ fn generate_lfm2moe(
         }
     }
 
-    m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
+    m.seq_pos = m.lfm2moe().unwrap().n_tokens();
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -15840,7 +16272,7 @@ mod tool_call_parser_tests {
 
 #[cfg(test)]
 mod lfm_sampling_tests {
-    use super::{apply_hf_repetition_penalty, sample_lfm_token};
+    use super::{apply_hf_repetition_penalty, lfm_gpu_greedy_sampling_enabled, sample_lfm_token};
     use hipfire_arch_deepseek4::sampling::Xorshift;
 
     #[test]
@@ -15848,8 +16280,7 @@ mod lfm_sampling_tests {
         let mut logits = [9.8_f32, 10.0, 1.0];
         let seen = [1_u32].into_iter().collect();
         let mut rng = Xorshift::new(7);
-        let token =
-            sample_lfm_token(&mut logits, &seen, 0.2, 1.0, 1, 1.05, &mut rng);
+        let token = sample_lfm_token(&mut logits, &seen, 0.2, 1.0, 1, 1.05, &mut rng);
         assert_eq!(token, 0);
     }
 
@@ -15860,6 +16291,13 @@ mod lfm_sampling_tests {
         apply_hf_repetition_penalty(&mut logits, &seen, 1.05);
         assert!((logits[0] - (10.0 / 1.05)).abs() < 1e-6);
         assert!((logits[1] - (-10.0 * 1.05)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gpu_greedy_sampling_requires_actual_exact_fusion() {
+        assert!(lfm_gpu_greedy_sampling_enabled(true, 0.0));
+        assert!(!lfm_gpu_greedy_sampling_enabled(false, 0.0));
+        assert!(!lfm_gpu_greedy_sampling_enabled(true, 0.2));
     }
 }
 
@@ -15953,3 +16391,4 @@ mod plan_prompt_cache_tests {
         assert!(!p.cache_hit);
     }
 }
+

@@ -87,8 +87,7 @@ impl AtlasRow {
         );
 
         // Artifacts
-        let blindspot_json: Vec<Value> =
-            report.blindspots.iter().map(|k| k.to_json()).collect();
+        let blindspot_json: Vec<Value> = report.blindspots.iter().map(|k| k.to_json()).collect();
         self.artifacts.insert(
             "rocprof_blindspots".to_string(),
             Value::Array(blindspot_json),

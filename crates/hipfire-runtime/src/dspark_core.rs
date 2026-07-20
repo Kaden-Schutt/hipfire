@@ -775,25 +775,24 @@ pub fn run_heads(
     // Reduced-vocab (d2t Some) forces the host path: each argmax is a DRAFT id
     // that must be d2t-remapped to a TARGET id before it can index the
     // full-target-vocab markov chain — the on-GPU chain kernel can't do that gather.
-    let chain_bufs: Option<(GpuTensor, GpuTensor)> = if markov_w1_device_embeddable(markov_w1)
-        && weights.d2t.is_none()
-    {
-        let chain = gpu
-            .alloc_tensor(&[block + 1], DType::F32)
-            .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
-        let seed_i32 = prev_token as i32;
-        let seed_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
-        gpu.hip
-            .memcpy_htod(&chain.buf, seed_bytes)
-            .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
-        let argmax_scratch = gpu
-            .alloc_tensor(&[1], DType::F32)
-            .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
-        Some((chain, argmax_scratch))
-    } else {
-        None
-    };
+    let chain_bufs: Option<(GpuTensor, GpuTensor)> =
+        if markov_w1_device_embeddable(markov_w1) && weights.d2t.is_none() {
+            let chain = gpu
+                .alloc_tensor(&[block + 1], DType::F32)
+                .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
+            let seed_i32 = prev_token as i32;
+            let seed_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
+            gpu.hip
+                .memcpy_htod(&chain.buf, seed_bytes)
+                .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
+            let argmax_scratch = gpu
+                .alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
+            Some((chain, argmax_scratch))
+        } else {
+            None
+        };
 
     // Confidence head buffers (ON GPU per slot inside the loop):
     // `conf_batch[block]` holds the per-slot confidence logit.

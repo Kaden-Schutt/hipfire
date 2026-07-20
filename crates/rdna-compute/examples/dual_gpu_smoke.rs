@@ -43,7 +43,11 @@ fn main() {
     println!("  bind gpu1 → current_device=1");
 
     gpu0.bind_thread().expect("bind 0 again");
-    assert_eq!(gpu0.hip.current_device().unwrap(), 0, "after re-bind on gpu0");
+    assert_eq!(
+        gpu0.hip.current_device().unwrap(),
+        0,
+        "after re-bind on gpu0"
+    );
     println!("  re-bind gpu0 → current_device=0 (cached path also exercised)");
 
     println!("\n── tensor allocation + pointer_get_attributes ─────────────");
@@ -62,10 +66,16 @@ fn main() {
         .pointer_get_attributes(&table0.buf)
         .expect("ptr-attr table0");
     assert_eq!(attr_table0.device, 0, "table0 should live on dev 0");
-    println!("  table0 (vocab={vocab}, dim={dim}) on dev 0 — attr.device={}", attr_table0.device);
+    println!(
+        "  table0 (vocab={vocab}, dim={dim}) on dev 0 — attr.device={}",
+        attr_table0.device
+    );
 
     let out0 = gpu0.zeros(&[dim], DType::F32).expect("zeros out on dev 0");
-    let attr_out0 = gpu0.hip.pointer_get_attributes(&out0.buf).expect("ptr-attr out0");
+    let attr_out0 = gpu0
+        .hip
+        .pointer_get_attributes(&out0.buf)
+        .expect("ptr-attr out0");
     assert_eq!(attr_out0.device, 0, "out0 should live on dev 0");
 
     // Different pattern so misroutes are visible in the assert_ne! below.
@@ -81,10 +91,16 @@ fn main() {
         .pointer_get_attributes(&table1.buf)
         .expect("ptr-attr table1");
     assert_eq!(attr_table1.device, 1, "table1 should live on dev 1");
-    println!("  table1 (vocab={vocab}, dim={dim}) on dev 1 — attr.device={}", attr_table1.device);
+    println!(
+        "  table1 (vocab={vocab}, dim={dim}) on dev 1 — attr.device={}",
+        attr_table1.device
+    );
 
     let out1 = gpu1.zeros(&[dim], DType::F32).expect("zeros out on dev 1");
-    let attr_out1 = gpu1.hip.pointer_get_attributes(&out1.buf).expect("ptr-attr out1");
+    let attr_out1 = gpu1
+        .hip
+        .pointer_get_attributes(&out1.buf)
+        .expect("ptr-attr out1");
     assert_eq!(attr_out1.device, 1, "out1 should live on dev 1");
 
     // ── embedding_lookup on each device ──────────────────────────────
@@ -97,7 +113,10 @@ fn main() {
     let out0_host = gpu0.download_f32(&out0).expect("download out0");
     let row0_expected = &table0_data[(token_id as usize) * dim..(token_id as usize + 1) * dim];
     assert_eq!(&out0_host, row0_expected, "dev 0 lookup row mismatch");
-    println!("  dev 0: looked up token {token_id} — first 4 elements: {:?}", &out0_host[..4]);
+    println!(
+        "  dev 0: looked up token {token_id} — first 4 elements: {:?}",
+        &out0_host[..4]
+    );
 
     gpu1.bind_thread().expect("bind 1 for lookup");
     gpu1.embedding_lookup(&table1, &out1, token_id, dim)
@@ -105,7 +124,10 @@ fn main() {
     let out1_host = gpu1.download_f32(&out1).expect("download out1");
     let row1_expected = &table1_data[(token_id as usize) * dim..(token_id as usize + 1) * dim];
     assert_eq!(&out1_host, row1_expected, "dev 1 lookup row mismatch");
-    println!("  dev 1: looked up token {token_id} — first 4 elements: {:?}", &out1_host[..4]);
+    println!(
+        "  dev 1: looked up token {token_id} — first 4 elements: {:?}",
+        &out1_host[..4]
+    );
 
     // The two rows must differ — if they accidentally come back identical
     // it would indicate dev_1 picked up dev_0's table (the multi-GPU
@@ -127,7 +149,10 @@ fn main() {
         let t = target
             .zeros(&[1024], DType::F32)
             .expect("alloc in stress loop");
-        let attr = target.hip.pointer_get_attributes(&t.buf).expect("ptr-attr in loop");
+        let attr = target
+            .hip
+            .pointer_get_attributes(&t.buf)
+            .expect("ptr-attr in loop");
         assert_eq!(
             attr.device, target.device_id,
             "stress iter {i}: alloc landed on dev {} but expected {}",

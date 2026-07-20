@@ -1156,6 +1156,9 @@ impl Carrier for Lfm2MoeCarrier {
     fn name(&self) -> &'static str {
         "lfm2moe"
     }
+    fn owns_recommended_sampling(&self) -> bool {
+        true
+    }
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<ModelState>,
@@ -1177,7 +1180,7 @@ impl Carrier for Lfm2MoeCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 11
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn load(&self, mut src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "lfm2moe: pipeline-parallel (pp>1) unsupported",
@@ -1186,9 +1189,17 @@ impl Carrier for Lfm2MoeCarrier {
             .into());
         }
         dir_diag(&src);
-        let meta = resolve_source_meta(&src, ctx.path)?;
 
         use hipfire_arch_lfm2moe as lfm2moe;
+        let retained_artifact = match &mut src {
+            ModelSource::Hfq(hfq) => lfm2moe::redline_plan::authenticate_retained_artifact(hfq)?,
+            ModelSource::Dir(_) => lfm2moe::redline_plan::RetainedArtifactProvenance::ABSENT,
+        };
+        let rec_sampling = match &src {
+            ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
+            ModelSource::Dir(_) => None,
+        };
+        let meta = resolve_source_meta(&src, ctx.path)?;
         // ── source-varying seam: (config, weights) only ──
         let (config, weights) = match src {
             ModelSource::Hfq(mut hfq) => {
@@ -1222,13 +1233,18 @@ impl Carrier for Lfm2MoeCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
+            state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle::new(
                 config,
                 weights,
                 state,
                 eos_tok,
-            })),
+                meta.arch_id,
+                retained_artifact,
+            ))),
             speculator,
+            rec_temperature: rec_sampling.and_then(|rec| rec.temperature),
+            rec_top_p: rec_sampling.and_then(|rec| rec.top_p),
+            rec_top_k: rec_sampling.and_then(|rec| rec.top_k.map(|k| k as f32)),
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

@@ -1065,7 +1065,6 @@ impl MiniMaxState {
     pub fn reset(&mut self) {
         self.n_tokens = 0;
     }
-
 }
 
 // ──────────────── ModelSource (safetensors) load helpers ────────────────

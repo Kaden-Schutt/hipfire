@@ -170,15 +170,7 @@ mod tests {
 
     #[test]
     fn divergence_is_miss() {
-        let p = plan_lfm_prompt_cache(
-            vec![1, 2, 9, 10],
-            &[1, 2, 3, 4],
-            4,
-            true,
-            true,
-            128,
-            16,
-        );
+        let p = plan_lfm_prompt_cache(vec![1, 2, 9, 10], &[1, 2, 3, 4], 4, true, true, 128, 16);
         assert!(!p.cache_hit);
         assert_eq!(p.start_pos, 0);
         assert_eq!(p.cached_tokens, 0);
@@ -275,15 +267,7 @@ mod tests {
 
     #[test]
     fn cache_disabled_is_miss_but_capacity_still_checked() {
-        let p = plan_lfm_prompt_cache(
-            vec![1, 2, 3, 4, 5],
-            &[1, 2, 3],
-            3,
-            true,
-            false,
-            8,
-            4,
-        );
+        let p = plan_lfm_prompt_cache(vec![1, 2, 3, 4, 5], &[1, 2, 3], 3, true, false, 8, 4);
         assert!(!p.cache_hit);
         assert_eq!(p.cached_tokens, 0);
         assert_eq!(p.new_tokens, vec![1, 2, 3, 4, 5]);

@@ -39,9 +39,13 @@ fn e4m3_to_f32(byte: u8) -> f32 {
     let sign = if (byte & 0x80) != 0 { -1.0 } else { 1.0 };
     let exp = ((byte >> 3) & 0xf) as i32;
     let mant = (byte & 0x7) as f32;
-    if exp == 0xf && mant == 7.0 { return 0.0; }
+    if exp == 0xf && mant == 7.0 {
+        return 0.0;
+    }
     if exp == 0 {
-        if mant == 0.0 { return 0.0; }
+        if mant == 0.0 {
+            return 0.0;
+        }
         return sign * (2.0f32.powi(-6)) * (mant / 8.0);
     }
     sign * (2.0f32.powi(exp - 7)) * (1.0 + mant / 8.0)
@@ -65,7 +69,9 @@ fn main() {
     let mut metas: HashMap<String, TensorMeta> = HashMap::new();
     if let serde_json::Value::Object(map) = hdr_json {
         for (k, v) in map {
-            if k == "__metadata__" { continue; }
+            if k == "__metadata__" {
+                continue;
+            }
             metas.insert(k, serde_json::from_value(v).unwrap());
         }
     }
@@ -75,10 +81,18 @@ fn main() {
     let wm = metas.get(w_name).expect("weight meta missing");
     let sm = metas.get(s_name).expect("scale meta missing");
 
-    eprintln!("weight: shape {:?} dtype {} bytes {}",
-        wm.shape, wm.dtype, wm.data_offsets[1] - wm.data_offsets[0]);
-    eprintln!("scale:  shape {:?} dtype {} bytes {}",
-        sm.shape, sm.dtype, sm.data_offsets[1] - sm.data_offsets[0]);
+    eprintln!(
+        "weight: shape {:?} dtype {} bytes {}",
+        wm.shape,
+        wm.dtype,
+        wm.data_offsets[1] - wm.data_offsets[0]
+    );
+    eprintln!(
+        "scale:  shape {:?} dtype {} bytes {}",
+        sm.shape,
+        sm.dtype,
+        sm.data_offsets[1] - sm.data_offsets[0]
+    );
 
     let w_bytes = &body[wm.data_offsets[0]..wm.data_offsets[1]];
     let s_bytes = &body[sm.data_offsets[0]..sm.data_offsets[1]];
@@ -88,17 +102,25 @@ fn main() {
     let hex: String = w_bytes[..16].iter().map(|b| format!("{:02x}", b)).collect();
     eprintln!("  {hex}");
 
-    eprintln!("scale[0,0] = 0x{:02x} (= 2^{})", s_bytes[0], s_bytes[0] as i32 - 127);
+    eprintln!(
+        "scale[0,0] = 0x{:02x} (= 2^{})",
+        s_bytes[0],
+        s_bytes[0] as i32 - 127
+    );
 
     let e4m3: Vec<f32> = w_bytes[..16].iter().map(|&b| e4m3_to_f32(b)).collect();
     let scale = ue8m0_to_scale(s_bytes[0]);
     let dequant: Vec<f32> = e4m3.iter().map(|&v| v * scale).collect();
 
     eprint!("E4M3 values: ");
-    for v in &e4m3 { eprint!("{:+.4} ", v); }
+    for v in &e4m3 {
+        eprint!("{:+.4} ", v);
+    }
     eprintln!();
     eprint!("× scale:     ");
-    for v in &dequant { eprint!("{:+.6} ", v); }
+    for v in &dequant {
+        eprint!("{:+.6} ", v);
+    }
     eprintln!();
 
     // First 4096 dequantized — stats
@@ -116,10 +138,20 @@ fn main() {
     sample.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = sample.len();
     eprintln!("\nfirst 4096 dequantized:");
-    eprintln!("  min={:.4} p1={:.4} median={:.4} p99={:.4} max={:.4}",
-        sample[0], sample[n / 100], sample[n / 2], sample[99 * n / 100], sample[n - 1]);
-    eprintln!("  fraction |w|<0.1: {:.3}",
-        sample.iter().filter(|&&v| v.abs() < 0.1).count() as f32 / n as f32);
-    eprintln!("  fraction |w|<1.0: {:.3}",
-        sample.iter().filter(|&&v| v.abs() < 1.0).count() as f32 / n as f32);
+    eprintln!(
+        "  min={:.4} p1={:.4} median={:.4} p99={:.4} max={:.4}",
+        sample[0],
+        sample[n / 100],
+        sample[n / 2],
+        sample[99 * n / 100],
+        sample[n - 1]
+    );
+    eprintln!(
+        "  fraction |w|<0.1: {:.3}",
+        sample.iter().filter(|&&v| v.abs() < 0.1).count() as f32 / n as f32
+    );
+    eprintln!(
+        "  fraction |w|<1.0: {:.3}",
+        sample.iter().filter(|&&v| v.abs() < 1.0).count() as f32 / n as f32
+    );
 }

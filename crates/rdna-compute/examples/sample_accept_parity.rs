@@ -18,7 +18,11 @@
 //!   cargo run -p rdna-compute --release --example sample_accept_parity
 //!   gpu_release
 
-#![allow(clippy::too_many_arguments, clippy::needless_range_loop, clippy::manual_memcpy)]
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::manual_memcpy
+)]
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -72,7 +76,9 @@ fn ref_lazy(
     let mut rng = seed;
     let mut ids = Vec::with_capacity(n);
     for i in 0..n {
-        let (tok, new_rng) = ref_sample(gpu, logits, result_buf, repeat_buf, i, temp, top_p, top_k, rng);
+        let (tok, new_rng) = ref_sample(
+            gpu, logits, result_buf, repeat_buf, i, temp, top_p, top_k, rng,
+        );
         rng = new_rng;
         ids.push(tok);
         if i + 1 < n && draft[i + 1] != tok {
@@ -87,7 +93,8 @@ fn ref_lazy(
 
 fn upload_u32(gpu: &mut Gpu, data: &[u32]) -> GpuTensor {
     let t = gpu.zeros(&[data.len()], DType::F32).expect("alloc u32 buf");
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     gpu.memcpy_htod_auto(&t.buf, bytes).expect("upload u32");
     t
 }
@@ -112,7 +119,9 @@ fn cactus_distribution_check(gpu: &mut Gpu) -> bool {
         logits[base + b] = pb.ln();
         logits[base + c] = pc.ln();
     }
-    let logits_t = gpu.upload_f32(&logits, &[2, VOCAB]).expect("upload cactus logits");
+    let logits_t = gpu
+        .upload_f32(&logits, &[2, VOCAB])
+        .expect("upload cactus logits");
     let draft_buf = upload_u32(gpu, &[0u32, a as u32]); // draft[1] = a
     let out_buf = gpu.zeros(&[3], DType::F32).expect("cactus out_buf");
 
@@ -139,7 +148,9 @@ fn cactus_distribution_check(gpu: &mut Gpu) -> bool {
             .wrapping_mul(2654435761)
             .wrapping_add(0x9E37_79B9);
         let (ids, _rng) = gpu
-            .sample_accept_lazy_f32(&logits_t, &draft_buf, &out_buf, 2, VOCAB, 1.0, 1.0, None, seed, delta)
+            .sample_accept_lazy_f32(
+                &logits_t, &draft_buf, &out_buf, 2, VOCAB, 1.0, 1.0, None, seed, delta,
+            )
             .expect("sample_accept_lazy_f32 cactus");
         let t0 = ids[0] as usize;
         if t0 < VOCAB {
@@ -152,7 +163,9 @@ fn cactus_distribution_check(gpu: &mut Gpu) -> bool {
 
     let tv = |hist: &[u32], theory: &[f32]| -> f32 {
         let nn = N_SAMPLES as f32;
-        0.5 * (0..VOCAB).map(|i| (hist[i] as f32 / nn - theory[i]).abs()).sum::<f32>()
+        0.5 * (0..VOCAB)
+            .map(|i| (hist[i] as f32 / nn - theory[i]).abs())
+            .sum::<f32>()
     };
     let tv_cactus = tv(&hist, &theory_cactus);
     let tv_delta0 = tv(&hist, &theory_delta0);
@@ -199,7 +212,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut rng = seed;
             let mut full = Vec::with_capacity(n);
             for i in 0..n {
-                let (tok, nr) = ref_sample(&mut gpu, &logits, &result_buf, &repeat_buf, i, temp, top_p, top_k, rng);
+                let (tok, nr) = ref_sample(
+                    &mut gpu,
+                    &logits,
+                    &result_buf,
+                    &repeat_buf,
+                    i,
+                    temp,
+                    top_p,
+                    top_k,
+                    rng,
+                );
                 rng = nr;
                 full.push(tok);
             }
@@ -220,9 +243,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // draft_c[k+1] stays u32::MAX → mismatch at pos k (if k+1 < n).
 
-            for (label, draft) in [("full", &draft_a), ("mismatch", &draft_b), ("partial", &draft_c)] {
-                let (ref_ids, ref_rng) =
-                    ref_lazy(&mut gpu, &logits, &result_buf, &repeat_buf, draft, temp, top_p, top_k, seed);
+            for (label, draft) in [
+                ("full", &draft_a),
+                ("mismatch", &draft_b),
+                ("partial", &draft_c),
+            ] {
+                let (ref_ids, ref_rng) = ref_lazy(
+                    &mut gpu,
+                    &logits,
+                    &result_buf,
+                    &repeat_buf,
+                    draft,
+                    temp,
+                    top_p,
+                    top_k,
+                    seed,
+                );
 
                 let draft_buf = upload_u32(&mut gpu, draft);
                 let out_buf = gpu.zeros(&[n + 1], DType::F32)?;
@@ -256,6 +292,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("\nFAIL: fused sample+accept kernel is NOT byte-identical to sample_top_p_pf (or CACTUS check failed)");
         std::process::exit(1);
     }
-    println!("\nPASS: dspark_sample_accept_lazy_f32 byte-identical at δ=0 AND matches CACTUS at δ>0");
+    println!(
+        "\nPASS: dspark_sample_accept_lazy_f32 byte-identical at δ=0 AND matches CACTUS at δ>0"
+    );
     Ok(())
 }

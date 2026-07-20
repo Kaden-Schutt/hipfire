@@ -29,8 +29,7 @@ fn lcg(state: &mut u32) -> u32 {
 
 // E2M1 LUT — matches the kernel's __shared__ lut[16].
 const E2M1: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 // Round f32 to f16 bits via bit manipulation (mirrors the helper used by
@@ -41,9 +40,15 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7F_FFFF;
-    if exp == 0 { return sign; }
-    if exp >= 143 { return sign | 0x7C00; }
-    if exp <= 112 { return sign; }
+    if exp == 0 {
+        return sign;
+    }
+    if exp >= 143 {
+        return sign | 0x7C00;
+    }
+    if exp <= 112 {
+        return sign;
+    }
     let new_exp = (exp - 127 + 15) as u16;
     let new_mant = (mant >> 13) as u16;
     sign | (new_exp << 10) | new_mant
@@ -84,9 +89,8 @@ fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len()], DType::F32)
         .expect("alloc f32");
@@ -95,9 +99,8 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len() * 4], DType::Raw)
         .expect("alloc i32");
@@ -106,9 +109,8 @@ fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     let t = gpu
         .alloc_tensor(&[data.len() * 8], DType::Raw)
         .expect("alloc u64");
@@ -189,19 +191,17 @@ fn cpu_reference(
     let lut: Vec<f32> = E2M1.to_vec();
 
     // Pre-convert X to fp16 (kernel does this via ensure_fp16_x).
-    let x_f16_bits: Vec<u16> = x_f32.iter()
-        .map(|&v| f32_to_f16_bits(v))
-        .collect();
-    let x_f16: Vec<f32> = x_f16_bits.iter()
-        .map(|&b| f16_bits_to_f32(b))
-        .collect();
+    let x_f16_bits: Vec<u16> = x_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let x_f16: Vec<f32> = x_f16_bits.iter().map(|&b| f16_bits_to_f32(b)).collect();
 
     let mut y = vec![0f32; m_total * m];
 
     let n_tiles_y = m_total / 16;
     for tile_y in 0..n_tiles_y {
         let expert_id = expert_tile_ids[tile_y];
-        if expert_id < 0 { continue; }
+        if expert_id < 0 {
+            continue;
+        }
         let weight = &expert_weights[expert_id as usize];
 
         let slot_start = tile_y * 16;
@@ -210,10 +210,18 @@ fn cpu_reference(
         let mut x_rows: [Option<usize>; 16] = [None; 16];
         for lane in 0..16 {
             let slot_idx = slot_start + lane;
-            if slot_idx >= m_total { continue; }
+            if slot_idx >= m_total {
+                continue;
+            }
             let flat = sorted_slot_index[slot_idx];
-            if flat < 0 { continue; }
-            let row = if x_row_div > 1 { flat / x_row_div } else { flat };
+            if flat < 0 {
+                continue;
+            }
+            let row = if x_row_div > 1 {
+                flat / x_row_div
+            } else {
+                flat
+            };
             if (row as usize) < n_rows_x {
                 x_rows[lane] = Some(row as usize);
             }
@@ -224,7 +232,9 @@ fn cpu_reference(
             let row_start = tile_x * 16;
             for out_row_off in 0..16 {
                 let m_row = row_start + out_row_off;
-                if m_row >= m { continue; }
+                if m_row >= m {
+                    continue;
+                }
                 let row_off = m_row * row_bytes;
                 let rs_bits = u16::from_le_bytes([weight[row_off], weight[row_off + 1]]);
                 let row_scale_f16 = f16_bits_to_f32(rs_bits);
@@ -232,7 +242,9 @@ fn cpu_reference(
                 // For each output column = slot lane.
                 for lane in 0..16 {
                     let out_col = slot_start + lane;
-                    if out_col >= m_total { continue; }
+                    if out_col >= m_total {
+                        continue;
+                    }
                     let x_row = match x_rows[lane] {
                         Some(r) => r,
                         None => {
@@ -253,7 +265,8 @@ fn cpu_reference(
                         // Per the kernel, sc_h = row_scale_h(fp16) * block_scale(fp16).
                         // Mirror that by converting block_scale to f16 first.
                         let block_scale_f16 = f16_bits_to_f32(f32_to_f16_bits(block_scale));
-                        let sc_h = f16_bits_to_f32(f32_to_f16_bits(row_scale_f16 * block_scale_f16));
+                        let sc_h =
+                            f16_bits_to_f32(f32_to_f16_bits(row_scale_f16 * block_scale_f16));
 
                         // 32 packed nibbles in this block.
                         for n_idx in 0..32 {
@@ -276,15 +289,29 @@ fn cpu_reference(
     y
 }
 
-fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize, seed_w: u32, seed_x: u32) -> bool {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+fn run_case(
+    label: &str,
+    m: usize,
+    k: usize,
+    m_total: usize,
+    num_experts: usize,
+    seed_w: u32,
+    seed_x: u32,
+) -> bool {
+    println!(
+        "=== {} | M={} K={} m_total={} E={} ===",
+        label, m, k, m_total, num_experts
+    );
     assert!(m % 16 == 0, "M must be a multiple of 16");
     assert!(m_total % 16 == 0, "m_total must be a multiple of 16");
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
     if !arch.starts_with("gfx12") {
-        println!("  SKIP — arch {} is not gfx12; HFP4 grouped-WMMA only registered for gfx12", arch);
+        println!(
+            "  SKIP — arch {} is not gfx12; HFP4 grouped-WMMA only registered for gfx12",
+            arch
+        );
         // Still exercise the CPU reference to catch host-side regressions in the
         // dequant logic / test scaffolding (no GPU comparison performed).
         let weights: Vec<Vec<u8>> = (0..num_experts)
@@ -296,8 +323,7 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
             .map(|tile_y| (tile_y % num_experts) as i32)
             .collect();
         let y_ref = cpu_reference(
-            &weights, &tile_ids, &sorted, &x_f32,
-            m, k, 1, m_total, m_total,
+            &weights, &tile_ids, &sorted, &x_f32, m, k, 1, m_total, m_total,
         );
         let max_abs = y_ref.iter().map(|v| v.abs()).fold(0f32, f32::max);
         println!("  CPU reference computed, max_abs_y = {:.6e}", max_abs);
@@ -342,15 +368,23 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
         1, // x_row_div
         m_total,
         m_total, // x_src_rows
-    ).expect("kernel launch");
+    )
+    .expect("kernel launch");
     gpu.hip.device_synchronize().expect("sync");
 
     let y_gpu_v = gpu.download_f32(&y_gpu).expect("download Y");
 
     // CPU reference.
     let y_ref = cpu_reference(
-        &weight_bytes, &tile_ids, &sorted, &x_f32,
-        m, k, 1, m_total, m_total,
+        &weight_bytes,
+        &tile_ids,
+        &sorted,
+        &x_f32,
+        m,
+        k,
+        1,
+        m_total,
+        m_total,
     );
 
     let mut max_abs = 0f32;
@@ -359,10 +393,17 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     let mut max_y_ref_abs = 0f32;
     for (i, (r, g)) in y_ref.iter().zip(y_gpu_v.iter()).enumerate() {
         let d = (r - g).abs();
-        if r.abs() > max_y_ref_abs { max_y_ref_abs = r.abs(); }
+        if r.abs() > max_y_ref_abs {
+            max_y_ref_abs = r.abs();
+        }
         let rel = if r.abs() > 1e-6 { d / r.abs() } else { d };
-        if d > max_abs { max_abs = d; argmax_abs = i; }
-        if rel > max_rel { max_rel = rel; }
+        if d > max_abs {
+            max_abs = d;
+            argmax_abs = i;
+        }
+        if rel > max_rel {
+            max_rel = rel;
+        }
     }
     let r_sample = y_ref[argmax_abs];
     let g_sample = y_gpu_v[argmax_abs];
@@ -377,8 +418,10 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     let tol_abs = 1e-3f32.max(1e-2 * max_y_ref_abs);
     let tol_rel = 1e-2f32;
     if max_abs > tol_abs && max_rel > tol_rel {
-        println!("  FAIL — max_abs {:.3e} > tol_abs {:.3e} AND max_rel {:.3e} > tol_rel {:.3e}",
-            max_abs, tol_abs, max_rel, tol_rel);
+        println!(
+            "  FAIL — max_abs {:.3e} > tol_abs {:.3e} AND max_rel {:.3e} > tol_rel {:.3e}",
+            max_abs, tol_abs, max_rel, tol_rel
+        );
         false
     } else {
         println!("  PASS");
@@ -389,11 +432,11 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
 fn main() {
     // Toy: 1 expert, single tile_y, M=32 / K=256 / m_total=16.
     let mut ok = true;
-    ok &= run_case("toy",       32,   256,  16, 1, 0xDEAD_BEEF, 0xCAFE_BABE);
+    ok &= run_case("toy", 32, 256, 16, 1, 0xDEAD_BEEF, 0xCAFE_BABE);
     // Small: 2 experts, 2 tile_y, M=64 / K=512 / m_total=32.
-    ok &= run_case("small",     64,   512,  32, 2, 0x1234_5678, 0x8765_4321);
+    ok &= run_case("small", 64, 512, 32, 2, 0x1234_5678, 0x8765_4321);
     // Medium: 4 experts, 4 tile_y, M=128 / K=1024 / m_total=64.
-    ok &= run_case("medium",   128,  1024,  64, 4, 0x0F0F_0F0F, 0xF0F0_F0F0);
+    ok &= run_case("medium", 128, 1024, 64, 4, 0x0F0F_0F0F, 0xF0F0_F0F0);
     // A3B-shaped slice: M=768 (mirrors per-expert gate_up/2), K=7168, m_total=256.
     ok &= run_case("a3b-slice", 768, 7168, 256, 8, 0x4242_4242, 0x2424_2424);
 

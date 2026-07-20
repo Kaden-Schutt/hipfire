@@ -12,8 +12,8 @@
 //! `DType` predicates, and `ArchCaps` capability gates.
 
 mod arch_caps;
+mod deepseek4;
 mod dtype;
-mod qwen35;
 mod llama;
 mod qwen2;
-mod deepseek4;
+mod qwen35;

@@ -32,6 +32,28 @@ pub fn gfx12_mq4r_redline_default(
             .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"))
 }
 
+/// Product-certified Redline default for the exact verified LFM2.5-350M fixture.
+///
+/// Fixture identity is supplied only by post-load validation; paths and file
+/// extensions must never participate in this admission decision.
+pub fn lfm2_gfx1201_redline_default(
+    gpu_arch: &str,
+    model_arch_id: u32,
+    retained_fixture_evidence: bool,
+    max_seq: usize,
+    pp: usize,
+    tp: usize,
+    plain_ar: bool,
+) -> bool {
+    gpu_arch == "gfx1201"
+        && model_arch_id == 11
+        && retained_fixture_evidence
+        && max_seq == 2048
+        && pp == 1
+        && tp == 1
+        && plain_ar
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub normalize_prompt: bool,
@@ -145,7 +167,9 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{gfx12_mq4r_redline_default, RuntimeConfig};
+    use super::{
+        gfx12_mq4r_redline_default, lfm2_gfx1201_redline_default, RuntimeConfig,
+    };
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -231,6 +255,35 @@ mod tests {
             6,
             1,
             2,
+        ));
+    }
+
+    #[test]
+    fn lfm2_redline_default_requires_the_exact_verified_gfx1201_fixture() {
+        assert!(lfm2_gfx1201_redline_default(
+            "gfx1201", 11, true, 2048, 1, 1, true,
+        ));
+
+        assert!(!lfm2_gfx1201_redline_default(
+            "gfx1200", 11, true, 2048, 1, 1, true,
+        ));
+        assert!(!lfm2_gfx1201_redline_default(
+            "gfx1201", 10, true, 2048, 1, 1, true,
+        ));
+        assert!(!lfm2_gfx1201_redline_default(
+            "gfx1201", 11, false, 2048, 1, 1, true,
+        ));
+        assert!(!lfm2_gfx1201_redline_default(
+            "gfx1201", 11, true, 4096, 1, 1, true,
+        ));
+        assert!(!lfm2_gfx1201_redline_default(
+            "gfx1201", 11, true, 2048, 2, 1, true,
+        ));
+        assert!(!lfm2_gfx1201_redline_default(
+            "gfx1201", 11, true, 2048, 1, 2, true,
+        ));
+        assert!(!lfm2_gfx1201_redline_default(
+            "gfx1201", 11, true, 2048, 1, 1, false,
         ));
     }
 }

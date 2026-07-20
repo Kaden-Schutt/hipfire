@@ -141,6 +141,7 @@ fn run_lfm2moe(path: &str, args: &Args) -> Vec<Vec<f32>> {
     use hipfire_arch_lfm2moe::config::Lfm2MoeConfig;
     use hipfire_arch_lfm2moe::forward::decode_step;
     use hipfire_arch_lfm2moe::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
+    use hipfire_arch_lfm2moe::redline_plan::{DecodeExecutionMode, RetainedFixtureEvidence};
     use hipfire_runtime::hfq::HfqFile;
     use std::path::Path;
 
@@ -165,8 +166,17 @@ fn run_lfm2moe(path: &str, args: &Args) -> Vec<Vec<f32>> {
 
     let mut all_logits = Vec::with_capacity(n);
     for (pos, &tok) in tokens.iter().take(n).enumerate() {
-        let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, tok, pos as u32)
-            .expect("decode_step");
+        let logits = decode_step(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            tok,
+            pos as u32,
+            RetainedFixtureEvidence::ABSENT,
+            DecodeExecutionMode::Oracle,
+        )
+        .expect("decode_step");
         all_logits.push(logits);
     }
     all_logits

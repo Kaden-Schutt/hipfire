@@ -47,12 +47,21 @@ fn run() -> Result<String, Outcome> {
         }
     }
 
-    let d_a = gpu.upload_f32(&a, &[m, k]).map_err(|e| Outcome::Fail(format!("upload A failed: {e}")))?;
-    let d_x = gpu.upload_f32(&x, &[k]).map_err(|e| Outcome::Fail(format!("upload x failed: {e}")))?;
-    let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).map_err(|e| Outcome::Fail(format!("alloc y failed: {e}")))?;
+    let d_a = gpu
+        .upload_f32(&a, &[m, k])
+        .map_err(|e| Outcome::Fail(format!("upload A failed: {e}")))?;
+    let d_x = gpu
+        .upload_f32(&x, &[k])
+        .map_err(|e| Outcome::Fail(format!("upload x failed: {e}")))?;
+    let d_y = gpu
+        .zeros(&[m], rdna_compute::DType::F32)
+        .map_err(|e| Outcome::Fail(format!("alloc y failed: {e}")))?;
 
-    gpu.gemv_f32(&d_a, &d_x, &d_y).map_err(|e| Outcome::Fail(format!("gemv_f32 failed: {e}")))?;
-    let y_gpu = gpu.download_f32(&d_y).map_err(|e| Outcome::Fail(format!("download failed: {e}")))?;
+    gpu.gemv_f32(&d_a, &d_x, &d_y)
+        .map_err(|e| Outcome::Fail(format!("gemv_f32 failed: {e}")))?;
+    let y_gpu = gpu
+        .download_f32(&d_y)
+        .map_err(|e| Outcome::Fail(format!("download failed: {e}")))?;
 
     let mut max_err = 0.0f32;
     let mut errors = 0usize;
@@ -64,12 +73,17 @@ fn run() -> Result<String, Outcome> {
         }
     }
 
-    gpu.free_tensor(d_a).map_err(|e| Outcome::Fail(format!("free A failed: {e}")))?;
-    gpu.free_tensor(d_x).map_err(|e| Outcome::Fail(format!("free x failed: {e}")))?;
-    gpu.free_tensor(d_y).map_err(|e| Outcome::Fail(format!("free y failed: {e}")))?;
+    gpu.free_tensor(d_a)
+        .map_err(|e| Outcome::Fail(format!("free A failed: {e}")))?;
+    gpu.free_tensor(d_x)
+        .map_err(|e| Outcome::Fail(format!("free x failed: {e}")))?;
+    gpu.free_tensor(d_y)
+        .map_err(|e| Outcome::Fail(format!("free y failed: {e}")))?;
 
     if errors > 0 {
-        Err(Outcome::Fail(format!("{errors}/{m} rows exceeded tolerance, max_err={max_err:.6}")))
+        Err(Outcome::Fail(format!(
+            "{errors}/{m} rows exceeded tolerance, max_err={max_err:.6}"
+        )))
     } else {
         Ok(format!("{}x{} max_err={max_err:.6}", m, k))
     }

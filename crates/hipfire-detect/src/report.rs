@@ -200,10 +200,7 @@ mod tests {
 
     #[test]
     fn overall_ok() {
-        let r = Report::new(
-            header(),
-            vec![("a", Verdict::Ok), ("b", Verdict::Ok)],
-        );
+        let r = Report::new(header(), vec![("a", Verdict::Ok), ("b", Verdict::Ok)]);
         assert_eq!(r.overall_label(), "OK");
         assert_eq!(r.hard_fails, 0);
     }
@@ -238,10 +235,7 @@ mod tests {
 
     #[test]
     fn pipe_in_detail_escaped() {
-        let r = Report::new(
-            header(),
-            vec![("x", Verdict::fail("a|b|c"))],
-        );
+        let r = Report::new(header(), vec![("x", Verdict::fail("a|b|c"))]);
         let md = r.to_markdown();
         // The escaped pipe should not appear as a raw delimiter.
         assert!(md.contains("a\\|b\\|c"));

@@ -1278,6 +1278,57 @@ pub fn weight_gemv_prerotated(
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
 }
 
+/// Residual GEMV using an activation already rotated for MQ weights.
+///
+/// This is the residual-preserving counterpart to `weight_gemv_prerotated`.
+/// When `x_rot` is present for a rotation-needing dtype, the rotated buffer
+/// feeds the fused `y += W * x` kernel directly. Other cases retain the
+/// established `weight_gemv_residual` route.
+pub fn weight_gemv_prerotated_residual(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    x_rot: Option<&GpuTensor>,
+    y: &GpuTensor,
+) -> HipResult<()> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
+    use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant};
+
+    if dtype_needs_rotation(w.gpu_dtype) {
+        if let Some(xr) = x_rot {
+            let gemv = crate::llama::gemv_family();
+            let ctx = DispatchCtx::new(gpu);
+            let wr = WeightRef {
+                buf: &w.buf,
+                dtype: w.gpu_dtype,
+                m: w.m,
+                k: w.k,
+                row_stride: 0,
+                rotation: None,
+                awq_scale: None,
+            };
+            return gemv
+                .run(
+                    &ctx,
+                    gpu,
+                    &GemvParams {
+                        w: &wr,
+                        x: xr,
+                        y,
+                        variant: GemvVariant::WithResidual,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                )
+                .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()));
+        }
+    }
+
+    weight_gemv_residual(gpu, w, x, y)
+}
+
 /// Weight GEMV with fused residual add: `y += W * x`.
 ///
 /// For HFQ4-G256 weights, routes through `gemv_hfq4g256_residual`, which

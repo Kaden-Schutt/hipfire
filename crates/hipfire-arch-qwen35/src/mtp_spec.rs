@@ -2421,7 +2421,10 @@ pub fn spec_step_mtp_compressed_serial(
         (true, false) => DraftMode::Greedy,
     };
     let use_p_min = matches!(draft_mode, DraftMode::PMin { .. });
-    let use_sampling = matches!(draft_mode, DraftMode::Sampled | DraftMode::SampledPMin { .. });
+    let use_sampling = matches!(
+        draft_mode,
+        DraftMode::Sampled | DraftMode::SampledPMin { .. }
+    );
     let use_sampled_pmin = matches!(draft_mode, DraftMode::SampledPMin { .. });
     let log_p_min = match draft_mode {
         DraftMode::PMin { log_p_min } | DraftMode::SampledPMin { log_p_min } => log_p_min,

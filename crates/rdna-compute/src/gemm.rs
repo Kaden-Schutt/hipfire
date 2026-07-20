@@ -2361,20 +2361,7 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.fused_qkv_hfq4g256_impl(
-            a_q,
-            a_k,
-            a_v,
-            x,
-            y_q,
-            y_k,
-            y_v,
-            q_m,
-            k_m,
-            v_m,
-            k,
-            None,
-        )
+        self.fused_qkv_hfq4g256_impl(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, None)
     }
 
     /// Qwen2-only bias-fold entry. It uses a distinct kernel symbol and kernarg
@@ -2833,21 +2820,18 @@ impl Gpu {
         let rdna3_wavepack4 = self.arch_caps.is_rdna3_dgpu()
             && self.flags.rdna3_hfq4_qkvza_wavepack4
             && total_m <= 2_048;
-        let rdna3_ldsx8 = self.arch_caps.is_gfx1100()
-            && self.flags.rdna3_hfq4_qkvza_ldsx8
-            && k == 2_048;
+        let rdna3_ldsx8 =
+            self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_ldsx8 && k == 2_048;
         let rdna3_reduce_chain =
             self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_reduce_chain;
-        let rdna3_k2048 = self.arch_caps.is_gfx1100()
-            && self.flags.rdna3_hfq4_qkvza_k2048
-            && k == 2_048;
+        let rdna3_k2048 =
+            self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 && k == 2_048;
         static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
                 std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
-                    || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA").as_deref()
-                        == Ok("1")
+                    || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA").as_deref() == Ok("1")
             });
         static GFX1151_QKVZA_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_all_buffer = self.arch_caps.is_gfx1151()
@@ -2904,9 +2888,8 @@ impl Gpu {
         static GFX1151_QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_r2 = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKVZA_R2.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_R2").as_deref() == Ok("1")
-            });
+            && *GFX1151_QKVZA_R2
+                .get_or_init(|| std::env::var("HIPFIRE_GFX1151_QKVZA_R2").as_deref() == Ok("1"));
         static GFX1151_QKVZA_R2_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_r2_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
@@ -2932,14 +2915,12 @@ impl Gpu {
             });
         static QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_r2 = rdna3_k2048
-            && *QKVZA_R2.get_or_init(|| {
-                std::env::var("HIPFIRE_RDNA3_QKVZA_R2").as_deref() == Ok("1")
-            });
+            && *QKVZA_R2
+                .get_or_init(|| std::env::var("HIPFIRE_RDNA3_QKVZA_R2").as_deref() == Ok("1"));
         static QKVZA_CPOL_SLC: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_cpol_slc = rdna3_k2048
-            && *QKVZA_CPOL_SLC.get_or_init(|| {
-                std::env::var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc")
-            });
+            && *QKVZA_CPOL_SLC
+                .get_or_init(|| std::env::var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc"));
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let (func_name, block, grid_x) = if rdna3_ldsx8 {
@@ -3010,11 +2991,7 @@ impl Gpu {
                 kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC,
                 "fused_qkvza_hfq4g256_k2048",
             )?;
-            (
-                "fused_qkvza_hfq4g256_k2048",
-                [32u32, 1, 1],
-                total_m as u32,
-            )
+            ("fused_qkvza_hfq4g256_k2048", [32u32, 1, 1], total_m as u32)
         } else if gfx1151_wave64_share_x {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_wave64_share_x_gfx1151",

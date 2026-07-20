@@ -116,6 +116,57 @@ impl Gpu {
         )
     }
 
+    /// Apply Hugging Face's multiplicative repetition penalty in place.
+    ///
+    /// `unique_tokens[0..unique_count]` must be deduplicated so each logit is
+    /// transformed exactly once. This launch deliberately bypasses retained
+    /// recording: sampling follows a completed forward/replay and is not part
+    /// of the stationary decode tape.
+    pub fn apply_hf_repetition_penalty_f32(
+        &mut self,
+        logits: &GpuTensor,
+        unique_tokens: &GpuTensor,
+        unique_count: usize,
+        vocab_size: usize,
+        penalty: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if unique_count == 0 || penalty == 1.0 {
+            return Ok(());
+        }
+        debug_assert!(unique_count <= i32::MAX as usize);
+        debug_assert!(vocab_size <= i32::MAX as usize);
+        debug_assert!(unique_count * std::mem::size_of::<u32>() <= unique_tokens.buf.size());
+
+        let kernel = "apply_hf_repetition_penalty_f32";
+        self.ensure_kernel(kernel, kernels::APPLY_HF_REPETITION_PENALTY_SRC, kernel)?;
+        let func = &self.functions[kernel];
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut tokens_ptr = unique_tokens.buf.as_ptr();
+        let mut count = unique_count as i32;
+        let mut vocab = vocab_size as i32;
+        let mut repeat_penalty = penalty;
+        let mut params: [*mut c_void; 5] = [
+            &mut logits_ptr as *mut _ as *mut c_void,
+            &mut tokens_ptr as *mut _ as *mut c_void,
+            &mut count as *mut _ as *mut c_void,
+            &mut vocab as *mut _ as *mut c_void,
+            &mut repeat_penalty as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (unique_count as u32).div_ceil(block);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.bind_thread()?;

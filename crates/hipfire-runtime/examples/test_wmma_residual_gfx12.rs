@@ -55,13 +55,13 @@ fn main() {
     //   - shape that mirrors a real 9B residual call site (intermediate=12288 → dim=4096)
     let shapes: &[(usize, usize, usize)] = &[
         // (M, K, N)
-        (16, 256, 16),    // minimal: 1 row-tile, 1 K-grp, 1 batch-tile
-        (16, 512, 16),    // K=2 groups: exercises K accumulation
-        (16, 256, 32),    // batch=2 tiles
-        (32, 256, 16),    // row=2 tiles
-        (32, 512, 32),    // multi-tile in every dim
-        (64, 1024, 32),   // larger but still tractable
-        (4096, 1024, 16), // 9B-shape band: exercises real M/N ratio at small K
+        (16, 256, 16),     // minimal: 1 row-tile, 1 K-grp, 1 batch-tile
+        (16, 512, 16),     // K=2 groups: exercises K accumulation
+        (16, 256, 32),     // batch=2 tiles
+        (32, 256, 16),     // row=2 tiles
+        (32, 512, 32),     // multi-tile in every dim
+        (64, 1024, 32),    // larger but still tractable
+        (4096, 1024, 16),  // 9B-shape band: exercises real M/N ratio at small K
         (3072, 1024, 2),   // LFM2.5-350M conv-in partial batch tile
         (1024, 1024, 2),   // LFM2.5-350M conv/attention-out partial tile
         (1024, 4608, 2),   // LFM2.5-350M dense-down partial tile

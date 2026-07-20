@@ -77,7 +77,12 @@ fn main() -> Result<(), String> {
     let gpu_main_x = gpu
         .download_f32(&main_x_dev)
         .map_err(|e| format!("d2h main_x: {e:?}"))?;
-    let check_a = parity_stats("(a) main_x = hidden_norm(fc(main_hidden))", &gpu_main_x, &cpu_main_x, 0.999);
+    let check_a = parity_stats(
+        "(a) main_x = hidden_norm(fc(main_hidden))",
+        &gpu_main_x,
+        &cpu_main_x,
+        0.999,
+    );
 
     // (b) x_head = norm(dspark_qwen3_block_forward(...))  [pre-norm out → rmsnorm]
     let scratch = Qwen3DsparkScratch::new(&mut gpu, &assets.config, block, 1)
@@ -115,7 +120,12 @@ fn main() -> Result<(), String> {
     let gpu_x_head = gpu
         .download_f32(&x_head_normed)
         .map_err(|e| format!("d2h x_head: {e:?}"))?;
-    let check_b = parity_stats("(b) x_head = norm(block_forward)", &gpu_x_head, &cpu_x_head, 0.999);
+    let check_b = parity_stats(
+        "(b) x_head = norm(block_forward)",
+        &gpu_x_head,
+        &cpu_x_head,
+        0.999,
+    );
 
     // (c) heads: run_heads on the (correct) pre-norm x_head → draft tokens.
     // Dumps the pre-norm x_head so a numpy heads-reference can compare on the
@@ -142,11 +152,17 @@ fn main() -> Result<(), String> {
         .download_f32(&x_head_dev)
         .map_err(|e| format!("d2h x_head prenorm: {e:?}"))?;
     let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(x_head_prenorm.as_ptr() as *const u8, x_head_prenorm.len() * 4)
+        std::slice::from_raw_parts(
+            x_head_prenorm.as_ptr() as *const u8,
+            x_head_prenorm.len() * 4,
+        )
     };
     std::fs::write("/tmp/hipfire_x_head_prenorm.f32bin", bytes)
         .map_err(|e| format!("write x_head prenorm: {e}"))?;
-    eprintln!("draft_vocab={draft_vocab}  hipfire drafts (target ids): {:?}", draft.tokens);
+    eprintln!(
+        "draft_vocab={draft_vocab}  hipfire drafts (target ids): {:?}",
+        draft.tokens
+    );
     eprintln!("wrote /tmp/hipfire_x_head_prenorm.f32bin (pre-norm x_head, for numpy heads check)");
 
     println!("\nORNITH Qwen3.5 DSpark GPU-vs-CPU x_head parity (seed_tok={SEED_TOK} block={block} n_rot={n_rot}):");
@@ -164,7 +180,9 @@ fn main() -> Result<(), String> {
         println!("\nPARITY PASS — drafter forward matches the CPU reference");
         Ok(())
     } else {
-        println!("\nPARITY FAIL — drafter forward diverges. (a) fc-ingest, (b) block-attention forward.");
+        println!(
+            "\nPARITY FAIL — drafter forward diverges. (a) fc-ingest, (b) block-attention forward."
+        );
         Err("parity fail".into())
     }
 }
@@ -186,7 +204,12 @@ struct ParityCheck {
     pass: bool,
 }
 
-fn parity_stats(name: &'static str, gpu: &[f32], cpu: &[f32], cosine_threshold: f32) -> ParityCheck {
+fn parity_stats(
+    name: &'static str,
+    gpu: &[f32],
+    cpu: &[f32],
+    cosine_threshold: f32,
+) -> ParityCheck {
     let n = gpu.len().min(cpu.len());
     let (mut dot, mut ng, mut nc, mut max_abs) = (0.0f64, 0.0f64, 0.0f64, 0.0f32);
     for i in 0..n {
@@ -225,7 +248,11 @@ fn load_f32bin(path: impl AsRef<Path>) -> Result<Vec<f32>, String> {
     let bytes = std::fs::read(path.as_ref())
         .map_err(|e| format!("read {}: {e}", path.as_ref().display()))?;
     if bytes.len() % 4 != 0 {
-        return Err(format!("{}: size {} not /4", path.as_ref().display(), bytes.len()));
+        return Err(format!(
+            "{}: size {} not /4",
+            path.as_ref().display(),
+            bytes.len()
+        ));
     }
     let n = bytes.len() / 4;
     let mut v = vec![0.0f32; n];

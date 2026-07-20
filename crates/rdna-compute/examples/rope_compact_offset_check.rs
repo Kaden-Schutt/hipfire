@@ -19,14 +19,19 @@ fn lcg(seed: u64, n: usize) -> Vec<f32> {
     let mut s = seed | 1;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         })
         .collect()
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 fn main() {
@@ -39,7 +44,10 @@ fn main() {
     let k_off = 137i32; // stand-in for a post-eviction compact_offset
 
     let mut gpu = Gpu::init().expect("GPU init");
-    eprintln!("GPU: {}  (b={b} nhq={n_heads_q} nhk={n_heads_k} hd={head_dim} n_rot={n_rot} K={k_off})", gpu.arch);
+    eprintln!(
+        "GPU: {}  (b={b} nhq={n_heads_q} nhk={n_heads_k} hd={head_dim} n_rot={n_rot} K={k_off})",
+        gpu.arch
+    );
 
     let q_src = lcg(0xA5A5, b * n_heads_q * head_dim);
     let k_src = lcg(0xC3C3, b * n_heads_k * head_dim);
@@ -56,8 +64,14 @@ fn main() {
     // Run A: positions = [K, K+1, K+2, K+3], offset = 0
     let qa = gpu.upload_f32(&q_src, &[q_src.len()]).unwrap();
     let ka = gpu.upload_f32(&k_src, &[k_src.len()]).unwrap();
-    let pos_a = pos_tensor(&mut gpu, &(0..b as i32).map(|i| k_off + i).collect::<Vec<_>>());
-    gpu.rope_partial_interleaved_f32_batched(&qa, &ka, &pos_a, n_heads_q, n_heads_k, head_dim, n_rot, freq_base, b, 0).unwrap();
+    let pos_a = pos_tensor(
+        &mut gpu,
+        &(0..b as i32).map(|i| k_off + i).collect::<Vec<_>>(),
+    );
+    gpu.rope_partial_interleaved_f32_batched(
+        &qa, &ka, &pos_a, n_heads_q, n_heads_k, head_dim, n_rot, freq_base, b, 0,
+    )
+    .unwrap();
     let qa_out = gpu.download_f32(&qa).unwrap();
     let ka_out = gpu.download_f32(&ka).unwrap();
 
@@ -65,7 +79,10 @@ fn main() {
     let qb = gpu.upload_f32(&q_src, &[q_src.len()]).unwrap();
     let kb = gpu.upload_f32(&k_src, &[k_src.len()]).unwrap();
     let pos_b = pos_tensor(&mut gpu, &(0..b as i32).collect::<Vec<_>>());
-    gpu.rope_partial_interleaved_f32_batched(&qb, &kb, &pos_b, n_heads_q, n_heads_k, head_dim, n_rot, freq_base, b, k_off).unwrap();
+    gpu.rope_partial_interleaved_f32_batched(
+        &qb, &kb, &pos_b, n_heads_q, n_heads_k, head_dim, n_rot, freq_base, b, k_off,
+    )
+    .unwrap();
     let qb_out = gpu.download_f32(&qb).unwrap();
     let kb_out = gpu.download_f32(&kb).unwrap();
 
@@ -82,7 +99,10 @@ fn main() {
     let kt = gpu.upload_f32(&k1, &[k1.len()]).unwrap();
     let pos_buf = gpu.hip.malloc(4).unwrap();
     gpu.hip.memcpy_htod(&pos_buf, &k_off.to_ne_bytes()).unwrap();
-    gpu.rope_partial_interleaved_f32(&qt, &kt, &pos_buf, n_heads_q, n_heads_k, head_dim, n_rot, freq_base).unwrap();
+    gpu.rope_partial_interleaved_f32(
+        &qt, &kt, &pos_buf, n_heads_q, n_heads_k, head_dim, n_rot, freq_base,
+    )
+    .unwrap();
     let qt_out = gpu.download_f32(&qt).unwrap();
     let kt_out = gpu.download_f32(&kt).unwrap();
 
@@ -90,7 +110,10 @@ fn main() {
     let qc = gpu.upload_f32(&q1, &[q1.len()]).unwrap();
     let kc = gpu.upload_f32(&k1, &[k1.len()]).unwrap();
     let pos_c = pos_tensor(&mut gpu, &[0]);
-    gpu.rope_partial_interleaved_f32_batched(&qc, &kc, &pos_c, n_heads_q, n_heads_k, head_dim, n_rot, freq_base, 1, k_off).unwrap();
+    gpu.rope_partial_interleaved_f32_batched(
+        &qc, &kc, &pos_c, n_heads_q, n_heads_k, head_dim, n_rot, freq_base, 1, k_off,
+    )
+    .unwrap();
     let qc_out = gpu.download_f32(&qc).unwrap();
     let kc_out = gpu.download_f32(&kc).unwrap();
 

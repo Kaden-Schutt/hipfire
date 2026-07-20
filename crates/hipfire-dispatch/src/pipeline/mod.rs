@@ -282,9 +282,8 @@ pub fn run_moe_decode(
         && p.k == 8
         && p.expert_dtype_tags.is_none()
         && p.dtypes.routed_down == DType::MQ4G256
-        && *DOWN_LAST_COMBINE.get_or_init(|| {
-            std::env::var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
-        });
+        && *DOWN_LAST_COMBINE
+            .get_or_init(|| std::env::var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1"));
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {

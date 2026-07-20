@@ -53,23 +53,29 @@ impl Device {
         let code_buf = self.alloc_vram(module.elf.len() as u64)?;
         self.upload(&code_buf, &module.elf)?;
 
-        let kernels: Vec<Kernel> = module.kernels.iter().map(|km| {
-            let kd_off = km.kd_offset as usize;
-            let kcp = if kd_off + 58 <= module.elf.len() {
-                u16::from_le_bytes([module.elf[kd_off + 56], module.elf[kd_off + 57]])
-            } else {
-                0
-            };
-            Kernel::from_meta(km, code_buf.gpu_addr, kcp)
-        }).collect();
+        let kernels: Vec<Kernel> = module
+            .kernels
+            .iter()
+            .map(|km| {
+                let kd_off = km.kd_offset as usize;
+                let kcp = if kd_off + 58 <= module.elf.len() {
+                    u16::from_le_bytes([module.elf[kd_off + 56], module.elf[kd_off + 57]])
+                } else {
+                    0
+                };
+                Kernel::from_meta(km, code_buf.gpu_addr, kcp)
+            })
+            .collect();
 
         Ok(LoadedModule { kernels, code_buf })
     }
 
     /// Load a .hsaco file from disk.
     pub fn load_module_file(&self, path: &str) -> Result<LoadedModule> {
-        let data = std::fs::read(path)
-            .map_err(|e| RedlineError { code: -1, message: format!("read {path}: {e}") })?;
+        let data = std::fs::read(path).map_err(|e| RedlineError {
+            code: -1,
+            message: format!("read {path}: {e}"),
+        })?;
         self.load_module(&data)
     }
 }
@@ -82,16 +88,28 @@ impl Kernel {
         let mut count = 0u32;
         let mut kernarg_idx = None;
 
-        if kcp & (1 << 0) != 0 { count += 4; } // private segment buffer
-        if kcp & (1 << 1) != 0 { count += 2; } // dispatch ptr
-        if kcp & (1 << 2) != 0 { count += 2; } // queue ptr
+        if kcp & (1 << 0) != 0 {
+            count += 4;
+        } // private segment buffer
+        if kcp & (1 << 1) != 0 {
+            count += 2;
+        } // dispatch ptr
+        if kcp & (1 << 2) != 0 {
+            count += 2;
+        } // queue ptr
         if kcp & (1 << 3) != 0 {
             kernarg_idx = Some(count);
             count += 2; // kernarg segment ptr
         }
-        if kcp & (1 << 4) != 0 { count += 2; } // dispatch id
-        if kcp & (1 << 5) != 0 { count += 2; } // flat scratch init
-        if kcp & (1 << 6) != 0 { count += 1; } // private segment size
+        if kcp & (1 << 4) != 0 {
+            count += 2;
+        } // dispatch id
+        if kcp & (1 << 5) != 0 {
+            count += 2;
+        } // flat scratch init
+        if kcp & (1 << 6) != 0 {
+            count += 1;
+        } // private segment size
 
         Kernel {
             name: km.name.clone(),
@@ -113,7 +131,9 @@ impl Kernel {
 
 impl CommandBuffer {
     pub fn new() -> Self {
-        Self { dwords: Vec::with_capacity(512) }
+        Self {
+            dwords: Vec::with_capacity(512),
+        }
     }
 
     /// Append a single dispatch to this command buffer.
@@ -182,8 +202,14 @@ impl CommandBuffer {
 
     /// Append a dispatch with explicit dynamic LDS (shared memory) size.
     /// `lds_bytes` is the dynamic shared memory in bytes (added to kernel's static LDS).
-    pub fn dispatch_with_lds(&mut self, k: &Kernel, grid: [u32; 3], block: [u32; 3],
-                              kernarg_va: u64, lds_bytes: u32) {
+    pub fn dispatch_with_lds(
+        &mut self,
+        k: &Kernel,
+        grid: [u32; 3],
+        block: [u32; 3],
+        kernarg_va: u64,
+        lds_bytes: u32,
+    ) {
         let d = &mut self.dwords;
 
         // COMPUTE_PGM_LO/HI
@@ -264,9 +290,9 @@ impl CommandBuffer {
         // RELEASE_MEM: wait for prior dispatches + flush caches + write fence value.
         // Encoding verified in C (test_release_mem.c + test_wrm.c).
         // CRITICAL: header uses PACKET3() WITHOUT SHADER_TYPE bit.
-        d.push(0xC006_4900);  // PACKET3(RELEASE_MEM, 6), NO shader_type
-        d.push(0x0660_3514);  // event + GCR flags (from nvd.h, matches kernel driver)
-        d.push(0x2000_0000);  // DATA_SEL(1) = 32-bit write
+        d.push(0xC006_4900); // PACKET3(RELEASE_MEM, 6), NO shader_type
+        d.push(0x0660_3514); // event + GCR flags (from nvd.h, matches kernel driver)
+        d.push(0x2000_0000); // DATA_SEL(1) = 32-bit write
         d.push(fence_va as u32);
         d.push((fence_va >> 32) as u32);
         d.push(fence_value);
@@ -274,13 +300,13 @@ impl CommandBuffer {
         d.push(0);
 
         // WAIT_REG_MEM: poll fence_va until value == fence_value.
-        d.push(0xC005_3C00);  // PACKET3(WAIT_REG_MEM, 5), NO shader_type
-        d.push(0x0000_0013);  // MEM_SPACE=1(memory) | FUNCTION=3(equal)
+        d.push(0xC005_3C00); // PACKET3(WAIT_REG_MEM, 5), NO shader_type
+        d.push(0x0000_0013); // MEM_SPACE=1(memory) | FUNCTION=3(equal)
         d.push(fence_va as u32);
         d.push((fence_va >> 32) as u32);
         d.push(fence_value);
-        d.push(0xFFFF_FFFF);  // mask
-        d.push(4);             // poll interval
+        d.push(0xFFFF_FFFF); // mask
+        d.push(4); // poll interval
     }
 
     /// Number of PM4 dwords in this command buffer.
@@ -309,7 +335,11 @@ impl DispatchQueue {
         let queue = ComputeQueue::new(dev)?;
         let ib_buf = dev.alloc_vram(IB_SIZE)?;
         let ka_buf = dev.alloc_vram(KA_SIZE)?;
-        Ok(Self { queue, ib_buf, ka_buf })
+        Ok(Self {
+            queue,
+            ib_buf,
+            ka_buf,
+        })
     }
 
     /// Single dispatch: upload args, build PM4, submit, wait.
@@ -350,7 +380,13 @@ impl DispatchQueue {
             w(hidden_off + 16, &(block[2] as u16).to_le_bytes());
             // remainder = 0 for uniform work groups (already zeroed)
             // grid_dims
-            let ndims = if grid[2] > 1 { 3u16 } else if grid[1] > 1 { 2 } else { 1 };
+            let ndims = if grid[2] > 1 {
+                3u16
+            } else if grid[1] > 1 {
+                2
+            } else {
+                1
+            };
             w(hidden_off + 64, &ndims.to_le_bytes());
         }
         dev.upload(&self.ka_buf, &ka_data)?;
@@ -367,26 +403,26 @@ impl DispatchQueue {
         let mut bos: Vec<&GpuBuffer> = vec![&self.ib_buf, &self.ka_buf];
         bos.extend_from_slice(extra_bos);
 
-        self.queue.submit_and_wait(dev, &self.ib_buf, cb.len_dwords(), &bos)
+        self.queue
+            .submit_and_wait(dev, &self.ib_buf, cb.len_dwords(), &bos)
     }
 
     /// Submit a pre-built command buffer. Caller manages kernarg separately.
-    pub fn submit(
-        &self,
-        dev: &Device,
-        cb: &CommandBuffer,
-        bos: &[&GpuBuffer],
-    ) -> Result<()> {
+    pub fn submit(&self, dev: &Device, cb: &CommandBuffer, bos: &[&GpuBuffer]) -> Result<()> {
         let ib_bytes = cb.as_bytes();
         if ib_bytes.len() as u64 > IB_SIZE {
-            return Err(RedlineError { code: -1, message: "command buffer exceeds IB size".into() });
+            return Err(RedlineError {
+                code: -1,
+                message: "command buffer exceeds IB size".into(),
+            });
         }
         dev.upload(&self.ib_buf, &ib_bytes)?;
 
         let mut all_bos: Vec<&GpuBuffer> = vec![&self.ib_buf];
         all_bos.extend_from_slice(bos);
 
-        self.queue.submit_and_wait(dev, &self.ib_buf, cb.len_dwords(), &all_bos)
+        self.queue
+            .submit_and_wait(dev, &self.ib_buf, cb.len_dwords(), &all_bos)
     }
 
     /// Get a reference to the persistent kernarg buffer.
@@ -406,8 +442,8 @@ pub struct FastDispatch {
     pub queue: ComputeQueue,
     ib_buf: GpuBuffer,
     ka_buf: GpuBuffer,
-    ib_ptr: *mut u8,    // persistent CPU mapping of IB
-    ka_ptr: *mut u8,    // persistent CPU mapping of kernarg
+    ib_ptr: *mut u8,                                // persistent CPU mapping of IB
+    ka_ptr: *mut u8,                                // persistent CPU mapping of kernarg
     bo_list_handle: crate::drm::AmdgpuBoListHandle, // persistent BO list
 }
 
@@ -425,12 +461,18 @@ impl FastDispatch {
         let mut ib_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let ret = unsafe { (dev.drm.bo_cpu_map)(ib_buf.handle, &mut ib_ptr) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: "map IB failed".into() });
+            return Err(RedlineError {
+                code: ret,
+                message: "map IB failed".into(),
+            });
         }
         let mut ka_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let ret = unsafe { (dev.drm.bo_cpu_map)(ka_buf.handle, &mut ka_ptr) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: "map KA failed".into() });
+            return Err(RedlineError {
+                code: ret,
+                message: "map KA failed".into(),
+            });
         }
 
         // Persistent BO list including IB + KA + all extra buffers
@@ -439,15 +481,25 @@ impl FastDispatch {
         let prios = vec![0u8; bo_handles.len()];
         let mut bo_list: crate::drm::AmdgpuBoListHandle = std::ptr::null_mut();
         let ret = unsafe {
-            (dev.drm.bo_list_create)(dev.handle, bo_handles.len() as u32,
-                bo_handles.as_ptr(), prios.as_ptr(), &mut bo_list)
+            (dev.drm.bo_list_create)(
+                dev.handle,
+                bo_handles.len() as u32,
+                bo_handles.as_ptr(),
+                prios.as_ptr(),
+                &mut bo_list,
+            )
         };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: "bo_list_create failed".into() });
+            return Err(RedlineError {
+                code: ret,
+                message: "bo_list_create failed".into(),
+            });
         }
 
         Ok(Self {
-            queue, ib_buf, ka_buf,
+            queue,
+            ib_buf,
+            ka_buf,
             ib_ptr: ib_ptr as *mut u8,
             ka_ptr: ka_ptr as *mut u8,
             bo_list_handle: bo_list,
@@ -500,7 +552,8 @@ impl FastDispatch {
         }
 
         // Submit with persistent BO list — only the ioctl remains
-        self.queue.submit_with_bo_list(dev, &self.ib_buf, cb.len_dwords(), self.bo_list_handle)
+        self.queue
+            .submit_with_bo_list(dev, &self.ib_buf, cb.len_dwords(), self.bo_list_handle)
     }
 
     /// Get a reference to the persistent kernarg buffer.
@@ -514,7 +567,8 @@ impl FastDispatch {
         unsafe {
             std::ptr::copy_nonoverlapping(ib_bytes.as_ptr(), self.ib_ptr, ib_bytes.len());
         }
-        self.queue.submit_with_bo_list(dev, &self.ib_buf, cb.len_dwords(), self.bo_list_handle)
+        self.queue
+            .submit_with_bo_list(dev, &self.ib_buf, cb.len_dwords(), self.bo_list_handle)
     }
 
     pub fn destroy(self, dev: &Device) {
@@ -535,7 +589,9 @@ pub struct KernargBuilder {
 
 impl KernargBuilder {
     pub fn new(capacity: usize) -> Self {
-        Self { data: vec![0u8; capacity] }
+        Self {
+            data: vec![0u8; capacity],
+        }
     }
 
     pub fn write_u32(&mut self, offset: usize, val: u32) -> &mut Self {

@@ -19,8 +19,8 @@ use rdna_compute::Gpu;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let gate_m: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(128);
-    let up_m: usize   = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(128);
-    let k: usize      = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let up_m: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(128);
+    let k: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     assert!(k % 256 == 0, "K must be a multiple of 256");
 
@@ -40,10 +40,14 @@ fn main() {
 
     // Random weights (deterministic, two distinct seeds for gate/up).
     let gate_bytes = synth_hfq4g256_weights(gate_m, groups_per_row, 0xC0DE_FACEu64);
-    let up_bytes   = synth_hfq4g256_weights(up_m,   groups_per_row, 0xDEAD_BEEFu64);
+    let up_bytes = synth_hfq4g256_weights(up_m, groups_per_row, 0xDEAD_BEEFu64);
 
-    let a_gate = gpu.upload_raw(&gate_bytes, &[gate_m * row_bytes]).expect("upload gate");
-    let a_up   = gpu.upload_raw(&up_bytes,   &[up_m   * row_bytes]).expect("upload up");
+    let a_gate = gpu
+        .upload_raw(&gate_bytes, &[gate_m * row_bytes])
+        .expect("upload gate");
+    let a_up = gpu
+        .upload_raw(&up_bytes, &[up_m * row_bytes])
+        .expect("upload up");
 
     // Random activations.
     let x_host: Vec<f32> = (0..k)
@@ -55,10 +59,18 @@ fn main() {
     let x = gpu.upload_f32(&x_host, &[k]).expect("upload x");
 
     // Allocate output tensors.
-    let y_gate_fp   = gpu.upload_f32(&vec![0f32; gate_m], &[gate_m]).expect("alloc y_gate_fp");
-    let y_up_fp     = gpu.upload_f32(&vec![0f32; up_m],   &[up_m]).expect("alloc y_up_fp");
-    let y_gate_dp4a = gpu.upload_f32(&vec![0f32; gate_m], &[gate_m]).expect("alloc y_gate_dp4a");
-    let y_up_dp4a   = gpu.upload_f32(&vec![0f32; up_m],   &[up_m]).expect("alloc y_up_dp4a");
+    let y_gate_fp = gpu
+        .upload_f32(&vec![0f32; gate_m], &[gate_m])
+        .expect("alloc y_gate_fp");
+    let y_up_fp = gpu
+        .upload_f32(&vec![0f32; up_m], &[up_m])
+        .expect("alloc y_up_fp");
+    let y_gate_dp4a = gpu
+        .upload_f32(&vec![0f32; gate_m], &[gate_m])
+        .expect("alloc y_gate_dp4a");
+    let y_up_dp4a = gpu
+        .upload_f32(&vec![0f32; up_m], &[up_m])
+        .expect("alloc y_up_dp4a");
 
     // Reference: FP wave64 path.
     eprintln!("running FP reference...");
@@ -67,19 +79,28 @@ fn main() {
 
     // dp4a path.
     eprintln!("running dp4a port...");
-    gpu.fused_gate_up_hfq4g256_dp4a(&a_gate, &a_up, &x, &y_gate_dp4a, &y_up_dp4a, gate_m, up_m, k)
-        .expect("dp4a fused_gate_up");
+    gpu.fused_gate_up_hfq4g256_dp4a(
+        &a_gate,
+        &a_up,
+        &x,
+        &y_gate_dp4a,
+        &y_up_dp4a,
+        gate_m,
+        up_m,
+        k,
+    )
+    .expect("dp4a fused_gate_up");
 
-    let yg_fp   = gpu.download_f32(&y_gate_fp).expect("dl yg_fp");
-    let yu_fp   = gpu.download_f32(&y_up_fp).expect("dl yu_fp");
+    let yg_fp = gpu.download_f32(&y_gate_fp).expect("dl yg_fp");
+    let yu_fp = gpu.download_f32(&y_up_fp).expect("dl yu_fp");
     let yg_dp4a = gpu.download_f32(&y_gate_dp4a).expect("dl yg_dp4a");
     let yu_dp4a = gpu.download_f32(&y_up_dp4a).expect("dl yu_dp4a");
 
     let (gate_max_rel, gate_mean_rel) = compare(&yg_fp, &yg_dp4a, "gate");
-    let (up_max_rel,   up_mean_rel)   = compare(&yu_fp, &yu_dp4a, "up");
+    let (up_max_rel, up_mean_rel) = compare(&yu_fp, &yu_dp4a, "up");
 
-    let pass = gate_max_rel < 0.05 && up_max_rel < 0.05
-            && gate_mean_rel < 0.01 && up_mean_rel < 0.01;
+    let pass =
+        gate_max_rel < 0.05 && up_max_rel < 0.05 && gate_mean_rel < 0.01 && up_mean_rel < 0.01;
     if pass {
         println!("PASS  (max_rel < 5%, mean_rel < 1% on both gate and up)");
     } else {
@@ -96,7 +117,11 @@ fn compare(reference: &[f32], dut: &[f32], label: &str) -> (f32, f32) {
     // pure relative error. Floor the denominator at 1e-2 of the max
     // |reference| to keep the metric meaningful.
     let mut ref_max = 0f32;
-    for &r in reference { if r.is_finite() { ref_max = ref_max.max(r.abs()); } }
+    for &r in reference {
+        if r.is_finite() {
+            ref_max = ref_max.max(r.abs());
+        }
+    }
     let rel_floor = (ref_max * 1e-2).max(1e-6);
 
     let mut max_abs = 0f32;
@@ -106,10 +131,15 @@ fn compare(reference: &[f32], dut: &[f32], label: &str) -> (f32, f32) {
     let mut n_finite = 0usize;
     let mut max_idx = 0usize;
     for (i, (&r, &d)) in reference.iter().zip(dut.iter()).enumerate() {
-        if !r.is_finite() || !d.is_finite() { continue; }
+        if !r.is_finite() || !d.is_finite() {
+            continue;
+        }
         let abs_err = (r - d).abs();
         let rel_err = abs_err / r.abs().max(rel_floor);
-        if rel_err > max_rel { max_rel = rel_err; max_idx = i; }
+        if rel_err > max_rel {
+            max_rel = rel_err;
+            max_idx = i;
+        }
         max_abs = max_abs.max(abs_err);
         sum_abs += abs_err;
         sum_rel += rel_err;
@@ -119,7 +149,10 @@ fn compare(reference: &[f32], dut: &[f32], label: &str) -> (f32, f32) {
     let mean_rel = sum_rel / n_finite as f32;
     eprintln!("  {label}: ref_max={ref_max:.3e} max_abs={max_abs:.3e} max_rel={max_rel:.3e} (idx {max_idx}) mean_abs={mean_abs:.3e} mean_rel={mean_rel:.3e}");
     if max_rel > 0.10 {
-        eprintln!("    sample at max_rel idx {max_idx}: ref={}, dut={}", reference[max_idx], dut[max_idx]);
+        eprintln!(
+            "    sample at max_rel idx {max_idx}: ref={}, dut={}",
+            reference[max_idx], dut[max_idx]
+        );
     }
     (max_rel, mean_rel)
 }
@@ -129,14 +162,20 @@ fn synth_hfq4g256_weights(m: usize, groups_per_row: usize, seed: u64) -> Vec<u8>
     let mut out = vec![0u8; total];
     let mut state = seed;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
 
     let scale_log10 = std::env::var("HFQ_TEST_SCALE_LOG10")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(-3.0);
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(-3.0);
     let zp_max = std::env::var("HFQ_TEST_ZP_MAX")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(1.0);
     let scale_target = 10.0f32.powf(scale_log10);
 
     for row in 0..m {

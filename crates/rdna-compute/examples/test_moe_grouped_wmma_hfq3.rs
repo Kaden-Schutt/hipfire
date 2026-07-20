@@ -11,7 +11,7 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_grouped_wmma_hfq3
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 // FP32 -> FP16 -> FP32 round trip via IEEE 754 binary16 (round to even).
 // Matches the implicit conversion done by `ensure_fp16_x` in the
@@ -123,9 +123,8 @@ fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len()], DType::F32)
         .expect("alloc_tensor f32");
@@ -134,9 +133,8 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len() * 4], DType::Raw)
         .expect("alloc_tensor i32");
@@ -145,9 +143,8 @@ fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     let t = gpu
         .alloc_tensor(&[data.len() * 8], DType::Raw)
         .expect("alloc_tensor u64");
@@ -163,10 +160,11 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 
 fn download_f32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh f32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh f32");
     data
 }
 
@@ -253,19 +251,29 @@ fn cpu_ref(
 
     for tile_y in 0..(m_total / 16) {
         let expert_id = expert_tile_ids[tile_y];
-        if expert_id < 0 { continue; }
+        if expert_id < 0 {
+            continue;
+        }
         let a = &weights[expert_id as usize];
 
         for m_lane in 0..16 {
             let slot_idx = tile_y * 16 + m_lane;
             let flat = sorted_slot_index[slot_idx];
-            if flat < 0 { continue; }
-            let x_row = if x_row_div > 1 { (flat as usize) / x_row_div } else { flat as usize };
+            if flat < 0 {
+                continue;
+            }
+            let x_row = if x_row_div > 1 {
+                (flat as usize) / x_row_div
+            } else {
+                flat as usize
+            };
 
             for row_start in (0..m).step_by(16) {
                 for j_lane in 0..16 {
                     let my_row = row_start + j_lane;
-                    if my_row >= m { continue; }
+                    if my_row >= m {
+                        continue;
+                    }
 
                     let row_off = my_row * bytes_per_row;
                     let mut acc: f32 = 0.0;
@@ -291,14 +299,14 @@ fn cpu_ref(
                                 let b2 = a[dp + 2] as u32;
                                 // Cross-byte 3-bit unpack matching kernel macro.
                                 let unpack = [
-                                     b0        & 7,
-                                    (b0 >> 3)  & 7,
-                                   ((b0 >> 6) | (b1 << 2)) & 7,
-                                    (b1 >> 1)  & 7,
-                                    (b1 >> 4)  & 7,
-                                   ((b1 >> 7) | (b2 << 1)) & 7,
-                                    (b2 >> 2)  & 7,
-                                    (b2 >> 5)  & 7,
+                                    b0 & 7,
+                                    (b0 >> 3) & 7,
+                                    ((b0 >> 6) | (b1 << 2)) & 7,
+                                    (b1 >> 1) & 7,
+                                    (b1 >> 4) & 7,
+                                    ((b1 >> 7) | (b2 << 1)) & 7,
+                                    (b2 >> 2) & 7,
+                                    (b2 >> 5) & 7,
                                 ];
                                 for i in 0..8 {
                                     let k_idx = g * 256 + kt * 16 + k_grp * 8 + i;
@@ -319,8 +327,19 @@ fn cpu_ref(
     y
 }
 
-fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize, seed_w: u32, seed_x: u32) {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+fn run_case(
+    label: &str,
+    m: usize,
+    k: usize,
+    m_total: usize,
+    num_experts: usize,
+    seed_w: u32,
+    seed_x: u32,
+) {
+    println!(
+        "=== {} | M={} K={} m_total={} E={} ===",
+        label, m, k, m_total, num_experts
+    );
     assert!(m % 16 == 0, "M must be a multiple of 16");
     assert!(m_total % 16 == 0, "m_total must be a multiple of 16");
     assert!(k % 256 == 0, "K must be a multiple of 256");
@@ -328,7 +347,10 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
     if !arch.starts_with("gfx12") {
-        println!("  SKIP — arch {} is not gfx12; HFQ3 grouped WMMA only registered for gfx12", arch);
+        println!(
+            "  SKIP — arch {} is not gfx12; HFQ3 grouped WMMA only registered for gfx12",
+            arch
+        );
         return;
     }
 
@@ -370,8 +392,11 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
         1, // x_row_div
         m_total,
         m_total, // x_src_rows
-    ).expect("HFQ3 grouped WMMA launch");
-    gpu.hip.device_synchronize().expect("sync after HFQ3 launch");
+    )
+    .expect("HFQ3 grouped WMMA launch");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after HFQ3 launch");
 
     let y_gpu_v = download_f32(&gpu, &y_gpu, m_total * m);
     let y_ref_v = cpu_ref(&expert_bytes, &tile_ids, &sorted, &x_f32, m, k, 1, m_total);
@@ -382,8 +407,13 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     for (i, (a, b)) in y_gpu_v.iter().zip(y_ref_v.iter()).enumerate() {
         let d = (a - b).abs();
         let r = if b.abs() > 1e-6 { d / b.abs() } else { d };
-        if d > max_abs { max_abs = d; argmax_abs = i; }
-        if r > max_rel { max_rel = r; }
+        if d > max_abs {
+            max_abs = d;
+            argmax_abs = i;
+        }
+        if r > max_rel {
+            max_rel = r;
+        }
     }
     let gpu_sample = y_gpu_v[argmax_abs];
     let ref_sample = y_ref_v[argmax_abs];

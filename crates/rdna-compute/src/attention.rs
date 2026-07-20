@@ -4,10 +4,10 @@
 
 //! Attention, KV cache, DFlash, pflash, triattn, kv_compact, and vision attention dispatch.
 
+use crate::kernels;
 use crate::DType;
 use crate::Gpu;
 use crate::GpuTensor;
-use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -2057,13 +2057,7 @@ impl Gpu {
         output_gate: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let tile_size = q8_flash_tile_size(
-            &self.arch,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            max_seq,
-        );
+        let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;
@@ -2216,11 +2210,7 @@ impl Gpu {
                 )?;
             } else {
                 const KERNEL: &str = "attention_flash_q8_0_reduce";
-                self.ensure_kernel(
-                    KERNEL,
-                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-                    KERNEL,
-                )?;
+                self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, KERNEL)?;
                 let mut params: Vec<*mut c_void> = vec![
                     &p_ptr as *const _ as *mut c_void,
                     &o_ptr as *const _ as *mut c_void,

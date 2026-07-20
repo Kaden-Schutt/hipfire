@@ -33,15 +33,9 @@ fn main() {
 
     for n in LENGTHS {
         let mut seed = 0x51a7_0000u32 ^ n as u32;
-        let bcx: Vec<f32> = (0..n * 3 * CHANNELS)
-            .map(|_| sample(&mut seed))
-            .collect();
-        let initial_state: Vec<f32> = (0..CHANNELS * 2)
-            .map(|_| sample(&mut seed))
-            .collect();
-        let weight: Vec<f32> = (0..CHANNELS * 3)
-            .map(|_| sample(&mut seed))
-            .collect();
+        let bcx: Vec<f32> = (0..n * 3 * CHANNELS).map(|_| sample(&mut seed)).collect();
+        let initial_state: Vec<f32> = (0..CHANNELS * 2).map(|_| sample(&mut seed)).collect();
+        let weight: Vec<f32> = (0..CHANNELS * 3).map(|_| sample(&mut seed)).collect();
 
         let bcx_gpu = gpu.upload_f32(&bcx, &[bcx.len()]).expect("upload bcx");
         let weight_gpu = gpu
@@ -115,9 +109,7 @@ fn main() {
 
         let scan_y = gpu.download_f32(&scan_out).expect("download scan out");
         let eager_y = gpu.download_f32(&eager_out).expect("download eager out");
-        let scan_tail = gpu
-            .download_f32(&scan_state)
-            .expect("download scan state");
+        let scan_tail = gpu.download_f32(&scan_state).expect("download scan state");
         let eager_tail = gpu
             .download_f32(&eager_state)
             .expect("download eager state");

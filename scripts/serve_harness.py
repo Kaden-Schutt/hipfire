@@ -171,7 +171,7 @@ def spawn_serve(cfg, home, log):
         except OSError:
             pass
     conf = {"max_seq": cfg.get("max_seq", 32768), "dflash_mode": "off", "mtp_mode": cfg["mtp"],
-            "ngram_mode": "off", "max_tokens": 16384, "thinking_budget": cfg["thinking_budget"]}
+            "ngram_mode": "off", "max_tokens": cfg["max_tokens"], "thinking_budget": cfg["thinking_budget"]}
     json.dump(conf, open(os.path.join(home, ".hipfire", "config.json"), "w"))
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS

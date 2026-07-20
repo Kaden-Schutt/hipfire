@@ -52,9 +52,7 @@
 
 use hipfire_arch_lfm2moe::config::{Lfm2MoeConfig, MixerKind};
 use hipfire_arch_lfm2moe::forward::{decode_step_capture, forward_prefill_batch_capture};
-use hipfire_arch_lfm2moe::lfm2moe::{
-    Ffn, Lfm2MoeState, Lfm2MoeWeights, Mixer,
-};
+use hipfire_arch_lfm2moe::lfm2moe::{Ffn, Lfm2MoeState, Lfm2MoeWeights, Mixer};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, WeightTensor};
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -241,7 +239,11 @@ fn require_q8_weight(w: &WeightTensor, m: usize, k: usize, name: &str) {
 
 /// Exact discrete topology: bijective layer→conv ring and layer→KV slot maps,
 /// dense-MQ4 projections, Q8 embed/head, Q8 KV, frozen 350M shape.
-fn assert_cohort_and_slot_mapping(cfg: &Lfm2MoeConfig, weights: &Lfm2MoeWeights, state: &Lfm2MoeState) {
+fn assert_cohort_and_slot_mapping(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &Lfm2MoeState,
+) {
     assert_eq!(cfg.hidden_size, 1024, "350M hidden");
     assert_eq!(cfg.vocab_size, 65_536, "350M vocab");
     assert_eq!(cfg.num_attention_heads, 16, "350M n_heads");
@@ -266,7 +268,12 @@ fn assert_cohort_and_slot_mapping(cfg: &Lfm2MoeConfig, weights: &Lfm2MoeWeights,
         "KV must be Q8 (HFQ_Q8_ONLY_POLICY); quant_q8={}",
         state.kv.quant_q8
     );
-    assert!(!state.kv.quant_hfq4 && !state.kv.quant_asym4 && !state.kv.quant_asym3 && !state.kv.quant_asym2);
+    assert!(
+        !state.kv.quant_hfq4
+            && !state.kv.quant_asym4
+            && !state.kv.quant_asym3
+            && !state.kv.quant_asym2
+    );
     assert_eq!(state.kv.n_kv_heads, cfg.num_key_value_heads);
     assert_eq!(state.kv.head_dim, cfg.head_dim);
     assert_eq!(state.kv.k_gpu.len(), cfg.num_attention_layers());
@@ -447,7 +454,8 @@ fn main() {
     );
     let md5 = file_md5(&model);
     assert_eq!(
-        md5, EXPECTED_MODEL_MD5,
+        md5,
+        EXPECTED_MODEL_MD5,
         "model md5 mismatch for {}: got {md5}, expected {EXPECTED_MODEL_MD5}",
         model.display()
     );
@@ -468,16 +476,17 @@ fn main() {
     );
     for &n in &LENGTHS {
         let plan = chunk_coverage_plan(n, chunk_capacity);
-        assert_eq!(plan.iter().sum::<usize>(), n, "chunk plan must cover all tokens");
+        assert_eq!(
+            plan.iter().sum::<usize>(),
+            n,
+            "chunk plan must cover all tokens"
+        );
         assert_eq!(
             plan.len(),
             expected_chunk_count(n, chunk_capacity),
             "N={n} chunk count"
         );
-        println!(
-            "chunk_coverage N={n} chunks={} plan={plan:?}",
-            plan.len()
-        );
+        println!("chunk_coverage N={n} chunks={} plan={plan:?}", plan.len());
     }
 
     let mut gpu = Gpu::init().expect("gpu init");
@@ -565,10 +574,7 @@ fn main() {
         .unwrap_or_else(|e| panic!("batched prefill N={length}: {e}"));
 
         // ---- exact discrete state ----
-        assert_eq!(
-            eager.n_tokens, length,
-            "N={length}: eager n_tokens"
-        );
+        assert_eq!(eager.n_tokens, length, "N={length}: eager n_tokens");
         assert_eq!(
             batched.n_tokens, length,
             "N={length}: batched n_tokens must equal prompt length (chunk plan {plan:?})"
@@ -591,7 +597,10 @@ fn main() {
         assert_eq!(logits_eager.len(), cfg.vocab_size);
         assert_eq!(logits_batched.len(), cfg.vocab_size);
         assert!(
-            logits_eager.iter().chain(&logits_batched).all(|v| v.is_finite()),
+            logits_eager
+                .iter()
+                .chain(&logits_batched)
+                .all(|v| v.is_finite()),
             "N={length}: non-finite logits"
         );
         let (logit_cos, logit_max_abs) = metrics(&logits_eager, &logits_batched);
@@ -678,16 +687,10 @@ fn main() {
             .enumerate()
         {
             for (which, lhs, rhs) in [("K", eager_k, batched_k), ("V", eager_v, batched_v)] {
-                let eager_values = dequant_q8(&download_prefix(
-                    &gpu,
-                    lhs,
-                    length * bytes_per_position,
-                ));
-                let batched_values = dequant_q8(&download_prefix(
-                    &gpu,
-                    rhs,
-                    length * bytes_per_position,
-                ));
+                let eager_values =
+                    dequant_q8(&download_prefix(&gpu, lhs, length * bytes_per_position));
+                let batched_values =
+                    dequant_q8(&download_prefix(&gpu, rhs, length * bytes_per_position));
                 assert_eq!(
                     eager_values.len(),
                     length * cfg.kv_dim(),

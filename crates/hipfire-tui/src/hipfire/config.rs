@@ -153,14 +153,14 @@ impl ConfigState {
     /// changed in easy mode too, not just advanced.
     pub fn easy_override_state(&self) -> Vec<bool> {
         vec![
-            self.is_override("default_model"),                       // Model
-            self.is_override("max_seq"),                             // Context
-            self.is_override("dflash_mode"),                         // Spec decode
-            self.is_override("prefill_compression"),                 // Prefill
-            self.is_override("kv_cache"),                            // KV cache
-            self.is_override("thinking"),                            // Thinking
-            self.is_override("thinking_budget"),                     // Reasoning budget
-            self.is_override("host") || self.is_override("port"),    // Serve
+            self.is_override("default_model"),                    // Model
+            self.is_override("max_seq"),                          // Context
+            self.is_override("dflash_mode"),                      // Spec decode
+            self.is_override("prefill_compression"),              // Prefill
+            self.is_override("kv_cache"),                         // KV cache
+            self.is_override("thinking"),                         // Thinking
+            self.is_override("thinking_budget"),                  // Reasoning budget
+            self.is_override("host") || self.is_override("port"), // Serve
         ]
     }
 
@@ -334,7 +334,10 @@ mod tests {
     fn pflash_needs_drafter_logic() {
         // 5d honest state: compression on + no drafter -> warns; with a drafter,
         // or compression off, -> fine.
-        assert!(!state_with(&[]).pflash_needs_drafter(), "off by default = fine");
+        assert!(
+            !state_with(&[]).pflash_needs_drafter(),
+            "off by default = fine"
+        );
         assert!(
             state_with(&[("prefill_compression", "auto")]).pflash_needs_drafter(),
             "auto without drafter needs one"
@@ -344,8 +347,11 @@ mod tests {
             "always without drafter needs one"
         );
         assert!(
-            !state_with(&[("prefill_compression", "auto"), ("prefill_drafter", "/d.hfq")])
-                .pflash_needs_drafter(),
+            !state_with(&[
+                ("prefill_compression", "auto"),
+                ("prefill_drafter", "/d.hfq")
+            ])
+            .pflash_needs_drafter(),
             "auto WITH a drafter is fine"
         );
     }
@@ -359,16 +365,27 @@ mod tests {
             .into_iter()
             .find(|(label, _, _)| *label == "Prefill")
             .expect("Prefill easy row present");
-        assert!(prefill.1.contains("needs drafter"), "no-op state shown: {}", prefill.1);
+        assert!(
+            prefill.1.contains("needs drafter"),
+            "no-op state shown: {}",
+            prefill.1
+        );
 
         // With a drafter set, the hint goes away.
-        let st2 = state_with(&[("prefill_compression", "auto"), ("prefill_drafter", "/d.hfq")]);
+        let st2 = state_with(&[
+            ("prefill_compression", "auto"),
+            ("prefill_drafter", "/d.hfq"),
+        ]);
         let prefill2 = st2
             .easy_rows()
             .into_iter()
             .find(|(label, _, _)| *label == "Prefill")
             .unwrap();
-        assert!(!prefill2.1.contains("needs drafter"), "hint cleared: {}", prefill2.1);
+        assert!(
+            !prefill2.1.contains("needs drafter"),
+            "hint cleared: {}",
+            prefill2.1
+        );
     }
 
     #[test]

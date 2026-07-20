@@ -14,8 +14,9 @@
 //! [`crate::qwen2::forward_step_greedy`] directly.
 
 use crate::qwen2::{Qwen2Config, Qwen2State, Qwen2Weights};
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{
+    Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
+};
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 

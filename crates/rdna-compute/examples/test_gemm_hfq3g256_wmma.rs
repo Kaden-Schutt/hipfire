@@ -17,7 +17,7 @@
 //! Routing between `_wmma` and `_mb4` is controlled in-process via the
 //! `HIPFIRE_MQ3_MB4` env var (set/unset around each call).
 
-use rdna_compute::{Gpu, DType};
+use rdna_compute::{DType, Gpu};
 
 // HFQ3 group: 8 B header (sc:f32 + zp:f32) + 96 B 3-bit indices = 104 B.
 // Same packing as MQ3-Lloyd test (see test_gemm_fused_mq3g256_lloyd_wmma.rs):
@@ -26,9 +26,11 @@ fn pack_3bit_group(qs: &[u8; 256]) -> [u8; 96] {
     let mut out = [0u8; 96];
     for tid in 0..32 {
         let mut pk: u32 = 0;
-        for i in 0..8 { pk |= (qs[tid * 8 + i] as u32 & 7) << (3 * i); }
-        out[tid * 3]     = (pk        & 0xff) as u8;
-        out[tid * 3 + 1] = ((pk >>  8) & 0xff) as u8;
+        for i in 0..8 {
+            pk |= (qs[tid * 8 + i] as u32 & 7) << (3 * i);
+        }
+        out[tid * 3] = (pk & 0xff) as u8;
+        out[tid * 3 + 1] = ((pk >> 8) & 0xff) as u8;
         out[tid * 3 + 2] = ((pk >> 16) & 0xff) as u8;
     }
     out
@@ -44,14 +46,18 @@ fn build_hfq3_matrix(m: usize, k: usize, proj_id: usize) -> Vec<u8> {
     for row in 0..m {
         for g in 0..groups_per_row {
             let proj_off = proj_id as f32 * 0.05;
-            let sc_raw = ((row * 7 + g * 11 + proj_id * 31) % 19) as f32 * 0.001 + 0.01 + proj_off * 0.005;
+            let sc_raw =
+                ((row * 7 + g * 11 + proj_id * 31) % 19) as f32 * 0.001 + 0.01 + proj_off * 0.005;
             let zp_raw = ((row * 13 + g * 17 + proj_id * 29) % 23) as f32 * 0.002 - 0.02 + proj_off;
             all_bytes.extend_from_slice(&sc_raw.to_le_bytes());
             all_bytes.extend_from_slice(&zp_raw.to_le_bytes());
             let mut q = [0u8; 256];
             for i in 0..256 {
-                q[i] = ((row.wrapping_mul(31) ^ g.wrapping_mul(53) ^ i.wrapping_mul(7)
-                       ^ proj_id.wrapping_mul(101)) & 7) as u8;
+                q[i] = ((row.wrapping_mul(31)
+                    ^ g.wrapping_mul(53)
+                    ^ i.wrapping_mul(7)
+                    ^ proj_id.wrapping_mul(101))
+                    & 7) as u8;
             }
             all_bytes.extend_from_slice(&pack_3bit_group(&q));
         }
@@ -61,7 +67,9 @@ fn build_hfq3_matrix(m: usize, k: usize, proj_id: usize) -> Vec<u8> {
 }
 
 fn make_x(n: usize, k: usize) -> Vec<f32> {
-    (0..(n * k)).map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05).collect()
+    (0..(n * k))
+        .map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05)
+        .collect()
 }
 
 fn diff_metrics(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
@@ -99,7 +107,9 @@ fn test_residual(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> bool {
 
     let a_b = build_hfq3_matrix(m, k, 0);
     let x = make_x(n, k);
-    let y_init: Vec<f32> = (0..(n * m)).map(|i| ((i as i32 % 11) as f32 - 5.0) * 0.001).collect();
+    let y_init: Vec<f32> = (0..(n * m))
+        .map(|i| ((i as i32 % 11) as f32 - 5.0) * 0.001)
+        .collect();
 
     let d_a = gpu.upload_raw(&a_b, &[a_b.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
@@ -107,28 +117,48 @@ fn test_residual(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> bool {
     // _wmma path
     let d_y_wmma = gpu.upload_f32(&y_init, &[n, m]).unwrap();
     run_with_mode(gpu, "0", |g| {
-        g.gemm_hfq3g256_residual_wmma(&d_a, &d_x, &d_y_wmma, m, k, n).unwrap();
+        g.gemm_hfq3g256_residual_wmma(&d_a, &d_x, &d_y_wmma, m, k, n)
+            .unwrap();
     });
     let y_wmma = gpu.download_f32(&d_y_wmma).unwrap();
 
     // _mb4 path (force-on regardless of size gate)
     let d_y_mb4 = gpu.upload_f32(&y_init, &[n, m]).unwrap();
     run_with_mode(gpu, "1", |g| {
-        g.gemm_hfq3g256_residual_wmma(&d_a, &d_x, &d_y_mb4, m, k, n).unwrap();
+        g.gemm_hfq3g256_residual_wmma(&d_a, &d_x, &d_y_mb4, m, k, n)
+            .unwrap();
     });
     let y_mb4 = gpu.download_f32(&d_y_mb4).unwrap();
 
     let (ma, mr, rms) = diff_metrics(&y_mb4, &y_wmma);
     let pass = ma < TOL;
-    println!("  max_abs={:.3e}  max_rel={:.3e}  rms={:.3e}  {}",
-             ma, mr, rms, if pass { "PASS" } else { "FAIL" });
+    println!(
+        "  max_abs={:.3e}  max_rel={:.3e}  rms={:.3e}  {}",
+        ma,
+        mr,
+        rms,
+        if pass { "PASS" } else { "FAIL" }
+    );
 
-    for d in [d_a, d_x, d_y_wmma, d_y_mb4] { gpu.free_tensor(d).unwrap(); }
+    for d in [d_a, d_x, d_y_wmma, d_y_mb4] {
+        gpu.free_tensor(d).unwrap();
+    }
     pass
 }
 
-fn test_qkvza(gpu: &mut Gpu, qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize, k: usize, n: usize) -> bool {
-    println!("--- qkvza M=({}+{}+{}+{}) K={} N={} ---", qkv_m, z_m, beta_m, alpha_m, k, n);
+fn test_qkvza(
+    gpu: &mut Gpu,
+    qkv_m: usize,
+    z_m: usize,
+    beta_m: usize,
+    alpha_m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    println!(
+        "--- qkvza M=({}+{}+{}+{}) K={} N={} ---",
+        qkv_m, z_m, beta_m, alpha_m, k, n
+    );
 
     let a_qkv_b = build_hfq3_matrix(qkv_m, k, 0);
     let a_z_b = build_hfq3_matrix(z_m, k, 1);
@@ -154,10 +184,10 @@ fn test_qkvza(gpu: &mut Gpu, qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: u
     let (d_yq_w, d_yz_w, d_yb_w, d_ya_w) = alloc(gpu);
     run_with_mode(gpu, "0", |g| {
         g.gemm_qkvza_hfq3g256_wmma(
-            &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x,
-            &d_yq_w, &d_yz_w, &d_yb_w, &d_ya_w,
+            &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x, &d_yq_w, &d_yz_w, &d_yb_w, &d_ya_w,
             qkv_m, z_m, beta_m, alpha_m, k, n,
-        ).unwrap();
+        )
+        .unwrap();
     });
     let yq_w = gpu.download_f32(&d_yq_w).unwrap();
     let yz_w = gpu.download_f32(&d_yz_w).unwrap();
@@ -167,10 +197,10 @@ fn test_qkvza(gpu: &mut Gpu, qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: u
     let (d_yq_m, d_yz_m, d_yb_m, d_ya_m) = alloc(gpu);
     run_with_mode(gpu, "1", |g| {
         g.gemm_qkvza_hfq3g256_wmma(
-            &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x,
-            &d_yq_m, &d_yz_m, &d_yb_m, &d_ya_m,
+            &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x, &d_yq_m, &d_yz_m, &d_yb_m, &d_ya_m,
             qkv_m, z_m, beta_m, alpha_m, k, n,
-        ).unwrap();
+        )
+        .unwrap();
     });
     let yq_m = gpu.download_f32(&d_yq_m).unwrap();
     let yz_m = gpu.download_f32(&d_yz_m).unwrap();
@@ -183,12 +213,19 @@ fn test_qkvza(gpu: &mut Gpu, qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: u
     let (ma_a, _, _) = diff_metrics(&ya_m, &ya_w);
     let max_abs = ma_q.max(ma_z).max(ma_b).max(ma_a);
     let pass = max_abs < TOL;
-    println!("  qkv max_abs={:.3e}  z={:.3e}  beta={:.3e}  alpha={:.3e}  {}",
-             ma_q, ma_z, ma_b, ma_a, if pass { "PASS" } else { "FAIL" });
+    println!(
+        "  qkv max_abs={:.3e}  z={:.3e}  beta={:.3e}  alpha={:.3e}  {}",
+        ma_q,
+        ma_z,
+        ma_b,
+        ma_a,
+        if pass { "PASS" } else { "FAIL" }
+    );
 
-    for d in [d_a_qkv, d_a_z, d_a_beta, d_a_alpha, d_x,
-              d_yq_w, d_yz_w, d_yb_w, d_ya_w,
-              d_yq_m, d_yz_m, d_yb_m, d_ya_m] {
+    for d in [
+        d_a_qkv, d_a_z, d_a_beta, d_a_alpha, d_x, d_yq_w, d_yz_w, d_yb_w, d_ya_w, d_yq_m, d_yz_m,
+        d_yb_m, d_ya_m,
+    ] {
         gpu.free_tensor(d).unwrap();
     }
     pass
@@ -207,16 +244,20 @@ fn test_qkv(gpu: &mut Gpu, q_m: usize, k_m: usize, v_m: usize, k: usize, n: usiz
     let d_a_v = gpu.upload_raw(&a_v_b, &[a_v_b.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
 
-    let alloc = |gpu: &mut Gpu| (
-        gpu.zeros(&[n, q_m], DType::F32).unwrap(),
-        gpu.zeros(&[n, k_m], DType::F32).unwrap(),
-        gpu.zeros(&[n, v_m], DType::F32).unwrap(),
-    );
+    let alloc = |gpu: &mut Gpu| {
+        (
+            gpu.zeros(&[n, q_m], DType::F32).unwrap(),
+            gpu.zeros(&[n, k_m], DType::F32).unwrap(),
+            gpu.zeros(&[n, v_m], DType::F32).unwrap(),
+        )
+    };
 
     let (d_yq_w, d_yk_w, d_yv_w) = alloc(gpu);
     run_with_mode(gpu, "0", |g| {
-        g.gemm_qkv_hfq3g256_wmma(&d_a_q, &d_a_k, &d_a_v, &d_x,
-            &d_yq_w, &d_yk_w, &d_yv_w, q_m, k_m, v_m, k, n).unwrap();
+        g.gemm_qkv_hfq3g256_wmma(
+            &d_a_q, &d_a_k, &d_a_v, &d_x, &d_yq_w, &d_yk_w, &d_yv_w, q_m, k_m, v_m, k, n,
+        )
+        .unwrap();
     });
     let yq_w = gpu.download_f32(&d_yq_w).unwrap();
     let yk_w = gpu.download_f32(&d_yk_w).unwrap();
@@ -224,8 +265,10 @@ fn test_qkv(gpu: &mut Gpu, q_m: usize, k_m: usize, v_m: usize, k: usize, n: usiz
 
     let (d_yq_m, d_yk_m, d_yv_m) = alloc(gpu);
     run_with_mode(gpu, "1", |g| {
-        g.gemm_qkv_hfq3g256_wmma(&d_a_q, &d_a_k, &d_a_v, &d_x,
-            &d_yq_m, &d_yk_m, &d_yv_m, q_m, k_m, v_m, k, n).unwrap();
+        g.gemm_qkv_hfq3g256_wmma(
+            &d_a_q, &d_a_k, &d_a_v, &d_x, &d_yq_m, &d_yk_m, &d_yv_m, q_m, k_m, v_m, k, n,
+        )
+        .unwrap();
     });
     let yq_m = gpu.download_f32(&d_yq_m).unwrap();
     let yk_m = gpu.download_f32(&d_yk_m).unwrap();
@@ -236,10 +279,17 @@ fn test_qkv(gpu: &mut Gpu, q_m: usize, k_m: usize, v_m: usize, k: usize, n: usiz
     let (ma_v, _, _) = diff_metrics(&yv_m, &yv_w);
     let max_abs = ma_q.max(ma_k).max(ma_v);
     let pass = max_abs < TOL;
-    println!("  q max_abs={:.3e}  k={:.3e}  v={:.3e}  {}",
-             ma_q, ma_k, ma_v, if pass { "PASS" } else { "FAIL" });
+    println!(
+        "  q max_abs={:.3e}  k={:.3e}  v={:.3e}  {}",
+        ma_q,
+        ma_k,
+        ma_v,
+        if pass { "PASS" } else { "FAIL" }
+    );
 
-    for d in [d_a_q, d_a_k, d_a_v, d_x, d_yq_w, d_yk_w, d_yv_w, d_yq_m, d_yk_m, d_yv_m] {
+    for d in [
+        d_a_q, d_a_k, d_a_v, d_x, d_yq_w, d_yk_w, d_yv_w, d_yq_m, d_yk_m, d_yv_m,
+    ] {
         gpu.free_tensor(d).unwrap();
     }
     pass
@@ -256,23 +306,25 @@ fn test_gate_up(gpu: &mut Gpu, gate_m: usize, up_m: usize, k: usize, n: usize) -
     let d_a_u = gpu.upload_raw(&a_u_b, &[a_u_b.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
 
-    let alloc = |gpu: &mut Gpu| (
-        gpu.zeros(&[n, gate_m], DType::F32).unwrap(),
-        gpu.zeros(&[n, up_m], DType::F32).unwrap(),
-    );
+    let alloc = |gpu: &mut Gpu| {
+        (
+            gpu.zeros(&[n, gate_m], DType::F32).unwrap(),
+            gpu.zeros(&[n, up_m], DType::F32).unwrap(),
+        )
+    };
 
     let (d_yg_w, d_yu_w) = alloc(gpu);
     run_with_mode(gpu, "0", |g| {
-        g.gemm_gate_up_hfq3g256_wmma(&d_a_g, &d_a_u, &d_x, &d_yg_w, &d_yu_w,
-            gate_m, up_m, k, n).unwrap();
+        g.gemm_gate_up_hfq3g256_wmma(&d_a_g, &d_a_u, &d_x, &d_yg_w, &d_yu_w, gate_m, up_m, k, n)
+            .unwrap();
     });
     let yg_w = gpu.download_f32(&d_yg_w).unwrap();
     let yu_w = gpu.download_f32(&d_yu_w).unwrap();
 
     let (d_yg_m, d_yu_m) = alloc(gpu);
     run_with_mode(gpu, "1", |g| {
-        g.gemm_gate_up_hfq3g256_wmma(&d_a_g, &d_a_u, &d_x, &d_yg_m, &d_yu_m,
-            gate_m, up_m, k, n).unwrap();
+        g.gemm_gate_up_hfq3g256_wmma(&d_a_g, &d_a_u, &d_x, &d_yg_m, &d_yu_m, gate_m, up_m, k, n)
+            .unwrap();
     });
     let yg_m = gpu.download_f32(&d_yg_m).unwrap();
     let yu_m = gpu.download_f32(&d_yu_m).unwrap();
@@ -281,8 +333,12 @@ fn test_gate_up(gpu: &mut Gpu, gate_m: usize, up_m: usize, k: usize, n: usize) -
     let (ma_u, _, _) = diff_metrics(&yu_m, &yu_w);
     let max_abs = ma_g.max(ma_u);
     let pass = max_abs < TOL;
-    println!("  gate max_abs={:.3e}  up={:.3e}  {}",
-             ma_g, ma_u, if pass { "PASS" } else { "FAIL" });
+    println!(
+        "  gate max_abs={:.3e}  up={:.3e}  {}",
+        ma_g,
+        ma_u,
+        if pass { "PASS" } else { "FAIL" }
+    );
 
     for d in [d_a_g, d_a_u, d_x, d_yg_w, d_yu_w, d_yg_m, d_yu_m] {
         gpu.free_tensor(d).unwrap();
@@ -293,15 +349,18 @@ fn test_gate_up(gpu: &mut Gpu, gate_m: usize, up_m: usize, k: usize, n: usize) -
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");
     eprintln!("GPU: {}", gpu.arch);
-    eprintln!("Verifying HFQ3 _mb4 == _wmma at all shapes (TOL={:.0e}).", TOL);
+    eprintln!(
+        "Verifying HFQ3 _mb4 == _wmma at all shapes (TOL={:.0e}).",
+        TOL
+    );
 
     let mut all_pass = true;
 
     // residual — covers boundary cases (n=16 padded to 64; n=64 partial-mb4).
-    all_pass &= test_residual(&mut gpu, 64,   1024,  16);
-    all_pass &= test_residual(&mut gpu, 64,   1024,  64);
-    all_pass &= test_residual(&mut gpu, 256,  4096, 256);
-    all_pass &= test_residual(&mut gpu, 1024, 4096,  64);
+    all_pass &= test_residual(&mut gpu, 64, 1024, 16);
+    all_pass &= test_residual(&mut gpu, 64, 1024, 64);
+    all_pass &= test_residual(&mut gpu, 256, 4096, 256);
+    all_pass &= test_residual(&mut gpu, 1024, 4096, 64);
     all_pass &= test_residual(&mut gpu, 1024, 12288, 64);
 
     // qkvza — straddles projection boundaries (4-way fan-out).

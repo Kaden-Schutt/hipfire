@@ -992,11 +992,7 @@ impl AqlQueue {
         let status = unsafe {
             (self.runtime().symbols.queue_cu_set_mask)(self.raw.as_ptr(), mask_bits, mask.as_ptr())
         };
-        check_status(
-            &self.runtime().symbols,
-            "hsa_amd_queue_cu_set_mask",
-            status,
-        )
+        check_status(&self.runtime().symbols, "hsa_amd_queue_cu_set_mask", status)
     }
 
     fn depth_sample(&self) -> QueueDepthSample {

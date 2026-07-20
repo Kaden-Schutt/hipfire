@@ -129,7 +129,7 @@ Use only when the claim class below names them. They are not universal.
 | Retained replay / PM4 / AQL graft | `scripts/redline_daemon_harness.py` **and** the certification steps in `docs/REDLINE.md` | Manual Redline; promotion still policy-gated |
 | Perf improvement claim | Protocol in `methodology/perf-benchmarking.md` + stationary matched runs; `speed-gate.sh` or `gates.sh` perf arm when applicable | Measured; not admission |
 | Arch port | `methodology/arch-port-validation.md` (channel + speed; no retired coherence battery as acceptance) | Manual |
-| Model/route **admission** into product defaults | Row in [`admissions.yml`](admissions.yml) | Registry is **empty / fail closed** at schema v1. No inferred rows. No record fields or sign-off ritual until a future schema/policy explicitly defines them. |
+| Model/route **admission** into product defaults | Row in [`admissions.yml`](admissions.yml) | Schema v2; exactly one evidence-bound record (LFM2.5-350M MQ4 gfx1201 retained-PM4). No inferred/wildcard rows. Runtime defaults must match loaded fixture evidence (`retained_fixture_evidence()` post-load) and fail closed on mismatch. |
 | Unknown surface | **Blocked** until an owner adds a row here | Fail closed |
 
 ## Retired coherence-gate scripts
@@ -158,7 +158,7 @@ blocked on purpose.
 | `redline_daemon_harness` fingerprint as installed product PM4/AQL route | **Rejected** without `REDLINE.md` ladder |
 | Coherence-gate pass as current acceptance | **Rejected** |
 | Bench number without protocol + identity hashes | **Rejected** as promotion evidence |
-| Inferred or “signed” `admissions.yml` row under schema v1 | **Rejected** — keep `records: []` |
+| Inferred or “signed” `admissions.yml` row without earned fixture evidence | **Rejected** — schema v2 forbids inferred/wildcard rows; only the exact admitted record applies |
 
 ## Related owners
 

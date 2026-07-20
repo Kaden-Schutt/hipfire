@@ -24,9 +24,18 @@ fn main() {
     eprintln!("  asic_id:    0x{:x}", dev.info.asic_id);
     eprintln!("  CUs:        {}", dev.info.num_cu);
     eprintln!("  SEs:        {}", dev.info.num_shader_engines);
-    eprintln!("  VRAM total: {:.1} GB", dev.info.vram_total_bytes as f64 / 1e9);
-    eprintln!("  VRAM used:  {:.1} GB", dev.info.vram_used_bytes as f64 / 1e9);
-    eprintln!("  VRAM free:  {:.1} GB", (dev.info.vram_total_bytes - dev.info.vram_used_bytes) as f64 / 1e9);
+    eprintln!(
+        "  VRAM total: {:.1} GB",
+        dev.info.vram_total_bytes as f64 / 1e9
+    );
+    eprintln!(
+        "  VRAM used:  {:.1} GB",
+        dev.info.vram_used_bytes as f64 / 1e9
+    );
+    eprintln!(
+        "  VRAM free:  {:.1} GB",
+        (dev.info.vram_total_bytes - dev.info.vram_used_bytes) as f64 / 1e9
+    );
 
     // Step 2: Alloc VRAM
     let size = 4096u64; // 4KB test buffer
@@ -62,7 +71,9 @@ fn main() {
     if readback == test_data {
         eprintln!("  OK — data matches!");
     } else {
-        let mismatches = readback.iter().zip(test_data.iter())
+        let mismatches = readback
+            .iter()
+            .zip(test_data.iter())
             .enumerate()
             .filter(|(_, (a, b))| a != b)
             .count();

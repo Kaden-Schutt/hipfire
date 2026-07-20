@@ -34,28 +34,42 @@ fn run() -> Result<String, Outcome> {
     let hip = hip_bridge::HipRuntime::load()
         .map_err(|e| Outcome::Skip(format!("HIP runtime unavailable: {e}")))?;
 
-    let count = hip.device_count().map_err(|e| Outcome::Fail(format!("device_count failed: {e}")))?;
+    let count = hip
+        .device_count()
+        .map_err(|e| Outcome::Fail(format!("device_count failed: {e}")))?;
     if count <= 0 {
         return Err(Outcome::Skip("no GPU devices found".to_string()));
     }
 
-    hip.set_device(0).map_err(|e| Outcome::Fail(format!("set_device failed: {e}")))?;
+    hip.set_device(0)
+        .map_err(|e| Outcome::Fail(format!("set_device failed: {e}")))?;
 
     let size = 4096usize;
-    let buf = hip.malloc(size).map_err(|e| Outcome::Fail(format!("malloc failed: {e}")))?;
+    let buf = hip
+        .malloc(size)
+        .map_err(|e| Outcome::Fail(format!("malloc failed: {e}")))?;
 
     let src: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
-    hip.memcpy_htod(&buf, &src).map_err(|e| Outcome::Fail(format!("H2D copy failed: {e}")))?;
+    hip.memcpy_htod(&buf, &src)
+        .map_err(|e| Outcome::Fail(format!("H2D copy failed: {e}")))?;
 
     let mut dst = vec![0u8; size];
-    hip.memcpy_dtoh(&mut dst, &buf).map_err(|e| Outcome::Fail(format!("D2H copy failed: {e}")))?;
+    hip.memcpy_dtoh(&mut dst, &buf)
+        .map_err(|e| Outcome::Fail(format!("D2H copy failed: {e}")))?;
 
     if src != dst {
         let mismatch = src.iter().zip(&dst).position(|(a, b)| a != b).unwrap_or(0);
         let _ = hip.free(buf);
-        return Err(Outcome::Fail(format!("data mismatch at byte {mismatch}: src={} dst={}", src[mismatch], dst[mismatch])));
+        return Err(Outcome::Fail(format!(
+            "data mismatch at byte {mismatch}: src={} dst={}",
+            src[mismatch], dst[mismatch]
+        )));
     }
 
-    hip.free(buf).map_err(|e| Outcome::Fail(format!("free failed: {e}")))?;
-    Ok(format!("{} devices visible, {} bytes round-tripped", count, size))
+    hip.free(buf)
+        .map_err(|e| Outcome::Fail(format!("free failed: {e}")))?;
+    Ok(format!(
+        "{} devices visible, {} bytes round-tripped",
+        count, size
+    ))
 }

@@ -25,7 +25,7 @@ do not carry that full identity manifest, so this page is **historical** only
    Measurement and admission are independent: a complete **measured** row is
    still not a product default or route certificate. Any product-default or
    admission claim **additionally** requires an explicit row in
-   [`admissions.yml`](admissions.yml) (currently empty — fail closed).
+   [`admissions.yml`](admissions.yml) (schema v2; exactly one earned record — fail closed otherwise).
 2. Many older rows used the then-default `asym3` KV mode. Current clean configs
    resolve `kv_cache=auto` through the model registry and otherwise fall back to
    `q8`. Do not compare asym3 rows to q8 rows as one A/B.
@@ -190,7 +190,7 @@ Supporting dated notes (still fixture-bound):
 | Bench-suite layout | [`methodology/bench-suite.md`](methodology/bench-suite.md) |
 | Immutable campaign checkpoints | [`perf-checkpoints/`](perf-checkpoints/) (new dated file; do not rewrite old bodies) |
 | Claim → validation route | [`VALIDATION.md`](VALIDATION.md) |
-| Product admission | [`admissions.yml`](admissions.yml) only (`records: []` until earned) |
+| Product admission | [`admissions.yml`](admissions.yml) only (schema v2; exactly one earned record) |
 | Redline-attributed claims | [`REDLINE.md`](REDLINE.md) |
 | Speculation capability inventory | [`speculation-support-inventory.md`](speculation-support-inventory.md) (verify in source) |
 

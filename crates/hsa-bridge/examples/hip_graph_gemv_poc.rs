@@ -90,8 +90,17 @@ type HipStream = *mut c_void;
 struct DirectHip {
     _lib: Library,
     fn_module_launch_kernel: unsafe extern "C" fn(
-        HipFunction, u32, u32, u32, u32, u32, u32, u32, HipStream,
-        *mut *mut c_void, *mut *mut c_void,
+        HipFunction,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        HipStream,
+        *mut *mut c_void,
+        *mut *mut c_void,
     ) -> u32,
 }
 
@@ -101,13 +110,25 @@ impl DirectHip {
         let fn_module_launch_kernel = unsafe {
             let sym: libloading::Symbol<
                 unsafe extern "C" fn(
-                    HipFunction, u32, u32, u32, u32, u32, u32, u32, HipStream,
-                    *mut *mut c_void, *mut *mut c_void,
+                    HipFunction,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    HipStream,
+                    *mut *mut c_void,
+                    *mut *mut c_void,
                 ) -> u32,
             > = lib.get(b"hipModuleLaunchKernel").unwrap();
             *sym.into_raw()
         };
-        Self { _lib: lib, fn_module_launch_kernel }
+        Self {
+            _lib: lib,
+            fn_module_launch_kernel,
+        }
     }
 }
 
@@ -148,8 +169,10 @@ fn bench_kernel(
 ) {
     eprintln!("\n========================================");
     eprintln!("  KERNEL: {name}   M={m}  K={k}");
-    eprintln!("  block=[{}, {}, {}]  grid=[{}, {}, {}]  launches/batch={n_launches}",
-        block[0], block[1], block[2], grid[0], grid[1], grid[2]);
+    eprintln!(
+        "  block=[{}, {}, {}]  grid=[{}, {}, {}]  launches/batch={n_launches}",
+        block[0], block[1], block[2], grid[0], grid[1], grid[2]
+    );
     eprintln!("========================================");
 
     // Compile fresh
@@ -195,15 +218,20 @@ fn bench_kernel(
     hip.memcpy_htod(&a_buf, &a_junk).unwrap();
     hip.memcpy_htod(&x_buf, unsafe {
         std::slice::from_raw_parts(x_junk.as_ptr() as *const u8, x_bytes)
-    }).unwrap();
+    })
+    .unwrap();
     hip.memcpy_htod(&y_buf, &vec![0u8; y_bytes]).unwrap();
 
-    eprintln!("  A={:.2} MiB, x={:.1} KiB, y={:.1} KiB",
-        a_bytes as f64 / (1024.0*1024.0),
+    eprintln!(
+        "  A={:.2} MiB, x={:.1} KiB, y={:.1} KiB",
+        a_bytes as f64 / (1024.0 * 1024.0),
         x_bytes as f64 / 1024.0,
-        y_bytes as f64 / 1024.0);
-    eprintln!("  A streaming BW per launch: {:.2} MiB (close to per-GEMV weight traffic)",
-        a_bytes as f64 / (1024.0*1024.0));
+        y_bytes as f64 / 1024.0
+    );
+    eprintln!(
+        "  A streaming BW per launch: {:.2} MiB (close to per-GEMV weight traffic)",
+        a_bytes as f64 / (1024.0 * 1024.0)
+    );
 
     // Pack kernargs: gemv_hfq4g256(const char* A, const float* x, float* y, int M, int K)
     // 3 × 8B pointer + 2 × 4B int = 32 bytes. Pointers are 8-byte aligned.
@@ -232,8 +260,12 @@ fn bench_kernel(
         unsafe {
             (direct.fn_module_launch_kernel)(
                 kfunc,
-                grid[0], grid[1], grid[2],
-                block[0], block[1], block[2],
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
                 0,
                 stream,
                 std::ptr::null_mut(),
@@ -262,7 +294,10 @@ fn bench_kernel(
         let per_call = t.elapsed() / n_launches;
         seq_per_launch.push(per_call);
     }
-    print_stats(&format!("[SEQ   {n_launches} launches × {iters}]"), &mut seq_per_launch);
+    print_stats(
+        &format!("[SEQ   {n_launches} launches × {iters}]"),
+        &mut seq_per_launch,
+    );
 
     // Single-launch sync-per-call latency (worst-case)
     let mut single_lat: Vec<std::time::Duration> = Vec::with_capacity(500);
@@ -301,7 +336,10 @@ fn bench_kernel(
         let per_call = t.elapsed() / n_launches;
         graph_per_launch.push(per_call);
     }
-    print_stats(&format!("[GRAPH {n_launches} launches × {replays}]"), &mut graph_per_launch);
+    print_stats(
+        &format!("[GRAPH {n_launches} launches × {replays}]"),
+        &mut graph_per_launch,
+    );
 
     // Summary
     graph_per_launch.sort();
@@ -353,8 +391,8 @@ fn main() {
     // hot-path GEMV kernel on gfx1010/gfx1013 for any M >= 64.
     let wide_src = std::fs::read_to_string("kernels/src/gemv_hfq4g256_wide.hip")
         .expect("read gemv_hfq4g256_wide.hip");
-    let narrow_src = std::fs::read_to_string("kernels/src/gemv_hfq4g256.hip")
-        .expect("read gemv_hfq4g256.hip");
+    let narrow_src =
+        std::fs::read_to_string("kernels/src/gemv_hfq4g256.hip").expect("read gemv_hfq4g256.hip");
 
     // Qwen3.5 0.8B real sizes:
     //   dim=1024, hidden_dim=2816
@@ -379,10 +417,12 @@ fn main() {
     let n_launches = 138u32;
 
     bench_kernel(
-        &hip, &direct,
+        &hip,
+        &direct,
         "gemv_hfq4g256_wide",
         &wide_src,
-        m, k,
+        m,
+        k,
         block_wide,
         grid_wide,
         n_launches,
@@ -390,10 +430,12 @@ fn main() {
     );
 
     bench_kernel(
-        &hip, &direct,
+        &hip,
+        &direct,
         "gemv_hfq4g256",
         &narrow_src,
-        m, k,
+        m,
+        k,
         block_narrow,
         grid_narrow,
         n_launches,
@@ -406,10 +448,12 @@ fn main() {
     let k2 = 1024u32;
     let grid_wide_big: [u32; 3] = [(m2 + 1) / 2, 1, 1];
     bench_kernel(
-        &hip, &direct,
+        &hip,
+        &direct,
         "gemv_hfq4g256_wide",
         &wide_src,
-        m2, k2,
+        m2,
+        k2,
         block_wide,
         grid_wide_big,
         n_launches,
@@ -445,13 +489,19 @@ fn realistic_forward_shape(
                 "--genco",
                 &format!("--offload-arch={arch}"),
                 "-O3",
-                "-I", "kernels/src",
-                "-o", &hsaco_path,
+                "-I",
+                "kernels/src",
+                "-o",
+                &hsaco_path,
                 &src_path,
             ])
             .output()
             .expect("hipcc");
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let hsaco = std::fs::read(&hsaco_path).unwrap();
         let module = hip.module_load_data(&hsaco).unwrap();
         let f = hip.module_get_function(&module, name).unwrap();
@@ -470,25 +520,25 @@ fn realistic_forward_shape(
     //           w_up (2816×1024), w_down (1024×2816)
     // 8 GEMVs per LA layer.
     let la_gemvs: Vec<(u32, u32, u32)> = vec![
-        (0, 768, 1024),   // wqkv
-        (0, 256, 1024),   // wz
-        (1,  32, 1024),   // w_beta (narrow — small M)
-        (1,  32, 1024),   // w_alpha
-        (0, 1024, 256),   // wo (residual, small K)
-        (0, 2816, 1024),  // w_gate  ← BIG
-        (0, 2816, 1024),  // w_up    ← BIG
-        (0, 1024, 2816),  // w_down  ← BIG (residual)
+        (0, 768, 1024),  // wqkv
+        (0, 256, 1024),  // wz
+        (1, 32, 1024),   // w_beta (narrow — small M)
+        (1, 32, 1024),   // w_alpha
+        (0, 1024, 256),  // wo (residual, small K)
+        (0, 2816, 1024), // w_gate  ← BIG
+        (0, 2816, 1024), // w_up    ← BIG
+        (0, 1024, 2816), // w_down  ← BIG (residual)
     ];
     // FA layer: wq (1024×1024), wk (256×1024), wv (256×1024),
     //           wo (1024×1024), w_gate, w_up, w_down. 7 GEMVs.
     let fa_gemvs: Vec<(u32, u32, u32)> = vec![
-        (0, 1024, 1024),  // wq
-        (0,  256, 1024),  // wk
-        (0,  256, 1024),  // wv
-        (0, 1024, 1024),  // wo (residual)
-        (0, 2816, 1024),  // w_gate
-        (0, 2816, 1024),  // w_up
-        (0, 1024, 2816),  // w_down (residual)
+        (0, 1024, 1024), // wq
+        (0, 256, 1024),  // wk
+        (0, 256, 1024),  // wv
+        (0, 1024, 1024), // wo (residual)
+        (0, 2816, 1024), // w_gate
+        (0, 2816, 1024), // w_up
+        (0, 1024, 2816), // w_down (residual)
     ];
 
     // Qwen3.5 0.8B layer pattern: ~18 LA + 6 FA = 24 layers
@@ -503,7 +553,10 @@ fn realistic_forward_shape(
     for _ in 0..6 {
         seq.extend_from_slice(&fa_gemvs);
     }
-    eprintln!("  {} GEMV calls/step total  (18 LA × 8 + 6 FA × 7)", seq.len());
+    eprintln!(
+        "  {} GEMV calls/step total  (18 LA × 8 + 6 FA × 7)",
+        seq.len()
+    );
 
     // Find max sizes so we can allocate a single set of buffers large enough
     // for every shape. Point all kernels at the same buffers.
@@ -522,7 +575,8 @@ fn realistic_forward_shape(
     let x_junk: Vec<f32> = (0..max_k as usize).map(|i| (i as f32) * 0.01).collect();
     hip.memcpy_htod(&x_buf, unsafe {
         std::slice::from_raw_parts(x_junk.as_ptr() as *const u8, x_bytes)
-    }).unwrap();
+    })
+    .unwrap();
     hip.memcpy_htod(&y_buf, &vec![0u8; y_bytes]).unwrap();
 
     // Stable per-launch state. EVERY pointer we pass into hipModuleLaunchKernel
@@ -579,8 +633,12 @@ fn realistic_forward_shape(
         unsafe {
             (direct.fn_module_launch_kernel)(
                 f,
-                grid[0], grid[1], grid[2],
-                block[0], block[1], block[2],
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
                 0,
                 stream_raw,
                 std::ptr::null_mut(),

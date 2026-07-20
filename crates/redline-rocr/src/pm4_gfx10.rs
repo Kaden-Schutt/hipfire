@@ -238,20 +238,14 @@ impl Gfx10Pm4CommandBuffer {
 
     /// Select the resource-distribution bits used by subsequently encoded
     /// dispatches. Occupancy limits remain unlimited for every policy.
-    pub fn with_resource_limits_policy(
-        mut self,
-        policy: Gfx11ComputeResourceLimitsPolicy,
-    ) -> Self {
+    pub fn with_resource_limits_policy(mut self, policy: Gfx11ComputeResourceLimitsPolicy) -> Self {
         self.resource_limits_policy = policy;
         self
     }
 
     /// Program a GFX11 dispatch-interleave queue preamble when requested.
     /// `None` preserves the queue/firmware value byte-for-byte.
-    pub fn with_dispatch_interleave(
-        mut self,
-        interleave: Option<Gfx11DispatchInterleave>,
-    ) -> Self {
+    pub fn with_dispatch_interleave(mut self, interleave: Option<Gfx11DispatchInterleave>) -> Self {
         if let Some(interleave) = interleave {
             self.set_sh_regs(COMPUTE_DISPATCH_INTERLEAVE, &[interleave.threads()]);
         }
@@ -765,8 +759,7 @@ mod tests {
             (Gfx11DispatchInterleave::Threads256, 256),
             (Gfx11DispatchInterleave::Threads512, 512),
         ] {
-            let commands =
-                Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(Some(policy));
+            let commands = Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(Some(policy));
             assert_eq!(
                 commands.dwords(),
                 &[
@@ -906,13 +899,7 @@ mod tests {
         commands.write_memory_value_after_idle(address, 9);
         assert_eq!(
             &commands.dwords()[2..],
-            &[
-                0xc003_3700,
-                0x0010_0500,
-                0x9abc_def0,
-                0x1234_5678,
-                9,
-            ]
+            &[0xc003_3700, 0x0010_0500, 0x9abc_def0, 0x1234_5678, 9,]
         );
         assert!(!commands.ends_with_compute_idle());
     }

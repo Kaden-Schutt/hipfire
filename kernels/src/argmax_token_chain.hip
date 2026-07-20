@@ -34,9 +34,13 @@ extern "C" __global__ void argmax_token_chain_f32(
     __syncthreads();
 
     for (int sz = blockDim.x / 2; sz > 0; sz >>= 1) {
-        if (threadIdx.x < sz && s[threadIdx.x + sz] > s[threadIdx.x]) {
-            s[threadIdx.x] = s[threadIdx.x + sz];
-            si[threadIdx.x] = si[threadIdx.x + sz];
+        if (threadIdx.x < sz) {
+            const int right = threadIdx.x + sz;
+            if (s[right] > s[threadIdx.x] ||
+                (s[right] == s[threadIdx.x] && si[right] < si[threadIdx.x])) {
+                s[threadIdx.x] = s[right];
+                si[threadIdx.x] = si[right];
+            }
         }
         __syncthreads();
     }

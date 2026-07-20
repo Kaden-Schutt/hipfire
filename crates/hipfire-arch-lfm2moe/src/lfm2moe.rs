@@ -1153,6 +1153,46 @@ fn checked_product(label: &str, factors: &[usize]) -> Result<usize, String> {
     })
 }
 
+/// Qwen35 `HIPFIRE_ATTN_FLASH` tri-state parser (pure; no env reads).
+///
+/// - `never`/`0`/`off` → 0
+/// - `always`/`2`/`force` → 2
+/// - all other values (incl. `auto`/`1`/`on`/unset) → 2 on gfx11/gfx12, else 1
+fn resolve_attn_flash_mode(raw: Option<&str>, arch: &str) -> u8 {
+    match raw {
+        Some("never") | Some("0") | Some("off") => 0,
+        Some("always") | Some("2") | Some("force") => 2,
+        _ => {
+            if arch.starts_with("gfx12") || arch.starts_with("gfx11") {
+                2
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// Decode-path Q8 flash partial buffer length:
+/// `n_heads * ceil(max_seq / tile_size) * (2 + head_dim)` (batch multiplier = 1).
+fn decode_flash_partials_elems(
+    n_heads: usize,
+    max_seq: usize,
+    head_dim: usize,
+    tile_size: usize,
+) -> Result<usize, String> {
+    if tile_size == 0 {
+        return Err("lfm2moe: flash tile_size is zero".to_string());
+    }
+    let max_tiles = max_seq
+        .checked_add(tile_size - 1)
+        .ok_or_else(|| "lfm2moe: flash max_tiles overflow".to_string())?
+        / tile_size;
+    let stride = head_dim
+        .checked_add(2)
+        .ok_or_else(|| "lfm2moe: flash stride overflow".to_string())?;
+    checked_product("flash_partials", &[n_heads, max_tiles, stride])
+}
+
 fn lfm2_moe_grouped_m_total_bound(
     rows: usize,
     n_exp: usize,
@@ -1468,6 +1508,15 @@ pub struct Lfm2MoeState {
     /// One rolling [hidden, K-1] f32 ring buffer per conv layer (zero-init).
     pub conv_states: Vec<GpuTensor>,
     pub pos_buf: hip_bridge::DeviceBuffer, // device i32 position scalar
+    /// Device-resident token id consumed by the captureable n=1 embedding.
+    pub(crate) token_buf: GpuTensor,
+    /// Persistent sampling result: `[token_id, rng_state]` as raw 32-bit words.
+    pub(crate) sample_buf: GpuTensor,
+    /// Full-request token history for device-side repetition policy.
+    pub(crate) repeat_buf: GpuTensor,
+    /// Device-resident full-RoPE table, [max_seq, head_dim / 2].
+    pub(crate) rope_cos_cache: GpuTensor,
+    pub(crate) rope_sin_cache: GpuTensor,
     /// hipGraph (HIPFIRE_LFM2_GRAPH) warmup latch: false until the first
     /// decode runs direct (so kernel JIT / lazy alloc happen outside any
     /// stream capture). Unused when the graph path is disabled.
@@ -1484,6 +1533,11 @@ pub struct Lfm2MoeState {
     pub fa_k: GpuTensor,        // [kv_dim]
     pub fa_v: GpuTensor,        // [kv_dim]
     pub fa_attn_out: GpuTensor, // [q_dim]
+    /// Eager Q8 flash tile+reduce partials for single-token decode
+    /// (`n_heads * ceil(max_seq/tile) * (2+head_dim)` F32). Pointer-stable.
+    pub(crate) flash_partials: GpuTensor,
+    /// Frozen Qwen35 `HIPFIRE_ATTN_FLASH` tri-state (0=never, 1=auto, 2=always).
+    pub(crate) flash_mode: u8,
 
     // conv scratch
     pub conv_bcx: GpuTensor, // [3*hidden] in_proj output (B|C|x)
@@ -1580,10 +1634,40 @@ impl Lfm2MoeState {
                 .map_err(|e| format!("lfm2moe: alloc {label}: {e:?}"))
         };
 
+        let tile_size = rdna_compute::attention::q8_flash_tile_size(
+            &gpu.arch,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            max_seq,
+        );
+        let flash_partials_n =
+            decode_flash_partials_elems(cfg.num_attention_heads, max_seq, cfg.head_dim, tile_size)?;
+        let flash_mode = resolve_attn_flash_mode(
+            std::env::var("HIPFIRE_ATTN_FLASH").ok().as_deref(),
+            &gpu.arch,
+        );
+        let rope_cache_elems = max_seq * (cfg.head_dim / 2);
+        let rope_cos_cache = alloc(gpu, rope_cache_elems, "rope_cos_cache")?;
+        let rope_sin_cache = alloc(gpu, rope_cache_elems, "rope_sin_cache")?;
+        gpu.init_rope_cache_f32(
+            &rope_cos_cache,
+            &rope_sin_cache,
+            max_seq,
+            cfg.head_dim,
+            cfg.rope_theta,
+        )
+        .map_err(|e| format!("lfm2moe: init rope cache: {e:?}"))?;
+
         Ok(Lfm2MoeState {
             kv,
             conv_states,
             pos_buf,
+            token_buf: alloc(gpu, 1, "token_buf")?,
+            sample_buf: alloc(gpu, 2, "sample_buf")?,
+            repeat_buf: alloc(gpu, max_seq, "repeat_buf")?,
+            rope_cos_cache,
+            rope_sin_cache,
             graph_warmed_up: false,
             max_seq,
             n_tokens: 0,
@@ -1593,6 +1677,8 @@ impl Lfm2MoeState {
             fa_k: alloc(gpu, kv_dim, "fa_k")?,
             fa_v: alloc(gpu, kv_dim, "fa_v")?,
             fa_attn_out: alloc(gpu, q_dim, "fa_attn_out")?,
+            flash_partials: alloc(gpu, flash_partials_n, "flash_partials")?,
+            flash_mode,
             conv_bcx: alloc(gpu, 3 * hidden, "conv_bcx")?,
             conv_y: alloc(gpu, hidden, "conv_y")?,
             ffn_tmp: alloc(gpu, hidden, "ffn_tmp")?,
@@ -1659,10 +1745,16 @@ impl Lfm2MoeState {
         }
         let _ = gpu.free_tensor(self.h);
         let _ = gpu.free_tensor(self.tmp);
+        let _ = gpu.free_tensor(self.token_buf);
+        let _ = gpu.free_tensor(self.sample_buf);
+        let _ = gpu.free_tensor(self.repeat_buf);
+        let _ = gpu.free_tensor(self.rope_cos_cache);
+        let _ = gpu.free_tensor(self.rope_sin_cache);
         let _ = gpu.free_tensor(self.fa_q);
         let _ = gpu.free_tensor(self.fa_k);
         let _ = gpu.free_tensor(self.fa_v);
         let _ = gpu.free_tensor(self.fa_attn_out);
+        let _ = gpu.free_tensor(self.flash_partials);
         let _ = gpu.free_tensor(self.conv_bcx);
         let _ = gpu.free_tensor(self.conv_y);
         let _ = gpu.free_tensor(self.ffn_tmp);
@@ -1702,5 +1794,85 @@ mod bf16_decode_tests {
             as_bf16, as_f16,
             "decoding BF16 bytes as F16 must differ — the original bug"
         );
+    }
+}
+
+#[cfg(test)]
+mod flash_decode_state_tests {
+    use super::{decode_flash_partials_elems, resolve_attn_flash_mode};
+
+    #[test]
+    fn resolve_attn_flash_mode_aliases_and_gfx_defaults() {
+        assert_eq!(resolve_attn_flash_mode(Some("never"), "gfx1201"), 0);
+        assert_eq!(resolve_attn_flash_mode(Some("0"), "gfx1030"), 0);
+        assert_eq!(resolve_attn_flash_mode(Some("off"), "gfx900"), 0);
+
+        assert_eq!(resolve_attn_flash_mode(Some("always"), "gfx1030"), 2);
+        assert_eq!(resolve_attn_flash_mode(Some("2"), "gfx900"), 2);
+        assert_eq!(resolve_attn_flash_mode(Some("force"), "gfx1030"), 2);
+
+        // auto / on / 1 / unset / unknown → gfx11/gfx12 always, else auto
+        assert_eq!(resolve_attn_flash_mode(Some("auto"), "gfx1201"), 2);
+        assert_eq!(resolve_attn_flash_mode(Some("1"), "gfx1100"), 2);
+        assert_eq!(resolve_attn_flash_mode(Some("on"), "gfx1150"), 2);
+        assert_eq!(resolve_attn_flash_mode(None, "gfx1201"), 2);
+        assert_eq!(resolve_attn_flash_mode(None, "gfx1100"), 2);
+        assert_eq!(resolve_attn_flash_mode(Some("garbage"), "gfx12xx"), 2);
+
+        assert_eq!(resolve_attn_flash_mode(Some("auto"), "gfx1030"), 1);
+        assert_eq!(resolve_attn_flash_mode(Some("1"), "gfx900"), 1);
+        assert_eq!(resolve_attn_flash_mode(Some("on"), "gfx1030"), 1);
+        assert_eq!(resolve_attn_flash_mode(None, "gfx1030"), 1);
+        assert_eq!(resolve_attn_flash_mode(None, "gfx900"), 1);
+        assert_eq!(resolve_attn_flash_mode(Some("garbage"), "gfx1030"), 1);
+    }
+
+    #[test]
+    fn decode_flash_partials_elems_ceil_formula() {
+        // tile 128, max_seq 8192 → 64 tiles; batch mult = 1
+        assert_eq!(
+            decode_flash_partials_elems(16, 8192, 64, 128).unwrap(),
+            16 * 64 * (2 + 64)
+        );
+        // exact multiple: 256/128 = 2
+        assert_eq!(
+            decode_flash_partials_elems(8, 256, 128, 128).unwrap(),
+            8 * 2 * (2 + 128)
+        );
+        // ceil: 129/128 = 2
+        assert_eq!(
+            decode_flash_partials_elems(1, 129, 64, 128).unwrap(),
+            1 * 2 * 66
+        );
+        // tile 16 path (e.g. certified small gfx12 shape)
+        assert_eq!(
+            decode_flash_partials_elems(8, 2048, 256, 16).unwrap(),
+            8 * 128 * (2 + 256)
+        );
+        assert_eq!(decode_flash_partials_elems(4, 0, 64, 128).unwrap(), 0);
+    }
+
+    #[test]
+    fn decode_flash_partials_elems_rejects_overflow_and_zero_tile() {
+        let zero = decode_flash_partials_elems(1, 1, 1, 0).unwrap_err();
+        assert!(
+            zero.starts_with("lfm2moe:"),
+            "expected lfm2moe: prefix, got {zero}"
+        );
+        assert!(zero.contains("tile_size"), "{zero}");
+
+        let tiles = decode_flash_partials_elems(1, usize::MAX, 1, 2).unwrap_err();
+        assert!(
+            tiles.starts_with("lfm2moe:"),
+            "expected lfm2moe: prefix, got {tiles}"
+        );
+        assert!(tiles.contains("max_tiles"), "{tiles}");
+
+        let product = decode_flash_partials_elems(usize::MAX, 2, 2, 1).unwrap_err();
+        assert!(
+            product.starts_with("lfm2moe:"),
+            "expected lfm2moe: prefix, got {product}"
+        );
+        assert!(product.contains("flash_partials"), "{product}");
     }
 }

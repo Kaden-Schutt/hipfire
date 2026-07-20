@@ -133,6 +133,7 @@ impl SpecTargetGuard for Qwen35SlotGuard<'_> {
 // `hipfire_runtime::spec::InPlaceGuard<B>`). The daemon resolves the carrier via
 // `hipfire_loader::carrier_for(arch_id)` and never arch-matches itself.
 
+
 /// Pick the speculative-decode drafter for a freshly-loaded model. This is the
 /// single load-time registry the daemon's `generate_dflash` routes through —
 /// it never learns which arm was chosen.
@@ -242,3 +243,4 @@ pub fn build_speculator(
     }
     None
 }
+

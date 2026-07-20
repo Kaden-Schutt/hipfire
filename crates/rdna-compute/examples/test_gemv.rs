@@ -44,7 +44,10 @@ fn main() {
         if err > 0.01 {
             errors += 1;
             if errors <= 5 {
-                eprintln!("  row {i}: gpu={:.6} ref={:.6} err={:.6}", y_gpu[i], y_ref[i], err);
+                eprintln!(
+                    "  row {i}: gpu={:.6} ref={:.6} err={:.6}",
+                    y_gpu[i], y_ref[i], err
+                );
             }
         }
     }

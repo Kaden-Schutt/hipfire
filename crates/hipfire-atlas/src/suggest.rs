@@ -42,19 +42,26 @@ pub fn suggestions_for_row(row: &AtlasRow, max_suggestions: usize) -> Vec<Sugges
         out.push(Suggestion {
             id: "dflash-tau-vs-wall".to_string(),
             title: "Optimize DFlash only when tau and wall time agree".to_string(),
-            rationale: format!("DFlash row has tau={tau:.2}; high tau without output sanity is not a win."),
+            rationale: format!(
+                "DFlash row has tau={tau:.2}; high tau without output sanity is not a win."
+            ),
             expected_effect: "Keeps Atlas from ranking attractor failures as speedups.".to_string(),
             confidence: "high".to_string(),
         });
     }
     if let Some(kernels) = row.artifact_array("profile_kernels") {
         if let Some(kernel) = kernels.first() {
-            let name = kernel.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let name = kernel
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             let pct = kernel.get("pct").and_then(Value::as_f64).unwrap_or(0.0);
             out.push(Suggestion {
                 id: "hot-kernel-task".to_string(),
                 title: format!("Create task for hot kernel {name}"),
-                rationale: format!("{name} is first in the profile list at {pct:.2}% of measured time."),
+                rationale: format!(
+                    "{name} is first in the profile list at {pct:.2}% of measured time."
+                ),
                 expected_effect: "Most likely single-kernel tuning target.".to_string(),
                 confidence: if pct >= 15.0 { "high" } else { "medium" }.to_string(),
             });

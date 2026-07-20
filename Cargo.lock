@@ -902,6 +902,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-loader",
  "libc",
+ "md5",
  "memmap2",
  "minijinja",
  "minijinja-contrib",

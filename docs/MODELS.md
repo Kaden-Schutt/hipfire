@@ -11,7 +11,7 @@ This page projects **registry availability**: tags, default artifact filenames, 
 | Registry tag | Pull/list name resolved through `cli/registry.json` (+ aliases). |
 | Default artifact | `file` field — what `hipfire pull <tag>` fetches into `~/.hipfire/models/`. |
 | Runtime support | Whether the daemon/loader/arch crate can load and run the artifact shape (`arch_id`, kernels, Cargo features). Source-of-truth: runtime crates + [`architecture-ids.md`](architecture-ids.md). |
-| Admission | Explicit product decision in [`admissions.yml`](admissions.yml). Empty `records` ⇒ **no inferred admissions**. |
+| Admission | Explicit product decision in [`admissions.yml`](admissions.yml). Schema v2 holds exactly one evidence-bound record; no inferred admissions beyond that row. |
 
 `hipfire list -r` prints the live registry plus local availability. Prefer that command when sizes change; this page is a checked narrative, not a second registry.
 
@@ -192,10 +192,10 @@ Audited branch wording allowed for optimized LFM prefill (and nothing broader):
 - Pin when citing branch implementation: `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e` (or later branch commits only if re-grounded).
 
 **Planned (not implemented claims here):** Q8-first generic completion of the optimized path, wider LFM cohorts (1.2B / 8B-A1B), multi-GPU, and Phase-4 default-on.
-**Not admitted:** empty [`admissions.yml`](admissions.yml) `records`.
+**Admitted (exact one row):** [`admissions.yml`](admissions.yml) schema v2 admits only the sealed gfx1201 LFM2.5-350M MQ4 retained-PM4 plain-AR product route; nothing else.
 **Not a current baseline:** any exploratory tok/s tables in designs/plans.
 
-Eager per-token prefill / decode remains the portable LFM path when the opt-in flag is off **or** the GPU is not gfx1201. On **gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`**, the daemon selects the batched path from GPU+flag alone and has **no post-selection fallback**: requests outside the exact **350M dense MQ4** fixture fail closed at the runtime fixture guard. Source symbol `validate_350m_mq4_admission` names that fixture check only — it does **not** create a product admission; [`admissions.yml`](admissions.yml) remains the sole authority (`records: []`).
+Eager per-token prefill / decode remains the portable LFM path when the opt-in flag is off **or** the GPU is not gfx1201. On **gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`**, the daemon selects the batched path from GPU+flag alone and has **no post-selection fallback**: requests outside the exact **350M dense MQ4** fixture fail closed at the runtime fixture guard. Source symbol `validate_350m_mq4_admission` names that fixture check only — it does **not** create a product admission; [`admissions.yml`](admissions.yml) remains the sole authority (schema v2, exactly one earned retained-PM4 product row for this sealed fixture).
 
 ---
 
@@ -254,6 +254,6 @@ Reasoning models may emit `<think>…</think>`. Visibility and budgets are **con
 | Env vars | [`env-vars.md`](env-vars.md) |
 | CLI pull/run/list | [`CLI.md`](CLI.md) |
 | Arch IDs | [`architecture-ids.md`](architecture-ids.md) |
-| Admissions | [`admissions.yml`](admissions.yml) (empty until earned) |
+| Admissions | [`admissions.yml`](admissions.yml) (schema v2; exactly one earned record) |
 | Validation routes | [`VALIDATION.md`](VALIDATION.md) |
-| Dated benches | [`BENCHMARKS.md`](BENCHMARKS.md) (historical unless admitted) |
+| Dated benches | [`BENCHMARKS.md`](BENCHMARKS.md) (tables remain **historical** regardless of admission; admission and measurement classification are independent) |

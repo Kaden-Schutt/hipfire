@@ -62,6 +62,7 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
+md5 = "0.8"
 safetensors.workspace = true
 half.workspace = true
 byteorder = "1"

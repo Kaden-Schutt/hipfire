@@ -25,10 +25,21 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 "#;
     std::fs::write("/tmp/redline_chain_va.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1010", "-O3",
-               "-o", "/tmp/redline_chain_va.hsaco", "/tmp/redline_chain_va.hip"])
-        .output().expect("hipcc");
-    assert!(out.status.success(), "hipcc: {}", String::from_utf8_lossy(&out.stderr));
+        .args([
+            "--genco",
+            "--offload-arch=gfx1010",
+            "-O3",
+            "-o",
+            "/tmp/redline_chain_va.hsaco",
+            "/tmp/redline_chain_va.hip",
+        ])
+        .output()
+        .expect("hipcc");
+    assert!(
+        out.status.success(),
+        "hipcc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let module = dev.load_module_file("/tmp/redline_chain_va.hsaco").unwrap();
     let kernel = Kernel::find(&module, "vector_add").expect("kernel not found");
@@ -57,17 +68,35 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     {
         // c = a + b → c should be [3, 3, 3, ...]
         let mut ka1 = KernargBuilder::new(28);
-        ka1.write_ptr(0, a_buf.gpu_addr).write_ptr(8, b_buf.gpu_addr)
-           .write_ptr(16, c_buf.gpu_addr).write_u32(24, n);
-        dq.dispatch(&dev, kernel, [groups, 1, 1], [256, 1, 1],
-            ka1.as_bytes(), &[&module.code_buf, &a_buf, &b_buf, &c_buf]).unwrap();
+        ka1.write_ptr(0, a_buf.gpu_addr)
+            .write_ptr(8, b_buf.gpu_addr)
+            .write_ptr(16, c_buf.gpu_addr)
+            .write_u32(24, n);
+        dq.dispatch(
+            &dev,
+            kernel,
+            [groups, 1, 1],
+            [256, 1, 1],
+            ka1.as_bytes(),
+            &[&module.code_buf, &a_buf, &b_buf, &c_buf],
+        )
+        .unwrap();
 
         // d = c + a → d should be [4, 4, 4, ...]
         let mut ka2 = KernargBuilder::new(28);
-        ka2.write_ptr(0, c_buf.gpu_addr).write_ptr(8, a_buf.gpu_addr)
-           .write_ptr(16, d_buf.gpu_addr).write_u32(24, n);
-        dq.dispatch(&dev, kernel, [groups, 1, 1], [256, 1, 1],
-            ka2.as_bytes(), &[&module.code_buf, &a_buf, &c_buf, &d_buf]).unwrap();
+        ka2.write_ptr(0, c_buf.gpu_addr)
+            .write_ptr(8, a_buf.gpu_addr)
+            .write_ptr(16, d_buf.gpu_addr)
+            .write_u32(24, n);
+        dq.dispatch(
+            &dev,
+            kernel,
+            [groups, 1, 1],
+            [256, 1, 1],
+            ka2.as_bytes(),
+            &[&module.code_buf, &a_buf, &c_buf, &d_buf],
+        )
+        .unwrap();
     }
     let seq_time = t0.elapsed();
 
@@ -76,7 +105,11 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     let d: &[f32] = unsafe { std::slice::from_raw_parts(d_raw.as_ptr() as *const f32, n as usize) };
     let bad = d.iter().filter(|&&v| (v - 4.0).abs() > 0.001).count();
     if bad == 0 {
-        eprintln!("  PASSED: {} elements = 4.0 ({:.1}ms)", n, seq_time.as_secs_f64() * 1000.0);
+        eprintln!(
+            "  PASSED: {} elements = 4.0 ({:.1}ms)",
+            n,
+            seq_time.as_secs_f64() * 1000.0
+        );
     } else {
         eprintln!("  FAILED: {bad}/{n} wrong (d[0]={}, d[1]={})", d[0], d[1]);
         std::process::exit(1);
@@ -104,27 +137,27 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
         ka_data[24..28].copy_from_slice(&n.to_le_bytes());
         // Hidden args for dispatch 1
         let hidden1 = 32usize;
-        ka_data[hidden1..hidden1+4].copy_from_slice(&groups.to_le_bytes()); // block_count_x
-        ka_data[hidden1+4..hidden1+8].copy_from_slice(&1u32.to_le_bytes()); // block_count_y
-        ka_data[hidden1+8..hidden1+12].copy_from_slice(&1u32.to_le_bytes()); // block_count_z
-        ka_data[hidden1+12..hidden1+14].copy_from_slice(&256u16.to_le_bytes()); // group_size_x
-        ka_data[hidden1+14..hidden1+16].copy_from_slice(&1u16.to_le_bytes()); // group_size_y
-        ka_data[hidden1+16..hidden1+18].copy_from_slice(&1u16.to_le_bytes()); // group_size_z
+        ka_data[hidden1..hidden1 + 4].copy_from_slice(&groups.to_le_bytes()); // block_count_x
+        ka_data[hidden1 + 4..hidden1 + 8].copy_from_slice(&1u32.to_le_bytes()); // block_count_y
+        ka_data[hidden1 + 8..hidden1 + 12].copy_from_slice(&1u32.to_le_bytes()); // block_count_z
+        ka_data[hidden1 + 12..hidden1 + 14].copy_from_slice(&256u16.to_le_bytes()); // group_size_x
+        ka_data[hidden1 + 14..hidden1 + 16].copy_from_slice(&1u16.to_le_bytes()); // group_size_y
+        ka_data[hidden1 + 16..hidden1 + 18].copy_from_slice(&1u16.to_le_bytes()); // group_size_z
 
         // Dispatch 2: d = c + a
         let o2 = ka2_off as usize;
-        ka_data[o2..o2+8].copy_from_slice(&c_buf.gpu_addr.to_le_bytes());
-        ka_data[o2+8..o2+16].copy_from_slice(&a_buf.gpu_addr.to_le_bytes());
-        ka_data[o2+16..o2+24].copy_from_slice(&d_buf.gpu_addr.to_le_bytes());
-        ka_data[o2+24..o2+28].copy_from_slice(&n.to_le_bytes());
+        ka_data[o2..o2 + 8].copy_from_slice(&c_buf.gpu_addr.to_le_bytes());
+        ka_data[o2 + 8..o2 + 16].copy_from_slice(&a_buf.gpu_addr.to_le_bytes());
+        ka_data[o2 + 16..o2 + 24].copy_from_slice(&d_buf.gpu_addr.to_le_bytes());
+        ka_data[o2 + 24..o2 + 28].copy_from_slice(&n.to_le_bytes());
         // Hidden args for dispatch 2
         let hidden2 = o2 + 32;
-        ka_data[hidden2..hidden2+4].copy_from_slice(&groups.to_le_bytes());
-        ka_data[hidden2+4..hidden2+8].copy_from_slice(&1u32.to_le_bytes());
-        ka_data[hidden2+8..hidden2+12].copy_from_slice(&1u32.to_le_bytes());
-        ka_data[hidden2+12..hidden2+14].copy_from_slice(&256u16.to_le_bytes());
-        ka_data[hidden2+14..hidden2+16].copy_from_slice(&1u16.to_le_bytes());
-        ka_data[hidden2+16..hidden2+18].copy_from_slice(&1u16.to_le_bytes());
+        ka_data[hidden2..hidden2 + 4].copy_from_slice(&groups.to_le_bytes());
+        ka_data[hidden2 + 4..hidden2 + 8].copy_from_slice(&1u32.to_le_bytes());
+        ka_data[hidden2 + 8..hidden2 + 12].copy_from_slice(&1u32.to_le_bytes());
+        ka_data[hidden2 + 12..hidden2 + 14].copy_from_slice(&256u16.to_le_bytes());
+        ka_data[hidden2 + 14..hidden2 + 16].copy_from_slice(&1u16.to_le_bytes());
+        ka_data[hidden2 + 16..hidden2 + 18].copy_from_slice(&1u16.to_le_bytes());
 
         // Fence buffer for barrier
         let fence_buf = dev.alloc_vram(4096).unwrap();
@@ -141,8 +174,20 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
         cb.dispatch(kernel, [groups, 1, 1], [256, 1, 1], ka_base + ka2_off);
 
         // One submit, one fence
-        dq.submit(&dev, &cb,
-            &[dq.kernarg_buf(), &module.code_buf, &a_buf, &b_buf, &c_buf, &d_buf, &fence_buf]).unwrap();
+        dq.submit(
+            &dev,
+            &cb,
+            &[
+                dq.kernarg_buf(),
+                &module.code_buf,
+                &a_buf,
+                &b_buf,
+                &c_buf,
+                &d_buf,
+                &fence_buf,
+            ],
+        )
+        .unwrap();
     }
     let chain_time = t0.elapsed();
 
@@ -151,15 +196,26 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     dev.download(&c_buf, &mut c_raw).unwrap();
     let c: &[f32] = unsafe { std::slice::from_raw_parts(c_raw.as_ptr() as *const f32, n as usize) };
     let c_bad = c.iter().filter(|&&v| (v - 3.0).abs() > 0.001).count();
-    eprintln!("  c_buf (intermediate): {}/{} correct (c[0]={} c[255]={} c[256]={})",
-        n as usize - c_bad, n, c[0], c[255], c[256]);
+    eprintln!(
+        "  c_buf (intermediate): {}/{} correct (c[0]={} c[255]={} c[256]={})",
+        n as usize - c_bad,
+        n,
+        c[0],
+        c[255],
+        c[256]
+    );
 
     let mut d_raw2 = vec![0u8; nbytes];
     dev.download(&d_buf, &mut d_raw2).unwrap();
-    let d2: &[f32] = unsafe { std::slice::from_raw_parts(d_raw2.as_ptr() as *const f32, n as usize) };
+    let d2: &[f32] =
+        unsafe { std::slice::from_raw_parts(d_raw2.as_ptr() as *const f32, n as usize) };
     let bad = d2.iter().filter(|&&v| (v - 4.0).abs() > 0.001).count();
     if bad == 0 {
-        eprintln!("  PASSED: {} elements = 4.0 ({:.1}ms)", n, chain_time.as_secs_f64() * 1000.0);
+        eprintln!(
+            "  PASSED: {} elements = 4.0 ({:.1}ms)",
+            n,
+            chain_time.as_secs_f64() * 1000.0
+        );
     } else {
         eprintln!("  FAILED: {bad}/{n} wrong");
         // Show first few wrong indices
@@ -172,9 +228,12 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
         }
     }
 
-    eprintln!("\nSpeedup: sequential {:.1}ms vs chained {:.1}ms ({:.1}x)",
-        seq_time.as_secs_f64() * 1000.0, chain_time.as_secs_f64() * 1000.0,
-        seq_time.as_secs_f64() / chain_time.as_secs_f64());
+    eprintln!(
+        "\nSpeedup: sequential {:.1}ms vs chained {:.1}ms ({:.1}x)",
+        seq_time.as_secs_f64() * 1000.0,
+        chain_time.as_secs_f64() * 1000.0,
+        seq_time.as_secs_f64() / chain_time.as_secs_f64()
+    );
 
     eprintln!("\n=== Chain dispatch PASSED ===");
     dq.destroy(&dev);

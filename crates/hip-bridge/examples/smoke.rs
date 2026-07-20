@@ -17,7 +17,11 @@ fn main() {
     // Allocate 4KB on GPU
     let size = 4096;
     let buf = hip.malloc(size).expect("failed to malloc");
-    println!("Allocated {} bytes on GPU at {:?}", buf.size(), buf.as_ptr());
+    println!(
+        "Allocated {} bytes on GPU at {:?}",
+        buf.size(),
+        buf.as_ptr()
+    );
 
     // Write test pattern to GPU
     let src: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();

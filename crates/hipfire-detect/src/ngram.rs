@@ -92,7 +92,11 @@ impl Detector for NgramDensity {
         if density > 0.50 {
             return Verdict::warn(format!(
                 "3-gram {:?} repeats {}/{} ({:.2}) in back half ({} toks)",
-                top_key, top_count, total_trigrams, density, back.len()
+                top_key,
+                top_count,
+                total_trigrams,
+                density,
+                back.len()
             ));
         }
         Verdict::Ok

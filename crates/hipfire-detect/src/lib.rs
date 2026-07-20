@@ -53,11 +53,7 @@ pub mod loop_guard_constants {
 pub enum Event<'a> {
     /// Token was decoded by the model. Always fires when the daemon's
     /// `emit_token_ids` flag is set.
-    Committed {
-        tok_id: u32,
-        pos: usize,
-        t_ms: u64,
-    },
+    Committed { tok_id: u32, pos: usize, t_ms: u64 },
     /// Visible bytes emitted to stdout. Fires once per
     /// `EosFilter::Emit`. Synthetic emits (no committed token) carry
     /// `synthetic = true`; detectors that correlate to commits should

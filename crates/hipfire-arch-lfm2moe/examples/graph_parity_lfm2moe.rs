@@ -22,6 +22,7 @@ fn main() {
     use hipfire_arch_lfm2moe::config::Lfm2MoeConfig;
     use hipfire_arch_lfm2moe::forward::{decode_step, decode_step_with_graph};
     use hipfire_arch_lfm2moe::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
+    use hipfire_arch_lfm2moe::redline_plan::{DecodeExecutionMode, RetainedFixtureEvidence};
     use hipfire_runtime::hfq::HfqFile;
     use std::path::PathBuf;
 
@@ -64,8 +65,17 @@ fn main() {
     let mut state_a = Lfm2MoeState::new_with_max_seq(&mut gpu, &cfg, n + 16).expect("state A");
     let mut logits_a: Vec<Vec<f32>> = Vec::with_capacity(n);
     for (pos, &t) in tokens.iter().enumerate() {
-        let l = decode_step(&cfg, &weights, &mut state_a, &mut gpu, t, pos as u32)
-            .expect("direct decode_step");
+        let l = decode_step(
+            &cfg,
+            &weights,
+            &mut state_a,
+            &mut gpu,
+            t,
+            pos as u32,
+            RetainedFixtureEvidence::ABSENT,
+            DecodeExecutionMode::Oracle,
+        )
+        .expect("direct decode_step");
         logits_a.push(l);
     }
 

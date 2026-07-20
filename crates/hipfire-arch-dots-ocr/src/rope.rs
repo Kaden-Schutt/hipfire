@@ -79,21 +79,24 @@ pub fn build_rope_2d_tables(
 ) -> (Vec<f32>, Vec<f32>) {
     assert!(spatial_merge_size > 0, "spatial_merge_size must be > 0");
     assert_eq!(
-        head_dim % 4, 0,
+        head_dim % 4,
+        0,
         "head_dim={head_dim} must be a multiple of 4 (two halves of equal h/w split)",
     );
     assert_eq!(
-        grid_h % spatial_merge_size, 0,
+        grid_h % spatial_merge_size,
+        0,
         "grid_h={grid_h} must be a multiple of spatial_merge_size={spatial_merge_size}",
     );
     assert_eq!(
-        grid_w % spatial_merge_size, 0,
+        grid_w % spatial_merge_size,
+        0,
         "grid_w={grid_w} must be a multiple of spatial_merge_size={spatial_merge_size}",
     );
 
     let n_patches = grid_h * grid_w;
-    let quarter = head_dim / 4;       // = head_dim_rotary_inv_freq_len = 32 for dots.ocr
-    let half = head_dim / 2;          // = 64
+    let quarter = head_dim / 4; // = head_dim_rotary_inv_freq_len = 32 for dots.ocr
+    let half = head_dim / 2; // = 64
 
     // inv_freq[k] = theta^(-2k / (head_dim/2))  for k in 0..quarter.
     // The exponent denominator is (head_dim / 2) because
@@ -130,10 +133,10 @@ pub fn build_rope_2d_tables(
                         let (wc, ws) = (w_angle.cos(), w_angle.sin());
 
                         // Layout per quarter: [hc, wc, hc, wc] across the head_dim.
-                        cos[base + k] = hc;            // 0          ..quarter
-                        cos[base + quarter + k] = wc;  // quarter    ..half
-                        cos[base + half + k] = hc;     // half       ..3*quarter   (repeat)
-                        cos[base + half + quarter + k] = wc;  // 3*quarter ..head_dim (repeat)
+                        cos[base + k] = hc; // 0          ..quarter
+                        cos[base + quarter + k] = wc; // quarter    ..half
+                        cos[base + half + k] = hc; // half       ..3*quarter   (repeat)
+                        cos[base + half + quarter + k] = wc; // 3*quarter ..head_dim (repeat)
 
                         sin[base + k] = hs;
                         sin[base + quarter + k] = ws;
@@ -237,8 +240,12 @@ mod tests {
         // Patch 0: (hpos=0, wpos=0) → all angles = 0 → cos=1, sin=0
         let p0_cos = &cos[0..8];
         let p0_sin = &sin[0..8];
-        for v in p0_cos { assert!((v - 1.0).abs() < 1e-6); }
-        for v in p0_sin { assert!(v.abs() < 1e-6); }
+        for v in p0_cos {
+            assert!((v - 1.0).abs() < 1e-6);
+        }
+        for v in p0_sin {
+            assert!(v.abs() < 1e-6);
+        }
 
         // Patch 2: (hpos=1, wpos=0)
         // h_angle = 1.0 * [1.0, 0.01] = [1.0, 0.01]
@@ -291,7 +298,7 @@ mod tests {
         assert_eq!(sin.len(), grid_h * grid_w * head_dim);
 
         let quarter = head_dim / 4; // 32
-        let half = head_dim / 2;     // 64
+        let half = head_dim / 2; // 64
 
         // Patch 3 in the 4×4 grid: walk the iteration order to find it.
         // Outer_h=2, outer_w=2, sm=2:
@@ -332,14 +339,20 @@ mod tests {
         // = cos(1.0 * 1.0) = cos(1) ≈ 0.5403.
         let got = cos[2 * 128 + 0];
         let want = 1.0_f32.cos();
-        assert!((got - want).abs() < 1e-6, "inv_freq[0] mismatch: got cos = {got}, want {want}");
+        assert!(
+            (got - want).abs() < 1e-6,
+            "inv_freq[0] mismatch: got cos = {got}, want {want}"
+        );
 
         // cos[patch2, 31] = cos(1.0 * inv_freq[31])
         // inv_freq[31] = 10000^(-62/64) = 10000^(-0.96875)
         let inv31 = 10000.0_f32.powf(-62.0 / 64.0);
         let got = cos[2 * 128 + 31];
         let want = (1.0 * inv31).cos();
-        assert!((got - want).abs() < 1e-6, "inv_freq[31] mismatch: got {got}, want {want}");
+        assert!(
+            (got - want).abs() < 1e-6,
+            "inv_freq[31] mismatch: got {got}, want {want}"
+        );
     }
 
     #[test]

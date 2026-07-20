@@ -743,13 +743,61 @@ fn gemv_family_resolves_mq3_prerotated_on_all_wave32_archs_not_cdna() {
     // gate is now HasWave32 (was HasWmma), so it resolves on every RDNA gen
     // (RDNA1/2/3/4) but still NOT on CDNA wave64 (a [32,1,1] kernel needs wave32).
     let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna1(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna4(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna1(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna4(),
+            None
+        )
+        .is_ok());
     // CDNA wave64 (gfx906) still excluded by HasWave32.
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_gfx906(), None).is_err());
-    assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_gfx906(),
+            None
+        )
+        .is_err());
+    assert!(fam
+        .resolve(
+            DType::MQ4G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
     // F32 Prerotated now falls back to GemvF32 (rotation-free dtype → plain key).
     // It resolves on any arch because GemvF32 has no arch gate.
     assert!(fam

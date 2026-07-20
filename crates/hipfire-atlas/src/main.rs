@@ -52,7 +52,9 @@ fn print_usage() {
     eprintln!("  hipfire-atlas suggest <path.jsonl> [INDEX] [MAX]  ranked tuning suggestions");
     eprintln!("  hipfire-atlas task <path.jsonl> [INDEX]     emit TaskBundle JSON for a row");
     eprintln!("  hipfire-atlas task-pytorch <name> <op> <shape> <dtype> <eval_cmd>");
-    eprintln!("                                              emit a TaskBundle for a PyTorch shape");
+    eprintln!(
+        "                                              emit a TaskBundle for a PyTorch shape"
+    );
     eprintln!();
     eprintln!("Eval:");
     eprintln!("  hipfire-atlas eval <task.json> [CWD]        run task's correctness+eval commands");
@@ -70,8 +72,8 @@ fn cmd_count(path: &str) -> Result<(), String> {
 fn cmd_head(path: &str, n: usize) -> Result<(), String> {
     let rows = load_rows(path)?;
     for row in rows.iter().take(n) {
-        let pretty = serde_json::to_string_pretty(row)
-            .map_err(|e| format!("serialize row: {e}"))?;
+        let pretty =
+            serde_json::to_string_pretty(row).map_err(|e| format!("serialize row: {e}"))?;
         println!("{pretty}");
     }
     Ok(())
@@ -81,8 +83,8 @@ fn cmd_read(path: &str) -> Result<(), String> {
     let rows = load_rows(path)?;
     println!("rows: {}", rows.len());
     if let Some(first) = rows.first() {
-        let pretty = serde_json::to_string_pretty(first)
-            .map_err(|e| format!("serialize first row: {e}"))?;
+        let pretty =
+            serde_json::to_string_pretty(first).map_err(|e| format!("serialize first row: {e}"))?;
         println!("first row:");
         println!("{pretty}");
     }
@@ -90,8 +92,7 @@ fn cmd_read(path: &str) -> Result<(), String> {
 }
 
 fn cmd_parse_bench(stdout_path: &str, out_path: &str) -> Result<(), String> {
-    let text = fs::read_to_string(stdout_path)
-        .map_err(|e| format!("read {stdout_path}: {e}"))?;
+    let text = fs::read_to_string(stdout_path).map_err(|e| format!("read {stdout_path}: {e}"))?;
     let rows = bench_rows_from_output(&text)?;
     write_rows_jsonl(&rows, out_path)?;
     println!("wrote {} rows to {out_path}", rows.len());
@@ -99,8 +100,7 @@ fn cmd_parse_bench(stdout_path: &str, out_path: &str) -> Result<(), String> {
 }
 
 fn cmd_parse_dflash(stdout_path: &str, out_path: &str) -> Result<(), String> {
-    let text = fs::read_to_string(stdout_path)
-        .map_err(|e| format!("read {stdout_path}: {e}"))?;
+    let text = fs::read_to_string(stdout_path).map_err(|e| format!("read {stdout_path}: {e}"))?;
     let row = dflash_row_from_output(&text)?;
     write_rows_jsonl(&[row], out_path)?;
     println!("wrote 1 row to {out_path}");
@@ -127,8 +127,8 @@ fn cmd_suggest(path: &str, idx: usize, max: usize) -> Result<(), String> {
 fn cmd_task(path: &str, idx: usize) -> Result<(), String> {
     let row = load_row(path, idx)?;
     let bundle = task_from_row(&row, None, Vec::new(), Vec::new());
-    let pretty = serde_json::to_string_pretty(&bundle)
-        .map_err(|e| format!("serialize task: {e}"))?;
+    let pretty =
+        serde_json::to_string_pretty(&bundle).map_err(|e| format!("serialize task: {e}"))?;
     println!("{pretty}");
     Ok(())
 }
@@ -154,16 +154,16 @@ fn cmd_task_pytorch(
         None,
         Vec::new(),
     );
-    let pretty = serde_json::to_string_pretty(&bundle)
-        .map_err(|e| format!("serialize task: {e}"))?;
+    let pretty =
+        serde_json::to_string_pretty(&bundle).map_err(|e| format!("serialize task: {e}"))?;
     println!("{pretty}");
     Ok(())
 }
 
 fn cmd_eval(task_path: &str, cwd: Option<&str>) -> Result<(), String> {
     let result = eval_task_file(task_path, cwd)?;
-    let pretty = serde_json::to_string_pretty(&result)
-        .map_err(|e| format!("serialize eval result: {e}"))?;
+    let pretty =
+        serde_json::to_string_pretty(&result).map_err(|e| format!("serialize eval result: {e}"))?;
     println!("{pretty}");
     if result.status != "pass" {
         return Err(format!("task {} failed", result.task_id));

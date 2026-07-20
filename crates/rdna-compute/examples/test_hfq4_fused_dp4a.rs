@@ -69,15 +69,15 @@ fn main() {
         let y_a_ref = gpu.zeros(&[n * ALPHA_M], DType::F32).unwrap();
 
         gpu.gemm_qkvza_hfq4g256_wave64_dp4a(
-            &a_qkv, &a_z, &a_beta, &a_alpha, &x,
-            &y_q_dp, &y_z_dp, &y_b_dp, &y_a_dp,
-            QKV_M, Z_M, BETA_M, ALPHA_M, k, n,
-        ).expect("qkvza dp4a");
+            &a_qkv, &a_z, &a_beta, &a_alpha, &x, &y_q_dp, &y_z_dp, &y_b_dp, &y_a_dp, QKV_M, Z_M,
+            BETA_M, ALPHA_M, k, n,
+        )
+        .expect("qkvza dp4a");
         gpu.gemm_qkvza_hfq4g256_fp16_wave64(
-            &a_qkv, &a_z, &a_beta, &a_alpha, &x,
-            &y_q_ref, &y_z_ref, &y_b_ref, &y_a_ref,
-            QKV_M, Z_M, BETA_M, ALPHA_M, k, n,
-        ).expect("qkvza fp16_wave64");
+            &a_qkv, &a_z, &a_beta, &a_alpha, &x, &y_q_ref, &y_z_ref, &y_b_ref, &y_a_ref, QKV_M,
+            Z_M, BETA_M, ALPHA_M, k, n,
+        )
+        .expect("qkvza fp16_wave64");
         gpu.hip.device_synchronize().expect("sync");
 
         let pass = compare(&mut gpu, &y_q_dp, &y_q_ref, "qkv")
@@ -92,7 +92,9 @@ fn main() {
     //    also exercises the `_prequant` entry point used by the dispatcher
     //    to skip re-quantization. ─────────────────────────────────────────
     {
-        eprintln!("\n=== qkvza tail (qkv_m=0, z_m=0) — exercises row-routing prologue + _prequant ===");
+        eprintln!(
+            "\n=== qkvza tail (qkv_m=0, z_m=0) — exercises row-routing prologue + _prequant ==="
+        );
         let a_qkv = upload_weights(&mut gpu, QKV_M, groups_per_row, 0xAA01);
         let a_z = upload_weights(&mut gpu, Z_M, groups_per_row, 0xAA02);
         let a_beta = upload_weights(&mut gpu, BETA_M, groups_per_row, 0xAA03);
@@ -118,16 +120,15 @@ fn main() {
         // Call _prequant directly — the path used by the dispatcher's MMQ-tail.
         let xq_ptr = gpu.ensure_q8_1_mmq_x(&x, n, k).expect("quantize x");
         gpu.gemm_qkvza_hfq4g256_wave64_dp4a_prequant(
-            &a_qkv, &a_z, &a_beta, &a_alpha,
-            xq_ptr,
-            &y_q_dp, &y_z_dp, &y_b_dp, &y_a_dp,
-            0, 0, BETA_M, ALPHA_M, k, n,
-        ).expect("qkvza dp4a tail prequant");
+            &a_qkv, &a_z, &a_beta, &a_alpha, xq_ptr, &y_q_dp, &y_z_dp, &y_b_dp, &y_a_dp, 0, 0,
+            BETA_M, ALPHA_M, k, n,
+        )
+        .expect("qkvza dp4a tail prequant");
         gpu.gemm_qkvza_hfq4g256_fp16_wave64(
-            &a_qkv, &a_z, &a_beta, &a_alpha, &x,
-            &y_q_ref, &y_z_ref, &y_b_ref, &y_a_ref,
-            0, 0, BETA_M, ALPHA_M, k, n,
-        ).expect("qkvza fp16_wave64 tail");
+            &a_qkv, &a_z, &a_beta, &a_alpha, &x, &y_q_ref, &y_z_ref, &y_b_ref, &y_a_ref, 0, 0,
+            BETA_M, ALPHA_M, k, n,
+        )
+        .expect("qkvza fp16_wave64 tail");
         gpu.hip.device_synchronize().expect("sync");
 
         // qkv + z outputs should remain zero (kernel skipped them via gid >= total_m).
@@ -171,13 +172,13 @@ fn main() {
         let y_v_ref = gpu.zeros(&[n * V_M], DType::F32).unwrap();
 
         gpu.gemm_qkv_hfq4g256_wave64_dp4a(
-            &a_q, &a_k, &a_v, &x, &y_q_dp, &y_k_dp, &y_v_dp,
-            Q_M, K_M, V_M, k, n,
-        ).expect("qkv dp4a");
+            &a_q, &a_k, &a_v, &x, &y_q_dp, &y_k_dp, &y_v_dp, Q_M, K_M, V_M, k, n,
+        )
+        .expect("qkv dp4a");
         gpu.gemm_qkv_hfq4g256_fp16_wave64(
-            &a_q, &a_k, &a_v, &x, &y_q_ref, &y_k_ref, &y_v_ref,
-            Q_M, K_M, V_M, k, n,
-        ).expect("qkv fp16_wave64");
+            &a_q, &a_k, &a_v, &x, &y_q_ref, &y_k_ref, &y_v_ref, Q_M, K_M, V_M, k, n,
+        )
+        .expect("qkv fp16_wave64");
         gpu.hip.device_synchronize().expect("sync");
 
         let pass = compare(&mut gpu, &y_q_dp, &y_q_ref, "q")
@@ -198,12 +199,12 @@ fn main() {
         let y_g_ref = gpu.zeros(&[n * GATE_M], DType::F32).unwrap();
         let y_u_ref = gpu.zeros(&[n * UP_M], DType::F32).unwrap();
 
-        gpu.gemm_gate_up_hfq4g256_wave64_dp4a(
-            &a_g, &a_u, &x, &y_g_dp, &y_u_dp, GATE_M, UP_M, k, n,
-        ).expect("gate_up dp4a");
+        gpu.gemm_gate_up_hfq4g256_wave64_dp4a(&a_g, &a_u, &x, &y_g_dp, &y_u_dp, GATE_M, UP_M, k, n)
+            .expect("gate_up dp4a");
         gpu.gemm_gate_up_hfq4g256_fp16_wave64(
             &a_g, &a_u, &x, &y_g_ref, &y_u_ref, GATE_M, UP_M, k, n,
-        ).expect("gate_up fp16_wave64");
+        )
+        .expect("gate_up fp16_wave64");
         gpu.hip.device_synchronize().expect("sync");
 
         let pass = compare(&mut gpu, &y_g_dp, &y_g_ref, "gate")
@@ -222,7 +223,8 @@ fn main() {
 
 fn upload_weights(gpu: &mut Gpu, m: usize, groups_per_row: usize, seed: u64) -> GpuTensor {
     let bytes = synth_hfq4g256_weights(m, groups_per_row, seed);
-    gpu.upload_raw(&bytes, &[m * groups_per_row * 136]).expect("upload weights")
+    gpu.upload_raw(&bytes, &[m * groups_per_row * 136])
+        .expect("upload weights")
 }
 
 fn upload_x(gpu: &mut Gpu, n: usize, k: usize) -> GpuTensor {
@@ -246,7 +248,9 @@ fn compare(gpu: &mut Gpu, dp4a: &GpuTensor, ref_: &GpuTensor, label: &str) -> bo
     let mut max_abs_err = 0.0f32;
     for i in 0..n {
         let err = (dp[i] - rf[i]).abs();
-        if err > max_abs_err { max_abs_err = err; }
+        if err > max_abs_err {
+            max_abs_err = err;
+        }
         sum_sq_err += (err as f64).powi(2);
         sum_sq_ref += (rf[i] as f64).powi(2);
     }
@@ -259,7 +263,9 @@ fn compare(gpu: &mut Gpu, dp4a: &GpuTensor, ref_: &GpuTensor, label: &str) -> bo
     let verdict = if pass { "PASS" } else { "FAIL" };
     eprintln!(
         "  [{label:5}] NRMSE={:.4}%  max_abs_err={:.4e}  rms_ref={:.4e}  {verdict}",
-        nrmse * 100.0, max_abs_err, rms_ref
+        nrmse * 100.0,
+        max_abs_err,
+        rms_ref
     );
     if !dp_nonzero {
         eprintln!("    dp4a output is all-zero — kernel may not have run");

@@ -64,8 +64,12 @@ fn main() {
         })
         .collect();
 
-    let y_dp4a = gpu.upload_f32(&y_init_host, &[n * m]).expect("alloc y_dp4a");
-    let y_fp16 = gpu.upload_f32(&y_init_host, &[n * m]).expect("alloc y_fp16");
+    let y_dp4a = gpu
+        .upload_f32(&y_init_host, &[n * m])
+        .expect("alloc y_dp4a");
+    let y_fp16 = gpu
+        .upload_f32(&y_init_host, &[n * m])
+        .expect("alloc y_fp16");
 
     let n_iter = std::env::var("HFQ_TEST_N_ITER")
         .ok()
@@ -131,14 +135,21 @@ fn main() {
     eprintln!("rms_ref      = {:.6e}", rms_ref);
     eprintln!("NRMSE        = {:.4}%", nrmse * 100.0);
     eprintln!("worst (col,row) = ({worst_col}, {worst_row})");
-    eprintln!("                  fp16={:.6e}  dp4a={:.6e}", worst_pair.0, worst_pair.1);
+    eprintln!(
+        "                  fp16={:.6e}  dp4a={:.6e}",
+        worst_pair.0, worst_pair.1
+    );
     eprintln!("ref range:  [{ref_min:.4e}, {ref_max:.4e}]");
     eprintln!("dp4a range: [{dp_min:.4e}, {dp_max:.4e}]");
 
     eprintln!("\n--- First 16 output cells (col=0, rows=0..15) ---");
     for i in 0..16.min(m) {
-        eprintln!("  row {i}: fp16={:.6e}  dp4a={:.6e}  diff={:.6e}",
-            fp16_out[i], dp4a_out[i], (fp16_out[i] - dp4a_out[i]).abs());
+        eprintln!(
+            "  row {i}: fp16={:.6e}  dp4a={:.6e}  diff={:.6e}",
+            fp16_out[i],
+            dp4a_out[i],
+            (fp16_out[i] - dp4a_out[i]).abs()
+        );
     }
 
     // Pass criteria:

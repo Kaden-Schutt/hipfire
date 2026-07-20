@@ -73,7 +73,10 @@ impl Detector for SpecialLeak {
 
     fn finalize(&mut self) -> Verdict {
         if let Some(m) = &self.fired {
-            return Verdict::fail(format!("special-token leak: {} appeared in visible text", m));
+            return Verdict::fail(format!(
+                "special-token leak: {} appeared in visible text",
+                m
+            ));
         }
         Verdict::Ok
     }
