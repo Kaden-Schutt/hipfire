@@ -1,7 +1,7 @@
 # Documentation Reliability Cutover Design
 
-**Status:** Approved design intent  
-**Lifecycle:** `planned`  
+**Status:** Superseded design intent
+**Lifecycle:** `superseded`
 **Allowed claim states:** Planned design requirements; cited audit examples retain their explicitly labeled states  
 **Canonical domain:** Documentation-governance cutover design, not operational runtime or validation policy  
 **Audited reference:** `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e`  
@@ -9,7 +9,7 @@
 **Cutover candidate reference (`C`):** Unset until closeout; MUST be one immutable full commit containing every substantive cutover change
 **Attestation reference (`A`):** External Git/CI identity of the final direct child of `C`; tracked content MUST NOT attempt to name `A`
 **Last checked:** 2026-07-18  
-**Replacement:** Becomes `superseded` and non-operational in `A`, after `docs/INDEX.md` and `docs/VALIDATION.md` assume their defined authority at `C`
+**Replacement:** Superseded by `docs/superpowers/specs/2026-07-18-greenfield-documentation-rewrite-design.md`
 
 The audited branch is 24 commits ahead of the comparison base. Facts introduced only in that delta are branch facts, not shipped `origin/beta` facts. This document uses **MUST**, **MUST NOT**, **SHOULD**, and **MAY** normatively.
 
