@@ -10,6 +10,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so DOCS_DIFF_BASE (PR base / push-before) resolves.
+          fetch-depth: 0
+
+      - name: Resolve docs diff base
+        id: docs_base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            base="${{ github.event.before }}"
+            # First push / force-created branch can report the zero SHA.
+            if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+              echo "no-gpu-ci: github.event.before is empty/zero; cannot set DOCS_DIFF_BASE" >&2
+              exit 1
+            fi
+          else
+            echo "no-gpu-ci: unsupported event '${{ github.event_name }}' for DOCS_DIFF_BASE" >&2
+            exit 1
+          fi
+          if [[ -z "$base" ]]; then
+            echo "no-gpu-ci: resolved empty DOCS_DIFF_BASE" >&2
+            exit 1
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "DOCS_DIFF_BASE=$base"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -29,4 +57,6 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Run no-GPU checks
+        env:
+          DOCS_DIFF_BASE: ${{ steps.docs_base.outputs.base }}
         run: ./scripts/no-gpu-ci.sh

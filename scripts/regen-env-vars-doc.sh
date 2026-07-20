@@ -6,11 +6,11 @@
 
 # Regenerate the quick-reference table check in docs/env-vars.md.
 #
-# Source-of-truth: env::var(), env::var_os(), and process.env.X across tracked
-# files. Surfaces the diff between source-extracted env vars and the table in
-# docs/env-vars.md so a contributor can see (a) any HIPFIRE_* var that was
-# added to source without a doc row, and (b) any doc row that no longer has
-# a matching source reference.
+# Source coverage: concrete env::var(), env::var_os(), and process.env.X reads
+# in tracked Rust/TypeScript files. Reports any HIPFIRE_* source read without a
+# documentation row. The generated inventory is intentionally broader
+# (Python/shell token hits and retained harness knobs), so doc-only rows are
+# expected and are not removal candidates.
 #
 # Note the (_os)? group in the regex: compiler.rs uses std::env::var_os(...)
 # rather than std::env::var(...). A regex matching only env::var( would
@@ -35,11 +35,11 @@ src_list=$(mktemp /tmp/hipfire-env-vars-src.XXXXXX)
 doc_list=$(mktemp /tmp/hipfire-env-vars-doc.XXXXXX)
 trap 'rm -f "$src_list" "$doc_list"' EXIT
 
-# Extract from source: env::var(...), env::var_os(...), process.env.X
-git ls-files | grep -E '\.(rs|ts)$' \
-    | xargs grep -hE 'env::var(_os)?\("HIPFIRE_|process\.env\.HIPFIRE_' 2>/dev/null \
-    | grep -oE '(env::var(_os)?\("[A-Z_0-9]+"\)|process\.env\.[A-Z_0-9]+)' \
-    | sed -E 's/env::var(_os)?\("//; s/"\)$//; s/process\.env\.//' \
+# Extract concrete HIPFIRE_* reads from source. Match the variable in the same
+# expression so another process.env name on that line cannot leak into output.
+git ls-files '*.rs' '*.ts' \
+    | xargs grep -hoE 'env::var(_os)?\([[:space:]]*"HIPFIRE_[A-Z_0-9]+"\)|process\.env\.HIPFIRE_[A-Z_0-9]+' 2>/dev/null \
+    | sed -E 's/.*"(HIPFIRE_[A-Z_0-9]+)".*/\1/; s/process\.env\.//' \
     | sort -u > "$src_list"
 
 # Extract from doc table: rows of the form `| `VAR` | category | default | location |`
@@ -62,9 +62,9 @@ if [ -n "$missing_in_doc" ]; then
 fi
 
 if [ -n "$missing_in_src" ]; then
-    echo
-    echo "STALE in $DOC (doc row, no source reference - candidates for retire):"
-    echo "$missing_in_src" | sed 's/^/  - /'
+    doc_only_count=$(printf '%s\n' "$missing_in_src" | wc -l)
+    echo "regen-env-vars-doc: note: $doc_only_count documented rows are outside"
+    echo "  the concrete Rust/TypeScript read set (expected for Python/shell/history)"
 fi
 
 if [ -n "$missing_in_doc" ]; then
@@ -74,7 +74,5 @@ if [ -n "$missing_in_doc" ]; then
     exit 1
 fi
 
-if [ -z "$missing_in_doc" ] && [ -z "$missing_in_src" ]; then
-    echo "regen-env-vars-doc: source and doc agree (no missing or stale entries)"
-fi
+echo "regen-env-vars-doc: source-to-table coverage ok"
 exit 0

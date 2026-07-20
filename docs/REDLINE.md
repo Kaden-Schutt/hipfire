@@ -1,52 +1,95 @@
 # Redline Contributor Guide
 
-This is the canonical, normative contributor procedure for Redline retained replay in hipfire. It defines how to construct, validate, measure, review, and promote a retained route. Runtime source remains authoritative for executable behavior. Dated reports remain evidence for the exact fixtures they record; they are not current defaults or timeless performance floors.
+Canonical **branch-implemented** procedure for Redline retained replay in
+hipfire. Use it to construct, validate, measure, review, and decide whether a
+retained route may be promoted. Runtime source is authoritative for executable
+behavior. Dated reports are evidence for the fixtures they name only.
+
+| Field | Value |
+|---|---|
+| Page state | **branch-implemented** (see [`INDEX.md`](INDEX.md)) |
+| Inventory date | 2026-07-19 |
+| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
+| Comparison base | `origin/beta` @ `9ffb18da9d1377dfbf759db82641ea039b2e522e` |
+| Validation routes | [`VALIDATION.md`](VALIDATION.md) |
+| Thin skill hook (non-normative) | [`.agents/skills/redline-retained-replay/SKILL.md`](../.agents/skills/redline-retained-replay/SKILL.md) |
+
+This guide is normative on the working branch. It is **not** an `origin/beta`
+product fact at the comparison base unless and until that base carries the same
+text.
 
 ## 1. Scope, authority, and evidence classes
 
-Use this guide when changing any of the following:
+Use this guide when changing any of:
 
 - model admission to retained AQL or retained PM4;
-- recorder coverage, launch identity, kernarg capture, artifacts, resource effects, or dynamic bindings;
-- retained-plan construction, PM4 lowering, queue policy, waits, fences, or acquire policy;
+- recorder coverage, launch identity, kernarg capture, artifacts, resource
+  effects, or dynamic bindings;
+- retained-plan construction, PM4 lowering, queue policy, waits, fences, or
+  acquire policy;
 - model reset, pointer lifetime, replay failure, or fallback behavior;
-- a kernel, fusion, Radiowave transformation, or scheduling overlay on a retained route;
+- a kernel, fusion, Radiowave transformation, or scheduling overlay on a
+  retained route;
 - a benchmark or product claim attributed to Redline.
 
-This guide covers ordinary sequential single-token autoregressive continuation. It does not certify prefill, speculative verification, MTP reseed or proposal work, mutable multi-token replay, or a new model path merely because those paths can be captured. It does not make the experimental direct-KMD `crates/redline` crate the serving transport.
+**In scope shape:** ordinary sequential single-token autoregressive
+continuation.
+
+**Out of scope unless separately certified:** prefill; speculative
+verification; MTP reseed or proposal; mutable multi-token replay; a new model
+path merely because it can be captured; the experimental direct-KMD
+`crates/redline` crate as a serving transport.
 
 ### Source-of-truth order
 
-1. Runtime source and tests define executable admission, state transitions, failure handling, and currently implemented encodings.
-2. This guide defines contributor workflow and the certification policy required before promotion or a performance claim.
-3. Dated performance checkpoints and raw reports preserve observations for exact fixtures.
-4. `crates/redline-dispatch/HIPFIRE-GRAFT.md` and `crates/redline-rocr/PROVENANCE.md` preserve graft and ABI provenance; they do not define the current procedure.
+1. Runtime source and tests — executable admission, state transitions, failure
+   handling, encodings.
+2. This guide — contributor workflow and certification policy before promotion
+   or a Redline-attributed performance claim.
+3. Dated performance checkpoints and raw reports — observations for exact
+   fixtures.
+4. `crates/redline-dispatch/HIPFIRE-GRAFT.md` and
+   `crates/redline-rocr/PROVENANCE.md` — graft/ABI provenance only; not current
+   procedure.
 
-Every Redline statement should be recognizable as one of these evidence classes:
+### Evidence classes
 
 | Class | Meaning | Examples |
 |---|---|---|
-| **Runtime fact** | Directly defined by current source or tests. | The current automatic default predicate; `ReplayState` transitions; replay failure returns an error. |
-| **Certification policy** | Evidence this guide requires before a route or optimization is promoted. It may be stricter than runtime enforcement. | Multi-position shadow parity; positive timed-arm route proof; matched stationary performance. |
-| **Dated evidence** | An observation tied to a named date, source/binary/model identity, and fixture. | A 2026-07-11 gfx1201 PM4-versus-HipGraph measurement. |
+| **Runtime fact** | Defined by current source or tests. | Automatic default predicate; `ReplayState` transitions; replay failure returns an error. |
+| **Certification policy** | Evidence this guide requires before promotion. May be stricter than runtime enforcement. | Multi-position shadow parity; positive timed-arm route proof; matched stationary performance. |
+| **Dated evidence** | Observation tied to date, source/binary/model identity, and fixture. | A 2026-07-11 gfx1201 PM4-versus-HipGraph measurement. |
 
-`ReplayState::Ready` is a runtime state. It is not, by itself, repository certification.
+`ReplayState::Ready` is a runtime state. It is **not** repository certification.
+
+### Capability vs admission (do not collapse)
+
+| Classification | Meaning |
+|---|---|
+| **Implementation capability** | Code can lower/prepare/replay something when explicitly driven. |
+| **Opt-in availability** | An explicit backend/manual path can exercise that capability. |
+| **Model performance evidence** | Dated tok/s (or similar) on a fixture; route may be unspecified. |
+| **Retained-route certification** | Full Section 7 ladder, including timed-arm route proof. |
+| **Automatic product default** | Runtime predicate requests Auto without explicit backend/manual bypass. |
+| **Registry admission** | Row in [`admissions.yml`](admissions.yml). Schema v1 keeps `records: []` until earned. |
+
+Runtime admission ≠ guide certification ≠ product admission.
 
 ### Terms
 
 | Term | Definition |
 |---|---|
-| **Recorder-aware HIP launch** | An ordinary HIP launch that also contributes exact typed launch metadata to the retained tape. Recorder awareness must not alter direct-HIP semantics. |
-| **Retained tape** | The stable ordered launch sequence plus exact artifacts, padded kernargs, geometry, resource contracts, dependencies, and dynamic bindings needed for replay. |
-| **PM4 command body** | An architecture-specific indirect-buffer command stream lowered from a certified tape. |
-| **PM4-IB AQL packet** | The public ROCr/HSA vendor packet that submits a retained PM4 command body. |
-| **Runtime admission** | Current code that decides whether a forward may capture, prepare, or consume replay. |
-| **Certification gate** | Evidence required by this guide before promotion or a performance claim. |
-| **External adapter boundary** | Work intentionally kept outside the retained body and explicitly counted as such, such as current Qwen token embedding and position preparation. |
+| **Recorder-aware HIP launch** | Ordinary HIP launch that also contributes exact typed launch metadata to the retained tape. Must not alter direct-HIP semantics. |
+| **Retained tape** | Stable ordered launch sequence plus exact artifacts, padded kernargs, geometry, resource contracts, dependencies, and dynamic bindings. |
+| **PM4 command body** | Architecture-specific indirect-buffer command stream lowered from a certified tape. |
+| **PM4-IB AQL packet** | Public ROCr/HSA vendor packet that submits a retained PM4 command body. |
+| **Runtime admission** | Current code deciding whether a forward may capture, prepare, or consume replay. |
+| **Certification gate** | Evidence this guide requires before promotion or a Redline-attributed claim. |
+| **External adapter boundary** | Work kept outside the retained body and explicitly counted (e.g. current Qwen token embedding and position preparation). |
 
 ## 2. Mental model and ownership
 
-The active retained-PM4 path is:
+Active retained-PM4 path:
 
 ```text
 ordinary recorder-aware HIP launches
@@ -67,35 +110,42 @@ one PM4-IB AQL packet
 public ROCr/HSA queue → release-ordered doorbell → signal → completion
 ```
 
-Redline retains the real model forward. It does not inherently replace or fuse its kernels. A kernel change is a separate optimization whose numerical, resource, and hazard contracts must be re-certified.
+Redline retains the real model forward. It does not inherently replace or fuse
+kernels. A kernel change is a separate optimization that must be re-certified.
 
 ### Three-crate ownership
 
 | Crate | Owns | Does not own |
 |---|---|---|
-| `redline` | Experimental direct-KMD/bare-libdrm device, memory, queue, PM4, and synchronization machinery. | The active product serving route. |
-| `redline-dispatch` | Dispatch-DAG recording and validation, artifact and kernarg identity, dependency and visibility policy, plan compilation/selection, and retained AQL/PM4 graph construction. | ROCr ABI lifetime mechanics or model-specific admission. |
-| `redline-rocr` | Dynamically loaded public ROCr/HSA ABI; agent, queue, memory, packet, signal, doorbell, and completion lifetimes; AQL packet encoding; architecture PM4 command builders. | Model scheduling, dispatch-DAG policy, or backend admission. |
+| `redline` | Experimental direct-KMD/bare-libdrm device, memory, queue, PM4, sync. | Active product serving route. |
+| `redline-dispatch` | Dispatch-DAG recording/validation, artifact/kernarg identity, dependency/visibility policy, plan compilation/selection, retained AQL/PM4 graph construction. | ROCr ABI lifetime mechanics or model-specific admission. |
+| `redline-rocr` | Dynamically loaded public ROCr/HSA ABI; agent, queue, memory, packet, signal, doorbell, completion lifetimes; AQL encoding; architecture PM4 builders. | Model scheduling, dispatch-DAG policy, or backend admission. |
 
-`rdna-compute::replay::ReplayController` is the product integration controller held by `Gpu`. The model adapter defines the eligible forward boundary and the model-owned state/lifetimes; the controller records, prepares, routes, poisons, and resets. This integration role does not turn `rdna-compute` into a fourth Redline transport crate.
+`rdna-compute::replay::ReplayController` is the product integration controller
+held by `Gpu`. The model adapter owns the eligible forward boundary and
+model-owned state/lifetimes; the controller records, prepares, routes, poisons,
+and resets. That role does **not** make `rdna-compute` a fourth Redline
+transport crate.
 
 ### Mechanisms that must remain distinct
 
-| Mechanism | Submission shape | What it proves | What it does not prove |
+| Mechanism | Submission shape | Proves | Does not prove |
 |---|---|---|---|
-| Ordinary serial HIP | One `hipModuleLaunchKernel` path per launch. | Baseline model execution. | Any retained route. |
-| HipGraph | HIP stream capture followed by a HIP graph launch. | HIP graph capture/replay for an eligible forward. | Retained AQL or retained PM4. |
-| Per-dispatch retained AQL | Many public-HSA kernel-dispatch AQL packets on one retained queue. | AQL packet preparation and replay when positively routed. | A single retained PM4 submission. |
-| Retained PM4-IB | One vendor AQL packet points to a retained architecture PM4 indirect buffer. | Retained PM4 only when preparation and observed replay are proven. | Direct-KMD dispatch. |
-| Experimental `crates/redline` | Direct DRM command submission outside HIP/ROCr serving. | Direct-KMD experimentation. | The current serving transport. |
-| Launch fusion | Fewer or different kernels under any host path. | A changed device graph. | Redline, route selection, or a wall-time win. |
-| Stable partial recorder fingerprint | A repeatable recorded subsequence. | Discovery progress. | A complete tape or installed route. |
+| Ordinary serial HIP | One `hipModuleLaunchKernel` path per launch | Baseline model execution | Any retained route |
+| HipGraph | HIP stream capture → graph launch | HIP graph capture/replay for an eligible forward | Retained AQL or PM4 |
+| Per-dispatch retained AQL | Many public-HSA kernel-dispatch AQL packets | AQL preparation/replay when positively routed | Single retained PM4 submission |
+| Retained PM4-IB | One vendor AQL packet → retained PM4 IB | Retained PM4 only when prep + observed replay are proven | Direct-KMD dispatch |
+| Experimental `crates/redline` | Direct DRM outside HIP/ROCr serving | Direct-KMD experimentation | Current serving transport |
+| Launch fusion | Fewer/different kernels under any host path | Changed device graph | Redline, route selection, or wall-time win |
+| Stable partial recorder fingerprint | Repeatable recorded subsequence | Discovery progress | Complete tape or installed route |
 
 ## 3. Runtime lifecycle and the model boundary
 
 ### Model load and automatic default
 
-After a successful model load, the daemon evaluates `gfx12_mq4r_redline_default` and calls `ReplayController::configure_model_default`. The exact automatic-default predicate is:
+After a successful model load, the daemon evaluates
+`gfx12_mq4r_redline_default` and calls
+`ReplayController::configure_model_default`. Exact automatic-default predicate:
 
 ```text
 gpu architecture name starts with "gfx12"
@@ -105,15 +155,30 @@ AND tensor parallelism == 1
 AND model extension is .mq4r, case-insensitive
 ```
 
-An explicit `HIPFIRE_REPLAY_BACKEND` selection or enabled `HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses the model default. `HIPFIRE_REPLAY_TRANSPORT` does not: it changes only the transport. Therefore an eligible gfx12 MQ4R model still requests `Auto` when only the transport is explicit, using that transport; with transport unset, it uses `Pm4Ib`. When the narrow predicate is false and no backend/manual selection applies, the backend remains ordinary HIP. Explicit opt-in can exercise broader implementation capability, but opt-in availability is not certification.
+Source: `crates/hipfire-runtime/src/config.rs` — `gfx12_mq4r_redline_default`.
 
-The controller's model reset clears recorded launches, certified observations, prepared AQL/PM4 objects, and the fallback reason, then sets `forward_eligible = true` before admission restarts. This reset is required because model allocation identity is part of the replay contract.
+An explicit `HIPFIRE_REPLAY_BACKEND` selection or enabled
+`HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses the model default.
+`HIPFIRE_REPLAY_TRANSPORT` does **not**: it changes only the transport.
+Therefore an eligible gfx12 MQ4R model still requests `Auto` when only the
+transport is explicit (using that transport); with transport unset, it uses
+`Pm4Ib`. When the narrow predicate is false and no backend/manual selection
+applies, the backend remains ordinary HIP.
+
+Explicit opt-in can exercise broader implementation capability. Opt-in
+availability is not certification.
+
+Model reset clears recorded launches, certified observations, prepared AQL/PM4
+objects, and the fallback reason, then sets `forward_eligible = true` before
+admission restarts. Allocation identity is part of the replay contract.
 
 ### Eligible forward boundary
 
-Only an ordinary sequential single-token continuation may arm, record, or consume the plain-AR tape. The model adapter must set a one-forward eligibility decision before the forward body.
+Only an ordinary sequential single-token continuation may arm, record, or
+consume the plain-AR tape. The model adapter must set a one-forward eligibility
+decision before the forward body.
 
-The following calls must neither contaminate nor consume the plain-AR tape:
+Must neither contaminate nor consume the plain-AR tape:
 
 - model load and initialization;
 - prefill;
@@ -123,9 +188,14 @@ The following calls must neither contaminate nor consume the plain-AR tape:
 - model swap or allocation reconstruction;
 - any other non-sequential call.
 
-In the current Qwen adapter, token embedding and the position-buffer host-to-device update stay outside the retained layer-stack body. That boundary is valid because it is explicit and counted. It is not permission to omit arbitrary raw launches.
+In the current Qwen adapter, token embedding and the position-buffer H2D update
+stay outside the retained layer-stack body. That boundary is valid only because
+it is explicit and counted.
 
-HipGraph and Redline share the plain-AR eligibility decision but are separate backends. While Redline is enabled and not in sticky fallback, the Qwen HipGraph path is mutually excluded. After preparation failure poisons Redline, later eligible forwards may use the HIP-side policy, which can include HipGraph.
+HipGraph and Redline share the plain-AR eligibility decision but are separate
+backends. While Redline is enabled and not in sticky fallback, the Qwen HipGraph
+path is mutually excluded. After preparation failure poisons Redline, later
+eligible forwards may use HIP-side policy (which can include HipGraph).
 
 ### Automatic product lifecycle
 
@@ -136,7 +206,7 @@ Armed
     │ begin_auto_capture_if_armed on the first eligible continuation
     ▼
 RecordingWarmup
-    │ run the ordinary HIP layer stack and record exact launches
+    │ ordinary HIP layer stack + record exact launches
     │ synchronize, then finish_capture
     ▼
 Captured
@@ -149,11 +219,16 @@ Ready ◄───────────────────────�
 observed retained AQL or PM4 replay
 ```
 
-The automatic Qwen product path goes directly from `Captured` to `Ready` when preparation succeeds. It does **not** traverse `ShadowValidated`, call `observe_shadow`, or call `install_prepared_plan`.
+The automatic Qwen product path goes **directly** from `Captured` to `Ready`
+when preparation succeeds. It does **not** traverse `ShadowValidated`, call
+`observe_shadow`, or call `install_prepared_plan`.
 
 ### Manual controller and certification lifecycle
 
-The separate manual controller API can collect `ShadowValidation` observations. Two accepted observations can move it to `ShadowValidated`; `install_prepared_plan` then moves a non-Shadow request to `Ready`. Manual capture alone ends at `Captured` and changes no launch route.
+The manual controller API can collect `ShadowValidation` observations. Two
+accepted observations can move it to `ShadowValidated`; `install_prepared_plan`
+then moves a non-Shadow request to `Ready`. Manual capture alone ends at
+`Captured` and changes no launch route.
 
 Repository certification is stricter than either automatic transition:
 
@@ -169,70 +244,99 @@ stable complete capture
   → promotion
 ```
 
-The controller's internal `1.03` shadow field is not a durable contributor promotion threshold and is not used by the automatic Qwen admission path. Each campaign must state its promotion rule in advance.
+The controller’s internal `1.03` shadow field is not a durable contributor
+promotion threshold and is not used by the automatic Qwen admission path. Each
+campaign must state its promotion rule in advance.
 
 ### Exact fail-closed semantics
 
 | Failure phase | What has already happened | Current forward | Later forwards | Required wording |
 |---|---|---|---|---|
-| Preparation after automatic warmup | The eligible ordinary-HIP warmup forward completed successfully and produced its output. | Returns success for that already-completed HIP forward; the controller is poisoned. | Sticky `Fallback`; retained routing is disabled. Eligible HIP-side policy may include HipGraph. | “Preparation failed after a successful HIP warmup; later forwards fall back.” |
-| Retained replay execution | A prepared AQL or PM4 route was selected and execution returned an error. | Controller is poisoned and the forward returns an error. **There is no same-forward HIP retry.** | Sticky `Fallback`; retained routing remains disabled. | “Replay failed; this forward errored; later forwards fall back.” |
-| Manual shadow observation | A manual observation failed parity, ABI, timing, or its configured observation gate. | No product-route promise. | Controller enters sticky fallback. | “Manual shadow validation failed.” |
-| Recorder capacity or capture contract | Capture could not remain valid. | The controller fails closed rather than installing a partial route. | Sticky fallback until reset. | Name the exact capture failure. |
-| Successful model load/reconfiguration | A new model/allocation identity has replaced the old one. | Old retained objects are not reusable. | Tape, prepared queues, command buffers, and fallback state are reset; admission starts over. | “Model reconfiguration invalidated the old plan.” |
+| Preparation after automatic warmup | Eligible ordinary-HIP warmup completed and produced output | Success for that completed HIP forward; controller poisoned | Sticky `Fallback`; retained routing disabled; HIP-side policy may include HipGraph | “Preparation failed after a successful HIP warmup; later forwards fall back.” |
+| Retained replay execution | Prepared AQL/PM4 selected; execution errored | Controller poisoned; forward returns error. **No same-forward HIP retry** | Sticky `Fallback` | “Replay failed; this forward errored; later forwards fall back.” |
+| Manual shadow observation | Observation failed parity, ABI, timing, or configured gate | No product-route promise | Sticky fallback | “Manual shadow validation failed.” |
+| Recorder capacity or capture contract | Capture could not remain valid | Fail closed; no partial route install | Sticky fallback until reset | Name the exact capture failure |
+| Successful model load/reconfiguration | New model/allocation identity | Old retained objects not reusable | Tape, prepared queues, command buffers, fallback state reset | “Model reconfiguration invalidated the old plan.” |
 
-Never describe a replay-execution error as “the same token retried through HIP.” That behavior does not exist.
+Never describe a replay-execution error as “the same token retried through HIP.”
+That behavior does not exist.
 
 ## 4. Retained tape, ABI, lifetime, and dynamic-state contract
 
-A retained route is valid only when all of the following invariants hold.
+A retained route is valid only when all of the following hold.
 
 ### Launch and kernarg identity
 
-- The recorder copies the exact naturally aligned, tail-padded kernarg bytes used by HIP. It must never retain a pointer to a caller stack frame or temporary argument array.
-- The loaded HSA code object that owns `{kernel}.kd` must match the captured launch symbol and loader metadata.
-- Runtime-specialized launch names and aliases must resolve to the exact owning artifact. An absent or ambiguous alias blocks preparation; it is not permission to pick a similarly named HSACO.
-- Unsupported scratch, implicit SGPR, loader-kernarg, workgroup, grid, shared-memory, or symbol metadata blocks installation before `Ready`.
-- Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded blob, grid, block, and shared memory are one identity contract. A stable kernel-name hash alone is insufficient.
+- Recorder copies exact naturally aligned, tail-padded kernarg bytes used by
+  HIP. Never retain a pointer to a caller stack frame or temporary argument
+  array.
+- Loaded HSA code object that owns `{kernel}.kd` must match the captured launch
+  symbol and loader metadata.
+- Runtime-specialized launch names and aliases must resolve to the exact owning
+  artifact. Absent or ambiguous alias blocks preparation.
+- Unsupported scratch, implicit SGPR, loader-kernarg, workgroup, grid, shared
+  memory, or symbol metadata blocks installation before `Ready`.
+- Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded
+  blob, grid, block, and shared memory are one identity contract. A stable
+  kernel-name hash alone is insufficient.
 
 ### Geometry and dynamic bindings
 
-- Capture-time geometry is immutable unless a named replay binding explicitly defines a bounded patch surface.
-- Current position-derived grid narrowing uses `ReplayGridBinding::PositionCeilDiv`; the recorded grid remains a hard maximum.
-- Dynamic scalar or pointer fields must be named, offset-bounded, type-sized, and associated with one owner. Hidden mutation of arbitrary kernarg bytes is forbidden.
-- A dynamic grid can be certified through a bounded binding. A dynamic block dimension or changing shared-memory assumption requires a replay-stable fixed/tiled design, not reuse of capture-time values.
-- Multi-queue phases must not share a dynamic patch key whose meaning depends on one global capture order.
+- Capture-time geometry is immutable unless a named replay binding defines a
+  bounded patch surface.
+- Current position-derived grid narrowing uses
+  `ReplayGridBinding::PositionCeilDiv`; the recorded grid remains a hard maximum.
+- Dynamic scalar or pointer fields must be named, offset-bounded, type-sized,
+  and associated with one owner. Hidden mutation of arbitrary kernarg bytes is
+  forbidden.
+- A dynamic grid can be certified through a bounded binding. A dynamic block
+  dimension or changing shared-memory assumption requires a replay-stable
+  fixed/tiled design.
+- Multi-queue phases must not share a dynamic patch key whose meaning depends on
+  one global capture order.
 
 ### Resources, dependencies, and state
 
-- Allocation-wide reads and writes are explicit. Unknown effects remain serialized.
-- The initial plan preserves all dependencies conservatively. Independence must be proven before waits or acquires are removed.
-- The shadow oracle must cover logits, KV cache, recurrent state, convolution state, guard regions, exact captured blobs, and every other mutable model-specific state touched by the forward.
-- Model reset, request reset, and model swap must reset or invalidate all retained mutable-state assumptions.
-- Incomplete recorder coverage is not a smaller valid tape unless every omitted launch belongs to a named external adapter boundary and launch accounting reconciles exactly.
+- Allocation-wide reads and writes are explicit. Unknown effects remain
+  serialized.
+- Initial plan preserves all dependencies conservatively. Independence must be
+  proven before waits or acquires are removed.
+- Shadow oracle must cover logits, KV cache, recurrent state, convolution state,
+  guard regions, exact captured blobs, and every other mutable model-specific
+  state touched by the forward.
+- Model reset, request reset, and model swap must reset or invalidate all
+  retained mutable-state assumptions.
+- Incomplete recorder coverage is not a smaller valid tape unless every omitted
+  launch belongs to a named external adapter boundary and launch accounting
+  reconciles exactly.
 
 ### Lifetime
 
-Prepared AQL packets and PM4 commands contain device pointers. The model allocations, scratch buffers, KV/recurrent state, loaded code objects, kernarg storage, queues, command memory, and completion objects they reference must retain identity and lifetime until the plan is destroyed. Allocation teardown, rebinding, model swap, or incompatible topology change invalidates the plan before any further replay.
+Prepared AQL packets and PM4 commands contain device pointers. Model
+allocations, scratch, KV/recurrent state, loaded code objects, kernarg storage,
+queues, command memory, and completion objects must retain identity and lifetime
+until the plan is destroyed. Allocation teardown, rebinding, model swap, or
+incompatible topology change invalidates the plan before further replay.
 
 ## 5. Reproducible model and architecture porting recipe
 
-Do these stages in order. Do not optimize waits or kernels while the route contract is still moving.
+Do these stages in order. Do not optimize waits or kernels while the route
+contract is still moving.
 
 | Stage | Required action | Binary exit criterion | Stop gate |
 |---:|---|---|---|
-| 1. Freeze the fixture | Record UTC date, branch/commit, clean state, binary digest, GPU/ROCm identity, model path/digest, architecture id, quantization, topology, KV mode, continuation API, exact prompt/token stream, and baseline route. | Another contributor can select the same bytes, binary, model, device, and route. | Any identity field is missing or the baseline is not coherent. |
-| 2. Define admission | Write one fail-closed predicate for an ordinary sequential generated-token forward. Preserve explicit negatives for prefill, spec/MTP, graph capture, batching, model swap, and incompatible topology. | Positive and every negative case are observable; no ineligible call can record or consume the tape. | The boundary depends on incidental call order or an unrecorded heuristic. |
-| 3. Census the full compute body | Use rocprof or an equivalent complete kernel trace. Name launches intentionally outside the tape. | `compute launches = retained dispatches + explicitly external launches` for each certified position. | Counts do not reconcile or a supposedly external launch mutates retained state. |
-| 4. Migrate recorder coverage | Route every in-body raw launch through the typed recorder while preserving the ordinary HIP call and its result. | Retained count equals the reconciled target and ordinary-HIP outputs remain unchanged. | Any raw in-body launch is missing, duplicated, or reordered. |
-| 5. Prove tape stability | Compare launch count, unique-kernel set, ordered sequence hash, geometry, and owning artifact identity across positions and fresh processes. | All immutable fields are stable; every intended dynamic difference has a named binding. | A stable partial subsequence, position-dependent unnamed mutation, or unexplained fresh-process drift. |
-| 6. Bind artifact and ABI | Resolve the exact loaded HSACO and symbol; validate loader metadata, padded kernargs, geometry, shared memory, resources, and every dynamic field. | Every launch passes the ABI/artifact probe with no alias ambiguity or unsupported contract. | Missing/wrong HSACO, loader incompatibility, scratch/implicit-SGPR uncertainty, or kernarg mismatch. |
-| 7. Stabilize geometry | Fix/tile changing block/shared-memory shapes; use only certified bounded patches for dynamic grids/scalars. | All supported positions fit the recorded maximum and produce the intended launch shape. | Replaying a capture-time block/shared-memory shape at a different context. |
-| 8. Build the state oracle | Add reset/prime, logits, KV, recurrent/convolution state, guard, and snapshot/restore support needed for multi-position comparison. | HIP, exact HIP-kernarg-blob, and candidate retained execution compare every mutable state surface. | A touched state surface cannot be observed or restored. |
-| 9. Lower conservatively | Start with one queue, explicit dependency waits, architecture-correct register encoding, and conservative acquire/fence policy. | A prepared route reaches `Ready`, executes, completes, and passes parity without hazard elision. | Unsupported architecture, unresolved dependency, queue/completion lifetime failure, or parity fault. |
-| 10. Certify and only then promote | Pass the complete ladder in Section 7 and archive the benchmark record in Section 8. | Positive route proof, serve health, matched stationary performance, long-context state, reset, model-swap, and failure-path gates all pass. | A capture fingerprint, microbenchmark, silent fallback, or unmatched speed ratio is the only positive evidence. |
+| 1. Freeze the fixture | Record UTC date, branch/commit, clean state, binary digest, GPU/ROCm identity, model path/digest, architecture id, quantization, topology, KV mode, continuation API, exact prompt/token stream, baseline route | Another contributor can select the same bytes, binary, model, device, and route | Any identity field missing or baseline not coherent |
+| 2. Define admission | One fail-closed predicate for an ordinary sequential generated-token forward; explicit negatives for prefill, spec/MTP, graph capture, batching, model swap, incompatible topology | Positive and every negative case observable; no ineligible call can record or consume the tape | Boundary depends on incidental call order or unrecorded heuristic |
+| 3. Census the full compute body | rocprof or equivalent complete kernel trace; name launches intentionally outside the tape | `compute launches = retained dispatches + explicitly external launches` at each certified position | Counts do not reconcile or a “external” launch mutates retained state |
+| 4. Migrate recorder coverage | Route every in-body raw launch through the typed recorder while preserving ordinary HIP call and result | Retained count equals reconciled target; ordinary-HIP outputs unchanged | Missing, duplicated, or reordered in-body launch |
+| 5. Prove tape stability | Compare launch count, unique-kernel set, ordered sequence hash, geometry, owning artifact identity across positions and fresh processes | Immutable fields stable; every intended dynamic difference has a named binding | Stable partial subsequence, unnamed position-dependent mutation, unexplained fresh-process drift |
+| 6. Bind artifact and ABI | Resolve exact loaded HSACO and symbol; validate loader metadata, padded kernargs, geometry, shared memory, resources, dynamic fields | Every launch passes ABI/artifact probe with no alias ambiguity | Missing/wrong HSACO, loader incompatibility, scratch/implicit-SGPR uncertainty, kernarg mismatch |
+| 7. Stabilize geometry | Fix/tile changing block/shared-memory shapes; only certified bounded patches for dynamic grids/scalars | Supported positions fit recorded maximum and intended launch shape | Replaying capture-time block/shared-memory shape at a different context |
+| 8. Build the state oracle | Reset/prime, logits, KV, recurrent/convolution, guard, snapshot/restore for multi-position comparison | HIP, exact HIP-kernarg-blob, and candidate retained execution compare every mutable state surface | Touched state surface cannot be observed or restored |
+| 9. Lower conservatively | One queue, explicit dependency waits, architecture-correct register encoding, conservative acquire/fence policy | Prepared route reaches `Ready`, executes, completes, passes parity without hazard elision | Unsupported architecture, unresolved dependency, queue/completion lifetime failure, parity fault |
+| 10. Certify then promote | Complete ladder in Section 7; archive benchmark record in Section 8 | Positive route proof, serve health, matched stationary performance, long-context state, reset, model-swap, failure-path gates all pass | Capture fingerprint, microbenchmark, silent fallback, or unmatched speed ratio as only positive evidence |
 
-A typical diagnostic sequence for a known supported Qwen fixture is:
+Diagnostic sequence for a known supported Qwen fixture (not full certification):
 
 ```bash
 HIPFIRE_REPLAY_MANUAL_CAPTURE=1 \
@@ -249,15 +353,37 @@ python3 scripts/redline_product_bench.py \
   --out .redline-work/product/report.json
 ```
 
-Set `MODEL` to the exact digested fixture before running. These commands are diagnostics only. They do **not** emit the full Section 7 timed-arm route-proof ledger.
+Set `MODEL` to the exact digested fixture. These commands are diagnostics only.
+They do **not** emit the full Section 7 timed-arm route-proof ledger.
 
-**Current tooling gap (route proof).** `scripts/redline_product_bench.py` records requested backend/transport and throughput, but not controller `Ready`, fallback reason, observed replay positions, packet/queue/dword identity, or anti-HIP/HipGraph proof. `scripts/redline_daemon_harness.py --pm4` can supply separate manual shadow/capture evidence, but it does not prove that the timed user-facing product arm actually routed. The two reports cannot be inferred or joined into positive timed-arm route proof. A route-proof-capable product harness/report must be implemented before any new or widened route can satisfy full certification under this guide; until then, such routes remain experiments, not fully certified promotions. Do not present the commands above as producing unavailable fields.
+### Current tooling gap (route proof)
+
+`scripts/redline_product_bench.py` records requested backend/transport and
+throughput, but not controller `Ready`, fallback reason, observed replay
+positions, packet/queue/dword identity, or anti-HIP/HipGraph proof.
+
+`scripts/redline_daemon_harness.py --pm4` can supply separate manual
+shadow/capture evidence, but it does not prove that the timed user-facing
+product arm actually routed.
+
+**Those two reports cannot be inferred or joined into positive timed-arm route
+proof.** Stitching them is explicitly **blocked** ([`INDEX.md`](INDEX.md),
+[`VALIDATION.md`](VALIDATION.md)).
+
+A route-proof-capable product harness/report must exist before any new or
+widened route can satisfy full certification under this guide. Until then, such
+routes remain experiments, not fully certified promotions. Do not present the
+commands above as complete Section 7 proof.
 
 ## 6. PM4 lowering and hazard policy
 
-`Pm4Architecture::from_device` selects distinct gfx10, gfx11, and gfx12 lowering. Gfx10/gfx11 and gfx12 do not share one universal register recipe. Register addresses, dispatch setup, acquire behavior, cache policy, and supported phase synchronization must be derived for the selected architecture and checked against current runtime support.
+`Pm4Architecture::from_device` selects distinct gfx10, gfx11, and gfx12
+lowering. Gfx10/gfx11 and gfx12 do not share one universal register recipe.
+Register addresses, dispatch setup, acquire behavior, cache policy, and
+supported phase synchronization must be derived for the selected architecture
+and checked against current runtime support.
 
-The first accepted route is deliberately boring:
+First accepted route is deliberately boring:
 
 1. one queue;
 2. original launch order;
@@ -266,300 +392,350 @@ The first accepted route is deliberately boring:
 5. one clear completion boundary;
 6. no CU-mask, register-policy, or phase-parallel overlay.
 
-Only remove a wait or acquire when both conditions hold:
+Remove a wait or acquire only when both hold:
 
-- an exact resource argument proves there is no producer/consumer, write/write, cache-visibility, or completion dependency across the boundary; and
-- multi-position parity, guard checks, serve behavior, and stationary PM4-versus-PM4-plus-change performance all pass.
+- an exact resource argument proves no producer/consumer, write/write,
+  cache-visibility, or completion dependency across the boundary; and
+- multi-position parity, guard checks, serve behavior, and stationary
+  PM4-versus-PM4-plus-change performance all pass.
 
-Sibling kernels are not independent merely because they have different names or output pointers. Consider allocation-wide aliasing, shared scratch, indirect addressing, KV/recurrent state, and terminal visibility. Unknown access metadata means serialize.
+Sibling kernels are not independent merely because they have different names or
+output pointers. Consider allocation-wide aliasing, shared scratch, indirect
+addressing, KV/recurrent state, and terminal visibility. Unknown access metadata
+means serialize.
 
-Multi-queue or phase parallelism is a later optimization. It additionally requires:
+Multi-queue or phase parallelism is a later optimization. It additionally
+requires a dependency-derived phase partition; explicit cross-queue fan-in
+before any consumer or terminal read; completion and queue lifetimes covering
+every phase; dynamic bindings with unambiguous keys per phase/queue;
+architecture-supported synchronization; and PM4-base versus PM4-plus-multi-queue
+evidence.
 
-- a dependency-derived phase partition;
-- explicit cross-queue fan-in before any consumer or terminal read;
-- completion and queue lifetimes that cover every phase;
-- dynamic bindings whose keys are unambiguous per phase/queue;
-- architecture-supported synchronization; and
-- PM4-base versus PM4-plus-multi-queue evidence.
-
-Teach the dependency argument, not a copied packet sequence. A valid gfx1201 packet trace is not automatically a valid gfx1100 or gfx1151 lowering.
+Teach the dependency argument, not a copied packet sequence. A valid gfx1201
+packet trace is not automatically a valid gfx1100 or gfx1151 lowering.
 
 ## 7. Certification and route-proof ladder
 
-Pass these gates in order. Failure at a gate blocks promotion even if a later-looking metric is attractive.
+Pass these gates in order. Failure at a gate blocks promotion even if a later
+metric looks attractive.
 
 | Gate | Required evidence | Rejection condition |
 |---:|---|---|
-| 1. Baseline correctness | Ordinary HIP produces stable, coherent output on the exact fixture. | Baseline is unstable, incoherent, or fixture identity is incomplete. |
-| 2. Capture completeness | Compute count, external-launch count, retained count, unique kernels, ordered sequence hash, and fresh-process stability reconcile. | Missing/extra launch, partial capture, unexplained drift, or unowned external boundary. |
-| 3. ABI/artifact validation | Every symbol resolves to the exact loaded artifact and loader metadata; padded blobs, geometry, effects, and dynamic bindings validate. | Wrong/missing artifact, ambiguous alias, unsupported ABI/resource contract, or hidden mutation. |
-| 4. Multi-position shadow parity | Ordinary HIP, retained PM4, and the exact HIP-kernarg-blob oracle agree for logits, KV, recurrent/model state, guards, and captured blobs. | Any unexplained state mismatch. Bit exactness is required for an execution-preserving route; a tolerance is allowed only for an explicitly changed numerical kernel contract and must be justified. |
-| 5. Route proof | Backend request, transport, successful preparation, `Ready`, observed replay at multiple positions, dispatch/packet/queue/dword identity, sequence hash, no replay fault, and fallback reason are recorded for every arm. | Timed arm may have silently used HIP/HipGraph, or reports only capture/`Ready` without observed replay. |
-| 6. Production serve | User-facing generation with exact model/settings has healthy decoded output, finish state, repetition/attractor behavior, and model-specific framing. | Emitted tokens without semantic/framing health, runaway output, empty response, or route ambiguity. |
-| 7. Stationary matched performance | Certified baseline and retained route use identical binary, model, prompt/token stream, settings, process policy, and clocks; tok/s and ms/token are reported. | Cross-harness, cross-binary, cross-prompt, nonstationary, silent-fallback, or microkernel-only comparison. |
-| 8. Long-context and lifecycle | Dynamic position, geometry, KV growth, recurrent/convolution state, request reset, failure behavior, and model swap pass throughout the supported range. | Context drift, state leak, stale pointer, wrong reset, or same-forward fallback claim. |
+| 1. Baseline correctness | Ordinary HIP produces stable, coherent output on the exact fixture | Baseline unstable, incoherent, or fixture identity incomplete |
+| 2. Capture completeness | Compute count, external-launch count, retained count, unique kernels, ordered sequence hash, fresh-process stability reconcile | Missing/extra launch, partial capture, unexplained drift, unowned external boundary |
+| 3. ABI/artifact validation | Every symbol resolves to the exact loaded artifact and loader metadata; padded blobs, geometry, effects, dynamic bindings validate | Wrong/missing artifact, ambiguous alias, unsupported ABI/resource contract, hidden mutation |
+| 4. Multi-position shadow parity | Ordinary HIP, retained PM4, and the exact HIP-kernarg-blob oracle agree for logits, KV, recurrent/model state, guards, and captured blobs | Any unexplained state mismatch. Bit exactness required for an execution-preserving route; tolerance only for an explicitly changed numerical kernel contract with justification |
+| 5. Route proof | Backend request, transport, successful preparation, `Ready`, observed replay at multiple positions, dispatch/packet/queue/dword identity, sequence hash, no replay fault, and fallback reason recorded for every arm | Timed arm may have silently used HIP/HipGraph, or reports only capture/`Ready` without observed replay |
+| 6. Production serve | User-facing generation with exact model/settings has healthy decoded output, finish state, repetition/attractor behavior, and model-specific framing | Emitted tokens without semantic/framing health, runaway, empty response, or route ambiguity |
+| 7. Stationary matched performance | Certified baseline and retained route use identical binary, model, prompt/token stream, settings, process policy, and clocks; tok/s and ms/token reported | Cross-harness, cross-binary, cross-prompt, nonstationary, silent-fallback, or microkernel-only comparison |
+| 8. Long-context and lifecycle | Dynamic position, geometry, KV growth, recurrent/convolution state, request reset, failure behavior, and model swap pass throughout the supported range | Context drift, state leak, stale pointer, wrong reset, or same-forward fallback claim |
 
-Harness success without route proof is insufficient. A ratio from two nominal arms that both executed ordinary HIP is invalid evidence. A stable manual-capture fingerprint is discovery evidence; it does not install a plan or prove that a user-facing forward selected retained AQL or PM4.
+Harness success without route proof is insufficient. A ratio from two nominal
+arms that both executed ordinary HIP is invalid evidence. A stable manual-capture
+fingerprint is discovery evidence; it does not install a plan or prove that a
+user-facing forward selected retained AQL or PM4.
 
-**Current tooling gap.** Full certification still requires the Minimum route-proof record below, but current product tooling cannot produce it end-to-end. `redline_product_bench.py` reports requested backend/transport and throughput only; it omits controller `Ready`, fallback reason, observed replay positions, packet/queue/dword identity, and proof the timed arm was not ordinary HIP or HipGraph. `redline_daemon_harness.py --pm4` is a separate manual shadow/capture path and does not prove the timed product arm routed. Those two outputs cannot be stitched into positive timed-arm route proof. Until a route-proof-capable product harness/report exists, new and widened routes cannot clear Gate 5 as fully certified product evidence and must remain experiments. Preserve the runtime-versus-certification distinction: runtime `Ready` is not repository certification, and missing report fields are not optional.
+**Tooling gap (Gate 5).** Full certification still requires the minimum
+route-proof record below, but current product tooling cannot produce it
+end-to-end. Until a route-proof-capable product harness/report exists, new and
+widened routes cannot clear Gate 5 as fully certified product evidence and must
+remain experiments. Preserve partial positive evidence as dated discovery; do
+not promote.
 
 ### Minimum route-proof record per arm
 
 | Field | Required content |
 |---|---|
-| Request and selection | Backend request, transport, exact eligibility predicate/result, and negative gates active. |
-| Preparation | Capture summary; preparation success; controller state; fallback reason. |
-| Tape identity | Dispatch count, external count, unique-kernel count, ordered sequence hash, owning artifacts, geometry, and dynamic bindings. |
-| Submission identity | Observed transport, packet count, queue identity/count, phase count, PM4 command dwords, and completion. |
-| Observation span | At least multiple generated positions, with positions named. |
-| Fault evidence | Replay error/fault absence, guard status, and any controller poison/reset event. |
-| Competing routes | Evidence the measured arm did not execute ordinary HIP or HipGraph. |
+| Request and selection | Backend request, transport, exact eligibility predicate/result, negative gates active |
+| Preparation | Capture summary; preparation success; controller state; fallback reason |
+| Tape identity | Dispatch count, external count, unique-kernel count, ordered sequence hash, owning artifacts, geometry, dynamic bindings |
+| Submission identity | Observed transport, packet count, queue identity/count, phase count, PM4 command dwords, completion |
+| Observation span | Multiple generated positions, named |
+| Fault evidence | Replay error/fault absence, guard status, any controller poison/reset event |
+| Competing routes | Evidence the measured arm did not execute ordinary HIP or HipGraph |
 
 ## 8. Benchmark record schema and claim language
 
-Every report supporting a retained-replay claim must contain the following schema.
+Every report supporting a retained-replay claim must contain:
 
 | Group | Required fields |
 |---|---|
-| Time and source | UTC date/time; branch; source commit; clean/dirty state; exact daemon/binary digest. |
-| Device | GPU product; PCI identity; gfx architecture; visible-device/topology selection; ROCm, runtime, and driver identity; clock/governor policy. |
-| Model | Full model path; model architecture id; quantization; artifact size/digest; sidecar names and digests. |
-| Workload | Harness path/revision; full command; prompt bytes or deterministic token-stream path and digest; sampler and seed; KV mode; context; prefill/generated counts; parallel topology; graph/spec/MTP settings. |
-| Configuration | Every route-affecting `HIPFIRE_*` variable and whether it was unset; explicit backend and transport request. |
-| Sampling | Warmup policy; fresh-process or resident-daemon policy; run order; run count; per-run raw values; minimum, median, and maximum; raw report path. |
-| Tape | Compute/external/retained counts; unique kernels; sequence hash; owning artifacts; geometry; resource effects; dynamic bindings. |
-| Route proof | Preparation success; `Ready`; observed replay positions; transport; packets; queues/phases; PM4 dwords; fault absence; fallback reason; proof against silent HIP/HipGraph. |
-| Correctness | Shadow/oracle report; logits/KV/recurrent/guard/blob results; tolerance and rationale if not bit exact; decoded-output health. |
-| Result | Tok/s and ms/token for each arm; ratio and absolute delta; predeclared promotion rule; disposition. |
+| Time and source | UTC date/time; branch; source commit; clean/dirty state; exact daemon/binary digest |
+| Device | GPU product; PCI identity; gfx architecture; visible-device/topology; ROCm, runtime, driver identity; clock/governor policy |
+| Model | Full model path; architecture id; quantization; artifact size/digest; sidecar names and digests |
+| Workload | Harness path/revision; full command; prompt bytes or deterministic token-stream path and digest; sampler and seed; KV mode; context; prefill/generated counts; parallel topology; graph/spec/MTP settings |
+| Configuration | Every route-affecting `HIPFIRE_*` variable and whether unset; explicit backend and transport request |
+| Sampling | Warmup policy; fresh-process or resident-daemon policy; run order; run count; per-run raw values; min/median/max; raw report path |
+| Tape | Compute/external/retained counts; unique kernels; sequence hash; owning artifacts; geometry; resource effects; dynamic bindings |
+| Route proof | Preparation success; `Ready`; observed replay positions; transport; packets; queues/phases; PM4 dwords; fault absence; fallback reason; proof against silent HIP/HipGraph |
+| Correctness | Shadow/oracle report; logits/KV/recurrent/guard/blob results; tolerance and rationale if not bit exact; decoded-output health |
+| Result | Tok/s and ms/token per arm; ratio and absolute delta; predeclared promotion rule; disposition |
 
 ### Comparison rules
 
-- Use byte-identical prompts or deterministic token streams, the same binary, model, topology, KV mode, context, generation length, sampler, and clocks.
-- State whether each sample used a fresh process or a resident daemon. Do not mix policies within an A/B.
-- Interleave run order when practical and archive raw values; report minimum/median/maximum rather than one best run.
+- Byte-identical prompts or deterministic token streams; same binary, model,
+  topology, KV mode, context, generation length, sampler, and clocks.
+- State whether each sample used a fresh process or a resident daemon. Do not
+  mix policies within an A/B.
+- Interleave run order when practical; archive raw values; report
+  min/median/max rather than one best run.
 - Automatic clocks are the default unless clock policy itself is the experiment.
 - Compare both tok/s and milliseconds per token.
-- Numbers from different harnesses, binaries, prompts, or route-proof states are not one A/B.
-- A dated number is evidence for its exact fixture, not a permanent minimum speedup or current product guarantee.
+- Numbers from different harnesses, binaries, prompts, or route-proof states are
+  not one A/B.
+- A dated number is evidence for its exact fixture, not a permanent minimum
+  speedup or current product guarantee.
+- General perf protocol:
+  [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
+  Historical non-Redline tables:
+  [`BENCHMARKS.md`](BENCHMARKS.md).
 
 ### Direct value versus enabling value
 
-Redline has two distinct performance roles:
+1. **Direct transport value:** one retained submission can remove variable host
+   launch and packet-publication work. Measure with a matched baseline-versus-PM4
+   comparison in which the device kernel stack is otherwise identical.
+2. **Enabling value:** reducing the host floor and host-side variance makes later
+   device-side kernel, traffic, fence, overlap, and composite transformations
+   easier to resolve. Measure each later lever as base PM4 versus PM4 plus that
+   one lever.
 
-1. **Direct transport value:** one retained submission can remove variable host launch and packet-publication work. Measure this with a matched baseline-versus-PM4 comparison in which the device kernel stack is otherwise identical.
-2. **Enabling value:** reducing the host floor and host-side variance makes later device-side kernel, traffic, fence, overlap, and composite transformations easier to resolve and compose. Measure each later lever as base PM4 versus PM4 plus that one lever.
-
-Do not merge these claims. In particular, the historical Qwen MQ4R progression from roughly 110 to 204 tok/s combined changing kernel stacks, graph shape, and Redline work. It is useful dated engineering history, not a pure PM4 transport A/B. The direct PM4 A/B must remain the matched, fixed-stack comparison recorded for its own checkpoint.
+Do not merge these claims. The historical Qwen MQ4R progression from roughly 110
+to 204 tok/s combined changing kernel stacks, graph shape, and Redline work. It
+is useful dated engineering history, not a pure PM4 transport A/B.
 
 ## 9. Post-Redline kernel and Radiowave loop
 
 After the conservative retained route passes Section 7:
 
 1. Freeze a stationary retained-PM4 baseline and archive its complete record.
-2. Profile the new device-bound timeline rather than assuming host launch cost still dominates.
-3. Choose one device-side lever: a kernel change, fusion, traffic reduction, fence/acquire policy, queue overlap, or Radiowave/composite transformation.
-4. Keep the base tape, fixture, binary inputs, route proof, and all unrelated overlays fixed.
+2. Profile the new device-bound timeline rather than assuming host launch cost
+   still dominates.
+3. Choose one device-side lever: kernel change, fusion, traffic reduction,
+   fence/acquire policy, queue overlap, or Radiowave/composite transformation.
+4. Keep the base tape, fixture, binary inputs, route proof, and all unrelated
+   overlays fixed.
 5. Compare **base PM4** against **PM4 plus exactly that overlay**.
-6. Retain the overlay only if state parity, route proof, serve health, long-context behavior, and reproducible wall time all pass.
-7. Compose independently proven overlays one at a time; refresh the stationary PM4 baseline after each accepted change.
-8. Rerun the full gates after any hazard-policy, geometry, artifact, dynamic-binding, or mutable-state boundary change.
+6. Retain the overlay only if state parity, route proof, serve health,
+   long-context behavior, and reproducible wall time all pass.
+7. Compose independently proven overlays one at a time; refresh the stationary
+   PM4 baseline after each accepted change.
+8. Rerun the full gates after any hazard-policy, geometry, artifact,
+   dynamic-binding, or mutable-state boundary change.
 
-Launch-count reduction alone is not proof of a wall-time win. Under retained PM4, fusion earns value by reducing device work, memory traffic, or synchronization—not by claiming avoidance of host API calls that the retained transport already removed. Radiowave transformations belong in this post-certification loop, not in the definition of Redline.
+Launch-count reduction alone is not proof of a wall-time win. Under retained
+PM4, fusion earns value by reducing device work, memory traffic, or
+synchronization—not by claiming avoidance of host API calls the retained
+transport already removed. Radiowave transformations belong in this
+post-certification loop, not in the definition of Redline.
 
 ## 10. Failure atlas
 
 | Symptom or mistake | Failure phase / diagnosis | Required response |
 |---|---|---|
-| Capture starts during model load or prefill. | Admission boundary is wrong; setup work contaminated the ordinary-AR tape. | Reset, move arming to the first eligible continuation, recapture, and rerun every gate. |
-| A raw in-body launch is absent from the recorder. | Capture completeness failure. | Migrate it to the typed recorder or formally place it at an external adapter boundary and reconcile counts. |
-| Recorder retains stack-backed kernargs. | ABI/lifetime failure; replay can dereference invalid bytes or pointers. | Copy exact padded bytes into owned storage; invalidate the tape. |
-| HSACO is missing, wrong, or loader-incompatible. | Artifact/ABI preparation failure. | Resolve the exact owning artifact and metadata; fail before `Ready`. Do not substitute by name similarity. |
-| Specialized launch alias resolves to another artifact. | Launch/artifact identity failure. | Correct and prove the alias mapping; regenerate fingerprint and parity evidence. |
-| Capture-time block or shared-memory shape is replayed at a new context. | Geometry contract failure. | Fix/tile the shape or add a bounded supported binding; recertify the range. |
-| Token, KV, recurrent, or convolution state is absent from the oracle. | State-certification gap. | Add snapshot/restore and comparison before interpreting parity or speed. |
-| Model swap retains pointer-keyed state. | Lifetime/reset failure. | Destroy prepared objects and reset admission on every successful reconfiguration. |
-| Scratch, implicit SGPR, or loader-kernarg contract is unsupported. | Preparation cannot safely lower the launch. | Reject installation until the runtime can validate the exact contract. |
-| A wait/acquire is removed because launches “look independent.” | Hazard-policy failure. | Restore conservative ordering; produce an exact resource argument and multi-position evidence before retrying. |
-| Timed `auto` and `hip` arms both execute HIP. | Route-proof failure. | Discard the ratio; instrument request, state, transport, packets/queues/dwords, replay positions, and fallback. |
-| Replay execution fails and is described as same-token HIP fallback. | Failure-phase misreport. | Report the current forward error and later sticky fallback exactly. |
-| Stable partial capture is called a complete route. | Capture classification failure. | Reconcile full compute, external, and retained counts; do not prepare or promote the partial tape. |
-| Launch graph shrinks but wall time does not improve. | Structural result without product value. | Keep it experimental or reject it under the campaign rule; do not market it as a speedup. |
-| Results from different harnesses, binaries, prompts, or clocks are compared. | Benchmark comparability failure. | Rerun a stationary matched experiment; keep old rows only as separate dated evidence. |
-| Manual capture reports a stable fingerprint and is called routed PM4. | Discovery evidence was promoted beyond its meaning. | Add preparation, `Ready`, observed multi-position replay, submission identity, and anti-fallback proof. |
-| Production framing fails while numerical replay parity passes. | User-facing contract failure may be framing rather than transport corruption. | Diagnose framing separately, preserve the parity classification, and block product promotion until serve health passes. |
+| Capture starts during model load or prefill | Admission boundary wrong | Reset; arm on first eligible continuation; recapture; rerun every gate |
+| Raw in-body launch absent from recorder | Capture completeness failure | Migrate to typed recorder or formally externalize and reconcile counts |
+| Recorder retains stack-backed kernargs | ABI/lifetime failure | Copy exact padded bytes into owned storage; invalidate the tape |
+| HSACO missing, wrong, or loader-incompatible | Artifact/ABI preparation failure | Resolve exact owning artifact; fail before `Ready` |
+| Specialized launch alias resolves to another artifact | Launch/artifact identity failure | Correct alias mapping; regenerate fingerprint and parity |
+| Capture-time block/shared-memory shape replayed at new context | Geometry contract failure | Fix/tile or add bounded binding; recertify range |
+| Token, KV, recurrent, or conv state absent from oracle | State-certification gap | Add snapshot/restore before interpreting parity or speed |
+| Model swap retains pointer-keyed state | Lifetime/reset failure | Destroy prepared objects; reset admission on every successful reconfiguration |
+| Scratch, implicit SGPR, or loader-kernarg unsupported | Preparation cannot safely lower | Reject installation until runtime validates the exact contract |
+| Wait/acquire removed because launches “look independent” | Hazard-policy failure | Restore conservative ordering; exact resource argument + multi-position evidence |
+| Timed `auto` and `hip` arms both execute HIP | Route-proof failure | Discard the ratio; instrument request, state, transport, packets/queues/dwords, replay positions, fallback |
+| Replay execution described as same-token HIP fallback | Failure-phase misreport | Report current forward error and later sticky fallback exactly |
+| Stable partial capture called a complete route | Capture classification failure | Reconcile full compute/external/retained counts |
+| Launch graph shrinks but wall time does not improve | Structural result without product value | Keep experimental or reject under campaign rule |
+| Results from different harnesses/binaries/prompts/clocks compared | Benchmark comparability failure | Rerun stationary matched experiment |
+| Manual capture fingerprint called routed PM4 | Discovery over-promoted | Add preparation, `Ready`, observed multi-position replay, submission identity, anti-fallback proof |
+| Production framing fails while numerical replay parity passes | User-facing contract failure may be framing | Diagnose framing separately; block product promotion until serve health passes |
 
 ## 11. Worked cases
 
-The following cases use the same classification fields. Historical measurements are quoted only with their dates and fixtures.
+Same classification fields throughout. Historical measurements are quoted only
+with their dates and fixtures. None of these cases is a universal admission.
 
 ### 11.1 Qwen3.5 0.8B dense `.mq4` on gfx1201: positive explicit opt-in evidence
 
 | Field | Evidence |
 |---|---|
-| Intent | Establish a compact dense-model capture, exact-state parity, and retained-PM4 example. |
-| Baseline route | HipGraph ordinary AR for the dated comparison. |
-| Candidate route | Explicitly selected retained PM4. This `arch_id=5`, `.mq4` model is not the automatic `.mq4r`, `arch_id=6` product default. |
-| Fixture | Qwen3.5 0.8B dense on gfx1201; dated 2026-07-11 in `crates/redline-dispatch/HIPFIRE-GRAFT.md`. The recoverable row does not pin the full model digest or daemon binary digest. |
-| Immutable contract | 356 retained dispatches, 21 unique kernels, ordered sequence hash `55f99a58cb4b9363`; exact artifacts/kernargs and ordinary-AR state. |
-| Validation | Fifteen consecutive positions were bit exact for logits, KV, and recurrent state against ordinary HIP and the exact HIP-kernarg-blob oracle. |
-| PM4 and route evidence | The dated record preserves the retained-PM4 fingerprint, PM4 shadow/parity evidence, and a nominal HipGraph-versus-PM4 product comparison. The recoverable timed-arm report does **not** contain the full Section 7 ledger: per-arm preparation and `Ready`, fallback reason, observed replay positions, and proof against silent HIP/HipGraph are missing. |
-| Performance observation | On 2026-07-11, automatic clocks, resident 10×100 comparison: HipGraph 363.682 tok/s versus requested PM4 392.248 tok/s, `1.07855×`. Because the timed-arm route ledger is incomplete, this remains fixture-bound positive performance evidence rather than a fully certified direct-transport A/B under this guide. Per-dispatch AQL was measured separately and was neutral. |
-| Serve | A five-prompt greedy battery had no runaways and averaged 384.7 decode tok/s, but the response-framing gate failed. That failure is independent of the PM4 capture/parity evidence, yet it still fails the full production-serve gate. |
-| Disposition | Preserve as positive explicit-opt-in capture, parity, PM4, and performance evidence. **Not fully certified under this guide**, not a passed full serve case, and not automatic-default admission. |
-| Reusable lesson | Capability, positive transport evidence, guide certification, production-serve health, and product default are separate classifications. |
-
-Evidence limitations: the recoverable graft row lacks the full artifact/binary identity and raw timed-arm route-proof ledger now required by Section 8. Use it as positive historical evidence, not as a complete modern certification manifest.
+| Intent | Compact dense-model capture, exact-state parity, retained-PM4 example |
+| Baseline route | HipGraph ordinary AR for the dated comparison |
+| Candidate route | Explicitly selected retained PM4. `arch_id=5`, `.mq4` — **not** the automatic `.mq4r` / `arch_id=6` product default |
+| Fixture | Qwen3.5 0.8B dense on gfx1201; dated 2026-07-11 in `crates/redline-dispatch/HIPFIRE-GRAFT.md`. Recoverable row does not pin full model digest or daemon binary digest |
+| Immutable contract | 356 retained dispatches, 21 unique kernels, ordered sequence hash `55f99a58cb4b9363` |
+| Validation | Fifteen consecutive positions bit exact for logits, KV, and recurrent state vs ordinary HIP and exact HIP-kernarg-blob oracle |
+| PM4 and route evidence | Dated record preserves retained-PM4 fingerprint, PM4 shadow/parity, and a nominal HipGraph-versus-PM4 product comparison. Recoverable timed-arm report **lacks** the full Section 7 ledger |
+| Performance observation | 2026-07-11, automatic clocks, resident 10×100: HipGraph 363.682 tok/s vs requested PM4 392.248 tok/s (`1.07855×`). Incomplete timed-arm ledger → fixture-bound positive performance evidence, **not** fully certified direct-transport A/B |
+| Serve | Five-prompt greedy battery: no runaways, avg 384.7 decode tok/s; response-framing gate failed (independent of PM4 parity; still fails full production-serve gate) |
+| Disposition | Preserve as positive explicit-opt-in capture/parity/PM4/performance evidence. **Not fully certified under this guide**, not a passed full serve case, not automatic-default admission |
+| Reusable lesson | Capability, positive transport evidence, guide certification, production-serve health, and product default are separate classifications |
 
 ### 11.2 Qwen3.6 35B-A3B MQ4R across gfx1100, gfx1151, and gfx1201
 
-The current automatic predicate is narrower than implementation capability: gfx12, `arch_id=6`, single GPU (`pp=tp=1`), and `.mq4r`. An explicit backend selection can request broader implemented paths. An explicit transport selection changes only the transport and does not by itself enable replay or bypass the model-default predicate.
+Current automatic predicate is narrower than implementation capability: gfx12,
+`arch_id=6`, single GPU (`pp=tp=1`), `.mq4r`. Explicit backend selection can
+request broader implemented paths. Explicit transport changes only the transport.
 
 | Architecture | Implementation capability | Model performance evidence | Explicit opt-in | Recoverable retained-PM4 evidence under Section 7 | Automatic default |
 |---|---|---|---|---|---|
-| gfx1100 | Yes: gfx11 PM4 lowering exists. | Yes: the dated README/CHANGELOG MQ4R row reports TG128 median 253.3 tok/s, route unspecified. | Available through an explicit backend request. | **No positive retained-route proof recovered.** A stationarity-test comment is insufficient. | No; runtime tests reject gfx1100 for the gfx12 default. |
-| gfx1151 | Yes: gfx11 PM4 lowering and gfx1151 experiment knobs exist. | Yes: the dated README/CHANGELOG MQ4R row reports TG128 median 115.1 tok/s, route unspecified. | Available through an explicit backend request. | **No positive retained-route proof recovered.** Experiment knobs are capability, not certification. | No. |
-| gfx1201 | Yes: gfx12 PM4 lowering and Qwen adapter. | Yes, with dated model and serve checkpoints. | Available. | Positive capture, retained-PM4 shadow/parity, submission-identity, and product-performance evidence is recoverable. The timed product arm lacks the full modern route-proof ledger, so this case is **not fully certified under this guide**. | Yes when the complete narrow predicate holds and no explicit backend/manual-capture bypass wins; a transport override changes only the selected transport. |
+| gfx1100 | Yes: gfx11 PM4 lowering exists | Yes: dated README/CHANGELOG MQ4R row TG128 median 253.3 tok/s, route unspecified | Via explicit backend request | **No positive retained-route proof recovered** | No; runtime tests reject gfx1100 for the gfx12 default |
+| gfx1151 | Yes: gfx11 PM4 lowering and gfx1151 experiment knobs | Yes: dated row TG128 median 115.1 tok/s, route unspecified | Via explicit backend request | **No positive retained-route proof recovered** | No |
+| gfx1201 | Yes: gfx12 PM4 lowering and Qwen adapter | Yes, with dated model and serve checkpoints | Available | Positive capture, retained-PM4 shadow/parity, submission-identity, and product-performance evidence recoverable; timed product arm lacks full modern route-proof ledger → **not fully certified under this guide** | Yes when complete narrow predicate holds and no explicit backend/manual-capture bypass wins |
 
 Primary gfx1201 case:
 
 | Field | Evidence |
 |---|---|
-| Intent | Establish and productize the single-GPU ordinary-AR Qwen3.6 35B-A3B MQ4R retained-PM4 route. |
-| Baseline route | Tuned HipGraph ordinary AR. |
-| Candidate route | `redline-dispatch`/`redline-rocr` PM4-IB through the Qwen adapter, first with conservative synchronization and then with a selective fence/wait overlay. |
-| Fixture | `qwen3.6-35b-a3b.mq4r`, `arch_id=6`, Q8 KV, no MTP/DFlash, gfx1201 Radeon AI PRO R9700; see `docs/perf-checkpoints/2026-07-11-redline-qwen36-a3b-ar.md`. |
-| Immutable contract | Initial tape: 833 launches, 26 kernels, sequence hash `8d5620ca2ca8a536`; PM4 body 34,563 dwords; one vendor AQL packet. Later graph reshapes have checkpoint-specific fingerprints and must not reuse this hash. |
-| Validation | Fifteen-position bit-exact logits hash `9874244965e2c7d6`, KV hash `fa5f3bb2b32fffcd`, recurrent hash `609db41ffad8ceb6`; `bit_exact`, `blob_bit_exact`, logits/KV/recurrent equality all passed. |
-| PM4 and route evidence | The dated shadow record proves successful retained-PM4 execution, one-packet submission identity, command dwords, and multi-position parity. The recoverable product benchmark records requested `transport=pm4` and HipGraph/`auto` throughput, but not per-timed-arm preparation, `Ready`, fallback reason, observed replay positions, or anti-fallback proof. It therefore does not satisfy the complete Section 7 timed-arm route ledger. |
-| Conservative PM4 observation | The earlier conservative policy measured HipGraph 164.220 tok/s versus requested retained PM4 174.087 tok/s, `1.06009×`. This is the closest recoverable conservative PM4-versus-HipGraph observation. Without the timed-arm route ledger, it is not a fully certified direct-transport A/B under this guide. |
-| Selective fence/wait composition | Tuned HipGraph 165.839 tok/s versus retained PM4 plus removal of one proven-independent boundary wait 178.320 tok/s, `1.07526×`. This is a **combined retained-PM4 plus selective fence/wait-policy observation**, not direct transport alone. |
-| Later progression | `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` records the later productized no-env campaign, including a TG128 median 203.93 tok/s and long-turn serve evidence. That progression changed kernel stack and graph shape; it is not a direct transport A/B. |
-| Automatic admission | Runtime automatically requests `Auto` on the complete gfx12/`arch_id=6`/`pp=tp=1`/`.mq4r` predicate unless an explicit backend or enabled manual capture bypasses the model default. An explicit transport overrides only the transport. Runtime admission is not guide certification. |
-| Disposition | Preserve as the strongest recoverable gfx1201 PM4 capture, parity, submission, performance, and productization evidence. **Do not call it fully certified under this guide** until a positive timed-arm route-proof ledger satisfying Section 7 is archived. |
-| Reusable lesson | Separate architecture capability, model performance, opt-in availability, dated PM4 evidence, guide certification, and automatic admission in every matrix. |
-
-Evidence limitations: initial raw `.redline-work` JSON is referenced by dated markdown but is not checked into the repository. The timed product-harness schema does not expose the controller fields required to exclude silent fallback. The initial checkpoint also records a composition/transplant provenance caveat; later product measurements supersede it for the productized path but do not turn the historical progression or the selective-fence result into pure transport experiments. The recoverable gfx1100 and gfx1151 performance rows do not state whether HIP, HipGraph, or retained PM4 was selected.
+| Intent | Single-GPU ordinary-AR Qwen3.6 35B-A3B MQ4R retained-PM4 route |
+| Baseline route | Tuned HipGraph ordinary AR |
+| Candidate route | `redline-dispatch`/`redline-rocr` PM4-IB through the Qwen adapter |
+| Fixture | `qwen3.6-35b-a3b.mq4r`, `arch_id=6`, Q8 KV, no MTP/DFlash, gfx1201 Radeon AI PRO R9700; see `docs/perf-checkpoints/2026-07-11-redline-qwen36-a3b-ar.md` |
+| Immutable contract | Initial tape: 833 launches, 26 kernels, sequence hash `8d5620ca2ca8a536`; PM4 body 34,563 dwords; one vendor AQL packet. Later graph reshapes have checkpoint-specific fingerprints |
+| Validation | Fifteen-position bit-exact logits hash `9874244965e2c7d6`, KV `fa5f3bb2b32fffcd`, recurrent `609db41ffad8ceb6` |
+| PM4 and route evidence | Dated shadow proves successful retained-PM4 execution and multi-position parity. Product benchmark records requested `transport=pm4` and throughput but **not** per-timed-arm preparation/`Ready`/fallback/observed replay/anti-fallback proof |
+| Conservative PM4 observation | HipGraph 164.220 vs requested retained PM4 174.087 tok/s (`1.06009×`) — closest recoverable conservative observation; not fully certified without timed-arm ledger |
+| Selective fence/wait composition | Tuned HipGraph 165.839 vs retained PM4 plus removal of one proven-independent boundary wait 178.320 tok/s (`1.07526×`) — **combined** PM4 + fence/wait observation, not direct transport alone |
+| Later progression | `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` — productized no-env campaign including TG128 median 203.93 tok/s. Changed kernel stack and graph shape; not a direct transport A/B |
+| Automatic admission | Runtime requests `Auto` on complete gfx12/`arch_id=6`/`pp=tp=1`/`.mq4r` predicate unless explicit backend or enabled manual capture bypasses. Runtime admission ≠ guide certification |
+| Disposition | Strongest recoverable gfx1201 PM4 capture/parity/submission/performance evidence. **Do not call fully certified under this guide** until a positive timed-arm route-proof ledger is archived |
 
 ### 11.3 Rejected gfx1030 Qwen3.6 MQ2 lowering
 
-This subsection is the repository-visible rejection record; the archived performance-checkpoint tree is not extended for this case.
+Repository-visible rejection record (performance-checkpoint tree not extended).
 
 | Field | Evidence |
 |---|---|
-| Intent | Port Qwen3.6 35B-A3B MQ2G256Lloyd prefill and retained-PM4 decode to an RX 6950 XT gfx1030 and earn a product wall-time win. |
-| Baseline route | Ordinary HIP decode. |
-| Candidate route | Product `auto` with `transport=pm4`, plus a Radiowave off/on overlay. |
-| Source identity | Host `hipx`; branch `feat/mq2g256-gfx1030-prefill-redline`; remote worktree `/home/kaden/hipfire-mq2-gfx1030`; prefill commit `0f3444f8cecf9976ced483237a8fc26028f3b94d`; measured candidate `e017f83ceb9d41d4be0d6665161615c9ae74d89b`; daemon `/home/kaden/hipfire-mq2-gfx1030/target/release/examples/daemon`, SHA-256 `47585859295f44a5cc2aab090e7fc43ef342d2932e1d7d402a4d569cbf53acaf`. |
-| Model and device fixture | `/home/kaden/bench/models/qwen3.6-35b-a3b.mq2`, 11,610,560,768 bytes, SHA-256 `48b3f84614c46eb8b5ffb494f7a75c15216664afcbb47c3e78dd80c4ce7eb0a3`; RX 6950 XT gfx1030; `ROCR_VISIBLE_DEVICES=2`; Q8 KV; automatic clocks. |
-| Product fixture | Context 32, 32 measured iterations per row, 10 warmups, 8 measured runs, requested `transport=pm4`; dated 2026-07-18. |
-| Immutable contract | Launch identity/order, owning HSACO, exact padded kernargs, effects, bindings, capture boundary, output/state parity, and positive product-arm route proof. |
-| Exact PM4 evidence | Radiowave-off and -on exact reports each recorded 942 launches, 24 kernels, sequence hash `becff4a4f1849d1e`, one PM4-IB packet, queue id 2, and 21,783 command dwords. `bit_exact`, `blob_bit_exact`, logits/KV/recurrent equality, and the overall exact-harness result all passed. Owning artifact paths and kernel names matched across arms. |
-| Raw hash interpretation | The off/on reports came from separate processes, and the daemon hashes the raw padded kernarg bytes, including device pointers. In the reported bytes, each of the first three pointer fields shifted by the same `0x9ef98000000` while the scalar tails matched. The resulting 942/942 hash drift is therefore consistent with process-local virtual-address relocation and is non-diagnostic for unexpected kernarg mutation. |
-| Matched product result | Same e017 binary/model: Radiowave-off HIP median 101.431 versus `auto` median 83.711 tok/s (`0.82529×`); Radiowave-on HIP 101.460 versus `auto` 83.653 tok/s (`0.82449×`). The nominal candidate arm was about 17.5% slower, and the overlay did not recover it. |
-| Pre-contract control | At commit `0f3444f8cecf9976ced483237a8fc26028f3b94d` with a different daemon, HIP and `auto` were approximately neutral: off `102.345→102.340`, on `102.608→102.512`, and ctx2048 `97.973→98.026` tok/s. These are controls, not retained-PM4 wins. |
-| Route-proof limitation | Exact shadow proves that PM4-IB could execute bit exactly. Product JSON records requested `transport=pm4` but omits controller `Ready`, fallback reason, and observed multi-position replay fields, so it does not independently exclude silent HIP for the timed arm. |
-| Intermediate bring-up evidence | Earlier session logs recorded `HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS` while loading `rmsnorm.hsaco`. The later exact reports loaded successfully and passed parity; those earlier errors are bring-up hazards, not the final rejection mode. |
-| Raw remote evidence | `ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-ab-20260718/` contains `off-exact.json`, `on-exact.json`, `off-product.json`, and `on-product.json`; `ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-precontract-ab-20260718/` contains the three control product reports. |
-| Evidence limitations | The raw reports are remote rather than checked in. The product reports lack the complete timed-arm controller ledger required by Section 7. No source-grounded record defines a single official enum for the rejection, and no final exact evidence shows an artifact-path, launch-order, output-state, or non-pointer kernarg failure. |
-| Certification-ladder classification | Positive capture and exact PM4 shadow/parity evidence is preserved, but the raw cross-process kernarg hashes do not establish an immutable-tape failure. The timed-arm route-proof gate is incomplete and the matched wall-time gate fails. This case is not certified. |
-| Disposition | **Rejected** as a retained-route/Radiowave product promotion. A commit-message or alternate-bench `+3.1%` is not the matched product result. |
-| Reusable lesson | Raw kernarg hashes from different processes require pointer-normalized field comparison; otherwise compare within one allocation session and inspect the scalar fields separately. Stable sequence and bit-exact shadow still cannot replace positive product-arm route proof plus matched wall time. |
+| Intent | Port Qwen3.6 35B-A3B MQ2G256Lloyd prefill and retained-PM4 decode to RX 6950 XT gfx1030 for a product wall-time win |
+| Baseline route | Ordinary HIP decode |
+| Candidate route | Product `auto` with `transport=pm4`, plus Radiowave off/on overlay |
+| Source identity | Host `hipx`; branch `feat/mq2g256-gfx1030-prefill-redline`; prefill commit `0f3444f8cecf9976ced483237a8fc26028f3b94d`; measured candidate `e017f83ceb9d41d4be0d6665161615c9ae74d89b`; daemon SHA-256 `47585859295f44a5cc2aab090e7fc43ef342d2932e1d7d402a4d569cbf53acaf` |
+| Model and device | `/home/kaden/bench/models/qwen3.6-35b-a3b.mq2`, SHA-256 `48b3f84614c46eb8b5ffb494f7a75c15216664afcbb47c3e78dd80c4ce7eb0a3`; RX 6950 XT gfx1030; `ROCR_VISIBLE_DEVICES=2`; Q8 KV; automatic clocks; dated 2026-07-18 |
+| Exact PM4 evidence | Radiowave-off/on exact reports: 942 launches, 24 kernels, sequence hash `becff4a4f1849d1e`, one PM4-IB packet, queue id 2, 21,783 command dwords; bit-exact parity passed |
+| Matched product result | Same e017 binary/model: Radiowave-off HIP median 101.431 vs `auto` 83.711 tok/s (`0.82529×`); Radiowave-on similar ~17.5% slower; overlay did not recover |
+| Route-proof limitation | Product JSON records requested `transport=pm4` but omits controller `Ready`, fallback reason, observed multi-position replay |
+| Disposition | **Rejected** as retained-route/Radiowave product promotion |
+| Reusable lesson | Stable sequence + bit-exact shadow cannot replace positive product-arm route proof plus matched wall time |
+
+Raw remote evidence (not checked in):
+`ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-ab-20260718/` and
+`ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-precontract-ab-20260718/`.
 
 ### 11.4 Rejected LFM Stage A
 
-This subsection is the repository-visible rejection record; the archived performance-checkpoint tree is not extended for this case.
+Repository-visible rejection record. **Not Redline** — serial-HIP fusion only.
+Exact scope: **LFM2.5-350M dense MQ4** on **gfx1201**, candidate path with
+explicit `HIPFIRE_LFM2_DECODE_FUSION=1`, ordinary serial HIP only (no AQL/PM4/
+HipGraph product route). **Rejected / not shipped.**
 
 | Field | Evidence |
 |---|---|
-| Intent | Reduce LFM2.5-350M MQ4 gfx1201 serial-HIP decode launches by fusing RMSNorm plus MQ rotation activation preparation. |
-| Baseline route | Serial HIP lowered decode, `HIPFIRE_LFM2_DECODE_FUSION=0`, graph off, Q8 KV. |
-| Candidate route | The same serial-HIP path with `HIPFIRE_LFM2_DECODE_FUSION=1`; not Redline, AQL, or PM4. |
-| Source identity | Baseline tree `/home/kaden/ClaudeCode/autorocm/hipfire`, branch `lfm-redline`, commit `e8831ae8347f04ac821077ee159c86423b4bf88a`, daemon MD5 `9ee43d2673866775786d8075fb5b6e76`; candidate tree `/home/kaden/ClaudeCode/autorocm/hipfire-lfm-gfx1201-pm4`, branch `feat/lfm-gfx1201-mq4-decode-fusion`, commit `518c221756a1065a7560449165bc8817c2ad6176`, daemon MD5 `07d62bbd915416b07ce7783969126dd7`. |
-| Model and prompt fixture | `/home/kaden/.hipfire/models/lfm2.5-350m.mq4`, MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`; candidate `benchmarks/prompts/lfm_stage_a_five_prompt.json`, MD5 `18cb45e00d424bef16fa9b097d02caf3`; Q8 KV, no DFlash/MTP/spec path. |
-| Device fixture | gfx1201 UUID `GPU-6125bfcd5e216e52`; daemon HIP 7.2; `hipcc 7.2.26015-fc0010cf6a`; ROCm clang `roc-7.2.0 26014`; dated 2026-07-19. |
-| Immutable contract | Bit-exact production decode; fail-closed non-admission on prefill/spec/graph/capture/default; campaign structural targets; predeclared campaign wall gates. PM4 was an explicit non-goal. |
-| Correctness and serve evidence | Frozen twelve-step decode parity was exact for logits, conv state, KV state, argmax, and token count. Default, eager-prefill, spec, graph, and capture/batched-prefill negatives did not admit Stage A. Five reference and five candidate serve prompts had exact assistant-content equality, no empty/runaway/attractor flags, and readable on-topic output. |
-| Launch reconciliation | Baseline 281 compute launches/token. Baseline recorder target 264 = 281 − 1 embedding − 10 direct-HIP conv − 6 direct-HIP attention. Stage A measured 221 compute launches and a stable recorder-visible tape of 204 launches, 9 kernels, hash `67dcc9e17e00ed8f`; 204 = 221 − 1 − 10 − 6. The value 220 = 221 − 1 is a **future** full-tape target after conv/attention recorder migration, not a Stage A pass bar. |
-| Fresh-process ABBA | Pooled tg128 medians were 489.892172→500.248379 tok/s (`+2.113977%`); pooled tg512 medians were 483.856115→488.890740 (`+1.040521%`). Both missed the campaign's predeclared `≥5%` wall gates. The lowest candidate sample also failed the `0.97 ×` pooled-baseline guard in each bucket. |
-| Route proof | Absent by design: no PM4 command, shadow, prepared plan, `Ready`, or observed replay was run. The recorder harness completed capture, then stopped at `redline_shadow_aql requires a loaded single-GPU Qwen3.5 model`; no LFM plan was installed. |
-| Raw local evidence | Source ledger `local://lfm-stage-a-measurement-report.md`; artifact root `/home/kaden/ClaudeCode/autorocm/lfm-stage-a-measurement-20260719/`; phase directories `preflight/`, `serve/`, `abba/`, `recorder/`, and `rocprof/`; command ledgers `run_preflight.sh`, `run_serve_gate.sh`, `run_abba.sh`, `run_recorder.sh`, `run_direct_capture.sh`, and `run_rocprof.sh`. |
-| Evidence limitations | The source ledger is session-local and the raw artifact root is workstation-local; no remote or checked-in raw copy was recovered. This guide therefore preserves the exact identities, fixture, accounting, measured values, and paths, but does not invent product controller fields for a PM4 route that was never run. |
-| Certification-ladder classification | Serial-HIP baseline correctness and serve health passed, but complete retained capture, ABI/artifact validation, PM4 shadow parity, timed-arm route proof, and retained-route lifecycle evidence were not attempted. The campaign wall-time gate failed. This case is not Redline-certified. |
-| Disposition | **Rejected** as a standalone Stage A promotion despite exactness and structural launch reduction. Classified as serial-HIP activation-preparation fusion, not Redline. |
-| Reusable lesson | Fewer launches are neither retained replay nor a wall-time win. Complete recorder coverage, replay-stable attention geometry, LFM mutable-state shadow support, prepared-plan installation, and positive PM4 route proof remain prerequisites. |
+| Intent | Reduce LFM2.5-350M dense MQ4 gfx1201 serial-HIP decode launches by fusing RMSNorm plus MQ rotation activation preparation |
+| Baseline route | Serial HIP lowered decode, `HIPFIRE_LFM2_DECODE_FUSION=0`, graph off, Q8 KV |
+| Candidate route | Same serial-HIP path with `HIPFIRE_LFM2_DECODE_FUSION=1`; **not** Redline, AQL, or PM4 |
+| Source identity | Baseline `lfm-redline` @ `e8831ae8347f04ac821077ee159c86423b4bf88a`, daemon MD5 `9ee43d2673866775786d8075fb5b6e76`; candidate `feat/lfm-gfx1201-mq4-decode-fusion` @ `518c221756a1065a7560449165bc8817c2ad6176`, daemon MD5 `07d62bbd915416b07ce7783969126dd7` |
+| Fixture | `lfm2.5-350m.mq4` (dense) MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`; prompt fixture MD5 `18cb45e00d424bef16fa9b097d02caf3`; gfx1201; HIP/ROCm 7.2; dated 2026-07-19 |
+| Correctness | Frozen twelve-step decode parity exact; Stage A negatives (default/eager-prefill/spec/graph/capture) did not admit; serve content equality passed |
+| Launch reconciliation | Baseline 281 compute launches/token; Stage A 221 compute / recorder-visible 204 launches, 9 kernels, hash `67dcc9e17e00ed8f` |
+| Fresh-process ABBA | Pooled tg128 medians +2.11%; tg512 +1.04% — both missed predeclared ≥5% wall gates |
+| Route proof | Absent by design: no PM4 plan installed; harness stopped at Qwen-only shadow requirement |
+| Disposition | **Rejected** as standalone Stage A promotion. Classified as serial-HIP activation-preparation fusion, **not** Redline. Not shipped. |
+| Reusable lesson | Fewer launches are neither retained replay nor a wall-time win. No generic LFM Redline or product promotion is implied |
+
+**Local evidence pointers (session/workstation-local — not checked into this
+repo):**
+
+| Kind | Location |
+|---|---|
+| Source ledger / narrative report | `local://lfm-stage-a-measurement-report.md` |
+| Raw artifact root | `/home/kaden/ClaudeCode/autorocm/lfm-stage-a-measurement-20260719/` |
+| Phase command ledgers | `run_preflight.sh`, `run_serve_gate.sh`, `run_abba.sh`, `run_recorder.sh`, `run_direct_capture.sh`, `run_rocprof.sh` under that root |
+| Phase raw dirs | `preflight/`, `serve/`, `abba/`, `recorder/`, `rocprof/` under that root |
+| GPU / ROCm identity | live `rocminfo` gfx1201 UUID `GPU-6125bfcd5e216e52`; daemon HIP 7.2; `hipcc` `7.2.26015-fc0010cf6a`; ROCm clang `roc-7.2.0 26014` (see `preflight/rocminfo.stdout`, `preflight/hipcc-version.stdout`) |
+
+**Locality warning:** those raw artifacts and the `local://` ledger are
+session/workstation-local evidence for the named 2026-07-19 campaign. They are
+**not** portable repository fixtures. Absence of the local tree on another
+machine does not reopen the rejection; it only means the raw dumps are not
+recoverable there. Do not treat missing local paths as missing rejection.
 
 ## 12. Copyable new-route checklist
 
-Copy this checklist into the route's dated evidence record.
-
 ### Admission and boundary
 
-- [ ] The exact positive admission predicate names model, architecture, quantization, topology, continuation shape, and route.
-- [ ] Explicit negative gates cover prefill, spec/MTP, batching, graph/capture conflicts, model swap, and every non-sequential call.
-- [ ] Compute launches, external launches, and retained dispatches reconcile exactly.
-- [ ] Every external adapter launch is named with a state/lifetime justification.
+- [ ] Exact positive admission predicate names model, architecture, quantization, topology, continuation shape, and route
+- [ ] Explicit negative gates cover prefill, spec/MTP, batching, graph/capture conflicts, model swap, and every non-sequential call
+- [ ] Compute / external / retained launches reconcile exactly
+- [ ] Every external adapter launch is named with state/lifetime justification
 
 ### Tape, ABI, and state
 
-- [ ] Every in-body launch uses the typed recorder while preserving ordinary-HIP behavior.
-- [ ] Count, unique-kernel set, ordered sequence hash, geometry, and owning artifact identity are stable across positions and fresh processes.
-- [ ] Each symbol resolves to the exact loaded artifact and loader kernarg metadata.
-- [ ] Exact padded kernarg bytes are owned; no stack-backed argument storage survives capture.
-- [ ] Resource reads/writes and dependencies are conservative and explicit.
-- [ ] Each dynamic value uses a named, bounded binding; no hidden kernarg mutation remains.
-- [ ] Reset/prime and snapshot/restore cover logits, KV, recurrent/convolution state, guards, and all model-specific mutable state.
-- [ ] Model swap/allocation teardown invalidates every retained pointer and prepared object.
+- [ ] Every in-body launch uses the typed recorder while preserving ordinary-HIP behavior
+- [ ] Count, unique-kernel set, ordered sequence hash, geometry, and owning artifact identity are stable across positions and fresh processes
+- [ ] Each symbol resolves to the exact loaded artifact and loader kernarg metadata
+- [ ] Exact padded kernarg bytes are owned; no stack-backed argument storage survives capture
+- [ ] Resource reads/writes and dependencies are conservative and explicit
+- [ ] Each dynamic value uses a named, bounded binding; no hidden kernarg mutation
+- [ ] Reset/prime and snapshot/restore cover logits, KV, recurrent/convolution state, guards, and all model-specific mutable state
+- [ ] Model swap/allocation teardown invalidates every retained pointer and prepared object
 
 ### Lowering and certification
 
-- [ ] PM4 register, acquire, fence, and completion policy is correct for the selected architecture.
-- [ ] The first route is single-queue and conservatively ordered.
-- [ ] Ordinary HIP, exact HIP-kernarg-blob, and retained PM4 pass multi-position state parity.
-- [ ] Route proof records request, transport, preparation, `Ready`, observed replay positions, dispatches, packets, queues/phases, dwords, faults, and fallback reason.
-- [ ] A route-proof-capable product harness/report recorded the timed-arm ledger (not only requested backend/transport + throughput). Until that tooling exists, treat the route as an experiment, not a fully certified promotion.
-- [ ] The timed retained arm is proven not to be ordinary HIP or HipGraph.
-- [ ] Production serve output, finish state, repetition/attractor health, and response framing pass.
-- [ ] Dynamic position, growing context, request reset, failure behavior, and model swap pass.
-- [ ] Stationary matched performance reports tok/s, ms/token, raw samples, and the predeclared disposition rule.
-- [ ] Dated raw evidence has an immutable path and complete identity manifest.
+- [ ] PM4 register, acquire, fence, and completion policy is correct for the selected architecture
+- [ ] First route is single-queue and conservatively ordered
+- [ ] Ordinary HIP, exact HIP-kernarg-blob, and retained PM4 pass multi-position state parity
+- [ ] Route proof records request, transport, preparation, `Ready`, observed replay positions, dispatches, packets, queues/phases, dwords, faults, and fallback reason
+- [ ] A route-proof-capable product harness/report recorded the timed-arm ledger (not only requested backend/transport + throughput). Until that tooling exists, treat the route as an experiment
+- [ ] Timed retained arm is proven not to be ordinary HIP or HipGraph
+- [ ] Production serve output, finish state, repetition/attractor health, and response framing pass
+- [ ] Dynamic position, growing context, request reset, failure behavior, and model swap pass
+- [ ] Stationary matched performance reports tok/s, ms/token, raw samples, and the predeclared disposition rule
+- [ ] Dated raw evidence has an immutable path and complete identity manifest
 
 ## 13. Copyable reviewer checklist
 
-- [ ] I can distinguish implementation capability, model performance, opt-in availability, retained-route certification, and automatic-default admission in every claim.
-- [ ] I verified the current runtime predicate and state transitions against the source symbols below.
-- [ ] Automatic `Captured → Ready` behavior is not mislabeled as automatic shadow certification.
-- [ ] Preparation failure and replay-execution failure use the exact phase-specific semantics in Section 3.
-- [ ] The full compute/external/retained launch equation reconciles; no stable partial tape is promoted.
-- [ ] Artifact, kernarg, geometry, resource, binding, lifetime, reset, and model-swap contracts are explicit.
-- [ ] Parity spans multiple positions and every mutable state surface, not logits alone.
-- [ ] Positive route proof excludes silent HIP and HipGraph for every timed arm.
-- [ ] Benchmark arms match binary, model, prompt/token bytes, topology, KV mode, clocks, harness, and process policy.
-- [ ] Direct transport A/B is separate from any changing-kernel historical progression.
-- [ ] Kernel/Radiowave/hazard overlays are compared as base PM4 versus PM4 plus one overlay.
-- [ ] Launch-count reductions are not presented as wall-time wins without stationary evidence.
-- [ ] Every throughput or ratio is dated and fixture-bound, never a timeless floor.
-- [ ] Rejected cases preserve the established falsification and do not invent a missing failure.
-- [ ] Raw reports and source/binary/model digests are recoverable.
+- [ ] I can distinguish implementation capability, model performance, opt-in availability, retained-route certification, and automatic-default admission in every claim
+- [ ] I verified the current runtime predicate and state transitions against the source symbols below
+- [ ] Automatic `Captured → Ready` is not mislabeled as automatic shadow certification
+- [ ] Preparation failure and replay-execution failure use the exact phase-specific semantics in Section 3
+- [ ] Full compute/external/retained launch equation reconciles; no stable partial tape is promoted
+- [ ] Artifact, kernarg, geometry, resource, binding, lifetime, reset, and model-swap contracts are explicit
+- [ ] Parity spans multiple positions and every mutable state surface, not logits alone
+- [ ] Positive route proof excludes silent HIP and HipGraph for every timed arm
+- [ ] Benchmark arms match binary, model, prompt/token bytes, topology, KV mode, clocks, harness, and process policy
+- [ ] Direct transport A/B is separate from any changing-kernel historical progression
+- [ ] Kernel/Radiowave/hazard overlays are compared as base PM4 versus PM4 plus one overlay
+- [ ] Launch-count reductions are not presented as wall-time wins without stationary evidence
+- [ ] Every throughput or ratio is dated and fixture-bound, never a timeless floor
+- [ ] Rejected cases preserve the established falsification and do not invent a missing failure
+- [ ] Raw reports and source/binary/model digests are recoverable
+- [ ] No stitched product-bench + daemon-harness “route proof”
+- [ ] No generic LFM (or other arch) promotion from Stage A / fusion / n-gram wiring alone
 
 ## 14. Stable source-path and symbol index
 
-Prefer these paths and symbols over line numbers; line numbers drift.
+Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
 | Automatic product predicate | `crates/hipfire-runtime/src/config.rs` — `gfx12_mq4r_redline_default` |
-| Model-load application and diagnostic handlers | `crates/hipfire-runtime/examples/daemon.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4`; prefix/profile/probe handlers |
-| Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; calls to `set_forward_eligible`, `should_route_aql`, `should_route_pm4`, `finish_capture`, and `prepare_*` |
-| Controller, tape, lifecycle, and routing | `crates/rdna-compute/src/replay.rs` — `ReplayController`; `ReplayState`; `RecordedHipLaunch`; `ReplayGridBinding`; `configure_model_default`; `reset_for_model`; `begin_auto_capture_if_armed`; `finish_capture`; `prepare_linear_aql_prefix`; `prepare_pm4_prefix`; `replay_linear_aql`; `replay_pm4`; `observe_shadow`; `install_prepared_plan`; `should_route_aql`; `should_route_pm4`; `poison` |
-| Central HIP recording and artifact aliases | `crates/rdna-compute/src/dispatch.rs` — `Gpu::replay`; central typed HIP launch recording and owning-artifact alias map |
-| DAG, identity, ABI, and visibility policy | `crates/redline-dispatch/src/lib.rs` — `Recorder`; `CompiledPlan`; `KernelArtifactIdentity`; `KernargAbi`; `derive_aql_visibility` |
+| Model-load application and diagnostic handlers | `crates/hipfire-runtime/examples/daemon.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
+| Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
+| Controller, tape, lifecycle, routing | `crates/rdna-compute/src/replay.rs` — `ReplayController`; `ReplayState`; `RecordedHipLaunch`; `ReplayGridBinding`; `configure_model_default`; `reset_for_model`; `begin_auto_capture_if_armed`; `finish_capture`; `prepare_linear_aql_prefix`; `prepare_pm4_prefix`; `replay_linear_aql`; `replay_pm4`; `observe_shadow`; `install_prepared_plan`; `should_route_aql`; `should_route_pm4`; `poison` |
+| Central HIP recording and artifact aliases | `crates/rdna-compute/src/dispatch.rs` — `Gpu::replay`; typed HIP launch recording |
+| DAG, identity, ABI, visibility | `crates/redline-dispatch/src/lib.rs` — `Recorder`; `CompiledPlan`; `KernelArtifactIdentity`; `KernargAbi`; `derive_aql_visibility` |
 | Retained AQL and PM4 graph objects | `crates/redline-dispatch/src/aql/replay.rs` — `SingleQueueBatchGraph`; `SingleQueuePm4Ib`; `PhasedMultiQueuePm4Ib` |
-| Public ROCr/HSA ownership | `crates/redline-rocr/src/lib.rs` — ROCr symbols, device/queue/pool/kernarg ownership exports |
+| Public ROCr/HSA ownership | `crates/redline-rocr/src/lib.rs` |
 | PM4-IB vendor packet | `crates/redline-rocr/src/packet.rs` — `PacketImage::pm4_indirect_buffer` |
 | Architecture PM4 builders | `crates/redline-rocr/src/pm4.rs`; `crates/redline-rocr/src/pm4_gfx10.rs` |
 | Manual capture/shadow diagnostic | `scripts/redline_daemon_harness.py` |
 | Product stationary comparison | `scripts/redline_product_bench.py` |
+| Claim → validation route selector | [`VALIDATION.md`](VALIDATION.md) |
 | Graft and ABI provenance | `crates/redline-dispatch/HIPFIRE-GRAFT.md`; `crates/redline-rocr/PROVENANCE.md` |
 | Positive dated gfx1201 evidence | `docs/perf-checkpoints/2026-07-11-redline-qwen36-a3b-ar.md`; `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` |
 
-A change to any referenced route, state, artifact, geometry, resource, or lifetime symbol requires rechecking the applicable certification gates. The guide should be updated when contributor procedure changes; dated case records should remain immutable evidence for their original fixtures.
+A change to any referenced route, state, artifact, geometry, resource, or
+lifetime symbol requires rechecking the applicable certification gates. Update
+this guide when contributor procedure changes; leave dated case records
+immutable for their original fixtures.

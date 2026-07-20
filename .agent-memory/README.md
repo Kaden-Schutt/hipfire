@@ -34,7 +34,7 @@ scripts/mem.sh list
   most valuable notes (they narrow the search space).
 - **Commit notes alongside the work they describe.** A note + its code change in one
   commit is a self-documenting decision log.
-- **Recall before answering**, remember after learning (see `docs/skills/agent-memory.md`).
+- **Recall before answering**, remember after learning. Helper: `scripts/mem.sh`. Sole skill root is `.agents/skills/` — `docs/skills/` is retired/removed and is not a second reference root.
 
 ## Why lexical, not embeddings (and what would change that)
 At this scale, `rg` beats a vector model on speed, footprint, and zero-config. If the

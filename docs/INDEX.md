@@ -13,7 +13,8 @@ Domain prose lives in the linked owners; this file does not duplicate it.
 
 ## Truth states
 
-Exactly one label applies to an active claim or surface:
+Exactly four **active** truth states apply to a current claim or surface.
+Pick exactly one:
 
 | State | Meaning |
 |---|---|
@@ -21,19 +22,32 @@ Exactly one label applies to an active claim or surface:
 | **branch-implemented** | Implemented or documented on `lfm-redline` (or another named working branch) but not a fact of `origin/beta` at the comparison base. |
 | **measured** | Observation tied to named fixture, binary/model identity, and date. Not a default, floor, or admission. |
 | **planned** | Intent only. No executable authority and no implied schedule. |
-| **historical** | Retained record. Useful for provenance; not current procedure or baseline unless a shipped owner re-states it. |
 
-Directory rows may say **mixed (member metadata)** when members span more than one defined state. That is collection policy, not a sixth truth state — each claim still takes exactly one label from the table above (or fail closed).
+**Historical** is a **lifecycle / evidence disposition**, not a fifth active
+truth state. It means a retained record useful for provenance — not current
+procedure, baseline, or product authority — unless a shipped owner re-states
+the claim under one of the four active states above.
 
-Lack of authority is not a fifth positive state:
+Directory and collection rows use **exactly one** canonical classification:
+one of the four active states, a historical disposition, or an explicit
+fail-closed marker below. When members vary, put the directory policy
+classification in the State cell and explain member exceptions in
+Notes/Policy. Never invent another truth state or a slash-combined policy
+state. Each individual claim still takes exactly one active label, a
+historical disposition, or fails closed.
+
+Lack of authority is not an active truth state:
 
 | Marker | Meaning |
 |---|---|
 | **blocked** | No single canonical owner, missing executable route, or unresolved contradiction. Fail closed. |
 | **superseded / rejected** | Replaced or declined; keep only as history. Do not promote. |
 | **unknown** | Not classified. Fail closed — do not invent an owner, admission, or gate. |
+| **historical** (disposition) | Retained evidence or archive. Not an active authority label. |
 
-**Fail-closed:** if a concern has no row below, or a row is `blocked` / `unknown`, do not treat any nearby doc, skill, measurement, or runtime default as authority. Open an explicit owner or keep the claim out of product language.
+**Fail-closed:** if a concern has no row below, or a row is `blocked` /
+`unknown`, do not treat any nearby doc, skill, measurement, or runtime default
+as authority. Open an explicit owner or keep the claim out of product language.
 
 Admissions are machine-recorded only in [`admissions.yml`](admissions.yml). An empty `records` list means no inferred admissions. Runtime gating or a passing measurement alone never admits a route.
 
@@ -56,7 +70,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Product onboarding | [`docs/GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | |
 | CLI surface and model lifecycle commands | [`docs/CLI.md`](CLI.md) | shipped / ref-pinned | |
 | Daemon / user config keys | [`docs/CONFIG.md`](CONFIG.md) | shipped / ref-pinned | |
-| Environment variables | [`docs/env-vars.md`](env-vars.md) | shipped / ref-pinned | Machine-checked against source where `scripts/check-env-docs.py` applies. |
+| Environment variables | [`docs/env-vars.md`](env-vars.md) | shipped / ref-pinned | Env coverage enforced by [`scripts/check-docs-reliability.py`](../scripts/check-docs-reliability.py) (subsumes retired `scripts/check-env-docs.py`). |
 | Registry models, VRAM, sampling, sidecars | [`docs/MODELS.md`](MODELS.md) | shipped / ref-pinned | Registry presence ≠ runtime admission. |
 | Serve HTTP API | [`docs/SERVE.md`](SERVE.md) | shipped / ref-pinned | |
 | Chat UX and daemon attach behavior | [`docs/CHAT.md`](CHAT.md) | shipped / ref-pinned | |
@@ -73,31 +87,30 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Perf-arch working discipline | [`docs/methodology/perf-arch-discipline.md`](methodology/perf-arch-discipline.md) | shipped / ref-pinned | |
 | Kernel Atlas methodology | [`docs/methodology/kernel-atlas.md`](methodology/kernel-atlas.md) | shipped / ref-pinned | |
 | Redline contributor certification and route-proof policy | [`docs/REDLINE.md`](REDLINE.md) | branch-implemented | Normative on this branch; not an `origin/beta` fact at the comparison base. |
-| Thin Redline skill hook (workflow only) | [`docs/skills/redline-retained-replay.md`](skills/redline-retained-replay.md) | branch-implemented | Must not fork policy from `REDLINE.md`. |
-| Executable agent skills root | [`.agents/skills/`](../.agents/skills/) | shipped / ref-pinned | Sole executable skill root. `docs/skills/` is non-executable reference only. |
+| Thin Redline skill hook (workflow only) | [`.agents/skills/redline-retained-replay/`](../.agents/skills/redline-retained-replay/) | branch-implemented | Must not fork policy from `REDLINE.md`. |
+| Executable agent skills root | [`.agents/skills/`](../.agents/skills/) | shipped / ref-pinned | Sole executable skill root. |
 | Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Inventory snapshot; verify in source before product claims. |
 | Spec-decode durability note (2026-06-23) | [`docs/spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated fixture/tables report. |
-| Published benchmark tables | [`docs/BENCHMARKS.md`](BENCHMARKS.md) | measured | Historical/measured snapshots; not live floors. |
+| Published benchmark tables | [`docs/BENCHMARKS.md`](BENCHMARKS.md) | historical | Unmanifested / incomplete evidence identity on tables → historical only; not live floors or admissions. |
 | Dated perf campaign checkpoints | [`docs/perf-checkpoints/`](perf-checkpoints/) | measured | Immutable bodies; amend only via new dated files. |
 | Dependency adoption log | [`docs/dependency-adoption-log.md`](dependency-adoption-log.md) | historical | |
 | Upstream merge journal | [`docs/upstream-merge-journal.md`](upstream-merge-journal.md) | historical | |
 | DeepSeek4 PR body archive | [`docs/deepseek4-pr-body.md`](deepseek4-pr-body.md) | historical | |
 | Multi-GPU bring-up lessons | [`docs/multi-gpu-bringup-lessons.md`](multi-gpu-bringup-lessons.md) | historical | |
-| HFP4 format note | [`docs/quant-formats/hfp4.md`](quant-formats/hfp4.md) | mixed (member metadata) | Member text: v1/v1.5 shipped / ref-pinned claims, v2/v3 planned. Broader quant authority remains `QUANTIZATION.md`. |
+| HFP4 format note | [`docs/quant-formats/hfp4.md`](quant-formats/hfp4.md) | shipped / ref-pinned | Current HFP4/MFP4 owners are shipped / ref-pinned; some reserved aliases remain planned. Broader quant authority stays `QUANTIZATION.md`. |
 | MoE AWQ working notes | [`docs/moe-awq/`](moe-awq/) | historical | |
 | MI300X rental runbook | [`docs/rental/MI300X-RENTAL-RUNBOOK.md`](rental/MI300X-RENTAL-RUNBOOK.md) | historical | |
 | Relicense / governance records | [`docs/governance/`](governance/) | historical | Legal/historical; do not rewrite. |
-| Design-time architecture drafts | [`docs/design/`](design/) | mixed (member metadata) | Branch-implemented LFM/Redline designs, measured baselines, and planned intent may coexist; not product defaults. |
-| Implementation plans and PRDs | [`docs/plans/`](plans/) | mixed (member metadata) | Plans/PRDs plus measured results ledgers. Recency ≠ authority. |
-| Narrow specs | [`docs/specs/`](specs/) | mixed (member metadata) | Intent/spec records; promote only via shipped owners. |
-| Investigations | [`docs/investigations/`](investigations/) | mixed (member metadata) | Discovery trails including measured research; not product defaults. |
+| Design-time architecture drafts | [`docs/design/`](design/) | planned | Directory policy is planned intent. Member exceptions: some branch-implemented LFM/Redline designs and measured baseline notes may coexist; none are product defaults. Historical member bodies stay disposition-only. |
+| Implementation plans and PRDs | [`docs/plans/`](plans/) | planned | Directory policy is planned intent. Member exceptions: measured results ledgers may appear; recency ≠ authority. |
+| Narrow specs | [`docs/specs/`](specs/) | planned | Intent/spec records; promote only via shipped owners. |
+| Investigations | [`docs/investigations/`](investigations/) | historical | Discovery trails including measured research; not product defaults. |
 | Reviews | [`docs/reviews/`](reviews/) | historical | Review archives. |
 | Lessons learned | [`docs/lessons_learned/`](lessons_learned/) | historical | Postmortems. |
-| Superpowers nested plans/specs | [`docs/superpowers/`](superpowers/) | mixed (member metadata) | Members are planned intent and historical nested plans/specs only. Not an executable skill root. |
+| Superpowers nested plans/specs | [`docs/superpowers/`](superpowers/) | planned | Nested plans/specs only. Not an executable skill root. |
 | Universal replacement gate for all GPU changes | — | **BLOCKED** | No universal gate. Route per [`VALIDATION.md`](VALIDATION.md). |
 | Inferred model/route admissions without registry rows | — | **BLOCKED** | [`admissions.yml`](admissions.yml) stays empty until earned records exist. |
 | Stitching manual Redline capture to product timed-arm proof | — | **BLOCKED** | See `REDLINE.md` certification ladder; fail closed. |
-| `docs/skills/` as executable skill root | — | **BLOCKED** | Non-executable reference/history only. Do not add executable skill definitions here. |
 
 ## Top-level page classification
 
@@ -123,7 +136,7 @@ Every current top-level page, exactly once.
 | [`CONTAINER.md`](CONTAINER.md) | shipped / ref-pinned | Containers. |
 | [`NIXOS.md`](NIXOS.md) | shipped / ref-pinned | NixOS. |
 | [`REDLINE.md`](REDLINE.md) | branch-implemented | Redline certification (branch-only vs `origin/beta`). |
-| [`BENCHMARKS.md`](BENCHMARKS.md) | measured | Dated/historical bench tables. |
+| [`BENCHMARKS.md`](BENCHMARKS.md) | historical | Dated/historical bench tables; incomplete manifests stay historical-only. |
 | [`speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Speculation inventory snapshot. |
 | [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated durability fixture/tables. |
 | [`dependency-adoption-log.md`](dependency-adoption-log.md) | historical | Dependency log. |
@@ -133,24 +146,23 @@ Every current top-level page, exactly once.
 
 ## Collection classification
 
-Every current top-level collection, exactly once. Directory policy applies to members that lack their own stronger metadata.
+Every current top-level collection, exactly once. Directory policy applies to members that lack their own stronger metadata. One canonical policy state per collection; member exceptions go in Policy only.
 
 | Collection | State | Policy |
 |---|---|---|
-| [`methodology/`](methodology/) | shipped / ref-pinned | Active methodology owners. Link; do not copy matrices into root guides. |
+| [`methodology/`](methodology/) | shipped / ref-pinned | Active methodology owners. Link; do not copy matrices into root guides. **Member exceptions:** [`astrea-atlas-pareto-workflow.md`](methodology/astrea-atlas-pareto-workflow.md) and [`astrea-model-policy.md`](methodology/astrea-model-policy.md) are **planned / blocked** (proposed intent; not current INDEX/VALIDATION owners; `candidate_id` join unsupported in current Atlas schema). |
 | [`perf-checkpoints/`](perf-checkpoints/) | measured | Immutable dated evidence. Correct only with a new dated amendment file. |
-| [`design/`](design/) | mixed (member metadata) | Approved branch-only LFM/Redline docs, measured baselines, and planned intent. Member label controls; directory is not runtime truth. |
-| [`plans/`](plans/) | mixed (member metadata) | Execution plans/PRDs and measured results ledgers. Recency ≠ authority. |
-| [`specs/`](specs/) | mixed (member metadata) | Narrow specs and intent; promote only via shipped owners. |
-| [`investigations/`](investigations/) | mixed (member metadata) | Historical discovery plus measured research trails. |
+| [`design/`](design/) | planned | Approved intent and drafts. Member exceptions: branch-implemented LFM/Redline docs and measured baseline notes may appear; directory is not runtime truth. |
+| [`plans/`](plans/) | planned | Execution plans/PRDs. Member exceptions: measured results ledgers may appear. Recency ≠ authority. |
+| [`specs/`](specs/) | planned | Narrow specs and intent; promote only via shipped owners. |
+| [`investigations/`](investigations/) | historical | Historical discovery plus measured research trails. |
 | [`reviews/`](reviews/) | historical | Review archives. |
 | [`lessons_learned/`](lessons_learned/) | historical | Postmortems. |
 | [`moe-awq/`](moe-awq/) | historical | MoE AWQ session notes. |
-| [`quant-formats/`](quant-formats/) | mixed (member metadata) | Format notes under quant umbrella (e.g. HFP4 ships some versions, plans others). `QUANTIZATION.md` remains primary. |
+| [`quant-formats/`](quant-formats/) | shipped / ref-pinned | Format notes under quant umbrella; HFP4/MFP4 current surface is shipped / ref-pinned while some aliases stay planned. `QUANTIZATION.md` remains primary. |
 | [`rental/`](rental/) | historical | Rental runbooks. |
 | [`governance/`](governance/) | historical | Legal/governance records; bodies stay untouched. |
-| [`skills/`](skills/) | mixed (member metadata) | Members are branch-implemented reference hooks and historical skill prose. Non-executable; sole executable root is `.agents/skills/`. |
-| [`superpowers/`](superpowers/) | mixed (member metadata) | Members are planned intent and historical nested plans/specs only. |
+| [`superpowers/`](superpowers/) | planned | Nested plans/specs only; not an executable skill root. |
 
 ## Branch scope
 

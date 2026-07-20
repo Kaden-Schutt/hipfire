@@ -56,6 +56,8 @@ ACTIVE_MARKDOWN = frozenset(
         "docs/methodology/arch-port-validation.md",
         "docs/methodology/kernel-atlas.md",
         "docs/methodology/kernel-atlas-architecture.md",
+        "docs/quant-formats/hfp4.md",
+        "docs/speculation-support-inventory.md",
     }
 )
 
@@ -65,7 +67,7 @@ ADMISSIONS_PATH = "docs/admissions.yml"
 INDEX_PATH = "docs/INDEX.md"
 CHECKPOINT_PREFIX = "docs/perf-checkpoints/"
 
-# Accept current authority spelling and the alias pair.
+# Accept the two ownership-table header spellings used by repository history.
 OWNERSHIP_HEADER_VARIANTS = (
     ("Concern", "Canonical owner", "State", "Notes"),
     ("Concern", "Canonical owner", "Truth state", "Scope/limits"),
@@ -74,9 +76,7 @@ OWNERSHIP_HEADER_VARIANTS = (
 TRUTH_STATES = frozenset(
     {
         "shipped / ref-pinned",
-        "shipped / integration-ref-pinned",
         "branch-implemented",
-        "branch-only",
         "measured",
         "planned",
         "historical",
@@ -84,26 +84,17 @@ TRUTH_STATES = frozenset(
         "superseded",
         "rejected",
         "unknown",
-        "planned / historical",
-        "branch-implemented / transitional",
         "superseded / rejected",
     }
 )
 
-BRANCHISH_TRUTH = frozenset(
-    {
-        "branch-implemented",
-        "branch-only",
-        "branch-implemented / transitional",
-    }
-)
+BRANCHISH_TRUTH = frozenset({"branch-implemented"})
 
 HISTORICALISH_TRUTH = frozenset(
     {
         "historical",
         "measured",
         "planned",
-        "planned / historical",
         "superseded",
         "rejected",
         "superseded / rejected",
@@ -122,11 +113,43 @@ COHERENCE_ACCEPTANCE_RE = re.compile(
     r"coherence-gate)"
 )
 
+# Same-line markers that disclose intentional missing/retired/historical paths.
+PATH_DENIAL_RE = re.compile(
+    r"(?i)\b(?:"
+    r"missing|retired|historical|pre-modular|"
+    r"does\s+not\s+exist|no\s+longer\s+exists?|"
+    r"removed|intentionally\s+(?:absent|missing|removed|omitted)|"
+    r"not\s+(?:present|available|shipped)|"
+    r"disclosure"
+    r")\b"
+)
+
+# Coherence-gate denial / historical-only framing near an acceptance-shaped hit.
+COHERENCE_DENIAL_RE = re.compile(
+    r"(?is)(?:"
+    r"\bdo\s+not\b|"
+    r"\bmust\s+not\b|"
+    r"\bnever\b|"
+    r"\bretired\b|"
+    r"\bhistorical(?:ly)?(?:\s*[- ]\s*only|\s+only|\s+reproduction)?\b|"
+    r"\bnot\s+acceptance\b|"
+    r"\brejected\b"
+    r")"
+)
+
+# Trailing :line or :start-end source locations on path tokens.
+SOURCE_LOCATION_SUFFIX_RE = re.compile(r":\d+(?:-\d+)?$")
+
 # Markdown links and images: ![alt](tgt) or [text](tgt)
 MD_LINK_OR_IMAGE_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
 BACKTICK_RE = re.compile(r"`([^`\n]+)`")
 HIPFIRE_ENV_RE = re.compile(r"\bHIPFIRE_[A-Z0-9_]+\b")
+RUST_ENV_ACCESS_RE = re.compile(
+    r'\b(?:std::)?env::var(?:_os)?\(\s*"(HIPFIRE_[A-Z0-9_]+)"'
+)
+TS_ENV_ACCESS_RE = re.compile(r"\bprocess\.env\.(HIPFIRE_[A-Z0-9_]+)\b")
+ENV_DOC_ROW_RE = re.compile(r"^\|\s*`(HIPFIRE_[A-Z0-9_]+)`\s*\|", re.MULTILINE)
 MD_OWNER_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 FULL_SHA_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
 
@@ -304,6 +327,45 @@ def strip_shell_punctuation(token: str) -> str:
     return token.strip().strip("`\"'").rstrip(".,;:)!?]>")
 
 
+def strip_source_location_suffix(token: str) -> str:
+    """Drop trailing :line or :start-end suffixes; keep the path bytes only."""
+    m = SOURCE_LOCATION_SUFFIX_RE.search(token)
+    if not m:
+        return token
+    base = token[: m.start()]
+    if not base or base.endswith(":"):
+        return token
+    return base
+
+
+def is_path_template_token(token: str) -> bool:
+    """True for intentional path templates / globs, not concrete repo paths."""
+    if any(ch in token for ch in ("*", "?", "[", "]", "<", ">", "{", "}")):
+        return True
+    if "..." in token or "…" in token:
+        return True
+    return False
+
+
+def line_span_containing(text: str, index: int) -> str:
+    """Return the single physical line that contains absolute index."""
+    start = text.rfind("\n", 0, index) + 1
+    end = text.find("\n", index)
+    if end < 0:
+        end = len(text)
+    return text[start:end]
+
+
+def line_has_path_denial(line: str) -> bool:
+    """True when the line discloses a missing/retired/historical path on purpose.
+
+    Backtick spans are stripped first so path tokens themselves (e.g. names
+    containing 'pre-modular') cannot satisfy the denial marker.
+    """
+    prose = BACKTICK_RE.sub(" ", line)
+    return PATH_DENIAL_RE.search(prose) is not None
+
+
 def extract_path_tokens(span: str) -> list[str]:
     """Extract concrete repo-root path tokens from a code span (may contain spaces)."""
     found: list[str] = []
@@ -312,7 +374,9 @@ def extract_path_tokens(span: str) -> list[str]:
         # Drop trailing anchor fragments for existence checks.
         token = token.split("#", 1)[0]
         token = strip_shell_punctuation(token)
-        if token:
+        token = strip_source_location_suffix(token)
+        token = strip_shell_punctuation(token)
+        if token and not is_path_template_token(token):
             found.append(token)
     return found
 
@@ -548,35 +612,21 @@ class Checker:
         return False
 
     def is_active_markdown(self, path: str) -> bool:
+        """True only for the explicit greenfield active set and executable skills.
+
+        INDEX lifecycle completeness is intentionally separate from this scan set:
+        historical/planned collections are classified there but not body-scanned.
+        """
         if path in ACTIVE_MARKDOWN:
             return True
         if path.startswith(".agents/skills/") and path.endswith((".md", ".MD")):
-            return True
-        # Non-historical docs/**/*.md are active for scans.
-        if (
-            path.startswith("docs/")
-            and path.endswith((".md", ".MD"))
-            and not self.is_historical_path(path)
-        ):
-            return True
-        # Root routing markdown always active when present.
-        if path in {"README.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md"}:
             return True
         return False
 
     def active_markdown_paths(self) -> list[str]:
         """Central active Markdown set for links, coherence, and skill-ref scans."""
         paths = self.target.list_paths()
-        out: list[str] = []
-        for p in sorted(paths):
-            if not p.endswith((".md", ".MD")):
-                continue
-            if self.is_active_markdown(p):
-                out.append(p)
-        for p in sorted(ACTIVE_MARKDOWN):
-            if p in paths and p not in out:
-                out.append(p)
-        return out
+        return sorted(p for p in paths if self.is_active_markdown(p))
 
     # --- admissions -----------------------------------------------------
 
@@ -1045,8 +1095,13 @@ class Checker:
     def _check_backticked_paths(self, path: str, text: str) -> None:
         for match in BACKTICK_RE.finditer(text):
             span = match.group(1)
+            if is_path_template_token(span):
+                # Whole-span templates (globs / placeholders) are never concrete paths.
+                continue
+            line = line_span_containing(text, match.start())
+            denied = line_has_path_denial(line)
             for token in extract_path_tokens(span):
-                if any(ch in token for ch in "*?["):
+                if is_path_template_token(token):
                     continue
                 if token.startswith(EXTERNAL_SCHEMES):
                     continue
@@ -1058,11 +1113,15 @@ class Checker:
                     self.add("path", path, f"repo-escaping backticked path {token}")
                     continue
                 if not self.target.exists(resolved):
-                    if not any(
+                    if any(
                         p.startswith(resolved.rstrip("/") + "/")
                         for p in self.target.list_paths()
                     ):
-                        self.add("path", path, f"missing backticked path {token}")
+                        continue
+                    if denied:
+                        # Same-line denial/disclosure: intentional missing mention.
+                        continue
+                    self.add("path", path, f"missing backticked path {token}")
 
     # --- coherence-gate acceptance --------------------------------------
 
@@ -1073,21 +1132,15 @@ class Checker:
                 continue
             for m in COHERENCE_ACCEPTANCE_RE.finditer(text):
                 snippet = " ".join(m.group(0).split())
-                window_start = max(0, m.start() - 80)
-                window_end = min(len(text), m.end() + 80)
-                window = text[window_start:window_end].lower()
-                if any(
-                    key in window
-                    for key in (
-                        "retired",
-                        "historical reproduction",
-                        "never promotion",
-                        "not acceptance",
-                        "must not be required",
-                        "do not treat",
-                        "rejected",
-                    )
-                ):
+                # Scope denials to the physical line(s) covered by the match so
+                # prior-paragraph words like "retired" cannot suppress a later
+                # positive acceptance claim.
+                line_start = text.rfind("\n", 0, m.start()) + 1
+                line_end = text.find("\n", m.end())
+                if line_end < 0:
+                    line_end = len(text)
+                context = text[line_start:line_end]
+                if COHERENCE_DENIAL_RE.search(context):
                     continue
                 self.add(
                     "coherence-gate",
@@ -1102,7 +1155,32 @@ class Checker:
         if canonical is None:
             self.add("env", ENV_CANONICAL, "missing canonical env docs")
             return
+
         canon_vars = set(HIPFIRE_ENV_RE.findall(canonical))
+        documented_rows = set(ENV_DOC_ROW_RE.findall(canonical))
+        source_uses: dict[str, set[str]] = defaultdict(set)
+        for path in self.target.list_paths():
+            pattern = None
+            if path.endswith(".rs"):
+                pattern = RUST_ENV_ACCESS_RE
+            elif path.endswith(".ts"):
+                pattern = TS_ENV_ACCESS_RE
+            if pattern is None:
+                continue
+            text = self.target.read_text(path)
+            if text is None:
+                continue
+            for name in pattern.findall(text):
+                source_uses[name].add(path)
+
+        for name in sorted(source_uses.keys() - documented_rows):
+            paths = ", ".join(sorted(source_uses[name]))
+            self.add(
+                "env",
+                ENV_CANONICAL,
+                f"{name} used by source but missing from env table ({paths})",
+            )
+
         for rel in ENV_REFERENCE_DOCS:
             text = self.target.read_text(rel)
             if text is None:

@@ -4,7 +4,7 @@
 # No database, no embeddings, no service: notes are .agent-memory/notes/*.md
 # (YAML frontmatter), recall is ripgrep ranked by match density. The right tool
 # for a few-hundred terse, keyword-dense engineering notes. Project findings live
-# here, in-repo, diffable, shared with contributors. See docs/skills/agent-memory.md.
+# here, in-repo, diffable, shared with contributors. See .agent-memory/README.md (docs/skills/ is retired).
 set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 NOTES="$ROOT/.agent-memory/notes"

@@ -1,7 +1,7 @@
 interface:
   display_name: "Astrea"
-  short_description: "Model calibration, KV policy, and eval workflow"
-  default_prompt: "Use $astrea to plan and evaluate a hipfire model calibration or KV policy experiment."
+  short_description: "Quant calibration, KLD/PPL eval, KV policy, and promotion discipline"
+  default_prompt: "Use $astrea to plan, calibrate, evaluate, or policy a hipfire quant/KV candidate; measure quality before any promote/reject/package call, and send runtime formats through Atlas only as measured evidence."
 
 policy:
   allow_implicit_invocation: true

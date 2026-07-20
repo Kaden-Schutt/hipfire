@@ -5,137 +5,171 @@ description: Use when porting a hipfire feature/fix branch authored against pre-
 
 # rebase-onto-modular
 
-Hipfire's 0.1.20 release split the monolithic `engine` crate into a runtime
-crate plus per-arch crates. Branches authored before 0.1.20 need their
-import paths, Cargo deps, and (sometimes) trait-dispatch sites rewritten
-before they compile against current master.
+Hipfire 0.1.20 split the monolithic engine crate (historical/pre-modular path
+`crates/engine/`, intentionally absent from the checkout) into
+`hipfire-runtime` plus per-family `hipfire-arch-*` crates. Branches authored
+against pre-modular trees need path, import, and sometimes dispatch rewrites
+before they compile on current master.
 
-This skill runs the mechanical 80% via `scripts/rebase-onto-modular.sh`,
-then guides human resolution of the remaining 20%.
+**The old helper `scripts/rebase-onto-modular.sh` was removed** (see CHANGELOG
+v0.3.0 — stale modular-rebase helper). This skill is the manual cutover
+playbook. Do not search for or reintroduce that script.
 
-## When to invoke
+## Reach for this when
 
-- A contributor's PR was authored against pre-modular master
-  (look for `crates/engine/src/`, `use engine::`, or `engine = { path =`
-  in the diff).
-- They (or you, on their behalf) want to bring it onto post-modular master.
+- The branch still has historical/pre-modular `crates/engine/` (intentionally
+  absent from the checkout), `use engine::`, or
+- A PR was cut from pre-0.1.20 history and must land on post-modular master.
 
-## Topology recap (post-0.1.20)
+## Do not use when
 
+- The branch was authored on post-0.1.20 modular master already.
+- Changes touch only paths that never lived under `engine/` and need a plain
+  `git rebase` onto current master (confirm with the map below first).
+- You only need a new arch on an already-modular tree — copy
+  `crates/hipfire-arch-toy/` and follow `docs/ARCHITECTURE.md` /
+  `.agents/skills/hipfire-arch-port/` instead.
+
+## Current topology (derive from tree; owners win on drift)
+
+Authoritative overviews — **look these up; do not maintain a second crate
+inventory in this skill:**
+
+- [`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) — crate roles + request lifecycle
+- [`docs/architecture-ids.md`](../../../docs/architecture-ids.md) — `arch_id` → crate
+- [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) — “Crate topology”
+- CHANGELOG **v0.1.20** — original migration map
+- Workspace members: root `Cargo.toml` `[workspace].members` and `ls crates/`
+
+Mandatory before path rewrites on a live tree:
+
+```bash
+# confirm post-modular layout (no crates/engine/)
+ls crates/
+# optional: workspace member list
+rg -n '^members' -A40 Cargo.toml
 ```
-crates/
-  hipfire-runtime/         ← was crates/engine/, plus 4 new modules
-                             (loop_guard, sampler, prompt_frame, eos_filter)
-  hipfire-arch-qwen35/     ← qwen35.rs + speculative.rs + pflash.rs
-  hipfire-arch-qwen35-vl/  ← qwen35_vl.rs + image.rs
-  hipfire-arch-llama/      ← facade over runtime::llama (real split = PR 14)
-  hipfire-arch-toy/        ← reference template for new-arch contributors
-  rdna-compute/            ← unchanged (kernel dispatch + RDNA-arch routing)
-  hip-bridge/              ← unchanged (HIP/ROCm FFI)
-  hipfire-quantize/        ← unchanged (quantizer CLI)
-```
+
+Bring-up contract: `hipfire_runtime::arch::Architecture` in
+`crates/hipfire-runtime/src/arch.rs`. Forward stays **off** the trait (static
+dispatch per concrete arch). Toy template for a new modular arch crate:
+`crates/hipfire-arch-toy/`.
+
+## Path / import cutover map
+
+Historical/pre-modular source paths below are intentionally absent from the
+checkout; map each to the post-modular destination (from CHANGELOG v0.1.20 —
+apply cleanly, no shims, no `engine` re-exports):
+
+| Pre-modular (historical; intentionally absent) | Post-modular |
+|---|---|
+| `crates/engine/src/lib.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-runtime/src/lib.rs` |
+| `crates/engine/src/qwen35.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-arch-qwen35/src/qwen35.rs` |
+| `crates/engine/src/qwen35_vl.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs` |
+| `crates/engine/src/image.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-arch-qwen35-vl/src/image.rs` |
+| `crates/engine/src/llama.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-runtime/src/llama.rs` (+ `hipfire_arch_llama::llama` re-export) |
+| `crates/engine/src/speculative.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-arch-qwen35/src/speculative.rs` (and related spec modules) |
+| `crates/engine/src/pflash.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-arch-qwen35/src/pflash.rs` |
+| `crates/engine/src/loop_guard.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-runtime/src/loop_guard.rs` |
+| `crates/engine/src/sampler.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-runtime/src/sampler.rs` |
+| `crates/engine/src/prompt_frame.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-runtime/src/prompt_frame.rs` |
+| `crates/engine/src/eos_filter.rs` (historical/pre-modular; intentionally absent from the checkout) | `crates/hipfire-runtime/src/eos_filter.rs` |
+
+Import rewrites:
+
+- `use engine::…` → `use hipfire_runtime::…` for runtime symbols
+- Arch-specific symbols → `use hipfire_arch_<family>::…`
+- Cargo: drop `engine` path dep; depend on `hipfire-runtime` and only the arch
+  crates you call
+- Shared GEMV / `KvCache` / dequant helpers that used to hang off
+  `engine::qwen35` generally live under `hipfire_runtime::llama` (still the
+  shared transformer home until a future physical split)
+
+**Clean cutover:** migrate every caller in the branch. Leave no `engine`
+alias, deprecated path, or dual-compile shim.
 
 ## Workflow
 
-### 1. Run the mechanical rebase script
-
-From the root of the contributor's worktree:
+### 1. Backup and rebase onto current master
 
 ```bash
-./scripts/rebase-onto-modular.sh
+git tag rebase-onto-modular-backup-$(date -u +%Y%m%dT%H%M%SZ)
+# working tree must be clean; do not run this on master itself
+git fetch origin
+git rebase origin/master   # or the repo's current default integration branch
 ```
 
-What it does:
-- Creates a backup tag (`rebase-onto-modular-backup-<timestamp>`) so any
-  step can be undone.
-- Refuses to run if the working tree is dirty or you're on master.
-- Rebases your branch onto current `origin/master`, favoring master on
-  conflicts (the assumption: structural conflicts are about the rename,
-  not about your changes; we re-apply your additive logic in the next step).
-- Applies the path-rename map (engine/src/X.rs → hipfire-runtime or arch crate).
-- Rewrites `use engine::*` → `use hipfire_runtime::*` (or arch crate), and
-  Cargo dep references.
-- Tries `cargo build --release --features deltanet --workspace` to surface
-  any remaining issues.
+On structural conflicts that are pure renames, prefer the post-modular side
+for file location, then re-apply the branch’s additive logic onto the new
+paths. Agents must not force-push or hard-reset without explicit human OK.
 
-If the script's mid-step says "rebase produced conflicts," follow its
-on-screen instructions:
-1. `git checkout --theirs <conflicted file>`
-2. `git add <file>`
-3. `git rebase --continue`
-4. Once rebase completes, re-run the script.
+### 2. Mechanical rewrite
 
-### 2. Address common semantic conflicts
+1. Move any remaining files still under historical/pre-modular `crates/engine/`
+   (intentionally absent from the checkout) to the table above
+   (or the correct newer arch crate if the code is family-specific).
+2. Rewrite imports and Cargo.toml deps workspace-wide on the branch.
+3. Grep until clean: `\bengine::`, historical/pre-modular `crates/engine`
+   (intentionally absent from the checkout), `path = .*/engine`.
+4. Update feature flags: consumers select arches via `hipfire-runtime`
+   features / direct arch-crate deps — not a monolithic engine feature.
 
-After the script's rewrites, `cargo build` may still fail. The usual
-suspects:
+### 3. Semantic conflict triage
 
 | Failure shape | What to do |
 |---|---|
-| `engine::X` import the script missed | Check `scripts/rebase-onto-modular.sh`'s `PATH_MAP` and `REWRITES`. If your branch uses an unusual import path, manually rewrite or extend the script's map. |
-| `arch_id` match-arm in your diff | Daemon's arch dispatch now goes through `<Architecture>::*` for the bring-up triple. If your branch added a new `arch_id => ...` arm in `daemon.rs::generate()`, port it into the new pattern: introduce a new arch crate (use `hipfire-arch-toy/` as template) or wire into an existing arch's dispatch. |
-| Direct `qwen35::*` reach from non-qwen35 code | Most cross-arch helpers (`weight_gemv`, `KvCache`, `dequantize_*`, RoPE) live in `hipfire_runtime::llama` (still — physical split waits for PR 14 transformer extraction). Replace `engine::qwen35::weight_gemv` → `hipfire_runtime::llama::weight_gemv`. |
-| `sampler` / `loop_guard` / `prompt_frame` / `eos_filter` not found | These moved to the runtime crate's top-level modules. `use hipfire_runtime::sampler::*` etc. |
-| Missing `Architecture` trait import | `use hipfire_runtime::arch::Architecture;` |
-| `image.rs` imports broken | Vision preprocessing moved to `hipfire-arch-qwen35-vl/src/image.rs`. Replace `engine::image::*` → `hipfire_arch_qwen35_vl::image::*`. |
+| Missed `engine::` import | Map symbol to runtime vs arch crate; fix call site (no blanket `pub use`). |
+| New `arch_id` match arms in `daemon.rs` | Prefer arch crate + `Architecture` bring-up triple; register id per `docs/architecture-ids.md`. Do not grow a permanent parallel ladder when a trait hook exists. |
+| Cross-arch helper via old `qwen35::*` | Use `hipfire_runtime::llama::{weight_gemv, KvCache, dequantize_*, …}` or the owning arch’s public API. |
+| `sampler` / `loop_guard` / `prompt_frame` / `eos_filter` missing | Top-level modules on `hipfire_runtime`. |
+| Missing `Architecture` trait | `use hipfire_runtime::arch::Architecture;` |
+| Broken `image` / VL imports | `hipfire_arch_qwen35_vl::…` |
+| Dispatch / kernel selection moved | Hot kernels route through `rdna-compute` + `hipfire-dispatch` families — do not re-embed arch-specific ISA ladders inside a random arch crate. |
+| Spec / DFlash symbols | Check `hipfire-runtime` spec seams and `hipfire-arch-qwen35` (or the arch that owns the drafter). Inventory snapshot: `docs/speculation-support-inventory.md` (historical — verify in source). |
 
-### 3. Verify
+### 4. Verify (claim-scoped; no universal gate)
+
+Build what you touched:
 
 ```bash
 cargo build --release --features deltanet --workspace
+# optional, if the branch had unit coverage:
 cargo test --lib --features deltanet --workspace
 ```
 
-Both must pass before pushing.
+Then pick **narrow** evidence from [`docs/VALIDATION.md`](../../../docs/VALIDATION.md)
+for the change class (docs-only, kernel numeric, forward parity oracle, serve
+semantics, perf protocol, arch-port procedure). Do **not**:
 
-If your branch had perf-sensitive changes:
+- require retired `scripts/coherence-gate-*.sh` as acceptance
+- invent a one-script replacement gate
+- treat green no-GPU CI as GPU correctness
+
+Perf-sensitive branches: follow
+`docs/methodology/perf-benchmarking.md` and, when applicable,
+`scripts/speed-gate.sh` baselines — measured, not admission.
+
+### 5. Push (human-approved)
+
 ```bash
-./scripts/speed-gate.sh
+git push --force-with-lease origin <branch>
 ```
 
-If your branch touched kernels / quant / dispatch / fusion / rotation /
-forward-pass:
-```bash
-./scripts/coherence-gate-dflash.sh
-```
-
-### 4. Push
-
-```bash
-git push --force-with-lease origin <your-branch>
-```
-
-`--force-with-lease` is safer than `--force` — it'll refuse if someone
-else updated the branch concurrently.
+`--force-with-lease` only after the human accepts the rewritten history.
 
 ## Rollback
-
-If the rebase produces something worse than what you started with:
 
 ```bash
 git reset --hard rebase-onto-modular-backup-<timestamp>
 git tag -d rebase-onto-modular-backup-<timestamp>
 ```
 
-The backup tag is created at the very start of the script and persists
-until you delete it.
+Agents must ask before destructive rollback or force-push.
 
-Agents must ask the user before running destructive rollback commands or
-force-pushing a rewritten branch. The commands above are human recovery
-instructions, not permission to discard unreviewed work.
+## Related
 
-## When NOT to use this skill
-
-- Brand-new branches authored against post-modular master — they don't
-  need rebase.
-- Branches that touch ONLY `kernels/src/` or `crates/rdna-compute/` —
-  those crate paths are unchanged; just `git rebase origin/master`.
-- Branches that touch ONLY `crates/hip-bridge/` — same.
-- Branches touching `crates/hipfire-quantize/` — same.
-
-## Reference
-
-- Migration map: `CHANGELOG.md` 0.1.20 entry
-- Crate topology: `CONTRIBUTING.md` "Crate topology" section
-- Architecture trait: `crates/hipfire-runtime/src/arch.rs`
-- Toy arch template: `crates/hipfire-arch-toy/`
+- New GPU arch port (not model-family crate split):
+  [`.agents/skills/hipfire-arch-port/`](../hipfire-arch-port/SKILL.md)
+- Validation routes: [`docs/VALIDATION.md`](../../../docs/VALIDATION.md)
+- Trait + overrides: `crates/hipfire-runtime/src/arch.rs`
+- Toy template: `crates/hipfire-arch-toy/`

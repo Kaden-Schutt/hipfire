@@ -17,312 +17,169 @@ hipfire run qwen3.5:4b "What is the capital of France?"
 
 The daemon exposes an OpenAI-compatible API on `0.0.0.0:11435`.
 
-Current stable release: **v0.2.1**. The next release is **v0.3.0**,
-headlined by MQ4R and Redline across RDNA. See
-[CHANGELOG.md](CHANGELOG.md).
+**Current stable release: v0.2.1.** The next release is **v0.3.0**
+(MQ4R + Redline across RDNA). See [CHANGELOG.md](CHANGELOG.md).
 
-Curated weights are published through
-[huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
+Curated weights: [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
 and the per-model repositories recorded in the dynamic registry.
 
 Discord: <https://discord.gg/F3BaywB8Rs>
 
-## MQ4R + Redline
-
-MQ4R is the performance-oriented Qwen 3.6 35B-A3B SKU. It combines
-uniform MQ4 attention and gate-side weights with graded routed experts
-and the fused gate path.
-
-```bash
-hipfire pull qwen3.6:35b-a3b-mq4r
-hipfire run qwen3.6:35b-a3b-mq4r \
-  "Implement a bounded lock-free queue in Rust."
-```
-
-The model is 18.7 GB and requires approximately 22 GB of available
-VRAM. MQ4R prioritizes throughput; use the default MQ4P model or MFP4,
-MQ5, or MQ6 when quality matters more than maximum decode speed.
-
-Redline is hipfire's in-tree dispatch and retained-replay substrate. It
-records the actual kernel graph, derives resource dependencies, retains
-invariant command state, and lowers validated paths through public ROCr
-queue interfaces.
-
-The lowering implementation has architecture-specific capability from RDNA1
-through RDNA4. Capability is not blanket route certification or automatic
-admission: the current automatic default is limited to single-GPU Qwen A3B
-`.mq4r` on gfx12. Pre-promotion shadow evidence remains a certification
-requirement, but the admitted automatic lifecycle does not wait for the
-controller's `ShadowValidated` state. A preparation failure poisons retained
-routing only after the HIP warmup has completed successfully. A retained-replay
-execution failure errors that call, poisons retained routing for later calls,
-and does not retry the same call through HIP; later eligible calls may use the
-HIP-side policy. See the canonical [Redline contributor guide](docs/REDLINE.md).
-
-### Qwen 3.6 35B-A3B MQ4R performance
-
-Ordinary autoregressive decode with Q8 KV. No MTP, DFlash, speculative
-acceptance, reduced-output benchmark, or manual clock pinning.
-
-| GPU | Architecture | TG128 AR | 8-turn average | Final-turn context | Final-turn speed | Health |
-|---|---:|---:|---:|---:|---:|---|
-| Radeon RX 7900 XTX | gfx1100 | **253.3 tok/s** | **191.0 tok/s** | 18.2K | **160.3 tok/s** | 8/8 clean |
-| Radeon 8060S / Strix Halo | gfx1151 | **115.1 tok/s** | **92.2 tok/s** | 21.3K | **82.5 tok/s** | 8/8 clean |
-| Radeon AI PRO R9700 | gfx1201 | **203.9 tok/s** | **169.5 tok/s** | 22.2K | **146.7 tok/s** | 8/8 clean; both recall probes 3/3 |
-
-Short-context measured ranges:
-
-| Architecture | Minimum | Median | Maximum |
-|---|---:|---:|---:|
-| gfx1100 | 253.04 | **253.31** | 253.48 tok/s |
-| gfx1151 | 115.02 | **115.10** | 115.18 tok/s |
-| gfx1201 | 203.42 | **203.93** | 204.04 tok/s |
-
-The eight-turn column is the mean decode speed across the user-facing
-multi-turn serving run. Final-turn context is reported explicitly because
-the three recorded sessions did not all terminate at exactly 22K.
-
-The gfx1201 campaign raised ordinary MQ4R autoregressive decode from
-approximately 110 tok/s to 203.9 tok/s. See the
-[gfx1201 campaign report](docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md),
-the [Redline integration boundary](crates/redline-dispatch/HIPFIRE-GRAFT.md),
-and the canonical [Redline contributor guide](docs/REDLINE.md).
-
-## Curated model registry
-
-The registry currently contains 54 pullable model entries. Run
-`hipfire list -r` to see the authoritative live list.
-
-| Registry family | Pull tags and variants |
-|---|---|
-| Qwen 3.5 dense | Primary: `qwen3.5:0.8b`, `qwen3.5:2b`, `qwen3.5:4b`, `qwen3.5:9b`, `qwen3.5:27b`; MQ3: `qwen3.5:2b-mq3`, `qwen3.5:4b-mq3`, `qwen3.5:9b-mq3`, `qwen3.5:27b-mq3`; MQ6: `qwen3.5:0.8b-mq6`, `qwen3.5:2b-mq6`, `qwen3.5:4b-mq6`, `qwen3.5:9b-mq6`, `qwen3.5:27b-mq6`; legacy HF6: `qwen3.5:2b-hf6`; drafts: `qwen3.5:9b-draft`, `qwen3.5:27b-draft`, `qwen3.5:27b-draft-mq3` |
-| Qwen 3.5 MoE | `qwen3.5:35b-a3b` |
-| Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
-| Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
-| DeepSeek V4 Flash | `deepseek-v4-flash` |
-| MiniMax-M2.7 | `minimax-m2.7` |
-| North-Mini-Code-1.0 | `north-mini-code` |
-| Qwen3 standard attention | `qwen3:0.6b`, `qwen3:8b` |
-| Carnice tool-use | `carnice:9b`, `carnice:27b`, `carnice:9b-mq6`, `carnice:27b-mq6` |
-| Qwopus | `qwopus:4b`, `qwopus:9b`, `qwopus:27b`, `qwopus:4b-mq6`, `qwopus:9b-mq6`, `qwopus:27b-mq6`, `qwopus3.6:27b-coder` |
-| LFM2.5 | `lfm2.5:350m`, `lfm2.5:1.2b`, `lfm2.5:1.2b-thinking`, `lfm2.5:8b-a1b` |
-| NEX N2 Mini | `nex-n2:mini` |
-| VibeThinker-3B | `vibethinker:3b`, `vibethinker:3b-mq6` |
-
-Common aliases include `qwen3.5`, `qwen3.6`, `qwen3`, `carnice`,
-`qwopus`, `deepseek4`, `deepseek-v4`, and `vibethinker`.
-
-Carnice uses the Hermes tool-call format. Plain Qwen 3.5 and 3.6 use
-their native Qwen XML tool-call format.
-
-See [docs/MODELS.md](docs/MODELS.md) for sizes, minimum VRAM,
-recommended sampling settings, sidecars, artifact provenance, and
-bring-your-own-model flows through `hipfire quantize`.
-
-## GPU support
-
-| Family | Representative architectures | Notes |
-|---|---|---|
-| Vega/CDNA | `gfx906`, `gfx908`, `gfx940`-`gfx942` | Native wave64 HIP paths |
-| RDNA1 | `gfx1010`-`gfx1013` | Portable HIP paths; retained lowering is implementation capability, not automatic admission |
-| RDNA2 | `gfx1030`-`gfx1032` | Portable HIP paths; retained lowering is implementation capability, not automatic admission |
-| RDNA3 | `gfx1100`-`gfx1103` | Architecture-tuned kernels; retained-route certification remains workload-specific |
-| RDNA3.5 | `gfx1150`-`gfx1152` | Architecture-tuned kernels; retained-route certification remains workload-specific |
-| RDNA4 | `gfx1200`, `gfx1201` | WMMA paths; retained PM4 is product-default only for the narrow single-GPU A3B `.mq4r` route, while certification still requires the guide's route-proof ledger |
-
-Architecture-specific kernels are selected through typed dispatch tables.
-Unsupported specializations return to the correct portable or architecture
-fallback instead of being applied to neighboring GPU families.
-
-## Why
-
-AMD GPUs are capable inference devices, but tuning and runtime support vary
-widely across consumer, professional, APU, and datacenter products.
-
-hipfire supplies its own Rust runtime, model implementations, quantization
-formats, dispatch layer, and HIP kernels. ROCm is loaded dynamically; there
-is no Python, PyTorch, CUDA translation layer, or third-party inference
-engine in the hot path.
-
-A retained Redline route changes how an eligible forward is submitted; it does
-not replace the model implementation or make implementation capability proof
-of certification.
-
-## Performance snapshots
-
-### Historical — 7900 XTX (gfx1100)
-
-Historical decode snapshot measured with the then-default asym3 KV
-configuration (FlashAttention auto):
-
-| Model | hipfire decode | hipfire prefill (peak) | vs ollama Q4_K_M |
-|---|---:|---:|---:|
-| Qwen 3.5 0.8B | **391** | 7383 | **2.10×** decode |
-| Qwen 3.5 4B | **180** | 2487 | **1.78×** decode |
-| Qwen 3.5 9B | **132** | 1663 | **1.71×** decode |
-| Qwen 3.5 27B | **47** | 478 | — |
-
-Historical DFlash measurements using the legacy asym3 / max=120 method
-reached **218 tok/s peak on 27B HumanEval/53** (4.45× over AR) and
-**372 tok/s peak on 9B**. These numbers are retained for historical
-context; they are not current performance baselines. Current DFlash
-claims use q8 / max=256 with prompt and binary hashes recorded. See
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full per-genre table
-and methodology notice.
-
-### RDNA4 (gfx1201, Radeon AI PRO R9700)
-
-| Model | Config | Decode tok/s |
-|---|---|---:|
-| Qwen2 1.5B HFQ4 | single GPU | **266** |
-| DeepSeek V4 Flash (82 GB MQ2-Lloyd) | 4× R9700, `hipfire serve --tp 4` (EP) | **25.6** |
-| Gemma 4 12B MQ4 | single GPU (integration branch, pre-merge) | **~47** |
-
-CASK-based KV cache eviction lets you run long-context prompts without
-OOM: generate a sidecar with `hipfire sidecar-gen <model>` and enable
-eviction with `hipfire config cask-profile balanced`. See
-[CONFIG.md](docs/CONFIG.md) for details.
-
-## Install
+## Quickstart
 
 Linux with ROCm 6 or newer:
 
 ```bash
 curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+hipfire diag
+hipfire pull qwen3.5:4b
+hipfire run qwen3.5:4b "Explain FFT in one line"
 ```
 
-RDNA4 requires ROCm 6.4 or newer. gfx1151 requires ROCm 7.2 or newer.
+- RDNA4 (`gfx1200`/`gfx1201`): ROCm 6.4+
+- Strix Halo / `gfx115x` (`gfx1150`–`gfx1152`): ROCm 7.2+
+- Windows, source builds, verify steps: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
+- NixOS flake/module: [docs/NIXOS.md](docs/NIXOS.md)
+- Containers: [docs/CONTAINER.md](docs/CONTAINER.md)
 
-For Windows, source builds, and verifying the install:
-[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
+## Models (dynamic registry)
 
-## NixOS
-
-First-class support via Nix flake. See [docs/NIXOS.md](docs/NIXOS.md).
+The authoritative pull list is **live**, not this README:
 
 ```bash
-nix develop github:Kaden-Schutt/hipfire  # dev shell with Rust + ROCm + bun
-nix build github:Kaden-Schutt/hipfire    # build package
+hipfire list -r
 ```
 
-NixOS module:
+Registry presence is not runtime admission. Sizes, VRAM floors, sampling
+defaults, sidecars, provenance, and bring-your-own flows live in
+[docs/MODELS.md](docs/MODELS.md). Operator surface:
+[docs/CLI.md](docs/CLI.md), [docs/SERVE.md](docs/SERVE.md),
+[docs/CHAT.md](docs/CHAT.md), [docs/CONFIG.md](docs/CONFIG.md),
+[docs/env-vars.md](docs/env-vars.md).
 
-```nix
-{
-  inputs.hipfire.url = "github:Kaden-Schutt/hipfire";
-  # then in configuration.nix:
-  services.hipfire.enable = true;
-  services.hipfire.gpuTargets = [ "gfx1100" ];
-}
-```
+## GPU support
 
-## Container (podman/docker)
+hipfire targets AMD RDNA/CDNA GPUs with HIP/ROCm-direct kernels and typed
+dispatch. Representative families include Vega/CDNA, RDNA1–RDNA4 (including
+`gfx115x` and `gfx1200`/`gfx1201`). Capability on a chip is not blanket route
+certification.
 
-A multi-stage `Containerfile` builds a slim deliverable inference image and a
-full-toolchain GPU gate-runner for reproducible PR/dev-build validation. See
-[docs/CONTAINER.md](docs/CONTAINER.md).
+Architecture-specific kernels are selected through typed dispatch tables. A
+portable path is used **only when one exists** for that specialization;
+unsupported combinations fail closed (`UnsupportedVariant` / no silent
+fallback). Install and host prerequisites:
+[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md). Multi-GPU ops:
+[docs/multi-gpu.md](docs/multi-gpu.md). Retained-replay admission:
+[docs/REDLINE.md](docs/REDLINE.md).
 
-```bash
-podman build -f Containerfile --target runtime -t hipfire .
-podman run --rm -it --device /dev/kfd --device /dev/dri \
-  --group-add keep-groups --security-opt seccomp=unconfined \
-  -v hipfire-models:/root/.hipfire/models \
-  -v hipfire-kcache:/var/cache/hipfire \
-  hipfire run qwen3.5:4b "2+2="
-```
+## MQ4R and Redline (next release)
 
-## Inspiration: Lucebox
+**MQ4R** is the performance-oriented Qwen 3.6 35B-A3B SKU (uniform MQ4
+attention/gate-side weights, graded routed experts, fused gate path).
+Pull via the live registry (`hipfire list -r`); VRAM and sampling live
+in [docs/MODELS.md](docs/MODELS.md). Prefer MQ4P / MFP4 / MQ5 / MQ6 when
+quality matters more than maximum decode speed.
 
-hipfire's DFlash work was substantially shaped by Davide Ciffa's
-[Lucebox DFlash on ggml](https://www.lucebox.com/blog/dflash27b) — a
-standalone C++/ggml/CUDA DFlash for Qwen 3.5-27B on a single RTX 3090.
-Different stack, different vendor — but Lucebox's blog gave us
-concrete published numbers to target, n_gen-aware bench methodology,
-and pointers at where the fat is. Cached snapshot at
-`.research-cache/lucebox-dflash27b.html` for forensic reproducibility.
+**Redline** is hipfire's in-tree dispatch and retained-replay substrate.
+It records the kernel graph, derives resource dependencies, retains
+invariant command state, and lowers validated paths through public ROCr
+queue interfaces. Implementation capability across RDNA is **not** the
+same as automatic product admission or timed-arm route proof. Normative
+certification and evidence policy:
+[docs/REDLINE.md](docs/REDLINE.md). Integration boundary:
+[crates/redline-dispatch/HIPFIRE-GRAFT.md](crates/redline-dispatch/HIPFIRE-GRAFT.md).
 
-## Inspiration: gfx906 (MI50/MI60) optimizations
+## Performance (historical / measured)
 
-hipfire's gfx906 prefill MMQ kernel and AR-decode optimizations were
-shaped by two community forks of `llama.cpp` that target Vega 20:
+Published tables and campaign checkpoints are **dated measurements**, not
+live floors, defaults, or admissions:
 
-- **[iacopPBK/llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906)**
-  — the original fork that ported and tuned gfx906-specific code paths
-  (warp-cooperative GEMV via half-wave split, Y-tile prefetch via
-  inline-asm `global_load_dword`, `__builtin_amdgcn_readfirstlane`-based
-  SGPR hoisting, separate HBM-load → register-cache → LDS-store
-  pipelining in the MMQ body). The "2602.01 version" commit
-  `eec153c086df6a9e7a69499bea3639597c085fff` was the canonical reference
-  we audited against.
-- **[skyne98/llama.cpp-gfx906](https://github.com/skyne98/llama.cpp-gfx906)**
-  — fork-of-fork that propagates iacop's optimizations (commit
-  `42c298c` "port iacop optimizations") and tracks upstream more
-  aggressively. The accompanying
-  [skyne98/wiki-gfx906](https://skyne98.github.io/wiki-gfx906/intro.html)
-  is the best public reference for gfx906 ISA quirks (LDS bank-conflict
-  patterns at stride 32, dp4a issue-rate ceiling, Q8_1 activation
-  layout) — we used it as a sanity-check for several PMC-driven
-  redesign decisions.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — historical snapshots (incomplete evidence manifests)
+- [docs/perf-checkpoints/](docs/perf-checkpoints/) — immutable dated campaigns
+  (e.g. gfx1201 MQ4R campaign report)
+- How to measure correctly:
+  [docs/methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md)
 
-And of course an extra shout-out to `ggml-org/llama.cpp` itself: the
-templated `mmq_x` body in `mul_mat_q.cu` was the architectural scaffold
-we ported to gfx906 (templated mmq_x ladder, per-thread accumulator
-layout, MMQ_TILE_NE_K=32 sub-block factoring, Q8_1 quantize math). The
-inner loop is gfx906-specific; the outer shape is descendant.
+Do not treat README snippets, registry tags, or harness exits as route
+admission. Admissions are machine-recorded only in
+[docs/admissions.yml](docs/admissions.yml) (fail closed when empty).
 
-A standalone gfx906 perf investigation log is at
-[`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`](docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md);
-the prefill MMQ redesign log is at
-[`docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md`](docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
+## Why
+
+AMD GPUs are capable inference devices, but tuning and runtime support
+vary across consumer, professional, APU, and datacenter products.
+
+hipfire supplies its own Rust runtime, model implementations, quantization
+formats, dispatch layer, and HIP kernels. ROCm is loaded dynamically;
+there is no Python, PyTorch, CUDA translation layer, or third-party
+inference engine in the hot path.
+
+A retained Redline route changes how an eligible forward is submitted; it
+does not replace the model implementation or turn capability into
+certification.
 
 ## Documentation
 
+Navigation, lifecycle labels, and ownership map (start here):
+
+**[docs/INDEX.md](docs/INDEX.md)**
+
 | Page | Topic |
 |---|---|
-| [GETTING_STARTED.md](docs/GETTING_STARTED.md) | Install, first run, what to read next |
-| [NIXOS.md](docs/NIXOS.md) | NixOS flake, module, dev shell |
-| [CLI.md](docs/CLI.md) | Every subcommand, flags, file locations |
-| [MODELS.md](docs/MODELS.md) | Curated tags, BYO models, file extensions |
-| [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
-| [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
-| [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
-| [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
-| [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
-| [CONTAINER.md](docs/CONTAINER.md) | Runtime and GPU gate-runner containers |
-| [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
-| [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |
-| [REDLINE.md](docs/REDLINE.md) | Canonical retained AQL/PM4 contributor procedure and evidence policy |
-| [HIPFIRE-GRAFT.md](crates/redline-dispatch/HIPFIRE-GRAFT.md) | Redline integration and enablement boundary |
+| [GETTING_STARTED.md](docs/GETTING_STARTED.md) | Install, first run |
+| [CLI.md](docs/CLI.md) | Subcommands and flags |
+| [MODELS.md](docs/MODELS.md) | Registry, BYO, sidecars |
+| [SERVE.md](docs/SERVE.md) / [CHAT.md](docs/CHAT.md) | HTTP API and chat UX |
+| [CONFIG.md](docs/CONFIG.md) / [env-vars.md](docs/env-vars.md) | Config and environment |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, request lifecycle |
+| [QUANTIZATION.md](docs/QUANTIZATION.md) / [QUANTIZE.md](docs/QUANTIZE.md) | Formats and `hipfire quantize` |
+| [VALIDATION.md](docs/VALIDATION.md) | Claim → validation route selector |
+| [REDLINE.md](docs/REDLINE.md) | Retained-replay certification |
+| [methodology/](docs/methodology/) | Perf, arch-port, Kernel Atlas protocols |
+| [BENCHMARKS.md](docs/BENCHMARKS.md) | Historical bench tables |
+
+Executable agent skills root: [`.agents/skills/`](.agents/skills/)
+(`docs/skills/` is retired/removed — not a second root).
+
+## Inspiration
+
+hipfire's DFlash work was substantially shaped by Davide Ciffa's
+[Lucebox DFlash on ggml](https://www.lucebox.com/blog/dflash27b).
+Cached snapshot: `.research-cache/lucebox-dflash27b.html`.
+
+gfx906 prefill MMQ and AR-decode optimizations were shaped by community
+`llama.cpp` forks targeting Vega 20:
+
+- [iacopPBK/llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906)
+- [skyne98/llama.cpp-gfx906](https://github.com/skyne98/llama.cpp-gfx906)
+  and [skyne98/wiki-gfx906](https://skyne98.github.io/wiki-gfx906/intro.html)
+
+plus the templated MMQ scaffold in `ggml-org/llama.cpp`. Investigation
+logs: [docs/perf-checkpoints/](docs/perf-checkpoints/).
 
 ## License
 
 hipfire is dual-licensed under MIT or Apache-2.0 at your option. See
-[LICENSE](LICENSE) (dual-license pointer), [LICENSE-MIT](LICENSE-MIT),
-[LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE) for details.
+[LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE).
 
 New contributions default to Apache-2.0 via DCO sign-off; existing
-contributors' MIT-licensed contributions remain MIT unless they opt
-in. Each source file carries an `SPDX-License-Identifier` reflecting
-actual authorship (MIT, Apache-2.0, or `MIT OR Apache-2.0`). See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the contributor side and
-[docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md)
-for the decision record (including the 2026-05-19 course correction
-from a unilateral Apache-2.0 relicense to dual licensing).
+contributors' MIT-licensed contributions remain MIT unless they opt in.
+Per-file `SPDX-License-Identifier` reflects actual authorship. Contributor
+procedure: [CONTRIBUTING.md](CONTRIBUTING.md). Decision record:
+[docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md).
 
-Original architectural innovations originating in hipfire are
-catalogued in [PRIOR-ART.md](PRIOR-ART.md); derivative works
-(including reimplementations informed by hipfire's design) should
-attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
+Original architectural innovations are catalogued in
+[PRIOR-ART.md](PRIOR-ART.md); derivative works (including reimplementations
+informed by hipfire's design) should attribute the corresponding inventions
+per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
-`./scripts/no-gpu-ci.sh`; it does not replace the hardware gates. Any
-change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-or the spec-decode path must pass `./scripts/coherence-gate-dflash.sh`
-before commit. That is the canonical correctness gate; architecture-specific
-work must also pass its channel test, anti-bleed checks, and relevant speed
-gate. Don't bypass the gates with `--no-verify` — see
-[methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).
+`./scripts/no-gpu-ci.sh` — it is not a substitute for GPU/model evidence.
+Pick validation routes from [docs/VALIDATION.md](docs/VALIDATION.md).
+Do not treat retired `scripts/coherence-gate-*.sh` batteries as current
+acceptance. Don't bypass hooks with `--no-verify`. Perf claims follow
+[docs/methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).
