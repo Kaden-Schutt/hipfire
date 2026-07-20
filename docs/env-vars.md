@@ -110,9 +110,11 @@ Values and defaults below match `cli/index.ts` and/or `RuntimeConfig` as of the 
 | `HIPFIRE_LFM2_PREFILL_BATCH` | **opt-in**; require `=1` | **Branch-only; not shipped** as a generic product default. Audited wording: **350M dense MQ4** cohort + **gfx1201** + this flag at `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e` (absent from `origin/beta@9ffb18da…`). Does **not** admit Q8/other cohorts/default-on. |
 | `HIPFIRE_LFM2_PREFILL_MAX_BATCH` | default 256, cap 512 | Chunk size for batched path |
 | `HIPFIRE_LFM2_GRAPH` | LFM graph experiments | Source in LFM crate/daemon |
+| `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` | default on for eligible fixture; `=0` opts out | Request bit for exact gfx1201 350M dense-MQ4 decode fusion. **Unset or `=1`** requests fusion; **`=0`** (or any other set value) disables the request. Actual enablement still requires verified fixture evidence, gfx1201, graph off, and lowered forward (`lfm2_decode_fusion_enabled`). Listed opt-out of the admitted retained-PM4 product default in [`admissions.yml`](admissions.yml). |
+| `HIPFIRE_FORWARD_LOWERED` | default on (LFM and several other arches); `=0` opts out | Shared lowered forward escape hatch. For LFM: **unset or any value other than `0`** keeps the lowered path; **`=0`** forces the legacy hand loop. Lowered-on is required for exact decode fusion and retained-route eligibility. Listed opt-out of the admitted retained-PM4 product default in [`admissions.yml`](admissions.yml). |
 | Other `HIPFIRE_LFM*` | diag/trace | Inventory |
 
-Eager LFM prefill remains available when the batch flag is off **or** the GPU is not gfx1201. On gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`, selection is GPU+flag only with **no post-selection fallback** — unsupported cohorts fail closed at the **runtime fixture validation/guard** (exact 350M dense MQ4 fixture only). Source symbol `validate_350m_mq4_admission` is a fixture-shape check only; its name does **not** create a product admission — [`admissions.yml`](admissions.yml) remains the sole authority and has `records: []`.
+Eager LFM prefill remains available when the batch flag is off **or** the GPU is not gfx1201. On gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`, selection is GPU+flag only with **no post-selection fallback** — unsupported cohorts fail closed at the **runtime fixture validation/guard** (exact 350M dense MQ4 fixture only). Source symbol `validate_350m_mq4_admission` is a fixture-shape check only; its name does **not** create a product admission — [`admissions.yml`](admissions.yml) remains the sole authority (schema v2; exactly one earned retained-PM4 product row).
 
 ### CASK / serve / multi-GPU
 
@@ -131,11 +133,11 @@ Eager LFM prefill remains available when the batch flag is off **or** the GPU is
 
 ### Redline / retained replay
 
-Policy owner: [`REDLINE.md`](REDLINE.md) (**branch-implemented** vs comparison base). Timing is not route-certified without same-report timed-arm proof.
+Policy owner: [`REDLINE.md`](REDLINE.md) (**branch-implemented** vs comparison base). Timing is not route-certified without same-report timed-arm proof. Registry admission is not canonical certification.
 
 | Variable | Notes |
 |---|---|
-| `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`; unset may select `auto` only for narrow gfx12+arch_id6+`.mq4r`+pp=tp=1 predicate (`gfx12_mq4r_redline_default`) |
+| `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`. Unset may select `auto` from **either** automatic product default: (1) Qwen `gfx12_mq4r_redline_default` — gfx12 + `arch_id==6` + `.mq4r` + pp=tp=1 (path/extension); or (2) exact LFM `lfm2_gfx1201_redline_default` — gfx1201 + `arch_id==11` + verified post-load `retained_fixture_evidence` + `max_seq==2048` + plain AR + pp=tp=1 (never path/extension). `=hip` is an explicit opt-out of the admitted LFM retained-PM4 default. Mismatch vs the sealed LFM row fails closed. |
 | `HIPFIRE_REPLAY_TRANSPORT` | `pm4` / AQL family |
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
@@ -965,6 +967,6 @@ When adding a user-facing knob:
 1. Prefer a `HipfireConfig` key + validation in `cli/index.ts` ([`CONFIG.md`](CONFIG.md)).
 2. Add the env name to product docs only if operators must set it outside config.
 3. Re-scan so the generated inventory stays complete.
-4. Do not document planned LFM default-on or multi-cohort admissions here.
+4. Do not document unearned or widened LFM defaults here (multi-cohort, path/extension selection, or generic default-on beyond the exact sealed [`admissions.yml`](admissions.yml) row). The earned exact LFM retained-PM4 default and its three opt-outs may be documented; planned broader admissions may not.
 
 **Last inventory generation:** 2026-07-19.

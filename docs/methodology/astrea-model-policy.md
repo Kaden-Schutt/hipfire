@@ -102,7 +102,7 @@ ParoQuant should be treated as a high-priority **transform experiment lane**,
 not a reason to invent runtime contracts. The first implementation target is
 evidence: show whether Paro-style transforms improve MQ/HFQ/HFP/MFP quality
 enough to justify new producer-consumer runtime contracts — still subject to
-VALIDATION and empty-fail-closed [`admissions.yml`](../admissions.yml).
+VALIDATION and fail-closed [`admissions.yml`](../admissions.yml) (schema v2; no inferred rows).
 
 ## Related
 

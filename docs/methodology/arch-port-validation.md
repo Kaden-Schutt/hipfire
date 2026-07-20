@@ -225,7 +225,7 @@ via MQ4→MQ6 sweep — **measured** on that campaign, not a live floor.
 | Atlas / bench tok/s as admission or certification | **Rejected** |
 | Claiming an unwitnessed WMMA/MFMA path “works” | **Blocked** |
 | Universal “three gates green = ship” ritual including coherence | **Rejected** — use VALIDATION tiers only |
-| Inferred [`admissions.yml`](../admissions.yml) row | **Rejected** under schema v1 |
+| Inferred [`admissions.yml`](../admissions.yml) row | **Rejected** under schema v2 (no wildcards; exact earned rows only) |
 
 ---
 

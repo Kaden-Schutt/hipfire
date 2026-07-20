@@ -181,4 +181,4 @@ bisect when their policy applies.
 | `docs/BENCHMARKS.md` / `perf-checkpoints/` | Human-facing measured/historical tables |
 
 No suite exit code admits a model route. Admissions stay in
-[`docs/admissions.yml`](../admissions.yml) (fail closed when empty).
+[`docs/admissions.yml`](../admissions.yml) (schema v2; fail closed outside the exact earned row).

@@ -1,4 +1,71 @@
-{
-  "schema_version": 1,
-  "records": []
-}
+# Machine admission registry (sole product-admission owner).
+# Runtime capability ≠ registry admission ≠ Redline certification.
+# No wildcards. No inferred rows. Mismatch fail-closed.
+#
+# Runtime automatic selection MUST be post-load from retained_fixture_evidence()
+# and MUST match this row's loaded fixture evidence; never path or extension
+# inference. On any mismatch, fail closed.
+schema_version: 2
+policy:
+  inferred_rows: forbidden
+  wildcards: forbidden
+  runtime_default_selection: post_load_retained_fixture_evidence
+  mismatch: fail_closed
+  certification_note: >
+    Registry admission is not canonical Redline certification. Screen numbers
+    bound to a record remain product-route evidence only unless a separate
+    certification ladder disposition says otherwise.
+records:
+  - id: lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar
+    status: admitted_product_route
+    artifact:
+      # MD5 is identity only; the admitted object is the same immutable sealed
+      # snapshot bytes (exact length below), not a path or filename.
+      byte_size: 229474032
+      md5: cb5284b8ad5c6f9e4ca859c0aff0bcd0
+      md5_role: identity_only
+      identity: same immutable sealed snapshot bytes
+    arch_id: 11
+    gpu: gfx1201
+    weight_quant: MQ4
+    kv_cache: Q8
+    max_seq: 2048
+    decode_mode: plain_AR
+    pp: 1
+    tp: 1
+    transport: PM4
+    retained_plan:
+      dispatches: 161
+      kernels: 15
+      sequence_hash: "04305cf1254244f6"
+    # Explicit runtime knobs that opt out of the admitted retained-PM4 product
+    # default (lowered + fusion + PM4). These are real env overrides, not
+    # exclusion booleans.
+    explicit_opt_outs:
+      - HIPFIRE_REPLAY_BACKEND=hip
+      - HIPFIRE_LFM2_GFX1201_DECODE_FUSION=0
+      - HIPFIRE_FORWARD_LOWERED=0
+    # Scope outside this exact row remains unadmitted (not user opt-out knobs).
+    excluded_scope:
+      gpus:
+        - gfx1200
+      any_field_mismatch: true
+      note: >
+        gfx1200 and every mismatch remain unadmitted; this row does not
+        generalize beyond the sealed fixture evidence match.
+    product_screen:
+      artifact: .redline-work/lfm-product-pm4-sealed-final.json
+      ordinary_hip_tok_s: 807.772834
+      retained_pm4_tok_s: 1023.616692
+      ratio: 1.267208612
+      # Positive route proof only; relaxed stationarity — not canonical certification.
+      canonical_certification: false
+      caveat: >
+        prior screen used relaxed stationarity and is not canonical certification
+    runtime_defaults:
+      must_match_loaded_fixture_evidence: true
+      fail_closed_on_mismatch: true
+      selection: retained_fixture_evidence_post_load
+      forbidden_selection:
+        - path_inference
+        - extension_inference

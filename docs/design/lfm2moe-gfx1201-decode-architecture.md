@@ -21,13 +21,13 @@ The optimized runtime route requires every condition:
 - RoPE theta 1,000,000, RMS epsilon 1e-5, convolution kernel size 3.
 - Mixer sequence is `CCACCACCACACACAC`.
 - Dense projections are MQ4G256 with 136 bytes per 256-weight group.
-- Embedding and tied lm_head are Q8; KV cache is Q8.
+- Embedding and tied lm_head are Q8; retained admission requires a Q8 KV cache with `max_seq == physical_cap == 2048`.
 - Every conv in-projection, attention Q/K/V projection, and dense gate/up projection has `awq_scale.is_none()`.
 - Both LFM loaders recorded source-level absence of every canonical `<weight-stem>.awq_scale.weight` tensor used by those projections. A malformed or unused sidecar still rejects fusion.
-- `HIPFIRE_LFM2_DECODE_FUSION=1`; unset, `0`, or any other value selects ordinary decode.
+- `HIPFIRE_LFM2_GFX1201_DECODE_FUSION=1`; unset, `0`, or any other value selects ordinary decode.
 - The lowered path is active and graph capture is off.
 
-The reportable fixture must additionally have model md5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`. The arch-local weights do not expose a file digest, so md5 is an external benchmark identity, not a runtime predicate. Runtime isolation comes from the exact shape, topology, dtype, sidecar-provenance, architecture, and opt-in conjunction above.
+The frozen runtime artifact identity is the 229,474,032-byte base HFQ with md5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`. On Linux, the trusted HFQ loader rejects overlays, copies exactly that length from its already-open file into an anonymous memfd while digesting the same stream, applies and verifies immutable seals, and reparses/rebinds every later HFQ read to the sealed snapshot before combining the opaque identity token with structural validation. Short source/tensor reads fail and non-Linux targets mint no retained provenance. A length or digest mismatch, a directory source, or any REAP overlay selects ordinary decode. MD5 identifies this frozen fixture; it is not treated as a cryptographic authorization primitive.
 
 Sidecar provenance is LFM-local metadata populated by both the HFQ and generic `ModelSource` loaders using the quantizer's canonical naming rule. This does not load or apply dense AWQ scales and does not change ordinary decode. If any participating sidecar exists, fusion is refused and the existing decode path handles the model unchanged.
 
