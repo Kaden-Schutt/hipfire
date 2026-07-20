@@ -44,6 +44,7 @@ kernels/compiled/
 .env
 .env.*
 docs/superpowers/
+.superpowers/
 .worktrees/
 .dflash-reference/
 .dflash-ref-hf/
