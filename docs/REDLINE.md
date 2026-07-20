@@ -629,11 +629,17 @@ Exact scope: **LFM2.5-350M dense MQ4** on **gfx1201**, candidate path with
 explicit `HIPFIRE_LFM2_DECODE_FUSION=1`, ordinary serial HIP only (no AQL/PM4/
 HipGraph product route). **Rejected / not shipped.**
 
+LFM was never **admitted** to a retained route: no Redline admission predicate
+covers `arch_id==11`. This is therefore not an admitted-then-rejected Redline
+candidate — it is a serial-HIP fusion experiment that never entered Redline,
+upstream of the missing recorder/PM4/shadow work below.
+
 | Field | Evidence |
 |---|---|
 | Intent | Reduce LFM2.5-350M dense MQ4 gfx1201 serial-HIP decode launches by fusing RMSNorm plus MQ rotation activation preparation |
 | Baseline route | Serial HIP lowered decode, `HIPFIRE_LFM2_DECODE_FUSION=0`, graph off, Q8 KV |
 | Candidate route | Same serial-HIP path with `HIPFIRE_LFM2_DECODE_FUSION=1`; **not** Redline, AQL, or PM4 |
+| Retained-route admission | **None — never admitted.** Automatic Redline admission (`gfx12_mq4r_redline_default`) requires `arch_id==6`; LFM is `arch_id==11` and is excluded. `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` bypasses admission and installs no plan. The sole arch-11 predicate, `plan_lfm_decode_fusion`, gates serial-HIP decode **fusion**, not a retained route. |
 | Source identity | Baseline `lfm-redline` @ `e8831ae8347f04ac821077ee159c86423b4bf88a`, daemon MD5 `9ee43d2673866775786d8075fb5b6e76`; candidate `feat/lfm-gfx1201-mq4-decode-fusion` @ `518c221756a1065a7560449165bc8817c2ad6176`, daemon MD5 `07d62bbd915416b07ce7783969126dd7` |
 | Fixture | `lfm2.5-350m.mq4` (dense) MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`; prompt fixture MD5 `18cb45e00d424bef16fa9b097d02caf3`; gfx1201; HIP/ROCm 7.2; dated 2026-07-19 |
 | Correctness | Frozen twelve-step decode parity exact; Stage A negatives (default/eager-prefill/spec/graph/capture) did not admit; serve content equality passed |
@@ -641,7 +647,7 @@ HipGraph product route). **Rejected / not shipped.**
 | Fresh-process ABBA | Pooled tg128 medians +2.11%; tg512 +1.04% — both missed predeclared ≥5% wall gates |
 | Route proof | Absent by design: no PM4 plan installed; harness stopped at Qwen-only shadow requirement |
 | Disposition | **Rejected** as standalone Stage A promotion. Classified as serial-HIP activation-preparation fusion, **not** Redline. Not shipped. |
-| Reusable lesson | Fewer launches are neither retained replay nor a wall-time win. No generic LFM Redline or product promotion is implied |
+| Reusable lesson | Fewer launches are neither retained replay nor a wall-time win. **LFM was never admitted to a Redline route** — "not Redline" is upstream of the absent PM4/shadow work: admission itself is unimplemented for `arch_id==11`. No generic LFM Redline or product promotion is implied. |
 
 **Local evidence pointers (session/workstation-local — not checked into this
 repo):**
