@@ -1,221 +1,265 @@
-# Kernel Atlas - Python-first architecture
+<!--
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) 2026 Kaden Schutt
+hipfire — see LICENSE and NOTICE in the project root.
+-->
 
-Kernel Atlas is hipfire's measurement corpus for kernel and runtime
-performance. Astrea is the matching corpus for quantization quality.
-The two tools should compose around a shared experiment key:
+# Kernel Atlas architecture
+
+How measurement emission, analysis, and experiment contracts fit together.
+Usage recipes live in [`kernel-atlas.md`](kernel-atlas.md). This page is
+layer ownership and status only.
+
+| Field | Value |
+|---|---|
+| Inventory date | 2026-07-19 |
+| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
+| On-disk schema | `hipfire.kernel_atlas.v0` |
+| Python CLI | [`scripts/kernel_atlas.py`](../../scripts/kernel_atlas.py) |
+| Rust crate | [`crates/hipfire-atlas/`](../../crates/hipfire-atlas/) |
+| Agent skill | [`.agents/skills/hipfire-kernel-atlas/`](../../.agents/skills/hipfire-kernel-atlas/) |
+| Quality corpus (sibling, planned join) | Astrea — see [`astrea-atlas-pareto-workflow.md`](astrea-atlas-pareto-workflow.md), [`astrea-model-policy.md`](astrea-model-policy.md). Not a current VALIDATION/INDEX owner. |
+
+Shared experiment identity when joining quality and runtime rows:
 
 ```text
 git_sha + model_hash + workload + quant_variant + runtime_variant
 ```
 
-Astrea answers "is this quant worth running?" Atlas answers "what did
-it cost or buy on the target hardware?"
+Astrea answers “is this quant worth running?” Atlas answers “what did it
+cost or buy on named hardware?” Neither file admits product defaults;
+admissions stay in [`docs/admissions.yml`](../admissions.yml) (fail closed).
+
+---
 
 ## Rust Atlas status
 
-`origin/master` currently contains `crates/hipfire-atlas`. Treat that
-crate and CLI as transitional and revert-bound. Do not expand the Rust
-Atlas port into the long-term user or agent surface.
+`crates/hipfire-atlas` is **present and transitional**. Its own
+`main.rs` / `lib.rs` mark the long-term user and agent surface as
+**Python-first**. Do not expand the Rust CLI as the primary Atlas UX.
 
-The useful concepts from the Rust crate should survive the revert:
+Keep in the Rust crate (useful concepts, already shipped as **independent
+transitional feature subsets** — not contract-compatible bridges to Python):
 
-- stable JSONL rows
-- task/eval bundles
-- schema validation
-- render/suggest commands
-- in-process bench emission when a Rust binary already owns the metric
+| Piece | Role |
+|---|---|
+| `schema::AtlasRow` + `ATLAS_SCHEMA` | Typed JSONL row; `append_to_jsonl` |
+| `parse` | Legacy stdout → typed rows (`parse-bench` / `parse-dflash`) for binaries not yet on `--emit-atlas` |
+| `render` / `suggest` / `task` / `eval` | Transitional subsets only: task JSON is not interoperable with Python; Rust `eval` lacks baseline/repeat/stability/ledger semantics; Rust `render` is not the Python ISA fit view |
+| `profile_report` | Attach internal profile / rocprof cross-check structs |
 
-The long-term Atlas tool should be Python-first because the dominant
-workflow is analysis: loading many rows, grouping by quant/runtime/arch,
-rendering Pareto tables, and rapidly changing ranking heuristics. Rust
-is still appropriate inside hipfire binaries when they emit metrics they
-already know, but the Atlas CLI, analyzer, agent workflow, and notebook
-surface should live in Python.
+Intended emission path for metrics a Rust binary already owns:
+`--emit-atlas <path>` (example:
+`crates/hipfire-runtime/examples/bench_qwen35_mq4.rs`). Prefer emit over
+stdout scrape for new work. Wiring is **shipped / ref-pinned** with
+**partial** binary coverage — do not assume every example emits.
+
+Analysis at scale, ISA inspection, dispatch provenance scans, collect
+orchestration, `graph-ab`, history-aware `suggest`, and agent workflows:
+**`scripts/kernel_atlas.py`**.
+
+---
 
 ## Layers
 
-### Layer 1 - Measurement emission
+### Layer 1 — Measurement emission
 
-Bench and inference binaries may emit Atlas JSONL directly through
-`--emit-atlas <path>`. The binary that owns a metric should write that
-metric rather than relying on a stdout parser. This is especially
-important for route information that is not visible from a summary line.
+Owners: bench / inference / demo binaries (and Python collectors that
+drive them).
 
-Required row fields for new measurements:
+| Mechanism | Status |
+|---|---|
+| `--emit-atlas <path.jsonl>` in-process | **shipped / ref-pinned** — partial binary coverage; wire remaining examples deliberately; do not assume every binary emits |
+| `kernel_atlas.py collect-ar` / `collect-dflash` | **shipped / ref-pinned** — scrape + enrich from live runs; success → `status: ok` observation rows; failure → `status: error` records |
+| `hipfire-atlas parse-bench` / `parse-dflash` | **shipped / ref-pinned** — offline stdout → typed JSONL row migration |
+| `kernel_atlas.py parse {bench,dflash}` | **shipped / ref-pinned** — metrics-only JSON extract (prints metrics; does **not** write Atlas rows) |
 
-- `schema`: `hipfire.kernel_atlas.v0`
-- `phase`: `prefill`, `decode_ar`, or `decode_dflash`
-- `workload_kind`: binary or workload class
-- `git_sha`, `hostname`, `arch`, `rocm_version`, `hipcc_version`
-- `model_path`, `model_hash`, `model_bytes`
-- `quant_variant`: flat MQ4, KMD2-lite, KMD2-full, etc.
-- `runtime_variant`: graph/KV/flash/config tuple
+Row contract (minimum for new **successful** `status: ok` **observations** —
+collector success proves collection, not INDEX **measured** eligibility):
 
-The row should also include enough run hygiene to keep small wins honest:
+| Field | Notes |
+|---|---|
+| `schema` | `hipfire.kernel_atlas.v0` |
+| `status` | `ok` for successful observations; collector failures use `error` and are non-observations |
+| `phase` | On `ok`: `prefill` \| `decode_ar` \| `decode_dflash`. Error records use provisional `ar` / `dflash` only |
+| `workload_kind` | Binary or workload class |
+| Identity | `git_sha`, host, `arch`, ROCm/hipcc when known |
+| Model | path; hash/bytes when `--hash-models` or emit provides them |
+| Quant / runtime labels | format + graph/KV/flash/config tuple as applicable |
 
-- `pass_index`
-- `discard_first_pass`
-- `warmup_tokens`
-- `gen_tokens`
-- `prefill_tokens`
-- `dpm_warmup_secs`
-- `binary_md5`
-- `prompt_md5` when a prompt is involved
+**Measured vs exploratory:** apply INDEX **measured** only when the row also
+carries the complete fixture, binary/model identity, and date manifest required
+by [`docs/INDEX.md`](../INDEX.md) and [`perf-benchmarking.md`](perf-benchmarking.md)
+(model hashing is optional on the collector — absence keeps the row
+**exploratory**). `status: ok` alone is never durable measured-state eligibility.
 
-### Layer 2 - Python Atlas CLI and analyzer
+Run hygiene (keep small wins honest):
 
-The Python Atlas surface owns orchestration and analysis:
+- `pass_index` / discard-first-pass policy when multi-pass
+- warmup / gen / prefill token counts
+- `dpm_warmup_secs` when used
+- `binary_md5`, dirty/diff md5
+- `prompt_md5` when a prompt file is involved
 
-- run bench matrices
-- discard pass 1 by default for JIT control
-- join candidate rows to baseline rows
-- render flat text tables for agents and humans
-- emit constrained tuning tasks
-- record eval results, diffs, correctness status, and lineage
+Optional artifacts on the same row:
 
-The graph/KV investigation added one hard requirement: Atlas must record
-the actual dispatch route, not just the requested environment.
+- `profile_kernels` (+ op attribution, rocprof coverage tags when present)
+- `isa` manifest path or inline objects
+- `dispatch` provenance path or inline entries
+- `runtime_route` from `build_route_manifest` (kv_mode, graph_enabled,
+  graph_blob_count, inferred attention_impl, warnings)
 
-Route manifest fields:
+Route fields are **observed or inferred evidence**. Missing fields stay
+unknown; do not invent flash/graph activity. Graph capture that changes
+attention implementation must be visible here before perf is trusted.
 
-- `kv_mode`: `q8`, `asym2`, `asym3`, `asym4`, etc.
-- `graph_enabled`
-- `graph_blob_count`
-- `attention_impl`: `q8_nonflash`, `q8_flash`, `asym2_flash`,
-  `asym3_flash`, `asym4_flash`, etc.
-- `flash_requested`: `never`, `auto`, or `always`
-- `flash_active`
-- `kernel_names`
-- `grid`, `block`, and `shared_mem` for hot kernels when available
-- `capture_safe`: true/false/unknown
+### Layer 2 — Python Atlas CLI and analyzer
 
-This would have surfaced the Q8 graph failure directly: capture was
-forcing Q8 flash attention at short context, and forced Q8 flash
-reproduced NaN logits even with graph disabled. Atlas should flag any
-case where graph capture changes the attention route.
+Owner: [`scripts/kernel_atlas.py`](../../scripts/kernel_atlas.py).
 
-### Layer 3 - Advisor
+Responsibilities:
 
-The advisor consumes the corpus and suggests bounded experiments:
+- Drive AR/DFlash matrices and write private JSONL under
+  `.codeinsight+research/kernel-atlas/`
+- Attach ISA manifests (HSACO/code-object inspect) and dispatch/source
+  scans
+- Join profile hot names to ISA symbols for fit view
+- Render agent-readable ASCII fit tables
+- Emit `suggest` queues and `task` / `task-pytorch` bundles
+- Run `eval` and `graph-ab`; append local ledgers
+- Annotate rocprof coverage / BLINDSPOT helpers (see
+  [`rocprof-coverage.md`](rocprof-coverage.md))
 
-- launch-bound retunes
-- K-unroll changes
-- graph capture enablement
-- flash/non-flash dispatch thresholds
-- KV policy choices
-- candidate vs baseline regressions
+ISA capability tables inside the script are **heuristic**. Unknown
+`arch` → no native-matrix claim. Full occupancy, clock, and cache
+models are **out of scope** (skill documents interpretation limits).
 
-Build this after the corpus has enough rows. Keep the first version as a
-Python ranker plus task emitter. Do not jump to autonomous mutation until
-`atlas task` and `atlas eval` contracts are boring and reliable.
+### Layer 3 — Advisor
 
-## Required Atlas eval modes
+Consumes the corpus to propose **bounded** experiments (launch-bound
+retunes, K-unroll, graph thresholds, flash cutovers, KV policy,
+baseline/candidate deltas).
+
+| Piece | Status |
+|---|---|
+| `suggest` ranker + history demotion | **shipped / ref-pinned** in Python (`pass` and `unstable` with speedup < 1.0 demote; unstable demotion ≠ rejection evidence) |
+| `task` / `eval` contracts | **shipped / ref-pinned** (Python primary; Rust subset not compatible) |
+| Autonomous mutation / closed-loop ship | **planned** — blocked until task/eval are boring and VALIDATION routes stay human-owned |
+
+Advisor output is an experiment queue, never a certification.
+
+---
+
+## Required eval modes (contracts)
 
 ### Graph A/B
 
-Atlas should provide a first-class graph comparison that runs:
+Implemented as `python3 scripts/kernel_atlas.py graph-ab` (and manual
+equivalent). Intent:
 
 ```text
-HIPFIRE_GRAPH=0 pass 1
-HIPFIRE_GRAPH=0 pass 2
-HIPFIRE_GRAPH=1 pass 1
-HIPFIRE_GRAPH=1 pass 2
+HIPFIRE_GRAPH=0  pass 1 (record, not headline)
+HIPFIRE_GRAPH=0  pass 2 (JIT-controlled)
+HIPFIRE_GRAPH=1  pass 1
+HIPFIRE_GRAPH=1  pass 2
 ```
 
-Pass 1 is recorded but not used for the headline. Pass 2 is the
-JIT-controlled row. The report must show:
+Report must surface graph-off/on tok/s, lift, latency deltas, prefill
+delta, **route changes**, and correctness status when a correctness
+command is supplied. That command must be a **current** VALIDATION
+route — not a retired coherence-gate battery presented as acceptance.
 
-- graph-off tok/s
-- graph-on tok/s
-- graph lift
-- p50/p99 delta
-- prefill delta
-- route changes between graph off and graph on
-- correctness status for graph-on
+### Baseline / candidate compare
 
-### Baseline/candidate compare
-
-Atlas should make "perf lost vs flat MQ4" automatic. A candidate report
-must accept a baseline row and print:
-
-- candidate tok/s delta
-- candidate p50/p99 delta
-- candidate prefill delta
-- candidate model-size delta
-- quality row link from Astrea
-- correctness/coherence status
-
-For example, the KMD2 investigation should be one Atlas comparison:
-
-```text
-baseline = flat MQ4 + q8conv1d
-candidate = full KMD2 + q8conv1d
-runtime matrix = q8/asym3 x graph off/on
-```
+`eval --refresh-baseline` / `--baseline baseline.json` makes “lost vs
+prior median” mechanical for a single task. Cross-quant Pareto with
+Astrea quality rows is the composition goal; incomplete joins stay
+labeled incomplete (`perf_only` when correctness evidence is missing).
 
 ### Correctness join
 
-A performance row without a correctness row is incomplete. Atlas should
-join to:
+A performance row without correctness evidence is **incomplete** for
+any ship/promote claim.
 
-- `coherence_probe`
-- `coherence-gate-dflash.sh` for DFlash claims
-- KLD/PPL/MSE rows from Astrea when the experiment changes quantization
+| Join target | Disposition |
+|---|---|
+| Path-specific parity / state oracle | **Current** when it exists for the surface |
+| `test_kernels` / channel | **Current** for kernel numeric claims |
+| Maintained serve / LFM / Redline harnesses | **Current** only for the semantics those harnesses own ([`VALIDATION.md`](../VALIDATION.md)) |
+| Astrea KLD/PPL/MSE rows | **planned / blocked** as a validation route — quality evidence only until INDEX/VALIDATION name Astrea as owner; compose manually via shared ids |
+| `scripts/coherence-gate-*.sh` | **Historical reproduction only** — not acceptance, not default `--correctness-command` |
 
-The report should mark rows as `perf_only` when correctness is missing.
+Mark or treat rows as `perf_only` when correctness is absent. Fail
+closed rather than implying a green gate.
+
+---
 
 ## Relationship to Astrea
 
-Astrea owns quality evidence:
+Astrea is the intended quality-evidence sibling (KLD vs reference, PPL,
+attribution, MSE, calibration method, promotion maps, bpw, oracle traces
+when available). It is **not** registered as a current owner in
+[`docs/INDEX.md`](../INDEX.md) or [`docs/VALIDATION.md`](../VALIDATION.md);
+under fail-closed rules the ownership/join stays **planned / blocked**
+until those owners name it. Treat Astrea outputs as quality evidence only
+— not a current validation route.
 
-- KLD vs BF16 reference
-- PPL
-- per-tensor and per-layer attribution
-- MSE and reconstruction stats
-- calibration method inputs: none, imatrix, AWQ, GPTQ, stacked methods
-- promotion maps and bpw
-- PyTorch oracle traces when available
+Handoff manifest fields (minimum **planned** intent for a candidate id;
+not a shipped Atlas schema field):
 
-Astrea hands candidates to Atlas only after producing a candidate
-manifest. Minimum manifest fields:
+`candidate_id`, `model_path`, `model_hash`, `source_model`,
+`quant_format`, `calibration_methods`, `promotion_map`, `bpw`,
+`size_bytes`, `kld_mean`, `ppl`, `mse_summary`, `reference_id`,
+`quality_artifacts`.
 
-- `candidate_id`
-- `model_path`
-- `model_hash`
-- `source_model`
-- `quant_format`
-- `calibration_methods`
-- `promotion_map`
-- `bpw`
-- `size_bytes`
-- `kld_mean`
-- `ppl`
-- `mse_summary`
-- `reference_id`
-- `quality_artifacts`
+Neither `scripts/kernel_atlas.py` nor `crates/hipfire-atlas` currently
+defines or accepts `candidate_id`. Runtime/quality join under a shared id
+is a **manual / planned** handoff contract — compose externally until
+first-class auto-join ships. Final human decision surface is a
+quality/performance Pareto table — still not an `admissions.yml` write.
 
-Atlas appends runtime rows under the same `candidate_id`. The final
-decision surface is a quality/performance Pareto table, not separate
-quality and speed reports.
+Workflow prose: [`astrea-atlas-pareto-workflow.md`](astrea-atlas-pareto-workflow.md).
+Policy: [`astrea-model-policy.md`](astrea-model-policy.md).
 
-## Migration plan
+---
+
+## Migration status (source-derived)
 
 | Step | Change | Status |
 |---|---|---|
-| 1 | Stop expanding `crates/hipfire-atlas`; mark it transitional/revert-bound | active |
-| 2 | Recreate the Atlas CLI surface in Python | TODO |
-| 3 | Port useful Rust CLI commands to Python: `read`, `head`, `render-fit`, `suggest`, `task`, `eval` | TODO |
-| 4 | Add route manifests and graph A/B to Python Atlas | TODO |
-| 5 | Add baseline/candidate comparison and correctness join | TODO |
-| 6 | Add Astrea candidate manifests and Atlas handoff rows | TODO |
-| 7 | Remove the Rust Atlas crate once Python has parity | TODO |
+| 1 | Treat `crates/hipfire-atlas` as transitional; do not grow as long-term UX | **shipped / ref-pinned** direction (crate docs state this; crate remains) |
+| 2 | Python CLI as primary analysis/collect surface | **shipped / ref-pinned** (`scripts/kernel_atlas.py`) |
+| 3 | Python parity for read-scale workflows + `render-fit` / `suggest` / `task` / `eval` | **shipped / ref-pinned** (Rust holds independent transitional subsets — not contract-compatible bridges) |
+| 4 | Route manifests + `graph-ab` | **shipped / ref-pinned** in Python (`build_route_manifest`, `graph-ab`) |
+| 5 | Baseline/candidate eval + correctness command hooks | **shipped / ref-pinned**; correctness **join policy** fail-closed per VALIDATION |
+| 6 | First-class Astrea candidate manifest auto-join in Atlas CLI | **planned** / incomplete — compose manually via shared ids until owned; no `candidate_id` field in Atlas today |
+| 7 | Remove Rust Atlas crate after full Python parity + emit coverage | **planned** — not done; crate remains |
 
-## Open follow-ups from gfx1100 KMD2 work
+Do not document step 7 as complete. Do not claim every bench emits
+Atlas natively.
 
-- Add route-manifest capture so graph cannot silently change attention
-  implementation.
-- Add graph A/B as a one-command Atlas eval.
-- Add pass-2/JIT-controlled headline reporting.
-- Add KMD2-vs-flat comparison as a built-in report.
-- Keep `asym3 + graph` and `q8 + graph` as the first runtime variants
-  to track for Qwen3.5 0.8B KMD2 on gfx1100.
+---
+
+## Explicit non-goals
+
+| Item | Disposition |
+|---|---|
+| Atlas as universal GPU gate | **Rejected** |
+| Coherence-gate batteries as Atlas default correctness | **Rejected** (retired acceptance) |
+| Fit view as occupancy or roofline certification | **Rejected** |
+| Capability claims for hardware-unwitnessed arches | **Blocked** |
+| Admissions from Atlas ledgers | **Rejected** |
+| Expanding Rust Atlas as the agent-facing product | **Rejected** direction |
+
+---
+
+## Related owners
+
+| Concern | Owner |
+|---|---|
+| How to run Atlas day-to-day | [`kernel-atlas.md`](kernel-atlas.md) |
+| Claim → validation route | [`docs/VALIDATION.md`](../VALIDATION.md) |
+| Arch-port evidence tiers | [`arch-port-validation.md`](arch-port-validation.md) |
+| Perf protocol | [`perf-benchmarking.md`](perf-benchmarking.md) |
+| rocprof vs internal timers | [`rocprof-coverage.md`](rocprof-coverage.md) |
+| Executable skill | `.agents/skills/hipfire-kernel-atlas/` |

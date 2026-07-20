@@ -1,50 +1,106 @@
 # Getting started
 
+Audience: first install on an AMD GPU host. Goal: install → verify → pull a model → run or chat.
+
+## Prerequisites
+
+- **Linux:** AMD GPU with `/dev/kfd`, HIP runtime (`libamdhip64.so`). RDNA4 (`gfx1200`/`gfx1201`) needs HIP/ROCm **6.4+**. Strix Halo / gfx115x needs **7.2+**.
+- **Windows:** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`).
+- **WSL2:** install AMD WSL GPU support first (`sudo amdgpu-install --usecase=wsl`), then use the Linux installer inside the distro.
+- Disk space for models under `~/.hipfire/models/` (a few GB for small tags; tens of GB for 27B+).
+
+Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list: [env-vars.md](env-vars.md).
+
 ## Install
 
-Linux with ROCm 6+ installed and an AMD RDNA GPU:
+### Linux (recommended) — pin, download, verify, execute
+
+Do **not** pipe a mutable branch URL into a shell. Pin a release tag or full
+commit, fetch the installer from that pin, inspect it, then run it against a
+checkout of the **same** pin (local mode). The installer script hard-codes
+`GITHUB_BRANCH=master` for remote clone mode, so a remote-only curl of a pinned
+script still installs the moving `master` tip unless you use a local checkout.
 
 ```bash
-curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+# Replace PIN with a release tag (e.g. v0.2.1) or full commit SHA.
+PIN=v0.2.1
+git clone --depth 1 --branch "$PIN" https://github.com/Kaden-Schutt/hipfire.git
+cd hipfire
+# Optional integrity check: record/compare sha256 of scripts/install.sh yourself.
+sha256sum scripts/install.sh
+# Inspect, then execute from the pinned tree (local mode wires CLI + PATH):
+less scripts/install.sh
+./scripts/install.sh
 ```
 
-The installer detects your GPU arch (`gfx1010` / `gfx1030` / `gfx1100` / etc.),
-fetches matching pre-compiled kernel blobs, drops the daemon and quantizer
-binaries into `~/.hipfire/bin/`, and adds a wrapper to `~/.local/bin/`. Make
-sure `~/.local/bin` is on your `PATH`.
+Download-only variant (still requires a same-pin checkout before execute if you
+want the installed tree pinned — do not `curl … | bash`):
 
-For Windows (native, with the AMD HIP SDK):
-
-```powershell
-irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
+```bash
+PIN=v0.2.1
+curl -fsSL "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/${PIN}/scripts/install.sh" \
+  -o /tmp/hipfire-install.sh
+sha256sum /tmp/hipfire-install.sh   # compare to a value you trust
+# Review the script, then either:
+#   (A) preferred — clone PIN and run ./scripts/install.sh from that tree, or
+#   (B) bash /tmp/hipfire-install.sh  # remote mode clones master tip (not PIN)
 ```
 
-The installer detects your AMD GPU via `Win32_VideoController`, downloads
-the prebuilt `daemon.exe` from the latest GitHub release, sets up the
-`bun`-based CLI, and runs `daemon.exe --precompile` to JIT-compile kernels
-for your arch into `~\.hipfire\bin\kernels\compiled\<arch>\`. This requires
-the [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
-to be installed (provides `hipcc.bat` + `amdhip64.dll`).
+> **Unverified moving tip:** `curl -L …/master/scripts/install.sh | bash` follows
+> the live `master` branch for both the script and the checkout it installs. Use
+> only for throwaway experiments; it is not the ref-pinned default.
 
-If hipcc is not available, kernels can still load from any prebuilt blobs
-in the repo. To force a fresh compile of the full kernel set:
+The installer detects GPU arch, ensures Bun + HIP, builds or copies the daemon into `~/.hipfire/bin/`, installs the Bun CLI under `~/.hipfire/cli/`, places kernels at `~/.hipfire/bin/kernels/compiled/<arch>/`, and installs a `hipfire` wrapper at `~/.hipfire/bin/hipfire` (it can offer to add `~/.hipfire/bin` to your `PATH`). Reload the shell if `hipfire` is not found.
+
+### Windows — pin, download, verify, execute
 
 ```powershell
+# Replace $Pin with a release tag (e.g. v0.2.1) or full commit SHA.
+$Pin = "v0.2.1"
+git clone --depth 1 --branch $Pin https://github.com/Kaden-Schutt/hipfire.git
+cd hipfire
+Get-FileHash .\scripts\install.ps1 -Algorithm SHA256   # record/compare yourself
+# Inspect, then run from the pinned tree (local mode):
+notepad .\scripts\install.ps1
+.\scripts\install.ps1
+```
+
+Download-only (do not `irm … | iex` for production). Remote mode in the script
+uses `$GithubBranch = "master"` for the checkout it installs:
+
+```powershell
+$Pin = "v0.2.1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/$Pin/scripts/install.ps1" `
+  -OutFile "$env:TEMP\hipfire-install.ps1"
+Get-FileHash "$env:TEMP\hipfire-install.ps1" -Algorithm SHA256
+# Review, then prefer running install.ps1 from a git clone of $Pin.
+```
+
+> **Unverified moving tip:** `irm …/master/scripts/install.ps1 | iex` is a
+> mutable master path for both script and installed tree — not the pinned default.
+
+Uses a GitHub release `daemon.exe` when available; otherwise builds from source under `~\.hipfire\src`. Sets up the Bun CLI and runs `daemon.exe --precompile` into `~\.hipfire\bin\kernels\compiled\<arch>\`. To force a full kernel compile after install:
+
+```powershell
+cd ~\.hipfire\src
 .\scripts\compile-kernels.ps1 gfx1100   # or your arch
+# script writes to the checkout's kernels\compiled\<arch>\ — copy into the install cache (or re-run install.ps1):
+Copy-Item .\kernels\compiled\<arch>\* $env:USERPROFILE\.hipfire\bin\kernels\compiled\<arch>\ -Force
 ```
 
-For WSL2 (Linux paths, `/dev/kfd` available): inside Ubuntu under WSL2
-run `sudo amdgpu-install --usecase=wsl` first, then the Linux installer
-above.
-
-For source builds:
+### Source checkout
 
 ```bash
 git clone https://github.com/Kaden-Schutt/hipfire
 cd hipfire
 cargo build --release --features deltanet --example daemon -p hipfire-runtime
 cargo build --release -p hipfire-quantize
+# optional TUI:
+cargo build --release -p hipfire-tui
+./scripts/install.sh   # from a checkout: local mode wires CLI + PATH
 ```
+
+Other packaging: [NIXOS.md](NIXOS.md), [CONTAINER.md](CONTAINER.md).
 
 ## Verify
 
@@ -52,79 +108,106 @@ cargo build --release -p hipfire-quantize
 hipfire diag
 ```
 
-Confirms ROCm version, HIP runtime, GPU arch, VRAM, and that the kernel
-blobs match. If anything is off it prints a targeted error rather than
-failing later at first inference.
+Reports GPU arch, VRAM, HIP/ROCm, kernel locations, model dir, and config overrides. Prefer this over guessing when a later command fails.
 
-## First run
+## First inference
 
 ```bash
-hipfire pull qwen3.5:4b                         # ~2.6 GB download
+hipfire pull qwen3.5:4b
 hipfire run  qwen3.5:4b "Explain FFT in one line"
 ```
 
-Cold start is 2–5 s while weights upload to VRAM and the kernel cache
-warms. After that decode is ~165 tok/s on a 7900 XTX.
+- `pull` downloads the registry artifact into `~/.hipfire/models/` (and published sidecars when the registry entry lists them).
+- `run` accepts a registry tag, alias, or path. **Recognized registry tags that are not local yet are auto-pulled** (can be multi-GB). Unresolved tags, aliases, or paths error with a `pull` / `list --remote` hint — they do not download.
+- Cold start loads weights and may JIT kernels; later calls are faster if a daemon is already up.
 
-## Background daemon
-
-For repeated calls or programmatic use, run the daemon in the background
-and hit it over HTTP:
+Interactive multi-turn:
 
 ```bash
-hipfire serve -d                                 # detaches, pre-warms default_model
-hipfire run qwen3.5:4b "..."                     # auto-routes through HTTP, skips cold-start
-hipfire stop                                     # graceful shutdown
+hipfire chat qwen3.5:4b
 ```
 
-The daemon speaks an OpenAI-compatible API on `localhost:11435`. See
-[SERVE.md](SERVE.md) for the HTTP surface.
+See [CHAT.md](CHAT.md).
 
-## Configure
+## Keep a daemon warm
 
 ```bash
-hipfire config                                   # interactive TUI for global keys
-hipfire config qwen3.5:9b                        # per-model overlay
+hipfire serve qwen3.5:4b -d    # background; OpenAI-compatible HTTP
+hipfire run qwen3.5:4b "..."   # reuses serve when healthy
+hipfire stop                   # graceful stop of the tracked daemon
 ```
 
-Common overrides: `temperature` (default 0.30), `kv_cache` (default
-`auto` → per-arch: `fwht3` on most arches, `fwht2` on tight-memory
-parts), `dflash_mode` (default `auto`). Full key list in
-[CONFIG.md](CONFIG.md).
+Defaults (overridable in config): bind **`0.0.0.0:11435`**, pre-warm **`default_model`** (`qwen3.5:9b` unless you set another). HTTP surface: [SERVE.md](SERVE.md). Subcommand flags: [CLI.md](CLI.md).
 
-## Long context: KV cache eviction
+> **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default `0.0.0.0` listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). For local-only use, bind loopback: `hipfire config set host 127.0.0.1` or `hipfire serve 127.0.0.1 11435`. Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
 
-For long-context prompts (16K+ tokens), CASK-based eviction prevents OOM by
-capping physical VRAM regardless of the advertised `max_seq`. For HuggingFace
-models pulled via `hipfire pull`, a sidecar is auto-attached — just enable
-eviction with:
+Force a one-shot daemon and skip HTTP:
 
 ```bash
-hipfire config cask-profile balanced   # or conservative / aggressive-vram
+HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."
 ```
 
-The daemon automatically discovers the shipped `.triattn.bin` beside the
-weights and sets `cask_sidecar` for you. No manual path needed.
-
-**Note:** eviction is disabled by default even when a sidecar exists —
-you must set a CASK profile (`balanced`, `conservative`, or `aggressive-vram`) to activate it.
-
-For custom or quantized models, generate the sidecar first:
+## Light configuration
 
 ```bash
-hipfire sidecar-gen ~/models/my-finetune.mq4 --corpus corpus.txt
-hipfire config cask-profile balanced
+hipfire config                 # global TUI → ~/.hipfire/config.json
+hipfire config qwen3.5:9b      # per-model overlay (catalog: ~/.hipfire/models.json)
+hipfire config set temperature 0.7
+hipfire config list
 ```
 
-See [CONFIG.md](CONFIG.md) for profiles, knobs, and safety constraints.
+Defaults that matter on day one (from CLI `CONFIG_DEFAULTS`; full table in [CONFIG.md](CONFIG.md)). **Sampling send path:** `run` / `serve` transmit only explicit request/CLI sampling values, per-model overlays, or registry `recommended_settings`; otherwise those fields are omitted for daemon/HFQ/arch fallback. Global `temperature` / `top_p` / `repeat_penalty` alone are **not** effective `run`/`serve` defaults. **Chat** is the exception — it uses a global config snapshot for the session ([CHAT.md](CHAT.md)).
+
+| Key | Default | Note |
+|---|---|---|
+| `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
+| `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
+| `kv_cache` | `auto` | Resolves via registry `default_kv_mode`, else `q8` |
+| `dflash_mode` | **`off`** | DFlash is opt-in; pulling a draft does not enable it |
+| `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
+| `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
+| `host` / `port` | `0.0.0.0` / `11435` | Serve bind (no auth, no TLS) |
+
+Enable draft-model speculation only when you intend to:
+
+```bash
+hipfire pull qwen3.5:9b
+hipfire pull qwen3.5:9b-draft
+hipfire config set dflash_mode auto    # or on / per-model
+```
+
+## Long context (optional)
+
+CASK/TriAttention eviction is **not** required for short prompts. When you need long context on limited VRAM:
+
+1. Prefer models whose `pull` ships a `.triattn.bin` sidecar, **or** generate one: `hipfire sidecar-gen <model>`.
+2. Pick a profile: `hipfire config cask-profile balanced` (or `conservative` / `aggressive-vram` / `off`).
+3. Read constraints (A3B, DFlash + m-fold) in [CONFIG.md](CONFIG.md) before enabling on MoE or with DFlash.
+
+## If something fails
+
+| Symptom | What to try |
+|---|---|
+| `hipfire: command not found` | Reload shell; ensure install dir is on `PATH` |
+| HIP / `/dev/kfd` / arch errors | `hipfire diag`; match ROCm/HIP version to arch (above) |
+| Model not found | `hipfire list` / `hipfire list -r`; `hipfire pull <tag>` |
+| Port in use / stale serve | `hipfire ps`; `hipfire stop --force`; check `~/.hipfire/serve.pid` and (detached only) `serve.log` |
+| Draft pulled but no speedup | Expected: `dflash_mode` defaults to **off** |
+| Truncated answers on thinking models | Raise `max_tokens` / `thinking_budget`; see [MODELS.md](MODELS.md) thinking section |
+
+```bash
+hipfire diag
+tail -f ~/.hipfire/serve.log
+```
 
 ## What to read next
 
-- [MODELS.md](MODELS.md) — supported model tags + how to bring your own
-  (HuggingFace, local safetensors, GGUF).
-- [CLI.md](CLI.md) — full subcommand reference.
-- [QUANTIZE.md](QUANTIZE.md) — quantize a finetune or a GGUF you already
-  have.
-- [BENCHMARKS.md](BENCHMARKS.md) — measured tok/s per arch.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — high-level engine design if you
-  want to contribute.
+| Doc | When |
+|---|---|
+| [CLI.md](CLI.md) | Every subcommand and flag surface |
+| [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
+| [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |
+| [MODELS.md](MODELS.md) | Tags, VRAM, BYO quantize, thinking/templates |
+| [CONFIG.md](CONFIG.md) | All config keys and CASK profiles |
+| [QUANTIZE.md](QUANTIZE.md) | `hipfire quantize` operator guide |
+| [INDEX.md](INDEX.md) | Ownership map for the rest of `docs/` |
