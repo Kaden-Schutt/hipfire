@@ -6,9 +6,10 @@
 **Canonical domain:** Documentation-governance cutover design, not operational runtime or validation policy  
 **Audited reference:** `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e`  
 **Comparison base:** `origin/beta@9ffb18da9d1377dfbf759db82641ea039b2e522e`  
-**Cutover target reference:** Unset until verification; MUST be one immutable full commit containing the candidate cutover  
+**Cutover candidate reference (`C`):** Unset until closeout; MUST be one immutable full commit containing every substantive cutover change
+**Attestation reference (`A`):** External Git/CI identity of the final direct child of `C`; tracked content MUST NOT attempt to name `A`
 **Last checked:** 2026-07-18  
-**Replacement:** Becomes `superseded` and non-operational when `docs/INDEX.md` and `docs/VALIDATION.md` assume their defined authority at the cutover target reference  
+**Replacement:** Becomes `superseded` and non-operational in `A`, after `docs/INDEX.md` and `docs/VALIDATION.md` assume their defined authority at `C`
 
 The audited branch is 24 commits ahead of the comparison base. Facts introduced only in that delta are branch facts, not shipped `origin/beta` facts. This document uses **MUST**, **MUST NOT**, **SHOULD**, and **MAY** normatively.
 
@@ -361,7 +362,7 @@ Forbidden wording includes “route-certified Redline timing,” “Redline caus
 - Canonical content is moved or consolidated, not copied. A former mirror becomes a link or is removed.
 - Executable skill content is consolidated under `.agents/skills/`; references are updated in the same cutover. No `.skills/` or `docs/skills/` compatibility execution root remains.
 - `AGENTS.md` and `CLAUDE.md` retain only hard repository rules that genuinely apply at that surface, provenance routing, and links to `docs/INDEX.md`, `docs/VALIDATION.md`, and `.agents/skills/`. They do not retain benchmark tables or validation playbooks.
-- Stale product facts are replaced by checked projections from the cutover target reference. Where no reliable projection exists, the claim is removed or marked blocked rather than guessed.
+- Stale product facts are replaced by checked projections from cutover candidate `C`. Where no reliable projection exists, the claim is removed or marked blocked rather than guessed.
 - Existing perf checkpoint files are preserved byte-for-byte. Corrections are added only as separate, newly dated amendment files that link to the unchanged originals. Migration does not aggregate or normalize their numbers.
 - Legacy plans and investigations are classified at the directory/index level. Their bodies are not rewritten merely to add modern terminology.
 - Branch-only LFM and Redline material carries full-ref labels until the integration target contains it. The labels are removed only after checking the new integration ref, not automatically when a branch merges.
@@ -384,7 +385,7 @@ Verification evaluates the documentation cutover itself. It does not certify the
 
 ### Structural verification
 
-- From a fresh checkout at the cutover target reference, every active page and anchor linked by README, CONTRIBUTING, AGENTS, CLAUDE, INDEX, and VALIDATION resolves.
+- From fresh detached checkouts of candidate `C` and attestation `A`, every active page and anchor linked by README, CONTRIBUTING, AGENTS, CLAUDE, INDEX, and VALIDATION resolves with identical substantive results.
 - `.agents/skills/` is the only tree containing executable skill definitions; no active link targets `.skills/`, and no executable skill remains under `docs/skills/`.
 - INDEX names exactly one canonical owner per concern and classifies all top-level documentation collections.
 - VALIDATION contains exactly one route-selection table and every listed executable path exists at the pinned ref.
@@ -392,11 +393,11 @@ Verification evaluates the documentation cutover itself. It does not certify the
 
 ### Fact verification
 
-- Regenerated or checked model facts match `cli/registry.json` and the registry artifact at the cutover target reference.
-- Configuration examples use keys, enums, and defaults accepted by the runtime definitions at that same reference.
+- Regenerated or checked model facts match `cli/registry.json` and the registry artifact at candidate `C`.
+- Configuration examples use keys, enums, and defaults accepted by the runtime definitions at `C`.
 - The environment inventory includes every recognized runtime variable and marks manual annotations separately.
-- CLI command and validation-script examples match parser/help output built from the cutover target reference.
-- Architecture and repository paths exist at the cutover target reference.
+- CLI command and validation-script examples match parser/help output built from `C`.
+- Architecture and repository paths exist at `C`.
 - Branch-diff checking identifies facts absent from the integration base and verifies that each is labeled branch-only.
 
 ### Evidence verification
@@ -413,9 +414,20 @@ Verification evaluates the documentation cutover itself. It does not certify the
 - Any Redline timing attribution links a single report containing both the timing and positive timed-arm route proof. Without it, wording is blocked or candidate-only.
 - No active documentation treats any retired coherence-gate script as acceptance evidence.
 
+### Candidate and attestation identity
+
+Closeout uses two commits because tracked content cannot contain its own Git object ID:
+
+1. Candidate `C` contains every substantive cutover change. Only the predeclared closeout values may remain pending: the INDEX candidate reference is null, this design remains `planned`, and the acceptance record is absent.
+2. Attestation `A` has exactly one parent, and `parent(A) = C`. Neither `C` nor tracked content in `A` names `A`.
+3. The `C..A` diff is field-allowlisted. It may only fill the human and machine INDEX candidate-reference fields with `C`, update this design's predeclared candidate/lifecycle/replacement metadata without changing its body or criteria, and add one schema-valid acceptance record whose evidence is bound to `C`.
+4. `A` MUST NOT change code, checks, tests, workflows, admissions, product truth, owner mappings, validation policy, historical evidence, or any other file or field. Attestation evidence cannot make a substantive predicate pass.
+5. All substantive predicates run against fresh detached checkouts of both `C` and `A` with identical results. Attestation-only checks on `A` prove parentage, exact recorded references, the field-level diff allowlist, acceptance-record integrity, final lifecycle metadata, and external CI bound to `A`.
+6. `C` and `A` are an inseparable closeout pair. Rebasing, amending, squashing, or cherry-picking either invalidates the attestation and requires a new pair plus complete re-verification.
+
 ## Binary acceptance criteria
 
-The cutover is accepted only if every row passes against the one immutable cutover target reference. `docs/INDEX.md` and the acceptance record MUST name that same full commit; the audited reference and comparison base cannot substitute for it.
+The cutover is accepted only if every row passes on attestation `A`. Substantive predicates MUST also pass identically on candidate `C`; no `A`-only metadata may make them pass. `docs/INDEX.md`, this design's closeout metadata, and the acceptance record in `A` MUST all name the same full `C`; the audited reference, comparison base, and `A` cannot substitute for it.
 
 | # | Pass condition |
 |---:|---|
@@ -435,7 +447,7 @@ The cutover is accepted only if every row passes against the one immutable cutov
 | 14 | Any LFM branch claim is limited to the exact audited 350M dense MQ4, gfx1201, opt-in predicate and states that it is absent from the comparison base. |
 | 15 | No Redline performance statement is called route-certified unless its own timed report contains positive timed-arm route proof; separate artifacts are never stitched. |
 | 16 | The rejected LFM Stage-A result remains rejected, below its promotion gate, and non-Redline in every summary that mentions it. |
-| 17 | All active internal links, anchors, skill paths, script paths, and command names resolve at the cutover target reference. |
+| 17 | All active internal links, anchors, skill paths, script paths, and command names resolve identically at candidate `C` and attestation `A`. |
 | 18 | Documentation checks fail when a machine-owned fact drifts, a second canonical owner appears, a branch label disappears, or an existing checkpoint is silently rewritten. |
 | 19 | README and BENCHMARKS label historical performance snapshots by date and fixture; a current claim requires a matching `docs/admissions.yml` record and complete evidence, otherwise the concern is explicitly historical or blocked. |
 | 20 | The final repository contains no unresolved active contradiction between INDEX, VALIDATION, product docs, routing surfaces, specialized guides, and executable sources. |
