@@ -1,7 +1,7 @@
 {
   "name": "hipfire-kernel-atlas",
   "version": "0.1.0",
-  "description": "Collect phase-aware hipfire Kernel Atlas rows and render ASCII ISA Fit View visualizations that connect AMD GPU arch capability, quant format intent, observed ISA mix, resource usage, and the likely performance left on the table.",
+  "description": "Use Kernel Atlas to collect phase-aware hipfire measurements and render ISA Fit View visualizations for AMD GPU kernels, quant formats, and architectures. Use when a user asks how MQ/HFQ/HFP/Q8 quants occupy hardware, asks for an ASCII ISA visualization, wants to compare gfx1010/gfx1030/gfx11/gfx12 kernel fit, or wants an agent-readable \"left on table\" summary from Atlas rows. Atlas output is measurement evidence only — never runtime or promotion proof.",
   "triggers": [
     "render-fit",
     "kernel atlas",
@@ -12,10 +12,22 @@
     "how does this quant use the hardware",
     "gfx1010 atlas",
     "gfx1030 atlas",
-    "gfx1201 atlas"
+    "gfx11 atlas",
+    "gfx12 atlas",
+    "gfx1201 atlas",
+    "collect-ar",
+    "collect-dflash",
+    "kernel_atlas.py"
   ],
   "entry": "./SKILL.md",
   "interpret": "./SKILL.md",
+  "render": "./render-fit.sh",
+  "cli": "../../../scripts/kernel_atlas.py",
+  "references": {
+    "methodology": "../../../docs/methodology/kernel-atlas.md",
+    "validation-routes": "../../../docs/VALIDATION.md",
+    "perf-protocol": "../../../docs/methodology/perf-benchmarking.md"
+  },
   "requires": {
     "repo": "hipfire checkout with scripts/kernel_atlas.py",
     "python": "python3",
@@ -23,6 +35,7 @@
   },
   "related": [
     "hipfire-kernel-tuning",
-    "hipfire-arch-port"
+    "hipfire-arch-port",
+    "astrea"
   ]
 }

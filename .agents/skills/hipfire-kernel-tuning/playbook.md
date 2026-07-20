@@ -1,230 +1,267 @@
 # Kernel-tuning playbook
 
-The 6-step workflow that's produced real perf wins in this repo. Each
-step has a gate that has to clear before you advance — skipping a
-step is how regressions ship.
+Actionable loop for a single lever on a known-hot kernel. Each step must
+clear before the next. Skipping steps is how silent corruption and fake
+wins reach master.
 
-## 1. Measure first, hypothesize second
+Mutable thresholds, noise bands, and route tables live in owners linked
+below — do not paste them here.
 
-Don't optimize from intuition. Pull the actual profile.
+## 0. Preconditions
+
+- Target **arch + quant + phase** (prefill / decode_ar / decode_dflash) named.
+- Hardware available for every arch you intend to **enable** in public
+  dispatch. No hardware → land kernel + channel test only; leave dispatch
+  flip for a measured follow-up (`cross-arch.md`).
+- Worktree identity recorded (commit or dirty `diff_md5`) before any timed run.
+- Read [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) claim→route map
+  for the surface you will touch.
+
+## 1. Profile first
+
+Do not optimize from intuition.
 
 ```bash
-HIPFIRE_PROFILE=1 hipfire bench qwen3.5:9b --runs 5 2>&1 | tee bench.log
+# Internal timers (wired through dispatched kernels)
+HIPFIRE_PROFILE=1 HIPFIRE_DPM_WARMUP_SECS=10 \
+  hipfire bench <model> --runs 5 2>&1 | tee bench.profile.log
+
+# Optional: phase-aware Atlas row + ISA + dispatch provenance
+# See docs/methodology/kernel-atlas.md and hipfire-kernel-atlas skill.
+python3 scripts/kernel_atlas.py collect-ar \
+  --model <path> --workload <id> --quant <q> \
+  --prefill <N> --gen <N> \
+  --profile-prefill --profile-decode \
+  --isa-dir .hipfire_kernels --isa-filter '<hot_kernel_stem>' \
+  --dispatch-provenance \
+  --output .codeinsight+research/kernel-atlas/runs/tune-$(date -u +%Y%m%dT%H%M%SZ).jsonl
 ```
 
-The `crate::profile::begin_timer` instrumentation is wired through
-every dispatched kernel. The output gives per-kernel µs / GB-s /
-%-of-cycle so you can identify the bottleneck.
+Read the profile for **class**, not just rank:
 
-Specific patterns to look for:
+| Signal | Likely class | Lever family (see `levers.md`) |
+|---|---|---|
+| High µs, low GB/s | Latency / occupancy / launch | Occupancy, multi-row, fuse launches, barrier-free |
+| High GB/s near peak | Bandwidth-saturated | Algorithm change or less traffic; micro-ISA rarely wins |
+| Low %-of-cycle | Not the bottleneck | Stop; re-profile end-to-end |
+| High launch count | Launch overhead | Fused projections, multi-row, batch across forward |
+| Matrix engine idle on prefill GEMM | Wrong path or shape | WMMA/MFMA route (capability-gated) |
+| Spills / high VGPR in ISA | Register pressure | Smaller tile, less multi-row R, simpler live ranges |
 
-- **High µs but low GB/s** — latency-bound, not bandwidth-bound. Adding
-  more compute won't help. Look at occupancy, kernel launch overhead,
-  or memory-access pattern.
-- **High GB/s near peak** — bandwidth-bound, already saturated. Don't
-  spend time here unless you can change the algorithm to need less BW
-  (e.g. fused kernels that share weight reads).
-- **Low GB/s + low %-of-cycle** — kernel is fine, look elsewhere.
-- **High launch count** — kernel-launch overhead dominates. Fuse with
-  a neighboring op, or batch invocations across a forward pass.
+Reconcile internal timers with **rocprof** when wall time and profile
+disagree. Use the canonical route in
+[`docs/methodology/rocprof-coverage.md`](../../../docs/methodology/rocprof-coverage.md):
+`scripts/rocprof-wrap.sh` + `scripts/coverage-audit.py`. Do not blame
+"launch overhead" until the trace shows it. Atlas ISA notes are for
+codegen/resource analysis only — they cannot expose missing kernel time.
 
-Anti-pattern: "this kernel feels slow on my machine" — without a
-profile, you're going to optimize the wrong thing or spend hours
-on a gain that's inside the noise band.
+## 2. Root-cause (source + ISA)
 
-## 2. Root-cause the bottleneck
+Before picking a lever:
 
-Once you have a number, figure out WHY before picking a lever:
+1. **Source** — open the `.hip` Atlas/dispatch attributes to the hot symbol.
+   Confirm the runtime path actually loads that file (chip > family > base
+   tags in `scripts/compile-kernels.sh`; see `cross-arch.md`).
+2. **ISA** — VGPR/SGPR, LDS, private/scratch, spills, wave size, matrix-op
+   mix. Prefer Atlas ISA manifests or `llvm-readobj` / `llvm-objdump` on the
+   HSACO under `.hipfire_kernels/`.
+3. **Dispatch** — capability gate vs perf sub-variant. Capability predicates
+   (`has_wmma_w32`, `has_wmma_w32_gfx12`, `is_rdna4`, …) answer "is the ISA
+   legal?". Perf variants (`plain` / `ldscoop` / `nosync` / `k4` / multi-row R)
+   need a **measured arch allowlist** and a conservative default
+   ([`perf-arch-discipline.md`](../../../docs/methodology/perf-arch-discipline.md)).
+4. **Adjacent archs** — list every chip that shares the file tag or
+   predicate you will touch. Those are your regression surface.
 
-- **VGPR pressure** — check `--save-temps` output for spills. RDNA3
-  budget is 256 VGPRs/wave at 100% occupancy; spilling drops you to
-  the next occupancy step.
-- **LDS bank conflicts** — happen when concurrent threads in a wave
-  hit the same LDS bank. RDNA has 32 banks at 32-bit each; stride
-  your LDS layout to avoid stride-of-32 access patterns.
-- **Coalescing** — adjacent threads should hit adjacent global-memory
-  addresses, otherwise you eat 2-4× the BW per fetch. Check the
-  inner loop's address arithmetic.
-- **Wave-size mismatch** — a wave32 kernel running on a wave64 arch
-  (or vice versa) silently does the wrong thing computationally OR
-  drops half the lanes. CDNA3 (gfx94x) is wave64 native; RDNA is
-  wave32. See `case-studies.md` §1.
-- **Builtin not available on target** — gfx12 doesn't have the gfx11
-  WMMA builtin; rocm 7's clang errors at codegen rather than fall
-  back. See `cross-arch.md`.
+Common root causes: wave-size mismatch (CDNA wave64 vs RDNA wave32), VGPR
+spills, LDS bank conflicts, uncoalesced global access, multi-wave
+`__syncthreads` serialization under low BW%, wrong builtin family on gfx12
+vs gfx11, perf variant inherited via a widened capability predicate.
 
-Tools that help: `--save-temps`, `rocprof` (per-kernel
-hardware counters), the per-kernel timer dumps from
-`HIPFIRE_PROFILE=1`.
+## 3. One lever
 
-## 3. Pick a lever from `levers.md`
+Open [`levers.md`](levers.md). Choose **exactly one** lever that matches the
+diagnosed class. Write the hypothesis in one sentence:
 
-Read [`levers.md`](levers.md). Pick ONE lever that addresses the
-diagnosed bottleneck. Don't bundle three speculative changes into one
-commit — that breaks the bisect path if any one of them is the
-fake-win.
+> On `<arch>` / `<kernel>` / `<phase+shape>`, `<lever>` should improve
+> `<metric>` because `<mechanism>`; risk is `<spill|correctness|adjacent>`.
 
-Common matchings:
+If the lever already has a **documented rejection** in `levers.md` § negative
+results or `case-studies.md`, do not re-run it without a *new* mechanism.
 
-| Bottleneck | Lever |
+## 4. Implement with arch boundaries
+
+- Prefer chip tag (`*.gfx1201.hip`) or family tag (`*.gfx12.hip`) over editing
+  the portable base when the win is arch-local.
+- Register source via existing `include_str!` / kernel tables in
+  `crates/rdna-compute` (or the owning arch crate for crate-local kernels).
+- Dispatch: fast correct path first, portable baseline last; **no unreachable
+  branches** when narrowing predicates (`cross-arch.md`).
+- Perf sub-variant: explicit arch allowlist + portable default — never
+  `if is_rdna3() { tuned }` as a perf key.
+
+Compile **concrete gfx atoms** before timing. `compile-kernels.sh` passes
+each argument to `hipcc --offload-arch`; family tags such as `gfx12` are
+**not** valid compile targets. A `*.gfx12.hip` (or other family-tag) edit
+must be compiled for **every affected concrete chip**:
+
+```bash
+# Example: family-tag edit covering RDNA4 chips
+./scripts/compile-kernels.sh gfx1200 gfx1201
+# Chip-local override
+./scripts/compile-kernels.sh gfx1201
+```
+
+## 4b. Candidate ISA inspect (post-compile, pre-measure)
+
+After the candidate builds, inspect its ISA **before** correctness timing:
+
+1. Confirm the intended symbol / instruction mix (WMMA/MFMA/dot2/scalar,
+   wave size, barrier presence) matches the lever hypothesis.
+2. Compare VGPR/SGPR, LDS, private/scratch, spills, and wave size against
+   the §2 baseline ISA for the same symbol.
+3. Prefer Atlas ISA manifests or `llvm-readobj` / `llvm-objdump` on the
+   candidate HSACO under `.hipfire_kernels/`.
+
+If spills rose, matrix ops are missing, or the wrong wave size landed,
+stop and fix the lever — do not measure a miscompiled candidate.
+
+## 5. Correctness route (claim-scoped)
+
+Select routes from [`docs/VALIDATION.md`](../../../docs/VALIDATION.md).
+Minimum patterns for kernel work:
+
+| Change | Typical minimum |
 |---|---|
-| Low occupancy from VGPR pressure | Tighter `__launch_bounds__`, smaller K-tile, or simpler inner loop |
-| Wave-size mismatch on CDNA | Wave64 port (`*.wave64.hip` variant) |
-| Kernel-launch overhead at small M | Fused projections (qkv → 1 launch) or multi-row variant |
-| Per-token weight rereads at decode | Multi-row GEMV (process N output rows per warp) |
-| BW-bound on long prefill | WMMA / MFMA (matrix engine throughput beats raw FMA) |
-| L2 misses on hot decode weights | `s_prefetch_data` software prefetch (gfx12 only — see PR #56's gemv_hfq4g256.gfx1201.hip) |
-| Kernel slow only on one arch | Per-chip override `<name>.gfx1100.hip` or family `<name>.gfx12.hip` |
-| Low BW utilization (<10%) + high wave-count from multi-wave WG | Barrier-free syncthreads elimination (levers.md §10) — remove LDS staging, each warp loads from global independently |
+| New/changed `.hip` numeric behavior | `test_kernels` (channel vs CPU/reference) on the target arch, **then** the applicable model/path-level manual route on that arch from [`docs/VALIDATION.md`](../../../docs/VALIDATION.md); add a dedicated element-wise check for new WMMA/MFMA mappings. **Blocked** if no model-level route exists for the surface |
+| Forward / fusion / KV **state or logits** | Path-specific parity oracle for that arch — **blocked** if none exists; serve harness is **not** parity |
+| User-facing serve behavior only | `scripts/serve_harness.py` (or LFM harness for thinking frames) **after** parity if numbers can break |
+| Dispatch `bind_thread` surface | `scripts/verify-bind-thread.sh` |
+| Perf-only microkernel with identical math | Channel/parity still required when lane mapping or reduction order can change |
 
-## 4. Implement + compile-check across the arch matrix
+**Do not** treat retired `scripts/coherence-gate-*.sh` as merge or promotion
+acceptance. **Do not** invent a one-script universal gate.
 
-Author your kernel. Then before benching:
+For WMMA/MFMA: element-wise reference comparison with row-mod histogram
+diagnostics (see `case-studies.md` silent-corruption lesson). Speed floors
+and English-shaped output miss systematic C-mapping bugs.
 
-```bash
-./scripts/compile-kernels.sh gfx1010 gfx1030 gfx1100 gfx1200 gfx1201
-```
+## 6. Fresh-process measurement
 
-This catches the most common cross-arch failure mode: a builtin or
-intrinsic that exists on your target arch but not on others. The
-script's family-tag handling (`.gfx12.hip` covers gfx1200 + gfx1201)
-keeps the fix scoped — see `cross-arch.md`.
+Follow [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md)
+end-to-end. Skill-level checklist:
 
-If the kernel is per-chip-specific (e.g. `s_prefetch_data` on
-gfx1201 only), name it `<base>.gfx1201.hip` so other archs keep
-using the family-default `<base>.hip`. The compile script will
-respect the override.
+1. Warm DPM / JIT (`HIPFIRE_DPM_WARMUP_SECS` or throwaway run).
+2. **Delete** the bench/daemon binary before rebuild so `ensure_build` cannot
+   measure a stale artifact.
+3. Record **binary md5**, **prompt md5** (byte-identical fixture files), model
+   identity, arch, flags, and phase.
+4. Cross-commit helper limits: `scripts/probe_commits.sh <baseline> <candidate>`
+   is a **Qwen3.5 in-process** one-sample-per-ref probe — not a general-model
+   product-path harness and not protocol-complete alone. Prefer repeated refs
+   (e.g. A/B/B/A) or another surface-matched fresh-process harness that keeps
+   **raw samples**. Do **not** treat `scripts/gates.sh --perf` as
+   protocol-complete evidence: it runs one baseline and one HEAD sample and
+   also pulls unrelated Redline/serve arms.
+5. Use daemon-authoritative prefill/decode rates for product-shaped claims;
+   do not cite eval-loop wall tok/s as kernel speed.
+6. ABBA or equivalent when the delta is near the protocol noise band; keep
+   the raw-sample report/artifact for the `measured` truth state.
+7. Optional: `scripts/speed-gate.sh` against
+   `tests/speed-baselines/<arch>.txt` when that floor policy applies to the
+   touched paths — update baselines in the **same** commit as a deliberate
+   trade-off, never as a silent chore.
 
-## 5. Validate against the three gates
+A delta that does not survive fresh-process is **not** a win.
 
-This is non-negotiable. Skipping any of these is how silent
-corruption (commit `b7ac66a`, 6 weeks) and fake wins (commit
-`0532579`, −13% disguised as +2%) shipped to master.
+## 7. Adjacent-arch regression surface
 
-### Gate A — channel-test (correctness)
+Before merge intent:
 
-```bash
-./target/release/examples/test_kernels      # all-kernel synthetic battery
-```
+- Every arch that can load the edited source tag or hit the edited predicate
+  must either stay on an unchanged path or be measured.
+- No local hardware for an enablement → **do not** flip public dispatch;
+  expose methods + tests only.
+- Capability-legal on many chips ≠ perf-safe on many chips
+  (`perf-arch-discipline.md`).
 
-For a new fast-path variant on a new arch, ALSO write a dedicated
-channel-test example that compares your kernel's output element-
-by-element against a validated reference (typically the dot2 or
-scalar fallback) on synthetic data. PR #56 is the worked example —
-six tests, one per kernel, with row-mod-16 histogram diagnostics
-that catch C-mapping row swaps.
+## 8. Decide: promote, reject, or park
 
-### Gate B — coherence-gate (output sanity)
+| Outcome | Action |
+|---|---|
+| Correct + real e2e win on target; adjacent OK | Ship with commit template below; keep claim **measured** unless a separate admission process applies |
+| Correct + microkernel win, flat e2e | Ship only if it unblocks a known next fuse; otherwise reject as non-goal |
+| Correct + no win / regression | **Reject and log** (next section); revert or leave opt-in dead code only with explicit env gate |
+| Incorrect | Fix or revert; do not keep "fast wrong" behind defaults |
 
-```bash
-./scripts/coherence-gate.sh           # AR runtime smoke, when relevant
-./scripts/coherence-gate-dflash.sh    # canonical correctness gate
-```
+This skill does **not** admit product defaults. Empty
+`docs/admissions.yml` means fail closed on inferred admissions.
 
-Hard fails on panics, zero tokens, timeouts, or attractor-loop
-fingerprints. Soft warns on output diffs that need human eyeball.
+## 9. Rejection logging
 
-### Gate C — speed-gate (no regression on baseline arch)
+1. **Hypothesis** and lever id from `levers.md`.
+2. **Identity**: arch, model md5, prompt md5, binary md5, commit, flags,
+   **`bench_date`** (UTC measurement date).
+3. **Numbers**: baseline vs candidate metric + protocol (fresh-process, N runs,
+   raw samples).
+4. **Raw report/artifact path** (and digest where retained) for the timed run.
+5. **Mechanism guess** (spills, BW already saturated, barrier was free, etc.).
+6. **Disposition**: rejected / opt-in-only / revisit-if.
 
-```bash
-# CRITICAL: rm the bench exe BEFORE running the gate to bypass the
-# stale-binary trap. The gate's `ensure_build` is a no-op when the
-# binary already exists, so a "stash and re-run" flow can measure
-# the same code twice. See docs/methodology/perf-benchmarking.md.
-rm -f target/release/examples/bench_qwen35_mq4
-./scripts/speed-gate.sh --fast
-```
+Where to put it:
 
-Tolerance is ±5% from `tests/speed-baselines/<arch>.txt`. If your
-change legitimately trades a small regression on the baseline arch
-for a much bigger win on another arch, update the baseline in the
-SAME commit:
+- Commit message (required for reverts and null-result experiments).
+- Atlas task `ledger.jsonl` / `result.json` when using Kernel Atlas eval.
+- One-line pointer in `levers.md` negative section if the failure generalizes.
 
-```bash
-./scripts/speed-gate.sh --update-baselines
-git add tests/speed-baselines/
-```
+Do not delete failed variant sources without a log — silent deletion causes
+re-discovery.
 
-So reviewers see the trade-off explicitly. Don't sneak baseline
-updates into a separate "chore" commit.
-
-## 6. Cross-process verify the win
-
-Within-session noise on gfx1100 is ±10–15%. A measurement taken in
-the same shell session as your code edits is inside that band — even
-if the same code measured "+5% over baseline" three times in a row.
-Real wins survive a fresh process.
-
-```bash
-./scripts/probe_commits.sh <baseline-sha> <candidate-sha>
-```
-
-This rebuilds from clean checkout per commit, runs the bench in a
-fresh process, and reports a multi-run median. A delta that survives
-this is real; one that doesn't probably isn't.
-
-If you don't have `probe_commits.sh` plumbed for your kernel, do it
-manually:
-
-```bash
-git checkout <baseline-sha>
-cargo clean -p rdna-compute
-rm -f target/release/examples/bench_qwen35_mq4
-cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
-./scripts/speed-gate.sh --fast > before.log
-
-git checkout <candidate-sha>
-cargo clean -p rdna-compute
-rm -f target/release/examples/bench_qwen35_mq4
-cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
-./scripts/speed-gate.sh --fast > after.log
-
-diff before.log after.log
-```
-
-The `cargo clean -p rdna-compute` + `rm -f .../bench_qwen35_mq4`
-combo is the load-bearing part. Skipping either gives you a stale
-binary measuring code from a prior run.
-
-## Commit message template
-
-For perf wins or perf reverts, the commit message must include:
-
-- The before/after numbers with binary md5 + prompt md5.
-- The hypothesis for why the win works (or why the candidate didn't).
-- The bench commands so the next contributor can reproduce.
-- For reverts, the bisect commit hash that established the regression.
-
-Example shape (from commit `4105035`):
+## Commit message template (wins and rejects)
 
 ```
-perf(cdna3): full wave64 port of all hot HFQ4 kernels — MI300X decode 48.6 → 96 tok/s
+perf(<arch>): <one-line outcome> — <metric> <before> → <after> | REJECT <reason>
 
-Bisect baseline: <baseline-sha> (record the exact MI300X 9B AR baseline
-commit and decode tok/s from your run).
-Candidate: this commit (decode 96.0 tok/s on MI300X 9B AR, 2× win).
-Bench: HIPFIRE_BASELINE_ARCH=gfx942 ./scripts/speed-gate.sh
-Binary md5: <hash>
-Prompt md5: <hash>
-
-Hypothesis: ... [explain why wave64 lifts on this hardware]
+Baseline: <sha>  Candidate: <sha>
+Arch/quant/phase: <...>
+Bench: <exact command>
+Bench date (UTC): <YYYY-MM-DD or ISO>
+Binary md5: <...>  Prompt md5: <...>  Model: <id/md5>
+Raw report/artifact: <path>  (digest: <...> if retained)
+Protocol: fresh-process N=<n> warmup=<...> repeated refs or surface harness (see methodology/perf-benchmarking.md)
+Correctness: <VALIDATION routes run — test_kernels + model-level route>
+Hypothesis: <...>
+Adjacent archs: <unchanged | measured | dispatch not flipped>
+Candidate ISA: <VGPR/SGPR/LDS/spills/wave vs baseline>
 ```
 
-This template is the format the project's perf-recovery commits
-(`9a2c667`) and reverts (`34eb024`) follow. Match it.
+Match the shape used by historical recovery/revert commits (e.g. `4105035`,
+`34eb024`) so `git log` remains searchable.
 
-## Common pitfalls
+## Pitfalls
 
-- **"My change wins +5% in this terminal."** Almost certainly noise.
-  See step 6.
-- **"It compiled fine on my GPU."** That's one of 6+ supported arches.
-  Run step 4.
-- **"I wrote a test, it passed."** A test that exercises the
-  modified path is necessary but not sufficient — the corollary case
-  is the fix touches the dispatch tree, the test still goes through
-  the OLD path, and the modified path silently breaks. Verify the
-  test actually exercises your code (eyeball the daemon log for the
-  expected dispatch print, or temporarily `eprintln!`).
-- **"--no-verify just to skip the gate while I iterate."** The gate
-  is fast on `--fast` mode. Iterating without it means landing
-  regressions you'll spend longer un-bisecting later.
+- **One-shell +8%.** Measure again under the methodology protocol.
+- **Compiled on my GPU.** That is one of many tags; compile the matrix you touch.
+- **Test passed but dispatch never hit the new path.** Confirm symbol/profile
+  or temporary log on the candidate branch.
+- **Widened `is_rdna3()` to ship a Strix tuning.** That is the
+  `perf-arch-discipline` failure mode — allowlist atoms/classes instead.
+- **Serve harness green as numeric proof.** Rejected by `VALIDATION.md`.
+- **Coherence-gate script as current acceptance.** Retired; historical only.
+- **eval_hipfire tok/s as kernel speed.** Scoring loop dominated; use daemon
+  or bench protocol metrics.
+- **Bypass speed-floor hooks to "iterate faster".** You lose the bisect
+  signal the floor exists to provide.
+
+## Done criteria
+
+- [ ] Single lever; hypothesis written.
+- [ ] Profile + source/ISA evidence for bottleneck class (rocprof coverage
+      audit when wall/profile disagree).
+- [ ] Post-compile candidate ISA inspected vs baseline.
+- [ ] VALIDATION routes for the claim class executed (or explicitly blocked),
+      including model-level route after `test_kernels` when required.
+- [ ] Fresh-process protocol numbers with identity hashes, **`bench_date`**,
+      and raw-sample/report artifact path.
+- [ ] Adjacent-arch story recorded.
+- [ ] Win shipped **or** rejection logged — no silent dead ends.
