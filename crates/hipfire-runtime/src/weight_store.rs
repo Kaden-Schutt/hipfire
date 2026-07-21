@@ -602,6 +602,14 @@ fn preflight_manifest(
     n_layers: usize,
     target_devices: usize,
 ) -> Result<(), FulfillError> {
+    if mesh.axes().iter().filter(|axis| axis.kind != DimKind::Pp).count() > 1 {
+        return Err(FulfillError {
+            name: String::new(),
+            layer: None,
+            device: 0,
+            reason: "composed Tp×Ep meshes are not supported (COMP-001)".to_owned(),
+        });
+    }
     for entry in weights {
         let devices = placement_devices(entry, mesh, n_layers);
         if is_dense_tp_slice(&entry.policy)
@@ -696,10 +704,6 @@ fn fulfill_into<F>(
 where
     F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
 {
-    debug_assert!(
-        mesh.axes().iter().filter(|a| a.kind != DimKind::Pp).count() <= 1,
-        "fulfill_manifest: single non-Pp axis only; composed Tp×Ep slicing is Phase 5b",
-    );
     for entry in weights {
         let devices = placement_devices(entry, mesh, n_layers);
         let tp_axis = mesh.size_of(DimKind::Tp);
@@ -1136,7 +1140,7 @@ mod tests {
     use super::*;
     use crate::tp_shard::ExpertAssign;
     use crate::weight_manifest::{DTypeConstraint, PinTarget};
-    use hipfire_hardware::DimKind;
+    use hipfire_hardware::{DeviceMesh, DimKind};
     use rdna_compute::DType;
     use std::cell::Cell;
     use std::sync::Mutex;
@@ -1200,6 +1204,24 @@ mod tests {
         ));
         assert!(s.get("wo", Some(0), 2).is_none());
         assert!(s.get("wo", Some(2), 0).is_none());
+    }
+
+    #[test]
+    fn fulfill_manifest_rejects_composed_tpep_mesh() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Ep, 2)]);
+        let entries = vec![wl("test", 0, ShardPolicy::Replicate)];
+        let err = preflight_manifest(&entries, &mesh, 1, 4).unwrap_err();
+        assert!(err.reason.contains("COMP-001"));
+        assert!(err.name.is_empty());
+        assert_eq!(err.device, 0);
+    }
+
+    #[test]
+    fn fulfill_manifest_accepts_single_axis_tp_mesh() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let entries = vec![wl("test", 0, ShardPolicy::Replicate)];
+        let result = preflight_manifest(&entries, &mesh, 1, 2);
+        assert!(result.is_ok(), "expected single-axis Tp mesh to pass, got: {result:?}");
     }
 
     #[test]
