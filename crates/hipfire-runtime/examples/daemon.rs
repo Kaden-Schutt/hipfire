@@ -2549,9 +2549,13 @@ fn main() {
                     }
                     ok
                 } else if m.arch_id == 12 {
-                    // Cohere2-MoE warm-pass: per-token decode_step over the
-                    // synthetic prompt. This primes attention + MoE dispatch
-                    // without mutating qwen/minimax-specific state.
+                    // Cohere2-MoE: measure the REAL production prefill — the
+                    // batched `forward_batch` (256-chunk) that `generate_cohere2moe`
+                    // uses — so the pp table reflects true prefill throughput
+                    // (~6x decode) instead of a per-token decode_step warm-pass
+                    // (which measures decode speed and mislabels it prefill).
+                    // Tiers with no indexed-MoE kernel (bf16 oracle / Q8 experts)
+                    // fall back to per-token, mirroring `forward_batch_supported`.
                     let b = m
                         .cohere2moe_mut()
                         .expect("arch_id=12 requires cohere2moe bundle");
@@ -2559,14 +2563,37 @@ fn main() {
                     let weights = &b.weights;
                     let state = &mut b.state;
                     let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if cohere2moe::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
+                    if cohere2moe::forward::forward_batch_supported(weights) && synthetic.len() > 1
+                    {
+                        let mut i = 0;
+                        while i < synthetic.len() {
+                            let end = (i + 256).min(synthetic.len());
+                            let start_pos = state.n_tokens;
+                            if cohere2moe::forward::forward_batch(
+                                config,
+                                weights,
+                                state,
+                                &mut gpu,
+                                &synthetic[i..end],
+                                start_pos,
+                            )
+                            .is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
+                            i = end;
+                        }
+                    } else {
+                        for (i, &tok) in synthetic.iter().enumerate() {
+                            if cohere2moe::forward::decode_step(
+                                config, weights, state, &mut gpu, tok, i as u32,
+                            )
+                            .is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
                     ok
@@ -12082,7 +12109,15 @@ fn generate_cohere2moe(
     let _ = writeln!(
         stdout,
         r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.1},"decode_tok_s":{:.2},"ttft_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, tok_s, prefill_ms, total_ms,
+        id,
+        generated_count,
+        tok_s,
+        prefill_tokens,
+        prefill_ms,
+        prefill_tok_s,
+        tok_s,
+        prefill_ms,
+        total_ms,
     );
     let _ = stdout.flush();
 }
