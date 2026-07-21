@@ -41,7 +41,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     };
 
     let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
-    let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+    let weights = crate::store::load_qwen35_hfq_weights(&hfq, &config, ctx.gpu)?;
 
     // ── MMQ screening ────────────────────────────────────────
     if ctx.gpu.mmq_screen.enabled

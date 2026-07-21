@@ -405,9 +405,11 @@ dependencies = [
  "hipfire-hardware",
  "hipfire-reap",
  "hipfire-runtime",
+ "quote",
  "rdna-compute",
  "serde",
  "serde_json",
+ "syn",
 ]
 
 [[package]]

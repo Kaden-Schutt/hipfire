@@ -56,6 +56,24 @@ pub enum PipelineOp {
     QkNorm,
     /// In-place bias add on one tensor (per-op only).
     BiasAdd,
+    #[cfg(feature = "deltanet")]
+    /// Prepare DeltaNet alpha and beta gates in-place.
+    DeltaGatePrep,
+    #[cfg(feature = "deltanet")]
+    /// Causal DeltaNet convolution followed by Q/K/V splitting.
+    DeltaConvSplit,
+    #[cfg(feature = "deltanet")]
+    /// Independently L2-normalize DeltaNet Q and K heads.
+    DeltaQkL2Norm,
+    #[cfg(feature = "deltanet")]
+    /// Repeat DeltaNet key heads into the value/query head layout.
+    DeltaRepeatHeads,
+    #[cfg(feature = "deltanet")]
+    /// Update/read the caller-owned DeltaNet recurrent state.
+    DeltaRecurrence,
+    #[cfg(feature = "deltanet")]
+    /// Apply DeltaNet z gating and output normalization.
+    DeltaGatedNorm,
 }
 
 // ── Variant enums ─────────────────────────────────────
@@ -357,6 +375,9 @@ pub enum KernelKey {
     FusedQkvzaParo4G128T,
     FusedQkvParo4G128T,
     FusedGateUpQ8_0,
+    #[cfg(feature = "deltanet")]
+    /// Batched DeltaNet Q/K L2 norm plus head-repeat fusion.
+    FusedDeltaQkL2NormRepeat,
     // Rotation
     RotateMq,
     RotateMqG128,

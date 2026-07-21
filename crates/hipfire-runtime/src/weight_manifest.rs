@@ -45,11 +45,17 @@ pub fn collective_for_policy(policy: &ShardPolicy) -> Option<CollectiveHint> {
 /// meshes are Phase 5b.
 pub fn placement_devices(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Vec<usize> {
     // Owning pipeline stage.
-    let stage = match (&entry.policy, entry.layer) {
-        (ShardPolicy::Pin(PinTarget::Embed), _) => 0,
-        (ShardPolicy::Pin(PinTarget::Output), _) => mesh.size_of(DimKind::Pp).saturating_sub(1),
-        (_, Some(l)) => mesh.stage_for_layer(l, n_layers),
-        (_, None) => 0,
+    let stage = match (&entry.placement, &entry.policy, entry.layer) {
+        (PlacementHint::Pin(PinTarget::Embed), _, _) => 0,
+        (PlacementHint::Pin(PinTarget::Output), _, _) => {
+            mesh.size_of(DimKind::Pp).saturating_sub(1)
+        }
+        (PlacementHint::Policy, ShardPolicy::Pin(PinTarget::Embed), _) => 0,
+        (PlacementHint::Policy, ShardPolicy::Pin(PinTarget::Output), _) => {
+            mesh.size_of(DimKind::Pp).saturating_sub(1)
+        }
+        (PlacementHint::Policy, _, Some(l)) => mesh.stage_for_layer(l, n_layers),
+        (PlacementHint::Policy, _, None) => 0,
     };
     // Coordinate with the Pp axis set to `stage`, others 0.
     let mut coord = mesh.coord_of(0);
@@ -266,7 +272,8 @@ pub enum ShardPolicy {
     /// Per-head weights (DeltaNet `w_alpha`/`w_beta`/`wz`) sharded on the head
     /// axis via `dn_value_head_range`.
     HeadSharded { n_heads: usize, head_dim: usize },
-    /// Aliases an already-placed tensor by name (tied lm_head / embeddings).
+    /// Ties this logical tensor to another entry; fulfillment aliases when the
+    /// source is local and materializes a copy when placement crosses devices.
     Tied { source: String },
     /// Pinned to a mesh-derived non-layer location (embed / output).
     Pin(PinTarget),
@@ -299,11 +306,63 @@ pub enum FusedQkvLayout {
 /// `layer` is `Some(idx)` for a per-layer weight (placed on that layer's stage)
 /// or `None` for a model-level weight (embed/lm_head/final-norm).
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SourceDType {
+    /// The source may be any dtype accepted by the source/loader contract.
+    Any,
+    /// The source must have this dtype.
+    Exact(DType),
+    /// The source may have any one of these dtypes; fulfillment preserves the
+    /// selected source dtype on the resident tensor.
+    OneOf(Vec<DType>),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DTypeConstraint {
+    /// Dtype(s) accepted from the source/resolver side. Fulfillment validates
+    /// this allow-list but preserves the source dtype on the resident tensor;
+    /// this type deliberately does not promise conversion or a resident dtype.
+    pub source: SourceDType,
+}
+
+impl DTypeConstraint {
+    pub fn any_source() -> Self {
+        Self {
+            source: SourceDType::Any,
+        }
+    }
+
+    pub fn source_exact(dtype: DType) -> Self {
+        Self {
+            source: SourceDType::Exact(dtype),
+        }
+    }
+
+    pub fn source_from_sources(sources: Vec<DType>) -> Self {
+        Self {
+            source: SourceDType::OneOf(sources),
+        }
+    }
+}
+
+/// Optional placement override independent of tensor identity/policy. This is
+/// needed for a tied lm_head: its identity aliases token_embd, but its
+/// resident copy belongs on the output PP stage.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlacementHint {
+    Policy,
+    Pin(PinTarget),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WeightEntry {
     pub name: String,
     pub layer: Option<usize>,
     pub logical_shape: Vec<usize>,
+    /// Logical dtype expected by the architecture. Fulfillment preserves the
+    /// source dtype unless a separate conversion path explicitly changes it.
     pub dtype: DType,
+    pub dtype_constraint: DTypeConstraint,
+    pub placement: PlacementHint,
     pub policy: ShardPolicy,
 }
 
@@ -315,11 +374,29 @@ impl WeightEntry {
         dtype: DType,
         policy: ShardPolicy,
     ) -> Self {
+        Self::model_with_dtype_constraint(
+            name,
+            logical_shape,
+            dtype,
+            DTypeConstraint::any_source(),
+            policy,
+        )
+    }
+
+    pub fn model_with_dtype_constraint(
+        name: impl Into<String>,
+        logical_shape: Vec<usize>,
+        dtype: DType,
+        dtype_constraint: DTypeConstraint,
+        policy: ShardPolicy,
+    ) -> Self {
         Self {
             name: name.into(),
             layer: None,
             logical_shape,
             dtype,
+            dtype_constraint,
+            placement: PlacementHint::Policy,
             policy,
         }
     }
@@ -332,13 +409,38 @@ impl WeightEntry {
         dtype: DType,
         policy: ShardPolicy,
     ) -> Self {
+        Self::layer_with_dtype_constraint(
+            name,
+            layer,
+            logical_shape,
+            dtype,
+            DTypeConstraint::any_source(),
+            policy,
+        )
+    }
+
+    pub fn layer_with_dtype_constraint(
+        name: impl Into<String>,
+        layer: usize,
+        logical_shape: Vec<usize>,
+        dtype: DType,
+        dtype_constraint: DTypeConstraint,
+        policy: ShardPolicy,
+    ) -> Self {
         Self {
             name: name.into(),
             layer: Some(layer),
             logical_shape,
             dtype,
+            dtype_constraint,
+            placement: PlacementHint::Policy,
             policy,
         }
+    }
+
+    pub fn with_placement(mut self, placement: PlacementHint) -> Self {
+        self.placement = placement;
+        self
     }
 }
 
@@ -397,6 +499,24 @@ mod tests {
         );
         assert_eq!(l.layer, Some(3));
         assert!(matches!(l.policy, ShardPolicy::RowShard { axis: 1 }));
+    }
+
+    #[test]
+    fn dtype_constraints_describe_source_dtypes_only() {
+        let raw =
+            DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::F16, DType::ParoQ4G128]);
+        assert_eq!(
+            raw.source,
+            SourceDType::OneOf(vec![DType::Q8_0, DType::F16, DType::ParoQ4G128])
+        );
+
+        let projection = WeightEntry::model(
+            "projection",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::ColumnShard { axis: 0 },
+        );
+        assert_eq!(projection.dtype_constraint, DTypeConstraint::any_source());
     }
 
     #[test]

@@ -555,7 +555,7 @@ pub fn load_drafter(
     max_kv_seq: usize,
 ) -> HipResult<()> {
     let kv_mode = DrafterKvMode::from_env();
-    let mut hfq = HfqFile::open(path).map_err(|e| {
+    let hfq = HfqFile::open(path).map_err(|e| {
         hip_bridge::HipError::new(
             0,
             &format!("pflash: open drafter HFQ at {}: {e}", path.display(),),
@@ -586,9 +586,8 @@ pub fn load_drafter(
                     &format!("pflash: hybrid tensors detected but qwen35 config parse failed: {e}"),
                 )
             })?;
-            let mut src = qwen35::HfqSource::new(&mut hfq, &q35_cfg);
-            let layout = qwen35::Layout::single(q35_cfg.n_layers);
-            let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &layout)?;
+            let weights = crate::load_qwen35_hfq_weights(&hfq, &q35_cfg, gpu)
+                .map_err(|e| hip_bridge::HipError::new(0, &e))?;
             let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &q35_cfg, 128, max_kv_seq)?;
             let dn_state = qwen35::DeltaNetState::new(gpu, &q35_cfg)?;
             // Hybrid drafter only stores K (and V for chat-path) at

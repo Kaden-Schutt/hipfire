@@ -11,6 +11,11 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 pub(crate) mod steps;
+#[cfg(feature = "deltanet")]
+pub use steps::{
+    build_delta_net_batch_steps, build_delta_net_decode_steps, build_delta_net_tree_steps,
+    DeltaNetOperandDescriptor, DeltaRecurrenceParams,
+};
 pub use steps::{
     execute_steps, execute_steps_mesh, execute_steps_parallel, execute_steps_tp, FusedPattern,
     GemvInput, MoeActivationVariant, MoeProj, ScoreActKind, Step, StepCollective, TpCollective,
@@ -41,6 +46,9 @@ pub struct LinearParams<'a> {
     pub k: usize,
 }
 
+// Keep the public enum's direct `MoeParams` variant; boxing it would break
+// existing callers constructing `PipelineParams::Moe`.
+#[allow(clippy::large_enum_variant)]
 pub enum PipelineParams<'a> {
     Linear(LinearParams<'a>),
     Moe(crate::families::moe::MoeParams<'a>),
@@ -285,9 +293,9 @@ pub fn run_moe_decode(
                 hip!(gpu.givens_rotate_to(
                     p.x_norm,
                     p.x_rot_local,
-                    &paro.pairs,
-                    &paro.theta,
-                    &paro.scales,
+                    paro.pairs,
+                    paro.theta,
+                    paro.scales,
                     1,
                     p.hidden,
                     paro.krot,
@@ -316,10 +324,10 @@ pub fn run_moe_decode(
     if res.gate_fusable {
         let xr = x_rot_local.expect("gate_fusable implies x_rot_local (needs_x_rot_local)");
         hip!(gpu.fused_qkvza_hfq4g256(
-            &p.router.buf,
-            &p.shared_expert_gate.buf,
-            &p.shared_gate_w.buf,
-            &p.shared_up_w.buf,
+            p.router.buf,
+            p.shared_expert_gate.buf,
+            p.shared_gate_w.buf,
+            p.shared_up_w.buf,
             xr,
             p.router_logits,
             p.scalar_buf,
@@ -466,7 +474,7 @@ pub fn run_moe_decode(
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
             }
             hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-                &p.shared_down_w.buf,
+                p.shared_down_w.buf,
                 &x_rot_alias,
                 out_target,
                 p.scalar_buf,
@@ -657,9 +665,9 @@ pub fn run_moe_decode(
                 p.gate_batch,
                 p.up_batch,
                 p.rot_batch,
-                &paro_down.pairs,
-                &paro_down.theta,
-                &paro_down.scales,
+                paro_down.pairs,
+                paro_down.theta,
+                paro_down.scales,
                 p.k,
                 p.mi,
                 paro_down.krot,
@@ -856,7 +864,7 @@ pub fn run_moe_decode(
 ///
 /// Does NOT call the combine itself (the caller's shared line does), and does
 /// NOT touch `out_target` directly.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn run_moe_decode_mixed(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams,
@@ -1081,9 +1089,9 @@ fn run_moe_decode_mixed(
                     &gate_view,
                     &up_view,
                     &rot_view,
-                    &paro_down.pairs,
-                    &paro_down.theta,
-                    &paro_down.scales,
+                    paro_down.pairs,
+                    paro_down.theta,
+                    paro_down.scales,
                     n,
                     mi,
                     paro_down.krot,
@@ -1156,6 +1164,7 @@ fn run_moe_decode_mixed(
 /// is exactly one bucket whose `ranks` are already `0..k` in order, so `perm`
 /// is the IDENTITY and `ranges == [(0, k)]`. That is what makes the mixed path
 /// emit the same kernel calls as the uniform path for a uniform table.
+#[allow(dead_code)]
 fn build_contiguous_permutation(
     buckets: &[crate::families::moe_buckets::TierBucket],
     k: usize,
@@ -1175,6 +1184,7 @@ fn build_contiguous_permutation(
 /// Covers the tiers a routed expert can realistically carry so an
 /// unsupported-tier error names the actual offending tier (e.g. "Q8_0")
 /// instead of a useless "other".
+#[allow(dead_code)]
 fn dtype_name(d: DType) -> &'static str {
     match d {
         DType::MQ4G256 => "MQ4G256",
@@ -1354,7 +1364,7 @@ fn run_moe_decode_cpu_fallback(
             hip!(gpu.fused_silu_mul_rotate_mq(shared_gate, shared_up, &x_rot_alias, p.smi))?;
         }
         hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-            &p.shared_down_w.buf,
+            p.shared_down_w.buf,
             &x_rot_alias,
             p.x_residual,
             p.scalar_buf,
@@ -1777,10 +1787,11 @@ pub fn run_moe_prefill_bias_aware(
         use std::io::Write;
         let raw = hip!(gpu.download_f32(p.topk_indices))?;
         let n = batch_size * k_top;
-        let mut indices: Vec<i32> = Vec::with_capacity(n);
-        for i in 0..n {
-            indices.push(raw[i].to_bits() as i32);
-        }
+        let indices: Vec<i32> = raw
+            .iter()
+            .take(n)
+            .map(|value| value.to_bits() as i32)
+            .collect();
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

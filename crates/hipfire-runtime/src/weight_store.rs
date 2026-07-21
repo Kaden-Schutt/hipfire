@@ -11,8 +11,8 @@
 //! `fulfill_manifest` is the thin GPU driver that reads each tensor's bytes and
 //! uploads them to the devices that plan names, returning a [`WeightStore`] —
 //! the load-side *placement container* keyed by `(logical_name, layer, device)`, whose
-//! value is a [`WeightHandle`] (`Resident` GPU tensor or `Alias` of another
-//! entry). See docs/…/2026-07-05-device-mesh-transparent-parallelism.md §4.
+//! value is a [`WeightHandle`] (`Resident` GPU tensor or a same-device `Alias`
+//! of another entry). See docs/…/2026-07-05-device-mesh-transparent-parallelism.md §4.
 //!
 //! **Scope.** Implemented placements: *whole-tensor upload* (single-GPU + all of
 //! PP + every `Replicate`/`Pin`/`Tied`, and any sharding policy that degenerates
@@ -38,9 +38,9 @@
 //! with the name-resolution seam made explicit.)
 
 use crate::tp_shard::ShardConfig;
-use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry};
+use crate::weight_manifest::{placement_devices, ShardPolicy, SourceDType, WeightEntry};
 use hipfire_hardware::{DeviceMesh, DimKind};
-use rdna_compute::{DType, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 
 /// A placed weight: either a GPU-resident tensor or an alias to another entry
@@ -50,8 +50,8 @@ use std::collections::HashMap;
 pub enum WeightHandle {
     /// The tensor's bytes live on the GPU (the device is the store key).
     Resident(GpuTensor),
-    /// This entry reuses another entry's tensor (tied lm_head ↔ token_embd);
-    /// the value is the source entry's logical name.
+    /// This entry reuses another entry's tensor on the same device (local tied
+    /// lm_head ↔ token_embd); the value is the source entry's logical name.
     Alias(String),
 }
 
@@ -87,6 +87,14 @@ impl WeightStore {
         self.placements.get(&(name.to_string(), layer, device))
     }
 
+    /// Whether a placement cell exists.  This is intentionally separate from
+    /// `get`: assemblers use it for optional companion records before taking
+    /// ownership of any resident buffer.
+    pub fn contains(&self, name: &str, layer: Option<usize>, device: usize) -> bool {
+        self.placements
+            .contains_key(&(name.to_string(), layer, device))
+    }
+
     /// The devices a `(name, layer)` weight was placed on (ascending).
     pub fn devices_for(&self, name: &str, layer: Option<usize>) -> Vec<usize> {
         let mut ds: Vec<usize> = self
@@ -107,6 +115,9 @@ impl WeightStore {
     /// Move a placed handle out of the store (transferring ownership of its
     /// `GpuTensor`) — used when assembling an arch's weight struct *from* the
     /// store (the Phase-3 store→forward bridge). Leaves the cell empty.
+    /// Legacy public extraction route for callers that complete assembly
+    /// immediately. New fallible assembly should use [`begin_assembly`],
+    /// whose rollback guard remains the transactional path.
     pub fn take(
         &mut self,
         name: &str,
@@ -120,13 +131,218 @@ impl WeightStore {
     /// to) and consume the store — the transactional rollback for
     /// [`fulfill_manifest`], also the sharded-weight arm of `TpModel::free`.
     /// `Alias` handles own no buffer, so they are skipped.
-    pub(crate) fn free_all(self, gpus: &crate::multi_gpu::Gpus) {
+    fn free_all_on_target(self, target: &WeightStoreTarget<'_>) {
         for ((_, _, dev), handle) in self.placements {
             if let WeightHandle::Resident(t) = handle {
-                if let Some(g) = gpus.devices.get(dev) {
+                if let Some(g) = target.device(dev) {
                     let _ = g.hip.free(t.buf);
                 }
             }
+        }
+    }
+
+    pub(crate) fn free_all(self, gpus: &crate::multi_gpu::Gpus) {
+        self.free_all_on_target(&WeightStoreTarget::Gpus(gpus));
+    }
+
+    /// Start a typed-assembly transaction. Entries taken through the returned
+    /// transaction are protected alongside untaken entries until successful
+    /// finalization; dropping either transaction form before then frees both
+    /// sets on their owning target.
+    pub fn begin_assembly<'a>(
+        &'a mut self,
+        target: WeightStoreTarget<'a>,
+    ) -> WeightStoreAssembly<'a> {
+        WeightStoreAssembly {
+            store: self,
+            target,
+            taken: Vec::new(),
+            finalized: false,
+        }
+    }
+}
+
+/// The two load surfaces intentionally share one fulfillment engine. The
+/// single-GPU adapter and the multi-GPU adapter differ only in how a logical
+/// device id resolves to a `Gpu`; source reads, policy checks, uploads, and
+/// rollback stay in one path.
+pub enum WeightStoreTarget<'a> {
+    Gpu(&'a Gpu),
+    Gpus(&'a crate::multi_gpu::Gpus),
+}
+
+impl WeightStoreTarget<'_> {
+    fn device(&self, device: usize) -> Option<&Gpu> {
+        match self {
+            Self::Gpu(gpu) => (device == 0).then_some(*gpu),
+            Self::Gpus(gpus) => gpus.devices.get(device),
+        }
+    }
+
+    fn device_count(&self) -> usize {
+        match self {
+            Self::Gpu(_) => 1,
+            Self::Gpus(gpus) => gpus.devices.len(),
+        }
+    }
+}
+
+/// One weight ownership item returned when typed assembly commits.
+pub struct TakenWeight {
+    pub device: usize,
+    pub handle: WeightHandle,
+}
+
+/// Transactional bridge from the generic store to a typed architecture-owned
+/// weight struct. This is public because the runtime cannot clean buffers that
+/// a downstream arch has already moved out unless the arch participates in the
+/// transaction.
+pub struct WeightStoreAssembly<'a> {
+    store: &'a mut WeightStore,
+    target: WeightStoreTarget<'a>,
+    taken: Vec<TakenWeight>,
+    finalized: bool,
+}
+
+impl<'a> WeightStoreAssembly<'a> {
+    /// Reserve one store entry for typed assembly. The returned index is stable
+    /// for the committed guard's lifetime.
+    pub fn take(&mut self, name: &str, layer: Option<usize>, device: usize) -> Option<usize> {
+        let handle = self.store.take(name, layer, device)?;
+        let slot = self.taken.len();
+        self.taken.push(TakenWeight { device, handle });
+        Some(slot)
+    }
+
+    /// Commit the reservation into a rollback-owning guard. The guard must be
+    /// consumed by [`WeightStoreAssemblyGuard::finalize`] only after all
+    /// fallible typed validation/conversion has succeeded.
+    pub fn commit(self) -> WeightStoreAssemblyGuard<'a> {
+        WeightStoreAssemblyGuard { inner: self }
+    }
+}
+
+impl Drop for WeightStoreAssembly<'_> {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        for taken in self.taken.drain(..) {
+            free_handle(&self.target, taken.device, taken.handle);
+        }
+        let store = std::mem::take(self.store);
+        store.free_all_on_target(&self.target);
+    }
+}
+
+/// Rollback-owning guard for handles reserved by a typed assembly. A failed
+/// conversion after `commit` still drops this guard and therefore releases
+/// both already-taken residents and every resident left in the store.
+pub struct WeightStoreAssemblyGuard<'a> {
+    inner: WeightStoreAssembly<'a>,
+}
+
+impl WeightStoreAssemblyGuard<'_> {
+    /// Reserve another store entry while the rollback guard is active.
+    pub fn take(&mut self, name: &str, layer: Option<usize>, device: usize) -> Option<usize> {
+        self.inner.take(name, layer, device)
+    }
+
+    /// Borrow a reserved handle for fallible type validation without moving
+    /// ownership out of the rollback guard.
+    pub fn get(&self, slot: usize) -> Option<&WeightHandle> {
+        self.inner.taken.get(slot).map(|taken| &taken.handle)
+    }
+
+    /// Replace a reserved handle while rollback ownership remains active.
+    /// The caller owns the returned old handle and must either free it or move
+    /// it into another owner after the replacement succeeds.
+    pub fn replace(&mut self, slot: usize, handle: WeightHandle) -> Option<WeightHandle> {
+        let taken = self.inner.taken.get_mut(slot)?;
+        Some(std::mem::replace(&mut taken.handle, handle))
+    }
+
+    /// Replace a resident whose buffer was already freed through a
+    /// non-owning wrapper. Unlike [`Self::replace`], this does not return the
+    /// stale old handle to callers. If installation cannot proceed, the new
+    /// handle is returned with the error so the caller can release it.
+    pub fn replace_after_free(
+        &mut self,
+        slot: usize,
+        handle: WeightHandle,
+    ) -> Result<(), (WeightHandle, String)> {
+        let Some(taken) = self.inner.taken.get_mut(slot) else {
+            return Err((handle, format!("assembly slot {slot} is missing")));
+        };
+        if !matches!(&taken.handle, WeightHandle::Resident(_)) {
+            return Err((handle, format!("assembly slot {slot} is not resident")));
+        }
+        taken.handle = handle;
+        Ok(())
+    }
+
+    /// Free an unused resident while rollback ownership is still active. The
+    /// raw non-owning wrapper means a failed `hipFree` leaves the original
+    /// `GpuTensor` in the guard; successful free replaces it with a marker
+    /// alias that owns no buffer. This must happen before `finalize`.
+    pub fn discard_resident(&mut self, slot: usize) -> Result<(), String> {
+        let (device, ptr, size) = {
+            let taken = self
+                .inner
+                .taken
+                .get(slot)
+                .ok_or_else(|| format!("assembly slot {slot} is missing"))?;
+            let WeightHandle::Resident(tensor) = &taken.handle else {
+                return Ok(());
+            };
+            (taken.device, tensor.buf.as_ptr(), tensor.buf.size())
+        };
+        let gpu = self
+            .inner
+            .target
+            .device(device)
+            .ok_or_else(|| format!("assembly slot {slot} targets missing device {device}"))?;
+        let raw = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, size) };
+        gpu.hip
+            .free(raw)
+            .map_err(|e| format!("discarding assembly slot {slot} failed: {e:?}"))?;
+        self.inner.taken[slot].handle = WeightHandle::Alias("__discarded__".into());
+        Ok(())
+    }
+
+    /// Complete typed assembly after all fallible work has succeeded. This is
+    /// the sole operation that releases handles from rollback ownership.
+    pub fn finalize(mut self) -> Vec<TakenWeight> {
+        self.inner.finalized = true;
+        std::mem::take(&mut self.inner.taken)
+    }
+}
+
+fn free_handle(target: &WeightStoreTarget<'_>, device: usize, handle: WeightHandle) {
+    if let WeightHandle::Resident(t) = handle {
+        if let Some(gpu) = target.device(device) {
+            let _ = gpu.hip.free(t.buf);
+        }
+    }
+}
+
+fn fulfill_with_target<F>(
+    target: &WeightStoreTarget<'_>,
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    source: &F,
+) -> Result<WeightStore, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
+{
+    preflight_manifest(weights, mesh, n_layers, target.device_count())?;
+    let mut store = WeightStore::new();
+    match fulfill_into(&mut store, weights, mesh, n_layers, target, source) {
+        Ok(()) => Ok(store),
+        Err(e) => {
+            store.free_all_on_target(target);
+            Err(e)
         }
     }
 }
@@ -346,15 +562,125 @@ pub fn fulfill_manifest<F>(
 where
     F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
 {
-    let mut store = WeightStore::new();
-    match fulfill_into(&mut store, weights, mesh, n_layers, gpus, &source) {
-        Ok(()) => Ok(store),
-        Err(e) => {
-            // Roll back every cell uploaded before the failure.
-            store.free_all(gpus);
-            Err(e)
+    fulfill_with_target(
+        &WeightStoreTarget::Gpus(gpus),
+        weights,
+        mesh,
+        n_layers,
+        &source,
+    )
+}
+
+/// Single-device adapter for architecture/`LoadCtx` callers. It deliberately
+/// enters the same private engine as [`fulfill_manifest`], including the same
+/// preflight and transactional rollback behavior.
+pub fn fulfill_manifest_gpu<F>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpu: &mut Gpu,
+    source: F,
+) -> Result<WeightStore, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
+{
+    fulfill_with_target(
+        &WeightStoreTarget::Gpu(gpu),
+        weights,
+        mesh,
+        n_layers,
+        &source,
+    )
+}
+
+/// CPU-only checks that must complete before the first source closure call.
+/// This is intentionally limited to fulfillment/target safety; architecture
+/// policy belongs to the architecture crate, not to generic `ShardPolicy`.
+fn preflight_manifest(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    target_devices: usize,
+) -> Result<(), FulfillError> {
+    for entry in weights {
+        let devices = placement_devices(entry, mesh, n_layers);
+        if is_dense_tp_slice(&entry.policy)
+            && mesh.size_of(DimKind::Tp) > 1
+            && !matches!(
+                entry.policy,
+                ShardPolicy::ColumnShard { axis: 0 } | ShardPolicy::RowShard { .. }
+            )
+        {
+            return Err(FulfillError {
+                name: entry.name.clone(),
+                layer: entry.layer,
+                device: devices.first().copied().unwrap_or(0),
+                reason: format!(
+                    "dense TP slicing (FusedQkv/Head/Vocab, or non-axis-0 Column) \
+                     is not yet implemented (PB-1b); group size {} > 1",
+                    devices.len()
+                ),
+            });
+        }
+        if let Some(&device) = devices.iter().find(|&&d| d >= target_devices) {
+            return Err(FulfillError {
+                name: entry.name.clone(),
+                layer: entry.layer,
+                device,
+                reason: format!(
+                    "target has {target_devices} device(s), placement needs device {device}"
+                ),
+            });
         }
     }
+    Ok(())
+}
+
+fn source_dtype_allowed(entry: &WeightEntry, dtype: DType) -> bool {
+    match &entry.dtype_constraint.source {
+        SourceDType::Any => true,
+        SourceDType::Exact(expected) => *expected == dtype,
+        SourceDType::OneOf(allowed) => allowed.contains(&dtype),
+    }
+}
+
+fn read_source<F>(
+    entry: &WeightEntry,
+    device: usize,
+    source: &F,
+) -> Result<(Vec<u8>, DType), FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
+{
+    let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
+        name: entry.name.clone(),
+        layer: entry.layer,
+        device,
+        reason: format!("source read failed: {e}"),
+    })?;
+    if !source_dtype_allowed(entry, dtype) {
+        return Err(FulfillError {
+            name: entry.name.clone(),
+            layer: entry.layer,
+            device,
+            reason: format!(
+                "source dtype {dtype:?} violates declared source constraint {:?}",
+                entry.dtype_constraint.source
+            ),
+        });
+    }
+    Ok((bytes, dtype))
+}
+
+fn tied_requires_materialization(
+    entry: &WeightEntry,
+    source: &WeightEntry,
+    mesh: &DeviceMesh,
+    n_layers: usize,
+) -> bool {
+    let destination = placement_devices(entry, mesh, n_layers).first().copied();
+    let source_devices = placement_devices(source, mesh, n_layers);
+    destination.is_some_and(|device| !source_devices.contains(&device))
 }
 
 /// The upload loop, writing into `store` so a partial result is reclaimable by
@@ -364,7 +690,7 @@ fn fulfill_into<F>(
     weights: &[WeightEntry],
     mesh: &DeviceMesh,
     n_layers: usize,
-    gpus: &crate::multi_gpu::Gpus,
+    target: &WeightStoreTarget<'_>,
     source: &F,
 ) -> Result<(), FulfillError>
 where
@@ -379,15 +705,51 @@ where
         let tp_axis = mesh.size_of(DimKind::Tp);
         let ep_axis = mesh.size_of(DimKind::Ep);
 
-        // Tied: no upload — record an alias to the source entry on its device.
+        // Tied entries alias only when the source is local. A PP-pinned output
+        // lm_head must be a resident copy on the output device; an alias would
+        // leave the final-stage forward reading a different device's buffer.
         if let ShardPolicy::Tied { source: src } = &entry.policy {
             let dev = devices.first().copied().unwrap_or(0);
-            store.insert(
-                &entry.name,
-                entry.layer,
-                dev,
-                WeightHandle::Alias(src.clone()),
-            );
+            let source_entry = weights
+                .iter()
+                .find(|candidate| candidate.name == *src)
+                .ok_or_else(|| FulfillError {
+                    name: entry.name.clone(),
+                    layer: entry.layer,
+                    device: dev,
+                    reason: format!("Tied source '{src}' has no manifest entry"),
+                })?;
+            if tied_requires_materialization(entry, source_entry, mesh, n_layers) {
+                let (source_bytes, source_dtype) = read_source(source_entry, dev, source)?;
+                let gpu = target.device(dev).ok_or_else(|| FulfillError {
+                    name: entry.name.clone(),
+                    layer: entry.layer,
+                    device: dev,
+                    reason: format!("device {dev} out of range (have {})", target.device_count()),
+                })?;
+                let mut tensor = gpu
+                    .upload_raw(&source_bytes, &entry.logical_shape)
+                    .map_err(|e| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: format!("upload_raw failed: {e}"),
+                    })?;
+                tensor.dtype = source_dtype;
+                store.insert(
+                    &entry.name,
+                    entry.layer,
+                    dev,
+                    WeightHandle::Resident(tensor),
+                );
+            } else {
+                store.insert(
+                    &entry.name,
+                    entry.layer,
+                    dev,
+                    WeightHandle::Alias(src.clone()),
+                );
+            }
             continue;
         }
 
@@ -406,12 +768,8 @@ where
                         reason: format!("ExpertSharded: {e}"),
                     }
                 })?;
-                let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: *devices.first().unwrap_or(&0),
-                    reason: format!("source read failed: {e}"),
-                })?;
+                let (bytes, dtype) =
+                    read_source(entry, devices.first().copied().unwrap_or(0), source)?;
                 for (rank, &dev) in devices.iter().enumerate() {
                     let owned = shard.experts_on_rank(rank);
                     let compact = expert_compact_blob(&bytes, *n_experts, &owned).map_err(|e| {
@@ -427,11 +785,14 @@ where
                     if let Some(first) = shape.first_mut() {
                         *first = owned.len();
                     }
-                    let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+                    let gpu = target.device(dev).ok_or_else(|| FulfillError {
                         name: entry.name.clone(),
                         layer: entry.layer,
                         device: dev,
-                        reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                        reason: format!(
+                            "device {dev} out of range (have {})",
+                            target.device_count()
+                        ),
                     })?;
                     let mut tensor =
                         gpu.upload_raw(&compact, &shape).map_err(|e| FulfillError {
@@ -473,12 +834,8 @@ where
                         ),
                     });
                 }
-                let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: *devices.first().unwrap_or(&0),
-                    reason: format!("source read failed: {e}"),
-                })?;
+                let (bytes, dtype) =
+                    read_source(entry, devices.first().copied().unwrap_or(0), source)?;
                 if bytes.len() % tp != 0 {
                     return Err(FulfillError {
                         name: entry.name.clone(),
@@ -499,11 +856,14 @@ where
                 }
                 for (rank, &dev) in devices.iter().enumerate() {
                     let slice = &bytes[rank * chunk..(rank + 1) * chunk];
-                    let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+                    let gpu = target.device(dev).ok_or_else(|| FulfillError {
                         name: entry.name.clone(),
                         layer: entry.layer,
                         device: dev,
-                        reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                        reason: format!(
+                            "device {dev} out of range (have {})",
+                            target.device_count()
+                        ),
                     })?;
                     let mut tensor = gpu.upload_raw(slice, &shape).map_err(|e| FulfillError {
                         name: entry.name.clone(),
@@ -545,12 +905,8 @@ where
                         reason: format!("RowShard: inner dim {inner} not divisible by Tp {tp}"),
                     });
                 }
-                let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: *devices.first().unwrap_or(&0),
-                    reason: format!("source read failed: {e}"),
-                })?;
+                let (bytes, dtype) =
+                    read_source(entry, devices.first().copied().unwrap_or(0), source)?;
                 if bytes.len() % rows != 0 {
                     return Err(FulfillError {
                         name: entry.name.clone(),
@@ -587,11 +943,14 @@ where
                         let base = row * row_bytes + rank * sub;
                         blob.extend_from_slice(&bytes[base..base + sub]);
                     }
-                    let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+                    let gpu = target.device(dev).ok_or_else(|| FulfillError {
                         name: entry.name.clone(),
                         layer: entry.layer,
                         device: dev,
-                        reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                        reason: format!(
+                            "device {dev} out of range (have {})",
+                            target.device_count()
+                        ),
                     })?;
                     let mut tensor = gpu.upload_raw(&blob, &shape).map_err(|e| FulfillError {
                         name: entry.name.clone(),
@@ -620,12 +979,8 @@ where
         if let ShardPolicy::ExpertTensorSharded { n_experts, inner } = &entry.policy {
             if tp_axis > 1 {
                 let tp = devices.len();
-                let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: *devices.first().unwrap_or(&0),
-                    reason: format!("source read failed: {e}"),
-                })?;
+                let (bytes, dtype) =
+                    read_source(entry, devices.first().copied().unwrap_or(0), source)?;
                 // Derive block_bytes from dtype.
                 let block_bytes: usize = match dtype {
                     DType::MQ2G256Lloyd => 72,
@@ -702,11 +1057,14 @@ where
                         device: dev,
                         reason: e,
                     })?;
-                    let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+                    let gpu = target.device(dev).ok_or_else(|| FulfillError {
                         name: entry.name.clone(),
                         layer: entry.layer,
                         device: dev,
-                        reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                        reason: format!(
+                            "device {dev} out of range (have {})",
+                            target.device_count()
+                        ),
                     })?;
                     let mut tensor = gpu
                         .upload_raw(&per_rank_blob, &entry.logical_shape)
@@ -745,18 +1103,13 @@ where
         }
 
         // Whole-tensor path: read once, upload the same bytes to each device.
-        let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
-            name: entry.name.clone(),
-            layer: entry.layer,
-            device: *devices.first().unwrap_or(&0),
-            reason: format!("source read failed: {e}"),
-        })?;
+        let (bytes, dtype) = read_source(entry, devices.first().copied().unwrap_or(0), source)?;
         for &dev in &devices {
-            let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+            let gpu = target.device(dev).ok_or_else(|| FulfillError {
                 name: entry.name.clone(),
                 layer: entry.layer,
                 device: dev,
-                reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                reason: format!("device {dev} out of range (have {})", target.device_count()),
             })?;
             let mut tensor =
                 gpu.upload_raw(&bytes, &entry.logical_shape)
@@ -782,17 +1135,17 @@ where
 mod tests {
     use super::*;
     use crate::tp_shard::ExpertAssign;
-    use crate::weight_manifest::PinTarget;
+    use crate::weight_manifest::{DTypeConstraint, PinTarget};
     use hipfire_hardware::DimKind;
     use rdna_compute::DType;
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
+    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn wl(name: &str, layer: usize, policy: ShardPolicy) -> WeightEntry {
         WeightEntry::layer(name, layer, vec![8, 8], DType::F16, policy)
     }
-
-    // These tests exercise the pure control-flow of fulfill_manifest that does
-    // NOT need a GPU: policy classification and the deferred-slicing refusal.
-    // The upload path is covered by the GPU example fulfill_manifest_probe.
 
     #[test]
     fn dense_tp_slice_classification() {
@@ -847,6 +1200,68 @@ mod tests {
         ));
         assert!(s.get("wo", Some(0), 2).is_none());
         assert!(s.get("wo", Some(2), 0).is_none());
+    }
+
+    #[test]
+    fn fulfillment_checks_raw_allowlist_but_accepts_quantized_projections() {
+        let raw = WeightEntry::model_with_dtype_constraint(
+            "raw",
+            vec![8],
+            DType::F32,
+            DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::F16, DType::ParoQ4G128]),
+            ShardPolicy::Replicate,
+        );
+        for dtype in [DType::Q8_0, DType::F16, DType::ParoQ4G128] {
+            assert_eq!(
+                read_source(&raw, 0, &|_| Ok((vec![0u8; 8], dtype)))
+                    .unwrap()
+                    .1,
+                dtype
+            );
+        }
+        assert!(read_source(&raw, 0, &|_| Ok((vec![0u8; 8], DType::MQ4G256))).is_err());
+
+        let projection = WeightEntry::model(
+            "projection",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::ColumnShard { axis: 0 },
+        );
+        assert_eq!(
+            read_source(&projection, 0, &|_| Ok((vec![0u8; 8], DType::MQ4G256)))
+                .unwrap()
+                .1,
+            DType::MQ4G256
+        );
+    }
+
+    #[test]
+    fn tied_output_device_requires_materialization_but_local_tie_aliases() {
+        let source = WeightEntry::model(
+            "token_embd",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Pin(PinTarget::Embed),
+        );
+        let tied = WeightEntry::model(
+            "lm_head",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "token_embd".into(),
+            },
+        )
+        .with_placement(crate::weight_manifest::PlacementHint::Pin(
+            PinTarget::Output,
+        ));
+        let pp2 = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
+        assert!(tied_requires_materialization(&tied, &source, &pp2, 1));
+        assert!(!tied_requires_materialization(
+            &tied,
+            &source,
+            &DeviceMesh::single(),
+            1
+        ));
     }
 
     #[cfg(test)]
@@ -1019,5 +1434,186 @@ mod tests {
         let devs1 = placement_devices(&e, &single, 4);
         assert_eq!(devs1, vec![0]);
         assert!(!(is_dense_tp_slice(&e.policy) && single.size_of(DimKind::Tp) > 1));
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises the real GPU adapter"]
+    fn gpu_adapter_runs_common_preflight_before_source_materialization() {
+        let _guard = GPU_TEST_LOCK.lock().unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let entries = vec![wl(
+            "wqkv",
+            0,
+            ShardPolicy::FusedQkv {
+                q_heads: 16,
+                kv_heads: 2,
+                head_dim: 128,
+                layout: crate::weight_manifest::FusedQkvLayout::Qkv,
+            },
+        )];
+        let payload_reads = Cell::new(0);
+        let mut gpu = Gpu::init().expect("GPU required for fulfillment adapter test");
+
+        let err = match fulfill_manifest_gpu(&entries, &mesh, 1, &mut gpu, |_| {
+            payload_reads.set(payload_reads.get() + 1);
+            Ok((vec![0; 128], DType::F16))
+        }) {
+            Ok(_) => panic!("unsafe fused QKV must be refused"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            payload_reads.get(),
+            0,
+            "preflight must not materialize payloads"
+        );
+        assert_eq!(err.name, "wqkv");
+        assert_eq!(
+            err.reason,
+            "dense TP slicing (FusedQkv/Head/Vocab, or non-axis-0 Column) is not yet implemented (PB-1b); group size 2 > 1"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises the real Gpus adapter"]
+    fn gpus_adapter_runs_common_preflight_before_source_materialization() {
+        let _guard = GPU_TEST_LOCK.lock().unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let entries = vec![wl(
+            "wqkv",
+            0,
+            ShardPolicy::FusedQkv {
+                q_heads: 16,
+                kv_heads: 2,
+                head_dim: 128,
+                layout: crate::weight_manifest::FusedQkvLayout::Qkv,
+            },
+        )];
+        let payload_reads = Cell::new(0);
+        let gpu = Gpu::init().expect("GPU required for fulfillment adapter test");
+        let gpus = crate::multi_gpu::Gpus::single(gpu, 1);
+
+        let err = match fulfill_manifest(&entries, &mesh, 1, &gpus, |_| {
+            payload_reads.set(payload_reads.get() + 1);
+            Ok((vec![0; 128], DType::F16))
+        }) {
+            Ok(_) => panic!("unsafe fused QKV must be refused"),
+            Err(err) => err,
+        };
+
+        assert_eq!(payload_reads.get(), 0);
+        assert_eq!(err.name, "wqkv");
+    }
+
+    #[test]
+    #[ignore = "requires two AMD GPUs; verifies cross-PP tied materialization"]
+    fn tied_output_lm_head_is_resident_and_usable_on_output_device() {
+        let _guard = GPU_TEST_LOCK.lock().unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
+        let source = WeightEntry::model(
+            "token_embd",
+            vec![2, 2],
+            DType::F16,
+            ShardPolicy::Pin(PinTarget::Embed),
+        );
+        let tied = WeightEntry::model(
+            "lm_head",
+            vec![2, 2],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "token_embd".into(),
+            },
+        )
+        .with_placement(crate::weight_manifest::PlacementHint::Pin(
+            PinTarget::Output,
+        ));
+        let gpus = crate::multi_gpu::Gpus::from_mesh(&mesh, 1).expect("two GPUs required");
+        let bytes = vec![0u8; 8];
+        let source_reads = Cell::new(0);
+        let store = fulfill_manifest(&[source, tied], &mesh, 1, &gpus, |entry| {
+            assert_eq!(entry.name, "token_embd");
+            source_reads.set(source_reads.get() + 1);
+            Ok((bytes.clone(), DType::F16))
+        })
+        .expect("cross-PP tied fulfillment");
+
+        assert_eq!(
+            source_reads.get(),
+            2,
+            "source content must be read for the copy"
+        );
+        match store.get("lm_head", None, 1) {
+            Some(WeightHandle::Resident(tensor)) => {
+                assert_eq!(tensor.shape, vec![2, 2]);
+                assert_eq!(tensor.dtype, DType::F16);
+                assert_eq!(tensor.buf.size(), bytes.len());
+            }
+            Some(WeightHandle::Alias(_)) => {
+                panic!("cross-PP lm_head must not alias token_embd")
+            }
+            None => panic!("output-device lm_head was not fulfilled"),
+        }
+        store.free_all(&gpus);
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises the real upload path"]
+    fn both_adapters_materialize_allowed_single_device_payloads() {
+        let _guard = GPU_TEST_LOCK.lock().unwrap();
+        let entries = vec![wl("safe", 0, ShardPolicy::Replicate)];
+
+        let gpu = Gpu::init().expect("GPU required for fulfillment adapter test");
+        let mut gpu_adapter = gpu;
+        let reads_gpu = Cell::new(0);
+        let store =
+            fulfill_manifest_gpu(&entries, &DeviceMesh::single(), 1, &mut gpu_adapter, |_| {
+                reads_gpu.set(reads_gpu.get() + 1);
+                Ok((vec![0; 128], DType::F16))
+            })
+            .expect("single-GPU fulfillment");
+        assert_eq!(reads_gpu.get(), 1);
+        store.free_all_on_target(&WeightStoreTarget::Gpu(&gpu_adapter));
+
+        let gpu = Gpu::init().expect("GPU required for fulfillment adapter test");
+        let gpus = crate::multi_gpu::Gpus::single(gpu, 1);
+        let reads_gpus = Cell::new(0);
+        let store = fulfill_manifest(&entries, &DeviceMesh::single(), 1, &gpus, |_| {
+            reads_gpus.set(reads_gpus.get() + 1);
+            Ok((vec![0; 128], DType::F16))
+        })
+        .expect("multi-GPU fulfillment");
+        assert_eq!(reads_gpus.get(), 1);
+        store.free_all(&gpus);
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises transactional assembly cleanup"]
+    fn assembly_failure_after_commit_cleans_taken_and_untaken_fulfilled_weights() {
+        let _guard = GPU_TEST_LOCK.lock().unwrap();
+        let entries = vec![
+            wl("first", 0, ShardPolicy::Replicate),
+            wl("second", 0, ShardPolicy::Replicate),
+        ];
+        let mut gpu = Gpu::init().expect("GPU required for fulfillment test");
+        let mut store = fulfill_manifest_gpu(&entries, &DeviceMesh::single(), 1, &mut gpu, |_| {
+            Ok((vec![0; 128], DType::F16))
+        })
+        .expect("fulfillment");
+        store.insert("alias", Some(0), 0, WeightHandle::Alias("first".into()));
+
+        let assembly_result: Result<(), &'static str> = (|| {
+            let mut tx = store.begin_assembly(WeightStoreTarget::Gpu(&gpu));
+            tx.take("first", Some(0), 0).ok_or("missing first")?;
+            let mut committed = tx.commit();
+            committed.take("alias", Some(0), 0).ok_or("missing alias")?;
+            match committed.get(1) {
+                Some(WeightHandle::Resident(_)) => Ok(()),
+                Some(WeightHandle::Alias(_)) => Err("typed assembly expected Resident"),
+                None => Err("missing committed alias"),
+            }
+        })();
+
+        assert_eq!(assembly_result, Err("typed assembly expected Resident"));
+        assert!(store.is_empty(), "rollback must drain untaken entries too");
     }
 }

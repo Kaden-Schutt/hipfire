@@ -16,6 +16,8 @@ arch-llama = ["dep:hipfire-arch-llama"]
 arch-qwen2 = ["dep:hipfire-arch-qwen2"]
 arch-deepseek4 = ["dep:hipfire-arch-deepseek4"]
 arch-dots-ocr = ["dep:hipfire-arch-dots-ocr"]
+# Test-only forwarding for the Qwen35 legacy-vs-dispatch parity seam.
+test-utils = ["arch-qwen35", "hipfire-arch-qwen35/test-utils"]
 # Test-only: compile the HIPFIRE_EP_FAIL_RANK partial-load fault injector. OFF by
 # default so production builds can never synthetically fail an EP load.
 ep-fault-inject = []
@@ -40,3 +42,8 @@ hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 serde_json = "1"
+
+[[test]]
+name = "qwen35_parity_compile"
+path = "tests/qwen35_parity_compile.rs"
+required-features = ["test-utils"]

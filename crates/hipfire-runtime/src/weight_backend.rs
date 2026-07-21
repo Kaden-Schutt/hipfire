@@ -536,6 +536,7 @@ pub fn dequant_norm(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        16 => widen_bf16(data),
         _ => {
             return Err(hip_bridge::HipError::new(
                 0,
