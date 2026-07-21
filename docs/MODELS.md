@@ -295,6 +295,8 @@ override it.
 | Cohere2-MoE (12) | implemented | planned (AXIS-003; HW-010 pending) | planned (AXIS-003; HW-010 pending) | planned (AXIS-003; HW-010 pending) |
 | toy / template (0xFF) | out-of-scope | out-of-scope | out-of-scope | out-of-scope |
 
+TP×EP composition is explicitly refused (COMP-001): `--tp` and `--ep` cannot both exceed one. Reopening it requires a concrete deployment requirement and separate implementation/physical-validation task.
+
 An axis marked partial, planned, or awaiting hardware evidence is not
 currently claimed as supported. CAP-001 will refuse planned cells when
 implemented; until then, an AXIS or GEN cell remains governed by the

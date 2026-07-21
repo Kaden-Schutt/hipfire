@@ -2951,6 +2951,10 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
     eprintln!("  Run `hipfire diag` for a full environment report.");
 }
 
+fn validate_load_parallelism(pp: usize, tp: usize, ep: usize) -> Result<(), String> {
+    hipfire_runtime::config::validate_parallel_axes(pp, tp, ep)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -3556,6 +3560,12 @@ fn main() {
                     .and_then(|p| p.get("ep"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
+                // Reject raw TP×EP before EP-wins remapping (COMP-001).
+                if let Err(message) = validate_load_parallelism(pp, tp, ep) {
+                    let _ = writeln!(stdout, r#"{{"type":"error","message":"{message}"}}"#);
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // Peek the arch to route a legacy `tp` correctly (MoE → EP).
                 let moe_arch = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(
                     msg.get("model").and_then(|v| v.as_str()).unwrap_or(""),
@@ -17019,5 +17029,17 @@ mod lifecycle_matrix_tests {
                 "non-cache-capable path unexpectedly admitted: arch_id={arch_id}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod load_parallelism_tests {
+    use super::validate_load_parallelism;
+
+    #[test]
+    fn load_rejects_tp_ep_before_ep_wins_remap() {
+        let error = validate_load_parallelism(1, 2, 2).unwrap_err();
+        assert!(error.contains("mutually exclusive"));
+        assert!(error.contains("COMP-001"));
     }
 }

@@ -138,7 +138,7 @@ enforcement for planned and unsupported cells; it is not implemented here.
 | MiniMax EP | Existing code; pending physical proof | `HW-002` |
 | Other planned PP/TP and MoE-EP cells | Current architecture-specific behavior remains under `PAR-001` characterization; consistent early planned/unsupported-cell enforcement belongs to `CAP-001` and the owning `AXIS-*`/`GEN-*` implementation | `AXIS-001`–`AXIS-004`, `GEN-001`, `PAR-002` |
 | Dense `EP > 1` | Governed by existing architecture-specific refusal; no EP support claim | `CAP-001` will normalize to one effective replica before mesh/device/allocation/collective construction |
-| `TP > 1` × `EP > 1` | Refused | Remains so unless `COMP-001` creates a requirement-specific follow-up |
+| `TP > 1` × `EP > 1` | Explicitly refused (COMP-001) | Out-of-scope decision recorded; see `.agent-progress/device-mesh-refactor-tracker.md` |
 
 Each implemented cell requires its applicable named hardware gate (for
 example, `HW-001`, `HW-002`, `HW-003`, `HW-004`, `HW-006`, or another gate

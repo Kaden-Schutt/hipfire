@@ -501,13 +501,14 @@ them toward completion.
 
 ### COMP-001 Gate Optional TP x EP Composition
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Make an unconditional scope decision for TP x EP composition in this refactor.
 - **Acceptance criteria:** Record one decision: either TP x EP is out of scope and `TP>1 && EP>1` is explicitly rejected, or a concrete deployment requirement names the model, topology, owner, and measurable success target. In the latter case, create a new conditional COMP task for design/implementation/physical validation; COMP-001 itself completes when the decision and refusal-or-follow-up are recorded and never waits on implementation or hardware.
+- **Decision:** TP×EP is out of scope for this refactor. Requests with `tp > 1 && ep > 1` are explicitly refused at every boundary.
 - **Validation:** Review the requirement record and support matrix; for the out-of-scope decision, run configuration/refusal tests; for the required decision, verify the new follow-up ID exists with dependencies and acceptance criteria.
 - **Hardware:** None
-- **Evidence:** Pending
+- **Evidence:** Implementation in working tree: `config::validate_parallel_axes` rejects the pair with a `Result<(), String>`, the daemon emits its JSON error envelope before the EP-wins remap, and `preflight_manifest` returns a `FulfillError` for a composed Tp×Ep mesh; `cargo test -p hipfire-runtime --lib config::tests` (11 passed), `cargo test -p hipfire-runtime --example daemon load_rejects_tp_ep_before_ep_wins_remap` (1 passed), `cargo test -p hipfire-runtime --lib weight_store::tests` (12 passed); PR #527 mirror synchronized.
 
 ### DOC-001 Consolidate Stale Status Documentation
 

@@ -33,6 +33,7 @@ existing architecture-specific gates characterized by PAR-001.
   that one crate may cover multiple ids — e.g. `Llama::arch_id() == 0`
   but the LLaMA crate's `config_from_hfq` handles HFQ files with
   `arch_id ∈ {0, 1}` by branching on metadata.
+- TP×EP composition is explicitly refused (COMP-001): `--tp` and `--ep` cannot both exceed one. Reopening it requires a concrete deployment requirement and separate implementation/physical-validation task.
 - A future PR may migrate `arch_id = 1` from the LLaMA crate to
   `hipfire-arch-qwen2` once the latter is mature; until then, both
   arch_ids coexist with non-overlapping ownership.

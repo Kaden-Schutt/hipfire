@@ -124,6 +124,17 @@ impl RuntimeConfig {
     }
 }
 
+pub fn validate_parallel_axes(pp: usize, tp: usize, ep: usize) -> Result<(), String> {
+    let _ = pp;
+    if tp > 1 && ep > 1 {
+        return Err(
+            "tensor-parallel (tp) and expert-parallel (ep) are mutually exclusive (COMP-001)"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Decide the effective `(pp, tp, ep)` parallelism degrees for a load. An
 /// explicitly-requested `pp`/`tp`/`ep > 1` (from the load message) always wins.
 /// Only when NONE is requested does `HIPFIRE_EMULATE_GPUS` default the mode — to
@@ -293,6 +304,24 @@ mod tests {
         assert_eq!(super::resolve_parallelism(1, 1, 4, Some(2)), (1, 1, 4));
         // No emulate -> unchanged.
         assert_eq!(super::resolve_parallelism(1, 1, 1, None), (1, 1, 1));
+    }
+
+    #[test]
+    fn validate_parallel_axes_rejects_tp_and_ep() {
+        assert_eq!(
+            super::validate_parallel_axes(1, 2, 2),
+            Err(
+                "tensor-parallel (tp) and expert-parallel (ep) are mutually exclusive (COMP-001)"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn validate_parallel_axes_accepts_other_axis_combinations() {
+        assert_eq!(super::validate_parallel_axes(1, 2, 1), Ok(()));
+        assert_eq!(super::validate_parallel_axes(1, 1, 2), Ok(()));
+        assert_eq!(super::validate_parallel_axes(2, 1, 1), Ok(()));
     }
 
     #[test]
