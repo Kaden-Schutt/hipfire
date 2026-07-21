@@ -30,7 +30,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ## Current Status
 
-**Foundation implemented; refactor incomplete.** `COR-004`, `COR-003`, `COR-002`, `COR-005`, `STEP-001`, and `PAR-001` are complete. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, STEP-001 DeltaNet migration, and PAR-001 policy characterization work are substantial and tested. Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+**Foundation implemented; refactor incomplete.** `COR-004`, `COR-003`, `COR-002`, `COR-005`, `COR-006`, `STEP-001`, and `PAR-001` are complete. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, COR-006 eviction physical-cap KV alignment, STEP-001 DeltaNet migration, and PAR-001 policy characterization work are substantial and tested. Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
 
 Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) confirmed balanced Qwen35 PP allocation and peer access, but did not close either physical PP gate: dense LLaMA forward hit an unclassified illegal access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded follow-up are recorded under HW-003 and HW-004; neither changes the current execution queue or relaxes exact-parity requirements.
 
@@ -40,10 +40,9 @@ This is the implementation queue. The dependency graph below remains the
 authoritative constraint; a task is marked `in progress` only when work begins.
 
 1. `COMP-001` — decide and enforce the TP x EP scope boundary.
-2. `COR-006` — align eviction physical-cap metadata with KV allocation.
-3. `CAP-001` — define the architecture capability contract and dense-EP normalization.
+2. `CAP-001` — define the architecture capability contract and dense-EP normalization.
 
-`PAR-001` is complete; the next queue is `COMP-001`, `COR-006`, then `CAP-001`.
+`PAR-001` and `COR-006` are complete; the next queue is `COMP-001`, then `CAP-001`.
 The `AXIS-001` through `AXIS-004`, `PAR-002`, and `HW-001` through `HW-013`
 tasks remain dependency-blocked until their capability, family, implementation,
 and topology prerequisites are satisfied. Hardware tasks remain blocked until
@@ -58,6 +57,7 @@ them toward completion.
 - Session/meta collapse: `a7082ee9`, `4b1a2fe8`, `e16e7c01`, `8be7bf63`, and `9c57148d` established `SessionState`, `PersistState`, reset routing, and `ModelMeta` readers.
 - Generic generation foundation: the live `ar_generate` path and StreamParser/ArchDispatch folds are documented with parity evidence in `.agent-memory/notes/daemon-god-struct-archdispatch-design.md` and `.superpowers/sdd/progress.md`.
 - Teardown and peer-order fixes: `eafd8663` and `17fc1c4c` closed the known emulated TP/PP unload leak and corrected peer-access ordering; physical teardown remains tracked below.
+- Eviction physical-cap KV alignment: `770d89ec` added `kv_physical_cap` to `LoadCtx`, threaded it into Qwen35 `KvDims` via the carrier, added pre-allocation budget/beta rejection, and added three VRAM-allocation GPU tests.
 - Scope and authority design: `a1ad8a46` defines this tracker, its PR synchronization rule, and the non-goal of treating emulation as production hardware proof.
 
 ## Active Tasks
@@ -286,7 +286,7 @@ them toward completion.
 
 ### COR-006 Align Eviction Physical-Cap Allocation
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Make the physical capacity derived for TriAttention/CASK size the
   actual Qwen35 KV allocation rather than only eviction metadata and scratch.
@@ -299,7 +299,17 @@ them toward completion.
   beta; run repeated long-context eviction and unload/reload cycles.
 - **Hardware:** A supported AMD GPU with a Qwen35 target and TriAttention
   sidecar.
-- **Evidence:** Pending
+- **Evidence:** Commit `770d89ec` — added `kv_physical_cap: Option<usize>` to
+  `LoadCtx`, threaded it through `Qwen35Carrier::load` into the `KvDims`
+  passed to `load_bundle`, and added pre-allocation rejection of `budget=0`
+  and `budget+beta+4 > max_seq`. Three `#[ignore]`'d GPU tests
+  (`qwen35_cask_physical_cap_reduces_kv_allocation`,
+  `qwen35_cask_rejects_impossible_budget_beta`,
+  `qwen35_no_eviction_load_unchanged`) validate the VRAM differential,
+  fast-reject paths, and non-eviction byte-identity respectively. The
+  `KvCache` capped-filtered constructors (`new_gpu_q8_capped_filtered` et al.)
+  already supported `physical_cap < max_seq` — the gap was only that the
+  derived capacity never reached `KvDims`.
 
 ### GEN-001 Complete Qwen35 Arch-Resident PP
 
