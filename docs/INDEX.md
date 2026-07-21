@@ -70,7 +70,8 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Product onboarding | [`docs/GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | |
 | CLI surface and model lifecycle commands | [`docs/CLI.md`](CLI.md) | shipped / ref-pinned | |
 | Daemon / user config keys | [`docs/CONFIG.md`](CONFIG.md) | shipped / ref-pinned | |
-| Environment variables | [`docs/env-vars.md`](env-vars.md) | shipped / ref-pinned | Env coverage enforced by [`scripts/check-docs-reliability.py`](../scripts/check-docs-reliability.py) (subsumes retired `scripts/check-env-docs.py`). |
+| Copyable TOML config profiles | [`docs/configs/`](configs/README.md) | shipped / ref-pinned | User, developer, and retained-PM4 examples. |
+| Environment variables | [`docs/env-vars.md`](env-vars.md) | shipped / ref-pinned | Env coverage enforced by [`scripts/check-env-docs.py`](../scripts/check-env-docs.py). |
 | Registry models, VRAM, sampling, sidecars | [`docs/MODELS.md`](MODELS.md) | shipped / ref-pinned | Registry presence ≠ runtime admission. |
 | Serve HTTP API | [`docs/SERVE.md`](SERVE.md) | shipped / ref-pinned | |
 | Chat UX and daemon attach behavior | [`docs/CHAT.md`](CHAT.md) | shipped / ref-pinned | |

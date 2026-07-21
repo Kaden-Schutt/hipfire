@@ -3872,4 +3872,15 @@ mod tests {
         assert!(layer.set_cli("dflash_ngram_block", "auto").is_ok());
         assert!(layer.set_cli("dflash_ngram_block", "false").is_ok());
     }
+
+    #[test]
+    fn documented_config_profiles_match_the_schema() {
+        let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/configs");
+        for name in ["user.toml", "developer.toml", "redline-pm4.toml"] {
+            let path = docs.join(name);
+            load_toml_layer(&path).unwrap_or_else(|error| {
+                panic!("{} is not a valid config profile: {error}", path.display())
+            });
+        }
+    }
 }

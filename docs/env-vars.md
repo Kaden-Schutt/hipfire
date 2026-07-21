@@ -217,6 +217,9 @@ it does not project these values into the child environment. The names below
 are accepted only as compatibility/one-shot input to the resolver. Message-
 field-only keys (temperature, thinking, …) have no compatibility alias.
 
+Copyable user, developer, and retained-PM4 TOML profiles are in
+[`docs/configs/`](configs/README.md).
+
 | Config key | Env |
 |---|---|
 | `kv_cache` | `HIPFIRE_KV_MODE` |

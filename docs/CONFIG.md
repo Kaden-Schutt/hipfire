@@ -19,6 +19,10 @@ Persistent stores under `~/.hipfire/`:
    `per_model_config.json`. Migration writes TOML and preserves the JSON files
    for rollback.
 
+Copyable sparse profiles for users, kernel developers, and retained-PM4 work
+live in [`docs/configs/`](configs/README.md). They include direct mappings from
+historical `HIPFIRE_*` inputs to their persistent TOML keys.
+
 Edit interactively: `hipfire config` or `hipfire config <tag>`. Non-interactive: `hipfire config set <key> <value>` / `hipfire config <tag> set <key> <value>`.
 
 **Precedence (operator view):** one-shot CLI values **>** legacy-compatible
@@ -451,6 +455,7 @@ Redline eligibility helper `gfx12_mq4r_redline_default` (same file) is a **narro
 
 | Topic | Owner |
 |---|---|
+| Copyable TOML profiles | [`configs/`](configs/README.md) |
 | Env inventory | [`env-vars.md`](env-vars.md) |
 | Models / registry sampling | [`MODELS.md`](MODELS.md) |
 | Serve API | [`SERVE.md`](SERVE.md) |
