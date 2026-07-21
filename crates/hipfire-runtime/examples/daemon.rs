@@ -12068,10 +12068,21 @@ fn generate_cohere2moe(
     } else {
         0.0
     };
+    // Prefill metrics so the CLI bench measures the REAL production prefill
+    // (batched `forward_batch`) straight off the generate response — mirrors
+    // the qwen35 `done` fields (`ttft_ms` ≈ prefill_ms, `decode_tok_s` = tok_s).
+    // Prior to this, cohere2moe omitted these, so `hipfire bench` fell back to
+    // the synthetic per-token `bench_prefill` path and under-reported prefill ~6×.
+    let prefill_tokens = prefill_ids.len();
+    let prefill_tok_s = if prefill_ms > 0 {
+        (prefill_tokens as f64 * 1000.0) / prefill_ms as f64
+    } else {
+        0.0
+    };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.1},"decode_tok_s":{:.2},"ttft_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
 }
