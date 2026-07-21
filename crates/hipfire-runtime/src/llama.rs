@@ -559,6 +559,22 @@ impl WeightTensor {
         }
         let _ = gpu.free_tensor(self.buf);
     }
+
+    /// Free metadata owned by a tensor whose main buffer is a non-owning alias.
+    /// Tied lm_heads use this path: the output buffer aliases token embeddings,
+    /// but an AWQ sidecar attached to the output remains independently owned.
+    pub fn free_sidecars(self, gpu: &mut Gpu) {
+        if let Some(paro) = self.paro {
+            if !paro.is_alias {
+                let _ = gpu.free_tensor(paro.pairs);
+                let _ = gpu.free_tensor(paro.theta);
+                let _ = gpu.free_tensor(paro.channel_scales);
+            }
+        }
+        if let Some(awq) = self.awq_scale {
+            let _ = gpu.free_tensor(awq);
+        }
+    }
 }
 
 impl WeightTensor {

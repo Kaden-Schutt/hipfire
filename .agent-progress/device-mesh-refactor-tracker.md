@@ -30,7 +30,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ## Current Status
 
-**Foundation implemented; refactor incomplete.** `COR-004` and `COR-003` are complete; no task is currently marked `in progress`. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, and COR-003 terminal lifecycle work are substantial and tested. Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+**Foundation implemented; refactor incomplete.** `COR-004`, `COR-003`, `COR-002`, `COR-005`, and `STEP-001` are complete; no task is currently marked `in progress`. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, and STEP-001 DeltaNet migration work are substantial and tested. Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
 
 Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) confirmed balanced Qwen35 PP allocation and peer access, but did not close either physical PP gate: dense LLaMA forward hit an unclassified illegal access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded follow-up are recorded under HW-003 and HW-004; neither changes the current execution queue or relaxes exact-parity requirements.
 
@@ -39,13 +39,9 @@ Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) con
 This is the implementation queue. The dependency graph below remains the
 authoritative constraint; a task is marked `in progress` only when work begins.
 
-1. `COR-002` — implement the total reset contract now that `COR-004` resolved the
-   ownership boundary.
-2. `STEP-001` — adopt Step/manifest for DeltaNet with single-device parity.
-3. `PAR-001` — publish and enforce the model-family PP/TP/EP support matrix.
-4. `COMP-001` — decide and enforce the TP x EP scope boundary.
-5. `COR-005` — make generic LLaMA/Qwen3 spec-target loading transactional.
-6. `COR-006` — align eviction physical-cap metadata with KV allocation.
+1. `PAR-001` — publish and enforce the model-family PP/TP/EP support matrix.
+2. `COMP-001` — decide and enforce the TP x EP scope boundary.
+3. `COR-006` — align eviction physical-cap metadata with KV allocation.
 
 After those ownership, execution, and support decisions, schedule their
 dependent work by the dependency graph. Hardware tasks remain blocked until
@@ -303,13 +299,13 @@ them toward completion.
 
 ### STEP-001 Adopt Step/Manifest For DeltaNet
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Represent Qwen35 DeltaNet weights, state, and forward execution through manifests and the Step spine.
 - **Acceptance criteria:** The Qwen35 weight manifest covers layer-type-specific fused projections, norms, convolution, recurrent parameters, and dense/MoE variants; placement derives from policy; DeltaNet forward emits/executes Steps without a parallel bespoke layer loop; single-device output remains identical.
 - **Validation:** Run manifest coverage/placement tests, source-to-store byte/dtype checks, Step-versus-legacy deterministic parity during migration, and Qwen35 coherence tests.
 - **Hardware:** None for manifest tests; a supported AMD GPU for forward parity.
-- **Evidence:** Pending
+- **Evidence:** Qwen35 manifest/resolver/transactional fulfillment is complete, covering the six semantic Steps through the canonical Step paths. Raw-vs-Step GPU parity passed on gfx1151 with HIP 7.2 using `qwen3.5-0.8b`. DFlash coherence passed with report `/tmp/coherence-dflash-20260720-222434.md`; serve multiturn passed with report `/tmp/serve-multiturn-20260720-222552.md`; final cargo checks/tests passed. Paro MoE remains intentionally on the legacy loader pending representation of separate gate/up projections plus shared sidecars; Paro GPU fixture parity was not run.
 
 ### STEP-002 Adopt Step/Manifest For MoE
 

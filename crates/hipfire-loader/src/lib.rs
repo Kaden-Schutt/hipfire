@@ -2268,6 +2268,14 @@ pub fn load_model_tp(
     let arch_id = hfq.arch_id;
     let mtp_mode = mtp_mode_from_spec(spec);
     let mtp_k = normalize_mtp_k(arch_id, spec.mtp_k)?;
+    #[cfg(feature = "arch-qwen35")]
+    if matches!(arch_id, 5 | 6) {
+        let config =
+            <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(
+                &hfq,
+            )?;
+        hipfire_arch_qwen35::arch::qwen35_tp_preflight(&config, mesh.size_of(DimKind::Tp))?;
+    }
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let chat_template = resolve_chat_template(&hfq, path);
@@ -4225,6 +4233,64 @@ mod reset_ownership_tests {
             "single Qwen35 model unexpectedly carries pipeline metadata"
         )
         .is_gpu_fatal());
+    }
+}
+
+#[cfg(all(test, feature = "arch-qwen35"))]
+mod qwen35_tp_loader_tests {
+    use super::load_model_tp;
+    use hipfire_runtime::loader_api::SpecLoadCfg;
+    use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind};
+    use std::io::Write;
+
+    fn write_metadata_only_hfq(path: &std::path::Path) {
+        let metadata = serde_json::json!({
+            "architecture": "qwen35",
+            "config": {
+                "hidden_size": 1024,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 8,
+                "vocab_size": 1000,
+                "layer_types": ["linear_attention"]
+            }
+        })
+        .to_string();
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let data_offset = (index_offset + 4 + 4095) & !4095;
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"HFQM").unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&5u32.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        file.write_all(&data_offset.to_le_bytes()).unwrap();
+        file.write_all(metadata.as_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(vec![0; (data_offset - index_offset - 4) as usize].as_slice())
+            .unwrap();
+    }
+
+    #[test]
+    fn load_model_tp_rejects_qwen35_before_tokenizer_or_gpu_work() {
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-qwen35-tp-preflight-{}-{}.hfq",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        write_metadata_only_hfq(&path);
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+
+        let result = load_model_tp(path.to_str().unwrap(), 8, &mesh, SpecLoadCfg::default());
+        let error = match result {
+            Ok(_) => panic!("Qwen35 Tp=2 must be rejected before GPU work"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "qwen35: Tp=2 is unsupported for DeltaNet wqkv (layer 0)"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }
 

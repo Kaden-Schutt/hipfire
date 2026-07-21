@@ -21,6 +21,12 @@ use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
 
+#[cfg(feature = "deltanet")]
+use crate::ops::delta_net::{
+    DeltaNetBatchIntent, DeltaNetBatchParams, DeltaNetStepParams, DeltaNetTreeParams,
+    DeltaNetTreeState, StateQuant,
+};
+
 /// Rotation disposition of a Gemv's input. Borrows (never owns a RotatedActivation).
 pub enum GemvInput<'a> {
     Raw(&'a GpuTensor),        // launch_op self-rotates via run_auto (plan-aware)
@@ -38,7 +44,9 @@ pub enum GemvInput<'a> {
 ///   weighted combine into the kernel and writes directly into the EP partial. Used
 ///   by MQ2L (minimax self-combining path) and MQ3L (the only down path for MQ3L).
 ///   Calling [`Step::MoeCombine`] after `DownResidual` would double-accumulate.
+///
 /// Score activation kind for in-place MoE routing pre-op.
+///
 /// Applied to the raw router logits before [`Step::MoeRoute`].
 #[derive(Clone, Copy, Debug)]
 pub enum ScoreActKind {
@@ -77,6 +85,281 @@ pub enum MoeProj<'a> {
     DownResidualI64 { topk_weights: &'a GpuTensor },
 }
 
+/// Borrowed execution shape for the DeltaNet recurrence. The six semantic
+/// [`Step`] variants stay dtype-agnostic; quantization and the decode,
+/// prefill, replay, or tree route are carried by the existing DeltaNet
+/// parameter contracts instead of multiplying the Step enum by dtype.
+#[cfg(feature = "deltanet")]
+pub enum DeltaRecurrenceParams<'a> {
+    Step(DeltaNetStepParams<'a>),
+    Batch {
+        params: DeltaNetBatchParams<'a>,
+        intent: DeltaNetBatchIntent,
+    },
+    Tree(DeltaNetTreeParams<'a>),
+}
+
+/// All caller-owned operands shared by the DeltaNet decode and batch/tree
+/// lowering paths.  This is deliberately a view: it does not allocate, own, or
+/// move recurrent state.  Qwen35 constructs it from the global-layer → compact
+/// state adapter and the per-layer scratch buffers.
+#[cfg(feature = "deltanet")]
+pub struct DeltaNetOperandDescriptor<'a> {
+    pub qkv: &'a GpuTensor,
+    pub q: &'a GpuTensor,
+    pub k: &'a GpuTensor,
+    pub v: &'a GpuTensor,
+    pub q_raw: &'a GpuTensor,
+    pub k_raw: &'a GpuTensor,
+    pub alpha: &'a GpuTensor,
+    pub beta: &'a GpuTensor,
+    pub dt_bias: Option<&'a GpuTensor>,
+    pub a_log: Option<&'a GpuTensor>,
+    pub state: &'a GpuTensor,
+    pub s_scales: &'a GpuTensor,
+    pub ef_residual: Option<&'a GpuTensor>,
+    pub conv_weight: &'a GpuTensor,
+    pub conv_state: &'a GpuTensor,
+    pub attn_out: &'a GpuTensor,
+    pub normed: Option<&'a GpuTensor>,
+    pub z: Option<&'a GpuTensor>,
+    pub norm_weight: Option<&'a GpuTensor>,
+    pub n_key_heads: usize,
+    pub n_value_heads: usize,
+    pub head_dim: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub q_scale: f32,
+    pub eps: f32,
+    pub quant: StateQuant,
+}
+
+#[cfg(feature = "deltanet")]
+impl<'a> DeltaNetOperandDescriptor<'a> {
+    fn recurrence_step(&self) -> DeltaNetStepParams<'a> {
+        DeltaNetStepParams {
+            q: self.q,
+            k: self.k,
+            v: self.v,
+            gate: self.alpha,
+            beta: self.beta,
+            state: self.state,
+            s_scales: self.s_scales,
+            output: self.attn_out,
+            ef_residual: self.ef_residual,
+            n_heads: self.n_value_heads,
+            head_dim: self.head_dim,
+            quant: self.quant,
+        }
+    }
+
+    fn gated_norm(&self, batch_size: usize) -> Option<Step<'a>> {
+        Some(Step::DeltaGatedNorm {
+            x: self.attn_out,
+            z: self.z?,
+            weight: self.norm_weight?,
+            out: self.normed?,
+            n_heads: self.n_value_heads,
+            head_dim: self.head_dim,
+            eps: self.eps,
+            batch_size,
+        })
+    }
+}
+
+/// Build the single-token DeltaNet attention body.  The decode builder uses
+/// the scalar kernels by setting `batch_size = 1`; it never changes the
+/// caller-owned state or creates a second state owner.
+#[cfg(feature = "deltanet")]
+pub fn build_delta_net_decode_steps<'a>(d: &'a DeltaNetOperandDescriptor<'a>) -> Vec<Step<'a>> {
+    vec![
+        Step::DeltaGatePrep {
+            beta: d.beta,
+            alpha: d.alpha,
+            dt_bias: d.dt_bias.expect("decode builder requires dt_bias"),
+            a_log: d.a_log.expect("decode builder requires a_log"),
+            n: d.n_value_heads,
+            batch_size: 1,
+        },
+        Step::DeltaConvSplit {
+            q_out: d.q_raw,
+            k_out: d.k_raw,
+            v_out: d.v,
+            input: d.qkv,
+            weight: d.conv_weight,
+            state: d.conv_state,
+            parent_indices: None,
+            k_dim: d.key_dim,
+            v_dim: d.value_dim,
+            n_tokens: 1,
+        },
+        Step::DeltaQkL2Norm {
+            q: d.q_raw,
+            k: d.k_raw,
+            n_key_heads: d.n_key_heads,
+            head_dim: d.head_dim,
+            q_scale: d.q_scale,
+            eps: d.eps,
+            batch_size: 1,
+        },
+        Step::DeltaRepeatHeads {
+            q_src: d.q_raw,
+            k_src: d.k_raw,
+            q_dst: d.q,
+            k_dst: d.k,
+            n_key_heads: d.n_key_heads,
+            ratio: d.n_value_heads / d.n_key_heads,
+            head_dim: d.head_dim,
+            batch_size: 1,
+        },
+        Step::DeltaRecurrence {
+            params: DeltaRecurrenceParams::Step(d.recurrence_step()),
+        },
+        d.gated_norm(1)
+            .expect("decode builder requires gated norm operands"),
+    ]
+}
+
+/// Build the real batched DeltaNet attention body.  `tree_state` selects the
+/// read-only tree tape route; `None` selects ordinary sequential prefill.
+/// Batch size is threaded into every operation, so this cannot accidentally
+/// lower a prefill/tree request into B=1 decode steps.
+#[cfg(feature = "deltanet")]
+pub fn build_delta_net_batch_steps<'a>(
+    d: &'a DeltaNetOperandDescriptor<'a>,
+    n_tokens: usize,
+    intent: DeltaNetBatchIntent,
+    tree_state: Option<DeltaNetTreeState<'a>>,
+    parent_indices: Option<&'a GpuTensor>,
+) -> Result<Vec<Step<'a>>, String> {
+    if n_tokens == 0 {
+        return Err("DeltaNet batch builder requires at least one token".into());
+    }
+    if tree_state.is_some() != parent_indices.is_some() {
+        return Err("DeltaNet tree builder requires parent indices and tape state together".into());
+    }
+    let recurrence = if let Some(state) = tree_state {
+        DeltaRecurrenceParams::Tree(DeltaNetTreeParams::new(
+            d.q,
+            d.k,
+            d.v,
+            d.alpha,
+            d.beta,
+            state,
+            parent_indices.expect("tree state checked above"),
+            d.attn_out,
+            n_tokens,
+            d.n_value_heads,
+            d.head_dim,
+        ))
+    } else {
+        DeltaRecurrenceParams::Batch {
+            params: DeltaNetBatchParams {
+                q_batch: d.q,
+                k_batch: d.k,
+                v_batch: d.v,
+                gate_batch: d.alpha,
+                beta_batch: d.beta,
+                state: d.state,
+                s_scales: d.s_scales,
+                output_batch: d.attn_out,
+                ef_residual: d.ef_residual,
+                n_tokens,
+                n_heads: d.n_value_heads,
+                head_dim: d.head_dim,
+                quant: d.quant,
+            },
+            intent,
+        }
+    };
+
+    let mut steps = Vec::with_capacity(6);
+    if matches!(intent, DeltaNetBatchIntent::NormalPrefill) {
+        steps.push(Step::DeltaGatePrep {
+            beta: d.beta,
+            alpha: d.alpha,
+            dt_bias: d.dt_bias.expect("prefill builder requires dt_bias"),
+            a_log: d.a_log.expect("prefill builder requires a_log"),
+            n: d.n_value_heads,
+            batch_size: n_tokens,
+        });
+    }
+    steps.extend([
+        Step::DeltaConvSplit {
+            q_out: d.q_raw,
+            k_out: d.k_raw,
+            v_out: d.v,
+            input: d.qkv,
+            weight: d.conv_weight,
+            state: d.conv_state,
+            parent_indices,
+            k_dim: d.key_dim,
+            v_dim: d.value_dim,
+            n_tokens,
+        },
+        Step::DeltaQkL2Norm {
+            q: d.q_raw,
+            k: d.k_raw,
+            n_key_heads: d.n_key_heads,
+            head_dim: d.head_dim,
+            q_scale: d.q_scale,
+            eps: d.eps,
+            batch_size: n_tokens,
+        },
+        Step::DeltaRepeatHeads {
+            q_src: d.q_raw,
+            k_src: d.k_raw,
+            q_dst: d.q,
+            k_dst: d.k,
+            n_key_heads: d.n_key_heads,
+            ratio: d.n_value_heads / d.n_key_heads,
+            head_dim: d.head_dim,
+            batch_size: n_tokens,
+        },
+        Step::DeltaRecurrence { params: recurrence },
+    ]);
+    if let Some(norm) = d.gated_norm(n_tokens) {
+        steps.push(norm);
+    }
+    Ok(steps)
+}
+
+/// Explicit tree-verify builder. Kept separate from the ordinary batch entry
+/// point so callers cannot accidentally omit the tape when lowering a tree.
+#[cfg(feature = "deltanet")]
+pub fn build_delta_net_tree_steps<'a>(
+    d: &'a DeltaNetOperandDescriptor<'a>,
+    n_tokens: usize,
+    parent_indices: &'a GpuTensor,
+    tape: &'a GpuTensor,
+    tape_scales: Option<&'a GpuTensor>,
+) -> Result<Vec<Step<'a>>, String> {
+    let tree_state = match d.quant {
+        StateQuant::FP32 => DeltaNetTreeState::F32 {
+            initial: d.state,
+            tape,
+        },
+        StateQuant::Q8 => DeltaNetTreeState::Q8 {
+            initial: d.state,
+            scales: d.s_scales,
+            tape,
+            tape_scales: tape_scales.ok_or("Q8 tree builder requires tape scales")?,
+        },
+        StateQuant::Q4 => {
+            return Err(
+                "Q4 DeltaNet state + tree-verify (DDTree) is unsupported: there is no Q4 tree-tape GDN kernel. Use Q8 or FP32 state for tree spec-decode.".into(),
+            )
+        }
+    };
+    build_delta_net_batch_steps(
+        d,
+        n_tokens,
+        DeltaNetBatchIntent::NormalPrefill,
+        Some(tree_state),
+        Some(parent_indices),
+    )
+}
+
 pub enum Step<'a> {
     Gemv {
         w: &'a WeightRef<'a>,
@@ -100,6 +383,75 @@ pub enum Step<'a> {
         x: &'a GpuTensor,
         y: &'a GpuTensor,
         batch: usize,
+    },
+    /// Batched GEMM dispatched by an explicit kernel-table key. This preserves
+    /// the caller's arch-specific routing for mixed quant formats.
+    GemmKeyedBatched {
+        w: &'a WeightRef<'a>,
+        x: &'a GpuTensor,
+        y: &'a GpuTensor,
+        batch: usize,
+        key: KernelKey,
+    },
+    /// Batched rmsnorm with the same optional FWHT/Givens rotation contract as
+    /// `RmsnormAutomatic`. Kept separate so existing decode Step literals keep
+    /// their B=1 semantics while prefill/tree callers must state their batch.
+    RmsnormBatched {
+        x: &'a GpuTensor,
+        norm_weight: &'a GpuTensor,
+        x_plain: &'a GpuTensor,
+        out: &'a GpuTensor,
+        awq_scale: Option<&'a GpuTensor>,
+        k: usize,
+        eps: f32,
+        rotation: RotationPlan,
+        batch: usize,
+    },
+    /// Batched Paro/Givens activation rotation. The rotation metadata is
+    /// borrowed from the weight sidecar; no temporary owner is created.
+    GivensRotateBatched {
+        x: &'a GpuTensor,
+        out: &'a GpuTensor,
+        pairs: &'a GpuTensor,
+        theta: &'a GpuTensor,
+        scales: &'a GpuTensor,
+        batch: usize,
+        dim: usize,
+        krot: usize,
+    },
+    /// Batched FWHT rotation for an already-normalized activation.
+    RotateFwhtBatched {
+        x: &'a GpuTensor,
+        out: &'a GpuTensor,
+        awq_scale: Option<&'a GpuTensor>,
+        k: usize,
+        batch: usize,
+    },
+    /// Four-way batched DeltaNet QKVZA projection.
+    #[cfg(feature = "deltanet")]
+    FusedQkvzaBatched {
+        wqkv: &'a WeightRef<'a>,
+        wz: &'a WeightRef<'a>,
+        w_beta: &'a WeightRef<'a>,
+        w_alpha: &'a WeightRef<'a>,
+        x: &'a GpuTensor,
+        qkv: &'a GpuTensor,
+        z: &'a GpuTensor,
+        beta: &'a GpuTensor,
+        alpha: &'a GpuTensor,
+        m: [usize; 4],
+        k: usize,
+        batch: usize,
+        key: KernelKey,
+    },
+    /// Batched output projection with the residual add performed by the
+    /// selected residual GEMM kernel.
+    GemmResidualBatched {
+        w: &'a WeightRef<'a>,
+        x: &'a GpuTensor,
+        residual: &'a GpuTensor,
+        batch: usize,
+        key: KernelKey,
     },
     /// Fused rmsnorm + optional FWHT rotation. The `rotation` field is derived
     /// by the caller via `dtype_rotation_plan(w.dtype)`. `out` holds the
@@ -146,6 +498,70 @@ pub enum Step<'a> {
         x: &'a GpuTensor,
         bias: &'a GpuTensor,
         dim: usize,
+    },
+    #[cfg(feature = "deltanet")]
+    /// DeltaNet alpha/beta preparation. All tensors are caller-owned.
+    DeltaGatePrep {
+        beta: &'a GpuTensor,
+        alpha: &'a GpuTensor,
+        dt_bias: &'a GpuTensor,
+        a_log: &'a GpuTensor,
+        n: usize,
+        batch_size: usize,
+    },
+    #[cfg(feature = "deltanet")]
+    /// Causal convolution and Q/K/V split. `parent_indices` selects the
+    /// read-only tree kernel; `None` selects the linear decode/prefill route.
+    DeltaConvSplit {
+        q_out: &'a GpuTensor,
+        k_out: &'a GpuTensor,
+        v_out: &'a GpuTensor,
+        input: &'a GpuTensor,
+        weight: &'a GpuTensor,
+        state: &'a GpuTensor,
+        parent_indices: Option<&'a GpuTensor>,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+    },
+    #[cfg(feature = "deltanet")]
+    /// In-place per-head Q/K L2 normalization and Q scaling.
+    DeltaQkL2Norm {
+        q: &'a GpuTensor,
+        k: &'a GpuTensor,
+        n_key_heads: usize,
+        head_dim: usize,
+        q_scale: f32,
+        eps: f32,
+        batch_size: usize,
+    },
+    #[cfg(feature = "deltanet")]
+    /// Copy normalized key heads into the value/query head layout.
+    DeltaRepeatHeads {
+        q_src: &'a GpuTensor,
+        k_src: &'a GpuTensor,
+        q_dst: &'a GpuTensor,
+        k_dst: &'a GpuTensor,
+        n_key_heads: usize,
+        ratio: usize,
+        head_dim: usize,
+        batch_size: usize,
+    },
+    #[cfg(feature = "deltanet")]
+    /// Recurrent DeltaNet update/read with borrowed state, scales, tape, and
+    /// optional Q8 error-feedback rows.
+    DeltaRecurrence { params: DeltaRecurrenceParams<'a> },
+    #[cfg(feature = "deltanet")]
+    /// z-gated output normalization.
+    DeltaGatedNorm {
+        x: &'a GpuTensor,
+        z: &'a GpuTensor,
+        weight: &'a GpuTensor,
+        out: &'a GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        batch_size: usize,
     },
     /// SwiGLU activation: `out = silu(gate) * up` (elementwise). Present so a
     /// dense FFN block can be one contiguous step list — the IR previously fused
@@ -326,7 +742,14 @@ fn op_kind(step: &Step) -> PipelineOp {
         // Reuses the Gemv tag: op_kind only feeds the fused-decode prefix table,
         // which the prefill-only Gemm step never enters.
         Step::Gemm { .. } => PipelineOp::Gemv,
+        Step::GemmKeyedBatched { .. } => PipelineOp::Gemv,
+        Step::RmsnormBatched { .. } => PipelineOp::RmsnormAutomatic,
+        Step::GivensRotateBatched { .. } => PipelineOp::GivensRotate,
+        Step::RotateFwhtBatched { .. } => PipelineOp::RotateFwht,
         Step::GemvResidual { .. } => PipelineOp::GemvResidual,
+        Step::GemmResidualBatched { .. } => PipelineOp::GemvResidual,
+        #[cfg(feature = "deltanet")]
+        Step::FusedQkvzaBatched { .. } => PipelineOp::Gemv,
         Step::RmsnormAutomatic { .. } => PipelineOp::RmsnormAutomatic,
         Step::Attend { .. } => PipelineOp::Attend,
         Step::Rope { .. } => PipelineOp::Rope,
@@ -334,6 +757,18 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
         Step::SiluMul { .. } => PipelineOp::SiluMul,
         Step::ResidualAdd { .. } => PipelineOp::ResidualAdd,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaGatePrep { .. } => PipelineOp::DeltaGatePrep,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaConvSplit { .. } => PipelineOp::DeltaConvSplit,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaQkL2Norm { .. } => PipelineOp::DeltaQkL2Norm,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaRepeatHeads { .. } => PipelineOp::DeltaRepeatHeads,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaRecurrence { .. } => PipelineOp::DeltaRecurrence,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaGatedNorm { .. } => PipelineOp::DeltaGatedNorm,
         // MoE decode ops (Task 4). Not fusible — no entry in FUSED_TABLE.
         Step::MoeRoute { .. } => PipelineOp::MoeRoute,
         Step::IndexedMoeGemv { .. } => PipelineOp::IndexedMoeGemv,
@@ -699,11 +1134,13 @@ pub fn match_prefix(
 /// lowering (`superop::lower_layer`) calls THIS — reusing the same table + guards
 /// verbatim — so a lowered program can never drift from what `execute_steps`
 /// would dispatch live (the fusion-drift mitigation, spike risk #1).
+#[allow(dead_code)]
 pub(crate) fn match_fused_prefix(steps: &[Step], ctx: &DispatchCtx) -> Option<(KernelKey, usize)> {
     match_prefix(FUSED_TABLE, steps, ctx)
 }
 
 /// Public(crate) op-kind accessor for the lowering (mirror of the private `op_kind`).
+#[allow(dead_code)]
 pub(crate) fn step_op_kind(step: &Step) -> PipelineOp {
     op_kind(step)
 }
@@ -726,6 +1163,95 @@ const GATE_UP2: &[PipelineOp] = &[
     PipelineOp::Gemv,
     PipelineOp::Gemv,
 ];
+
+#[cfg(feature = "deltanet")]
+const DELTA_QK_REPEAT: &[PipelineOp] = &[PipelineOp::DeltaQkL2Norm, PipelineOp::DeltaRepeatHeads];
+
+#[cfg(feature = "deltanet")]
+fn guard_delta_qk_repeat(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused || steps.len() != 2 {
+        return false;
+    }
+    let (
+        q,
+        k,
+        n_key_heads,
+        norm_head_dim,
+        norm_batch_size,
+        q_src,
+        k_src,
+        q_dst,
+        k_dst,
+        repeat_key_heads,
+        ratio,
+        repeat_head_dim,
+        repeat_batch_size,
+    ) = match (&steps[0], &steps[1]) {
+        (
+            Step::DeltaQkL2Norm {
+                q,
+                k,
+                n_key_heads,
+                head_dim,
+                batch_size,
+                ..
+            },
+            Step::DeltaRepeatHeads {
+                q_src,
+                k_src,
+                q_dst,
+                k_dst,
+                n_key_heads: repeat_key_heads,
+                ratio,
+                head_dim: repeat_head_dim,
+                batch_size: repeat_batch_size,
+            },
+        ) => (
+            *q,
+            *k,
+            *n_key_heads,
+            *head_dim,
+            *batch_size,
+            *q_src,
+            *k_src,
+            *q_dst,
+            *k_dst,
+            *repeat_key_heads,
+            *ratio,
+            *repeat_head_dim,
+            *repeat_batch_size,
+        ),
+        _ => return false,
+    };
+
+    // The only fused implementation is the batched interleave kernel. Keep
+    // the decode path on the two standalone operations and reject aliasing:
+    // the fused kernel reads the normalized source and writes the repeated
+    // destination in one launch.
+    norm_batch_size > 1
+        && norm_batch_size == repeat_batch_size
+        && n_key_heads == repeat_key_heads
+        && norm_head_dim == repeat_head_dim
+        && ratio > 1
+        && q.dtype == DType::F32
+        && k.dtype == DType::F32
+        && q_src.dtype == DType::F32
+        && k_src.dtype == DType::F32
+        && q_dst.dtype == DType::F32
+        && k_dst.dtype == DType::F32
+        && q.buf.as_ptr() == q_src.buf.as_ptr()
+        && k.buf.as_ptr() == k_src.buf.as_ptr()
+        && q.buf.as_ptr() != k.buf.as_ptr()
+        && q_dst.buf.as_ptr() != q.buf.as_ptr()
+        && k_dst.buf.as_ptr() != k.buf.as_ptr()
+        && q_dst.buf.as_ptr() != k.buf.as_ptr()
+        && k_dst.buf.as_ptr() != q.buf.as_ptr()
+        && q_dst.buf.as_ptr() != k_dst.buf.as_ptr()
+        && q.numel() == norm_batch_size * n_key_heads * norm_head_dim
+        && k.numel() == norm_batch_size * n_key_heads * norm_head_dim
+        && q_dst.numel() == norm_batch_size * n_key_heads * ratio * norm_head_dim
+        && k_dst.numel() == norm_batch_size * n_key_heads * ratio * norm_head_dim
+}
 
 const FUSED_TABLE: &[FusedPattern] = &[
     // ── QKV 3-way ──────────────────────────────────────────────────────────
@@ -847,10 +1373,17 @@ const FUSED_TABLE: &[FusedPattern] = &[
         key: KernelKey::FusedQkvParo4G128T,
         guard: guard_qkv_paro4g128t,
     },
+    #[cfg(feature = "deltanet")]
+    FusedPattern {
+        ops: DELTA_QK_REPEAT,
+        key: KernelKey::FusedDeltaQkL2NormRepeat,
+        guard: guard_delta_qk_repeat,
+    },
 ];
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 static FUSED_QKV: OnceLock<FusedQkvFamily> = OnceLock::new();
+static GEMM: OnceLock<crate::families::gemm::GemmFamily> = OnceLock::new();
 
 pub fn execute_steps(
     gpu: &mut Gpu,
@@ -947,6 +1480,8 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         Step::Gemv { out, .. } => Some(&out.buf),
         Step::GemvResidual { out, .. } => Some(&out.buf),
         Step::Gemm { y, .. } => Some(&y.buf),
+        Step::GemmKeyedBatched { y, .. } => Some(&y.buf),
+        Step::GemmResidualBatched { residual, .. } => Some(&residual.buf),
         // EP partial: combine result or residual-fused down result.
         Step::MoeCombine { out, .. } => Some(&out.buf),
         Step::IndexedMoeGemv {
@@ -969,6 +1504,13 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         // ConvertI64ToF32: on the EP i64 path (ZeroI64Only→DownResidualI64→ConvertI64ToF32→AllReduce{Ep}),
         // the f32 `dst` IS the EP partial that the AllReduce{Ep} collective must target.
         Step::ConvertI64ToF32 { dst, .. } => Some(&dst.buf),
+        #[cfg(feature = "deltanet")]
+        Step::DeltaGatePrep { .. }
+        | Step::DeltaConvSplit { .. }
+        | Step::DeltaQkL2Norm { .. }
+        | Step::DeltaRepeatHeads { .. }
+        | Step::DeltaRecurrence { .. }
+        | Step::DeltaGatedNorm { .. } => None,
         _ => None,
     }
 }
@@ -1291,6 +1833,25 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             let gemv = GEMV.get_or_init(GemvFamily::new);
             gemv.run_auto(ctx, gpu, w, x, out)
         }
+        Step::GemmKeyedBatched {
+            w,
+            x,
+            y,
+            batch,
+            key,
+        } => GEMM
+            .get_or_init(crate::families::gemm::GemmFamily::new)
+            .run_key(
+                *key,
+                ctx,
+                gpu,
+                &crate::families::gemm::GemmParams {
+                    w,
+                    x,
+                    y,
+                    batch_size: *batch,
+                },
+            ),
         Step::Gemm { w, x, y, batch } => {
             // Batched (B>1) GEMM. Mirrors runtime `weight_gemm` (llama.rs:1444)
             // per-dtype against a `WeightRef`; the batched kernels live in
@@ -1329,6 +1890,58 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                     "Step::Gemm: dtype {other:?} not wired (add its weight_gemm arm)"
                 ))),
             }
+        }
+        Step::GemmResidualBatched {
+            w,
+            x,
+            residual,
+            batch,
+            key,
+        } => GEMM
+            .get_or_init(crate::families::gemm::GemmFamily::new)
+            .run_key(
+                *key,
+                ctx,
+                gpu,
+                &crate::families::gemm::GemmParams {
+                    w,
+                    x,
+                    y: residual,
+                    batch_size: *batch,
+                },
+            ),
+        #[cfg(feature = "deltanet")]
+        Step::FusedQkvzaBatched {
+            wqkv,
+            wz,
+            w_beta,
+            w_alpha,
+            x,
+            qkv,
+            z,
+            beta,
+            alpha,
+            m,
+            k,
+            batch,
+            key,
+        } => {
+            let weights = [wqkv.buf, wz.buf, w_beta.buf, w_alpha.buf];
+            let outputs = [*qkv, *z, *beta, *alpha];
+            FUSED_QKV.get_or_init(FusedQkvFamily::new).run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: *key,
+                    weights: &weights,
+                    x,
+                    outputs: &outputs,
+                    m: &m[..],
+                    k: *k,
+                    rot_scratch: &[],
+                    batch_size: Some(*batch),
+                },
+            )
         }
         Step::Gemv {
             w,
@@ -1505,6 +2118,72 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                     .map_err(|e| DispatchError::Hip(e.to_string()))
             }
         }
+        Step::RmsnormBatched {
+            x,
+            norm_weight,
+            x_plain,
+            out,
+            awq_scale,
+            k,
+            eps,
+            rotation,
+            batch,
+        } => {
+            if *rotation == RotationPlan::None {
+                gpu.rmsnorm_batched(x, norm_weight, out, *batch, *k, *eps)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
+            } else {
+                ROTATION
+                    .get_or_init(RotationFamily::new)
+                    .run(
+                        ctx,
+                        gpu,
+                        RotationParams {
+                            x,
+                            x_up: None,
+                            w_norm: Some(norm_weight),
+                            x_plain,
+                            x_rot: out,
+                            awq_scale: *awq_scale,
+                            k: *k,
+                            eps: *eps,
+                            batch_size: *batch,
+                            variant: RotationVariant::WithRmsnorm,
+                            givens_pairs: None,
+                            givens_theta: None,
+                            givens_scales: None,
+                            givens_krot: None,
+                        },
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
+            }
+        }
+        Step::GivensRotateBatched {
+            x,
+            out,
+            pairs,
+            theta,
+            scales,
+            batch,
+            dim,
+            krot,
+        } => gpu
+            .givens_rotate_to(x, out, pairs, theta, scales, *batch, *dim, *krot)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::RotateFwhtBatched {
+            x,
+            out,
+            awq_scale,
+            k,
+            batch,
+        } => match awq_scale {
+            Some(scale) => gpu
+                .rotate_x_mq_awq_batched(x, scale, out, *k, *batch)
+                .map_err(|e| DispatchError::Hip(e.to_string())),
+            None => gpu
+                .rotate_x_mq_batched(x, out, *k, *batch)
+                .map_err(|e| DispatchError::Hip(e.to_string())),
+        },
         Step::Attend { plan, io } => {
             use crate::families::attention::AttentionFamily;
             static ATTENTION: OnceLock<AttentionFamily> = OnceLock::new();
@@ -1540,6 +2219,168 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::ResidualAdd { x, y, dim: _ } => gpu
             .add_f32(x, y, x)
             .map_err(|e| DispatchError::Hip(e.to_string())),
+        #[cfg(feature = "deltanet")]
+        Step::DeltaGatePrep {
+            beta,
+            alpha,
+            dt_bias,
+            a_log,
+            n,
+            batch_size,
+        } => {
+            let result = if *batch_size > 1 {
+                gpu.fused_sigmoid_alpha_gate_f32_batched(
+                    beta,
+                    alpha,
+                    dt_bias,
+                    a_log,
+                    *n,
+                    *batch_size,
+                )
+            } else {
+                gpu.fused_sigmoid_alpha_gate_f32(beta, alpha, dt_bias, a_log, *n)
+            };
+            result.map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        #[cfg(feature = "deltanet")]
+        Step::DeltaConvSplit {
+            q_out,
+            k_out,
+            v_out,
+            input,
+            weight,
+            state,
+            parent_indices,
+            k_dim,
+            v_dim,
+            n_tokens,
+        } => {
+            let result = if let Some(parents) = parent_indices {
+                gpu.conv1d_silu_split_tree_f32_n(
+                    q_out, k_out, v_out, input, weight, state, parents, *k_dim, *v_dim, *n_tokens,
+                )
+            } else if *n_tokens > 1 {
+                gpu.conv1d_silu_split_f32_n(
+                    q_out, k_out, v_out, input, weight, state, *k_dim, *v_dim, *n_tokens,
+                )
+            } else {
+                gpu.conv1d_silu_split_f32(q_out, k_out, v_out, input, weight, state, *k_dim, *v_dim)
+            };
+            result.map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        #[cfg(feature = "deltanet")]
+        Step::DeltaQkL2Norm {
+            q,
+            k,
+            n_key_heads,
+            head_dim,
+            q_scale,
+            eps,
+            batch_size,
+        } => {
+            let result = if *batch_size > 1 {
+                gpu.fused_qk_l2_norm_scale_f32_batched(
+                    q,
+                    k,
+                    *n_key_heads,
+                    *head_dim,
+                    *q_scale,
+                    *eps,
+                    *batch_size,
+                )
+            } else {
+                gpu.fused_qk_l2_norm_scale_f32(q, k, *n_key_heads, *head_dim, *q_scale, *eps)
+            };
+            result.map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        #[cfg(feature = "deltanet")]
+        Step::DeltaRepeatHeads {
+            q_src,
+            k_src,
+            q_dst,
+            k_dst,
+            n_key_heads,
+            ratio,
+            head_dim,
+            batch_size,
+        } => {
+            let result = if *ratio <= 1 {
+                let bytes = n_key_heads * head_dim * batch_size * 4;
+                let q_result = if q_src.buf.as_ptr() == q_dst.buf.as_ptr() {
+                    Ok(())
+                } else {
+                    gpu.memcpy_dtod_auto(&q_dst.buf, &q_src.buf, bytes)
+                };
+                q_result.and_then(|_| {
+                    if k_src.buf.as_ptr() == k_dst.buf.as_ptr() {
+                        Ok(())
+                    } else {
+                        gpu.memcpy_dtod_auto(&k_dst.buf, &k_src.buf, bytes)
+                    }
+                })
+            } else if *batch_size > 1 {
+                gpu.repeat_interleave_qk_f32_batched(
+                    q_src,
+                    k_src,
+                    q_dst,
+                    k_dst,
+                    *n_key_heads,
+                    *ratio,
+                    *head_dim,
+                    *batch_size,
+                )
+            } else {
+                gpu.repeat_interleave_qk_f32(
+                    q_src,
+                    k_src,
+                    q_dst,
+                    k_dst,
+                    *n_key_heads,
+                    *ratio,
+                    *head_dim,
+                )
+            };
+            result.map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        #[cfg(feature = "deltanet")]
+        Step::DeltaRecurrence { params } => {
+            use crate::ops::delta_net::DeltaNetOps;
+            let result = match params {
+                DeltaRecurrenceParams::Step(p) => ().run_delta_net_step(gpu, p),
+                DeltaRecurrenceParams::Batch { params, intent } => {
+                    ().run_delta_net_batch_with_intent(gpu, params, *intent)
+                }
+                DeltaRecurrenceParams::Tree(p) => ().run_delta_net_tree(gpu, p),
+            };
+            result.map_err(DispatchError::Hip)
+        }
+        #[cfg(feature = "deltanet")]
+        Step::DeltaGatedNorm {
+            x,
+            z,
+            weight,
+            out,
+            n_heads,
+            head_dim,
+            eps,
+            batch_size,
+        } => {
+            let result = if *batch_size > 1 {
+                gpu.gated_norm_f32_batched(
+                    x,
+                    z,
+                    weight,
+                    out,
+                    *n_heads,
+                    *head_dim,
+                    *eps,
+                    *batch_size,
+                )
+            } else {
+                gpu.gated_norm_f32(x, z, weight, out, *n_heads, *head_dim, *eps)
+            };
+            result.map_err(|e| DispatchError::Hip(e.to_string()))
+        }
         // ── MoE decode ops (Task 4) ─────────────────────────────────────
         Step::MoeRoute {
             scores,
@@ -1750,6 +2591,65 @@ fn launch_fused(
     key: KernelKey,
     steps: &[Step],
 ) -> Result<(), DispatchError> {
+    #[cfg(feature = "deltanet")]
+    if key == KernelKey::FusedDeltaQkL2NormRepeat {
+        let (q_src, k_src, q_dst, k_dst, n_key_heads, ratio, head_dim, q_scale, eps, batch_size) =
+            match (&steps[0], &steps[1]) {
+                (
+                    Step::DeltaQkL2Norm {
+                        q,
+                        k,
+                        n_key_heads,
+                        head_dim,
+                        q_scale,
+                        eps,
+                        batch_size,
+                    },
+                    Step::DeltaRepeatHeads {
+                        ratio,
+                        q_dst,
+                        k_dst,
+                        ..
+                    },
+                ) => (
+                    *q,
+                    *k,
+                    *q_dst,
+                    *k_dst,
+                    *n_key_heads,
+                    *ratio,
+                    *head_dim,
+                    *q_scale,
+                    *eps,
+                    *batch_size,
+                ),
+                _ => {
+                    return Err(DispatchError::Hip(
+                        "Delta QK fusion received a non-adjacent or malformed step pair"
+                            .to_string(),
+                    ))
+                }
+            };
+        gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
+            q_src,
+            k_src,
+            q_dst,
+            k_dst,
+            n_key_heads,
+            ratio,
+            head_dim,
+            q_scale,
+            eps,
+            batch_size,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+
+        // The fused kernel mutates q_src/k_src in-place while producing the
+        // repeated destinations, matching the standalone pair's observable
+        // source/output contract without a second launch.
+        return Ok(());
+    }
+
     // Step 0 is always RmsnormAutomatic — run it to fill the activated buffer.
     launch_op(gpu, ctx, &steps[0])?;
     let activated = rmsnorm_out(&steps[0]);
@@ -2089,19 +2989,17 @@ mod tests {
         let q8_key = KernelKey::for_gemv(DType::Q8_0, GemvVariant::Plain, false);
         // Paro and Q8 should resolve to plain GEMV keys, not fused QKVZA keys.
         // (They may be Err for arches without support, which is also fine.)
-        for key in [paro_q4_key, q8_key] {
-            if let Ok(k) = key {
-                assert!(
-                    !matches!(
-                        k,
-                        KernelKey::FusedQkvzaMq4G256Lloyd
-                            | KernelKey::FusedQkvzaMq3G256Lloyd
-                            | KernelKey::FusedQkvzaHfq4G256
-                            | KernelKey::FusedQkvzaHfq6G256
-                    ),
-                    "ParoQ4G128/Q8_0 should not resolve to a fused QKVZA key"
-                );
-            }
+        for k in [paro_q4_key, q8_key].into_iter().flatten() {
+            assert!(
+                !matches!(
+                    k,
+                    KernelKey::FusedQkvzaMq4G256Lloyd
+                        | KernelKey::FusedQkvzaMq3G256Lloyd
+                        | KernelKey::FusedQkvzaHfq4G256
+                        | KernelKey::FusedQkvzaHfq6G256
+                ),
+                "ParoQ4G128/Q8_0 should not resolve to a fused QKVZA key"
+            );
         }
     }
 
@@ -2274,6 +3172,517 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn deltanet_step_surface_is_exactly_six_and_total() {
+        use crate::ops::delta_net::{
+            DeltaNetBatchIntent, DeltaNetBatchParams, DeltaNetStepParams, StateQuant,
+        };
+        use std::collections::HashSet;
+
+        let tags = [
+            PipelineOp::DeltaGatePrep,
+            PipelineOp::DeltaConvSplit,
+            PipelineOp::DeltaQkL2Norm,
+            PipelineOp::DeltaRepeatHeads,
+            PipelineOp::DeltaRecurrence,
+            PipelineOp::DeltaGatedNorm,
+        ];
+        assert_eq!(tags.len(), 6);
+        assert_eq!(tags.iter().copied().collect::<HashSet<_>>().len(), 6);
+
+        // Metadata-only tensors are sufficient: this test exercises the
+        // total op-kind and TP-output matches without touching HIP.
+        let t = |ptr: usize| GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096) },
+            shape: vec![8],
+            dtype: DType::F32,
+        };
+        let beta = t(1);
+        let alpha = t(2);
+        let dt_bias = t(3);
+        let a_log = t(4);
+        let input = t(5);
+        let weight = t(6);
+        let state = t(7);
+        let q = t(8);
+        let k = t(9);
+        let q_dst = t(10);
+        let k_dst = t(11);
+        let out = t(12);
+
+        let steps = [
+            Step::DeltaGatePrep {
+                beta: &beta,
+                alpha: &alpha,
+                dt_bias: &dt_bias,
+                a_log: &a_log,
+                n: 2,
+                batch_size: 1,
+            },
+            Step::DeltaConvSplit {
+                q_out: &q,
+                k_out: &k,
+                v_out: &out,
+                input: &input,
+                weight: &weight,
+                state: &state,
+                parent_indices: None,
+                k_dim: 4,
+                v_dim: 4,
+                n_tokens: 1,
+            },
+            Step::DeltaQkL2Norm {
+                q: &q,
+                k: &k,
+                n_key_heads: 1,
+                head_dim: 4,
+                q_scale: 1.0,
+                eps: 1e-6,
+                batch_size: 1,
+            },
+            Step::DeltaRepeatHeads {
+                q_src: &q,
+                k_src: &k,
+                q_dst: &q_dst,
+                k_dst: &k_dst,
+                n_key_heads: 1,
+                ratio: 2,
+                head_dim: 4,
+                batch_size: 1,
+            },
+            Step::DeltaRecurrence {
+                params: DeltaRecurrenceParams::Step(DeltaNetStepParams {
+                    q: &q,
+                    k: &k,
+                    v: &out,
+                    gate: &alpha,
+                    beta: &beta,
+                    state: &state,
+                    s_scales: &dt_bias,
+                    output: &out,
+                    ef_residual: None,
+                    n_heads: 1,
+                    head_dim: 4,
+                    quant: StateQuant::FP32,
+                }),
+            },
+            Step::DeltaGatedNorm {
+                x: &out,
+                z: &alpha,
+                weight: &dt_bias,
+                out: &q_dst,
+                n_heads: 1,
+                head_dim: 4,
+                eps: 1e-6,
+                batch_size: 1,
+            },
+        ];
+
+        for (step, expected) in steps.iter().zip(tags) {
+            assert_eq!(step_op_kind(step), expected);
+            assert!(
+                tp_step_out_buf(step).is_none(),
+                "DeltaNet step exposed TP output"
+            );
+        }
+
+        let batch_params = DeltaNetBatchParams {
+            q_batch: &q,
+            k_batch: &k,
+            v_batch: &out,
+            gate_batch: &alpha,
+            beta_batch: &beta,
+            state: &state,
+            s_scales: &dt_bias,
+            output_batch: &out,
+            ef_residual: None,
+            n_tokens: 2,
+            n_heads: 1,
+            head_dim: 4,
+            quant: StateQuant::FP32,
+        };
+        let replay = DeltaRecurrenceParams::Batch {
+            params: batch_params,
+            intent: DeltaNetBatchIntent::SpeculativeReplay,
+        };
+        match replay {
+            DeltaRecurrenceParams::Batch { intent, .. } => {
+                assert_eq!(intent, DeltaNetBatchIntent::SpeculativeReplay)
+            }
+            _ => unreachable!("batch recurrence lost its intent"),
+        }
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn deltanet_builders_keep_decode_and_batch_shapes_distinct() {
+        let t = |ptr: usize| GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096) },
+            shape: vec![8],
+            dtype: DType::F32,
+        };
+        let qkv = t(101);
+        let q = t(102);
+        let k = t(103);
+        let v = t(104);
+        let q_raw = t(105);
+        let k_raw = t(106);
+        let alpha = t(107);
+        let beta = t(108);
+        let dt_bias = t(109);
+        let a_log = t(110);
+        let state = t(111);
+        let scales = t(112);
+        let conv_weight = t(113);
+        let conv_state = t(114);
+        let attn_out = t(115);
+        let normed = t(116);
+        let z = t(117);
+        let norm_weight = t(118);
+        let d = DeltaNetOperandDescriptor {
+            qkv: &qkv,
+            q: &q,
+            k: &k,
+            v: &v,
+            q_raw: &q_raw,
+            k_raw: &k_raw,
+            alpha: &alpha,
+            beta: &beta,
+            dt_bias: Some(&dt_bias),
+            a_log: Some(&a_log),
+            state: &state,
+            s_scales: &scales,
+            ef_residual: None,
+            conv_weight: &conv_weight,
+            conv_state: &conv_state,
+            attn_out: &attn_out,
+            normed: Some(&normed),
+            z: Some(&z),
+            norm_weight: Some(&norm_weight),
+            n_key_heads: 1,
+            n_value_heads: 2,
+            head_dim: 4,
+            key_dim: 4,
+            value_dim: 8,
+            q_scale: 0.5,
+            eps: 1e-6,
+            quant: StateQuant::Q8,
+        };
+
+        let decode = build_delta_net_decode_steps(&d);
+        assert_eq!(decode.len(), 6);
+        assert!(matches!(
+            decode[0],
+            Step::DeltaGatePrep { batch_size: 1, .. }
+        ));
+        assert!(matches!(
+            decode[1],
+            Step::DeltaConvSplit {
+                n_tokens: 1,
+                parent_indices: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode[4],
+            Step::DeltaRecurrence {
+                params: DeltaRecurrenceParams::Step(_)
+            }
+        ));
+        assert!(matches!(
+            decode[5],
+            Step::DeltaGatedNorm { batch_size: 1, .. }
+        ));
+
+        let batch =
+            build_delta_net_batch_steps(&d, 4, DeltaNetBatchIntent::NormalPrefill, None, None)
+                .unwrap();
+        assert_eq!(batch.len(), 6);
+        assert!(matches!(
+            batch[0],
+            Step::DeltaGatePrep { batch_size: 4, .. }
+        ));
+        assert!(matches!(
+            batch[1],
+            Step::DeltaConvSplit {
+                n_tokens: 4,
+                parent_indices: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            batch[2],
+            Step::DeltaQkL2Norm { batch_size: 4, .. }
+        ));
+        assert!(matches!(
+            batch[3],
+            Step::DeltaRepeatHeads { batch_size: 4, .. }
+        ));
+        assert!(matches!(
+            batch[4],
+            Step::DeltaRecurrence {
+                params: DeltaRecurrenceParams::Batch { .. }
+            }
+        ));
+        assert!(matches!(
+            batch[5],
+            Step::DeltaGatedNorm { batch_size: 4, .. }
+        ));
+
+        let replay =
+            build_delta_net_batch_steps(&d, 4, DeltaNetBatchIntent::SpeculativeReplay, None, None)
+                .unwrap();
+        assert_eq!(replay.len(), 5);
+        assert!(matches!(
+            replay[0],
+            Step::DeltaConvSplit { n_tokens: 4, .. }
+        ));
+        assert!(matches!(
+            replay[3],
+            Step::DeltaRecurrence {
+                params: DeltaRecurrenceParams::Batch {
+                    intent: DeltaNetBatchIntent::SpeculativeReplay,
+                    ..
+                }
+            }
+        ));
+
+        let parent = t(119);
+        let tape = t(120);
+        let tape_scales = t(121);
+        let tree = build_delta_net_tree_steps(&d, 4, &parent, &tape, Some(&tape_scales)).unwrap();
+        assert!(matches!(
+            tree[1],
+            Step::DeltaConvSplit {
+                n_tokens: 4,
+                parent_indices: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            tree[4],
+            Step::DeltaRecurrence {
+                params: DeltaRecurrenceParams::Tree(_)
+            }
+        ));
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn deltanet_qk_repeat_fuses_only_the_valid_adjacent_batched_pair() {
+        fn metadata_tensor(ptr: usize, shape: Vec<usize>, dtype: DType) -> GpuTensor {
+            GpuTensor {
+                buf: unsafe {
+                    hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096)
+                },
+                shape,
+                dtype,
+            }
+        }
+
+        let q = metadata_tensor(101, vec![2, 1, 4], DType::F32);
+        let k = metadata_tensor(102, vec![2, 1, 4], DType::F32);
+        let q_src = metadata_tensor(101, vec![2, 1, 4], DType::F32);
+        let k_src = metadata_tensor(102, vec![2, 1, 4], DType::F32);
+        let q_dst = metadata_tensor(103, vec![2, 2, 4], DType::F32);
+        let k_dst = metadata_tensor(104, vec![2, 2, 4], DType::F32);
+        let ctx = DispatchCtx::for_test("gfx1100");
+
+        let valid = [
+            Step::DeltaQkL2Norm {
+                q: &q,
+                k: &k,
+                n_key_heads: 1,
+                head_dim: 4,
+                q_scale: 0.5,
+                eps: 1e-6,
+                batch_size: 2,
+            },
+            Step::DeltaRepeatHeads {
+                q_src: &q_src,
+                k_src: &k_src,
+                q_dst: &q_dst,
+                k_dst: &k_dst,
+                n_key_heads: 1,
+                ratio: 2,
+                head_dim: 4,
+                batch_size: 2,
+            },
+        ];
+        assert_eq!(
+            match_prefix(FUSED_TABLE, &valid, &ctx),
+            Some((KernelKey::FusedDeltaQkL2NormRepeat, 2))
+        );
+
+        // Decode has no fused interleave kernel: it must remain two
+        // standalone operations, so normalization cannot happen twice.
+        let decode = [
+            Step::DeltaQkL2Norm {
+                q: &q,
+                k: &k,
+                n_key_heads: 1,
+                head_dim: 4,
+                q_scale: 0.5,
+                eps: 1e-6,
+                batch_size: 1,
+            },
+            Step::DeltaRepeatHeads {
+                q_src: &q_src,
+                k_src: &k_src,
+                q_dst: &q_dst,
+                k_dst: &k_dst,
+                n_key_heads: 1,
+                ratio: 2,
+                head_dim: 4,
+                batch_size: 1,
+            },
+        ];
+        assert_eq!(match_prefix(FUSED_TABLE, &decode, &ctx), None);
+
+        // A ratio of one is a copy, not an interleave, and is likewise kept
+        // on the explicit standalone path.
+        let no_repeat = [
+            Step::DeltaQkL2Norm {
+                q: &q,
+                k: &k,
+                n_key_heads: 1,
+                head_dim: 4,
+                q_scale: 0.5,
+                eps: 1e-6,
+                batch_size: 2,
+            },
+            Step::DeltaRepeatHeads {
+                q_src: &q_src,
+                k_src: &k_src,
+                q_dst: &q_dst,
+                k_dst: &k_dst,
+                n_key_heads: 1,
+                ratio: 1,
+                head_dim: 4,
+                batch_size: 2,
+            },
+        ];
+        assert_eq!(match_prefix(FUSED_TABLE, &no_repeat, &ctx), None);
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[test]
+    #[ignore = "requires an AMD GPU and DeltaNet kernel JIT"]
+    fn deltanet_qk_repeat_fused_execution_gpu() {
+        let mut gpu = Gpu::init().expect("GPU required for ignored DeltaNet execution test");
+        let ctx = DispatchCtx::new(&gpu);
+        let q_data = vec![0.25, -0.5, 0.75, 1.0, -1.25, 0.5, 0.125, -0.875];
+        let k_data = vec![-0.75, 0.25, 1.5, -0.125, 0.875, -1.0, 0.375, 0.625];
+        let q_unfused = gpu.upload_f32(&q_data, &[2, 1, 4]).unwrap();
+        let k_unfused = gpu.upload_f32(&k_data, &[2, 1, 4]).unwrap();
+        let q_unfused_dst = gpu.alloc_tensor(&[2, 2, 4], DType::F32).unwrap();
+        let k_unfused_dst = gpu.alloc_tensor(&[2, 2, 4], DType::F32).unwrap();
+        let unfused_steps = [
+            Step::DeltaQkL2Norm {
+                q: &q_unfused,
+                k: &k_unfused,
+                n_key_heads: 1,
+                head_dim: 4,
+                q_scale: 0.5,
+                eps: 1e-6,
+                batch_size: 2,
+            },
+            Step::DeltaRepeatHeads {
+                q_src: &q_unfused,
+                k_src: &k_unfused,
+                q_dst: &q_unfused_dst,
+                k_dst: &k_unfused_dst,
+                n_key_heads: 1,
+                ratio: 2,
+                head_dim: 4,
+                batch_size: 2,
+            },
+        ];
+        // Force the standalone semantics by disabling fusion for this run.
+        let mut unfused_flags =
+            rdna_compute::feature_flags::FeatureFlags::from_env_for_test("gfx1100");
+        unfused_flags.force_unfused = true;
+        let unfused_ctx = DispatchCtx {
+            arch: rdna_compute::arch_caps::ArchCaps::new(
+                "gfx1100",
+                std::sync::Arc::new(
+                    rdna_compute::feature_flags::FeatureFlags::from_env_for_test("gfx1100"),
+                ),
+            ),
+            flags: std::sync::Arc::new(unfused_flags),
+            resources: crate::resource::ResourceManager::for_test(),
+        };
+        execute_steps(&mut gpu, &unfused_ctx, &unfused_steps).unwrap();
+
+        let q_fused = gpu.upload_f32(&q_data, &[2, 1, 4]).unwrap();
+        let k_fused = gpu.upload_f32(&k_data, &[2, 1, 4]).unwrap();
+        let q_fused_dst = gpu.alloc_tensor(&[2, 2, 4], DType::F32).unwrap();
+        let k_fused_dst = gpu.alloc_tensor(&[2, 2, 4], DType::F32).unwrap();
+        let fused_steps = [
+            Step::DeltaQkL2Norm {
+                q: &q_fused,
+                k: &k_fused,
+                n_key_heads: 1,
+                head_dim: 4,
+                q_scale: 0.5,
+                eps: 1e-6,
+                batch_size: 2,
+            },
+            Step::DeltaRepeatHeads {
+                q_src: &q_fused,
+                k_src: &k_fused,
+                q_dst: &q_fused_dst,
+                k_dst: &k_fused_dst,
+                n_key_heads: 1,
+                ratio: 2,
+                head_dim: 4,
+                batch_size: 2,
+            },
+        ];
+        execute_steps(&mut gpu, &ctx, &fused_steps).unwrap();
+
+        let q0 = gpu.download_f32(&q_unfused).unwrap();
+        let k0 = gpu.download_f32(&k_unfused).unwrap();
+        let qo0 = gpu.download_f32(&q_unfused_dst).unwrap();
+        let ko0 = gpu.download_f32(&k_unfused_dst).unwrap();
+        let q1 = gpu.download_f32(&q_fused).unwrap();
+        let k1 = gpu.download_f32(&k_fused).unwrap();
+        let qo1 = gpu.download_f32(&q_fused_dst).unwrap();
+        let ko1 = gpu.download_f32(&k_fused_dst).unwrap();
+        for (name, lhs, rhs) in [
+            ("q", &q0, &q1),
+            ("k", &k0, &k1),
+            ("q_out", &qo0, &qo1),
+            ("k_out", &ko0, &ko1),
+        ] {
+            assert_eq!(lhs.len(), rhs.len());
+            let max_diff = lhs
+                .iter()
+                .zip(rhs)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("{name}: max fused/unfused diff = {max_diff:e}");
+            assert!(
+                max_diff <= 1e-5,
+                "fused/unfused DeltaNet QK source/output mismatch"
+            );
+        }
+
+        for tensor in [
+            q_unfused,
+            k_unfused,
+            q_unfused_dst,
+            k_unfused_dst,
+            q_fused,
+            k_fused,
+            q_fused_dst,
+            k_fused_dst,
+        ] {
+            gpu.free_tensor(tensor).unwrap();
+        }
+    }
+
     /// Pure-logic test: TpCollective→StepCollective wrapper mapping and
     /// the three validate_parallel_args length-mismatch guards.
     /// No GPU needed — only enum construction and the pure validator are exercised.
@@ -2283,7 +3692,7 @@ mod tests {
 
         // --- mapping test: execute_steps_tp wrapper logic ---
         // AllReduceOut{dim:8} must map to AllReduce{kind:Tp, dim:8}
-        let tp_colls = vec![TpCollective::None, TpCollective::AllReduceOut { dim: 8 }];
+        let tp_colls = [TpCollective::None, TpCollective::AllReduceOut { dim: 8 }];
         let mapped: Vec<StepCollective> = tp_colls
             .iter()
             .map(|c| match c {

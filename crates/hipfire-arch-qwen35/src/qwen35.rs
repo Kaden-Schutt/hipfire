@@ -11,7 +11,11 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
-use hipfire_dispatch::pipeline::{execute_steps, execute_steps_mesh, GemvInput, Step};
+use hipfire_dispatch::ops::delta_net::StateQuant as DispatchStateQuant;
+use hipfire_dispatch::pipeline::{
+    build_delta_net_batch_steps, build_delta_net_decode_steps, build_delta_net_tree_steps,
+    execute_steps_mesh, DeltaNetOperandDescriptor, GemvInput, Step,
+};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::RotationPlan;
 use hipfire_hardware::DeviceMesh;
@@ -135,6 +139,10 @@ pub struct Qwen35Config {
     pub dim: usize,
     pub n_layers: usize,
     pub vocab_size: usize,
+    /// Whether the checkpoint config declares lm_head tied to token_embd.
+    /// The manifest uses this logical policy; the loader still handles the
+    /// physical source tensor condition when it resolves the head.
+    pub tie_word_embeddings: bool,
     pub norm_eps: f32,
     pub eos_token: u32,
 
@@ -240,6 +248,8 @@ struct RawQwen35Config {
     #[serde(default)]
     eos_token_id: Option<serde_json::Value>,
     #[serde(default)]
+    tie_word_embeddings: Option<bool>,
+    #[serde(default)]
     rope_parameters: Option<RawRope>,
     // FLAT partial_rotary_factor takes precedence over the nested one (finalize).
     #[serde(default)]
@@ -313,6 +323,11 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     let raw: RawQwen35Config = serde_json::from_value(tc.clone())
         .map_err(|e| format!("qwen35: parsing config failed: {e}"))?;
     let is_vl_text = config.get("text_config").is_some() && config.get("vision_config").is_some();
+    let tie_word_embeddings = config
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        .or(raw.tie_word_embeddings)
+        .unwrap_or(true);
 
     let dim = raw.hidden_size;
     let n_heads = raw.num_attention_heads;
@@ -348,6 +363,13 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
                 .collect()
         })
         .unwrap_or_else(|| vec![LayerType::FullAttention; raw.num_hidden_layers]);
+    if layer_types.len() != raw.num_hidden_layers {
+        return Err(format!(
+            "qwen35: layer_types length {} does not match num_hidden_layers {}",
+            layer_types.len(),
+            raw.num_hidden_layers
+        ));
+    }
 
     let has_shared_expert = raw.shared_expert_intermediate_size > 0;
 
@@ -355,6 +377,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         dim,
         n_layers: raw.num_hidden_layers,
         vocab_size: raw.vocab_size,
+        tie_word_embeddings,
         norm_eps: raw.rms_norm_eps,
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 248044),
         n_heads,
@@ -691,6 +714,8 @@ impl Qwen35Weights {
         let _ = gpu.free_tensor(self.output_norm);
         if !self.lm_head_aliases_embd {
             self.output.free_all(gpu);
+        } else {
+            self.output.free_sidecars(gpu);
         }
         for layer in self.layers {
             match layer {
@@ -773,7 +798,11 @@ impl Qwen35Weights {
         let _ = gpus.devices[0].free_tensor(self.token_embd);
         let out_dev = gpus.output_device;
         let _ = gpus.devices[out_dev].free_tensor(self.output_norm);
-        self.output.free_all(&mut gpus.devices[out_dev]);
+        if self.lm_head_aliases_embd {
+            self.output.free_sidecars(&mut gpus.devices[out_dev]);
+        } else {
+            self.output.free_all(&mut gpus.devices[out_dev]);
+        }
         for (i, layer) in self.layers.into_iter().enumerate() {
             let dev_idx = gpus.device_for_layer(i);
             let gpu = &mut gpus.devices[dev_idx];
@@ -899,12 +928,48 @@ pub struct DeltaNetState {
     pub quant: StateQuant,
 }
 
+/// Borrowed compact state slot for one global Qwen35 DeltaNet layer.
+#[derive(Clone, Copy)]
+pub struct DeltaNetStateSlot<'a> {
+    pub s: &'a GpuTensor,
+    pub scales: &'a GpuTensor,
+    pub conv: &'a GpuTensor,
+    pub ef: Option<&'a GpuTensor>,
+    pub compact: usize,
+}
+
 impl DeltaNetState {
     /// EF residual for a delta-layer, if error-feedback is active (Q8 + flag).
     /// `None` ⇒ callers pass null ⇒ kernel uses the legacy stochastic-rounding requant.
     #[inline]
     pub fn ef_residual(&self, idx: usize) -> Option<&GpuTensor> {
         self.s_ef_residual.get(idx)
+    }
+
+    /// Borrow the compact recurrent/conv slot for a global model layer.
+    /// State vectors are compacted to DeltaNet layers, while weights and
+    /// configuration remain indexed by global layer. This adapter is a pure
+    /// view over the existing owner; it never allocates or creates another
+    /// state object.
+    pub fn slot_for_global_layer<'a>(
+        &'a self,
+        layer_types: &[LayerType],
+        global_layer: usize,
+    ) -> Option<DeltaNetStateSlot<'a>> {
+        if layer_types.get(global_layer) != Some(&LayerType::LinearAttention) {
+            return None;
+        }
+        let compact = layer_types[..global_layer]
+            .iter()
+            .filter(|kind| **kind == LayerType::LinearAttention)
+            .count();
+        Some(DeltaNetStateSlot {
+            s: self.s_matrices.get(compact)?,
+            scales: self.s_scales.get(compact)?,
+            conv: self.conv_states.get(compact)?,
+            ef: self.s_ef_residual.get(compact),
+            compact,
+        })
     }
 
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<Self> {
@@ -7263,7 +7328,6 @@ fn run_plain_gemm_key(
     k: usize,
     n: usize,
 ) -> HipResult<()> {
-    use hipfire_dispatch::families::gemm::GemmParams;
     let ctx = DispatchCtx::new(gpu);
     let w = WeightRef {
         buf: w_buf,
@@ -7274,15 +7338,15 @@ fn run_plain_gemm_key(
         rotation: None,
         awq_scale: None,
     };
-    let params = GemmParams {
+    let step = Step::GemmKeyedBatched {
         w: &w,
         x,
         y,
-        batch_size: n,
+        batch: n,
+        key,
     };
-    hipfire_runtime::llama::gemm_family()
-        .run_key(key, &ctx, gpu, &params)
-        .map_err(HipError::from)
+    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[step])
+        .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
 /// #397 Ship 5.2 FINAL: route a single BATCHED-prefill RESIDUAL-fused GEMM
@@ -7313,7 +7377,6 @@ fn run_residual_gemm_key(
     k: usize,
     n: usize,
 ) -> HipResult<()> {
-    use hipfire_dispatch::families::gemm::GemmParams;
     let ctx = DispatchCtx::new(gpu);
     let w = WeightRef {
         buf: w_buf,
@@ -7324,16 +7387,15 @@ fn run_residual_gemm_key(
         rotation: None,
         awq_scale: None,
     };
-    // The residual stream `y` is BOTH the residual and the output (`y += W·x`).
-    let params = GemmParams {
+    let step = Step::GemmResidualBatched {
         w: &w,
         x,
-        y,
-        batch_size: n,
+        residual: y,
+        batch: n,
+        key,
     };
-    hipfire_runtime::llama::gemm_family()
-        .run_key(key, &ctx, gpu, &params)
-        .map_err(HipError::from)
+    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[step])
+        .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
 /// #397 Ship 5.2 slice 2: route a single BATCHED-prefill FUSED gate+up GEMM
@@ -7464,6 +7526,87 @@ fn run_fused_qkvza_key(
     k: usize,
     n: usize,
 ) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    let wqkv = WeightRef {
+        buf: w_qkv,
+        dtype: w_qkv.dtype,
+        m: qkv_m,
+        k,
+        row_stride: k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let wz = WeightRef {
+        buf: w_z,
+        dtype: w_z.dtype,
+        m: z_m,
+        k,
+        row_stride: k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let wbeta = WeightRef {
+        buf: w_beta,
+        dtype: w_beta.dtype,
+        m: beta_m,
+        k,
+        row_stride: k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let walpha = WeightRef {
+        buf: w_alpha,
+        dtype: w_alpha.dtype,
+        m: alpha_m,
+        k,
+        row_stride: k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let step = Step::FusedQkvzaBatched {
+        wqkv: &wqkv,
+        wz: &wz,
+        w_beta: &wbeta,
+        w_alpha: &walpha,
+        x,
+        qkv: y_qkv,
+        z: y_z,
+        beta: y_beta,
+        alpha: y_alpha,
+        m: [qkv_m, z_m, beta_m, alpha_m],
+        k,
+        batch: n,
+        key,
+    };
+    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[step])
+        .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+/// Scalar DeltaNet QKVZA dispatch used by PP/decode paths. `batch_size: None`
+/// is intentional: the fused family selects the historical scalar kernels,
+/// including the MQ3-Lloyd gfx10-safe ladder. Do not route N=1 PP decode
+/// through the batched Step variant; its GEMM kernels have different arch
+/// predicates and launch contracts.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_fused_qkvza_scalar_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_qkv: &GpuTensor,
+    w_z: &GpuTensor,
+    w_beta: &GpuTensor,
+    w_alpha: &GpuTensor,
+    x: &GpuTensor,
+    y_qkv: &GpuTensor,
+    y_z: &GpuTensor,
+    y_beta: &GpuTensor,
+    y_alpha: &GpuTensor,
+    qkv_m: usize,
+    z_m: usize,
+    beta_m: usize,
+    alpha_m: usize,
+    k: usize,
+) -> HipResult<()> {
     use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
     let ctx = DispatchCtx::new(gpu);
     let params = FusedQkvParams {
@@ -7474,11 +7617,30 @@ fn run_fused_qkvza_key(
         m: &[qkv_m, z_m, beta_m, alpha_m],
         k,
         rot_scratch: &[],
-        batch_size: Some(n),
+        batch_size: None,
     };
     hipfire_runtime::llama::fused_qkv_family()
         .run(&ctx, gpu, &params)
         .map_err(HipError::from)
+}
+
+fn scalar_qkvza_key(
+    wqkv: DType,
+    wz: DType,
+    w_beta: DType,
+    w_alpha: DType,
+) -> Option<hipfire_dispatch::types::KernelKey> {
+    if wqkv == wz && wz == w_beta && w_beta == w_alpha {
+        match wqkv {
+            DType::MQ4G256 | DType::HFQ4G256 => {
+                Some(hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256)
+            }
+            DType::MQ3G256Lloyd => Some(hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
@@ -8269,10 +8431,6 @@ fn forward_prefill_chunk(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
-    // Build one DispatchCtx per chunk (decision-only, threaded through
-    // MoE prefill family calls). Ship 4.2.
-    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-
     let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
     let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
     // `max_layer = Some(N)` early-exits at layer N (exclusive). pflash uses
@@ -8542,28 +8700,23 @@ fn forward_prefill_chunk(
                 // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
                 // we reuse x_rot_batch as the "normed, unrotated" output
                 // so the subsequent GEMM can read it the same way.
-                if is_mq {
-                    // AWQ-aware: next linear is LA's fused wqkv.
-                    fused_rmsnorm_rotate_mq_batched_for(
-                        gpu,
-                        &pbs.x_batch,
-                        &layer.attn_norm,
-                        &layer.wqkv,
-                        &pbs.x_rot_batch,
-                        dim,
-                        config.norm_eps,
-                        n,
-                    )?;
-                } else {
-                    gpu.rmsnorm_batched(
-                        &pbs.x_batch,
-                        &layer.attn_norm,
-                        &pbs.x_rot_batch,
-                        n,
-                        dim,
-                        config.norm_eps,
-                    )?;
-                }
+                let norm_step = Step::RmsnormBatched {
+                    x: &pbs.x_batch,
+                    norm_weight: &layer.attn_norm,
+                    x_plain: &pbs.x_norm_batch,
+                    out: &pbs.x_rot_batch,
+                    awq_scale: layer.wqkv.awq_scale.as_ref(),
+                    k: dim,
+                    eps: config.norm_eps,
+                    rotation: if is_mq {
+                        dtype_rotation_plan(layer.wqkv.gpu_dtype)
+                    } else {
+                        RotationPlan::None
+                    },
+                    batch: n,
+                };
+                execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[norm_step])
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
 
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
                 if is_6bit {
@@ -8757,269 +8910,138 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
-                gpu.fused_sigmoid_alpha_gate_f32_batched(
-                    &pbs.dn_beta_batch,
-                    &pbs.dn_alpha_batch,
-                    &layer.dt_bias,
-                    &layer.a_log,
-                    n_v_heads,
-                    n,
-                )?;
-
-                // DFlash tape capture: snap pre-conv1d qkv + post-sigmoid α/β
-                // for this layer into the per-layer tape slots. The next LA
-                // layer's fused_qkvza / fused_sigmoid_alpha_gate will overwrite
-                // dn_qkv_batch / dn_{alpha,beta}_batch, so capture must happen
-                // now (after sigmoid_alpha_gate, before conv1d consumes qkv).
+                let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+                let slot = dn_state
+                    .slot_for_global_layer(&config.layer_types, layer_idx)
+                    .ok_or_else(|| HipError::new(0, "missing compact DeltaNet state slot"))?;
+                let d = DeltaNetOperandDescriptor {
+                    qkv: &pbs.dn_qkv_batch,
+                    q: &pbs.dn_q_batch,
+                    k: &pbs.dn_k_batch,
+                    v: &pbs.dn_v_batch,
+                    q_raw: &pbs.dn_q_raw_batch,
+                    k_raw: &pbs.dn_k_raw_batch,
+                    alpha: &pbs.dn_alpha_batch,
+                    beta: &pbs.dn_beta_batch,
+                    dt_bias: Some(&layer.dt_bias),
+                    a_log: Some(&layer.a_log),
+                    state: slot.s,
+                    s_scales: slot.scales,
+                    ef_residual: slot.ef,
+                    conv_weight: &layer.conv_weight,
+                    conv_state: slot.conv,
+                    attn_out: &pbs.dn_attn_out_batch,
+                    normed: Some(&pbs.dn_normed_batch),
+                    z: Some(&pbs.dn_z_batch),
+                    norm_weight: Some(&layer.norm_weight),
+                    n_key_heads: config.linear_num_key_heads,
+                    n_value_heads: n_v_heads,
+                    head_dim: hd,
+                    key_dim: k_dim,
+                    value_dim: v_dim,
+                    q_scale: 1.0 / (hd as f32).sqrt(),
+                    eps: config.norm_eps,
+                    quant: match dn_state.quant {
+                        StateQuant::FP32 => DispatchStateQuant::FP32,
+                        StateQuant::Q8 => DispatchStateQuant::Q8,
+                        StateQuant::Q4 => DispatchStateQuant::Q4,
+                    },
+                };
+                let steps = if let Some(parents) = tree_parents {
+                    build_delta_net_tree_steps(
+                        &d,
+                        n,
+                        parents,
+                        match dn_state.quant {
+                            StateQuant::FP32 => pbs.dn_s_tape_f32.as_ref().expect("FP32 tree tape"),
+                            StateQuant::Q8 => pbs.dn_s_tape_q8.as_ref().expect("Q8 tree tape"),
+                            StateQuant::Q4 => return Err(HipError::new(0, "Q4 DeltaNet state + tree-verify (DDTree) is unsupported: there is no Q4 tree-tape GDN kernel. Use Q8 or FP32 state for tree spec-decode.")),
+                        },
+                        if dn_state.quant == StateQuant::Q8 { pbs.dn_s_tape_scales.as_ref() } else { None },
+                    )
+                } else {
+                    build_delta_net_batch_steps(
+                        &d,
+                        n,
+                        hipfire_dispatch::ops::delta_net::DeltaNetBatchIntent::NormalPrefill,
+                        None,
+                        None,
+                    )
+                }
+                .map_err(|e| HipError::new(0, &e))?;
+                // Keep the DFlash tape boundary after sigmoid(alpha/beta) and
+                // before conv1d, exactly as in the legacy sequence. Test mode
+                // deliberately avoids steps[..1] so gate preparation parity is
+                // covered by the independent raw seam.
+                #[cfg(feature = "test-utils")]
+                if crate::test_utils::raw_delta_net_enabled() {
+                    crate::test_utils::raw_delta_net_gate_prep(
+                        gpu,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        &layer.dt_bias,
+                        &layer.a_log,
+                        n_v_heads,
+                        n,
+                    )?;
+                } else {
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps[..1])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                }
+                #[cfg(not(feature = "test-utils"))]
+                execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps[..1])
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
                 if let Some(tape) = gdn_tape.as_ref() {
                     let qkv_row_bytes = tape.qkv_dim * 4;
                     let alpha_row_bytes = n_v_heads * 4;
                     let off_qkv = tape_offset * qkv_row_bytes;
                     let off_a = tape_offset * alpha_row_bytes;
-                    let copy_qkv = n * qkv_row_bytes;
-                    let copy_a = n * alpha_row_bytes;
                     gpu.memcpy_dtod_at_auto(
                         &tape.qkv_bufs[delta_layer_idx].buf,
                         off_qkv,
                         &pbs.dn_qkv_batch.buf,
                         0,
-                        copy_qkv,
+                        n * qkv_row_bytes,
                     )?;
                     gpu.memcpy_dtod_at_auto(
                         &tape.alpha_bufs[delta_layer_idx].buf,
                         off_a,
                         &pbs.dn_alpha_batch.buf,
                         0,
-                        copy_a,
+                        n * alpha_row_bytes,
                     )?;
                     gpu.memcpy_dtod_at_auto(
                         &tape.beta_bufs[delta_layer_idx].buf,
                         off_a,
                         &pbs.dn_beta_batch.buf,
                         0,
-                        copy_a,
+                        n * alpha_row_bytes,
                     )?;
                 }
-
-                // Tree-aware dispatch gate: when the caller provides
-                // parent_indices (Phase 3b+ of Task #101), swap the linear
-                // conv1d + GDN for tree-walking variants that eliminate
-                // sibling-subtree state cross-contamination. The tree
-                // kernels are READ-ONLY on dn_state (don't advance it) —
-                // caller runs linear replay on the accepted spine
-                // post-acceptance to commit the trajectory.
-                let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
-                if let Some(parents) = tree_parents {
-                    gpu.conv1d_silu_split_tree_f32_n(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch,
+                #[cfg(feature = "test-utils")]
+                if crate::test_utils::raw_delta_net_enabled() {
+                    crate::test_utils::raw_delta_net_batch_body(
+                        gpu,
                         &layer.conv_weight,
-                        &dn_state.conv_states[delta_layer_idx],
-                        parents,
-                        k_dim,
-                        v_dim,
+                        &layer.norm_weight,
+                        slot,
+                        pbs,
                         n,
+                        tree_parents,
+                        pbs.dn_s_tape_f32.as_ref(),
+                        pbs.dn_s_tape_q8.as_ref(),
+                        pbs.dn_s_tape_scales.as_ref(),
+                        dn_state.quant,
+                        hipfire_dispatch::ops::delta_net::DeltaNetBatchIntent::NormalPrefill,
+                        config,
                     )?;
                 } else {
-                    gpu.conv1d_silu_split_f32_n(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch,
-                        &layer.conv_weight,
-                        &dn_state.conv_states[delta_layer_idx],
-                        k_dim,
-                        v_dim,
-                        n,
-                    )?;
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps[1..])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
                 }
-
-                // Fused L2-norm(Q) + scale(Q) + L2-norm(K) + repeat-interleave
-                // when n_key_heads < n_v_heads. One launch instead of two —
-                // ~200µs saved per LA layer × ~30 LA layers ≈ 6ms per prefill
-                // on A3B (R9700/gfx1201).
-                //
-                // The fused kernel reads q_raw/k_raw (unchanged on exit), so
-                // the conv1d output is preserved if downstream readers need it
-                // (no current consumer reads _raw after this).
-                if config.linear_num_key_heads < n_v_heads {
-                    let ratio = n_v_heads / config.linear_num_key_heads;
-                    gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        config.linear_num_key_heads,
-                        ratio,
-                        hd,
-                        1.0 / (hd as f32).sqrt(),
-                        config.norm_eps,
-                        n,
-                    )?;
-                } else {
-                    // n_key_heads == n_v_heads → no replication; keep the
-                    // original sequence (norm in place, then memcpy).
-                    gpu.fused_qk_l2_norm_scale_f32_batched(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        config.linear_num_key_heads,
-                        hd,
-                        1.0 / (hd as f32).sqrt(),
-                        config.norm_eps,
-                        n,
-                    )?;
-                    gpu.memcpy_dtod_auto(
-                        &pbs.dn_q_batch.buf,
-                        &pbs.dn_q_raw_batch.buf,
-                        n * k_dim * 4,
-                    )?;
-                    gpu.memcpy_dtod_auto(
-                        &pbs.dn_k_batch.buf,
-                        &pbs.dn_k_raw_batch.buf,
-                        n * k_dim * 4,
-                    )?;
-                }
-
-                // Gated Delta Net — tree variant reads per-token S from
-                // s_tape[parent] (or pre-block s_q8_init at root); linear
-                // variant advances dn_state.s_matrices in place.
-                if let Some(parents) = tree_parents {
-                    // Tree-verify GDN, dispatched by DeltaNet state quant.
-                    // FP32 uses the full-precision tree-tape kernel (no
-                    // per-node Q8 round-trip); Q8 the original; Q4 tree has
-                    // no kernel (was silently mis-routed to the Q8 tree
-                    // kernel before — now a clean error).
-                    match dn_state.quant {
-                        StateQuant::FP32 => {
-                            let tape_f32 = pbs.dn_s_tape_f32.as_ref().expect(
-                                "FP32 tree-aware LA requires dn_s_tape_f32 scratch (check PrefillBatchScratch::new)",
-                            );
-                            gpu.gated_delta_net_f32_tree_batch_seq(
-                                &pbs.dn_q_batch,
-                                &pbs.dn_k_batch,
-                                &pbs.dn_v_batch,
-                                &pbs.dn_alpha_batch,
-                                &pbs.dn_beta_batch,
-                                &dn_state.s_matrices[delta_layer_idx],
-                                tape_f32,
-                                parents,
-                                &pbs.dn_attn_out_batch,
-                                n,
-                                n_v_heads,
-                                config.linear_value_head_dim,
-                            )?;
-                        }
-                        StateQuant::Q8 => {
-                            let tape_q8 = pbs.dn_s_tape_q8.as_ref()
-                                .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
-                            let tape_sc = pbs.dn_s_tape_scales.as_ref()
-                                .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
-                            gpu.gated_delta_net_q8_tree_batch_seq(
-                                &pbs.dn_q_batch,
-                                &pbs.dn_k_batch,
-                                &pbs.dn_v_batch,
-                                &pbs.dn_alpha_batch,
-                                &pbs.dn_beta_batch,
-                                &dn_state.s_matrices[delta_layer_idx],
-                                &dn_state.s_scales[delta_layer_idx],
-                                tape_q8,
-                                tape_sc,
-                                parents,
-                                &pbs.dn_attn_out_batch,
-                                n,
-                                n_v_heads,
-                                config.linear_value_head_dim,
-                            )?;
-                        }
-                        StateQuant::Q4 => {
-                            return Err(hip_bridge::HipError::new(
-                                0,
-                                "Q4 DeltaNet state + tree-verify (DDTree) is unsupported: \
-                                 there is no Q4 tree-tape GDN kernel. Use Q8 or FP32 state \
-                                 for tree spec-decode.",
-                            ));
-                        }
-                    }
-                } else {
-                    // EXPERIMENT (not #417): mirror the state-quant dispatch the
-                    // decode siblings already do (forward_scratch_layers:13194),
-                    // so the captured/eager batched prefill honours FP32/Q4 state
-                    // instead of forcing the Q8 kernel onto non-Q8 buffers.
-                    match dn_state.quant {
-                        StateQuant::FP32 => {
-                            if rdna_compute::norm::gdn_chunked() && n > 1 {
-                                gpu.gated_delta_net_f32_chunked(
-                                    &pbs.dn_q_batch,
-                                    &pbs.dn_k_batch,
-                                    &pbs.dn_v_batch,
-                                    &pbs.dn_alpha_batch,
-                                    &pbs.dn_beta_batch,
-                                    &dn_state.s_matrices[delta_layer_idx],
-                                    &pbs.dn_attn_out_batch,
-                                    n,
-                                    n_v_heads,
-                                    config.linear_value_head_dim,
-                                    rdna_compute::norm::gdn_chunk_size(),
-                                )?
-                            } else {
-                                gpu.gated_delta_net_f32_batch_seq(
-                                    &pbs.dn_q_batch,
-                                    &pbs.dn_k_batch,
-                                    &pbs.dn_v_batch,
-                                    &pbs.dn_alpha_batch,
-                                    &pbs.dn_beta_batch,
-                                    &dn_state.s_matrices[delta_layer_idx],
-                                    &pbs.dn_attn_out_batch,
-                                    n,
-                                    n_v_heads,
-                                    config.linear_value_head_dim,
-                                )?
-                            }
-                        }
-                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            dn_state.ef_residual(delta_layer_idx),
-                        )?,
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
-                    }
-                }
-
-                // Batched gated output norm.
-                gpu.gated_norm_f32_batched(
-                    &pbs.dn_attn_out_batch,
-                    &pbs.dn_z_batch,
-                    &layer.norm_weight,
-                    &pbs.dn_normed_batch,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                    config.norm_eps,
-                    n,
-                )?;
+                #[cfg(not(feature = "test-utils"))]
+                execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps[1..])
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
 
                 // Batched wo + residual.
                 //
@@ -9044,14 +9066,15 @@ fn forward_prefill_chunk(
                 let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let wo_input = if wo_is_mq {
                     // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
-                    rotate_x_mq_batched_for(
-                        gpu,
-                        &layer.wo,
-                        &pbs.dn_normed_batch,
-                        &pbs.dn_normed_rot_batch,
-                        layer.wo.k,
-                        n,
-                    )?;
+                    let step = Step::RotateFwhtBatched {
+                        x: &pbs.dn_normed_batch,
+                        out: &pbs.dn_normed_rot_batch,
+                        awq_scale: layer.wo.awq_scale.as_ref(),
+                        k: layer.wo.k,
+                        batch: n,
+                    };
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[step])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
                     &pbs.dn_normed_rot_batch
                 } else {
                     &pbs.dn_normed_batch
@@ -10353,41 +10376,28 @@ fn forward_prefill_chunk(
                 let is_paro = matches!(layer.wqkv.gpu_dtype, DType::ParoQ4G128);
                 let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
 
-                if is_mq {
-                    // AWQ-aware: next linear is LA's fused wqkv.
-                    fused_rmsnorm_rotate_mq_batched_for(
-                        gpu,
-                        &pbs.x_batch,
-                        &layer.attn_norm,
-                        &layer.wqkv,
-                        &pbs.x_rot_batch,
-                        dim,
-                        config.norm_eps,
-                        n,
-                    )?;
-                } else if is_paro {
-                    // PARO: need un-rotated x_norm available for per-weight
-                    // Givens rotation. Write rmsnorm into x_norm_batch (the
-                    // dedicated normalized buffer); x_rot_batch becomes the
-                    // per-weight rotation scratch (overwritten per GEMM).
-                    gpu.rmsnorm_batched(
-                        &pbs.x_batch,
-                        &layer.attn_norm,
-                        &pbs.x_norm_batch,
-                        n,
-                        dim,
-                        config.norm_eps,
-                    )?;
+                let norm_out = if is_paro {
+                    &pbs.x_norm_batch
                 } else {
-                    gpu.rmsnorm_batched(
-                        &pbs.x_batch,
-                        &layer.attn_norm,
-                        &pbs.x_rot_batch,
-                        n,
-                        dim,
-                        config.norm_eps,
-                    )?;
-                }
+                    &pbs.x_rot_batch
+                };
+                let norm_step = Step::RmsnormBatched {
+                    x: &pbs.x_batch,
+                    norm_weight: &layer.attn_norm,
+                    x_plain: &pbs.x_norm_batch,
+                    out: norm_out,
+                    awq_scale: layer.wqkv.awq_scale.as_ref(),
+                    k: dim,
+                    eps: config.norm_eps,
+                    rotation: if is_mq {
+                        dtype_rotation_plan(layer.wqkv.gpu_dtype)
+                    } else {
+                        RotationPlan::None
+                    },
+                    batch: n,
+                };
+                execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[norm_step])
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
                 if is_paro {
                     // PARO 4-way unfused dispatch. wqkv and wz are
                     // ParoQ4G128 with their own Givens rotation tables;
@@ -10402,16 +10412,22 @@ fn forward_prefill_chunk(
                         panic!("ParoQ4G128 wz missing paro metadata at LA layer {layer_idx}")
                     });
                     // wqkv: rotate x_norm → x_rot, then HFQ4G128 GEMM.
-                    gpu.givens_rotate_to(
-                        &pbs.x_norm_batch,
-                        &pbs.x_rot_batch,
-                        &paro_wqkv.pairs,
-                        &paro_wqkv.theta,
-                        &paro_wqkv.channel_scales,
-                        n,
-                        dim,
-                        paro_wqkv.krot as usize,
-                    )?;
+                    execute_steps_mesh(
+                        &DeviceMesh::single(),
+                        gpu,
+                        &ctx,
+                        &[Step::GivensRotateBatched {
+                            x: &pbs.x_norm_batch,
+                            out: &pbs.x_rot_batch,
+                            pairs: &paro_wqkv.pairs,
+                            theta: &paro_wqkv.theta,
+                            scales: &paro_wqkv.channel_scales,
+                            batch: n,
+                            dim,
+                            krot: paro_wqkv.krot as usize,
+                        }],
+                    )
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
                     run_plain_gemm_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::GemmHfq4G128,
@@ -10424,16 +10440,22 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                     // wz: re-rotate x_norm → x_rot (overwrite), then GEMM.
-                    gpu.givens_rotate_to(
-                        &pbs.x_norm_batch,
-                        &pbs.x_rot_batch,
-                        &paro_wz.pairs,
-                        &paro_wz.theta,
-                        &paro_wz.channel_scales,
-                        n,
-                        dim,
-                        paro_wz.krot as usize,
-                    )?;
+                    execute_steps_mesh(
+                        &DeviceMesh::single(),
+                        gpu,
+                        &ctx,
+                        &[Step::GivensRotateBatched {
+                            x: &pbs.x_norm_batch,
+                            out: &pbs.x_rot_batch,
+                            pairs: &paro_wz.pairs,
+                            theta: &paro_wz.theta,
+                            scales: &paro_wz.channel_scales,
+                            batch: n,
+                            dim,
+                            krot: paro_wz.krot as usize,
+                        }],
+                    )
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
                     run_plain_gemm_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::GemmHfq4G128,
@@ -10587,104 +10609,134 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 }
-                gpu.fused_sigmoid_alpha_gate_f32_batched(
-                    &pbs.dn_beta_batch,
-                    &pbs.dn_alpha_batch,
-                    &layer.dt_bias,
-                    &layer.a_log,
-                    n_v_heads,
-                    n,
-                )?;
+                let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+                let slot = dn_state
+                    .slot_for_global_layer(&config.layer_types, layer_idx)
+                    .ok_or_else(|| HipError::new(0, "missing compact DeltaNet state slot"))?;
+                let d = DeltaNetOperandDescriptor {
+                    qkv: &pbs.dn_qkv_batch,
+                    q: &pbs.dn_q_batch,
+                    k: &pbs.dn_k_batch,
+                    v: &pbs.dn_v_batch,
+                    q_raw: &pbs.dn_q_raw_batch,
+                    k_raw: &pbs.dn_k_raw_batch,
+                    alpha: &pbs.dn_alpha_batch,
+                    beta: &pbs.dn_beta_batch,
+                    dt_bias: Some(&layer.dt_bias),
+                    a_log: Some(&layer.a_log),
+                    state: slot.s,
+                    s_scales: slot.scales,
+                    ef_residual: slot.ef,
+                    conv_weight: &layer.conv_weight,
+                    conv_state: slot.conv,
+                    attn_out: &pbs.dn_attn_out_batch,
+                    normed: Some(&pbs.dn_normed_batch),
+                    z: Some(&pbs.dn_z_batch),
+                    norm_weight: Some(&layer.norm_weight),
+                    n_key_heads: config.linear_num_key_heads,
+                    n_value_heads: n_v_heads,
+                    head_dim: hd,
+                    key_dim: k_dim,
+                    value_dim: v_dim,
+                    q_scale: 1.0 / (hd as f32).sqrt(),
+                    eps: config.norm_eps,
+                    quant: match dn_state.quant {
+                        StateQuant::FP32 => DispatchStateQuant::FP32,
+                        StateQuant::Q8 => DispatchStateQuant::Q8,
+                        StateQuant::Q4 => DispatchStateQuant::Q4,
+                    },
+                };
+                let steps = if let Some(parents) = tree_parents {
+                    build_delta_net_tree_steps(
+                        &d,
+                        n,
+                        parents,
+                        match dn_state.quant {
+                            StateQuant::FP32 => pbs.dn_s_tape_f32.as_ref().expect("FP32 tree tape"),
+                            StateQuant::Q8 => pbs.dn_s_tape_q8.as_ref().expect("Q8 tree tape"),
+                            StateQuant::Q4 => return Err(HipError::new(0, "Q4 DeltaNet state + tree-verify (DDTree) is unsupported: there is no Q4 tree-tape GDN kernel. Use Q8 or FP32 state for tree spec-decode.")),
+                        },
+                        if dn_state.quant == StateQuant::Q8 { pbs.dn_s_tape_scales.as_ref() } else { None },
+                    )
+                } else {
+                    build_delta_net_batch_steps(
+                        &d,
+                        n,
+                        hipfire_dispatch::ops::delta_net::DeltaNetBatchIntent::NormalPrefill,
+                        None,
+                        None,
+                    )
+                }
+                .map_err(|e| HipError::new(0, &e))?;
+                #[cfg(feature = "test-utils")]
+                if crate::test_utils::raw_delta_net_enabled() {
+                    crate::test_utils::raw_delta_net_gate_prep(
+                        gpu,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        &layer.dt_bias,
+                        &layer.a_log,
+                        n_v_heads,
+                        n,
+                    )?;
+                } else {
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps[..1])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                }
+                #[cfg(not(feature = "test-utils"))]
+                execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps[..1])
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
                 if let Some(tape) = gdn_tape.as_ref() {
                     let qkv_row_bytes = tape.qkv_dim * 4;
                     let alpha_row_bytes = n_v_heads * 4;
                     let off_qkv = tape_offset * qkv_row_bytes;
                     let off_a = tape_offset * alpha_row_bytes;
-                    let copy_qkv = n * qkv_row_bytes;
-                    let copy_a = n * alpha_row_bytes;
                     gpu.memcpy_dtod_at_auto(
                         &tape.qkv_bufs[delta_layer_idx].buf,
                         off_qkv,
                         &pbs.dn_qkv_batch.buf,
                         0,
-                        copy_qkv,
+                        n * qkv_row_bytes,
                     )?;
                     gpu.memcpy_dtod_at_auto(
                         &tape.alpha_bufs[delta_layer_idx].buf,
                         off_a,
                         &pbs.dn_alpha_batch.buf,
                         0,
-                        copy_a,
+                        n * alpha_row_bytes,
                     )?;
                     gpu.memcpy_dtod_at_auto(
                         &tape.beta_bufs[delta_layer_idx].buf,
                         off_a,
                         &pbs.dn_beta_batch.buf,
                         0,
-                        copy_a,
+                        n * alpha_row_bytes,
                     )?;
                 }
-                // Same tree-aware dispatch gate as dense LA branch above.
-                let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
-                if let Some(parents) = tree_parents {
-                    gpu.conv1d_silu_split_tree_f32_n(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch,
+                #[cfg(feature = "test-utils")]
+                if crate::test_utils::raw_delta_net_enabled() {
+                    crate::test_utils::raw_delta_net_batch_body(
+                        gpu,
                         &layer.conv_weight,
-                        &dn_state.conv_states[delta_layer_idx],
-                        parents,
-                        k_dim,
-                        v_dim,
+                        &layer.norm_weight,
+                        slot,
+                        pbs,
                         n,
+                        tree_parents,
+                        pbs.dn_s_tape_f32.as_ref(),
+                        pbs.dn_s_tape_q8.as_ref(),
+                        pbs.dn_s_tape_scales.as_ref(),
+                        dn_state.quant,
+                        hipfire_dispatch::ops::delta_net::DeltaNetBatchIntent::NormalPrefill,
+                        config,
                     )?;
                 } else {
-                    gpu.conv1d_silu_split_f32_n(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch,
-                        &layer.conv_weight,
-                        &dn_state.conv_states[delta_layer_idx],
-                        k_dim,
-                        v_dim,
-                        n,
-                    )?;
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps[1..])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
                 }
-                gpu.fused_qk_l2_norm_scale_f32_batched(
-                    &pbs.dn_q_raw_batch,
-                    &pbs.dn_k_raw_batch,
-                    config.linear_num_key_heads,
-                    hd,
-                    1.0 / (hd as f32).sqrt(),
-                    config.norm_eps,
-                    n,
-                )?;
-                if config.linear_num_key_heads < n_v_heads {
-                    let ratio = n_v_heads / config.linear_num_key_heads;
-                    gpu.repeat_interleave_qk_f32_batched(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        config.linear_num_key_heads,
-                        ratio,
-                        hd,
-                        n,
-                    )?;
-                } else {
-                    gpu.memcpy_dtod_auto(
-                        &pbs.dn_q_batch.buf,
-                        &pbs.dn_q_raw_batch.buf,
-                        n * k_dim * 4,
-                    )?;
-                    gpu.memcpy_dtod_auto(
-                        &pbs.dn_k_batch.buf,
-                        &pbs.dn_k_raw_batch.buf,
-                        n * k_dim * 4,
-                    )?;
-                }
+                #[cfg(not(feature = "test-utils"))]
+                execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps[1..])
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
                 // DIAG: dump GDN inputs (batched, MoE branch)
                 if layer_idx == 0 {
                     let qk_dim = n_v_heads * hd;
@@ -10710,147 +10762,19 @@ fn forward_prefill_chunk(
                         "beta_b",
                     );
                 }
-                if let Some(parents) = tree_parents {
-                    // MoE-path tree-verify GDN, dispatched by state quant
-                    // (mirror of the dense path above).
-                    match dn_state.quant {
-                        StateQuant::FP32 => {
-                            let tape_f32 = pbs.dn_s_tape_f32.as_ref().expect(
-                                "FP32 tree-aware LA requires dn_s_tape_f32 scratch (check PrefillBatchScratch::new)",
-                            );
-                            gpu.gated_delta_net_f32_tree_batch_seq(
-                                &pbs.dn_q_batch,
-                                &pbs.dn_k_batch,
-                                &pbs.dn_v_batch,
-                                &pbs.dn_alpha_batch,
-                                &pbs.dn_beta_batch,
-                                &dn_state.s_matrices[delta_layer_idx],
-                                tape_f32,
-                                parents,
-                                &pbs.dn_attn_out_batch,
-                                n,
-                                n_v_heads,
-                                config.linear_value_head_dim,
-                            )?;
-                        }
-                        StateQuant::Q8 => {
-                            let tape_q8 = pbs
-                                .dn_s_tape_q8
-                                .as_ref()
-                                .expect("tree-aware LA requires dn_s_tape_q8 scratch");
-                            let tape_sc = pbs
-                                .dn_s_tape_scales
-                                .as_ref()
-                                .expect("tree-aware LA requires dn_s_tape_scales scratch");
-                            gpu.gated_delta_net_q8_tree_batch_seq(
-                                &pbs.dn_q_batch,
-                                &pbs.dn_k_batch,
-                                &pbs.dn_v_batch,
-                                &pbs.dn_alpha_batch,
-                                &pbs.dn_beta_batch,
-                                &dn_state.s_matrices[delta_layer_idx],
-                                &dn_state.s_scales[delta_layer_idx],
-                                tape_q8,
-                                tape_sc,
-                                parents,
-                                &pbs.dn_attn_out_batch,
-                                n,
-                                n_v_heads,
-                                config.linear_value_head_dim,
-                            )?;
-                        }
-                        StateQuant::Q4 => {
-                            return Err(hip_bridge::HipError::new(
-                                0,
-                                "Q4 DeltaNet state + tree-verify (DDTree) is unsupported: \
-                                 there is no Q4 tree-tape GDN kernel. Use Q8 or FP32 state \
-                                 for tree spec-decode.",
-                            ));
-                        }
-                    }
-                } else {
-                    match dn_state.quant {
-                        StateQuant::FP32 => {
-                            if rdna_compute::norm::gdn_chunked() && n > 1 {
-                                gpu.gated_delta_net_f32_chunked(
-                                    &pbs.dn_q_batch,
-                                    &pbs.dn_k_batch,
-                                    &pbs.dn_v_batch,
-                                    &pbs.dn_alpha_batch,
-                                    &pbs.dn_beta_batch,
-                                    &dn_state.s_matrices[delta_layer_idx],
-                                    &pbs.dn_attn_out_batch,
-                                    n,
-                                    n_v_heads,
-                                    config.linear_value_head_dim,
-                                    rdna_compute::norm::gdn_chunk_size(),
-                                )?
-                            } else {
-                                gpu.gated_delta_net_f32_batch_seq(
-                                    &pbs.dn_q_batch,
-                                    &pbs.dn_k_batch,
-                                    &pbs.dn_v_batch,
-                                    &pbs.dn_alpha_batch,
-                                    &pbs.dn_beta_batch,
-                                    &dn_state.s_matrices[delta_layer_idx],
-                                    &pbs.dn_attn_out_batch,
-                                    n,
-                                    n_v_heads,
-                                    config.linear_value_head_dim,
-                                )?
-                            }
-                        }
-                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            dn_state.ef_residual(delta_layer_idx),
-                        )?,
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
-                    }
-                    // DIAG: dump GDN attention output at layer 0
-                    if layer_idx == 0 {
-                        dump_hidden_localize(
-                            gpu,
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            start_pos,
-                            n_v_heads * config.linear_value_head_dim,
-                            0,
-                            "gdn_b",
-                        );
-                    }
+                // The builder above selected the tree tape or the normal
+                // batched recurrence; all kernels remain N-token kernels.
+                if layer_idx == 0 {
+                    dump_hidden_localize(
+                        gpu,
+                        &pbs.dn_attn_out_batch,
+                        n,
+                        start_pos,
+                        n_v_heads * config.linear_value_head_dim,
+                        0,
+                        "gdn_b",
+                    );
                 }
-                gpu.gated_norm_f32_batched(
-                    &pbs.dn_attn_out_batch,
-                    &pbs.dn_z_batch,
-                    &layer.norm_weight,
-                    &pbs.dn_normed_batch,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                    config.norm_eps,
-                    n,
-                )?;
                 // wo + residual. Q8 wo lands un-rotated (Q8 weights were
                 // quantized against un-rotated activations); MQ4/MQ6 wo
                 // require FWHT(awq_scale-adjusted) rotation. Mirrors the
@@ -10871,27 +10795,34 @@ fn forward_prefill_chunk(
                     let paro_wo = layer.wo.paro.as_ref().unwrap_or_else(|| {
                         panic!("ParoQ4G128 wo missing paro metadata at LA layer {layer_idx}")
                     });
-                    gpu.givens_rotate_to(
-                        &pbs.dn_normed_batch,
-                        &pbs.dn_normed_rot_batch,
-                        &paro_wo.pairs,
-                        &paro_wo.theta,
-                        &paro_wo.channel_scales,
-                        n,
-                        layer.wo.k,
-                        paro_wo.krot as usize,
-                    )?;
+                    execute_steps_mesh(
+                        &DeviceMesh::single(),
+                        gpu,
+                        &ctx,
+                        &[Step::GivensRotateBatched {
+                            x: &pbs.dn_normed_batch,
+                            out: &pbs.dn_normed_rot_batch,
+                            pairs: &paro_wo.pairs,
+                            theta: &paro_wo.theta,
+                            scales: &paro_wo.channel_scales,
+                            batch: n,
+                            dim: layer.wo.k,
+                            krot: paro_wo.krot as usize,
+                        }],
+                    )
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
                     &pbs.dn_normed_rot_batch
                 } else {
                     // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
-                    rotate_x_mq_batched_for(
-                        gpu,
-                        &layer.wo,
-                        &pbs.dn_normed_batch,
-                        &pbs.dn_normed_rot_batch,
-                        layer.wo.k,
-                        n,
-                    )?;
+                    let step = Step::RotateFwhtBatched {
+                        x: &pbs.dn_normed_batch,
+                        out: &pbs.dn_normed_rot_batch,
+                        awq_scale: layer.wo.awq_scale.as_ref(),
+                        k: layer.wo.k,
+                        batch: n,
+                    };
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &[step])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
                     &pbs.dn_normed_rot_batch
                 };
                 if dn_wo_is_6bit {
@@ -12107,7 +12038,6 @@ fn forward_scratch_layers(
 
     let ctx = DispatchCtx::new(gpu);
 
-    let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
 
     for layer_idx in 0..config.n_layers {
@@ -12132,101 +12062,70 @@ fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
 
-                gpu.fused_sigmoid_alpha_gate_f32(
-                    &s.dn_beta,
-                    &s.dn_alpha,
-                    &layer.dt_bias,
-                    &layer.a_log,
-                    n_v_heads,
-                )?;
-
-                gpu.conv1d_silu_split_f32(
-                    &s.dn_q_raw,
-                    &s.dn_k_raw,
-                    &s.dn_v,
-                    &s.dn_qkv,
-                    &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx],
-                    k_dim,
-                    v_dim,
-                )?;
-
-                gpu.fused_qk_l2_norm_scale_f32(
-                    &s.dn_q_raw,
-                    &s.dn_k_raw,
-                    config.linear_num_key_heads,
-                    hd,
-                    1.0 / (hd as f32).sqrt(),
-                    config.norm_eps,
-                )?;
-
-                if config.linear_num_key_heads < n_v_heads {
-                    let ratio = n_v_heads / config.linear_num_key_heads;
-                    gpu.repeat_interleave_qk_f32(
-                        &s.dn_q_raw,
-                        &s.dn_k_raw,
-                        &s.dn_q,
-                        &s.dn_k,
-                        config.linear_num_key_heads,
-                        ratio,
-                        hd,
+                let slot = dn_state
+                    .slot_for_global_layer(&config.layer_types, layer_idx)
+                    .ok_or_else(|| HipError::new(0, "missing compact DeltaNet state slot"))?;
+                let d = DeltaNetOperandDescriptor {
+                    qkv: &s.dn_qkv,
+                    q: &s.dn_q,
+                    k: &s.dn_k,
+                    v: &s.dn_v,
+                    q_raw: &s.dn_q_raw,
+                    k_raw: &s.dn_k_raw,
+                    alpha: &s.dn_alpha,
+                    beta: &s.dn_beta,
+                    dt_bias: Some(&layer.dt_bias),
+                    a_log: Some(&layer.a_log),
+                    state: slot.s,
+                    s_scales: slot.scales,
+                    ef_residual: slot.ef,
+                    conv_weight: &layer.conv_weight,
+                    conv_state: slot.conv,
+                    attn_out: &s.dn_attn_out,
+                    normed: Some(&s.dn_normed),
+                    z: Some(&s.dn_z),
+                    norm_weight: Some(&layer.norm_weight),
+                    n_key_heads: config.linear_num_key_heads,
+                    n_value_heads: n_v_heads,
+                    head_dim: hd,
+                    key_dim: k_dim,
+                    value_dim: v_dim,
+                    q_scale: 1.0 / (hd as f32).sqrt(),
+                    eps: config.norm_eps,
+                    quant: match dn_state.quant {
+                        StateQuant::FP32 => DispatchStateQuant::FP32,
+                        StateQuant::Q8 => DispatchStateQuant::Q8,
+                        StateQuant::Q4 => DispatchStateQuant::Q4,
+                    },
+                };
+                #[cfg(feature = "test-utils")]
+                if crate::test_utils::raw_delta_net_enabled() {
+                    crate::test_utils::raw_delta_net_decode_body(
+                        gpu,
+                        &layer.dt_bias,
+                        &layer.a_log,
+                        &layer.conv_weight,
+                        &layer.norm_weight,
+                        slot,
+                        s,
+                        config,
+                        match dn_state.quant {
+                            StateQuant::FP32 => crate::qwen35::StateQuant::FP32,
+                            StateQuant::Q8 => crate::qwen35::StateQuant::Q8,
+                            StateQuant::Q4 => crate::qwen35::StateQuant::Q4,
+                        },
                     )?;
                 } else {
-                    gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
-                    gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                    let steps = build_delta_net_decode_steps(&d);
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps)
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
                 }
-
-                match dn_state.quant {
-                    StateQuant::FP32 => gpu.gated_delta_net_f32(
-                        &s.dn_q,
-                        &s.dn_k,
-                        &s.dn_v,
-                        &s.dn_alpha,
-                        &s.dn_beta,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &s.dn_attn_out,
-                        1,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?,
-                    StateQuant::Q8 => gpu.gated_delta_net_q8(
-                        &s.dn_q,
-                        &s.dn_k,
-                        &s.dn_v,
-                        &s.dn_alpha,
-                        &s.dn_beta,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        &s.dn_attn_out,
-                        1,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                        dn_state.ef_residual(delta_layer_idx),
-                    )?,
-                    StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &s.dn_q,
-                        &s.dn_k,
-                        &s.dn_v,
-                        &s.dn_alpha,
-                        &s.dn_beta,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        &s.dn_attn_out,
-                        1,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?,
+                #[cfg(not(feature = "test-utils"))]
+                {
+                    let steps = build_delta_net_decode_steps(&d);
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps)
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
                 }
-
-                gpu.gated_norm_f32(
-                    &s.dn_attn_out,
-                    &s.dn_z,
-                    &layer.norm_weight,
-                    &s.dn_normed,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                    config.norm_eps,
-                )?;
                 {
                     let wr = layer.wo.dispatch_ref();
                     execute_steps_mesh(
@@ -12278,7 +12177,6 @@ fn forward_scratch_layers(
                     &format!("layer {layer_idx} LinearAttention residual"),
                     &s.x,
                 )?;
-                delta_layer_idx += 1;
             }
 
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
@@ -12423,49 +12321,72 @@ fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
 
-                // Find GDN call location by dumping after common operations
-                gpu.fused_sigmoid_alpha_gate_f32(
-                    &s.dn_beta,
-                    &s.dn_alpha,
-                    &layer.dt_bias,
-                    &layer.a_log,
-                    n_v_heads,
-                )?;
-                gpu.conv1d_silu_split_f32(
-                    &s.dn_q_raw,
-                    &s.dn_k_raw,
-                    &s.dn_v,
-                    &s.dn_qkv,
-                    &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx],
-                    k_dim,
-                    v_dim,
-                )?;
-                gpu.fused_qk_l2_norm_scale_f32(
-                    &s.dn_q_raw,
-                    &s.dn_k_raw,
-                    config.linear_num_key_heads,
-                    hd,
-                    1.0 / (hd as f32).sqrt(),
-                    config.norm_eps,
-                )?;
-                if config.linear_num_key_heads < n_v_heads {
-                    let ratio = n_v_heads / config.linear_num_key_heads;
-                    gpu.repeat_interleave_qk_f32(
-                        &s.dn_q_raw,
-                        &s.dn_k_raw,
-                        &s.dn_q,
-                        &s.dn_k,
-                        config.linear_num_key_heads,
-                        ratio,
-                        hd,
+                let slot = dn_state
+                    .slot_for_global_layer(&config.layer_types, layer_idx)
+                    .ok_or_else(|| HipError::new(0, "missing compact DeltaNet state slot"))?;
+                let d = DeltaNetOperandDescriptor {
+                    qkv: &s.dn_qkv,
+                    q: &s.dn_q,
+                    k: &s.dn_k,
+                    v: &s.dn_v,
+                    q_raw: &s.dn_q_raw,
+                    k_raw: &s.dn_k_raw,
+                    alpha: &s.dn_alpha,
+                    beta: &s.dn_beta,
+                    dt_bias: Some(&layer.dt_bias),
+                    a_log: Some(&layer.a_log),
+                    state: slot.s,
+                    s_scales: slot.scales,
+                    ef_residual: slot.ef,
+                    conv_weight: &layer.conv_weight,
+                    conv_state: slot.conv,
+                    attn_out: &s.dn_attn_out,
+                    normed: Some(&s.dn_normed),
+                    z: Some(&s.dn_z),
+                    norm_weight: Some(&layer.norm_weight),
+                    n_key_heads: config.linear_num_key_heads,
+                    n_value_heads: n_v_heads,
+                    head_dim: hd,
+                    key_dim: k_dim,
+                    value_dim: v_dim,
+                    q_scale: 1.0 / (hd as f32).sqrt(),
+                    eps: config.norm_eps,
+                    quant: match dn_state.quant {
+                        StateQuant::FP32 => DispatchStateQuant::FP32,
+                        StateQuant::Q8 => DispatchStateQuant::Q8,
+                        StateQuant::Q4 => DispatchStateQuant::Q4,
+                    },
+                };
+                #[cfg(feature = "test-utils")]
+                if crate::test_utils::raw_delta_net_enabled() {
+                    crate::test_utils::raw_delta_net_decode_body(
+                        gpu,
+                        &layer.dt_bias,
+                        &layer.a_log,
+                        &layer.conv_weight,
+                        &layer.norm_weight,
+                        slot,
+                        s,
+                        config,
+                        match dn_state.quant {
+                            StateQuant::FP32 => crate::qwen35::StateQuant::FP32,
+                            StateQuant::Q8 => crate::qwen35::StateQuant::Q8,
+                            StateQuant::Q4 => crate::qwen35::StateQuant::Q4,
+                        },
                     )?;
                 } else {
-                    gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
-                    gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                    let steps = build_delta_net_decode_steps(&d);
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps)
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
                 }
-
-                // DIAG: dump GDN inputs (per-token)
+                #[cfg(not(feature = "test-utils"))]
+                {
+                    let steps = build_delta_net_decode_steps(&d);
+                    execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps)
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                }
+                // DIAG: dump GDN inputs (per-token), after the builder has
+                // produced the normalized/repeated operands.
                 if layer_idx == 0 {
                     let qk_dim = n_v_heads * config.linear_key_head_dim;
                     dump_hidden_localize(gpu, &s.dn_q, 1, pos, qk_dim, 0, "q_p");
@@ -12473,48 +12394,6 @@ fn forward_scratch_layers(
                     dump_hidden_localize(gpu, &s.dn_v, 1, pos, v_dim, 0, "v_p");
                     dump_hidden_localize(gpu, &s.dn_alpha, 1, pos, n_v_heads, 0, "alpha_p");
                     dump_hidden_localize(gpu, &s.dn_beta, 1, pos, n_v_heads, 0, "beta_p");
-                }
-
-                match dn_state.quant {
-                    StateQuant::FP32 => gpu.gated_delta_net_f32(
-                        &s.dn_q,
-                        &s.dn_k,
-                        &s.dn_v,
-                        &s.dn_alpha,
-                        &s.dn_beta,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &s.dn_attn_out,
-                        1,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?,
-                    StateQuant::Q8 => gpu.gated_delta_net_q8(
-                        &s.dn_q,
-                        &s.dn_k,
-                        &s.dn_v,
-                        &s.dn_alpha,
-                        &s.dn_beta,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        &s.dn_attn_out,
-                        1,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                        dn_state.ef_residual(delta_layer_idx),
-                    )?,
-                    StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &s.dn_q,
-                        &s.dn_k,
-                        &s.dn_v,
-                        &s.dn_alpha,
-                        &s.dn_beta,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        &s.dn_attn_out,
-                        1,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?,
                 }
                 // DIAG: dump GDN attention output (per-token)
                 if layer_idx == 0 {
@@ -12529,15 +12408,6 @@ fn forward_scratch_layers(
                     );
                 }
 
-                gpu.gated_norm_f32(
-                    &s.dn_attn_out,
-                    &s.dn_z,
-                    &layer.norm_weight,
-                    &s.dn_normed,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                    config.norm_eps,
-                )?;
                 {
                     let wr = layer.wo.dispatch_ref();
                     execute_steps_mesh(
@@ -12568,8 +12438,6 @@ fn forward_scratch_layers(
                         rb.write_at_head(gpu, slot, &s.x)?;
                     }
                 }
-
-                delta_layer_idx += 1;
             }
 
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
@@ -13450,7 +13318,6 @@ fn forward_scratch_layers_multi(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
 
-    let mut delta_layer_idx = 0usize;
     let mut prev_dev: Option<usize> = None;
 
     for layer_idx in 0..config.n_layers {
@@ -13506,12 +13373,29 @@ fn forward_scratch_layers_multi(
                         la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
+                    debug_assert_eq!(
+                        scalar_qkvza_key(
+                            layer.wqkv.gpu_dtype,
+                            layer.wz.gpu_dtype,
+                            layer.w_beta.gpu_dtype,
+                            layer.w_alpha.gpu_dtype,
+                        ),
+                        if fused_la4_mq4 {
+                            Some(hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256)
+                        } else if fused_la4_lloyd_mq3 {
+                            Some(hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd)
+                        } else {
+                            None
+                        }
+                    );
                     if fused_la4_mq4 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkvza_hfq4g256(
+                        run_fused_qkvza_scalar_key(
+                            gpu,
+                            hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
                             &layer.wqkv.buf,
                             &layer.wz.buf,
                             &layer.w_beta.buf,
@@ -13532,7 +13416,9 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkvza_mq3g256_lloyd(
+                        run_fused_qkvza_scalar_key(
+                            gpu,
+                            hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd,
                             &layer.wqkv.buf,
                             &layer.wz.buf,
                             &layer.w_beta.buf,
@@ -13554,96 +13440,71 @@ fn forward_scratch_layers_multi(
                         weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                         weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                     }
-                    gpu.fused_sigmoid_alpha_gate_f32(
-                        &s.dn_beta,
-                        &s.dn_alpha,
-                        &layer.dt_bias,
-                        &layer.a_log,
-                        n_v_heads,
-                    )?;
-                    gpu.conv1d_silu_split_f32(
-                        &s.dn_q_raw,
-                        &s.dn_k_raw,
-                        &s.dn_v,
-                        &s.dn_qkv,
-                        &layer.conv_weight,
-                        &dn_state.conv_states[delta_layer_idx],
-                        k_dim,
-                        v_dim,
-                    )?;
-                    gpu.fused_qk_l2_norm_scale_f32(
-                        &s.dn_q_raw,
-                        &s.dn_k_raw,
-                        config.linear_num_key_heads,
-                        hd,
-                        1.0 / (hd as f32).sqrt(),
-                        config.norm_eps,
-                    )?;
-                    if config.linear_num_key_heads < n_v_heads {
-                        let ratio = n_v_heads / config.linear_num_key_heads;
-                        gpu.repeat_interleave_qk_f32(
-                            &s.dn_q_raw,
-                            &s.dn_k_raw,
-                            &s.dn_q,
-                            &s.dn_k,
-                            config.linear_num_key_heads,
-                            ratio,
-                            hd,
+                    let slot = dn_state
+                        .slot_for_global_layer(&config.layer_types, layer_idx)
+                        .ok_or_else(|| HipError::new(0, "missing compact DeltaNet state slot"))?;
+                    let d = DeltaNetOperandDescriptor {
+                        qkv: &s.dn_qkv,
+                        q: &s.dn_q,
+                        k: &s.dn_k,
+                        v: &s.dn_v,
+                        q_raw: &s.dn_q_raw,
+                        k_raw: &s.dn_k_raw,
+                        alpha: &s.dn_alpha,
+                        beta: &s.dn_beta,
+                        dt_bias: Some(&layer.dt_bias),
+                        a_log: Some(&layer.a_log),
+                        state: slot.s,
+                        s_scales: slot.scales,
+                        ef_residual: slot.ef,
+                        conv_weight: &layer.conv_weight,
+                        conv_state: slot.conv,
+                        attn_out: &s.dn_attn_out,
+                        normed: Some(&s.dn_normed),
+                        z: Some(&s.dn_z),
+                        norm_weight: Some(&layer.norm_weight),
+                        n_key_heads: config.linear_num_key_heads,
+                        n_value_heads: n_v_heads,
+                        head_dim: hd,
+                        key_dim: k_dim,
+                        value_dim: v_dim,
+                        q_scale: 1.0 / (hd as f32).sqrt(),
+                        eps: config.norm_eps,
+                        quant: match dn_state.quant {
+                            StateQuant::FP32 => DispatchStateQuant::FP32,
+                            StateQuant::Q8 => DispatchStateQuant::Q8,
+                            StateQuant::Q4 => DispatchStateQuant::Q4,
+                        },
+                    };
+                    let ctx = DispatchCtx::new(gpu);
+                    #[cfg(feature = "test-utils")]
+                    if crate::test_utils::raw_delta_net_enabled() {
+                        crate::test_utils::raw_delta_net_decode_body(
+                            gpu,
+                            &layer.dt_bias,
+                            &layer.a_log,
+                            &layer.conv_weight,
+                            &layer.norm_weight,
+                            slot,
+                            s,
+                            config,
+                            match dn_state.quant {
+                                StateQuant::FP32 => crate::qwen35::StateQuant::FP32,
+                                StateQuant::Q8 => crate::qwen35::StateQuant::Q8,
+                                StateQuant::Q4 => crate::qwen35::StateQuant::Q4,
+                            },
                         )?;
                     } else {
-                        gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
-                        gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                        let steps = build_delta_net_decode_steps(&d);
+                        execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps)
+                            .map_err(|e| HipError::new(0, &e.to_string()))?;
                     }
-                    match dn_state.quant {
-                        StateQuant::FP32 => gpu.gated_delta_net_f32(
-                            &s.dn_q,
-                            &s.dn_k,
-                            &s.dn_v,
-                            &s.dn_alpha,
-                            &s.dn_beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &s.dn_attn_out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
-                        StateQuant::Q8 => gpu.gated_delta_net_q8(
-                            &s.dn_q,
-                            &s.dn_k,
-                            &s.dn_v,
-                            &s.dn_alpha,
-                            &s.dn_beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &s.dn_attn_out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            dn_state.ef_residual(delta_layer_idx),
-                        )?,
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &s.dn_q,
-                            &s.dn_k,
-                            &s.dn_v,
-                            &s.dn_alpha,
-                            &s.dn_beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &s.dn_attn_out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
+                    #[cfg(not(feature = "test-utils"))]
+                    {
+                        let steps = build_delta_net_decode_steps(&d);
+                        execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps)
+                            .map_err(|e| HipError::new(0, &e.to_string()))?;
                     }
-                    gpu.gated_norm_f32(
-                        &s.dn_attn_out,
-                        &s.dn_z,
-                        &layer.norm_weight,
-                        &s.dn_normed,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                        config.norm_eps,
-                    )?;
                     {
                         let ctx = DispatchCtx::new(gpu);
                         let wr = layer.wo.dispatch_ref();
@@ -13719,7 +13580,6 @@ fn forward_scratch_layers_multi(
                         &s.ffn_hidden,
                         &s.x,
                     )?;
-                    delta_layer_idx += 1;
                 }
 
                 (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
@@ -14180,7 +14040,9 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkvza_hfq4g256(
+                        run_fused_qkvza_scalar_key(
+                            gpu,
+                            hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
                             &layer.wqkv.buf,
                             &layer.wz.buf,
                             &layer.w_beta.buf,
@@ -14201,7 +14063,9 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkvza_mq3g256_lloyd(
+                        run_fused_qkvza_scalar_key(
+                            gpu,
+                            hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd,
                             &layer.wqkv.buf,
                             &layer.wz.buf,
                             &layer.w_beta.buf,
@@ -14223,96 +14087,71 @@ fn forward_scratch_layers_multi(
                         weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                         weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                     }
-                    gpu.fused_sigmoid_alpha_gate_f32(
-                        &s.dn_beta,
-                        &s.dn_alpha,
-                        &layer.dt_bias,
-                        &layer.a_log,
-                        n_v_heads,
-                    )?;
-                    gpu.conv1d_silu_split_f32(
-                        &s.dn_q_raw,
-                        &s.dn_k_raw,
-                        &s.dn_v,
-                        &s.dn_qkv,
-                        &layer.conv_weight,
-                        &dn_state.conv_states[delta_layer_idx],
-                        k_dim,
-                        v_dim,
-                    )?;
-                    gpu.fused_qk_l2_norm_scale_f32(
-                        &s.dn_q_raw,
-                        &s.dn_k_raw,
-                        config.linear_num_key_heads,
-                        hd,
-                        1.0 / (hd as f32).sqrt(),
-                        config.norm_eps,
-                    )?;
-                    if config.linear_num_key_heads < n_v_heads {
-                        let ratio = n_v_heads / config.linear_num_key_heads;
-                        gpu.repeat_interleave_qk_f32(
-                            &s.dn_q_raw,
-                            &s.dn_k_raw,
-                            &s.dn_q,
-                            &s.dn_k,
-                            config.linear_num_key_heads,
-                            ratio,
-                            hd,
+                    let slot = dn_state
+                        .slot_for_global_layer(&config.layer_types, layer_idx)
+                        .ok_or_else(|| HipError::new(0, "missing compact DeltaNet state slot"))?;
+                    let d = DeltaNetOperandDescriptor {
+                        qkv: &s.dn_qkv,
+                        q: &s.dn_q,
+                        k: &s.dn_k,
+                        v: &s.dn_v,
+                        q_raw: &s.dn_q_raw,
+                        k_raw: &s.dn_k_raw,
+                        alpha: &s.dn_alpha,
+                        beta: &s.dn_beta,
+                        dt_bias: Some(&layer.dt_bias),
+                        a_log: Some(&layer.a_log),
+                        state: slot.s,
+                        s_scales: slot.scales,
+                        ef_residual: slot.ef,
+                        conv_weight: &layer.conv_weight,
+                        conv_state: slot.conv,
+                        attn_out: &s.dn_attn_out,
+                        normed: Some(&s.dn_normed),
+                        z: Some(&s.dn_z),
+                        norm_weight: Some(&layer.norm_weight),
+                        n_key_heads: config.linear_num_key_heads,
+                        n_value_heads: n_v_heads,
+                        head_dim: hd,
+                        key_dim: k_dim,
+                        value_dim: v_dim,
+                        q_scale: 1.0 / (hd as f32).sqrt(),
+                        eps: config.norm_eps,
+                        quant: match dn_state.quant {
+                            StateQuant::FP32 => DispatchStateQuant::FP32,
+                            StateQuant::Q8 => DispatchStateQuant::Q8,
+                            StateQuant::Q4 => DispatchStateQuant::Q4,
+                        },
+                    };
+                    let ctx = DispatchCtx::new(gpu);
+                    #[cfg(feature = "test-utils")]
+                    if crate::test_utils::raw_delta_net_enabled() {
+                        crate::test_utils::raw_delta_net_decode_body(
+                            gpu,
+                            &layer.dt_bias,
+                            &layer.a_log,
+                            &layer.conv_weight,
+                            &layer.norm_weight,
+                            slot,
+                            s,
+                            config,
+                            match dn_state.quant {
+                                StateQuant::FP32 => crate::qwen35::StateQuant::FP32,
+                                StateQuant::Q8 => crate::qwen35::StateQuant::Q8,
+                                StateQuant::Q4 => crate::qwen35::StateQuant::Q4,
+                            },
                         )?;
                     } else {
-                        gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
-                        gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                        let steps = build_delta_net_decode_steps(&d);
+                        execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps)
+                            .map_err(|e| HipError::new(0, &e.to_string()))?;
                     }
-                    match dn_state.quant {
-                        StateQuant::FP32 => gpu.gated_delta_net_f32(
-                            &s.dn_q,
-                            &s.dn_k,
-                            &s.dn_v,
-                            &s.dn_alpha,
-                            &s.dn_beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &s.dn_attn_out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
-                        StateQuant::Q8 => gpu.gated_delta_net_q8(
-                            &s.dn_q,
-                            &s.dn_k,
-                            &s.dn_v,
-                            &s.dn_alpha,
-                            &s.dn_beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &s.dn_attn_out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            dn_state.ef_residual(delta_layer_idx),
-                        )?,
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &s.dn_q,
-                            &s.dn_k,
-                            &s.dn_v,
-                            &s.dn_alpha,
-                            &s.dn_beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &s.dn_attn_out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
+                    #[cfg(not(feature = "test-utils"))]
+                    {
+                        let steps = build_delta_net_decode_steps(&d);
+                        execute_steps_mesh(&DeviceMesh::single(), gpu, &ctx, &steps)
+                            .map_err(|e| HipError::new(0, &e.to_string()))?;
                     }
-                    gpu.gated_norm_f32(
-                        &s.dn_attn_out,
-                        &s.dn_z,
-                        &layer.norm_weight,
-                        &s.dn_normed,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                        config.norm_eps,
-                    )?;
                     {
                         let ctx = DispatchCtx::new(gpu);
                         let wr = layer.wo.dispatch_ref();
@@ -14345,7 +14184,6 @@ fn forward_scratch_layers_multi(
                         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
                         moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
                     }
-                    delta_layer_idx += 1;
                 }
 
                 (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
@@ -15157,6 +14995,43 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pp_decode_qkvza_selection_stays_scalar() {
+        assert_eq!(
+            scalar_qkvza_key(
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ4G256
+            ),
+            Some(hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256)
+        );
+        // MQ3-Lloyd must remain on the scalar family: gfx10 has no safe
+        // batched QKVZA/GEMM path for this format.
+        assert_eq!(
+            scalar_qkvza_key(
+                DType::MQ3G256Lloyd,
+                DType::MQ3G256Lloyd,
+                DType::MQ3G256Lloyd,
+                DType::MQ3G256Lloyd,
+            ),
+            Some(hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd)
+        );
+        assert_eq!(
+            scalar_qkvza_key(DType::Q8_0, DType::Q8_0, DType::Q8_0, DType::Q8_0),
+            None
+        );
+        assert_eq!(
+            scalar_qkvza_key(
+                DType::MQ4G256,
+                DType::HFQ4G256,
+                DType::MQ4G256,
+                DType::MQ4G256
+            ),
+            None
+        );
+    }
 
     // ── SP2 — per-expert mixed-tier table builder (CPU-pure) ──────────────
     // `mixed_tier_table` is the testable core of `per_expert_tier_tables`:

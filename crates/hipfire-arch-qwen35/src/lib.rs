@@ -61,6 +61,11 @@ pub mod qwen35;
 mod spec_impl;
 #[cfg(feature = "deltanet")]
 pub mod speculative;
+#[cfg(feature = "deltanet")]
+pub mod store;
+/// Test-only access to the unchanged legacy Qwen3.5 forward sequence.
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 
 /// Grammar-guided decoding for qwen35 tool-call format. Independent of
 /// the deltanet feature gate — pure data-structure work, no GPU
@@ -81,3 +86,8 @@ pub use carrier::{load_bundle as load_qwen35_bundle, Qwen35Bundle};
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
 #[cfg(feature = "deltanet")]
 pub use mtp_speculator::{build_qwen35_mtp_speculator, Qwen35MtpDrafter};
+#[cfg(feature = "deltanet")]
+pub use store::{
+    assemble_qwen35_weights, load_qwen35_hfq_weights, load_qwen35_paro_weights, qtype_dtype,
+    Qwen35ParoSourceResolver, Qwen35SourceLayout, Qwen35SourceResolver, ResolvedQwen35Source,
+};

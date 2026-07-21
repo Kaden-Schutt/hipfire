@@ -19,7 +19,10 @@
 use crate::carrier::Qwen35Bundle;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
-use hipfire_dispatch::families::kv_tier::KTier;
+use hipfire_dispatch::pipeline::{
+    build_delta_net_batch_steps, execute_steps_mesh, DeltaNetOperandDescriptor,
+};
+use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -605,7 +608,7 @@ impl ModelSlot {
         slot_config: ModelSlotConfig,
     ) -> HipResult<Self> {
         let name = name.into();
-        let mut hfq = HfqFile::open(path).map_err(|e| {
+        let hfq = HfqFile::open(path).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("open {} ({}): {}", path.display(), name, e))
         })?;
         let config = qwen35::config_from_hfq(&hfq).map_err(|e| {
@@ -618,9 +621,8 @@ impl ModelSlot {
                 ),
             )
         })?;
-        let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &layout)?;
+        let weights = crate::load_qwen35_hfq_weights(&hfq, &config, gpu)
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
 
         // For hybrid arches (Qwen 3.5 = 48 DeltaNet LinearAttention + 16
         // FullAttention out of 64 total), only the FullAttention layers need
@@ -1302,7 +1304,16 @@ impl GdnTape {
         n_steps: usize,
     ) -> HipResult<()> {
         let graph_enabled = std::env::var("HIPFIRE_REPLAY_GRAPH").ok().as_deref() == Some("1");
-        let can_graph = graph_enabled && gpu.active_stream.is_some();
+        let can_graph = graph_enabled && gpu.active_stream.is_some() && {
+            #[cfg(feature = "test-utils")]
+            {
+                !crate::test_utils::raw_delta_net_enabled()
+            }
+            #[cfg(not(feature = "test-utils"))]
+            {
+                true
+            }
+        };
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
             return gpu.graphs.replay_graph_launch(
@@ -1376,7 +1387,6 @@ impl GdnTape {
         let hd = self.key_head_dim;
         let v_dim = self.v_dim;
         let k_dim = self.k_dim;
-        let value_head_dim = self.value_head_dim;
         let mut la_idx = 0usize;
 
         for (layer_idx, lt) in config.layer_types.iter().enumerate() {
@@ -1389,104 +1399,88 @@ impl GdnTape {
                 _ => unreachable!("LA layer type mismatch in replay_gdn"),
             };
 
-            // 1. conv1d + SiLU + split — advances conv_state, writes
-            //    (q_raw, k_raw, v) into scratch.
-            gpu.conv1d_silu_split_f32_n(
-                &self.q_raw_scratch,
-                &self.k_raw_scratch,
-                &self.v_scratch,
-                &self.qkv_bufs[la_idx],
+            let slot = dn_state
+                .slot_for_global_layer(&config.layer_types, layer_idx)
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "missing compact DeltaNet state slot")
+                })?;
+            let d = DeltaNetOperandDescriptor {
+                qkv: &self.qkv_bufs[la_idx],
+                q: &self.q_scratch,
+                k: &self.k_scratch,
+                v: &self.v_scratch,
+                q_raw: &self.q_raw_scratch,
+                k_raw: &self.k_raw_scratch,
+                alpha: &self.alpha_bufs[la_idx],
+                beta: &self.beta_bufs[la_idx],
+                // Replay tapes already contain post-sigmoid alpha/beta; the
+                // SpeculativeReplay intent therefore omits DeltaGatePrep.
+                dt_bias: None,
+                a_log: None,
+                state: slot.s,
+                s_scales: slot.scales,
+                ef_residual: slot.ef,
                 conv_weight,
-                &dn_state.conv_states[la_idx],
-                k_dim,
-                v_dim,
-                n_steps,
-            )?;
-
-            // 2. L2 norm(Q) + L2 norm(K) + scale(Q).
-            gpu.fused_qk_l2_norm_scale_f32_batched(
-                &self.q_raw_scratch,
-                &self.k_raw_scratch,
+                conv_state: slot.conv,
+                attn_out: &self.attn_scratch,
+                normed: None,
+                z: None,
+                norm_weight: None,
                 n_key_heads,
-                hd,
-                1.0 / (hd as f32).sqrt(),
-                config.norm_eps,
-                n_steps,
-            )?;
-
-            // 3. Repeat-interleave if GQA.
-            if n_key_heads < n_v_heads {
-                let ratio = n_v_heads / n_key_heads;
-                gpu.repeat_interleave_qk_f32_batched(
+                n_value_heads: n_v_heads,
+                head_dim: hd,
+                key_dim: k_dim,
+                value_dim: v_dim,
+                q_scale: 1.0 / (hd as f32).sqrt(),
+                eps: config.norm_eps,
+                quant: match dn_state.quant {
+                    qwen35::StateQuant::FP32 => hipfire_dispatch::ops::delta_net::StateQuant::FP32,
+                    qwen35::StateQuant::Q8 => hipfire_dispatch::ops::delta_net::StateQuant::Q8,
+                    qwen35::StateQuant::Q4 => hipfire_dispatch::ops::delta_net::StateQuant::Q4,
+                },
+            };
+            #[cfg(feature = "test-utils")]
+            if crate::test_utils::raw_delta_net_enabled() {
+                crate::test_utils::raw_delta_net_replay_body(
+                    gpu,
+                    conv_weight,
+                    slot,
+                    &self.qkv_bufs[la_idx],
                     &self.q_raw_scratch,
                     &self.k_raw_scratch,
+                    &self.v_scratch,
                     &self.q_scratch,
                     &self.k_scratch,
+                    &self.alpha_bufs[la_idx],
+                    &self.beta_bufs[la_idx],
+                    &self.attn_scratch,
+                    n_steps,
                     n_key_heads,
-                    ratio,
+                    n_v_heads,
                     hd,
-                    n_steps,
+                    k_dim,
+                    v_dim,
+                    config.norm_eps,
+                    dn_state.quant,
                 )?;
-            } else {
-                let bytes = n_steps * k_dim * 4;
-                gpu.hip.memcpy_dtod_at(
-                    &self.q_scratch.buf,
-                    0,
-                    &self.q_raw_scratch.buf,
-                    0,
-                    bytes,
-                )?;
-                gpu.hip.memcpy_dtod_at(
-                    &self.k_scratch.buf,
-                    0,
-                    &self.k_raw_scratch.buf,
-                    0,
-                    bytes,
-                )?;
+                la_idx += 1;
+                continue;
             }
-
-            // 4. GDN recurrence — advances S_state.
-            match dn_state.quant {
-                qwen35::StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                )?,
-                qwen35::StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &dn_state.s_scales[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                    dn_state.ef_residual(la_idx),
-                )?,
-                qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &dn_state.s_scales[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                )?,
-            }
+            let steps = build_delta_net_batch_steps(
+                &d,
+                n_steps,
+                hipfire_dispatch::ops::delta_net::DeltaNetBatchIntent::SpeculativeReplay,
+                None,
+                None,
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            execute_steps_mesh(
+                &DeviceMesh::single(),
+                gpu,
+                &hipfire_dispatch::context::DispatchCtx::new(gpu),
+                &steps,
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
             la_idx += 1;
         }
@@ -6091,13 +6085,13 @@ mod tests {
         assert_eq!(buffers, vec![2, 4]);
         assert_eq!(error.as_deref(), Some("hipFree failed for 2"));
 
-        let retry_error = retain_failed_buffers(
-            &mut buffers,
-            |_buffer| Ok::<(), (u8, String)>(()),
-            None,
-        );
+        let retry_error =
+            retain_failed_buffers(&mut buffers, |_buffer| Ok::<(), (u8, String)>(()), None);
         assert!(retry_error.is_none());
-        assert!(buffers.is_empty(), "successful retry removes retained buffers");
+        assert!(
+            buffers.is_empty(),
+            "successful retry removes retained buffers"
+        );
     }
 
     /// CPU mirror of the GPU `softmax_temp_topp_batched_f32` nucleus phase:

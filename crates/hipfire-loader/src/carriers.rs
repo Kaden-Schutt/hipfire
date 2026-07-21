@@ -107,6 +107,20 @@ fn dir_diag(src: &ModelSource) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Qwen35ParoLoaderKind {
+    DenseManifest,
+    LegacyMoe,
+}
+
+fn qwen35_paro_loader_kind(num_experts: usize) -> Qwen35ParoLoaderKind {
+    if num_experts == 0 {
+        Qwen35ParoLoaderKind::DenseManifest
+    } else {
+        Qwen35ParoLoaderKind::LegacyMoe
+    }
+}
+
 // ─── Qwen2Carrier ────────────────────────────────────────────────────
 
 pub struct Qwen2Carrier;
@@ -404,16 +418,30 @@ impl Carrier for Qwen35Carrier {
                         "  warning: CASK eviction is not supported for safetensors Dir sources; eviction sidecar ignored"
                     );
                 }
-                let mut paro_source =
-                    hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
-                        .map_err(|e| format!("ParoSource::new: {e:?}"))?;
-                let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
-                let weights = hipfire_arch_qwen35::qwen35::load_weights(
-                    &mut paro_source,
-                    std::slice::from_mut(ctx.gpu),
-                    &paro_layout,
-                )
-                .map_err(|e| format!("load_weights: {e:?}"))?;
+                let weights = match qwen35_paro_loader_kind(config.num_experts) {
+                    Qwen35ParoLoaderKind::DenseManifest => {
+                        // Dense Paro is represented by the manifest resolver.
+                        hipfire_arch_qwen35::load_qwen35_paro_weights(&source, &config, ctx.gpu)?
+                    }
+                    Qwen35ParoLoaderKind::LegacyMoe => {
+                        // Paro MoE/A3B has separate gate_proj/up_proj tensors and
+                        // layer-shared rotation sidecars.  The manifest currently
+                        // models neither the fused gate_up payload nor paro_shared
+                        // ownership, so preserve the production legacy route.
+                        eprintln!(
+                            "  Paro MoE/A3B: using legacy loader until manifest supports shared sidecars"
+                        );
+                        let mut paro =
+                            hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
+                                .map_err(|e| format!("legacy Paro source setup failed: {e:?}"))?;
+                        hipfire_arch_qwen35::qwen35::load_weights(
+                            &mut paro,
+                            std::slice::from_mut(ctx.gpu),
+                            &hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers),
+                        )
+                        .map_err(|e| format!("legacy Paro MoE load failed: {e:?}"))?
+                    }
+                };
                 let is_kv_layer: Vec<bool> = config
                     .layer_types
                     .iter()
@@ -868,12 +896,25 @@ impl Carrier for LlamaCarrier {
 
 #[cfg(test)]
 mod tests {
-    use super::dspark_lm_head_vocab;
+    use super::{dspark_lm_head_vocab, qwen35_paro_loader_kind, Qwen35ParoLoaderKind};
 
     #[test]
     fn dspark_lm_head_vocab_preserves_reduced_and_fallback_shapes() {
         assert_eq!(dspark_lm_head_vocab(151_936, 152_064), 151_936);
         assert_eq!(dspark_lm_head_vocab(0, 152_064), 152_064);
+    }
+
+    #[test]
+    fn qwen35_paro_moe_keeps_legacy_shared_sidecar_route() {
+        assert_eq!(
+            qwen35_paro_loader_kind(0),
+            Qwen35ParoLoaderKind::DenseManifest
+        );
+        assert_eq!(qwen35_paro_loader_kind(1), Qwen35ParoLoaderKind::LegacyMoe);
+        assert_eq!(
+            qwen35_paro_loader_kind(256),
+            Qwen35ParoLoaderKind::LegacyMoe
+        );
     }
 }
 
