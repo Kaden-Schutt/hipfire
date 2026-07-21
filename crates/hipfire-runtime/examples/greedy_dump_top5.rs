@@ -36,7 +36,10 @@ fn main() {
     let model_path = &args[1];
     let out_prefix = &args[2];
     let mut max_gen_override: Option<usize> = None;
-    let mut kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let mut kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
+        "auto" => "q8".to_string(),
+        mode => mode.to_string(),
+    };
     let mut prompt_parts = Vec::new();
     let mut i = 3;
     while i < args.len() {

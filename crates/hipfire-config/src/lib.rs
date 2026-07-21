@@ -14,6 +14,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 use thiserror::Error;
 
@@ -196,7 +197,7 @@ pub struct ConfigField {
     pub registry_allowed: bool,
     pub experimental: bool,
     pub env_compat: Option<&'static str>,
-    pub project_default_to_env: bool,
+    pub include_builtin_in_process_config: bool,
     pub help: &'static str,
 }
 
@@ -344,7 +345,7 @@ macro_rules! field {
             registry_allowed: $registry,
             experimental: $experimental,
             env_compat: $env,
-            project_default_to_env: true,
+            include_builtin_in_process_config: true,
             help: $help,
         }
     };
@@ -362,16 +363,17 @@ macro_rules! bridge_field {
             registry_allowed: false,
             experimental: $experimental,
             env_compat: Some($env),
-            project_default_to_env: false,
+            include_builtin_in_process_config: false,
             help: $help,
         }
     };
 }
 
-// These fields bridge stable TOML policy into the legacy environment snapshot
-// consumed by hipfire-runtime and rdna-compute. They are process-scoped because
-// those crates resolve the variables once; advertising per-model overrides
-// would be dishonest for a long-lived serve process.
+// These fields preserve legacy environment spellings while exposing stable
+// TOML policy to the typed ProcessConfig handoff consumed by hipfire-runtime
+// and rdna-compute. They are process-scoped because those crates snapshot the
+// values once; advertising per-model overrides would be dishonest for a
+// long-lived serve process.
 macro_rules! process_bool_field {
     ($key:literal, $legacy:literal, $category:ident, $default:expr, $experimental:expr, $env:literal, $help:literal) => {
         bridge_field!(
@@ -2238,6 +2240,139 @@ impl ResolvedConfig {
     }
 }
 
+/// Versioned process-start policy sent from the native CLI to the engine
+/// daemon. Values remain sparse where absence selects an architecture-specific
+/// default, but every included value is validated against [`FIELDS`] before it
+/// crosses the process boundary and again after deserialization.
+///
+/// The daemon lowers this envelope into compact runtime-specific structs; GPU
+/// and model hot paths never parse TOML or inspect this generic value map.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessConfig {
+    pub schema_version: i64,
+    pub values: ConfigLayer,
+}
+
+static ACTIVE_PROCESS_CONFIG: OnceLock<ProcessConfig> = OnceLock::new();
+
+impl ProcessConfig {
+    pub fn from_resolved(resolved: &ResolvedConfig) -> Result<Self> {
+        let mut values = ConfigLayer::default();
+        for schema in FIELDS {
+            if schema.env_compat.is_none() {
+                continue;
+            }
+            let Some(resolved_value) = resolved.get(schema.key) else {
+                continue;
+            };
+            // Architecture-sensitive defaults are represented by absence.
+            // Once a user, registry, one-shot argument, or compatibility env
+            // explicitly resolves the field, carry its concrete value.
+            if matches!(resolved_value.source, ConfigSource::BuiltIn)
+                && !schema.include_builtin_in_process_config
+            {
+                continue;
+            }
+            values.set(schema.key, resolved_value.value.clone())?;
+        }
+        let config = Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            values,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != CONFIG_SCHEMA_VERSION {
+            return Err(ConfigError::InvalidValue {
+                key: "schema_version".into(),
+                message: format!(
+                    "unsupported process config schema {}; expected {}",
+                    self.schema_version, CONFIG_SCHEMA_VERSION
+                ),
+            });
+        }
+        self.values.validate()?;
+        for key in self.values.values.keys() {
+            let schema = field(key).expect("ConfigLayer::validate accepted key");
+            if schema.env_compat.is_none() {
+                return Err(ConfigError::InvalidValue {
+                    key: key.clone(),
+                    message: "field is not part of process-start policy".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Render the compatibility spelling expected by an internal snapshot
+    /// parser. This is an in-memory adapter only; it does not mutate or inspect
+    /// the ambient process environment.
+    pub fn legacy_value(&self, name: &str) -> Option<String> {
+        let schema = FIELDS
+            .iter()
+            .find(|schema| schema.env_compat == Some(name))?;
+        self.values.get(schema.key).and_then(render_compat_value)
+    }
+}
+
+pub fn install_process_config(config: ProcessConfig) -> std::result::Result<(), ProcessConfig> {
+    ACTIVE_PROCESS_CONFIG.set(config)
+}
+
+pub fn active_process_config() -> Option<&'static ProcessConfig> {
+    ACTIVE_PROCESS_CONFIG.get()
+}
+
+/// Resolve global TOML plus the legacy compatibility layer for direct daemon
+/// and developer-tool invocation. Native CLI launches install their already
+/// resolved policy explicitly and never take this fallback.
+pub fn load_local_process_config() -> Result<ProcessConfig> {
+    let paths = ConfigPaths::discover();
+    let loaded = load_global(&paths)?;
+    let mut layers = vec![NamedLayer {
+        source: ConfigSource::GlobalUser {
+            path: loaded.path,
+        },
+        layer: loaded.layer,
+    }];
+    let environment = load_env_layer()?;
+    if !environment.values.is_empty() {
+        layers.push(NamedLayer {
+            source: ConfigSource::LegacyEnv {
+                name: "HIPFIRE_*".into(),
+            },
+            layer: environment,
+        });
+    }
+    ProcessConfig::from_resolved(&resolve(layers)?)
+}
+
+pub fn active_or_local_process_config() -> &'static ProcessConfig {
+    ACTIVE_PROCESS_CONFIG.get_or_init(|| {
+        load_local_process_config()
+            .unwrap_or_else(|error| panic!("invalid hipfire process configuration: {error}"))
+    })
+}
+
+fn render_compat_value(value: &ConfigValue) -> Option<String> {
+    Some(match value {
+        ConfigValue::Bool(value) => {
+            if *value {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        ConfigValue::Integer(value) => value.to_string(),
+        ConfigValue::Float(value) => value.to_string(),
+        ConfigValue::String(value) => value.clone(),
+        ConfigValue::Null => return None,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct NamedLayer {
     pub source: ConfigSource,
@@ -3086,7 +3221,7 @@ mod tests {
                     "duplicate environment alias {name}"
                 );
             }
-            if !field.project_default_to_env {
+            if !field.include_builtin_in_process_config {
                 assert!(field.env_compat.is_some(), "bridge without env alias");
                 assert!(
                     matches!(field.scope, ConfigScope::Process | ConfigScope::Diagnostic),
@@ -3270,6 +3405,51 @@ mod tests {
             ConfigSource::GlobalUser { .. }
         ));
         assert_eq!(temperature.shadowed.len(), 2);
+    }
+
+    #[test]
+    fn process_config_is_sparse_versioned_and_revalidated() {
+        let mut global = ConfigLayer::default();
+        global.set_cli("kernel.mw16", "true").unwrap();
+        global
+            .set_cli("diagnostic.kernel.gemv_rows", "4")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: global,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+
+        assert_eq!(process.legacy_value("HIPFIRE_MW16").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_GEMV_ROWS").as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            process.legacy_value("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64"),
+            None,
+            "architecture-sensitive bridge defaults remain absent"
+        );
+        assert_eq!(
+            process.legacy_value("HIPFIRE_DEVICES"),
+            None,
+            "nullable TOML fields remain absent instead of becoming empty strings"
+        );
+
+        let encoded = serde_json::to_string(&process).unwrap();
+        let decoded: ProcessConfig = serde_json::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+
+        let wrong_version = encoded.replace("\"schema_version\":1", "\"schema_version\":2");
+        let decoded: ProcessConfig = serde_json::from_str(&wrong_version).unwrap();
+        assert!(decoded.validate().is_err());
+        assert!(serde_json::from_str::<ProcessConfig>(
+            r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
+        )
+        .is_err());
     }
 
     #[test]

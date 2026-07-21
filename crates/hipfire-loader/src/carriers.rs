@@ -166,7 +166,7 @@ fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
     ctx.kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default())
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone())
 }
 
 fn resolve_kv_mode(
@@ -1007,9 +1007,7 @@ impl Carrier for Deepseek4Carrier {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .or_else(|| {
-                    std::env::var("HIPFIRE_MTP_K")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
+                    Some(hipfire_runtime::config::get().mtp_k)
                 })
                 .unwrap_or(2);
             let ctx_capacity = config.max_position_embeddings;

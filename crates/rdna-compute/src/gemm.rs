@@ -122,7 +122,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let use_mmq = self.arch.starts_with("gfx1151")
-            && std::env::var("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0")
+            && self.flags.hfq4g128_mmq
             && batch_size >= 16
             && batch_size % 16 == 0
             && m % 16 == 0

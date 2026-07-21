@@ -17,11 +17,11 @@ pub struct DispatchCtx {
 
 impl DispatchCtx {
     /// Create a `DispatchCtx` from the GPU's current state. This is cheap
-    /// enough to call per-layer (ArchCaps is a few dozen bools; FeatureFlags
-    /// reads a handful of env vars), but callers in tight loops should prefer
-    /// creating it once and reusing the reference.
+    /// enough to call per-layer (ArchCaps is a few dozen bools and the
+    /// FeatureFlags snapshot is reference-counted), but callers in tight loops
+    /// should prefer creating it once and reusing the reference.
     pub fn new(gpu: &Gpu) -> Self {
-        let flags = Arc::new(FeatureFlags::from_env(&gpu.arch));
+        let flags = gpu.flags.clone();
         let arch = ArchCaps::new(&gpu.arch, flags.clone());
         Self {
             arch,

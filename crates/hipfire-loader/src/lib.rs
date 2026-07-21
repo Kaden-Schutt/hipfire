@@ -533,17 +533,17 @@ pub enum EpArch {
 
 // ─── Helper functions ─────────────────────────────────────────────────
 
-/// Layer 1 (env var) + Layer 2 (per-model ~/.hipfire/templates) — source-agnostic.
+/// Layer 1 (resolved config) + Layer 2 (per-model ~/.hipfire/templates).
 fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
-    if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
-        if !env_path.is_empty() {
-            match std::fs::read_to_string(&env_path) {
+    if let Some(config_path) = hipfire_runtime::config::get().chat_template_file.as_deref() {
+        if !config_path.is_empty() {
+            match std::fs::read_to_string(config_path) {
                 Ok(s) => {
-                    eprintln!("[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={}", env_path);
+                    eprintln!("[chat_template] using configured template {config_path}");
                     return Some(s);
                 }
                 Err(e) => eprintln!(
-                    "[chat_template] HIPFIRE_CHAT_TEMPLATE_FILE={env_path} failed to read ({e}); falling through"
+                    "[chat_template] configured template {config_path} failed to read ({e}); falling through"
                 ),
             }
         }

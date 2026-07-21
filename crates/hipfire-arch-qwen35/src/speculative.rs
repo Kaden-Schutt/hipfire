@@ -2909,10 +2909,10 @@ pub fn spec_step_dflash(
     // production-path defense in daemon/run/infer for the AR sampler.
     // Forces the per-row host download even when RP is off (extra D2H per
     // cycle); off-by-default for that reason.
-    static NGRAM_BLOCK_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ngram_block_env = *NGRAM_BLOCK_ENV
-        .get_or_init(|| std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1"));
-    let ngram_block_active = !use_temp_sampling && ngram_block_env;
+    let ngram_block_active = !use_temp_sampling
+        && hipfire_runtime::config::get()
+            .dflash_ngram_block
+            .unwrap_or(false);
     // HIPFIRE_DFLASH_LOGIT_DUMP=1: per-cycle diagnostic. Forces the host-logits
     // path and prints, at the acceptance boundary, the target top1/top2 margin
     // and the logit gap to the drafted (rejected) token. A tiny gap at the

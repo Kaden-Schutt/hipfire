@@ -842,7 +842,7 @@ fn main() {
         // ── Per-row tokenize + ChatML wrap ─────────────────────────
         let prompt_normalized =
             hipfire_runtime::tokenizer::maybe_normalize_prompt(row_raw_prompt).into_owned();
-        if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+        if hipfire_runtime::config::get().prompt_token_heat {
             tokenizer.dump_prompt_heat(&prompt_normalized);
         }
         let mut prompt_tokens = tokenizer.encode(&prompt_normalized);
@@ -1996,7 +1996,9 @@ fn main() {
                 mean_nodes,
                 meta.min_nodes,
                 meta.max_nodes,
-                std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF").unwrap_or_else(|_| "off".to_string()),
+                hipfire_config::active_or_local_process_config()
+                    .legacy_value("HIPFIRE_DDTREE_LOGW_CUTOFF")
+                    .unwrap_or_else(|| "off".to_string()),
             );
         }
         // Adaptive-B usage report — only meaningful when --adaptive-b is on.

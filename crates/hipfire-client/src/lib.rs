@@ -226,6 +226,24 @@ impl Engine {
         })
     }
 
+    /// Start the engine daemon and install validated process policy before the
+    /// daemon initializes a GPU. This is the native control-plane path; the
+    /// environment map is reserved for non-hipfire bootstrap state inherited
+    /// by external launchers.
+    pub fn spawn_configured(
+        daemon: impl AsRef<Path>,
+        environment: &BTreeMap<String, String>,
+        config: &hipfire_config::ProcessConfig,
+    ) -> Result<Self> {
+        let mut engine = Self::spawn(daemon, environment)?;
+        let response = engine.request(&serde_json::json!({
+            "type": "configure",
+            "config": config,
+        }))?;
+        expect_type(&response, "configured")?;
+        Ok(engine)
+    }
+
     pub fn send(&mut self, message: &Value) -> Result<()> {
         serde_json::to_writer(&mut self.stdin, message).map_err(|error| {
             ClientError::Protocol(format!("failed to serialize request: {error}"))
@@ -376,6 +394,30 @@ mod tests {
         .unwrap();
         fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
         let mut engine = Engine::spawn(&daemon, &BTreeMap::new()).unwrap();
+        engine.ping().unwrap();
+        engine.unload().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_spawn_sends_process_policy_before_ping() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-configured-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let daemon = root.join("daemon");
+        fs::write(
+            &daemon,
+            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) configured=1; echo '{\"type\":\"configured\"}' ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
+        )
+        .unwrap();
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &config).unwrap();
         engine.ping().unwrap();
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);

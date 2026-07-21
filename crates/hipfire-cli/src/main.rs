@@ -1500,8 +1500,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             "daemon binary not found; build `cargo build --release --features deltanet -p hipfire-runtime --example daemon`"
         )
     })?;
-    let environment = daemon_environment(&resolved);
-    let mut engine = Engine::spawn(&daemon, &environment)?;
+    let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
     engine.ping()?;
     let mut params = load_params(&resolved, entry, max_tokens, args.kv_mode.as_deref())?;
     let selector = args
@@ -2155,8 +2155,8 @@ fn serve_foreground(
 ) -> Result<()> {
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let registry = load_registry(&paths.registry).registry;
-    let environment = daemon_environment(&global);
-    let mut engine = Engine::spawn(&daemon, &environment)?;
+    let process_config = hipfire_config::ProcessConfig::from_resolved(&global)?;
+    let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
     engine.ping()?;
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
     let max_queue = config_u64(&global, "serve.max_queue")? as usize;
@@ -3139,42 +3139,6 @@ fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) ->
     Ok(())
 }
 
-fn daemon_environment(resolved: &hipfire_config::ResolvedConfig) -> BTreeMap<String, String> {
-    let mut environment = BTreeMap::new();
-    for schema in fields() {
-        let Some(name) = schema.env_compat else {
-            continue;
-        };
-        if env::var_os(name).is_some() {
-            continue;
-        }
-        let Some(resolved_value) = resolved.get(schema.key) else {
-            continue;
-        };
-        // Absence is meaningful to RuntimeConfig and FeatureFlags: several
-        // defaults are selected by architecture. New bridge fields therefore
-        // project only explicit config; established fields retain compatibility.
-        if matches!(resolved_value.source, ConfigSource::BuiltIn) && !schema.project_default_to_env
-        {
-            continue;
-        }
-        let value = &resolved_value.value;
-        let rendered = match value {
-            hipfire_config::ConfigValue::Bool(value) => {
-                if *value {
-                    "1".into()
-                } else {
-                    "0".into()
-                }
-            }
-            hipfire_config::ConfigValue::Null => continue,
-            value => value.to_string(),
-        };
-        environment.insert(name.to_owned(), rendered);
-    }
-    environment
-}
-
 fn apply_reasoning_request(
     resolved: &hipfire_config::ResolvedConfig,
     request: &mut serde_json::Value,
@@ -3565,7 +3529,7 @@ fn open_bench_engine(
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
-    let mut environment = daemon_environment(&resolved);
+    let mut environment = BTreeMap::new();
     if args.redline {
         environment.insert("HIPFIRE_REPLAY_BACKEND".into(), "auto".into());
         environment.insert("HIPFIRE_REPLAY_TRANSPORT".into(), "pm4".into());
@@ -3573,10 +3537,13 @@ fn open_bench_engine(
         environment.insert("HIPFIRE_GRAPH".into(), "1".into());
         environment.insert("HIPFIRE_CASK_OFF".into(), "1".into());
     }
+    let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     if let Some(variant) = rdna2_variant {
-        environment.insert("HIPFIRE_RDNA2_VARIANT".into(), variant.to_string());
+        process_config
+            .values
+            .set_cli("diagnostic.kernel.rdna2_variant", &variant.to_string())?;
     }
-    let mut engine = Engine::spawn(daemon, &environment)?;
+    let mut engine = Engine::spawn_configured(daemon, &environment, &process_config)?;
     engine.ping()?;
     let pre_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let longest_prefill = args.pp.iter().copied().max().unwrap_or(0) as u64;
@@ -4627,33 +4594,6 @@ fn registry_source(source: RegistrySource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvRestore {
-        name: &'static str,
-        value: Option<OsString>,
-    }
-
-    impl EnvRestore {
-        fn capture(name: &'static str) -> Self {
-            Self {
-                name,
-                value: env::var_os(name),
-            }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match self.value.take() {
-                Some(value) => env::set_var(self.name, value),
-                None => env::remove_var(self.name),
-            }
-        }
-    }
 
     #[test]
     fn model_suffix_filter_covers_current_formats() {
@@ -4837,14 +4777,11 @@ mod tests {
     }
 
     #[test]
-    fn daemon_environment_projects_only_explicit_config_and_preserves_parent_env() {
+    fn process_config_projects_only_explicit_arch_sensitive_config() {
         const NAME: &str = "HIPFIRE_FP16";
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _restore = EnvRestore::capture(NAME);
-
-        env::remove_var(NAME);
         let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
-        assert!(!daemon_environment(&builtins).contains_key(NAME));
+        let process = hipfire_config::ProcessConfig::from_resolved(&builtins).unwrap();
+        assert_eq!(process.legacy_value(NAME), None);
 
         let mut global = ConfigLayer::default();
         global.set_cli("kernel.fp16", "false").unwrap();
@@ -4855,32 +4792,18 @@ mod tests {
             layer: global,
         }])
         .unwrap();
-        assert_eq!(
-            daemon_environment(&resolved).get(NAME).map(String::as_str),
-            Some("0")
-        );
-
-        env::set_var(NAME, "parent");
-        assert!(!daemon_environment(&resolved).contains_key(NAME));
+        let process = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        assert_eq!(process.legacy_value(NAME).as_deref(), Some("0"));
     }
 
     #[test]
-    fn daemon_environment_projects_typed_scalar_and_variant_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn process_config_projects_typed_scalar_and_variant_config() {
         const NAMES: &[&str] = &[
             "HIPFIRE_DEVICES",
             "HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB",
             "HIPFIRE_GEMV_ROWS",
             "HIPFIRE_LM_HEAD_F16",
         ];
-        let restores = NAMES
-            .iter()
-            .map(|name| EnvRestore::capture(name))
-            .collect::<Vec<_>>();
-        for name in NAMES {
-            env::remove_var(name);
-        }
-
         let mut global = ConfigLayer::default();
         global.set_cli("hardware.devices", "2,3").unwrap();
         global
@@ -4895,13 +4818,11 @@ mod tests {
             layer: global,
         }])
         .unwrap();
-        let environment = daemon_environment(&resolved);
-        assert_eq!(environment.get(NAMES[0]).map(String::as_str), Some("2,3"));
-        assert_eq!(environment.get(NAMES[1]).map(String::as_str), Some("1.5"));
-        assert_eq!(environment.get(NAMES[2]).map(String::as_str), Some("4"));
-        assert_eq!(environment.get(NAMES[3]).map(String::as_str), Some("f32"));
-
-        drop(restores);
+        let process = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        assert_eq!(process.legacy_value(NAMES[0]).as_deref(), Some("2,3"));
+        assert_eq!(process.legacy_value(NAMES[1]).as_deref(), Some("1.5"));
+        assert_eq!(process.legacy_value(NAMES[2]).as_deref(), Some("4"));
+        assert_eq!(process.legacy_value(NAMES[3]).as_deref(), Some("f32"));
     }
 
     #[test]

@@ -64,9 +64,10 @@ fn parse_f16_lm_head_mode(value: Option<&str>) -> F16LmHeadMode {
     }
 }
 
-fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
-    let value = std::env::var("HIPFIRE_LM_HEAD_F16").ok();
-    parse_f16_lm_head_mode(value.as_deref())
+fn f16_lm_head_mode_from_config() -> F16LmHeadMode {
+    parse_f16_lm_head_mode(Some(
+        hipfire_runtime::config::get().lm_head_f16.as_str(),
+    ))
 }
 
 /// Optional tree-attention context for `forward_prefill_batch` — activates
@@ -1621,7 +1622,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
-        1 => match f16_lm_head_mode_from_env() {
+        1 => match f16_lm_head_mode_from_config() {
             F16LmHeadMode::Native => dequant_weight_raw(gpu, quant_type, data, m, k),
             F16LmHeadMode::F32 => {
                 let f32_data: Vec<f32> = data
@@ -5069,9 +5070,8 @@ impl Qwen35Scratch {
                 )
                 .min(128);
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
+                let batch_mult = hipfire_runtime::config::get()
+                    .flash_partials_batch
                     .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
                     .unwrap_or(16);
                 gpu.alloc_tensor(
@@ -5103,9 +5103,9 @@ impl Qwen35Scratch {
             // Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override
             // for users who prefer the non-flash kernel and don't intend
             // to use graph capture.
-            flash_mode: match std::env::var("HIPFIRE_ATTN_FLASH").as_deref() {
-                Ok("never") | Ok("0") | Ok("off") => 0,
-                Ok("always") | Ok("2") | Ok("force") => 2,
+            flash_mode: match hipfire_runtime::config::get().attention_flash_mode.as_str() {
+                "never" | "0" | "off" => 0,
+                "always" | "2" | "force" => 2,
                 _ => {
                     let graph_capable_arch =
                         gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
@@ -7291,8 +7291,7 @@ pub fn prefill_batch_pbs_eligible(
     let verify_decouple = n <= 32
         && decouple_env.as_deref() != Some("0")
         && (is_rdna3_decouple || decouple_env.as_deref() == Some("1"));
-    let force_fallback =
-        !verify_decouple && std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    let force_fallback = !verify_decouple && !hipfire_runtime::config::get().prefill_batched;
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
     // num_experts ≤ 1024 (bound of the batched top-K shared mem).
     let moe_topk_ok =
@@ -16845,7 +16844,7 @@ pub fn forward_prefill_batch_multi(
         .filter(|&v| v >= 2)
         .unwrap_or(PREFILL_MAX_BATCH);
 
-    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    let force_fallback = !hipfire_runtime::config::get().prefill_batched;
 
     // Eligibility: same checks as `forward_prefill_batch_with_pbs`. If any
     // layer fails the batched gate, fall back to per-token forward —

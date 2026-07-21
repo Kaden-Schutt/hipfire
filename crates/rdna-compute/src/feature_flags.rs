@@ -2,11 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Typed, immutable env-var resolution for rdna-compute.
+//! Typed, immutable startup-policy resolution for rdna-compute.
 //!
-//! All `HIPFIRE_*` env vars are read exactly once at `Gpu::init()` time via
-//! `FeatureFlags::from_env()`. Dispatching hot paths access `self.flags.*`
-//! instead of hitting `std::env::var`'s global lock on every call.
+//! The native daemon installs a schema-validated process configuration before
+//! `Gpu::init()`. Dispatching hot paths access `self.flags.*` instead of
+//! parsing TOML or consulting ambient process state on every call.
+
+use hipfire_config::ProcessConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mb4Mode {
@@ -244,8 +246,23 @@ pub struct FeatureFlags {
 
 impl FeatureFlags {
     pub fn from_env(arch: &str) -> Self {
+        Self::from_lookup(arch, |name| std::env::var(name).map_err(|_| ()))
+    }
+
+    pub fn from_process_config(arch: &str, config: &ProcessConfig) -> Self {
+        Self::from_lookup(arch, |name| config.legacy_value(name).ok_or(()))
+    }
+
+    pub fn from_active_config(arch: &str) -> Self {
+        Self::from_process_config(arch, hipfire_config::active_or_local_process_config())
+    }
+
+    fn from_lookup(
+        arch: &str,
+        value: impl Fn(&str) -> std::result::Result<String, ()>,
+    ) -> Self {
         let parse_bool = |name: &str| -> Option<bool> {
-            match std::env::var(name).ok().as_deref() {
+            match value(name).ok().as_deref() {
                 Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") => Some(true),
                 Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") => {
                     Some(false)
@@ -255,10 +272,10 @@ impl FeatureFlags {
         };
 
         let parse_usize =
-            |name: &str| -> Option<usize> { std::env::var(name).ok().and_then(|s| s.parse().ok()) };
+            |name: &str| -> Option<usize> { value(name).ok().and_then(|s| s.parse().ok()) };
 
         let parse_mb4 = |name: &str| -> Option<Mb4Mode> {
-            match std::env::var(name).ok().as_deref() {
+            match value(name).ok().as_deref() {
                 Some("1") => Some(Mb4Mode::Pack1),
                 Some("2") => Some(Mb4Mode::Pack2),
                 Some("4") => Some(Mb4Mode::Pack4),
@@ -278,7 +295,7 @@ impl FeatureFlags {
             _ => 2,
         };
 
-        let mut hipcc_extra_flags = std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
+        let mut hipcc_extra_flags = value("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
         let mut append_hipcc_flag = |flag: &str| {
             if !hipcc_extra_flags.is_empty() {
                 hipcc_extra_flags.push(' ');
@@ -286,7 +303,7 @@ impl FeatureFlags {
             hipcc_extra_flags.push_str(flag);
         };
         if arch == "gfx1100" {
-            match std::env::var("HIPFIRE_GFX11_WEIGHT_LOAD_POLICY")
+            match value("HIPFIRE_GFX11_WEIGHT_LOAD_POLICY")
                 .ok()
                 .as_deref()
             {
@@ -301,7 +318,7 @@ impl FeatureFlags {
             }
         }
         if arch == "gfx1201" {
-            let policy_flag = match std::env::var("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY")
+            let policy_flag = match value("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY")
                 .ok()
                 .as_deref()
             {
@@ -324,7 +341,7 @@ impl FeatureFlags {
             arch: arch.to_string(),
 
             // GEMV tuning
-            gemv_rows: std::env::var("HIPFIRE_GEMV_ROWS")
+            gemv_rows: value("HIPFIRE_GEMV_ROWS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .map(|r| match r {
@@ -343,82 +360,82 @@ impl FeatureFlags {
             hfq3_dp4a: parse_bool("HIPFIRE_HFQ3_DP4A"),
             hfq3_mmq: parse_bool("HIPFIRE_HFQ3_MMQ"),
             hfq4_mmq_rdna2: parse_bool("HIPFIRE_HFQ4_MMQ_RDNA2"),
-            fp8_wmma: std::env::var("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
-            dot2_gemv: std::env::var("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
+            fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
+            dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
-            rdna3_hfq4_qkv_wave64: std::env::var("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref()
+            rdna3_hfq4_qkv_wave64: value("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_2wave: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
+            rdna3_hfq4_qkvza_2wave: value("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_wavepack4: std::env::var(
+            rdna3_hfq4_qkvza_wavepack4: value(
                 "HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4",
             )
             .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_ldsx8: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8")
+            rdna3_hfq4_qkvza_ldsx8: value("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8")
                 .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_reduce_chain: std::env::var(
+            rdna3_hfq4_qkvza_reduce_chain: value(
                 "HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN",
             )
             .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_hoist_x32: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
+            rdna3_hfq4_qkvza_hoist_x32: value("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
                 .as_deref()
                 == Ok("1"),
             rdna3_hfq4_qkvza_k2048: parse_bool("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
                 .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
                 .unwrap_or(arch == "gfx1100"),
-            rdna3_hfq4_residual_k2048: std::env::var("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048")
+            rdna3_hfq4_residual_k2048: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048")
                 .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_sigmoid_tight_grid: std::env::var(
+            rdna3_hfq4_sigmoid_tight_grid: value(
                 "HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID",
             )
             .as_deref()
                 == Ok("1"),
             rdna3_hfq4_sigmoid_buffer: parse_bool("HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER")
                 .unwrap_or(arch == "gfx1100"),
-            rdna3_hfq4_sigmoid_rows4: std::env::var(
+            rdna3_hfq4_sigmoid_rows4: value(
                 "HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4",
             )
             .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_lm_head_k2048: std::env::var(
+            rdna3_hfq4_lm_head_k2048: value(
                 "HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048",
             )
             .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_moe_gate_up_k2048: std::env::var(
+            rdna3_hfq4_moe_gate_up_k2048: value(
                 "HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048",
             )
             .as_deref()
                 == Ok("1"),
-            mmq_override: match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
+            mmq_override: match value("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
                 Some("1") | Some("on") => Some(true),
                 _ => None,
             },
             mmq_min_batch: parse_usize("HIPFIRE_MMQ_MIN_BATCH"),
-            fp16_disabled: std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0"),
+            fp16_disabled: value("HIPFIRE_FP16").map_or(false, |v| v == "0"),
             fp16_layer_min: parse_usize("HIPFIRE_FP16_LAYER_MIN"),
             fp16_layer_max: parse_usize("HIPFIRE_FP16_LAYER_MAX"),
-            wo_mmq: std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
-            lm_head_wmma_disabled: std::env::var("HIPFIRE_LM_HEAD_WMMA")
+            wo_mmq: value("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
+            lm_head_wmma_disabled: value("HIPFIRE_LM_HEAD_WMMA")
                 .map_or(false, |v| v == "0"),
-            lm_head_overwrite: std::env::var("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
+            lm_head_overwrite: value("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
 
             // MMQ screening
-            mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN")
+            mmq_screen: value("HIPFIRE_MMQ_SCREEN")
                 .ok()
                 .map(|v| v == "1")
                 .unwrap_or(mmq_screen_default),
-            mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
+            mmq_screen_threshold: value("HIPFIRE_MMQ_SCREEN_THRESHOLD")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(mmq_screen_threshold_default),
-            mmq_diag_quantize_only: std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY")
+            mmq_diag_quantize_only: value("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY")
                 .ok()
                 .as_deref()
                 == Some("1"),
@@ -426,51 +443,51 @@ impl FeatureFlags {
             // Kernel variant overrides
             lloyd_mb4: parse_mb4("HIPFIRE_LLOYD_MB4"),
             mq3_mb4: parse_mb4("HIPFIRE_MQ3_MB4"),
-            hfq4g128_mmq: std::env::var("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0"),
+            hfq4g128_mmq: value("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0"),
             hfq3_mmq_layer_min: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MIN"),
             hfq3_mmq_layer_max: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MAX"),
-            hfq4_mmq_gfx906_y64: std::env::var("HIPFIRE_HFQ4_MMQ_GFX906_Y64")
+            hfq4_mmq_gfx906_y64: value("HIPFIRE_HFQ4_MMQ_GFX906_Y64")
                 .map_or(false, |v| v == "1"),
-            gate_up_variant: std::env::var("HIPFIRE_GATE_UP_VARIANT").ok(),
-            gate_up_nosync: std::env::var("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
+            gate_up_variant: value("HIPFIRE_GATE_UP_VARIANT").ok(),
+            gate_up_nosync: value("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
             qkvza_split_tail: parse_bool("HIPFIRE_QKVZA_SPLIT_TAIL").unwrap_or(false),
             gfx942_gemv_v2: parse_bool("HIPFIRE_GFX942_GEMV_V2"),
-            gfx942_gemv_v3: std::env::var("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
+            gfx942_gemv_v3: value("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
-                && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
-            rmsnorm_mq_tight_lds: std::env::var("HIPFIRE_RMSNORM_MQ_TIGHT_LDS").as_deref()
+                && value("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
+            rmsnorm_mq_tight_lds: value("HIPFIRE_RMSNORM_MQ_TIGHT_LDS").as_deref()
                 == Ok("1"),
-            rdna3_rmsnorm_wavegrid: std::env::var("HIPFIRE_RDNA3_RMSNORM_WAVEGRID")
+            rdna3_rmsnorm_wavegrid: value("HIPFIRE_RDNA3_RMSNORM_WAVEGRID")
                 .as_deref()
                 == Ok("1"),
-            rdna3_rmsnorm_split: std::env::var("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref()
+            rdna3_rmsnorm_split: value("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref()
                 == Ok("1"),
             rdna3_rmsnorm_vecsum: parse_bool("HIPFIRE_RDNA3_RMSNORM_VECSUM")
                 .unwrap_or(arch == "gfx1100"),
-            rdna3_rmsnorm_sign_lds: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS")
+            rdna3_rmsnorm_sign_lds: value("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS")
                 .as_deref()
                 == Ok("1"),
-            rdna3_rmsnorm_sign_const: std::env::var("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST")
+            rdna3_rmsnorm_sign_const: value("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST")
                 .as_deref()
                 == Ok("1"),
-            gfx942_mfma_prefill: std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
-            moe_grouped_i8: match std::env::var("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
+            gfx942_mfma_prefill: value("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
+            moe_grouped_i8: match value("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
                 Some("1") => Some(true),
                 Some("0") => Some(false),
                 _ => None,
             },
-            moe_grouped_i8_k8: std::env::var("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1"),
-            moe_grouped_i8_k4: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() == Ok("1"),
-            moe_grouped_i8_k4_gfx12: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref()
+            moe_grouped_i8_k8: value("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1"),
+            moe_grouped_i8_k4: value("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() == Ok("1"),
+            moe_grouped_i8_k4_gfx12: value("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref()
                 == Ok("1"),
-            moe_grouped_m2: std::env::var("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1"),
-            moe_grouped_4w: std::env::var("HIPFIRE_MOE_GROUPED_4W").as_deref() == Ok("1"),
-            moe_down_combine_vec4: std::env::var("HIPFIRE_MOE_DOWN_COMBINE_VEC4").as_deref()
+            moe_grouped_m2: value("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1"),
+            moe_grouped_4w: value("HIPFIRE_MOE_GROUPED_4W").as_deref() == Ok("1"),
+            moe_down_combine_vec4: value("HIPFIRE_MOE_DOWN_COMBINE_VEC4").as_deref()
                 == Ok("1"),
-            moe_hfq6_i8: std::env::var("HIPFIRE_MOE_HFQ6_I8").as_deref() == Ok("1"),
-            moe_hfq6_v2: std::env::var("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
+            moe_hfq6_i8: value("HIPFIRE_MOE_HFQ6_I8").as_deref() == Ok("1"),
+            moe_hfq6_v2: value("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
             // MoE prefill (Ship 4.2)
-            moe_grouped_gemm: match std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() {
+            moe_grouped_gemm: match value("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() {
                 Some("0") | Some("off") => false,
                 _ => true,
             },
@@ -478,31 +495,31 @@ impl FeatureFlags {
             moe_paro_i8_k8: parse_bool("HIPFIRE_MOE_PARO_I8_K8"),
 
             // Graph / capture / deterministic
-            force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
-            gemm_dump: std::env::var("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
-            deterministic: std::env::var("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
-            mw16: std::env::var("HIPFIRE_MW16").map_or(false, |v| v == "1"),
-            q8_batched_legacy: std::env::var("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
-            deepseek4_q8_wmma_off: std::env::var("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
-            deepseek4_q8_4w_off: std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
-            rope_interleaved_legacy: std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY")
+            force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
+            gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
+            deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
+            mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
+            q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
+            deepseek4_q8_wmma_off: value("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
+            deepseek4_q8_4w_off: value("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
+            rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY")
                 .ok()
                 .as_deref()
                 == Some("1"),
-            wo_wmma_variant: std::env::var("HIPFIRE_WO_WMMA_VARIANT").ok(),
+            wo_wmma_variant: value("HIPFIRE_WO_WMMA_VARIANT").ok(),
 
             // rocBLAS
-            rocblas_all_archs: std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref()
+            rocblas_all_archs: value("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref()
                 == Some("1"),
-            rocblas_off: std::env::var("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1"),
+            rocblas_off: value("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1"),
             rocblas_min_batch: parse_usize("HIPFIRE_ROCBLAS_MIN_BATCH"),
 
             // Kernels.rs
-            lloyd_force_baseline: std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE")
+            lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE")
                 .ok()
                 .as_deref()
                 == Some("1"),
-            rdna2_variant: std::env::var("HIPFIRE_RDNA2_VARIANT")
+            rdna2_variant: value("HIPFIRE_RDNA2_VARIANT")
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok()),
 
@@ -510,7 +527,7 @@ impl FeatureFlags {
             hipcc_extra_flags,
 
             // Interpreter Phase 2a
-            force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
+            force_unfused: value("HIPFIRE_FORCE_UNFUSED")
                 .map(|v| v == "1")
                 .unwrap_or(false),
 
@@ -520,17 +537,17 @@ impl FeatureFlags {
             // drafter emits independent per-position marginals — a tree branch
             // has no joint to exploit. Opt in with the CLI `--ddtree` flag (sets
             // HIPFIRE_DFLASH_TREE=1).
-            dflash_tree: std::env::var("HIPFIRE_DFLASH_TREE").as_deref() == Ok("1"),
+            dflash_tree: value("HIPFIRE_DFLASH_TREE").as_deref() == Ok("1"),
             ddtree_budget: parse_usize("HIPFIRE_DDTREE_BUDGET").filter(|&b| b > 0),
             ddtree_topk: parse_usize("HIPFIRE_DDTREE_TOPK").filter(|&k| k >= 1),
             // D8: ddtree_verify_naive removed; HIPFIRE_DDTREE_VERIFY env is no-op.
-            ddtree_tree_la: std::env::var("HIPFIRE_DDTREE_TREE_LA").as_deref() != Ok("0"),
-            dflash_fast_sample: std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").as_deref() != Ok("0"),
-            ddtree_logw_cutoff: std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF")
+            ddtree_tree_la: value("HIPFIRE_DDTREE_TREE_LA").as_deref() != Ok("0"),
+            dflash_fast_sample: value("HIPFIRE_DFLASH_FAST_SAMPLE").as_deref() != Ok("0"),
+            ddtree_logw_cutoff: value("HIPFIRE_DDTREE_LOGW_CUTOFF")
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|&x| x > 0.0),
-            dflash_q8_lmhead_wmma: match std::env::var("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
+            dflash_q8_lmhead_wmma: match value("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
                 Ok(v) => {
                     let v = v.trim().to_ascii_lowercase();
                     !(v == "0" || v == "false" || v == "off" || v == "no")
@@ -540,7 +557,7 @@ impl FeatureFlags {
 
             // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
             fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
-            fuse_qkv_bias_debug: std::env::var("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
+            fuse_qkv_bias_debug: value("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
         }
     }
 
@@ -727,6 +744,9 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_config::{
+        ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve,
+    };
     use std::ffi::OsString;
     use std::sync::Mutex;
 
@@ -772,5 +792,28 @@ mod tests {
 
         std::env::set_var(QKVZA_SPLIT_TAIL_ENV, "1");
         assert!(FeatureFlags::from_env("gfx1100").qkvza_split_tail);
+    }
+
+    #[test]
+    fn process_config_preserves_explicit_and_arch_default_flags() {
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.qkvza_split_tail", "true").unwrap();
+        layer
+            .set_cli("diagnostic.kernel.gemv_rows", "4")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let flags = FeatureFlags::from_process_config("gfx1100", &process);
+
+        assert!(flags.qkvza_split_tail);
+        assert_eq!(flags.gemv_rows, Some(4));
+        assert!(flags.rdna3_hfq4_qkvza_k2048);
+        assert!(flags.rdna3_hfq4_residual_stage_x32);
     }
 }

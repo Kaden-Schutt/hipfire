@@ -1019,6 +1019,65 @@ fn init_tracing() {
     }
 }
 
+fn install_process_config(config: hipfire_config::ProcessConfig) -> Result<(), String> {
+    config.validate().map_err(|error| error.to_string())?;
+    let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config(&config);
+    hipfire_config::install_process_config(config)
+        .map_err(|_| "process configuration was already initialized".to_owned())?;
+    hipfire_runtime::config::init_with(runtime)
+        .map_err(|_| "runtime process configuration was already initialized".to_owned())
+}
+
+/// Read the first protocol message before GPU initialization. Native clients
+/// send `configure`; older/direct clients may send `load`, in which case the
+/// daemon resolves local TOML plus compatibility env itself and preserves the
+/// load as the first regular command.
+fn receive_startup_config(
+    stdout: &mut impl Write,
+) -> Result<Option<(hipfire_config::ProcessConfig, Option<DaemonMsg>, bool)>, String> {
+    let stdin = std::io::stdin();
+    let mut lock = stdin.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lock.read_line(&mut line).map_err(|error| error.to_string())? == 0 {
+            return Ok(None);
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let msg = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(msg) => msg,
+            Err(error) => {
+                writeln!(
+                    stdout,
+                    r#"{{"type":"error","message":"invalid JSON: {}"}}"#,
+                    error
+                )
+                .map_err(|write_error| write_error.to_string())?;
+                stdout.flush().map_err(|error| error.to_string())?;
+                continue;
+            }
+        };
+        if msg.get("type").and_then(|value| value.as_str()) == Some("configure") {
+            let config = serde_json::from_value::<hipfire_config::ProcessConfig>(
+                msg.get("config")
+                    .cloned()
+                    .ok_or_else(|| "configure message is missing config".to_owned())?,
+            )
+            .map_err(|error| format!("invalid process configuration: {error}"))?;
+            config.validate().map_err(|error| error.to_string())?;
+            return Ok(Some((config, None, true)));
+        }
+        let config = hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
+        return Ok(Some((
+            config,
+            Some(DaemonMsg::Regular(msg)),
+            false,
+        )));
+    }
+}
+
 fn main() {
     init_tracing();
     tracing::info!(pid = std::process::id(), "daemon starting");
@@ -1033,6 +1092,14 @@ fn main() {
     // compat paths (hfq4, hfq6, q8 weights × asym3, q8 KV) so models from any
     // era of the registry start instantly.
     if args.iter().any(|a| a == "--precompile") {
+        let process_config = hipfire_config::load_local_process_config().unwrap_or_else(|error| {
+            eprintln!("FATAL: invalid process configuration: {error}");
+            std::process::exit(1);
+        });
+        install_process_config(process_config).unwrap_or_else(|error| {
+            eprintln!("FATAL: failed to install process configuration: {error}");
+            std::process::exit(1);
+        });
         // Pre-create the expected precompiled-dir next to this binary so the
         // compiler's writeback path fires. Without this, Gpu::init probes for
         // an existing dir and silently disables writeback if it's missing —
@@ -1083,6 +1150,35 @@ fn main() {
     // Kept in a binding so the fd lives for the full process lifetime.
     let _daemon_lock = acquire_daemon_lock();
 
+    let mut stdout = std::io::stdout();
+    let Some((process_config, pending_message, acknowledge_config)) =
+        receive_startup_config(&mut stdout).unwrap_or_else(|error| {
+            eprintln!("FATAL: failed to resolve startup configuration: {error}");
+            std::process::exit(1);
+        })
+    else {
+        return;
+    };
+    install_process_config(process_config).unwrap_or_else(|error| {
+        eprintln!("FATAL: failed to install process configuration: {error}");
+        std::process::exit(1);
+    });
+    if acknowledge_config {
+        writeln!(
+            stdout,
+            r#"{{"type":"configured","schema_version":{}}}"#,
+            hipfire_config::CONFIG_SCHEMA_VERSION
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("FATAL: failed to acknowledge process configuration: {error}");
+            std::process::exit(1);
+        });
+        stdout.flush().unwrap_or_else(|error| {
+            eprintln!("FATAL: failed to flush process configuration acknowledgement: {error}");
+            std::process::exit(1);
+        });
+    }
+
     let mut gpu = match rdna_compute::Gpu::init() {
         Ok(g) => g,
         Err(e) => {
@@ -1116,6 +1212,9 @@ fn main() {
     // GPU compute and wouldn't even read the abort line until after
     // the prefill completed.
     let (msg_tx, msg_rx) = mpsc::channel::<DaemonMsg>();
+    if let Some(message) = pending_message {
+        let _ = msg_tx.send(message);
+    }
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let lock = stdin.lock();
@@ -1165,8 +1264,6 @@ fn main() {
             }
         }
     });
-    let mut stdout = std::io::stdout();
-
     while let Ok(daemon_msg) = msg_rx.recv() {
         let msg = match daemon_msg {
             DaemonMsg::Regular(m) => m,
@@ -1193,6 +1290,13 @@ fn main() {
         tracing::debug!("daemon command received");
 
         match msg_type {
+            "configure" => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","message":"process configuration is immutable after daemon startup"}}"#
+                );
+                let _ = stdout.flush();
+            }
             "load" => {
                 // FIX #1 (transactional EP load): the unload of the prior model
                 // is deferred for the EP (tp>1) path until AFTER the new load
@@ -1959,7 +2063,7 @@ fn main() {
                     .unwrap_or("Hello");
                 let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
                 let prompt: &str = &prompt_norm;
-                if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+                if hipfire_runtime::config::get().prompt_token_heat {
                     if let Some(tok) = m.tokenizer.as_ref() {
                         tok.dump_prompt_heat(prompt);
                     }
@@ -2227,10 +2331,7 @@ fn main() {
                 // (`experimental_budget_alert: true` → HIPFIRE_EXPERIMENTAL_
                 // BUDGET_ALERT=1 set by the CLI). Research use only; not a
                 // stable contract.
-                let experimental_ok = std::env::var("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT")
-                    .ok()
-                    .as_deref()
-                    == Some("1");
+                let experimental_ok = hipfire_runtime::config::get().experimental_budget_alert;
                 let budget_alert_at_tok = if experimental_ok {
                     msg.get("budget_alert_at_tok")
                         .and_then(|v| v.as_u64())
@@ -6149,9 +6250,7 @@ fn generate_qwen35_mtp(
     // the GPU-validation thread can sweep. `set_p_min(0.4)` is applied below
     // unconditionally (the MtpSpecState::new default p_min is arch-derived; we
     // pin the proven value for the serve path and let HIPFIRE_MTP_P_MIN win).
-    let max_n: usize = std::env::var("HIPFIRE_MTP_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
+    let max_n: usize = Some(hipfire_runtime::config::get().mtp_k)
         .filter(|k| (1..=8).contains(k))
         .unwrap_or(3);
     let p_min: f32 = std::env::var("HIPFIRE_MTP_P_MIN")
@@ -7334,10 +7433,7 @@ fn generate_multi(
     let mut prev_in_think: bool = false;
     let mut force_answer_latched = false;
     let think_open_tok = tokenizer.special_token_id("<think>");
-    let max_total_think: usize = std::env::var("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let max_total_think = hipfire_runtime::config::get().max_total_think_tokens;
     let mut total_think_tokens: usize = 0;
     // Post-latch answer bound. Once the think-cap latches we force-close <think>
     // and ask the model to answer; but `total_think_tokens` only advances
@@ -8452,7 +8548,7 @@ fn generate(
     // chain rejection sampling (chain mode). A greedy-only drafter (MTP/n-gram) keeps
     // temp>0 on AR. min_p is unimplemented on both spec paths (a min_p request → AR).
     // Opt out of temp>0 spec entirely: HIPFIRE_DFLASH_TEMP_SPEC=0.
-    let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0");
+    let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
     let dflash_min_p_present = min_p.map(|p| p > 0.0).unwrap_or(false);
     let temp_spec_env_off = std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
     let supports_temp_swor = m
@@ -9899,10 +9995,7 @@ fn generate(
         // the model answer); if it's STILL thinking a margin past the cap, we
         // force EOS so the turn can't run unbounded — 35b-a3b re-opens <think>
         // after the one-shot force-answer and out-thinks client timeouts.
-        let max_total_think: usize = std::env::var("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let max_total_think = hipfire_runtime::config::get().max_total_think_tokens;
         let mut total_think_tokens: usize = 0;
         // Post-latch answer bound (see the _multi decode path for rationale): the
         // +256 EOS below only counts in-think tokens, so a non-think ramble or a
@@ -11114,20 +11207,17 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     prompt_ids
 }
 
-/// Resolve whether deepseek4 spec-decode is requested for this model, mirroring
-/// the env/config chain inside `generate_deepseek4` (daemon.rs spec_requested).
+/// Resolve whether deepseek4 spec-decode is requested for this model from the
+/// typed process policy.
 /// The dispatch uses this (plus `temp <= 1e-6` and `m.speculator.is_some()`) to
 /// route the spec path through the unified `generate_spec`; the AR path (and the
 /// no-speculator fallback) stay in `generate_deepseek4`.
 fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
-    std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or_else(|| match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
-            Some("on") => true,
-            Some("off") => false,
-            _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
-        })
+    match hipfire_runtime::config::get().mtp_mode.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
+    }
 }
 
 /// deepseek4 MTP spec-decode through the unified `generate_spec` (Phase 4 T4c-2).
@@ -11197,9 +11287,7 @@ fn generate_deepseek4_spec(
         .ok()
         .and_then(|s| s.parse().ok())
         .or_else(|| {
-            std::env::var("HIPFIRE_MTP_K")
-                .ok()
-                .and_then(|s| s.parse().ok())
+            Some(hipfire_runtime::config::get().mtp_k)
         })
         .unwrap_or(2);
 

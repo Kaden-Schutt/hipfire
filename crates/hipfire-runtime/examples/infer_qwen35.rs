@@ -156,7 +156,10 @@ fn main() {
     .expect("failed to load weights");
 
     let kv_seq = 2048usize;
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
+        "auto" => "q8".to_string(),
+        mode => mode.to_string(),
+    };
     let mut kv_cache = match kv_mode.as_str() {
         "givens4" => {
             eprintln!("KV cache: givens4");

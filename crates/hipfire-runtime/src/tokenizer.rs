@@ -1503,7 +1503,7 @@ pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
 /// `OnceLock`, so toggling `HIPFIRE_NORMALIZE_PROMPT` per-call can't drive it
 /// in a shared test process — that mismatch is what silently broke the
 /// opt-out tests until CI surfaced it.)
-fn normalize_prompt_with(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
+pub fn normalize_prompt_with(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     if !enabled {
         return Cow::Borrowed(s);

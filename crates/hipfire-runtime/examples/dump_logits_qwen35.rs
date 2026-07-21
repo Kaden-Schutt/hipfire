@@ -67,7 +67,10 @@ fn main() {
     .expect("load weights");
 
     let kv_seq = (prefill_len + 16).max(512);
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
+        "auto" => "q8".to_string(),
+        mode => mode.to_string(),
+    };
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
             &mut gpu,

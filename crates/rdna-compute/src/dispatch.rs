@@ -802,7 +802,7 @@ impl Gpu {
             hip_minor
         );
 
-        let flags = Arc::new(FeatureFlags::from_env(&arch));
+        let flags = Arc::new(FeatureFlags::from_active_config(&arch));
         let arch_caps = crate::arch_caps::ArchCaps::new(&arch, flags.clone());
 
         let compiler = KernelCompiler::new(&arch, flags.hipcc_extra_flags.clone())?;

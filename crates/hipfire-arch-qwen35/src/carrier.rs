@@ -32,7 +32,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         .kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
 
     let is_kv_layer: Vec<bool> = config
         .layer_types
@@ -84,7 +84,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         .kv_adaptive_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_ADAPTIVE").unwrap_or_default());
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_adaptive.clone());
 
     let _kv_adaptive: Option<KvAdaptive> = {
         match parse_kv_adaptive(&kv_adaptive_spec) {

@@ -59,6 +59,7 @@ arch-dots-ocr = []
 ep-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"

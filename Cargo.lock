@@ -899,6 +899,7 @@ dependencies = [
 name = "hipfire-client"
 version = "0.3.0"
 dependencies = [
+ "hipfire-config",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1017,6 +1018,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
+ "hipfire-config",
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-loader",
@@ -1910,6 +1912,7 @@ name = "rdna-compute"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "rayon",
  "redline-dispatch",
 ]

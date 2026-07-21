@@ -186,12 +186,13 @@ The canonical documentation checker requires every `HIPFIRE_*` token in `AGENTS.
 
 ---
 
-## Manual — config key → env projection (CLI apply path)
+## Manual — TOML key → legacy environment compatibility
 
 Compatibility map from the `hipfire-config` schema. TOML is the supported
-persistent surface; this projection is an interim daemon handoff and not a
-second user configuration system. Message-field-only keys (temperature,
-thinking, …) are not compatibility-env projected.
+persistent surface. The native CLI sends typed policy directly to the daemon;
+it does not project these values into the child environment. The names below
+are accepted only as compatibility/one-shot input to the resolver. Message-
+field-only keys (temperature, thinking, …) have no compatibility alias.
 
 | Config key | Env |
 |---|---|

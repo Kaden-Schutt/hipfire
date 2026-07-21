@@ -4,7 +4,9 @@
 **Machine sources:**
 
 - Native schema + resolution: `crates/hipfire-config/src/lib.rs`
-- Runtime env snapshot (daemon): `crates/hipfire-runtime/src/config.rs` → `RuntimeConfig`
+- Versioned CLI/daemon handoff: `hipfire_config::ProcessConfig`
+- Compact runtime snapshots: `hipfire_runtime::config::RuntimeConfig` and
+  `rdna_compute::feature_flags::FeatureFlags`
 
 **Last checked:** 2026-07-21.
 
@@ -23,16 +25,16 @@ Edit interactively: `hipfire config` or `hipfire config <tag>`. Non-interactive:
 process env **>** per-model override **>** global TOML **>** registry card
 (`recommended_settings`) **>** built-in defaults. `hipfire config explain`
 prints the winning source and shadowed candidates. Direct daemon invocation
-still reads only its JSON request and process env.
+resolves the same local TOML plus compatibility environment before GPU startup.
 
 TOML is the supported persistent surface. Environment variables named in the
 schema are compatibility/one-shot overrides, not a second persistent config
-system. For process-wide runtime and kernel fields, the native CLI projects an
-**explicitly set** TOML value into the daemon's legacy environment. The new
-boolean bridge fields never project their built-in schema default: absence
-remains absence so architecture-selected defaults in `RuntimeConfig` and
-`FeatureFlags` are unchanged. Older schema fields retain their established
-projection behavior for compatibility.
+system. The native CLI serializes a versioned, schema-validated
+`ProcessConfig` to the daemon before the GPU is initialized. The daemon
+revalidates it and lowers it directly into `RuntimeConfig` and `FeatureFlags`;
+it does not materialize TOML values as process environment variables. Sparse
+architecture-sensitive fields remain absent so existing compiled defaults are
+unchanged.
 
 Process and diagnostic keys are global-only. `hipfire config <model> set ...`
 rejects them because the daemon snapshots these values once; claiming a

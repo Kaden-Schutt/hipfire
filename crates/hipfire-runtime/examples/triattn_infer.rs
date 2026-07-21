@@ -234,7 +234,7 @@ fn main() {
     let nl = tok.encode("\n");
     let user_tok = tok.encode("user");
     let asst_tok = tok.encode("assistant");
-    if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+    if hipfire_runtime::config::get().prompt_token_heat {
         tok.dump_prompt_heat(&prompt);
     }
     let body = tok.encode(&prompt);
