@@ -30,7 +30,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ## Current Status
 
-**Foundation implemented; refactor incomplete.** `COR-004`, `COR-003`, `COR-002`, `COR-005`, and `STEP-001` are complete; `PAR-001` is currently `in progress`. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, and STEP-001 DeltaNet migration work are substantial and tested. Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+**Foundation implemented; refactor incomplete.** `COR-004`, `COR-003`, `COR-002`, `COR-005`, `STEP-001`, and `PAR-001` are complete. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, STEP-001 DeltaNet migration, and PAR-001 policy characterization work are substantial and tested. Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
 
 Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) confirmed balanced Qwen35 PP allocation and peer access, but did not close either physical PP gate: dense LLaMA forward hit an unclassified illegal access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded follow-up are recorded under HW-003 and HW-004; neither changes the current execution queue or relaxes exact-parity requirements.
 
@@ -39,12 +39,11 @@ Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) con
 This is the implementation queue. The dependency graph below remains the
 authoritative constraint; a task is marked `in progress` only when work begins.
 
-1. `PAR-001` — currently in progress: publish the model-family PP/TP/EP support matrix and characterize current refusals.
-2. `COMP-001` — decide and enforce the TP x EP scope boundary.
-3. `COR-006` — align eviction physical-cap metadata with KV allocation.
-4. `CAP-001` — define the architecture capability contract and dense-EP normalization.
+1. `COMP-001` — decide and enforce the TP x EP scope boundary.
+2. `COR-006` — align eviction physical-cap metadata with KV allocation.
+3. `CAP-001` — define the architecture capability contract and dense-EP normalization.
 
-After `PAR-001` completes, the queue is `COMP-001`, `COR-006`, then `CAP-001`.
+`PAR-001` is complete; the next queue is `COMP-001`, `COR-006`, then `CAP-001`.
 The `AXIS-001` through `AXIS-004`, `PAR-002`, and `HW-001` through `HW-013`
 tasks remain dependency-blocked until their capability, family, implementation,
 and topology prerequisites are satisfied. Hardware tasks remain blocked until
@@ -432,13 +431,13 @@ them toward completion.
 
 ### PAR-001 Decide Model-Family PP/TP/EP Support
 
-- **Status:** in progress
+- **Status:** complete
 - **Dependencies:** None
 - **Goal:** Publish the policy matrix for every registered model family and characterize current refusal behavior for each PP/TP/EP axis.
 - **Acceptance criteria:** A maintained matrix covers Single, PP, TP, and EP for every family; each cell is supported, planned with a named implementation and hardware dependency, explicitly unsupported with a technical reason, or, for dense EP, marked `normalized-to-single(CAP-001)` as the future state. Dense LFM2 is currently refused for its single/PP/TP admission path and is explicitly planned under AXIS-003; dense LFM2 EP is normalized by CAP-001 rather than admitted. Current loader/daemon selection and refusal behavior is recorded without claiming new runtime enforcement; CAP-001 and AXIS-001 through AXIS-004 own subsequent implementation.
 - **Validation:** Compare the matrix with architecture registration and current load dispatch; run characterization tests for existing selection/refusal behavior for every family and axis; verify the policy matrix and current refusal report agree. This task does not implement the capability contract or dense-EP normalization.
 - **Hardware:** None for policy and current-refusal characterization; supported cells inherit their implementation task's hardware gates.
-- **Evidence:** Pending
+- **Evidence:** Commit `4e8bd0a2` (`docs(device-mesh): define parallel capability policy`); `cargo test -p hipfire-loader reset_ownership_tests --lib` passed (11 tests); `git diff --check` passed; final integration review approved; PR #527 mirror synchronized. Scoped `cargo clippy -p hipfire-loader --lib --no-deps -- -D warnings` reported nine pre-existing errors outside this diff and was explicitly accepted by the user for this commit; clippy did not pass and is not claimed as passed.
 
 ### CAP-001 Architecture Capability Contract And Dense-EP Normalization
 
