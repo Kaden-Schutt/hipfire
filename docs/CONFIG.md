@@ -103,11 +103,43 @@ Diagnostic booleans all default off: `diagnostic.prompt_token_heat`,
 `diagnostic.blob_force`, `diagnostic.gemm_dump`, and
 `diagnostic.qkv_bias`.
 
-This boolean migration deliberately leaves typed scalar/enum work for the next
-slice: device lists, paths, layer ranges, batch thresholds, variant selectors,
-and weight-load policies. `HIPFIRE_HIPCC_EXTRA_FLAGS` remains environment-only
-by design because it is an unsafe compiler/bootstrap escape hatch rather than
-product configuration.
+Process-wide scalar policy is typed as well:
+
+| Key | Default | Values / purpose |
+|---|---:|---|
+| `hardware.devices` | `null` | Comma-separated device IDs; unset uses normal discovery. |
+| `hardware.uniform_vram_tolerance_gb` | `null` | Free-VRAM spread override; unset uses the compiled default. |
+| `generation.loop_guard_threshold` | `0` | Repeated 4-gram count that forces EOS; zero disables. |
+| `generation.loop_guard_window` | `256` | Token window inspected by the loop guard. |
+| `kernel.flash_partials_batch` | `null` | Prefill flash-attention scratch multiplier. |
+| `kernel.lm_head_f16` | `"auto"` | `auto`, `native`, `f16`, `f32`, `fp32`, `legacy`, plus numeric compatibility aliases `1`/`0`. |
+| `diagnostic.prompt_heat_limit` | `64` | Maximum token-heat rows. |
+
+Developer-only scalar and variant controls live below `diagnostic.kernel` so
+they remain visible and typed without becoming registry-authorized product
+defaults:
+
+| Key | Values when set |
+|---|---|
+| `diagnostic.kernel.gemv_rows` | `"1"`, `"2"`, `"4"`, `"8"` |
+| `diagnostic.kernel.fp16_layer_min`, `diagnostic.kernel.fp16_layer_max` | non-negative layer index |
+| `diagnostic.kernel.hfq3_mmq_layer_min`, `diagnostic.kernel.hfq3_mmq_layer_max` | non-negative layer index |
+| `diagnostic.kernel.mmq_min_batch`, `diagnostic.kernel.rocblas_min_batch` | non-negative batch threshold |
+| `diagnostic.kernel.ddtree_logw_cutoff` | non-negative number |
+| `diagnostic.kernel.lloyd_mb4`, `diagnostic.kernel.mq3_mb4` | `"1"`, `"2"`, `"4"` |
+| `diagnostic.kernel.gate_up_variant` | `ldsx`, `k4`, `ldscoop`, `2tile` |
+| `diagnostic.kernel.gfx11_weight_load_policy` | `buffer`, `global`, `flat-buffer` |
+| `diagnostic.kernel.gfx12_weight_load_policy` | `rt`, `global`, `ht`, `nt-rt`, `nt-ht` |
+| `diagnostic.kernel.gfx942_mfma_prefill` | `"1"`, `"2"`, `"3"`, `"4"` |
+| `diagnostic.kernel.rdna2_variant` | integer 1–5 |
+| `diagnostic.kernel.wo_wmma_variant` | `ksplit`, `ksplit_det`, `k2`, `k2x32`, `k4`, `wmma`, `wmma2` |
+| `diagnostic.compiler.hipcc_extra_flags` | advanced local compiler-flag string |
+
+Every field currently read by the centralized `RuntimeConfig` and
+`FeatureFlags` snapshots now has a schema mapping. The next migration stage is
+to replace their environment transport with direct typed daemon/runtime
+handoff; compatibility aliases remain active until that handoff has parity
+evidence.
 
 ---
 
@@ -337,8 +369,7 @@ remain scheduled for the typed scalar/enum migration.
 | `normalize_prompt` | `prompt.normalize` | `HIPFIRE_NORMALIZE_PROMPT` | true unless `0`/`false`/`off`/`no` |
 | `prompt_token_heat` | `diagnostic.prompt_token_heat` | `HIPFIRE_PROMPT_TOKEN_HEAT` | off unless `1` |
 | `prompt_heat_json` | `diagnostic.prompt_heat_json` | `HIPFIRE_PROMPT_HEAT_JSON` | off unless `1` |
-| `prompt_heat_limit` | *(scalar migration pending)* | `HIPFIRE_PROMPT_HEAT_LIMIT` | 64 |
-| `dflash_draft` | *(path migration pending)* | `HIPFIRE_DFLASH_DRAFT` | unset |
+| `prompt_heat_limit` | `diagnostic.prompt_heat_limit` | `HIPFIRE_PROMPT_HEAT_LIMIT` | 64 |
 | `dflash_mode` | `speculation.dflash` | `HIPFIRE_DFLASH_MODE` | `"off"` |
 | `draft_f16` | `speculation.draft_f16` | `HIPFIRE_DRAFT_F16` | true unless `0` |
 | `draft_gemm_dump` | `diagnostic.draft_gemm_dump` | `HIPFIRE_DRAFT_GEMM_DUMP` | off unless `1` |
@@ -346,16 +377,21 @@ remain scheduled for the typed scalar/enum migration.
 | `ddtree_budget` | `speculation.ddtree_budget` | `HIPFIRE_DDTREE_BUDGET` | 256 |
 | `ddtree_topk` | `speculation.ddtree_topk` | `HIPFIRE_DDTREE_TOPK` | 8 |
 | `prefill_batched` | `kernel.prefill_batched` | `HIPFIRE_PREFILL_BATCHED` | true unless `0` |
-| `flash_partials_batch` | *(scalar migration pending)* | `HIPFIRE_FLASH_PARTIALS_BATCH` | unset |
+| `flash_partials_batch` | `kernel.flash_partials_batch` | `HIPFIRE_FLASH_PARTIALS_BATCH` | unset |
 | `tp_use_rccl` | `hardware.tp_use_rccl` | `HIPFIRE_TP_USE_RCCL` | unset → RCCL default on; `0`/`false` opt out |
-| `ngram_loop_threshold` | *(scalar migration pending)* | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | **0 (off)** |
-| `ngram_window` | *(scalar migration pending)* | `HIPFIRE_NGRAM_WINDOW` | 256 |
-| `devices` | *(topology migration pending)* | `HIPFIRE_DEVICES` | unset |
+| `ngram_loop_threshold` | `generation.loop_guard_threshold` | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | **0 (off)** |
+| `ngram_window` | `generation.loop_guard_window` | `HIPFIRE_NGRAM_WINDOW` | 256 |
+| `devices` | `hardware.devices` | `HIPFIRE_DEVICES` | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
-| `uniform_vram_tolerance_gb` | *(scalar migration pending)* | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
-| `lm_head_f16` | *(enum migration pending)* | `HIPFIRE_LM_HEAD_F16` | `"auto"` |
+| `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
 | `mtp_mode` | `speculation.mtp` | `HIPFIRE_MTP_MODE` | `"auto"` |
 | `mtp_k` | `speculation.mtp_k` | `HIPFIRE_MTP_K` | 3 |
+
+`kernel.lm_head_f16` maps the live Qwen3.5/3.6 loader compatibility control
+`HIPFIRE_LM_HEAD_F16`; the duplicate unused `RuntimeConfig` member was removed.
+The similarly unused `RuntimeConfig::dflash_draft` member was removed rather
+than promoted. Draft selection remains part of the typed speculation/load
+policy and filename/registry discovery.
 
 Note: CLI `ddtree_budget` default is `0` while bare `RuntimeConfig` default is `256` when only env/runtime path is used — CLI load params are the product path for `hipfire run`/`serve`.
 

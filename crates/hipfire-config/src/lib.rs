@@ -172,6 +172,8 @@ pub enum ValueRule {
     PathOrEmpty,
     Enum(&'static [&'static str]),
     AutoBool,
+    NullableString,
+    NullableEnum(&'static [&'static str]),
     NullableInteger {
         min: i64,
         max: i64,
@@ -232,6 +234,13 @@ impl ConfigField {
                 matches!(value, ConfigValue::Bool(_))
                     || matches!(value, ConfigValue::String(v) if v == "auto")
             }
+            ValueRule::NullableString => {
+                matches!(value, ConfigValue::Null | ConfigValue::String(_))
+            }
+            ValueRule::NullableEnum(values) => {
+                matches!(value, ConfigValue::Null)
+                    || matches!(value, ConfigValue::String(v) if values.contains(&v.as_str()))
+            }
             ValueRule::NullableInteger { min, max } => {
                 matches!(value, ConfigValue::Null)
                     || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
@@ -263,6 +272,12 @@ impl ConfigField {
             ValueRule::Float { .. } => raw.parse::<f64>().ok().map(ConfigValue::Float),
             ValueRule::AutoBool if raw == "auto" => Some(ConfigValue::String(raw.to_owned())),
             ValueRule::AutoBool => parse_bool(raw).map(ConfigValue::Bool),
+            ValueRule::NullableString if raw.eq_ignore_ascii_case("null") => {
+                Some(ConfigValue::Null)
+            }
+            ValueRule::NullableEnum(_) if raw.eq_ignore_ascii_case("null") => {
+                Some(ConfigValue::Null)
+            }
             ValueRule::NullableInteger { .. } if raw.eq_ignore_ascii_case("null") => {
                 Some(ConfigValue::Null)
             }
@@ -335,61 +350,97 @@ macro_rules! field {
     };
 }
 
+macro_rules! bridge_field {
+    ($key:literal, $legacy:literal, $category:ident, $scope:ident, $default:expr, $rule:expr, $experimental:expr, $env:literal, $help:literal) => {
+        ConfigField {
+            key: $key,
+            legacy_key: $legacy,
+            category: ConfigCategory::$category,
+            scope: ConfigScope::$scope,
+            default: $default,
+            rule: $rule,
+            registry_allowed: false,
+            experimental: $experimental,
+            env_compat: Some($env),
+            project_default_to_env: false,
+            help: $help,
+        }
+    };
+}
+
 // These fields bridge stable TOML policy into the legacy environment snapshot
 // consumed by hipfire-runtime and rdna-compute. They are process-scoped because
 // those crates resolve the variables once; advertising per-model overrides
 // would be dishonest for a long-lived serve process.
 macro_rules! process_bool_field {
     ($key:literal, $legacy:literal, $category:ident, $default:expr, $experimental:expr, $env:literal, $help:literal) => {
-        ConfigField {
-            key: $key,
-            legacy_key: $legacy,
-            category: ConfigCategory::$category,
-            scope: ConfigScope::Process,
-            default: DefaultValue::Bool($default),
-            rule: ValueRule::Bool,
-            registry_allowed: false,
-            experimental: $experimental,
-            env_compat: Some($env),
-            project_default_to_env: false,
-            help: $help,
-        }
+        bridge_field!(
+            $key,
+            $legacy,
+            $category,
+            Process,
+            DefaultValue::Bool($default),
+            ValueRule::Bool,
+            $experimental,
+            $env,
+            $help
+        )
     };
 }
 
 macro_rules! process_auto_bool_field {
     ($key:literal, $legacy:literal, $category:ident, $experimental:expr, $env:literal, $help:literal) => {
-        ConfigField {
-            key: $key,
-            legacy_key: $legacy,
-            category: ConfigCategory::$category,
-            scope: ConfigScope::Process,
-            default: DefaultValue::String("auto"),
-            rule: ValueRule::AutoBool,
-            registry_allowed: false,
-            experimental: $experimental,
-            env_compat: Some($env),
-            project_default_to_env: false,
-            help: $help,
-        }
+        bridge_field!(
+            $key,
+            $legacy,
+            $category,
+            Process,
+            DefaultValue::String("auto"),
+            ValueRule::AutoBool,
+            $experimental,
+            $env,
+            $help
+        )
     };
 }
 
 macro_rules! diagnostic_bool_field {
     ($key:literal, $legacy:literal, $default:expr, $env:literal, $help:literal) => {
-        ConfigField {
-            key: $key,
-            legacy_key: $legacy,
-            category: ConfigCategory::Diagnostic,
-            scope: ConfigScope::Diagnostic,
-            default: DefaultValue::Bool($default),
-            rule: ValueRule::Bool,
-            registry_allowed: false,
-            experimental: true,
-            env_compat: Some($env),
-            project_default_to_env: false,
-            help: $help,
-        }
+        bridge_field!(
+            $key,
+            $legacy,
+            Diagnostic,
+            Diagnostic,
+            DefaultValue::Bool($default),
+            ValueRule::Bool,
+            true,
+            $env,
+            $help
+        )
+    };
+}
+
+macro_rules! process_field {
+    ($key:literal, $legacy:literal, $category:ident, $default:expr, $rule:expr, $experimental:expr, $env:literal, $help:literal) => {
+        bridge_field!(
+            $key,
+            $legacy,
+            $category,
+            Process,
+            $default,
+            $rule,
+            $experimental,
+            $env,
+            $help
+        )
+    };
+}
+
+macro_rules! diagnostic_field {
+    ($key:literal, $legacy:literal, $default:expr, $rule:expr, $env:literal, $help:literal) => {
+        bridge_field!(
+            $key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help
+        )
     };
 }
 
@@ -1125,6 +1176,243 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DEFAULT_CHATML"),
         "Allow the fallback ChatML frame when no template resolves."
+    ),
+    process_field!(
+        "hardware.devices",
+        "devices",
+        Hardware,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        false,
+        "HIPFIRE_DEVICES",
+        "Comma-separated GPU device IDs used when no explicit topology is supplied."
+    ),
+    process_field!(
+        "hardware.uniform_vram_tolerance_gb",
+        "uniform_vram_tolerance_gb",
+        Hardware,
+        DefaultValue::Null,
+        ValueRule::NullableFloat {
+            min: f64::MIN,
+            max: f64::MAX
+        },
+        false,
+        "HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB",
+        "Allowed free-VRAM spread across a uniform multi-GPU topology."
+    ),
+    process_field!(
+        "generation.loop_guard_threshold",
+        "ngram_loop_threshold",
+        Generation,
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: i64::MAX
+        },
+        false,
+        "HIPFIRE_NGRAM_LOOP_THRESHOLD",
+        "Repeated 4-gram count that forces EOS; zero disables the guard."
+    ),
+    process_field!(
+        "generation.loop_guard_window",
+        "ngram_window",
+        Generation,
+        DefaultValue::Integer(256),
+        ValueRule::Integer {
+            min: 0,
+            max: i64::MAX
+        },
+        false,
+        "HIPFIRE_NGRAM_WINDOW",
+        "Token window inspected by the repeated 4-gram loop guard."
+    ),
+    process_field!(
+        "kernel.flash_partials_batch",
+        "flash_partials_batch",
+        Kernel,
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: 0, max: 65536 },
+        true,
+        "HIPFIRE_FLASH_PARTIALS_BATCH",
+        "Override the prefill flash-attention partial-scratch batch multiplier."
+    ),
+    process_field!(
+        "kernel.lm_head_f16",
+        "lm_head_f16",
+        Kernel,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "native", "f16", "1", "f32", "fp32", "legacy", "0"]),
+        false,
+        "HIPFIRE_LM_HEAD_F16",
+        "Storage policy for native FP16 LM-head weights."
+    ),
+    diagnostic_field!(
+        "diagnostic.prompt_heat_limit",
+        "prompt_heat_limit",
+        DefaultValue::Integer(64),
+        ValueRule::Integer {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_PROMPT_HEAT_LIMIT",
+        "Maximum rows emitted by prompt token-heat diagnostics."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.gemv_rows",
+        "gemv_rows",
+        DefaultValue::Null,
+        ValueRule::NullableEnum(&["1", "2", "4", "8"]),
+        "HIPFIRE_GEMV_ROWS",
+        "Override the architecture-selected GEMV rows per workgroup."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.fp16_layer_min",
+        "fp16_layer_min",
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_FP16_LAYER_MIN",
+        "First layer included in the FP16 route override."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.fp16_layer_max",
+        "fp16_layer_max",
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_FP16_LAYER_MAX",
+        "Last layer included in the FP16 route override."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.hfq3_mmq_layer_min",
+        "hfq3_mmq_layer_min",
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_HFQ3_MMQ_LAYER_MIN",
+        "First layer included in the HFQ3 MMQ route override."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.hfq3_mmq_layer_max",
+        "hfq3_mmq_layer_max",
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_HFQ3_MMQ_LAYER_MAX",
+        "Last layer included in the HFQ3 MMQ route override."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.mmq_min_batch",
+        "mmq_min_batch",
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_MMQ_MIN_BATCH",
+        "Minimum batch size for MMQ dispatch."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.rocblas_min_batch",
+        "rocblas_min_batch",
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_ROCBLAS_MIN_BATCH",
+        "Minimum batch size for rocBLAS dispatch."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.ddtree_logw_cutoff",
+        "ddtree_logw_cutoff",
+        DefaultValue::Null,
+        ValueRule::NullableFloat {
+            min: 0.0,
+            max: f64::MAX
+        },
+        "HIPFIRE_DDTREE_LOGW_CUTOFF",
+        "Positive DDTree cumulative-log-weight expansion cutoff."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.lloyd_mb4",
+        "lloyd_mb4",
+        DefaultValue::Null,
+        ValueRule::NullableEnum(&["1", "2", "4"]),
+        "HIPFIRE_LLOYD_MB4",
+        "Lloyd kernel rows packed per MB4 work item."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.mq3_mb4",
+        "mq3_mb4",
+        DefaultValue::Null,
+        ValueRule::NullableEnum(&["1", "2", "4"]),
+        "HIPFIRE_MQ3_MB4",
+        "MQ3 kernel rows packed per MB4 work item."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.gate_up_variant",
+        "gate_up_variant",
+        DefaultValue::Null,
+        ValueRule::NullableEnum(&["ldsx", "k4", "ldscoop", "2tile"]),
+        "HIPFIRE_GATE_UP_VARIANT",
+        "Select a gate/up WMMA experiment variant."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.gfx11_weight_load_policy",
+        "gfx11_weight_load_policy",
+        DefaultValue::Null,
+        ValueRule::NullableEnum(&["buffer", "global", "flat-buffer"]),
+        "HIPFIRE_GFX11_WEIGHT_LOAD_POLICY",
+        "Select the gfx11 compiler weight-load policy."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.gfx12_weight_load_policy",
+        "gfx12_weight_load_policy",
+        DefaultValue::Null,
+        ValueRule::NullableEnum(&["rt", "global", "ht", "nt-rt", "nt-ht"]),
+        "HIPFIRE_GFX12_WEIGHT_LOAD_POLICY",
+        "Select the gfx12 compiler weight-load policy."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.gfx942_mfma_prefill",
+        "gfx942_mfma_prefill",
+        DefaultValue::Null,
+        ValueRule::NullableEnum(&["1", "2", "3", "4"]),
+        "HIPFIRE_GFX942_MFMA_PREFILL",
+        "Select the gfx942 direct-MFMA prefill experiment."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.rdna2_variant",
+        "rdna2_variant",
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: 1, max: 5 },
+        "HIPFIRE_RDNA2_VARIANT",
+        "Select the gfx1030/gfx1031 HFQ4-G256 GEMV variant."
+    ),
+    diagnostic_field!(
+        "diagnostic.kernel.wo_wmma_variant",
+        "wo_wmma_variant",
+        DefaultValue::Null,
+        ValueRule::NullableEnum(&["ksplit", "ksplit_det", "k2", "k2x32", "k4", "wmma", "wmma2"]),
+        "HIPFIRE_WO_WMMA_VARIANT",
+        "Select a weight-only residual WMMA variant."
+    ),
+    diagnostic_field!(
+        "diagnostic.compiler.hipcc_extra_flags",
+        "hipcc_extra_flags",
+        DefaultValue::String(""),
+        ValueRule::String,
+        "HIPFIRE_HIPCC_EXTRA_FLAGS",
+        "Append advanced local flags to HIP kernel compilation."
     ),
     process_bool_field!(
         "hardware.allow_mixed_arch",
@@ -2857,6 +3145,43 @@ mod tests {
         assert!(rendered.contains("[generation]"));
         assert!(rendered.contains("[memory]"));
         assert!(!rendered.contains("temperature"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typed_runtime_scalars_and_variants_roundtrip() {
+        let root = temp_root("runtime-scalars");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("hardware.devices", "2,3").unwrap();
+        layer
+            .set_cli("hardware.uniform_vram_tolerance_gb", "1.5")
+            .unwrap();
+        layer
+            .set_cli("diagnostic.kernel.gate_up_variant", "k4")
+            .unwrap();
+        layer
+            .set_cli("diagnostic.kernel.rdna2_variant", "5")
+            .unwrap();
+        layer.set_cli("kernel.lm_head_f16", "f32").unwrap();
+        assert!(
+            layer
+                .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
+                .is_err()
+        );
+        assert!(
+            layer
+                .set_cli("diagnostic.kernel.rdna2_variant", "6")
+                .is_err()
+        );
+
+        write_global_toml(&paths, &layer).unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert_eq!(loaded.layer, layer);
+        let rendered = fs::read_to_string(&paths.config_toml).unwrap();
+        assert!(rendered.contains("[diagnostic.kernel]"));
+        assert!(rendered.contains("gate_up_variant = \"k4\""));
+        assert!(rendered.contains("rdna2_variant = 5"));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -38,7 +38,6 @@ pub struct RuntimeConfig {
     pub prompt_token_heat: bool,
     pub prompt_heat_json: bool,
     pub prompt_heat_limit: usize,
-    pub dflash_draft: Option<String>,
     pub dflash_mode: String,
     pub draft_f16: bool,
     pub draft_gemm_dump: bool,
@@ -56,7 +55,6 @@ pub struct RuntimeConfig {
     pub devices: Option<String>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
-    pub lm_head_f16: String,
     pub mtp_mode: String,
     pub mtp_k: usize,
 }
@@ -92,7 +90,6 @@ impl RuntimeConfig {
             prompt_token_heat,
             prompt_heat_json,
             prompt_heat_limit,
-            dflash_draft: std::env::var("HIPFIRE_DFLASH_DRAFT").ok(),
             dflash_mode: std::env::var("HIPFIRE_DFLASH_MODE").unwrap_or_else(|_| "off".to_string()),
             draft_f16: std::env::var("HIPFIRE_DRAFT_F16").ok().as_deref() != Some("0"),
             draft_gemm_dump: std::env::var("HIPFIRE_DRAFT_GEMM_DUMP").ok().as_deref() == Some("1"),
@@ -132,8 +129,6 @@ impl RuntimeConfig {
             uniform_vram_tolerance_gb: std::env::var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
                 .ok()
                 .and_then(|s| s.parse().ok()),
-            lm_head_f16: std::env::var("HIPFIRE_LM_HEAD_F16")
-                .unwrap_or_else(|_| "auto".to_string()),
             mtp_mode: std::env::var("HIPFIRE_MTP_MODE").unwrap_or_else(|_| "auto".to_string()),
             mtp_k: std::env::var("HIPFIRE_MTP_K")
                 .ok()

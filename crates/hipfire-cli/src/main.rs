@@ -15,7 +15,7 @@ use hipfire_client::{
 use hipfire_config::{
     field, fields, load_catalog, load_env_layer, load_global, resolve, write_catalog_toml,
     write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
-    NamedLayer,
+    NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
@@ -136,6 +136,8 @@ enum ConfigAction {
         #[command(flatten)]
         output: OutputArgs,
     },
+    /// Print the authoritative typed configuration schema.
+    Schema(OutputArgs),
     /// Convert legacy config.json to sparse config.toml without deleting JSON.
     Migrate,
 }
@@ -631,6 +633,46 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             }
             Ok(())
         }
+        ConfigAction::Schema(output) => {
+            let schema = fields()
+                .iter()
+                .map(|field| {
+                    serde_json::json!({
+                        "key": field.key,
+                        "legacy_key": field.legacy_key,
+                        "category": field.category,
+                        "scope": field.scope,
+                        "default": config_default_value(field),
+                        "rule": config_rule_json(field.rule),
+                        "registry_allowed": field.registry_allowed,
+                        "experimental": field.experimental,
+                        "env_compat": field.env_compat,
+                        "help": field.help,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if output.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": CONFIG_SCHEMA_VERSION,
+                        "fields": schema,
+                    }))?
+                );
+            } else {
+                println!("Configuration schema v{CONFIG_SCHEMA_VERSION}");
+                for field in fields() {
+                    println!(
+                        "  {:<48} {:<18} {:<12} {}",
+                        field.key,
+                        format_default(field),
+                        config_rule_label(field.rule),
+                        field.help
+                    );
+                }
+            }
+            Ok(())
+        }
         ConfigAction::Migrate => {
             let loaded = load_global(&paths.config)?;
             match loaded.format {
@@ -688,8 +730,8 @@ fn model_config_command(
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
         .unwrap_or((None, None));
     let action = action.unwrap_or(ConfigAction::List(OutputArgs { json: false }));
-    if matches!(action, ConfigAction::Migrate) {
-        bail!("config migrate is global; omit the model argument");
+    if matches!(action, ConfigAction::Migrate | ConfigAction::Schema(_)) {
+        bail!("config migrate/schema are global; omit the model argument");
     }
 
     match action {
@@ -875,7 +917,7 @@ fn model_config_command(
             }
             Ok(())
         }
-        ConfigAction::Migrate => unreachable!(),
+        ConfigAction::Migrate | ConfigAction::Schema(_) => unreachable!(),
     }
 }
 
@@ -4483,7 +4525,82 @@ fn source_label(source: &ConfigSource) -> String {
     }
 }
 
-fn format_default(schema: &hipfire_config::ConfigField) -> String {
+fn config_rule_json(rule: ValueRule) -> serde_json::Value {
+    match rule {
+        ValueRule::Bool => serde_json::json!({ "type": "boolean" }),
+        ValueRule::Integer { min, max } => {
+            serde_json::json!({ "type": "integer", "minimum": min, "maximum": max })
+        }
+        ValueRule::Float {
+            min,
+            max,
+            min_inclusive,
+        } => serde_json::json!({
+            "type": "number",
+            "minimum": min,
+            "maximum": max,
+            "minimum_inclusive": min_inclusive,
+        }),
+        ValueRule::String => serde_json::json!({ "type": "string" }),
+        ValueRule::NonEmptyString => {
+            serde_json::json!({ "type": "string", "min_length": 1 })
+        }
+        ValueRule::Host => serde_json::json!({ "type": "string", "format": "host" }),
+        ValueRule::PathOrEmpty => {
+            serde_json::json!({ "type": "string", "format": "existing-path-or-empty" })
+        }
+        ValueRule::Enum(values) => {
+            serde_json::json!({ "type": "string", "enum": values })
+        }
+        ValueRule::AutoBool => serde_json::json!({
+            "type": ["boolean", "string"],
+            "enum": [true, false, "auto"],
+        }),
+        ValueRule::NullableString => {
+            serde_json::json!({ "type": ["string", "null"] })
+        }
+        ValueRule::NullableEnum(values) => serde_json::json!({
+            "type": ["string", "null"],
+            "enum": values,
+            "nullable": true,
+        }),
+        ValueRule::NullableInteger { min, max } => serde_json::json!({
+            "type": ["integer", "null"],
+            "minimum": min,
+            "maximum": max,
+        }),
+        ValueRule::NullableFloat { min, max } => serde_json::json!({
+            "type": ["number", "null"],
+            "minimum": min,
+            "maximum": max,
+        }),
+        ValueRule::KvAdaptive => serde_json::json!({
+            "type": "string",
+            "format": "kv-adaptive-policy",
+        }),
+    }
+}
+
+fn config_rule_label(rule: ValueRule) -> &'static str {
+    match rule {
+        ValueRule::Bool => "bool",
+        ValueRule::Integer { .. } => "integer",
+        ValueRule::Float { .. } => "number",
+        ValueRule::String => "string",
+        ValueRule::NonEmptyString => "nonempty-string",
+        ValueRule::Host => "host",
+        ValueRule::PathOrEmpty => "path-or-empty",
+        ValueRule::Enum(_) => "enum",
+        ValueRule::AutoBool => "auto-bool",
+        ValueRule::NullableString => "string|null",
+        ValueRule::NullableEnum(_) => "enum|null",
+        ValueRule::NullableInteger { .. } => "integer|null",
+        ValueRule::NullableFloat { .. } => "number|null",
+        ValueRule::KvAdaptive => "kv-adaptive",
+    }
+}
+
+fn config_default_value(schema: &hipfire_config::ConfigField) -> hipfire_config::ConfigValue {
     // Resolve one empty layer set so the config crate remains the only place
     // that turns the private DefaultValue representation into a public value.
     resolve(Vec::<NamedLayer>::new())
@@ -4491,7 +4608,11 @@ fn format_default(schema: &hipfire_config::ConfigField) -> String {
         .get(schema.key)
         .expect("schema key resolved")
         .value
-        .to_string()
+        .clone()
+}
+
+fn format_default(schema: &hipfire_config::ConfigField) -> String {
+    config_default_value(schema).to_string()
 }
 
 fn registry_source(source: RegistrySource) -> &'static str {
@@ -4622,6 +4743,34 @@ mod tests {
         };
         assert_eq!(model.model.as_deref(), Some("qwen:test"));
         assert!(matches!(model.action, Some(ConfigAction::Get { .. })));
+
+        let schema = Cli::try_parse_from(["hipfire", "config", "schema", "--json"]).unwrap();
+        let Some(Commands::Config(schema)) = schema.command else {
+            panic!("expected config command")
+        };
+        assert!(schema.model.is_none());
+        assert!(matches!(
+            schema.action,
+            Some(ConfigAction::Schema(OutputArgs { json: true }))
+        ));
+    }
+
+    #[test]
+    fn schema_json_preserves_default_types_and_validation_rules() {
+        let bool_field = field("hardware.allow_mixed_arch").unwrap();
+        assert_eq!(
+            config_default_value(bool_field),
+            hipfire_config::ConfigValue::Bool(false)
+        );
+        assert_eq!(config_rule_json(bool_field.rule)["type"], "boolean");
+
+        let variant_field = field("diagnostic.kernel.rdna2_variant").unwrap();
+        assert_eq!(
+            config_default_value(variant_field),
+            hipfire_config::ConfigValue::Null
+        );
+        assert_eq!(config_rule_json(variant_field.rule)["minimum"], 1);
+        assert_eq!(config_rule_json(variant_field.rule)["maximum"], 5);
     }
 
     #[test]
@@ -4713,6 +4862,46 @@ mod tests {
 
         env::set_var(NAME, "parent");
         assert!(!daemon_environment(&resolved).contains_key(NAME));
+    }
+
+    #[test]
+    fn daemon_environment_projects_typed_scalar_and_variant_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "HIPFIRE_DEVICES",
+            "HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB",
+            "HIPFIRE_GEMV_ROWS",
+            "HIPFIRE_LM_HEAD_F16",
+        ];
+        let restores = NAMES
+            .iter()
+            .map(|name| EnvRestore::capture(name))
+            .collect::<Vec<_>>();
+        for name in NAMES {
+            env::remove_var(name);
+        }
+
+        let mut global = ConfigLayer::default();
+        global.set_cli("hardware.devices", "2,3").unwrap();
+        global
+            .set_cli("hardware.uniform_vram_tolerance_gb", "1.5")
+            .unwrap();
+        global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
+        global.set_cli("kernel.lm_head_f16", "f32").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: global,
+        }])
+        .unwrap();
+        let environment = daemon_environment(&resolved);
+        assert_eq!(environment.get(NAMES[0]).map(String::as_str), Some("2,3"));
+        assert_eq!(environment.get(NAMES[1]).map(String::as_str), Some("1.5"));
+        assert_eq!(environment.get(NAMES[2]).map(String::as_str), Some("4"));
+        assert_eq!(environment.get(NAMES[3]).map(String::as_str), Some("f32"));
+
+        drop(restores);
     }
 
     #[test]

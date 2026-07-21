@@ -73,14 +73,14 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_PROMPT_TOKEN_HEAT=1` | dump BPE heat | RuntimeConfig |
 | `HIPFIRE_PROMPT_HEAT_JSON=1` | JSON heat | RuntimeConfig |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | default **64** | RuntimeConfig |
-| `HIPFIRE_LM_HEAD_F16` | default **`auto`** | RuntimeConfig |
+| `HIPFIRE_LM_HEAD_F16` | default **`auto`** | Qwen loader compatibility alias for `kernel.lm_head_f16` |
 
 ### Speculation / DFlash / MTP / n-gram / DSpark
 
 | Variable | Default / sense | Notes |
 |---|---|---|
 | `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
-| `HIPFIRE_DFLASH_DRAFT` | path or empty | Draft discovery override |
+| `HIPFIRE_DFLASH_DRAFT` | retired engine read | Still appears in legacy gate scripts; product draft discovery uses typed speculation/load policy and registry/filename matching. |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash path |
@@ -166,11 +166,15 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**branch-implemented** vs comparison b
 | `HIPFIRE_HOST_TIMING=1` | Host timing JSON |
 | `HIPFIRE_PROFILE` / `HIPFIRE_PROFILE_DECODE` / `HIPFIRE_PROFILE_CYCLES` | Profiling |
 | `HIPFIRE_DETERMINISTIC` | Determinism toggles in dispatch |
-| `HIPFIRE_HIPCC_EXTRA_FLAGS` | Extra hipcc flags |
+| `HIPFIRE_HIPCC_EXTRA_FLAGS` | Compatibility alias for `diagnostic.compiler.hipcc_extra_flags` |
 | `HIPFIRE_KERNEL_CACHE` | Kernel cache dir (`var_os`) |
 | `HIPFIRE_*_DUMP` / `*_TRACE` / `*_PROFILE` | Diagnostic families — see inventory |
 
-Kernel-selector and arch-specific `HIPFIRE_GFX*` / `HIPFIRE_RDNA*` / `HIPFIRE_MOE_*` levers are **research/power-user**. Defaults and safety are source-defined; do not treat inventory presence as a product recommendation.
+Kernel-selector and arch-specific `HIPFIRE_GFX*` / `HIPFIRE_RDNA*` /
+`HIPFIRE_MOE_*` levers are **research/power-user**. Centralized
+`FeatureFlags` controls now have typed TOML keys under `kernel` or
+`diagnostic.kernel`; defaults and safety remain source-defined and none are
+registry-authorized.
 
 ---
 
@@ -184,8 +188,10 @@ The canonical documentation checker requires every `HIPFIRE_*` token in `AGENTS.
 
 ## Manual — config key → env projection (CLI apply path)
 
-Partial map from the `hipfire-config` schema. Message-field-only keys
-(temperature, thinking, …) are not compatibility-env projected.
+Compatibility map from the `hipfire-config` schema. TOML is the supported
+persistent surface; this projection is an interim daemon handoff and not a
+second user configuration system. Message-field-only keys (temperature,
+thinking, …) are not compatibility-env projected.
 
 | Config key | Env |
 |---|---|
@@ -206,6 +212,15 @@ Partial map from the `hipfire-config` schema. Message-field-only keys
 | `serve_queue_timeout_ms` | `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` |
 | `prefill_*` | matching `HIPFIRE_PREFILL_*` |
 | `mmq_screen*` | `HIPFIRE_MMQ_SCREEN*` |
+| `hardware.devices` | `HIPFIRE_DEVICES` |
+| `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` |
+| `hardware.tp_use_rccl` | `HIPFIRE_TP_USE_RCCL` |
+| `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` |
+| `generation.loop_guard_threshold` / `generation.loop_guard_window` | `HIPFIRE_NGRAM_LOOP_THRESHOLD` / `HIPFIRE_NGRAM_WINDOW` |
+| `kernel.flash_partials_batch` | `HIPFIRE_FLASH_PARTIALS_BATCH` |
+| `kernel.lm_head_f16` | `HIPFIRE_LM_HEAD_F16` |
+| `diagnostic.prompt_*` | matching `HIPFIRE_PROMPT_*` |
+| `diagnostic.kernel.*` / `diagnostic.compiler.*` | schema-declared kernel/compiler compatibility aliases; enumerate with `hipfire config schema --json` |
 
 ---
 
