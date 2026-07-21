@@ -256,11 +256,51 @@ is a custom non-Hipfire architecture target.
 
 | Family | Local examples | Runtime status | DFlash | MTP | CASK | PP | Batched prefill | KLD ref gen | Compatible / missing kernels |
 |---|---|---|---|---|---|---|---|---|---|
-| Qwen 3.5 / 3.6 dense hybrid | `qwen3.5-{0.8b,2b,4b,9b}`, `qwen3.6-27b` | Supported as Qwen35 dense (`arch_id=5`). | Supported for paired dense drafts when target lm_head dtype is Q8/HFQ4/MQ4, plus MQ3 on gfx11/gfx12; MQ6 targets need AR. | Present as native Qwen35 speculative-verify/MTP surfaces for validated dense paths; still correctness-first and not the same as DFlash drafts. | Supported with TriAttention/CASK sidecars on FullAttention layers. | Supported only on Qwen35 path when incompatible features are off. | Supported via Qwen35 batched prefill path. | Smoke refs exist for `qwen3.5-{0.8b,2b,9b}`; no full refs yet. | Dense Qwen35 decode/prefill kernels cover BF16/MQ4/MQ6 and selected MQ3. Missing DFlash batched lm_head/verify support for MQ6/MQ8/MQ2/F16 targets. |
-| Qwen 3.5 / 3.6 MoE | `qwen3.6-35b-a3b`, `qwen3.5-122b-a10b` | Supported as Qwen35 MoE (`arch_id=6`) when quantized in Qwen3.5-MoE tensor layout. | Limited: dense-style DFlash works only where target/draft dtypes hit supported batched verify paths; MQ3 MoE is refused for DFlash. | MoE MTP code exists, but admission is narrower than dense and still gated by MoE dtype/layout validation. | Supported on FullAttention layers; no MoE-specific eviction of expert weights unless using the separate pager path. | Supported only on Qwen35 path when incompatible features are off. | Supported; MoE batched prefill admits MQ4 control and newer MQ6/MQ3 surfaces on validated arches. | `qwen3.6-35b-a3b-bf16` KLD producer is currently skipped on error; no completed refs for MoE rows. | Indexed MoE gate/up/down, shared expert, router, and grouped GEMM kernels exist for Qwen35 MoE. Missing broad MQ3/MQ2/MQ8 MoE DFlash coverage and full validation for every local MoE artifact. |
+| Qwen 3.5 / 3.6 dense hybrid | `qwen3.5-{0.8b,2b,4b,9b}`, `qwen3.6-27b` | Qwen35 dense runtime is available (`arch_id=5`); PP is partial arch-resident (GEN-001; not production-supported). | Supported for paired dense drafts when target lm_head dtype is Q8/HFQ4/MQ4, plus MQ3 on gfx11/gfx12; MQ6 targets need AR. | Present as native Qwen35 speculative-verify/MTP surfaces for validated dense paths; still correctness-first and not the same as DFlash drafts. | Supported with TriAttention/CASK sidecars on FullAttention layers. | partial arch-resident PP (GEN-001; not production-supported) | Supported via Qwen35 batched prefill path. | Smoke refs exist for `qwen3.5-{0.8b,2b,9b}`; no full refs yet. | Dense Qwen35 decode/prefill kernels cover BF16/MQ4/MQ6 and selected MQ3. Missing DFlash batched lm_head/verify support for MQ6/MQ8/MQ2/F16 targets. |
+| Qwen 3.5 / 3.6 MoE | `qwen3.6-35b-a3b`, `qwen3.5-122b-a10b` | Qwen35 MoE runtime is available (`arch_id=6`); PP is partial arch-resident (GEN-001; not production-supported). | Limited: dense-style DFlash works only where target/draft dtypes hit supported batched verify paths; MQ3 MoE is refused for DFlash. | MoE MTP code exists, but admission is narrower than dense and still gated by MoE dtype/layout validation. | Supported on FullAttention layers; no MoE-specific eviction of expert weights unless using the separate pager path. | partial arch-resident PP (GEN-001; not production-supported) | Supported; MoE batched prefill admits MQ4 control and newer MQ6/MQ3 surfaces on validated arches. | `qwen3.6-35b-a3b-bf16` KLD producer is currently skipped on error; no completed refs for MoE rows. | Indexed MoE gate/up/down, shared expert, router, and grouped GEMM kernels exist for Qwen35 MoE. Missing broad MQ3/MQ2/MQ8 MoE DFlash coverage and full validation for every local MoE artifact. |
 | Qwen3-MoE / Qwen3-Coder (`qwen3_moe`) | `qwen3-coder-30b-a3b-instruct`, `tiny-random/qwen3-moe` | Not currently first-class. Local Coder HFQs are stamped `arch_id=0`, but source configs are `qwen3_moe`; that does not match the Qwen35-MoE loader layout. | No. | No. | No. | No. | No. | Listed as a desired KLD target for Coder, but no completed ref. | Needs a `qwen3_moe` architecture mapping and loader/kernel audit. Existing Qwen35 MoE kernels assume Qwen3.5 hybrid layer/tensor layout, not plain Qwen3-MoE/Coder layout. |
 | DeepSeek V4 Flash | `deepseek-v4-flash.mq4.hfq` | Supported as dedicated DeepSeek V4 path (`arch_id=9`). | No Qwen-style DFlash drafter. | Supported as DeepSeek V4's own optional MTP speculative decode path. | No. | No. | Supported by DeepSeek V4 chunked batched prefill / MTP fill. | Not currently targeted for KLD refs. | Dedicated DeepSeek V4 kernels cover Hyper-Connections, compressed-KV indexer, SWA attention, routed MoE, MQ2/MQ3-Lloyd expert variants, and MTP. Missing CASK, PP, and Qwen-style DFlash integration. |
 | LFM2.5-MoE | `lfm2.5-8b-a1b` | Supported as LFM2.5-MoE (`arch_id=11`) when compiled with `arch-lfm2moe`. Minimal AR bring-up. | No. | No. | No. | No. | No; prefill is per-token `decode_step`. | No completed refs yet. | Short-conv, attention, router, top-4 MoE, MQ4/MQ6 expert kernels are present. Missing batched prefill, DFlash/spec decode, CASK, PP, and grammar/tool-exec integration. |
-| Dense LFM2.5 | `lfm2.5-350m`, `lfm2.5-1.2b-instruct` | Not supported as dense LFM2. Local MQ artifacts stamped `arch_id=11` are suspect because the LFM2-MoE parser requires MoE-only fields. | No. | No. | No. | No. | No. | KLD producer currently skipped on error for dense LFM2 rows. | Needs a dense LFM2 architecture crate or a generalized LFM2 loader. Current `hipfire-arch-lfm2moe` kernels/config assume `lfm2_moe` layer types, experts, and MoE FFN fields. |
-| LLaMA-family dense | `llama-3.2-1b-instruct`, `supra-50m-instruct` | Basic dense AR support through LLaMA-family path (`arch_id=0`). | No. | No. | No. | No. | No Qwen35-style batched prefill. | Producer skipped on error for `llama-3.2-1b-instruct-bf16` and `supra-50m-instruct-bf16`. | Dense LLaMA/GGUF-style GEMV, Q8/HFQ/MQ weight paths exist. Missing family-specific optimized prefill, DFlash, CASK, PP, and per-model quality refs. |
+| Dense LFM2.5 | `lfm2.5-350m`, `lfm2.5-1.2b-instruct` | Currently refused; pending admission under AXIS-003. Local MQ artifacts stamped `arch_id=11` are suspect because the LFM2-MoE parser requires MoE-only fields. | No. | No. | No. | No. | No. | KLD producer currently skipped on error for dense LFM2 rows. | Needs a dense LFM2 architecture crate or a generalized LFM2 loader. Current `hipfire-arch-lfm2moe` kernels/config assume `lfm2_moe` layer types, experts, and MoE FFN fields. |
+| LLaMA-family dense | `llama-3.2-1b-instruct`, `supra-50m-instruct` | Basic dense AR support through LLaMA-family path (`arch_id=0`); dense PP code exists separately and its production proof is `HW-003`. The absence of Qwen35-style batched prefill is unrelated to dense PP. | No. | No. | No. | Dense PP code exists separately; `HW-003` physical proof pending. | No Qwen35-style batched prefill. | Producer skipped on error for `llama-3.2-1b-instruct-bf16` and `supra-50m-instruct-bf16`. | Dense LLaMA/GGUF-style GEMV, Q8/HFQ/MQ weight paths exist. Missing family-specific optimized prefill, DFlash, CASK, broader TP eligibility, and per-model quality refs. |
 | Gemma 4 | `gemma-4-E2B-it` | Not runnable as a Gemma architecture yet. Prompt/tool-call support scaffolding exists, but no Gemma4 architecture crate is in the workspace. | No. | No. | No. | No. | No. | Not generated. | Needs `hipfire-arch-gemma4`, config/loader/forward kernels, and stop/tool-call policy wiring. Existing Gemma parser support is not model execution support. |
+
+### Parallelism capability policy
+
+PP and TP are required targets for every shipped family; EP is required
+for MoE. CAP-001 will enforce refusal of planned cells and normalize
+dense EP to one effective replica before mesh, device, allocation, or
+collective creation; those behaviors are not currently enforced. Until
+then, current loader behavior remains the existing architecture-specific
+gates characterized by PAR-001. Dense LFM2 Single is currently refused
+pending AXIS-003 admission. Dense normalization creates no EP support
+claim. Physical hardware evidence is required for production status. The
+authoritative status is
+`.agent-progress/device-mesh-refactor-tracker.md`; this matrix must not
+override it.
+
+| Family / arch_id | Single | PP | TP | EP |
+|---|---|---|---|---|
+| LLaMA (0) | implemented | implemented code; HW-003 pending | partial; `has_qk_norm=true` / Qwen3-family metadata eligible; non-qk-norm LLaMA/Mistral refused; HW-006 pending for eligible artifacts | normalized-to-single(CAP-001) |
+| plain Qwen3 (1) | implemented | implemented code; HW-003 pending | implemented code; HW-006 pending | normalized-to-single(CAP-001) |
+| Qwen3.5 dense (5) | implemented | partial (GEN-001; HW-004 pending) | planned (AXIS-002; HW-007 pending) | normalized-to-single(CAP-001) |
+| Qwen3.5 MoE (6) | implemented | partial (GEN-001; HW-004 pending) | planned (AXIS-002; HW-007 pending) | planned (AXIS-002; HW-011 pending) |
+| Qwen2 dense (7) | implemented | planned (AXIS-001; HW-003 pending) | planned (AXIS-001; HW-006 pending) | normalized-to-single(CAP-001) |
+| dots.ocr (8) | implemented | planned (AXIS-004; HW-012 pending) | planned (AXIS-004; HW-013 pending) | normalized-to-single(CAP-001) |
+| Qwen35-VL (arch 5 VL extension) | implemented | planned (AXIS-004; HW-012 pending) | planned (AXIS-004; HW-013 pending) | normalized-to-single(CAP-001) |
+| DeepSeek4 (9) | implemented | planned (AXIS-003; HW-008 pending) | planned (AXIS-003; HW-008 pending) | implemented code; HW-001 pending |
+| MiniMax (10) | implemented | planned (AXIS-003; HW-009 pending) | planned (AXIS-003; HW-009 pending) | implemented code; HW-002 pending |
+| LFM2 dense (11) | currently refused; planned admission AXIS-003 | planned (AXIS-003; HW-010 pending) | planned (AXIS-003; HW-010 pending) | normalized-to-single(CAP-001) |
+| LFM2-MoE (11) | implemented | planned (AXIS-003; HW-010 pending) | planned (AXIS-003; HW-010 pending) | planned (AXIS-003; HW-010 pending) |
+| Cohere2-MoE (12) | implemented | planned (AXIS-003; HW-010 pending) | planned (AXIS-003; HW-010 pending) | planned (AXIS-003; HW-010 pending) |
+| toy / template (0xFF) | out-of-scope | out-of-scope | out-of-scope | out-of-scope |
+
+An axis marked partial, planned, or awaiting hardware evidence is not
+currently claimed as supported. CAP-001 will refuse planned cells when
+implemented; until then, an AXIS or GEN cell remains governed by the
+current architecture-specific loader gates characterized by PAR-001. An
+implemented EP cell with a pending HW gate is not production status.
+
+Qwen35-VL caveat: the current `pp > 1` HFQ path bypasses VL detection and
+does not explicitly refuse the admission at load. CAP-001 must make that
+admission error explicit; this is not a claim that PP+VL works.

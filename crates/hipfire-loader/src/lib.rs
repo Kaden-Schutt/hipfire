@@ -4145,6 +4145,74 @@ mod reset_ownership_tests {
     }
 
     #[test]
+    // Characterizes post-load reset ownership; CAP-001 owns unified loader/daemon admission enforcement.
+    fn parallel_reset_ownership_table() {
+        use ModelParallelKind::*;
+        use ModelStateKind::*;
+
+        enum Expected {
+            AcceptedNow,
+            Refused,
+        }
+
+        let cases = [
+            ("arch 0 TP", Tp, None, 0, Expected::AcceptedNow),
+            ("arch 0 dense PP", PpDense, None, 0, Expected::AcceptedNow),
+            ("arch 0 EP", Ep, None, 0, Expected::Refused),
+            ("arch 1 TP", Tp, None, 1, Expected::AcceptedNow),
+            ("arch 1 dense PP", PpDense, None, 1, Expected::AcceptedNow),
+            ("arch 1 EP", Ep, None, 1, Expected::Refused),
+            (
+                "arch 5 Qwen35 PP",
+                PpQwen35,
+                Some(Qwen35),
+                5,
+                Expected::AcceptedNow,
+            ),
+            ("arch 5 TP", Tp, None, 5, Expected::Refused),
+            ("arch 5 EP", Ep, None, 5, Expected::Refused),
+            (
+                "arch 6 Qwen35 PP",
+                PpQwen35,
+                Some(Qwen35),
+                6,
+                Expected::AcceptedNow,
+            ),
+            ("arch 6 TP", Tp, None, 6, Expected::Refused),
+            ("arch 6 EP", Ep, None, 6, Expected::Refused),
+            ("arch 7 dense PP", PpDense, None, 7, Expected::Refused),
+            ("arch 7 TP", Tp, None, 7, Expected::Refused),
+            ("arch 7 EP", Ep, None, 7, Expected::Refused),
+            ("arch 8 dense PP", PpDense, None, 8, Expected::Refused),
+            ("arch 8 TP", Tp, None, 8, Expected::Refused),
+            ("arch 8 EP", Ep, None, 8, Expected::Refused),
+            ("arch 9 EP", Ep, None, 9, Expected::AcceptedNow),
+            ("arch 9 dense PP", PpDense, None, 9, Expected::Refused),
+            ("arch 9 TP", Tp, None, 9, Expected::Refused),
+            ("arch 10 EP", Ep, None, 10, Expected::AcceptedNow),
+            ("arch 10 dense PP", PpDense, None, 10, Expected::Refused),
+            ("arch 10 TP", Tp, None, 10, Expected::Refused),
+            ("arch 11 dense PP", PpDense, None, 11, Expected::Refused),
+            ("arch 11 TP", Tp, None, 11, Expected::Refused),
+            ("arch 11 EP", Ep, None, 11, Expected::Refused),
+            ("arch 12 dense PP", PpDense, None, 12, Expected::Refused),
+            ("arch 12 TP", Tp, None, 12, Expected::Refused),
+            ("arch 12 EP", Ep, None, 12, Expected::Refused),
+        ];
+
+        for (name, parallel, state, arch_id, expected) in cases {
+            let result = reset_ownership_kind(parallel, state, arch_id);
+            match expected {
+                Expected::AcceptedNow => assert_eq!(result, Ok(parallel), "{name}"),
+                Expected::Refused => assert!(
+                    matches!(result, Err(ResetError::Architecture { .. })),
+                    "{name}: result={result:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn ep_rejects_arch_variant_mismatch() {
         let result = validate_ep_layout(9, EpArchKind::Minimax, 2, 2);
         assert!(matches!(result, Err(ResetError::Architecture { .. })));

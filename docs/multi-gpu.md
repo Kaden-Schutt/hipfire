@@ -1,10 +1,12 @@
 # Multi-GPU Pipeline-Parallel
 
-**Status:** v1 feature-complete on `feat/multi-gpu-pp` branch — tracking
-issue [#58](https://github.com/Kaden-Schutt/hipfire/issues/58). Stages
-0–9 of the v2 plan are merged; refusal contracts (DFlash / VL / CASK +
-pp>1) are wired and validated. This doc is the source of truth for
-memory budget, deployment recipes, throughput, and known limitations.
+**Status:** Axis policy follows the [authoritative device-mesh
+tracker](../.agent-progress/device-mesh-refactor-tracker.md). Current
+loader behavior remains architecture-specific and is characterized by
+`PAR-001`; this document does not claim that `CAP-001` is implemented or
+that a cell is production-ready without its required physical evidence.
+The memory budget, deployment recipes, and measured throughput below remain
+useful operational notes.
 
 ## Why PP
 
@@ -119,15 +121,29 @@ Direct daemon JSON (driving without the CLI):
 | `HIPFIRE_PREFILL_MAX_BATCH=N` | Override per-chunk prefill batch (default `PREFILL_MAX_BATCH`); chunks > N split with peer-copy at boundary |
 | `HIPFIRE_WO_WMMA_VARIANT={k2,ksplit,k4,…}` | Manual override of the wo-residual GEMM variant — see `dispatch.rs` auto-dispatch |
 
-### Refusal matrix at load (`pp > 1`)
+### Current axis policy
 
-| Feature | Behavior | Why |
-|---------|----------|-----|
-| arch_id ∈ {5, 6} (Qwen3.5 dense + MoE/A3B) | Accepted | Validated end-to-end |
-| arch_id = others (LLaMA / Qwen3) | Refused | Single-GPU only in v1 |
-| VL models (vision_config + vision tensors) | Refused | v1.1 |
-| DFlash draft (`draft` field set) | Refused | v1.1 — see `feedback_cask_mfold_dflash_broken.md` for the v1 ship-blocker |
-| CASK / TriAttention sidecar | Refused | Eviction context is single-device — v1.1 |
+The loader's current behavior is architecture-specific; `PAR-001` records
+that behavior and the policy below. `CAP-001` will provide consistent early
+enforcement for planned and unsupported cells; it is not implemented here.
+
+| Axis/cell | Current policy | Production gate or owner |
+|-----------|----------------|--------------------------|
+| Plain Qwen PP/TP | Existing code; pending applicable physical proof | `HW-003` / `HW-006` |
+| LLaMA PP | Existing code; physical proof pending | `HW-003` |
+| LLaMA TP | Partial; narrow eligible-artifact support | `AXIS-001`, then `HW-006` for production closure |
+| Qwen2/VibeThinker PP/TP | Planned; not currently supported | `AXIS-001`, then `HW-003` / `HW-006` |
+| Qwen35 arch-resident PP | Partial; generation remains arch-resident | `GEN-001`, then `HW-004` |
+| DeepSeek4 EP | Existing code; pending physical proof | `HW-001` |
+| MiniMax EP | Existing code; pending physical proof | `HW-002` |
+| Other planned PP/TP and MoE-EP cells | Current architecture-specific behavior remains under `PAR-001` characterization; consistent early planned/unsupported-cell enforcement belongs to `CAP-001` and the owning `AXIS-*`/`GEN-*` implementation | `AXIS-001`–`AXIS-004`, `GEN-001`, `PAR-002` |
+| Dense `EP > 1` | Governed by existing architecture-specific refusal; no EP support claim | `CAP-001` will normalize to one effective replica before mesh/device/allocation/collective construction |
+| `TP > 1` × `EP > 1` | Refused | Remains so unless `COMP-001` creates a requirement-specific follow-up |
+
+Each implemented cell requires its applicable named hardware gate (for
+example, `HW-001`, `HW-002`, `HW-003`, `HW-004`, `HW-006`, or another gate
+listed by its owner) before production status. Emulated parity and
+allocation evidence never substitute for the applicable physical gate.
 
 ## Throughput baseline (gfx1100 × 2)
 
@@ -140,25 +156,26 @@ Measured on 2× Radeon RX 7900 XTX, ROCm 6.4.3, with
 | 0.8B mq4 | 322 tok (chunked) | 6493 tok/s | 5490 tok/s | 315 tok/s | 212 tok/s | 67% |
 | 35B-A3B mq4 (MoE) | 15 tok | 331 tok/s | 258 tok/s | 142 tok/s | 97 tok/s | 68% |
 
-The pp=2 decode penalty is inherent to v1: per-token
-`forward_scratch_multi` pays one HIP launch per kernel per layer with
-no graph capture (vs pp=1 which captures + replays the AR-step graph
-after warmup). Pipelined decode + per-band graph capture lift this in
-v1.1.
+Current limitation: pp=2 decode is per-token, and
+`forward_scratch_multi` launches each kernel per layer without graph
+capture. Async stream/pipeline execution, per-band graph capture, and
+pipelined prefill are not currently available.
 
-## Limitations (v1)
+## Current boundaries
 
-Refused at load time:
-- `pp > 1` + DFlash speculative decode
-- `pp > 1` + CASK/TriAttention sidecar (eviction is single-device)
-- `pp > 1` + VL models (vision encoder is single-device)
-- `pp > 1` + arch_id ∉ {5, 6} (LLaMA / Qwen3 dense are pp=1 only)
-
-Architectural limits in v1:
+- The axis table is a policy and current-behavior summary, not a claim that
+  `CAP-001` has landed.
+- Documented refusal guards for `pp > 1` with DFlash or CASK/TriAttention
+  remain in force; this document does not broaden those paths.
+- Current `pp > 1` Qwen35 loading bypasses VL detection and lacks explicit
+  load-time refusal. This is not PP+VL support; `CAP-001` must turn it into
+  an explicit admission error.
 - Homogeneous arch only (`init_uniform` hard-fails on arch mismatch)
-- Uniform layer split — `init_layers(per_device)` is the manual escape hatch; `init_vram_weighted` stubbed
-- Per-token decode (no async stream pipeline / per-band graph capture) — v1.1
-- Pipelined prefill (chunk N+1 on dev_0 while chunk N processes on dev_1) — v1.1
+- Uniform layer split — `init_layers(per_device)` is the manual escape hatch;
+  `init_vram_weighted` is stubbed.
+- Per-token decode has no async stream pipeline or per-band graph capture.
+- Pipelined prefill (chunk N+1 on dev_0 while chunk N processes on dev_1) is
+  not yet available.
 
 ## Validation (Stage 9)
 
