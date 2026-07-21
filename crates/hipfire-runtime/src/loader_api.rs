@@ -76,6 +76,13 @@ pub struct LoadCtx<'a> {
     /// Load-resolved MTP K for model construction and speculative decoding.
     pub mtp_k: usize,
     pub spec: SpecLoadCfg,
+    /// Eviction-aware KV physical capacity override. When `Some(cap)` and
+    /// `cap < max_seq`, the carrier's KvCache allocation uses `cap` instead of
+    /// `max_seq` for the physical buffer size (keeping `max_seq` as the logical
+    /// RoPE/mask range). Set by the CASK/TriAttention physical-cap derivation to
+    /// shrink KV allocation from full-context to the eviction working window.
+    /// `None` means physical_cap == max_seq (no eviction bounding).
+    pub kv_physical_cap: Option<usize>,
     pub gpu: &'a mut Gpu,
 }
 

@@ -158,6 +158,7 @@ fn main() -> Result<(), String> {
         mtp_mode: "auto",
         mtp_k: 3,
         spec: SpecLoadCfg::default(),
+        kv_physical_cap: None,
         gpu: &mut gpu,
     };
     let mut bundle = load_llama_bundle(src, &mut ctx)?;

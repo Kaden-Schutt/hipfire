@@ -47,6 +47,7 @@ fn main() {
         mtp_mode: "auto",
         mtp_k: 3,
         spec: SpecLoadCfg::default(),
+        kv_physical_cap: None,
         gpu: &mut gpu,
     };
 
