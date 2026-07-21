@@ -188,7 +188,14 @@ works, what to measure, what counts as pass/fail.
    or a heredoc inside a committed script.
 5. **No grep / find / glob inside `exec:bash`.** Use the `Grep` tool
    directly, or `exec:nodejs` with `execSync('rg -n PATTERN')`.
-6. **`scripts/install.{sh,ps1}` copy the whole `cli/` directory recursively
+6. **Scope formatting and linting to changed Rust code.** Run rustfmt only
+   against `.rs` files edited in the current change, using:
+   `rustfmt --edition 2021 --check --config skip_children=true "${files[@]}"`.
+   Clippy cannot select individual files; invoke it only for the narrowest
+   affected Cargo target (for example, `cargo clippy -p <package> --lib`, or
+   the relevant `--bin`, `--example`, or `--test` target). Do not churn
+   unrelated pre-existing formatting or lint findings.
+7. **`scripts/install.{sh,ps1}` copy the whole `cli/` directory recursively
    and prune dev/test artifacts by pattern.** New `.ts` files in `cli/`
    are auto-installed — no install-script edit required. Tests must
    follow `*.test.ts` / `test_*.ts` / `bench_*.ts` naming so the prune
