@@ -28,7 +28,7 @@ certification prose live in their owners ([`INDEX.md`](INDEX.md)).
 
 | Class | When it runs | Authority |
 |---|---|---|
-| **Automatic (no GPU CI)** | PR / push via the no-GPU workflow only | Merge bar for compile, unit, docs reliability (incl. env coverage), Bun when present. **Not** model coherence, serve semantics, or perf admission. |
+| **Automatic (no GPU CI)** | PR / push via the no-GPU workflow only | Merge bar for compile, native control-plane/unit tests, and docs reliability. **Not** model coherence, serve semantics, or perf admission. |
 | **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged paths | Always runs documentation reliability first; documentation/governance/tooling-only staged sets exit before runtime/GPU hotspot gates; mixed commits continue through the hotspot guards that match remaining staged paths. **Not** a full product matrix. |
 | **Manual local no-GPU equivalent** | Human/agent invokes `scripts/no-gpu-ci.sh` outside CI | Same checks as the workflow script body; still **manual invocation**, not automatic CI. |
 | **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Required for kernel, dispatch, forward, quant, serve-behavior, Redline, and perf claims. |
@@ -48,7 +48,7 @@ Automatic CI green never substitutes for a required manual route. Running the no
 
 | Route | Path | Role |
 |---|---|---|
-| No-GPU script | [`scripts/no-gpu-ci.sh`](../scripts/no-gpu-ci.sh) | Manual local run of the same body CI uses: `cargo check --workspace --examples`; selected no-GPU Rust lib tests; CPU pytest; focused docs-reliability unit tests; `scripts/check-docs-reliability.py`; Bun test/typecheck when Bun exists. |
+| No-GPU script | [`scripts/no-gpu-ci.sh`](../scripts/no-gpu-ci.sh) | Manual local run of the same body CI uses: `cargo check --workspace --examples`; selected no-GPU Rust and native control-plane tests; CPU pytest; env/docs coverage. |
 
 ### Documentation reliability checker
 
@@ -99,7 +99,7 @@ Narrow roles. Do not widen a harness into a universal gate.
 |---|---|---|---|
 | **gates.sh** | [`scripts/gates.sh`](../scripts/gates.sh) | Maintained **manual** wrapper: optional Redline capture, generic serve battery, optional fresh-process perf compare (`probe_commits.sh`). Requires `--model`. | Not CI-default. Not universal. Does not call retired coherence-gate scripts. |
 | **serve_harness.py** | [`scripts/serve_harness.py`](../scripts/serve_harness.py) | **Model-agnostic** user-facing serve behavior (battery / chain / session): finish reasons, runaway/empty, prefix cache, prefill/decode timing, recall hooks. | Not LFM thinking-frame specifics. Not Redline route proof. |
-| **lfm_serve_harness.py** | [`scripts/lfm_serve_harness.py`](../scripts/lfm_serve_harness.py) | **LFM2.5-only** single-turn serve smoke with explicit thinking / combined-output checks and registry sampling. | Not generic multi-model serve. Not a substitute for numerical parity oracles. |
+| **serve_harness.py (LFM tag)** | [`scripts/serve_harness.py`](../scripts/serve_harness.py) | LFM2.5 serve smoke with the exact registry tag; use registry sampling or `recipe:nothink` for non-thinking framing. | Not a substitute for numerical parity oracles. |
 | **redline_daemon_harness.py** | [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py) | Resident-daemon **Redline** capture, phase fingerprint, shadow/parity, and timing evidence under manual-capture env. | Discovery/correctness evidence ≠ product timed-arm route proof by itself. Does not enable AQL routing. |
 
 ### Supporting manual tools (existing; claim-scoped)
@@ -125,7 +125,7 @@ Use only when the claim class below names them. They are not universal.
 | Dispatch `bind_thread` / public `dispatch.rs` bind surface | `.githooks/pre-commit` → `scripts/verify-bind-thread.sh` (or run that script manually) | Automatic hook or manual bind check — **not** `test_kernels` |
 | Forward / fusion / KV **numerical or state parity** | Path-specific parity/state oracle for that arch/surface; **blocked** if no oracle exists | Manual oracle — **not** `serve_harness.py` |
 | Forward / fusion / sampling / KV **user-facing serve semantics** | `scripts/serve_harness.py` with the exact model (after parity route if the change can break numbers/state); add `scripts/gates.sh` when the Redline+serve+optional perf wrapper is desired | Manual serve (semantics only) |
-| LFM2.5 chat framing / thinking output | `scripts/lfm_serve_harness.py` with an `lfm2.5:*` registry tag | Manual LFM |
+| LFM2.5 chat framing / thinking output | `scripts/serve_harness.py` with an `lfm2.5:*` registry tag | Manual LFM |
 | Retained replay / PM4 / AQL graft | `scripts/redline_daemon_harness.py` **and** the certification steps in `docs/REDLINE.md` | Manual Redline; promotion still policy-gated |
 | Perf improvement claim | Protocol in `methodology/perf-benchmarking.md` + stationary matched runs; `speed-gate.sh` or `gates.sh` perf arm when applicable | Measured; not admission |
 | Arch port | `methodology/arch-port-validation.md` (channel + speed; no retired coherence battery as acceptance) | Manual |

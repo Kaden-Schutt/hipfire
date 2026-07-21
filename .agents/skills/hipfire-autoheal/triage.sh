@@ -41,7 +41,7 @@ line() {
 section "environment"
 line "$(uname -sr)"
 line "shell: $SHELL"
-line "PATH (hipfire-relevant): $(echo "$PATH" | tr ':' '\n' | grep -E 'rocm|hipfire|bun' | head -5 | tr '\n' ':')"
+line "PATH (hipfire-relevant): $(echo "$PATH" | tr ':' '\n' | grep -E 'rocm|hipfire|cargo' | head -5 | tr '\n' ':')"
 section_end
 
 # ── 2. GPU stack ──
@@ -60,9 +60,15 @@ section_end
 section "hipfire_install"
 HIPFIRE_DIR="${HIPFIRE_DIR:-$HOME/.hipfire}"
 [ -d "$HIPFIRE_DIR" ] && line "~/.hipfire: present" || line "~/.hipfire: MISSING (not installed)"
+[ -x "$HIPFIRE_DIR/bin/hipfire" ] && line "CLI: $HIPFIRE_DIR/bin/hipfire" || line "CLI: not installed under ~/.hipfire/bin"
 [ -x "$HIPFIRE_DIR/bin/daemon" ] && line "daemon: $(stat -c %y "$HIPFIRE_DIR/bin/daemon" 2>/dev/null | cut -d. -f1)" || line "daemon: MISSING"
-[ -f "$HIPFIRE_DIR/cli/index.ts" ] && line "CLI: $(wc -l < "$HIPFIRE_DIR/cli/index.ts") lines"
-[ -f "$HIPFIRE_DIR/config.json" ] && line "config: $(cat "$HIPFIRE_DIR/config.json" | tr -d '\n' | head -c 200)" || line "config: using defaults"
+if [ -f "$HIPFIRE_DIR/config.toml" ]; then
+    line "config: $HIPFIRE_DIR/config.toml"
+elif [ -f "$HIPFIRE_DIR/config.json" ]; then
+    line "config: legacy $HIPFIRE_DIR/config.json (migrates on write)"
+else
+    line "config: using defaults"
+fi
 KBLOB_COUNT=$(find "$HIPFIRE_DIR/bin/kernels" -name '*.hsaco' 2>/dev/null | wc -l)
 line "pre-compiled kernels: $KBLOB_COUNT blobs"
 section_end
@@ -70,9 +76,9 @@ section_end
 # ── 4. running state ──
 section "running_state"
 DAEMON_PIDS=$(pgrep -f 'bin/daemon' 2>/dev/null | tr '\n' ' ')
-BUN_PIDS=$(pgrep -f 'cli/index.ts.*serve' 2>/dev/null | tr '\n' ' ')
+SERVE_PIDS=$(pgrep -f '(^|/)hipfire serve' 2>/dev/null | tr '\n' ' ')
 line "daemon PIDs: ${DAEMON_PIDS:-none}"
-line "bun serve PIDs: ${BUN_PIDS:-none}"
+line "native serve PIDs: ${SERVE_PIDS:-none}"
 PID_FILE="$HIPFIRE_DIR/serve.pid"
 if [ -f "$PID_FILE" ]; then
     PF_PID=$(cat "$PID_FILE")

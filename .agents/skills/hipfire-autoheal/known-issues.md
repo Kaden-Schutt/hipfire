@@ -164,7 +164,7 @@ Do not quote pre-retest figures as live floors.
 
 Blind `pkill -9` is not an autoheal first action (pid reuse, wrong process name,
 orphans reparented to PID 1). Plain tracked `hipfire stop` ownership rules:
-`cli/serve_admission.ts`. Force/restart reaping is broader — inspect owners
+`crates/hipfire-cli/src/main.rs`. Force/restart reaping is broader — inspect owners
 first (playbook / SKILL destructive class).
 
 ---

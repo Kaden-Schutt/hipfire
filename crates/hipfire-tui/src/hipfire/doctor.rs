@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::hipfire::cli_command;
 use crate::hipfire::dashboard::{run_bounded, RocmSmiRun};
+use crate::hipfire::native_cli_command;
 
 /// Hard wall-clock bound on `hipfire diag` — it spawns the daemon (GPU init), so
 /// it is much heavier than rocm-smi, but a hung daemon must not leak the worker
@@ -39,7 +39,7 @@ pub struct DoctorReport {
     pub error: Option<String>,
 }
 
-/// Spawn `bun cli/index.ts diag --json` on a background thread; the single
+/// Spawn native `hipfire diag --json` on a background thread; the single
 /// report arrives on the returned receiver.
 pub fn run() -> Receiver<DoctorReport> {
     let (tx, rx) = mpsc::channel();
@@ -50,13 +50,13 @@ pub fn run() -> Receiver<DoctorReport> {
 }
 
 fn run_inner() -> DoctorReport {
-    let mut cmd = match cli_command() {
+    let mut cmd = match native_cli_command() {
         Some(c) => c,
         None => {
             return DoctorReport {
                 checks: Vec::new(),
                 error: Some(
-                    "cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run from the repo root)"
+                    "native hipfire binary not found (set HIPFIRE_CLI_BIN or install hipfire)"
                         .into(),
                 ),
             }
@@ -72,7 +72,7 @@ fn run_inner() -> DoctorReport {
             Some(json) => parse_diag_json(json),
             None => err("diag produced no JSON object".into()),
         },
-        RocmSmiRun::NotFound => err("bun not found on PATH".into()),
+        RocmSmiRun::NotFound => err("hipfire not found on PATH".into()),
         RocmSmiRun::TimedOut => err(format!(
             "diag timed out after {}s (killed)",
             DOCTOR_TIMEOUT.as_secs()
@@ -144,14 +144,14 @@ pub fn parse_diag_json(body: &str) -> DoctorReport {
     // Loose match: any non-empty string means a daemon was located (tolerates a
     // future "present"/path value); null/empty is the only failure.
     let daemon = v["daemon"].as_str().filter(|s| !s.is_empty());
-    checks.push(check("daemon binary", daemon.is_some(), daemon.unwrap_or("missing")));
+    checks.push(check(
+        "daemon binary",
+        daemon.is_some(),
+        daemon.unwrap_or("missing"),
+    ));
 
     let n_gpus = v["gpus"].as_array().map(|a| a.len()).unwrap_or(0);
-    checks.push(check(
-        "GPU (PCI)",
-        n_gpus > 0,
-        format!("{n_gpus} detected"),
-    ));
+    checks.push(check("GPU (PCI)", n_gpus > 0, format!("{n_gpus} detected")));
 
     let n_models = v["models"].as_array().map(|a| a.len()).unwrap_or(0);
     checks.push(check(
@@ -260,7 +260,10 @@ mod tests {
         let body = r#"{"daemon": "/home/u/.hipfire/bin/daemon", "gpu": "disabled"}"#;
         let r = parse_diag_json(body);
         let c = |n: &str| r.checks.iter().find(|c| c.name == n).unwrap();
-        assert!(c("daemon binary").ok, "any non-empty daemon string is found");
+        assert!(
+            c("daemon binary").ok,
+            "any non-empty daemon string is found"
+        );
         assert!(!c("live GPU probe").ok);
         assert_eq!(c("live GPU probe").detail, "disabled");
     }

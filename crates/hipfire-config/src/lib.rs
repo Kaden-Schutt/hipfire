@@ -1,0 +1,2189 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Typed configuration schema and deterministic layer resolution for hipfire.
+//!
+//! This crate is deliberately independent of GPU and model crates. It owns the
+//! public configuration vocabulary, legacy-key compatibility, TOML/JSON
+//! persistence, validation, and field-level provenance. Runtime crates consume
+//! resolved values; they do not parse user configuration in hot paths.
+
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fmt, fs,
+    path::{Path, PathBuf},
+};
+use thiserror::Error;
+
+pub const CONFIG_SCHEMA_VERSION: i64 = 1;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("unknown configuration key '{0}'")]
+    UnknownKey(String),
+    #[error("invalid value for {key}: {message}")]
+    InvalidValue { key: String, message: String },
+    #[error("failed to read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse {path}: {message}")]
+    Parse { path: PathBuf, message: String },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+pub type Result<T> = std::result::Result<T, ConfigError>;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConfigValue {
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Null,
+}
+
+impl ConfigValue {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Bool(_) => "bool",
+            Self::Integer(_) => "integer",
+            Self::Float(_) => "number",
+            Self::String(_) => "string",
+            Self::Null => "null",
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Integer(v) => Some(*v as f64),
+            Self::Float(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn into_toml(self) -> Option<toml::Value> {
+        match self {
+            Self::Bool(v) => Some(toml::Value::Boolean(v)),
+            Self::Integer(v) => Some(toml::Value::Integer(v)),
+            Self::Float(v) => Some(toml::Value::Float(v)),
+            Self::String(v) => Some(toml::Value::String(v)),
+            Self::Null => None,
+        }
+    }
+
+    fn from_toml(value: &toml::Value) -> Option<Self> {
+        match value {
+            toml::Value::Boolean(v) => Some(Self::Bool(*v)),
+            toml::Value::Integer(v) => Some(Self::Integer(*v)),
+            toml::Value::Float(v) => Some(Self::Float(*v)),
+            toml::Value::String(v) => Some(Self::String(v.clone())),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ConfigValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bool(v) => write!(f, "{v}"),
+            Self::Integer(v) => write!(f, "{v}"),
+            Self::Float(v) => write!(f, "{v}"),
+            Self::String(v) => f.write_str(v),
+            Self::Null => f.write_str("null"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigCategory {
+    Generation,
+    Reasoning,
+    Memory,
+    Attention,
+    Speculation,
+    Replay,
+    Fusions,
+    Prompt,
+    Serve,
+    Experimental,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigScope {
+    Process,
+    ModelLoad,
+    Session,
+    Request,
+    Diagnostic,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DefaultValue {
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(&'static str),
+    Null,
+}
+
+impl DefaultValue {
+    fn to_value(self) -> ConfigValue {
+        match self {
+            Self::Bool(v) => ConfigValue::Bool(v),
+            Self::Integer(v) => ConfigValue::Integer(v),
+            Self::Float(v) => ConfigValue::Float(v),
+            Self::String(v) => ConfigValue::String(v.to_owned()),
+            Self::Null => ConfigValue::Null,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ValueRule {
+    Bool,
+    Integer {
+        min: i64,
+        max: i64,
+    },
+    Float {
+        min: f64,
+        max: f64,
+        min_inclusive: bool,
+    },
+    String,
+    NonEmptyString,
+    Host,
+    PathOrEmpty,
+    Enum(&'static [&'static str]),
+    AutoBool,
+    NullableInteger {
+        min: i64,
+        max: i64,
+    },
+    NullableFloat {
+        min: f64,
+        max: f64,
+    },
+    KvAdaptive,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigField {
+    pub key: &'static str,
+    pub legacy_key: &'static str,
+    pub category: ConfigCategory,
+    pub scope: ConfigScope,
+    pub default: DefaultValue,
+    pub rule: ValueRule,
+    pub registry_allowed: bool,
+    pub experimental: bool,
+    pub env_compat: Option<&'static str>,
+    pub help: &'static str,
+}
+
+impl ConfigField {
+    pub fn validate(&self, value: &ConfigValue) -> Result<()> {
+        let valid = match self.rule {
+            ValueRule::Bool => matches!(value, ConfigValue::Bool(_)),
+            ValueRule::Integer { min, max } => {
+                matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+            }
+            ValueRule::Float {
+                min,
+                max,
+                min_inclusive,
+            } => value
+                .as_f64()
+                .is_some_and(|v| (if min_inclusive { v >= min } else { v > min }) && v <= max),
+            ValueRule::String => matches!(value, ConfigValue::String(_)),
+            ValueRule::NonEmptyString => {
+                matches!(value, ConfigValue::String(v) if !v.trim().is_empty())
+            }
+            ValueRule::Host => matches!(value, ConfigValue::String(v)
+                if !v.is_empty() && v.len() <= 255 && v.trim() == v && !v.chars().any(char::is_whitespace)),
+            ValueRule::PathOrEmpty => matches!(value, ConfigValue::String(v) if {
+                if v.is_empty() {
+                    true
+                } else {
+                    expand_tilde(v).is_file()
+                }
+            }),
+            ValueRule::Enum(values) => {
+                matches!(value, ConfigValue::String(v) if values.contains(&v.as_str()))
+            }
+            ValueRule::AutoBool => {
+                matches!(value, ConfigValue::Bool(_))
+                    || matches!(value, ConfigValue::String(v) if v == "auto")
+            }
+            ValueRule::NullableInteger { min, max } => {
+                matches!(value, ConfigValue::Null)
+                    || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+            }
+            ValueRule::NullableFloat { min, max } => {
+                matches!(value, ConfigValue::Null)
+                    || value.as_f64().is_some_and(|v| v >= min && v <= max)
+            }
+            ValueRule::KvAdaptive => matches!(value, ConfigValue::String(v) if {
+                matches!(v.as_str(), "off" | "conservative" | "balanced" | "aggressive")
+                    || valid_advanced_kv(v)
+            }),
+        };
+
+        if valid {
+            Ok(())
+        } else {
+            Err(ConfigError::InvalidValue {
+                key: self.key.to_owned(),
+                message: format!("{} does not satisfy {:?}", value.kind(), self.rule),
+            })
+        }
+    }
+
+    pub fn parse_cli(&self, raw: &str) -> Result<ConfigValue> {
+        let value = match self.rule {
+            ValueRule::Bool => parse_bool(raw).map(ConfigValue::Bool),
+            ValueRule::Integer { .. } => raw.parse::<i64>().ok().map(ConfigValue::Integer),
+            ValueRule::Float { .. } => raw.parse::<f64>().ok().map(ConfigValue::Float),
+            ValueRule::AutoBool if raw == "auto" => Some(ConfigValue::String(raw.to_owned())),
+            ValueRule::AutoBool => parse_bool(raw).map(ConfigValue::Bool),
+            ValueRule::NullableInteger { .. } if raw.eq_ignore_ascii_case("null") => {
+                Some(ConfigValue::Null)
+            }
+            ValueRule::NullableInteger { .. } => raw.parse::<i64>().ok().map(ConfigValue::Integer),
+            ValueRule::NullableFloat { .. } if raw.eq_ignore_ascii_case("null") => {
+                Some(ConfigValue::Null)
+            }
+            ValueRule::NullableFloat { .. } => raw.parse::<f64>().ok().map(ConfigValue::Float),
+            _ => Some(ConfigValue::String(raw.to_owned())),
+        }
+        .ok_or_else(|| ConfigError::InvalidValue {
+            key: self.key.to_owned(),
+            message: format!("could not parse '{raw}'"),
+        })?;
+        self.validate(&value)?;
+        Ok(value)
+    }
+}
+
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn valid_advanced_kv(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("advanced:k=") else {
+        return false;
+    };
+    let Some((k, v)) = rest.split_once(",v=") else {
+        return false;
+    };
+    matches!(k, "fwht4" | "fwht3" | "fwht2") && matches!(v, "lloyd4" | "lloyd3" | "lloyd2")
+}
+
+fn expand_tilde(value: &str) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+const KV_MODES: &[&str] = &[
+    "auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4",
+    "turbo3", "turbo2",
+];
+const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
+const THINKING_BUDGETS: &[&str] = &["low", "med", "high", "xhigh", "max", "uncapped"];
+const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
+
+macro_rules! field {
+    ($key:literal, $legacy:literal, $category:ident, $scope:ident, $default:expr, $rule:expr, $registry:expr, $experimental:expr, $env:expr, $help:literal) => {
+        ConfigField {
+            key: $key,
+            legacy_key: $legacy,
+            category: ConfigCategory::$category,
+            scope: ConfigScope::$scope,
+            default: $default,
+            rule: $rule,
+            registry_allowed: $registry,
+            experimental: $experimental,
+            env_compat: $env,
+            help: $help,
+        }
+    };
+}
+
+/// The public schema. Canonical dotted keys are the TOML surface; `legacy_key`
+/// accepts the current flat JSON/CLI spelling during migration.
+pub static FIELDS: &[ConfigField] = &[
+    field!(
+        "memory.kv_cache",
+        "kv_cache",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(KV_MODES),
+        true,
+        false,
+        Some("HIPFIRE_KV_MODE"),
+        "KV cache format; auto inherits the registry recommendation, then q8."
+    ),
+    field!(
+        "memory.kv_adaptive",
+        "kv_adaptive",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::KvAdaptive,
+        true,
+        false,
+        Some("HIPFIRE_KV_ADAPTIVE"),
+        "Runtime VRAM-fit KV precision policy."
+    ),
+    field!(
+        "attention.flash",
+        "flash_mode",
+        Attention,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "always", "never"]),
+        true,
+        false,
+        Some("HIPFIRE_ATTN_FLASH"),
+        "Flash-attention admission preference."
+    ),
+    field!(
+        "serve.default_model",
+        "default_model",
+        Serve,
+        Process,
+        DefaultValue::String("qwen3.5:9b"),
+        ValueRule::NonEmptyString,
+        false,
+        false,
+        Some("HIPFIRE_MODEL"),
+        "Model pre-warmed by serve."
+    ),
+    field!(
+        "generation.temperature",
+        "temperature",
+        Generation,
+        Request,
+        DefaultValue::Float(0.3),
+        ValueRule::Float {
+            min: 0.0,
+            max: 2.0,
+            min_inclusive: true
+        },
+        true,
+        false,
+        None,
+        "Sampling temperature."
+    ),
+    field!(
+        "generation.top_p",
+        "top_p",
+        Generation,
+        Request,
+        DefaultValue::Float(0.8),
+        ValueRule::Float {
+            min: 0.0,
+            max: 1.0,
+            min_inclusive: false
+        },
+        true,
+        false,
+        None,
+        "Nucleus sampling probability."
+    ),
+    field!(
+        "generation.repeat_penalty",
+        "repeat_penalty",
+        Generation,
+        Request,
+        DefaultValue::Float(1.05),
+        ValueRule::Float {
+            min: 1.0,
+            max: 3.0,
+            min_inclusive: true
+        },
+        true,
+        false,
+        None,
+        "Token repetition penalty."
+    ),
+    field!(
+        "generation.max_tokens",
+        "max_tokens",
+        Generation,
+        Request,
+        DefaultValue::Integer(4096),
+        ValueRule::Integer {
+            min: 1,
+            max: 131072
+        },
+        true,
+        false,
+        None,
+        "Per-turn generation cap."
+    ),
+    field!(
+        "memory.max_seq",
+        "max_seq",
+        Memory,
+        ModelLoad,
+        DefaultValue::Integer(32768),
+        ValueRule::Integer {
+            min: 512,
+            max: 524288
+        },
+        true,
+        false,
+        None,
+        "Logical KV context capacity."
+    ),
+    field!(
+        "reasoning.mode",
+        "thinking",
+        Reasoning,
+        Session,
+        DefaultValue::String("on"),
+        ValueRule::Enum(&["on", "off"]),
+        true,
+        false,
+        None,
+        "Visible reasoning mode."
+    ),
+    field!(
+        "reasoning.budget",
+        "thinking_budget",
+        Reasoning,
+        Request,
+        DefaultValue::String("med"),
+        ValueRule::Enum(THINKING_BUDGETS),
+        true,
+        false,
+        None,
+        "Named per-turn reasoning budget."
+    ),
+    field!(
+        "reasoning.max_tokens",
+        "max_think_tokens",
+        Reasoning,
+        Request,
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: 0, max: 32768 },
+        true,
+        false,
+        None,
+        "Raw reasoning-token override; absent means use the named budget."
+    ),
+    field!(
+        "reasoning.max_total_tokens",
+        "max_total_think_tokens",
+        Reasoning,
+        Request,
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: 1000000
+        },
+        true,
+        false,
+        Some("HIPFIRE_MAX_TOTAL_THINK_TOKENS"),
+        "Cross-reopen reasoning budget; zero disables it."
+    ),
+    field!(
+        "serve.host",
+        "host",
+        Serve,
+        Process,
+        DefaultValue::String("0.0.0.0"),
+        ValueRule::Host,
+        false,
+        false,
+        Some("HIPFIRE_HOST"),
+        "Serve bind address."
+    ),
+    field!(
+        "serve.port",
+        "port",
+        Serve,
+        Process,
+        DefaultValue::Integer(11435),
+        ValueRule::Integer { min: 1, max: 65535 },
+        false,
+        false,
+        Some("HIPFIRE_PORT"),
+        "Serve TCP port."
+    ),
+    field!(
+        "serve.idle_timeout_seconds",
+        "idle_timeout",
+        Serve,
+        Process,
+        DefaultValue::Integer(300),
+        ValueRule::Integer { min: 0, max: 86400 },
+        false,
+        false,
+        Some("HIPFIRE_IDLE_TIMEOUT"),
+        "Seconds before idle model unload; zero disables."
+    ),
+    field!(
+        "serve.max_request_bytes",
+        "max_request_bytes",
+        Serve,
+        Process,
+        DefaultValue::Integer(67108864),
+        ValueRule::Integer {
+            min: 4096,
+            max: 4294967296
+        },
+        false,
+        false,
+        Some("HIPFIRE_MAX_REQUEST_BYTES"),
+        "Maximum request-body bytes."
+    ),
+    field!(
+        "serve.max_queue",
+        "serve_max_queue",
+        Serve,
+        Process,
+        DefaultValue::Integer(64),
+        ValueRule::Integer {
+            min: 0,
+            max: 100000
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MAX_QUEUE"),
+        "Maximum queued serve requests; zero is uncapped."
+    ),
+    field!(
+        "serve.queue_timeout_ms",
+        "serve_queue_timeout_ms",
+        Serve,
+        Process,
+        DefaultValue::Integer(30000),
+        ValueRule::Integer {
+            min: 0,
+            max: 3600000
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_QUEUE_TIMEOUT_MS"),
+        "Maximum admission-queue wait."
+    ),
+    field!(
+        "experimental.budget_alert",
+        "experimental_budget_alert",
+        Experimental,
+        Request,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        false,
+        true,
+        Some("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT"),
+        "Research-only in-band reasoning alert gate."
+    ),
+    field!(
+        "speculation.dflash_adaptive_b",
+        "dflash_adaptive_b",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        true,
+        false,
+        None,
+        "Adapt the DFlash block size to observed acceptance."
+    ),
+    field!(
+        "speculation.dflash",
+        "dflash_mode",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(AUTO_ON_OFF),
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_MODE"),
+        "DFlash eligibility policy."
+    ),
+    field!(
+        "speculation.dflash_ngram_block",
+        "dflash_ngram_block",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_NGRAM_BLOCK"),
+        "Verify-path n-gram defense."
+    ),
+    field!(
+        "memory.cask.sidecar",
+        "cask_sidecar",
+        Memory,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::String,
+        true,
+        false,
+        Some("HIPFIRE_CASK_SIDECAR"),
+        "TriAttention sidecar path; empty disables eviction."
+    ),
+    field!(
+        "memory.cask.enabled",
+        "cask",
+        Memory,
+        ModelLoad,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        true,
+        false,
+        None,
+        "Enable core-aware CASK folding."
+    ),
+    field!(
+        "memory.cask.budget",
+        "cask_budget",
+        Memory,
+        ModelLoad,
+        DefaultValue::Integer(512),
+        ValueRule::Integer {
+            min: 64,
+            max: 65536
+        },
+        true,
+        false,
+        None,
+        "Active-token target after eviction."
+    ),
+    field!(
+        "memory.cask.beta",
+        "cask_beta",
+        Memory,
+        ModelLoad,
+        DefaultValue::Integer(128),
+        ValueRule::Integer { min: 0, max: 65536 },
+        true,
+        false,
+        None,
+        "Eviction hysteresis."
+    ),
+    field!(
+        "memory.cask.core_fraction",
+        "cask_core_frac",
+        Memory,
+        ModelLoad,
+        DefaultValue::Float(0.5),
+        ValueRule::Float {
+            min: 0.0,
+            max: 1.0,
+            min_inclusive: true
+        },
+        true,
+        false,
+        None,
+        "Fraction of the CASK budget retained as core."
+    ),
+    field!(
+        "memory.cask.fold",
+        "cask_fold_m",
+        Memory,
+        ModelLoad,
+        DefaultValue::Integer(2),
+        ValueRule::Integer { min: 1, max: 16 },
+        true,
+        false,
+        None,
+        "CASK merge factor."
+    ),
+    field!(
+        "memory.cask.auto_attach",
+        "cask_auto_attach",
+        Memory,
+        ModelLoad,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        true,
+        false,
+        None,
+        "Discover a matching TriAttention sidecar."
+    ),
+    field!(
+        "prompt.normalize",
+        "prompt_normalize",
+        Prompt,
+        Request,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        true,
+        false,
+        Some("HIPFIRE_NORMALIZE_PROMPT"),
+        "Collapse runs of three or more newlines before tokenization."
+    ),
+    field!(
+        "memory.mmq.screen",
+        "mmq_screen",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(AUTO_ON_OFF),
+        true,
+        false,
+        Some("HIPFIRE_MMQ_SCREEN"),
+        "Per-weight MMQ correctness screening policy."
+    ),
+    field!(
+        "memory.mmq.screen_threshold",
+        "mmq_screen_threshold",
+        Memory,
+        ModelLoad,
+        DefaultValue::Float(0.1),
+        ValueRule::Float {
+            min: 0.0,
+            max: 1.0,
+            min_inclusive: false
+        },
+        true,
+        false,
+        Some("HIPFIRE_MMQ_SCREEN_THRESHOLD"),
+        "MMQ screening absolute-error threshold."
+    ),
+    field!(
+        "speculation.prefill.mode",
+        "prefill_compression",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(&["off", "auto", "always"]),
+        true,
+        true,
+        None,
+        "PFlash speculative-prefill policy."
+    ),
+    field!(
+        "speculation.prefill.threshold",
+        "prefill_threshold",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(32768),
+        ValueRule::Integer {
+            min: 0,
+            max: 524288
+        },
+        true,
+        true,
+        None,
+        "PFlash auto-mode token threshold."
+    ),
+    field!(
+        "speculation.prefill.keep_ratio",
+        "prefill_keep_ratio",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Float(0.05),
+        ValueRule::Float {
+            min: 0.0,
+            max: 1.0,
+            min_inclusive: false
+        },
+        true,
+        true,
+        None,
+        "PFlash retained-token ratio."
+    ),
+    field!(
+        "speculation.prefill.alpha",
+        "prefill_alpha",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Float(0.85),
+        ValueRule::Float {
+            min: 0.0,
+            max: 1.0,
+            min_inclusive: true
+        },
+        true,
+        true,
+        None,
+        "PFlash block-selection strictness."
+    ),
+    field!(
+        "speculation.prefill.min_keep",
+        "prefill_min_keep",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(2048),
+        ValueRule::Integer {
+            min: 0,
+            max: 524288
+        },
+        true,
+        true,
+        None,
+        "PFlash retained-token floor."
+    ),
+    field!(
+        "speculation.prefill.sink",
+        "prefill_sink",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(256),
+        ValueRule::Integer { min: 0, max: 65536 },
+        true,
+        true,
+        None,
+        "Always-retained prompt prefix."
+    ),
+    field!(
+        "speculation.prefill.recent",
+        "prefill_recent",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(1024),
+        ValueRule::Integer { min: 0, max: 65536 },
+        true,
+        true,
+        None,
+        "Always-retained prompt tail."
+    ),
+    field!(
+        "speculation.prefill.block",
+        "prefill_block",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(128),
+        ValueRule::Integer { min: 1, max: 4096 },
+        true,
+        true,
+        None,
+        "PFlash scoring block size."
+    ),
+    field!(
+        "speculation.prefill.drafter",
+        "prefill_drafter",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::String,
+        true,
+        true,
+        None,
+        "PFlash drafter path."
+    ),
+    field!(
+        "speculation.prefill.drafter_device",
+        "prefill_drafter_device",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(-1),
+        ValueRule::Integer { min: -1, max: 15 },
+        true,
+        true,
+        None,
+        "PFlash drafter device; -1 uses the target device."
+    ),
+    field!(
+        "speculation.prefill.profile",
+        "prefill_profile",
+        Speculation,
+        Diagnostic,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        false,
+        true,
+        None,
+        "Emit PFlash stage timings."
+    ),
+    field!(
+        "speculation.prefill.sparse_threshold",
+        "prefill_sparse_threshold",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(32768),
+        ValueRule::Integer {
+            min: 0,
+            max: 524288
+        },
+        true,
+        true,
+        None,
+        "Sparse-attention threshold."
+    ),
+    field!(
+        "speculation.mtp",
+        "mtp_mode",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(AUTO_ON_OFF),
+        true,
+        false,
+        Some("HIPFIRE_MTP_MODE"),
+        "MTP eligibility policy."
+    ),
+    field!(
+        "speculation.mtp_k",
+        "mtp_k",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(3),
+        ValueRule::Integer { min: 1, max: 10 },
+        true,
+        false,
+        Some("HIPFIRE_MTP_K"),
+        "MTP draft window."
+    ),
+    field!(
+        "speculation.mode",
+        "speculation",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(SPECULATION_MODES),
+        true,
+        false,
+        Some("HIPFIRE_SPECULATION"),
+        "Canonical speculative-decoding selector."
+    ),
+    field!(
+        "speculation.dspark_confidence",
+        "dspark_conf_threshold",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableFloat { min: 0.0, max: 1.0 },
+        true,
+        true,
+        None,
+        "DSpark confidence truncation threshold."
+    ),
+    field!(
+        "speculation.ngram",
+        "ngram_mode",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(AUTO_ON_OFF),
+        true,
+        false,
+        None,
+        "Model-free n-gram speculation policy."
+    ),
+    field!(
+        "speculation.ngram_k",
+        "ngram_k",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(12),
+        ValueRule::Integer { min: 2, max: 32 },
+        true,
+        false,
+        None,
+        "N-gram draft window."
+    ),
+    field!(
+        "speculation.ngram_min_count",
+        "ngram_min_count",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(2),
+        ValueRule::Integer { min: 1, max: 10 },
+        true,
+        false,
+        None,
+        "Minimum n-gram match count."
+    ),
+    field!(
+        "speculation.ddtree_budget",
+        "ddtree_budget",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 64 },
+        true,
+        true,
+        Some("HIPFIRE_DDTREE_BUDGET"),
+        "DFlash verify-tree node budget; zero selects chain mode."
+    ),
+    field!(
+        "speculation.ddtree_topk",
+        "ddtree_topk",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(4),
+        ValueRule::Integer { min: 1, max: 8 },
+        true,
+        true,
+        Some("HIPFIRE_DDTREE_TOPK"),
+        "DFlash verify-tree fanout."
+    ),
+    field!(
+        "prompt.chat_template",
+        "chat_template",
+        Prompt,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::PathOrEmpty,
+        true,
+        false,
+        Some("HIPFIRE_CHAT_TEMPLATE_FILE"),
+        "Optional Jinja chat-template path."
+    ),
+    field!(
+        "prompt.default_chatml",
+        "default_chatml",
+        Prompt,
+        ModelLoad,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        true,
+        false,
+        Some("HIPFIRE_DEFAULT_CHATML"),
+        "Allow the fallback ChatML frame when no template resolves."
+    ),
+    field!(
+        "replay.backend",
+        "replay_backend",
+        Replay,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "hip", "redline"]),
+        true,
+        false,
+        None,
+        "Preferred launch backend, subject to immutable admission policy."
+    ),
+    field!(
+        "fusions.policy",
+        "fusion_policy",
+        Fusions,
+        ModelLoad,
+        DefaultValue::String("safe"),
+        ValueRule::Enum(&["safe", "off"]),
+        true,
+        false,
+        None,
+        "Certified fusion policy; individual kernel selection remains compiled."
+    ),
+];
+
+pub fn fields() -> &'static [ConfigField] {
+    FIELDS
+}
+
+pub fn field(key: &str) -> Option<&'static ConfigField> {
+    FIELDS
+        .iter()
+        .find(|candidate| candidate.key == key || candidate.legacy_key == key)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConfigLayer {
+    pub values: BTreeMap<String, ConfigValue>,
+}
+
+impl ConfigLayer {
+    pub fn set(&mut self, key: &str, value: ConfigValue) -> Result<()> {
+        let field = field(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
+        field.validate(&value)?;
+        self.values.insert(field.key.to_owned(), value);
+        Ok(())
+    }
+
+    pub fn set_cli(&mut self, key: &str, raw: &str) -> Result<()> {
+        let field = field(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
+        self.set(field.key, field.parse_cli(raw)?)
+    }
+
+    pub fn get(&self, key: &str) -> Option<&ConfigValue> {
+        let field = field(key)?;
+        self.values.get(field.key)
+    }
+
+    pub fn remove(&mut self, key: &str) -> Result<Option<ConfigValue>> {
+        let field = field(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
+        Ok(self.values.remove(field.key))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (key, value) in &self.values {
+            let field = field(key).ok_or_else(|| ConfigError::UnknownKey(key.clone()))?;
+            field.validate(value)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ConfigSource {
+    BuiltIn,
+    RegistryModel {
+        tag: String,
+        revision: String,
+    },
+    RegistryTarget {
+        tag: String,
+        arch: String,
+        revision: String,
+    },
+    GlobalUser {
+        path: PathBuf,
+    },
+    ModelUser {
+        model: String,
+        path: PathBuf,
+    },
+    LegacyEnv {
+        name: String,
+    },
+    OneShot {
+        argument: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConfigCandidate {
+    pub value: ConfigValue,
+    pub source: ConfigSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResolvedValue {
+    pub value: ConfigValue,
+    pub source: ConfigSource,
+    pub shadowed: Vec<ConfigCandidate>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ResolvedConfig {
+    pub values: BTreeMap<String, ResolvedValue>,
+}
+
+impl ResolvedConfig {
+    pub fn get(&self, key: &str) -> Option<&ResolvedValue> {
+        let field = field(key)?;
+        self.values.get(field.key)
+    }
+
+    pub fn legacy_values(&self) -> BTreeMap<String, ConfigValue> {
+        FIELDS
+            .iter()
+            .filter_map(|field| {
+                self.values
+                    .get(field.key)
+                    .map(|resolved| (field.legacy_key.to_owned(), resolved.value.clone()))
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NamedLayer {
+    pub source: ConfigSource,
+    pub layer: ConfigLayer,
+}
+
+/// Resolve layers supplied from lowest to highest priority.
+pub fn resolve(layers: impl IntoIterator<Item = NamedLayer>) -> Result<ResolvedConfig> {
+    let mut out = ResolvedConfig::default();
+    for field in FIELDS {
+        out.values.insert(
+            field.key.to_owned(),
+            ResolvedValue {
+                value: field.default.to_value(),
+                source: ConfigSource::BuiltIn,
+                shadowed: Vec::new(),
+            },
+        );
+    }
+
+    for named in layers {
+        named.layer.validate()?;
+        for (key, value) in named.layer.values {
+            let current = out
+                .values
+                .get_mut(&key)
+                .ok_or_else(|| ConfigError::UnknownKey(key.clone()))?;
+            current.shadowed.push(ConfigCandidate {
+                value: current.value.clone(),
+                source: current.source.clone(),
+            });
+            current.value = value;
+            current.source = named.source.clone();
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigFormat {
+    Toml,
+    LegacyJson,
+    Empty,
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedConfig {
+    pub layer: ConfigLayer,
+    pub path: PathBuf,
+    pub format: ConfigFormat,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogFormat {
+    Toml,
+    LegacyJson,
+    Empty,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LocalModelConfig {
+    pub path: Option<PathBuf>,
+    pub registry_tag: Option<String>,
+    pub overrides: ConfigLayer,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelCatalog {
+    /// Human-friendly name to canonical local model identity.
+    pub aliases: BTreeMap<String, String>,
+    /// Canonical local identity to path, registry identity, and sparse overrides.
+    pub models: BTreeMap<String, LocalModelConfig>,
+}
+
+impl ModelCatalog {
+    pub fn model_id(&self, name: &str) -> Option<&str> {
+        if let Some((id, _)) = self.models.get_key_value(name) {
+            return Some(id);
+        }
+        if let Some(id) = self.aliases.get(name) {
+            return Some(id);
+        }
+        self.models.iter().find_map(|(id, model)| {
+            let path_match = model.path.as_ref().is_some_and(|path| {
+                path == Path::new(name)
+                    || path.file_name().and_then(|file| file.to_str()) == Some(name)
+            });
+            (model.registry_tag.as_deref() == Some(name) || path_match).then_some(id.as_str())
+        })
+    }
+
+    pub fn model(&self, name: &str) -> Option<(&str, &LocalModelConfig)> {
+        let id = self.model_id(name)?;
+        Some((id, self.models.get(id)?))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut paths = BTreeSet::new();
+        for (id, model) in &self.models {
+            if id.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    key: "models".into(),
+                    message: "model identity cannot be empty".into(),
+                });
+            }
+            if let Some(path) = &model.path {
+                if path.as_os_str().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        key: format!("models.{id}.path"),
+                        message: "path cannot be empty".into(),
+                    });
+                }
+                if !paths.insert(path.clone()) {
+                    return Err(ConfigError::InvalidValue {
+                        key: format!("models.{id}.path"),
+                        message: format!("duplicate catalog path {}", path.display()),
+                    });
+                }
+            }
+            validate_model_layer(&model.overrides)?;
+        }
+        for (alias, target) in &self.aliases {
+            if alias.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    key: "aliases".into(),
+                    message: "alias cannot be empty".into(),
+                });
+            }
+            if alias == target {
+                return Err(ConfigError::InvalidValue {
+                    key: format!("aliases.{alias}"),
+                    message: "alias cannot point to itself".into(),
+                });
+            }
+            if !self.models.contains_key(target) {
+                return Err(ConfigError::InvalidValue {
+                    key: format!("aliases.{alias}"),
+                    message: format!("unknown local model identity {target}"),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedCatalog {
+    pub catalog: ModelCatalog,
+    pub path: PathBuf,
+    pub format: CatalogFormat,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigPaths {
+    pub root: PathBuf,
+    pub models: PathBuf,
+    pub config_toml: PathBuf,
+    pub config_json: PathBuf,
+    pub models_toml: PathBuf,
+    pub models_json: PathBuf,
+    pub legacy_per_model_json: PathBuf,
+}
+
+impl ConfigPaths {
+    pub fn discover() -> Self {
+        let root = env::var_os("HIPFIRE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
+            .unwrap_or_else(|| PathBuf::from(".hipfire"));
+        let mut paths = Self::under(root);
+        if let Some(models) = env::var_os("HIPFIRE_MODELS_DIR") {
+            paths.models = PathBuf::from(models);
+        }
+        paths
+    }
+
+    pub fn under(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        Self {
+            models: root.join("models"),
+            config_toml: root.join("config.toml"),
+            config_json: root.join("config.json"),
+            models_toml: root.join("models.toml"),
+            models_json: root.join("models.json"),
+            legacy_per_model_json: root.join("per_model_config.json"),
+            root,
+        }
+    }
+}
+
+pub fn load_global(paths: &ConfigPaths) -> Result<LoadedConfig> {
+    if paths.config_toml.exists() {
+        let layer = load_toml_layer(&paths.config_toml)?;
+        return Ok(LoadedConfig {
+            layer,
+            path: paths.config_toml.clone(),
+            format: ConfigFormat::Toml,
+            warnings: Vec::new(),
+        });
+    }
+    if paths.config_json.exists() {
+        let (layer, warnings) = load_legacy_json_layer(&paths.config_json)?;
+        return Ok(LoadedConfig {
+            layer,
+            path: paths.config_json.clone(),
+            format: ConfigFormat::LegacyJson,
+            warnings,
+        });
+    }
+    Ok(LoadedConfig {
+        layer: ConfigLayer::default(),
+        path: paths.config_toml.clone(),
+        format: ConfigFormat::Empty,
+        warnings: Vec::new(),
+    })
+}
+
+/// Load the local model catalog. TOML is authoritative once present. Legacy
+/// JSON inputs are merged in memory so the first native write can preserve
+/// aliases and per-model overrides without deleting the rollback files.
+pub fn load_catalog(paths: &ConfigPaths) -> Result<LoadedCatalog> {
+    if paths.models_toml.exists() {
+        return Ok(LoadedCatalog {
+            catalog: load_catalog_toml(&paths.models_toml)?,
+            path: paths.models_toml.clone(),
+            format: CatalogFormat::Toml,
+            warnings: Vec::new(),
+        });
+    }
+
+    if paths.models_json.exists() || paths.legacy_per_model_json.exists() {
+        let (catalog, warnings) = load_legacy_catalog(paths)?;
+        return Ok(LoadedCatalog {
+            catalog,
+            path: paths.models_json.clone(),
+            format: CatalogFormat::LegacyJson,
+            warnings,
+        });
+    }
+
+    Ok(LoadedCatalog {
+        catalog: ModelCatalog::default(),
+        path: paths.models_toml.clone(),
+        format: CatalogFormat::Empty,
+        warnings: Vec::new(),
+    })
+}
+
+pub fn load_catalog_toml(path: &Path) -> Result<ModelCatalog> {
+    let raw = read_string(path)?;
+    let mut root = toml::from_str::<toml::Table>(&raw).map_err(|source| ConfigError::Parse {
+        path: path.to_owned(),
+        message: source.to_string(),
+    })?;
+    let version = root
+        .remove("schema_version")
+        .and_then(|value| value.as_integer())
+        .unwrap_or(CONFIG_SCHEMA_VERSION);
+    if version != CONFIG_SCHEMA_VERSION {
+        return Err(ConfigError::Parse {
+            path: path.to_owned(),
+            message: format!("unsupported schema_version {version}"),
+        });
+    }
+
+    let aliases_value = root
+        .remove("aliases")
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+    let aliases_table = aliases_value.as_table().ok_or_else(|| ConfigError::Parse {
+        path: path.to_owned(),
+        message: "aliases must be a table".into(),
+    })?;
+    let mut aliases = BTreeMap::new();
+    for (alias, target) in aliases_table {
+        let target = target.as_str().ok_or_else(|| ConfigError::Parse {
+            path: path.to_owned(),
+            message: format!("aliases.{alias} must be a string"),
+        })?;
+        aliases.insert(alias.clone(), target.to_owned());
+    }
+
+    let models_value = root
+        .remove("models")
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+    let models_table = models_value.as_table().ok_or_else(|| ConfigError::Parse {
+        path: path.to_owned(),
+        message: "models must be a table".into(),
+    })?;
+    let mut models = BTreeMap::new();
+    for (id, value) in models_table {
+        let record = value.as_table().ok_or_else(|| ConfigError::Parse {
+            path: path.to_owned(),
+            message: format!("models.{id} must be a table"),
+        })?;
+        let unknown = record
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "path" | "registry_tag" | "overrides"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(ConfigError::Parse {
+                path: path.to_owned(),
+                message: format!("unknown fields in models.{id}: {}", unknown.join(", ")),
+            });
+        }
+        let path_value = record
+            .get("path")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| ConfigError::Parse {
+                        path: path.to_owned(),
+                        message: format!("models.{id}.path must be a string"),
+                    })
+            })
+            .transpose()?;
+        let registry_tag = record
+            .get("registry_tag")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| ConfigError::Parse {
+                        path: path.to_owned(),
+                        message: format!("models.{id}.registry_tag must be a string"),
+                    })
+            })
+            .transpose()?;
+        let mut overrides = ConfigLayer::default();
+        if let Some(value) = record.get("overrides") {
+            let table = value.as_table().ok_or_else(|| ConfigError::Parse {
+                path: path.to_owned(),
+                message: format!("models.{id}.overrides must be a table"),
+            })?;
+            let mut flat = BTreeMap::new();
+            flatten_toml("", table, &mut flat, path)?;
+            for (key, value) in flat {
+                overrides.set(&key, value)?;
+            }
+        }
+        validate_model_layer(&overrides)?;
+        models.insert(
+            id.clone(),
+            LocalModelConfig {
+                path: path_value,
+                registry_tag,
+                overrides,
+            },
+        );
+    }
+    if !root.is_empty() {
+        return Err(ConfigError::Parse {
+            path: path.to_owned(),
+            message: format!(
+                "unknown top-level fields: {}",
+                root.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        });
+    }
+
+    let catalog = ModelCatalog { aliases, models };
+    catalog.validate()?;
+    Ok(catalog)
+}
+
+pub fn write_catalog_toml(paths: &ConfigPaths, catalog: &ModelCatalog) -> Result<()> {
+    catalog.validate()?;
+    let mut root = toml::Table::new();
+    root.insert(
+        "schema_version".into(),
+        toml::Value::Integer(CONFIG_SCHEMA_VERSION),
+    );
+    if !catalog.aliases.is_empty() {
+        root.insert(
+            "aliases".into(),
+            toml::Value::Table(
+                catalog
+                    .aliases
+                    .iter()
+                    .map(|(alias, target)| (alias.clone(), toml::Value::String(target.clone())))
+                    .collect(),
+            ),
+        );
+    }
+    let mut models = toml::Table::new();
+    for (id, model) in &catalog.models {
+        let mut record = toml::Table::new();
+        if let Some(path) = &model.path {
+            record.insert(
+                "path".into(),
+                toml::Value::String(path.display().to_string()),
+            );
+        }
+        if let Some(tag) = &model.registry_tag {
+            record.insert("registry_tag".into(), toml::Value::String(tag.clone()));
+        }
+        if !model.overrides.values.is_empty() {
+            let mut overrides = toml::Table::new();
+            for (key, value) in &model.overrides.values {
+                let Some(value) = value.clone().into_toml() else {
+                    continue;
+                };
+                insert_toml_path(&mut overrides, key, value)?;
+            }
+            record.insert("overrides".into(), toml::Value::Table(overrides));
+        }
+        models.insert(id.clone(), toml::Value::Table(record));
+    }
+    if !models.is_empty() {
+        root.insert("models".into(), toml::Value::Table(models));
+    }
+    let rendered =
+        toml::to_string_pretty(&toml::Value::Table(root)).map_err(|source| ConfigError::Parse {
+            path: paths.models_toml.clone(),
+            message: source.to_string(),
+        })?;
+    atomic_write(&paths.models_toml, rendered.as_bytes())
+}
+
+fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
+    layer.validate()?;
+    for key in layer.values.keys() {
+        let schema = field(key).expect("validated configuration field");
+        if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
+            return Err(ConfigError::InvalidValue {
+                key: key.clone(),
+                message: "field is not valid in a per-model override".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn load_legacy_catalog(paths: &ConfigPaths) -> Result<(ModelCatalog, Vec<String>)> {
+    let mut catalog = ModelCatalog::default();
+    let mut warnings = Vec::new();
+    let raw = if paths.models_json.exists() {
+        Some(read_json_object(&paths.models_json)?)
+    } else {
+        None
+    };
+
+    if let Some(raw) = raw.as_ref() {
+        if raw
+            .get("schema_version")
+            .and_then(serde_json::Value::as_i64)
+            == Some(2)
+        {
+            if let Some(models) = raw.get("models").and_then(serde_json::Value::as_object) {
+                for (id, value) in models {
+                    let Some(record) = value.as_object() else {
+                        warnings.push(format!("ignored invalid legacy model {id}"));
+                        continue;
+                    };
+                    let path_value = record
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(PathBuf::from);
+                    let registry_tag = record
+                        .get("registry_tag")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let overrides = legacy_override_layer(
+                        record.get("config"),
+                        &format!("models.{id}.config"),
+                        &mut warnings,
+                    );
+                    catalog.models.insert(
+                        id.clone(),
+                        LocalModelConfig {
+                            path: path_value,
+                            registry_tag,
+                            overrides,
+                        },
+                    );
+                    if let Some(aliases) =
+                        record.get("aliases").and_then(serde_json::Value::as_array)
+                    {
+                        for alias in aliases.iter().filter_map(serde_json::Value::as_str) {
+                            catalog.aliases.insert(alias.to_owned(), id.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(configs) = raw.get("configs").and_then(serde_json::Value::as_object) {
+                for (key, value) in configs {
+                    merge_legacy_override(&mut catalog, key, value, &mut warnings);
+                }
+            }
+            migrate_legacy_aliases(raw.get("aliases"), paths, &mut catalog, &mut warnings);
+        } else {
+            migrate_legacy_aliases(
+                Some(&serde_json::Value::Object(raw.clone())),
+                paths,
+                &mut catalog,
+                &mut warnings,
+            );
+        }
+    }
+
+    if paths.legacy_per_model_json.exists() {
+        let legacy = read_json_object(&paths.legacy_per_model_json)?;
+        for (key, value) in &legacy {
+            merge_legacy_override(&mut catalog, key, value, &mut warnings);
+        }
+    }
+
+    // Legacy catalogs can contain duplicate derived paths or dangling alias
+    // records. Preserve every usable override and report the rest instead of
+    // turning migration into a startup failure.
+    for (alias, target) in catalog.aliases.clone() {
+        if !catalog.models.contains_key(&target) {
+            catalog.aliases.remove(&alias);
+            warnings.push(format!("ignored dangling legacy alias {alias} -> {target}"));
+        }
+    }
+    Ok((catalog, warnings))
+}
+
+fn read_json_object(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let raw = read_string(path)?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .map_err(|source| ConfigError::Parse {
+            path: path.to_owned(),
+            message: source.to_string(),
+        })?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ConfigError::Parse {
+            path: path.to_owned(),
+            message: "root must be a JSON object".into(),
+        })
+}
+
+fn legacy_override_layer(
+    value: Option<&serde_json::Value>,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> ConfigLayer {
+    let mut layer = ConfigLayer::default();
+    let Some(object) = value.and_then(serde_json::Value::as_object) else {
+        return layer;
+    };
+    for (key, value) in object {
+        let Some(schema) = field(key) else {
+            warnings.push(format!("ignored unknown legacy field {context}.{key}"));
+            continue;
+        };
+        let Some(value) = from_json_value(value) else {
+            warnings.push(format!("ignored unsupported legacy value {context}.{key}"));
+            continue;
+        };
+        if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
+            warnings.push(format!("ignored global-only legacy field {context}.{key}"));
+            continue;
+        }
+        if let Err(error) = layer.set(schema.key, value) {
+            warnings.push(format!(
+                "ignored invalid legacy field {context}.{key}: {error}"
+            ));
+        }
+    }
+    layer
+}
+
+fn merge_legacy_override(
+    catalog: &mut ModelCatalog,
+    key: &str,
+    value: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) {
+    let layer = legacy_override_layer(Some(value), key, warnings);
+    if layer.values.is_empty() {
+        return;
+    }
+    let model_id = catalog
+        .model_id(key)
+        .map(str::to_owned)
+        .unwrap_or_else(|| key.to_owned());
+    let model = catalog
+        .models
+        .entry(model_id)
+        .or_insert_with(|| LocalModelConfig {
+            registry_tag: Some(key.to_owned()),
+            ..LocalModelConfig::default()
+        });
+    model.overrides.values.extend(layer.values);
+}
+
+fn migrate_legacy_aliases(
+    value: Option<&serde_json::Value>,
+    paths: &ConfigPaths,
+    catalog: &mut ModelCatalog,
+    warnings: &mut Vec<String>,
+) {
+    let Some(aliases) = value.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    for (alias, value) in aliases {
+        let Some(record) = value.as_object() else {
+            warnings.push(format!("ignored invalid legacy alias {alias}"));
+            continue;
+        };
+        let local_path = record
+            .get("local_path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from);
+        let file = record.get("file").and_then(serde_json::Value::as_str);
+        let path = local_path.or_else(|| file.map(|file| paths.models.join(file)));
+        let existing = catalog.models.iter().find_map(|(id, model)| {
+            let same_path = path
+                .as_ref()
+                .is_some_and(|path| model.path.as_ref() == Some(path));
+            let same_file = file.is_some_and(|file| {
+                model
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|v| v.to_str())
+                    == Some(file)
+            });
+            (same_path || same_file).then_some(id.clone())
+        });
+        let id = existing.unwrap_or_else(|| format!("local:{alias}"));
+        catalog
+            .models
+            .entry(id.clone())
+            .or_insert_with(|| LocalModelConfig {
+                path,
+                ..LocalModelConfig::default()
+            });
+        catalog.aliases.insert(alias.clone(), id);
+    }
+}
+
+pub fn load_env_layer() -> Result<ConfigLayer> {
+    let mut layer = ConfigLayer::default();
+    for field in FIELDS {
+        let Some(name) = field.env_compat else {
+            continue;
+        };
+        let Ok(raw) = env::var(name) else {
+            continue;
+        };
+        let value = match (field.legacy_key, raw.as_str()) {
+            ("default_chatml", "0") => ConfigValue::Bool(false),
+            ("dflash_ngram_block", "1") => ConfigValue::Bool(true),
+            ("prompt_normalize", "0" | "false" | "off" | "no") => ConfigValue::Bool(false),
+            ("prompt_normalize", _) => ConfigValue::Bool(true),
+            _ => field.parse_cli(&raw)?,
+        };
+        layer.set(field.key, value)?;
+    }
+    Ok(layer)
+}
+
+pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
+    let raw = read_string(path)?;
+    let table = toml::from_str::<toml::Table>(&raw).map_err(|source| ConfigError::Parse {
+        path: path.to_owned(),
+        message: source.to_string(),
+    })?;
+    if let Some(version) = table.get("schema_version") {
+        if version.as_integer() != Some(CONFIG_SCHEMA_VERSION) {
+            return Err(ConfigError::Parse {
+                path: path.to_owned(),
+                message: format!("unsupported schema_version {version}"),
+            });
+        }
+    }
+    let mut flat = BTreeMap::new();
+    flatten_toml("", &table, &mut flat, path)?;
+    let mut layer = ConfigLayer::default();
+    for (key, value) in flat {
+        layer.set(&key, value)?;
+    }
+    Ok(layer)
+}
+
+fn flatten_toml(
+    prefix: &str,
+    table: &toml::map::Map<String, toml::Value>,
+    out: &mut BTreeMap<String, ConfigValue>,
+    path: &Path,
+) -> Result<()> {
+    for (key, value) in table {
+        if prefix.is_empty() && key == "schema_version" {
+            continue;
+        }
+        let dotted = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if let Some(nested) = value.as_table() {
+            flatten_toml(&dotted, nested, out, path)?;
+        } else if let Some(value) = ConfigValue::from_toml(value) {
+            out.insert(dotted, value);
+        } else {
+            return Err(ConfigError::Parse {
+                path: path.to_owned(),
+                message: format!("unsupported value at {dotted}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn load_legacy_json_layer(path: &Path) -> Result<(ConfigLayer, Vec<String>)> {
+    let raw = read_string(path)?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|source| ConfigError::Parse {
+            path: path.to_owned(),
+            message: source.to_string(),
+        })?;
+    let object = parsed.as_object().ok_or_else(|| ConfigError::Parse {
+        path: path.to_owned(),
+        message: "root must be a JSON object".to_owned(),
+    })?;
+    let mut layer = ConfigLayer::default();
+    let mut warnings = Vec::new();
+    for (key, value) in object {
+        let Some(field) = field(key) else {
+            warnings.push(format!("ignored unknown legacy key {key}"));
+            continue;
+        };
+        let Some(value) = from_json_value(value) else {
+            warnings.push(format!("ignored unsupported legacy value for {key}"));
+            continue;
+        };
+        if let Err(error) = layer.set(field.key, value) {
+            warnings.push(format!("ignored invalid legacy {key}: {error}"));
+        }
+    }
+    Ok((layer, warnings))
+}
+
+fn from_json_value(value: &serde_json::Value) -> Option<ConfigValue> {
+    match value {
+        serde_json::Value::Null => Some(ConfigValue::Null),
+        serde_json::Value::Bool(v) => Some(ConfigValue::Bool(*v)),
+        serde_json::Value::Number(v) => v
+            .as_i64()
+            .map(ConfigValue::Integer)
+            .or_else(|| v.as_f64().map(ConfigValue::Float)),
+        serde_json::Value::String(v) => Some(ConfigValue::String(v.clone())),
+        _ => None,
+    }
+}
+
+pub fn write_global_toml(paths: &ConfigPaths, layer: &ConfigLayer) -> Result<()> {
+    layer.validate()?;
+    let mut root = toml::map::Map::new();
+    root.insert(
+        "schema_version".to_owned(),
+        toml::Value::Integer(CONFIG_SCHEMA_VERSION),
+    );
+    for (key, value) in &layer.values {
+        let Some(value) = value.clone().into_toml() else {
+            continue;
+        };
+        insert_toml_path(&mut root, key, value)?;
+    }
+    let rendered =
+        toml::to_string_pretty(&toml::Value::Table(root)).map_err(|source| ConfigError::Parse {
+            path: paths.config_toml.clone(),
+            message: source.to_string(),
+        })?;
+    atomic_write(&paths.config_toml, rendered.as_bytes())
+}
+
+fn insert_toml_path(
+    table: &mut toml::map::Map<String, toml::Value>,
+    dotted: &str,
+    value: toml::Value,
+) -> Result<()> {
+    let mut parts = dotted.splitn(2, '.');
+    let head = parts.next().expect("non-empty config key");
+    let Some(tail) = parts.next() else {
+        table.insert(head.to_owned(), value);
+        return Ok(());
+    };
+    let entry = table
+        .entry(head.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let nested = entry
+        .as_table_mut()
+        .ok_or_else(|| ConfigError::InvalidValue {
+            key: dotted.to_owned(),
+            message: format!("{head} is already a scalar"),
+        })?;
+    insert_toml_path(nested, tail, value)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.to_owned(),
+            source,
+        })?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp, bytes).map_err(|source| ConfigError::Write {
+        path: tmp.clone(),
+        source,
+    })?;
+    fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn read_string(path: &Path) -> Result<String> {
+    fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn schema_has_unique_keys_and_legacy_keys() {
+        let mut canonical = std::collections::BTreeSet::new();
+        let mut legacy = std::collections::BTreeSet::new();
+        for field in FIELDS {
+            assert!(canonical.insert(field.key), "duplicate {}", field.key);
+            assert!(
+                legacy.insert(field.legacy_key),
+                "duplicate {}",
+                field.legacy_key
+            );
+            field
+                .validate(&field.default.to_value())
+                .unwrap_or_else(|error| panic!("invalid default {}: {error}", field.key));
+        }
+    }
+
+    #[test]
+    fn legacy_json_maps_to_canonical_keys() {
+        let root = temp_root("legacy");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+        fs::write(
+            &paths.config_json,
+            r#"{"kv_cache":"q8","max_tokens":8192,"prompt_normalize":false,"unknown":1}"#,
+        )
+        .unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert_eq!(loaded.format, ConfigFormat::LegacyJson);
+        assert_eq!(
+            loaded.layer.get("memory.kv_cache"),
+            Some(&ConfigValue::String("q8".into()))
+        );
+        assert_eq!(
+            loaded.layer.get("generation.max_tokens"),
+            Some(&ConfigValue::Integer(8192))
+        );
+        assert_eq!(loaded.warnings.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sparse_toml_roundtrip() {
+        let root = temp_root("roundtrip");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kv_cache", "q8").unwrap();
+        layer.set_cli("generation.max_tokens", "8192").unwrap();
+        layer.set_cli("prompt_normalize", "false").unwrap();
+        write_global_toml(&paths, &layer).unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert_eq!(loaded.format, ConfigFormat::Toml);
+        assert_eq!(loaded.layer, layer);
+        let rendered = fs::read_to_string(&paths.config_toml).unwrap();
+        assert!(rendered.contains("[generation]"));
+        assert!(rendered.contains("[memory]"));
+        assert!(!rendered.contains("temperature"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_catalog_migrates_aliases_and_model_overrides_to_toml() {
+        let root = temp_root("catalog-migration");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+        fs::write(
+            &paths.models_json,
+            r#"{
+              "schema_version": 2,
+              "aliases": {
+                "my-qwen": {"file":"qwen.mq4r","local_path":"/models/qwen.mq4r"}
+              },
+              "configs": {"qwen:tag":{"thinking_budget":"xhigh"}},
+              "models": {
+                "qwen.mq4r": {
+                  "path":"/models/qwen.mq4r",
+                  "registry_tag":"qwen:tag",
+                  "aliases":["q-local"],
+                  "config":{"kv_cache":"q8"}
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &paths.legacy_per_model_json,
+            r#"{"my-qwen":{"max_tokens":8192}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_catalog(&paths).unwrap();
+        assert_eq!(loaded.format, CatalogFormat::LegacyJson);
+        let (id, model) = loaded.catalog.model("my-qwen").unwrap();
+        assert_eq!(id, "qwen.mq4r");
+        assert_eq!(
+            model.overrides.get("memory.kv_cache"),
+            Some(&ConfigValue::String("q8".into()))
+        );
+        assert_eq!(
+            model.overrides.get("reasoning.budget"),
+            Some(&ConfigValue::String("xhigh".into()))
+        );
+        assert_eq!(
+            model.overrides.get("generation.max_tokens"),
+            Some(&ConfigValue::Integer(8192))
+        );
+
+        write_catalog_toml(&paths, &loaded.catalog).unwrap();
+        let roundtrip = load_catalog(&paths).unwrap();
+        assert_eq!(roundtrip.format, CatalogFormat::Toml);
+        assert_eq!(roundtrip.catalog, loaded.catalog);
+        assert!(paths.models_json.exists());
+        assert!(paths.legacy_per_model_json.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolution_keeps_provenance_and_shadowed_values() {
+        let mut registry = ConfigLayer::default();
+        registry.set_cli("temperature", "1.0").unwrap();
+        let mut global = ConfigLayer::default();
+        global.set_cli("generation.temperature", "0.7").unwrap();
+        let resolved = resolve([
+            NamedLayer {
+                source: ConfigSource::RegistryModel {
+                    tag: "model".into(),
+                    revision: "v1".into(),
+                },
+                layer: registry,
+            },
+            NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: PathBuf::from("config.toml"),
+                },
+                layer: global,
+            },
+        ])
+        .unwrap();
+        let temperature = resolved.get("temperature").unwrap();
+        assert_eq!(temperature.value, ConfigValue::Float(0.7));
+        assert!(matches!(
+            temperature.source,
+            ConfigSource::GlobalUser { .. }
+        ));
+        assert_eq!(temperature.shadowed.len(), 2);
+    }
+
+    #[test]
+    fn invalid_values_fail_closed() {
+        let mut layer = ConfigLayer::default();
+        assert!(layer.set_cli("top_p", "0").is_err());
+        assert!(layer.set_cli("port", "70000").is_err());
+        assert!(layer.set_cli("kv_cache", "magic4").is_err());
+        assert!(layer.set_cli("dflash_ngram_block", "auto").is_ok());
+        assert!(layer.set_cli("dflash_ngram_block", "false").is_ok());
+    }
+}

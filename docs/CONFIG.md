@@ -3,20 +3,27 @@
 **Owner:** daemon / user config keys (`docs/INDEX.md`).
 **Machine sources:**
 
-- CLI schema + defaults: `cli/index.ts` → `HipfireConfig`, `CONFIG_DEFAULTS`, `validateConfigValue`
+- Native schema + resolution: `crates/hipfire-config/src/lib.rs`
 - Runtime env snapshot (daemon): `crates/hipfire-runtime/src/config.rs` → `RuntimeConfig`
 
-**Last checked:** 2026-07-19.
+**Last checked:** 2026-07-20.
 
 Persistent stores under `~/.hipfire/`:
 
-1. **Global** — `config.json` (full key set; missing keys inherit `CONFIG_DEFAULTS`).
-2. **Per-model overlay (primary)** — `models.json` **schema v2** catalog: aliases, discovery, and sparse per-tag overrides. This is the active store written by `hipfire config <tag> …` and `quantize --register`.
-3. **Legacy seed only** — `per_model_config.json` is a compatibility input. On catalog refresh the CLI **merges/folds** it into `models.json`; it is not the primary active overlay once folded.
+1. **Global** — sparse typed `config.toml`; missing keys inherit schema defaults.
+2. **Per-model overlay (primary)** — `models.toml`: aliases, local paths,
+   registry identities, and sparse per-model overrides.
+3. **Migration inputs** — `config.json`, `models.json`, and
+   `per_model_config.json`. Migration writes TOML and preserves the JSON files
+   for rollback.
 
 Edit interactively: `hipfire config` or `hipfire config <tag>`. Non-interactive: `hipfire config set <key> <value>` / `hipfire config <tag> set <key> <value>`.
 
-**Precedence (operator view):** per-model overlay (catalog v2) **>** registry card (`recommended_settings` on the resolved tag) **>** global config **>** built-in defaults. Process env and CLI one-shot flags that set env usually sit above files, but this is **not** universal: on the CLI apply path, `applyConfigEnv` **overwrites or deletes** inherited `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT`, `HIPFIRE_NORMALIZE_PROMPT`, `HIPFIRE_DFLASH_NGRAM_BLOCK`, `HIPFIRE_MTP_MODE`, and `HIPFIRE_MTP_K` from the resolved config view. Direct daemon invocation without the CLI reads env only (no config files, no registry card).
+**Precedence (operator view):** one-shot CLI values **>** compatible process env
+**>** per-model override **>** global TOML **>** registry card
+(`recommended_settings`) **>** built-in defaults. `hipfire config explain`
+prints the winning source and shadowed candidates. Direct daemon invocation
+still reads only its JSON request and process env.
 
 This page is the normative **key/default/enum** table. Procedures for CASK profiles, PFlash bypass reasons, and multi-GPU topology live in linked owners — not duplicated matrices here.
 
@@ -36,7 +43,7 @@ This page is the normative **key/default/enum** table. Procedures for CASK profi
 | `max_think_tokens` | *(absent)* | int 0–32768 when set | Optional raw override. If unset, preset drives. `0` = unlimited. |
 | `max_total_think_tokens` | `0` | int 0–1000000 | Cross-reopen total `<think>` budget; `0` = off. |
 
-**Thinking budget map** (`THINKING_BUDGET` in `cli/index.ts`):
+**Thinking budget map** (`hipfire-config` schema, lowered by `hipfire-cli`):
 
 | Preset | Tokens |
 |---|---:|
@@ -47,7 +54,7 @@ This page is the normative **key/default/enum** table. Procedures for CASK profi
 | `max` | 32768 |
 | `uncapped` | 0 (unlimited) |
 
-**Effective sampling send order** (`resolveSamplingForSend` / `run`): explicit CLI flags **>** per-model overlay **>** registry `recommended_settings` **>** daemon/HFQ/arch fallback. Global `temperature` / `top_p` / `repeat_penalty` (and other sampling fields changed only in global `config.json`) are **not** transmitted on the current run/serve path when a send view is present. Registry entry `sampling` blocks (e.g. on `deepseek-v4-flash`, `north-mini-code`) are **metadata only today** — the resolver reads `recommended_settings` only; see [`MODELS.md`](MODELS.md).
+**Effective sampling send order** (`request_f64` / `run`): explicit CLI flags **>** per-model overlay **>** registry `recommended_settings` **>** daemon/HFQ/arch fallback. Global `temperature` / `top_p` / `repeat_penalty` changed only in global `config.toml` are deliberately not transmitted on the current run/serve path; if a global value shadows a registry recommendation, the registry value is recovered for the request. Registry entry `sampling` blocks are metadata only today — the resolver reads `recommended_settings`; see [`MODELS.md`](MODELS.md).
 
 ---
 
@@ -58,7 +65,8 @@ This page is the normative **key/default/enum** table. Procedures for CASK profi
 | `kv_cache` | `"auto"` | `auto`, `q8`, `asym4`, `asym3`, `asym2`, `fwht4`, `fwht3`, `fwht2`, `turbo`, `turbo4`, `turbo3`, `turbo2` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
 
-**Resolution of `auto`:** registry entry `default_kv_mode` if present and valid; else universal fallback **`q8`** (`DEFAULT_KV_MODE` in `cli/index.ts`). There is **no** live per-arch `archDefaults` fwht table in current CLI source (removed; tests assert absence).
+**Resolution of `auto`:** registry entry `default_kv_mode` if present and valid;
+else universal fallback **`q8`**. There is no per-arch implicit FWHT table.
 
 `turbo*` values remain accepted aliases for validation/compat; resolution maps them in `resolveKvMode`.
 
@@ -135,8 +143,6 @@ MMQ itself is activated via env (`HIPFIRE_MMQ` / `HIPFIRE_WO_MMQ`); screening on
 | `cask_fold_m` | `2` | int 1–16 |
 | `cask_auto_attach` | `true` | bool |
 
-**Profiles** (`hipfire config cask-profile <name>`): `auto`, `off`, `balanced`, `conservative`, `aggressive-vram` rewrite bundles of the knobs above. Safety hard rules (A3B eviction refusal, m-fold+DFlash attractor) are enforced in CLI/engine — see source and historical notes; do not treat profile names as admissions.
-
 Ops escape: `HIPFIRE_CASK_OFF=1`, `HIPFIRE_FORCE_A3B_EVICTION=1` (env doc).
 
 Sidecar generation: `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
@@ -209,7 +215,9 @@ hipfire config qwen3.5:9b set dflash_mode off
 hipfire config qwen3.5:9b          # TUI on overlay
 ```
 
-Only explicitly set keys are stored; others inherit global. Primary path: `~/.hipfire/models.json` (schema v2). Legacy `~/.hipfire/per_model_config.json` is folded into the catalog on refresh and is not the long-term write target.
+Only explicitly set keys are stored; others inherit global. Primary path:
+`~/.hipfire/models.toml`. Legacy `models.json` and `per_model_config.json` are
+migration inputs and are not native write targets.
 
 ---
 

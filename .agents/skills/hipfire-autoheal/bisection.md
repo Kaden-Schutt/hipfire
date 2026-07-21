@@ -1,7 +1,7 @@
 # Bisection (after the playbook catalog)
 
 Use when playbook fixes 1–10 do not localize the failure. Goal: isolate
-**layer** (GPU/kernel vs daemon stdio vs Bun HTTP) and **feature flag**
+**layer** (GPU/kernel vs daemon stdio vs native HTTP service) and **feature flag**
 (KV mode, flash, hipGraph) with reversible one-shot env overrides.
 
 Guardrails:
@@ -43,7 +43,7 @@ resident serve holds the GPU lock if the experiment needs a fresh daemon).
 
 | Result | Meaning | Next |
 |---|---|---|
-| Bench/local OK, HTTP/serve hangs | Bun serve / HTTP / pid lifecycle | Playbook 1; section G |
+| Bench/local OK, HTTP/serve hangs | Native serve / HTTP / pid lifecycle | Playbook 1; section G |
 | Bench/local also fails | Load, kernel, or GPU stack | Playbook 2–4, 8, 10; sections C–E |
 | Nothing runs | Install/ROCm | `hipfire diag` + hipfire-diag skill |
 
@@ -129,14 +129,14 @@ cat /tmp/daemon.strace
 |---|---|
 | `ioctl` | HIP/GPU work (slow vs stuck — correlate with log) |
 | `futex` | Lock contention |
-| `read`/`write` on pipes | Stdio backpressure with Bun parent |
+| `read`/`write` on pipes | Stdio backpressure with native service parent |
 | near-zero syscalls + high CPU | Userspace spin (see BC-250 historical notes) |
 
 ---
 
-## G. Daemon stdio vs Bun HTTP
+## G. Daemon stdio vs native HTTP
 
-Minimal Python driver (no Bun, no HTTP). Adjust daemon path to the install
+Minimal Python driver (no HTTP). Adjust daemon path to the install
 (`~/.hipfire/bin/daemon` or a local `target/release/examples/daemon`).
 Drain generation through a terminal `done`/`error` event inside a
 timeout-protected `try`/`finally` before terminate/wait.
@@ -213,7 +213,7 @@ finally:
 | Result | Meaning |
 |---|---|
 | Stdio OK, `hipfire serve` / HTTP fails | CLI serve layer, pid/port, or HTTP state |
-| Stdio fails | Daemon/GPU/kernels — stay out of Bun |
+| Stdio fails | Daemon/GPU/kernels — stay below the HTTP layer |
 
 Also useful: `HIPFIRE_LOCAL=1 hipfire run …` forces one-shot local spawn and
 skips attaching to a background serve ([`docs/SERVE.md`](../../../docs/SERVE.md)).
@@ -229,7 +229,7 @@ hipfire misbehaves
 │  └─ match playbook 1–10 first
 │
 ├─ direct bench / HIPFIRE_LOCAL / stdio daemon works?
-│  ├─ YES → serve/HTTP/Bun lifecycle (playbook 1; section G)
+│  ├─ YES → native serve/HTTP lifecycle (playbook 1; section G)
 │  └─ NO  → GPU/JIT/KV (playbook 2–4, 8, 10; sections C–E)
 │
 ├─ first request only?

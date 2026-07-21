@@ -1617,7 +1617,7 @@ mod tests {
         // Every ChatML special token observed in qwen3.6 attractor
         // cases must be rejected at the `<tool_call>` boundary. These
         // are the tokens that leaked into the body in the Pi log + the
-        // CLI's parseOneToolCall sanitizer (cli/index.ts:2273-2278).
+        // Native control plane's parseOneToolCall-compatible sanitizer.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>");
         for tok in &[

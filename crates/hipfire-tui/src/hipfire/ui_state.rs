@@ -57,7 +57,8 @@ mod tests {
 
     #[test]
     fn missing_file_is_default() {
-        let dir = std::env::temp_dir().join(format!("hipfire-uistate-missing-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-uistate-missing-{}", std::process::id()));
         let p = dir.join("nope.json");
         let s = UiState::load(&p);
         assert_eq!(s.active_tab, "");
@@ -76,7 +77,10 @@ mod tests {
         s.save(&p).expect("save");
         let back = UiState::load(&p);
         assert_eq!(back.active_tab, "Models");
-        assert_eq!(back.expanded_groups, vec!["qwen".to_string(), "lfm".to_string()]);
+        assert_eq!(
+            back.expanded_groups,
+            vec!["qwen".to_string(), "lfm".to_string()]
+        );
         // No temp file left behind.
         assert!(!p.with_file_name("ui_state.json.tmp").exists());
         let _ = fs::remove_dir_all(&dir);
@@ -84,7 +88,8 @@ mod tests {
 
     #[test]
     fn corrupt_file_is_default_not_error() {
-        let dir = std::env::temp_dir().join(format!("hipfire-uistate-corrupt-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-uistate-corrupt-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let p = dir.join("ui_state.json");
         fs::write(&p, b"{not valid json").unwrap();

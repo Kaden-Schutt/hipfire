@@ -6,7 +6,7 @@
 
 # Regression test for `hipfire update` dirty-working-tree bug.
 #
-# Before the fix, cli/index.ts ran `git pull origin master` which aborts with
+# Before the fix, the legacy updater ran `git pull origin master` which aborts with
 #   "Your local changes to the following files would be overwritten by merge"
 # whenever a tracked file (notably Cargo.lock, which cargo build can rewrite
 # across cargo versions) is modified in the working tree.
@@ -95,7 +95,7 @@ grep -q "local changes to the following files would be overwritten" "$TMPDIR/pul
     || fail "baseline reproduction didn't hit the reported error; saw: $(cat "$TMPDIR/pull.err")"
 
 # ── 5. Exercise the FIXED update sequence ───────────────────────────────
-# This mirrors the post-fix logic in cli/index.ts. If cli/index.ts diverges
+# This mirrors the native updater. If the Rust updater diverges
 # from this sequence, this test will need to be updated in lockstep.
 # Return codes:
 #   0  = updated
@@ -194,32 +194,32 @@ grep -q 'local-only change' "$LOCAL_AHEAD/local_only.txt" \
     || fail "ahead-commits guard clobbered the local commit"
 
 # ── 8. Divergence guard ────────────────────────────────────────────────
-# The update_flow() above mirrors the logic in cli/index.ts. If someone
-# reverts cli/index.ts back to a plain `git pull`, this test still passes
+# The update_flow() above mirrors the native Rust logic. If someone
+# reverts the implementation back to a plain `git pull`, this test still passes
 # (because update_flow is independent). Catch that by asserting the key
-# pieces of the fix are still present in cli/index.ts itself.
+# pieces of the fix are still present in the native CLI itself.
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
 if [ -z "$REPO_ROOT" ]; then
     # Running from an extracted tarball or CI without a checkout; skip.
     echo "  (divergence guard skipped: not in a git checkout)"
 else
-    CLI="$REPO_ROOT/cli/index.ts"
-    [ -f "$CLI" ] || fail "cli/index.ts not found at $CLI"
+    CLI="$REPO_ROOT/crates/hipfire-cli/src/main.rs"
+    [ -f "$CLI" ] || fail "native CLI source not found at $CLI"
 
     # Required: the fix must be present. Each marker is checked
     # independently so multi-line formatting doesn't break us.
-    grep -q '"stash", "push", "--include-untracked"' "$CLI" \
-        || fail "cli/index.ts is missing the 'git stash push --include-untracked' call"
+    grep -q '"stash"' "$CLI" && grep -q '"--include-untracked"' "$CLI" \
+        || fail "native updater is missing the 'git stash push --include-untracked' call"
     grep -q 'hipfire-update-' "$CLI" \
-        || fail "cli/index.ts is missing the 'hipfire-update-' stash marker"
+        || fail "native updater is missing the 'hipfire-update-' stash marker"
     grep -q '"reset", "--hard", "origin/master"' "$CLI" \
-        || fail "cli/index.ts is missing the 'git reset --hard origin/master' step"
+        || fail "native updater is missing the 'git reset --hard origin/master' step"
     grep -q 'rev-list.*--count.*origin/master\.\.HEAD' "$CLI" \
-        || fail "cli/index.ts is missing the unpushed-commits guard"
+        || fail "native updater is missing the unpushed-commits guard"
 
     # Forbidden: the old buggy call must not be back.
     if grep -E '"pull", *"origin", *"master"' "$CLI" >/dev/null; then
-        fail "cli/index.ts still contains the buggy 'git pull origin master' call"
+        fail "native updater still contains the buggy 'git pull origin master' call"
     fi
 fi
 

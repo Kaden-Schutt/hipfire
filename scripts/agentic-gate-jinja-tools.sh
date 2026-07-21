@@ -9,7 +9,7 @@
 #
 # Why this gate exists:
 #   `scripts/agentic-gate.sh` sends tool definitions as TEXT inside the
-#   system prompt (the same shape cli/index.ts pre-renders today). The
+#   system prompt (the same shape the native control plane pre-renders). The
 #   model's Jinja template `{% if tools %}` block is therefore unreachable
 #   from the daemon — there is no way to A/B the upstream tools-block
 #   against the hand-rolled system-prompt-text path.
@@ -27,7 +27,7 @@
 #     That is Phase 3 once `messages` history and tool-response role are
 #     wired through the Plain ChatML fallback path too.
 #   - Comparing tools-block-rendered text vs hand-rolled system-prompt-
-#     text output quality. Phase 2 work after `cli/index.ts` switches to
+#     text output quality. Phase 2 work after the native control plane switches to
 #     structured tools.
 #
 # Exit codes:

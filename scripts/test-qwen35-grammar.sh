@@ -23,7 +23,7 @@
 #   - Daemon launched with model loadable for tool-call requests.
 #   - Default model qwen3.6-35b-a3b.mq4 covers the non-dflash path.
 #   - qwen3.6-27b.mq4 + its dflash sidecar covers the dflash path
-#     (requires dflash_mode=on in ~/.hipfire/config.json).
+#     (requires `hipfire config set dflash_mode on`).
 #   - Grammar is on by default; disable with HIPFIRE_QWEN35_GRAMMAR=0
 #     in the daemon env at launch time for A/B.
 #
@@ -78,10 +78,10 @@ run_check "qwen3.6-35b-a3b.mq4" "T1 non-dflash path"
 # T2: dflash path. Requires dflash_mode=on globally and the 27b dflash
 # sidecar (qwen36-27b-dflash-mq4.hfq) in ~/.hipfire/models/. The CLI's
 # `draft` auto-discovery wires it up at model load.
-DFLASH_MODE=$(jq -r '.dflash_mode // "off"' ~/.hipfire/config.json 2>/dev/null)
+DFLASH_MODE=$(hipfire config get dflash_mode 2>/dev/null || echo off)
 if [ "$DFLASH_MODE" = "on" ]; then
     run_check "qwen3.6-27b.mq4" "T2 dflash path"
 else
     echo "=== T2 dflash path - skipped (dflash_mode=$DFLASH_MODE in config) ==="
-    echo "  hint: jq '. + {dflash_mode: \"on\"}' ~/.hipfire/config.json > /tmp/c && mv /tmp/c ~/.hipfire/config.json"
+    echo "  hint: hipfire config set dflash_mode on"
 fi

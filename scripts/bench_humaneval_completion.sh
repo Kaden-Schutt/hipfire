@@ -71,7 +71,7 @@ HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -2
 # serve.log had a stale "warm-up complete" line from the previous session
 # (the file is opened O_APPEND), and the `pgrep -af "examples/daemon"`
 # fallback that fired falsely because the CLI no longer spawns a process
-# named "examples/daemon" (it's `bun ... serve <port>` now).
+# named "examples/daemon" (the native `hipfire serve` owns it now).
 want=$(basename "$HFQ_PATH")
 warmup_start=$(date +%s)
 ready=0

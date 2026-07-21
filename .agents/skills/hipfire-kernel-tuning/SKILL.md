@@ -105,7 +105,7 @@ Use only when the claim class needs them — full roles in `VALIDATION.md`:
   graph-parity examples when the change can break state — **blocked** if no
   oracle exists for that surface.
 - Serve semantics only: `scripts/serve_harness.py` / LFM
-  `scripts/lfm_serve_harness.py` — never numerical parity substitutes.
+  `scripts/serve_harness.py` — never numerical parity substitutes.
 
 `.agents/skills/hipfire-kernel-tuning/` is the sole executable root for this
 skill.

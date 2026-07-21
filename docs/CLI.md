@@ -1,6 +1,7 @@
 # CLI reference
 
-Audience: operators driving the `hipfire` Bun wrapper (`cli/index.ts`).
+Audience: operators driving the native Rust `hipfire` binary
+(`crates/hipfire-cli`).
 Run `hipfire <cmd> --help` (or `hipfire help <cmd>`) for the live flag text. This page indexes subcommands and file locations; it does **not** duplicate the full model registry or every config key.
 
 Bare interactive `hipfire` launches the terminal UI when `hipfire-tui` is installed; otherwise it prints the command list. Config keys: [CONFIG.md](CONFIG.md). Env vars: [env-vars.md](env-vars.md). Models: [MODELS.md](MODELS.md).
@@ -14,13 +15,18 @@ Bare interactive `hipfire` launches the terminal UI when `hipfire-tui` is instal
 | `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`.triattn*.bin`, `*.mtp`). Confirms unless `-y`. |
 | `hipfire ps [-j\|--json]` | Running daemon / quantize / upload processes and whether the configured serve port is busy (process scan is Linux-oriented). |
 
-Tags resolve through the dynamic registry + aliases. Authoritative live list: `hipfire list -r`. Bundled registry is `cli/registry.json`; at startup the CLI may refresh from GitHub `registry/v1.json` into `~/.hipfire/registry.cache.json` (24h). Offline / failed validation falls back to cache then bundled. Pin bundled with `HIPFIRE_NO_REGISTRY_FETCH=1`.
+Tags resolve through the dynamic registry + aliases. Authoritative live list:
+`hipfire list -r`. The native binary embeds `registry/v1.json`; the curated
+editing surface is `registry/models.json`. At startup it may refresh the v1
+payload into `~/.hipfire/registry.cache.json` (24h). Offline or invalid remote
+payloads fall back to cache then the embedded registry. Pin the bundle with
+`HIPFIRE_NO_REGISTRY_FETCH=1`.
 
 ## Inference
 
 | Command | Purpose |
 |---|---|
-| `hipfire run <model> [flags] [prompt...]` | One-shot generate. Model = registry tag, alias, or path. Uses a healthy `serve` over HTTP when present; otherwise spawns a one-shot daemon. Forces local spawn (skips HTTP) when `HIPFIRE_LOCAL=1` or any of `--kv-mode`, `--json`, `--no-stream` is set. Recognized missing registry tags auto-pull. |
+| `hipfire run <model> [flags] [prompt...]` | One-shot generate. Model = registry tag, alias, or path. Uses a healthy `serve` over HTTP when present; otherwise spawns a one-shot daemon. Forces local spawn when `HIPFIRE_LOCAL=1` or a load-time override such as `--kv-mode`/`--image` cannot safely reuse the resident model. Recognized missing registry tags auto-pull. |
 | `hipfire chat <model> [--no-color]` | Interactive multi-turn TUI. See [CHAT.md](CHAT.md). |
 | `hipfire serve [model] [host] [port] [flags]` | OpenAI-compatible HTTP server. See [SERVE.md](SERVE.md). |
 | `hipfire restart [serve flags...]` | `stop --force` semantics then start with the same flags. |
@@ -56,7 +62,7 @@ hipfire run qwen3.5:27b -md ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq "..."
 HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."   # skip HTTP; always local spawn
 ```
 
-Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL=1`, or any of `--kv-mode`, `-j`/`--json`, `--no-stream`.
+Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL=1`, `--kv-mode`, or `--image`. JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
 
 ### `hipfire serve` flags
 
@@ -73,11 +79,10 @@ Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL=1`, or any of `--kv-mode`, 
 
 | Command | Purpose |
 |---|---|
-| `hipfire config` | Global interactive TUI → `~/.hipfire/config.json`. |
+| `hipfire config` | Global interactive TUI → `~/.hipfire/config.toml`. |
 | `hipfire config <tag>` | Per-model overlay TUI (stored in models catalog). |
 | `hipfire config list\|get\|set\|reset ...` | Scriptable global ops (`--json` on list/get). |
 | `hipfire config <tag> list\|get\|set\|reset ...` | Same, scoped to per-model keys. |
-| `hipfire config cask-profile [name]` | Show or apply a CASK eviction profile bundle (global or under `<tag>`). |
 
 Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ranges. Notable defaults from source: `dflash_mode=off`, `speculation=auto`, `thinking=on`, `thinking_budget=med`, `max_tokens=4096`, `idle_timeout=300`.
 
@@ -96,7 +101,7 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 | `--both` | `mq4` + `mq6`. |
 | `-o` / `--output`, `--output-dir`, `--stem` | Output naming. |
 | `--install` | Copy into `~/.hipfire/models/`. |
-| `--register <tag>` | Local alias in `~/.hipfire/models.json`. |
+| `--register <tag>` | Local alias in `~/.hipfire/models.toml`. |
 | `--upload <owner/repo>`, `--create-repo` | Optional HF publish. |
 
 Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq aliases. Graded MoE recipes need the quantizer binary directly — [QUANTIZE.md](QUANTIZE.md).
@@ -118,7 +123,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 |---|---|
 | `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). |
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--redline`). |
-| `hipfire profile [model] [--kernel substr] [--json]` | Roofline / compiled-kernel report. Optional workload: `--pp CSV --tg CSV [--ctx N] [--runs N]` (needs a probe-supported arch). |
+| `hipfire profile [model] [--kernel substr] [--json]` | Compiled-kernel inventory for the detected architecture. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | GPU, HIP, kernels, models, config overrides. |
 | `hipfire update` | **Linux only:** fetch `master`, rebuild daemon/CLI/kernels. Other platforms: re-run the platform installer or build from source. |
 
@@ -128,12 +133,12 @@ Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarki
 
 | Path | Role |
 |---|---|
-| `~/.hipfire/bin/` | `hipfire` wrapper, `daemon`, optional `hipfire-tui`, tools |
+| `~/.hipfire/bin/` | native `hipfire`, `daemon`, optional `hipfire-tui`, tools |
 | `~/.hipfire/bin/kernels/compiled/<arch>/` | Precompiled / JIT kernels |
-| `~/.hipfire/cli/` | Installed Bun CLI + bundled `registry.json` |
 | `~/.hipfire/models/` | Weight files and co-located sidecars |
-| `~/.hipfire/config.json` | Global config |
-| `~/.hipfire/models.json` | Models catalog v2 (aliases, per-model overlays, discovery) |
+| `~/.hipfire/config.toml` | Sparse typed global config (`config.json` is migration input) |
+| `~/.hipfire/models.toml` | Local aliases, paths, registry identities, and per-model overrides |
+| `~/.hipfire/models.json` | Legacy catalog migration input |
 | `~/.hipfire/per_model_config.json` | Legacy overlay; folded into the catalog on refresh |
 | `~/.hipfire/registry.cache.json` | Dynamic registry cache |
 | `~/.hipfire/serve.pid` / `serve.log` | Detached serve pid record and log |
@@ -144,7 +149,7 @@ Override catalog path with `HIPFIRE_MODELS_CATALOG_PATH` if needed.
 
 ## Dynamic registry
 
-1. Bundled `cli/registry.json` (always present).
+1. Bundled `registry/v1.json` (embedded in the binary).
 2. Optional network fetch of `registry/v1.json` → 24h cache.
 3. Invalid remote payloads are rejected wholesale.
 `hipfire diag` reports which source the process used. Entry metadata may include size, `arch_id` ([architecture-ids.md](architecture-ids.md)), quant, and hashes — registry presence is not a runtime admission ([INDEX.md](INDEX.md), [admissions.yml](admissions.yml)).
@@ -155,7 +160,9 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 
 | Variable | Effect |
 |---|---|
-| `HIPFIRE_LOCAL=1` | `run` skips HTTP serve and spawns local (also forced by `--kv-mode` / `--json` / `--no-stream`). |
+| `HIPFIRE_LOCAL=1` | `run` skips HTTP serve and spawns a local daemon (also forced by load-time overrides such as `--kv-mode` or `--image`). |
+| `HIPFIRE_HOME=...` | Override the state/config root (default `~/.hipfire`). |
+| `HIPFIRE_MODELS_DIR=...` | Override model discovery, pull, list, and TUI model paths. |
 | `HIPFIRE_KV_MODE=...` | Override KV layout. |
 | `HIPFIRE_SPECULATION=...` | Top of speculation ladder. |
 | `HIPFIRE_DFLASH_DRAFT=...` | Explicit draft path. |

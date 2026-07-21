@@ -135,7 +135,7 @@ already attention-weighted. Live modes store **V as Q8** and compress **K**:
 | `asym4` / `asym3` / `asym2` | Givens + Lloyd-Max K | Q8_0 | **Legacy**; degrades DFlash acceptance vs fwht* |
 | `turbo` / `turbo2` / `turbo3` / `turbo4` | aliases | | Map to asym3 / asym2 / asym3 / asym4 |
 
-**Default resolution** (`cli/index.ts`):
+**Default resolution** (`crates/hipfire-cli/src/main.rs`):
 
 1. `HIPFIRE_KV_MODE` env
 2. Per-model config `kv_cache`
@@ -267,4 +267,4 @@ perf-checkpoints); do not promote undated multiples here.
 - Arch IDs: [architecture-ids.md](architecture-ids.md)
 - Sources: `crates/hipfire-quantize/src/main.rs` (`QuantType`, encoders),
   `crates/hipfire-runtime/src/{hfq,llama,weight_backend}.rs`,
-  `cli/index.ts` (`resolveKvMode`, `quantize`)
+  `crates/hipfire-cli/src/main.rs`, `crates/hipfire-config/src/lib.rs`

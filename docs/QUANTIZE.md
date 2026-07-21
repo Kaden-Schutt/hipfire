@@ -175,12 +175,12 @@ hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
 ```
 
 Writes `my-finetune.mq4.triattn.bin` beside the model by default. The daemon
-auto-discovers it when a CASK profile is enabled (`hipfire config cask-profile
-…`). See [CLI.md](CLI.md).
+auto-discovers it when CASK is enabled (for example,
+`hipfire config set memory.cask.enabled true`). See [CONFIG.md](CONFIG.md).
 
 ## Related
 
 - Formats and KV: [QUANTIZATION.md](QUANTIZATION.md)
 - Models / aliases: [MODELS.md](MODELS.md)
 - CLI surface: [CLI.md](CLI.md)
-- Sources: `cli/index.ts` (`case "quantize"`), `crates/hipfire-quantize`
+- Sources: `crates/hipfire-cli/src/main.rs`, `crates/hipfire-quantize`

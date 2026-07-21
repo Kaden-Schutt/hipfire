@@ -25,6 +25,10 @@ crates/
 ├── hipfire-quantize/        # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
 ├── hipfire-detect/          # observational JSONL behavior detectors
 ├── hipfire-atlas/           # Kernel Atlas schema + emit helpers
+├── hipfire-config/          # typed TOML config + migration
+├── hipfire-registry/        # strict bundled/dynamic model registry
+├── hipfire-client/          # daemon JSONL + OpenAI HTTP/SSE client
+├── hipfire-cli/             # native operator and HTTP service
 ├── hipfire-tui/             # terminal UI
 ├── hipfire-reap/            # utility crate
 ├── redline/                 # experimental direct-KMD / bare-libdrm research
@@ -32,13 +36,14 @@ crates/
 └── redline-rocr/            # public ROCr/HSA ABI + PM4 packet builders
 ```
 
-Plus the Bun/TS operator surface (`cli/`) and HIP sources (`kernels/src/`).
+HIP sources live under `kernels/src/`; there is no JavaScript/TypeScript
+operator runtime.
 
 ### Layering
 
 | Layer | Crates | Role |
 |---|---|---|
-| Operator | `cli/`, `hipfire-tui` | Tag resolve, pull, serve attach, one-shot daemon spawn |
+| Operator | `hipfire-cli`, `hipfire-config`, `hipfire-registry`, `hipfire-client`, `hipfire-tui` | Tag resolve, typed config, pull, HTTP service/client, one-shot daemon spawn |
 | Composition root | `hipfire-loader`, `hipfire-runtime/examples/daemon.rs` | Single load dispatch; HTTP/JSONL serve; generate ladders |
 | Arch forward | `hipfire-arch-*` | Config / weights / state / static-dispatch forward (LLaMA exception: canonical forward remains in runtime) |
 | Shared infra | `hipfire-runtime` | HFQ/safetensors, tokenizer, sampler, framing, KV policy, spec primitives, `Architecture` trait |
@@ -63,7 +68,7 @@ still live in `hipfire_runtime::llama`; the arch crate re-exports them.
 hipfire run <tag-or-path> "…"
         │
         ▼
-CLI (cli/index.ts)
+Native CLI (`crates/hipfire-cli`)
   resolve registry tag → model path under ~/.hipfire/models/ (or local path)
   if serve up AND not forced local → HTTP POST /v1/chat/completions
     forced local when HIPFIRE_LOCAL=1, --kv-mode, --json, or --no-stream

@@ -10,7 +10,7 @@
 # small agent task battery.
 #
 # Prereqs (from Stage A):
-#   - bun installed, hipfire daemon binary built, hermes-agent installed
+#   - native hipfire binaries built, hermes-agent installed
 #   - /root/hf_cache/models--kai-os--Carnice-9b/snapshots/... present
 #   - /root/hermes_traces_corpus.txt present
 #
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-export PATH=/root/.cargo/bin:/root/.bun/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
+export PATH=/root/.cargo/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
 export HIP_PATH=/opt/rocm
 export ROCM_PATH=/opt/rocm
 export HIPFIRE_FP16=0
@@ -83,9 +83,9 @@ tail -6 /root/cal_36a3b_hermes.log 2>&1 || true
 
 # ── 4. Smoke-test hipfire serve /v1/chat/completions ─────────────────
 log "starting hipfire serve on port 8080..."
-cd /root/hipfire/cli
+cd /root/hipfire
 PORT=8080
-nohup bun run index.ts serve $PORT > /root/hipfire_serve.log 2>&1 &
+nohup ./target/release/hipfire serve --model carnice:9b $PORT > /root/hipfire_serve.log 2>&1 &
 SERVE_PID=$!
 disown
 log "serve PID=$SERVE_PID"

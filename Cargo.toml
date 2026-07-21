@@ -26,6 +26,10 @@ members = [
     "crates/hipfire-tui",
     "crates/hipfire-reap",
     "crates/hipfire-loader",
+    "crates/hipfire-config",
+    "crates/hipfire-registry",
+    "crates/hipfire-cli",
+    "crates/hipfire-client",
 ]
 
 [workspace.package]

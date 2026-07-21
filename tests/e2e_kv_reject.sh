@@ -19,21 +19,28 @@
 set -uo pipefail
 PORT=${PORT:-11441}
 MODEL=${MODEL:-qwen3.5:0.8b}
+HIPFIRE=${HIPFIRE_CLI_BIN:-./target/release/hipfire}
+[ -x "$HIPFIRE" ] || { echo "native hipfire CLI not found" >&2; exit 2; }
 LOG=$(mktemp)
 TMPCFG=$(mktemp -d)
 
-# Isolate HOME so we don't clobber the user's real ~/.hipfire/config.json.
+# Isolate HOME so we don't clobber the user's real ~/.hipfire/config.toml.
 # Only the config file differs — models/bin are SYMLINKED, never copied.
 mkdir -p "$TMPCFG/.hipfire"
 ln -sfn "$HOME/.hipfire/models" "$TMPCFG/.hipfire/models"
 ln -sfn "$HOME/.hipfire/bin"    "$TMPCFG/.hipfire/bin"
 # Tight config: tiny max_seq + default max_tokens so a moderate prompt tips
 # over the KV budget and the daemon must reject.
-cat > "$TMPCFG/.hipfire/config.json" <<'JSON'
-{"max_seq": 1024, "max_tokens": 16, "default_model": "qwen3.5:0.8b"}
-JSON
+cat > "$TMPCFG/.hipfire/config.toml" <<'TOML'
+[memory]
+max_seq = 1024
+[generation]
+max_tokens = 16
+[serve]
+default_model = "qwen3.5:0.8b"
+TOML
 
-HOME="$TMPCFG" HIPFIRE_MODEL="$MODEL" bun cli/index.ts serve "$PORT" > "$LOG" 2>&1 &
+HOME="$TMPCFG" "$HIPFIRE" serve --model "$MODEL" "$PORT" > "$LOG" 2>&1 &
 PID=$!
 # shellcheck disable=SC2329 # invoked by trap
 cleanup() {

@@ -171,7 +171,7 @@ HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
 USER_READ="benchmarks/prompts/agentic_user_read.txt"
 
 # ---- VRAM headroom check ---------------------------------------------------
-# Models declare min_vram_gb in cli/registry.json. If the host can't meet
+# Models declare min_vram_gb in registry/models.json. If the host can't meet
 # that minimum, the model loads but silently OOMs during prefill and emits
 # zero tokens (looks like a tool-call regression — it isn't). Treat such
 # models as absent so the existing skip path covers this case too.
@@ -187,7 +187,7 @@ USER_READ="benchmarks/prompts/agentic_user_read.txt"
 #
 # Disable with HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK=1 (e.g., on hosts where
 # the registry minimums are conservative).
-REGISTRY="cli/registry.json"
+REGISTRY="registry/models.json"
 # Multi-card systems take the max VRAM across all DRM cards. iGPUs report
 # zero / a sliver, so max correctly picks the dGPU. On dual-dGPU hosts this
 # is optimistic — we don't know which card the daemon will use.

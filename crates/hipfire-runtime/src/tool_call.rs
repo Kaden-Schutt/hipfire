@@ -5,7 +5,7 @@
 //! Per-arch tool-call output parsers.
 //!
 //! Stage 3 of the Jinja transition: move tool-call parsing out of
-//! `cli/index.ts:parseToolCalls` (TypeScript, single-format JSON) into
+//! the retired control-plane parser (single-format JSON) into
 //! the Rust runtime so the daemon can parse per-arch and emit structured
 //! `tool_calls` events on the SSE stream. Once Stage 5 lands, the CLI
 //! becomes a passthrough and `cli/parse_tool_calls.test.ts` is archived.
@@ -25,7 +25,7 @@
 //!   yet.)
 //!
 //! - [`HermesJsonParser`] — bare `<tool_call>{...JSON...}</tool_call>`
-//!   shape. Port of `cli/index.ts:parseToolCalls` + `parseOneToolCall`.
+//!   shape. Native port of the legacy `parseToolCalls` + `parseOneToolCall` behavior.
 //!   Includes the MQ4 #111 stopgap repairs (stacked-opener strip,
 //!   flat-object coercion, XML-tag head fallback). This is the
 //!   default `Architecture::tool_call_parser` because most current
@@ -75,7 +75,7 @@ pub trait ToolCallParser: Send + Sync {
 // ── Hermes JSON parser ──────────────────────────────────────────────
 
 /// Hermes-style: `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`.
-/// Port of `cli/index.ts:parseToolCalls` + `parseOneToolCall` with the
+/// Native implementation of the legacy `parseToolCalls` + `parseOneToolCall` behavior with the
 /// MQ4 #111 stopgap repairs (stacked-opener strip, flat-object
 /// coercion, XML-tag fallback).
 pub struct HermesJsonParser;

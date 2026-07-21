@@ -50,7 +50,7 @@ pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCal
         };
         let body_raw = &s[body_start..body_end];
         // Sanitize ChatML special-token leakage (mirrors CLI's
-        // parseOneToolCall: cli/index.ts:2273-2278). qwen3.6:27b
+        // native parseOneToolCall-compatible sanitizer). qwen3.6:27b
         // occasionally glues `<|im_start|>` / `<|im_end|>` / etc. into
         // the JSON body when the tokenizer's special-token boundary
         // catches the JSON key opener.
@@ -93,7 +93,7 @@ pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCal
             // Form 4 (regex fallback): when JSON and native XML parsing fail,
             // recover
             // name + arguments via a relaxed key-delimiter pattern.
-            // Mirrors cli/index.ts:2287-2295.
+            // Mirrors the native tool-call compatibility parser.
             if parsed.is_none() {
                 if let Some(name) = extract_tool_call_name_fallback(body) {
                     if let Some(arguments) = extract_tool_call_arguments_fallback(body) {

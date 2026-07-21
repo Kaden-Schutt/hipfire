@@ -79,8 +79,7 @@ downloads:
 ```
 
 It runs `cargo check --workspace --examples`, no-GPU Rust unit tests,
-CPU Python tests, the env/docs drift check, and Bun tests/typecheck
-when Bun is installed. GPU coherence and speed gates remain required
+CPU Python tests, and the env/docs drift check. GPU coherence and speed gates remain required
 for kernel, dispatch, quant, forward-pass, and spec-decode changes.
 
 ### GPU kernel correctness check

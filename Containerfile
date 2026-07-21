@@ -27,7 +27,7 @@
 #     -p 11435:11435 hipfire run qwen3.5:4b "2+2="
 
 # ─────────────────────────────────────────────────────────────────────────────
-# base-rocm — ROCm SDK (hipcc + clang + HIP headers + runtime .so set) + Bun.
+# base-rocm — ROCm SDK (hipcc + clang + HIP headers + runtime .so set).
 # The non-"-complete" dev image (~1.2 GB) ships hipcc and the HIP headers, which
 # is all the JIT path needs for gfx1151. If a build ever reports hipcc/headers
 # missing, switch the tag to `7.2.4-complete` (adds rocBLAS/MIOpen, ~7.4 GB).
@@ -44,11 +44,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
     && rm -rf /var/lib/apt/lists/*
-
-# Bun 1.3.13 (pins the CI-tested CLI runtime). Installs to $BUN_INSTALL/bin.
-ENV BUN_INSTALL=/usr/local
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13" \
-    && bun --version
 
 # HIP install root (compiler.rs defaults HIP_PATH to /opt/rocm) and a writable
 # JIT cache dir (the default is CWD-relative .hipfire_kernels/ — unusable in a
@@ -73,14 +68,7 @@ COPY . .
 # arch crates; deltanet is additive (DeltaNet/DFlash arches). Matches CLAUDE.md.
 RUN cargo build --release --locked --features deltanet \
         --example daemon -p hipfire-runtime
-
-# Compile the Bun CLI to a single self-contained binary. registry.json is a
-# static `import ... with { type: "json" }`, so it is inlined here — no runtime
-# copy needed. This drops the Bun runtime from the deliverable.
-RUN mkdir -p /out \
-    && cd cli \
-    && bun install --frozen-lockfile \
-    && bun build --compile --outfile /out/hipfire index.ts
+RUN cargo build --release --locked -p hipfire-cli
 
 # ─────────────────────────────────────────────────────────────────────────────
 # runtime — TARGET A, deliverable. No Rust, no source tree, no gate scripts.
@@ -88,7 +76,7 @@ RUN mkdir -p /out \
 FROM base-rocm AS runtime
 
 COPY --from=builder /hipfire/target/release/examples/daemon /opt/hipfire/bin/daemon
-COPY --from=builder /out/hipfire /usr/local/bin/hipfire
+COPY --from=builder /hipfire/target/release/hipfire /usr/local/bin/hipfire
 
 ENV HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon \
     HIPFIRE_DIR=/root/.hipfire
@@ -109,7 +97,7 @@ FROM builder AS gate-runner
 # pytest/numpy for the Python-backed detector arms in the gate scripts.
 RUN pip install --no-cache-dir --break-system-packages pytest numpy
 
-COPY --from=builder /out/hipfire /usr/local/bin/hipfire
+COPY --from=builder /hipfire/target/release/hipfire /usr/local/bin/hipfire
 
 ENV HIPFIRE_DAEMON_BIN=/hipfire/target/release/examples/daemon \
     HIPFIRE_DIR=/root/.hipfire \

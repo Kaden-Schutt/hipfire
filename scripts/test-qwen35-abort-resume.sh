@@ -40,7 +40,7 @@ LINES0=$(wc -l < "$LOG" 2>/dev/null || echo 0)
 
 echo "=== Turn A: stream with thinking ON, close the socket mid-decode (curl -m 5) ==="
 # Thinking ON + a hard prompt guarantees Turn A is still in <think> decode at 5s
-# (35b-a3b reasons for minutes). curl -m 5 closes the socket -> bun detects the
+# (35b-a3b reasons for minutes). curl -m 5 closes the socket -> native serve detects the
 # disconnect -> sends {type:abort} -> AR decode-abort fires. `|| true`: -m exits 28.
 curl -sS -N -m 5 "$EP" -H 'content-type: application/json' \
   -d "$(jq -cn --arg m "$MODEL" --arg p "$PROMPT" '{model:$m,messages:[{role:"user",content:$p}],max_tokens:4000,temperature:0,stream:true}')" \

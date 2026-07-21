@@ -5,7 +5,7 @@ reports on AMD GPUs. Works with any agent framework.
 
 Mutable inventories (model tags, VRAM floors, default KV, format tables) live
 in canonical owners — **do not copy them here**. Resolve tags from
-[`cli/registry.json`](../../../cli/registry.json) and
+[`registry/models.json`](../../../registry/models.json) and
 [`docs/MODELS.md`](../../../docs/MODELS.md). Route every claim through
 [`docs/VALIDATION.md`](../../../docs/VALIDATION.md).
 
@@ -23,7 +23,7 @@ in canonical owners — **do not copy them here**. Resolve tags from
 6. Perf numbers need [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md):
    warm DPM/JIT, fresh process when comparing commits, binary + prompt identity.
    Matrix/profile CLI arms are **synthetic daemon probes**; production-path
-   authority is daemon `done` fields / `cli/bench_sweep.ts`.
+   authority is native `serve_harness.py` JSON / daemon `done` fields.
 7. Local serve/harness testing binds **loopback** (`127.0.0.1`). All-interface
    exposure needs explicit approval plus trusted firewall or authenticated
    reverse proxy ([`docs/SERVE.md`](../../../docs/SERVE.md) — no auth/TLS).
@@ -118,7 +118,7 @@ arch crates (e.g. LFM dump/parity examples) when present.
 
 - Oracle exists → run it and record pass/fail **before** serve semantics or perf.
 - No oracle for the surface → **BLOCKED** — do not substitute
-  `serve_harness.py`, `lfm_serve_harness.py`, `hipfire bench`, or tok/s.
+  `serve_harness.py`, `hipfire bench`, or tok/s.
 
 ### 3c. Generic serve semantics
 
@@ -165,29 +165,29 @@ python3 scripts/serve_harness.py \
 ```
 
 Useful flags: `--tag`, `--mode {battery,chain,session}`, `--kv`, `--mtp`,
-`--thinking`, `--seed`, `--prompts-file`. Spawn mode hard-codes a machine-local
-Bun path — prefer `--no-spawn` on portable setups. For `--mode session`, always
+`--thinking`, `--seed`, `--prompts-file`. Spawn mode resolves the native
+`hipfire` binary (or `HIPFIRE_CLI_BIN`). For `--mode session`, always
 pass an explicit `--session PATH` (default is a machine-local fixture path).
 
 ### 3d. LFM2.5 framing / thinking
 
 Only for registry tags under the `lfm2.5` family — resolve the exact tag and
-on-disk file from [`cli/registry.json`](../../../cli/registry.json) /
+on-disk file from [`registry/models.json`](../../../registry/models.json) /
 [`docs/MODELS.md`](../../../docs/MODELS.md) at use time (do not copy a tag list
 here).
 
 ```bash
-python3 scripts/lfm_serve_harness.py \
+python3 scripts/serve_harness.py \
   --model "$HOME/.hipfire/models/lfm2.5-1.2b-thinking.mq4" \
   --tag lfm2.5:1.2b-thinking \
-  --bun "$(command -v bun)" \
-  --expect Paris
-# optional: --nothink, --reasoning-effort, --prompt / --prompt-file
-# --daemon-bin overrides default target/release/examples/daemon
+  --sampling registry \
+  --mode battery
+# non-thinking framing: --sampling recipe:nothink
+# HIPFIRE_DAEMON_BIN overrides target/release/examples/daemon
 ```
 
-Requires a built daemon (default `target/release/examples/daemon`) and a
-portable Bun via `--bun`. Semantic smoke only — not logit/KV oracles. If the
+Requires a built native CLI and daemon (default
+`target/release/examples/daemon`). Semantic smoke only — not logit/KV oracles. If the
 claim also needs numerical/state proof, complete 3b first or stay **BLOCKED**.
 
 ### 3e. Multi-turn recall (manual HTTP)
@@ -267,13 +267,14 @@ Prefer `HIPFIRE_DPM_WARMUP_SECS=10` for stationary numbers.
 
 ### Production-path throughput
 
-Report production-path numbers from daemon `done` fields (`prefill_tok_s`,
-`decode_tok_s`, `ttft_ms`) or the production suite:
+Report production-path numbers from native `serve_harness.py` JSON / daemon
+`done` fields (`prefill_tok_s`, `decode_tok_s`, `ttft_ms`):
 
 ```bash
-# see docs/methodology/bench-suite.md for full contract
+# see docs/methodology/bench-suite.md for the identity contract
 HIPFIRE_DAEMON_BIN=./target/release/examples/daemon \
-  bun cli/bench_sweep.ts <model_path> …
+  python3 scripts/serve_harness.py --model <model_path> --tag <tag> \
+  --sampling registry --mode battery --out /tmp/serve-harness.json
 ```
 
 ### Speed floor (MQ4 baselines when policy applies)
@@ -330,11 +331,11 @@ operator guide: [`docs/QUANTIZE.md`](../../../docs/QUANTIZE.md).
   - [ ] bring-up smoke (`hipfire run`) — pass/fail
   - [ ] test_kernels **then** model/path manual route — if numeric `.hip`
   - [ ] path-specific parity oracle — if numbers/state; else BLOCKED if required and missing
-  - [ ] serve_harness / lfm_serve_harness / gates.sh — semantics only; loopback bind
+  - [ ] serve_harness / gates.sh — semantics only; loopback bind
   - [ ] redline harness / speed-gate / probe_commits — if claimed
 - Bench (if any):
   - synthetic probe: `hipfire bench` / `--matrix` / `profile` — label synthetic
-  - production-path: daemon `done` fields and/or `cli/bench_sweep.ts`
+  - production-path: native `serve_harness.py` JSON and daemon `done` fields
   - command, binary md5, prompt id, warmup, table of pp/tg
 - Evidence class per number: measured synthetic | measured production-path | not claimed as admission
 - Failures / quirks / BLOCKED (missing oracle):

@@ -72,11 +72,12 @@ separate throwaway or warmed-prefill protocol; do not treat DPM alone as
 prefill warmup for that harness. Default is off so production load
 latency is unchanged.
 
-Two phases when using the daemon suite ([`cli/bench_sweep.ts`](../../cli/bench_sweep.ts)):
+Two phases when using the native serve suite
+([`scripts/serve_harness.py`](../../scripts/serve_harness.py)):
 
 1. **Load-time DPM** — `HIPFIRE_DPM_WARMUP_SECS` pins clocks before `loaded`.
-2. **Throwaway forward** — one prefill per shape + one generate so JIT
-   completes and clocks re-ramp after JIT idle.
+2. **Throwaway forward** — run an unrecorded matching request so JIT completes
+   and clocks re-ramp after JIT idle.
 
 Measure only after both. Continuous measured passes keep DPM high.
 
@@ -85,7 +86,7 @@ Measure only after both. Continuous measured passes keep DPM high.
 | Policy | Use when | Rules |
 |---|---|---|
 | **Fresh process** | Commit A/B, promotion, regression floors, any number you will cite later | One process per sample; rebuild when code changes; do not mix with resident samples in one A/B |
-| **Resident daemon** | Multi-row sweeps on one loaded model (e.g. DFlash `--prompts-file`, one `bench_sweep.ts` JSON) | One suite JSON = one resident-process sample; state reset between rows; still record identity; do not call resident medians “fresh-process” |
+| **Resident daemon** | Multi-row sweeps on one loaded model (e.g. DFlash `--prompts-file`, one `serve_harness.py` JSON) | One suite JSON = one resident-process sample; state reset between independent rows; still record identity; do not call resident medians “fresh-process” |
 | **ABBA / interleave** | Ordering scheme **on top of** matched fresh-process samples when order/thermal bias matters | Order A→B→B→A (or declared interleave); archive **raw** samples; report min / median / max — never best-of-one. ABBA is not a substitute for the fresh-process policy |
 
 Do not promote on a single point estimate. Archive raw values and the
@@ -101,7 +102,7 @@ Supporting scripts (claim-scoped, not universal):
 | [`scripts/bench-cold.sh`](../../scripts/bench-cold.sh) | N fresh processes; min/median/max/spread for in-process `bench_qwen35_mq4` |
 | [`scripts/probe_commits.sh`](../../scripts/probe_commits.sh) | Fresh-process commit pair compare (optional arm of `gates.sh --perf`) |
 | [`scripts/speed-gate.sh`](../../scripts/speed-gate.sh) | Prefill/decode vs committed `tests/speed-baselines/<arch>.txt` when that path’s policy applies |
-| [`cli/bench_sweep.ts`](../../cli/bench_sweep.ts) | Daemon-driven pp sweep + decode (production path numbers) |
+| [`scripts/serve_harness.py`](../../scripts/serve_harness.py) | Native Rust HTTP service battery/session driver (production path timings) |
 
 Route selection for “must I run X?” stays in
 [`VALIDATION.md`](../VALIDATION.md).
@@ -111,7 +112,7 @@ Route selection for “must I run X?” stays in
 | Source | Use for | Do not use for |
 |---|---|---|
 | Daemon `done` fields (`prefill_tok_s`, `decode_tok_s`, `ttft_ms`) | Production-path throughput | — |
-| `cli/bench_sweep.ts` JSON | Daemon path ledger rows (when hashes present) | Unsigned exploratory if hashes missing |
+| `serve_harness.py` JSON | Native service-path ledger rows (when hashes present) | Unsigned exploratory if hashes missing |
 | In-process `bench_qwen35_mq4` | Kernel profile, rocprof attach, speed-gate floor, bisect lower bound | Citing as production MoE decode (misses daemon AR hipGraph) |
 | Probe-derived wall/gen tok/s | UX framing only | Kernel or format ranking |
 | `eval_hipfire` trailing tok/s | Never as forward throughput | Kernel-speed claims (lm_head scoring loop dominates wall) |

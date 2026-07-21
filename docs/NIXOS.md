@@ -5,9 +5,9 @@ packages and the NixOS module under `nix/`.
 
 | Output | Path / attribute | Role |
 |---|---|---|
-| Package | `packages.hipfire` (default) | CLI (`hipfire` → bun + `cli/`) + wrapped `hipfire-daemon` |
+| Package | `packages.hipfire` (default) | Native `hipfire` CLI + wrapped `hipfire-daemon` |
 | Kernels | `packages.hipfire-kernels` | Optional precompile via `scripts/compile-kernels.sh` |
-| Dev shell | `devShells.default` | Rust, bun, hipcc/ROCm tools when `rocmSupport` |
+| Dev shell | `devShells.default` | Rust and hipcc/ROCm tools when `rocmSupport` |
 | Module | `nixosModules.default` | `services.hipfire` systemd unit(s) |
 | Overlay | `overlays.default` | Pins `rocmPackages` from this flake’s nixpkgs + hipfire packages |
 
@@ -126,7 +126,7 @@ services.hipfire = {
   # openFirewall = true opens cfg.port with NO auth/TLS on the listener — see SERVE.md
 
   defaultModel = "qwen3.5:9b";
-  # Module writes these into config.json as stored globals. run/serve sampling
+  # Module writes these into config.toml as stored globals. run/serve sampling
   # send still omits bare globals (CLI flags / per-model / registry card only);
   # see CONFIG.md. Chat uses the global snapshot exception.
   temperature = 0.3;
@@ -138,8 +138,7 @@ services.hipfire = {
   dflashMode = "off";
   idleTimeout = 300;
 
-  # Writes legacy per_model_config.json seed only. On CLI refresh that seed is
-  # folded into ~/.hipfire/models.json (schema v2); existing catalog entries win.
+  # Writes native ~/.hipfire/models.toml per-model overrides.
   perModelSettings = {
     "qwen3.5:27b" = {
       max_seq = 16384;
@@ -149,45 +148,38 @@ services.hipfire = {
   };
 
   extraSettings = {
-    # snake_case keys merged into config.json (can override typed fields)
+    # Canonical dotted keys are preferred; legacy snake_case aliases are
+    # translated before writing config.toml.
     # Actual loopback-only listen (openFirewall=false alone is not enough):
     host = "127.0.0.1";
   };
 
   environment = {
     HIPFIRE_NORMALIZE_PROMPT = "1";
-    # True no-prewarm (empty defaultModel alone is NOT enough — CLI rejects ""
-    # and restores qwen3.5:9b). Uncomment for an actual no-prewarm service:
-    # HIPFIRE_NO_PREWARM = "1";
   };
 
-  # Exported as HIPFIRE_MODELS_DIR only — CLI does not read it today (see below).
+  # Exported as HIPFIRE_MODELS_DIR and honored by the native CLI/TUI.
   modelDir = "/var/lib/hipfire/models";
 };
 ```
 
-Typed options are written to `config.json` as snake_case
-(`default_model`, `top_p`, `idle_timeout`, …). See [CONFIG.md](CONFIG.md)
+Typed options are written to `config.toml` using the canonical dotted schema
+(`serve.default_model`, `generation.top_p`, `serve.idle_timeout_seconds`, …). See [CONFIG.md](CONFIG.md)
 for the full key set the CLI understands; module-typed keys are the subset
 in `nix/module.nix`.
 
 ### modelDir and effective paths
 
-`services.hipfire.modelDir` is written only as the env var
-`HIPFIRE_MODELS_DIR`. The current CLI (`cli/index.ts`) **does not read**
-`HIPFIRE_MODELS_DIR`; tag/list/pull/pre-warm discovery always uses
-`$HOME/.hipfire/models`:
+`services.hipfire.modelDir` is exported as `HIPFIRE_MODELS_DIR`. The native
+CLI and TUI use it for tag/list/pull/pre-warm discovery:
 
 | Mode | `HOME` | Effective CLI models path |
 |---|---|---|
-| System service (`userService = false`) | `/var/lib/hipfire` | `/var/lib/hipfire/.hipfire/models` |
-| User service | the login user’s home | `~/.hipfire/models` |
+| System service (`userService = false`) | `/var/lib/hipfire` | configured `services.hipfire.modelDir` |
+| User service | the login user’s home | configured `services.hipfire.modelDir` |
 
-Workarounds until the CLI honors the env var: place or symlink model files
-into that effective path, or pass **absolute** model paths to
-`hipfire serve` / `run` / harnesses. `modelDir` is still created by
-`hipfire-setup` and listed in system `ReadWritePaths`, but it is **not** the
-discovery root the CLI uses today.
+`hipfire-setup` creates `modelDir`, and the system service includes it in
+`ReadWritePaths`. Absolute model paths remain valid for ad-hoc runs.
 
 ### Desktop / user service
 
@@ -199,7 +191,7 @@ services.hipfire = {
   # Must be user-writable. Default /var/lib/hipfire/models is not; setup's
   # mkdir -p fails for an unprivileged user unit.
   modelDir = "/home/yourname/.hipfire/models";  # match effective CLI path
-  environment.HIPFIRE_NO_PREWARM = "1";         # optional true no-prewarm
+  defaultModel = "";                             # module starts --no-prewarm
 };
 
 users.users.yourname.extraGroups = [ "video" "render" ];
@@ -256,13 +248,12 @@ When `userService = false` (default):
 
 | Unit | Role |
 |---|---|
-| `hipfire-setup.service` | Oneshot: `config.json`, legacy `per_model_config.json` seed (folded into `models.json` v2 on CLI refresh), `bin/daemon` symlink, kernels symlink under `/var/lib/hipfire/.hipfire` |
+| `hipfire-setup.service` | Oneshot: native `config.toml` + `models.toml`, `bin/daemon` symlink, kernels symlink under `/var/lib/hipfire/.hipfire` |
 | `hipfire-precompile.service` | Oneshot: `hipfire-daemon --precompile` (failure is warned; JIT still works) |
 | `hipfire.service` | `ExecStart = hipfire serve`, restart on failure |
 
-Environment always includes `HIPFIRE_MODELS_DIR=<modelDir>` (for future/daemon
-consumers). The CLI does **not** currently honor that variable for discovery —
-see [modelDir limitation](#modeldir-and-effective-paths). With `rocmSupport`,
+Environment always includes `HIPFIRE_MODELS_DIR=<modelDir>`; the native CLI
+and TUI honor it for discovery and model lifecycle. With `rocmSupport`,
 `LD_LIBRARY_PATH` is set for nixpkgs ROCm. System mode also sets
 `HOME=/var/lib/hipfire` and `HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels`.
 
@@ -315,19 +306,19 @@ From `nix/module.nix` (defaults are module defaults, not every CLI default):
 | `gpuTargets` | list of str | `[]` (**required non-empty when enabled**) | Kernel compile arches |
 | `rocmSupport` | bool | `true` | Use nixpkgs ROCm + graphics ICD |
 | `port` | port | `11435` | Serve port |
-| `defaultModel` | str | `""` | Written to `config.json` as `default_model`. Empty is **rejected** by CLI validation and restored to `qwen3.5:9b`, so a present default tag can still pre-warm. For true no-prewarm set `environment.HIPFIRE_NO_PREWARM = "1"` (or `hipfire serve --no-prewarm`) |
-| `temperature` | float | `0.3` | Stored in config.json only; not an effective run/serve send default (see CONFIG.md sampling send) |
+| `defaultModel` | str | `""` | Empty omits `serve.default_model` and makes the module start `hipfire serve --no-prewarm`; a non-empty value is pre-warmed |
+| `temperature` | float | `0.3` | Stored in config.toml only; not an effective run/serve send default (see CONFIG.md sampling send) |
 | `topP` | float | `0.8` | Stored global; same send caveat as temperature |
-| `maxTokens` | int | `512` | Written to config.json |
+| `maxTokens` | int | `512` | Written to config.toml |
 | `maxSeq` | int | `32768` | KV capacity |
 | `repeatPenalty` | float | `1.05` | Stored global; same send caveat as temperature |
 | `kvCache` | str | `"auto"` | KV mode string |
 | `dflashMode` | enum | `"off"` | `on` / `off` / `auto` |
 | `idleTimeout` | int | `300` | Idle unload seconds (`0` = never) |
-| `extraSettings` | attrs | `{}` | Extra config.json keys (e.g. `host = "127.0.0.1"` for loopback listen) |
-| `perModelSettings` | attrs of attrs | `{}` | Writes **legacy** `per_model_config.json` seed; folded into `models.json` v2 on refresh (catalog entries take precedence) |
+| `extraSettings` | attrs | `{}` | Extra config.toml keys (e.g. `"serve.host" = "127.0.0.1"`; legacy `host` is translated) |
+| `perModelSettings` | attrs of attrs | `{}` | Writes native `models.toml` per-model overrides |
 | `environment` | attrs of str | `{}` | Extra env for the unit |
-| `modelDir` | str | `"/var/lib/hipfire/models"` | Exported as `HIPFIRE_MODELS_DIR` only; **CLI does not read it** — effective paths above |
+| `modelDir` | str | `"/var/lib/hipfire/models"` | Exported as `HIPFIRE_MODELS_DIR`; native CLI/TUI model discovery uses it |
 | `userService` | bool | `false` | systemd `--user` mode |
 | `user` / `group` | str | `"hipfire"` | System service identity |
 
@@ -361,8 +352,8 @@ You must still satisfy GPU device access and any ICD requirements yourself.
 Same layered model as the CLI:
 
 1. Engine / daemon defaults
-2. `config.json` (module typed options + `extraSettings`)
-3. Per-model overlay: primary store is `models.json` schema v2; module `perModelSettings` only seeds legacy `per_model_config.json`, which the CLI folds into the catalog (existing catalog entries win)
+2. `config.toml` (module typed options + `extraSettings`)
+3. Per-model overlay from `models.toml` (`perModelSettings`)
 4. Environment (`services.hipfire.environment` and process env)
 
 Interactive shells outside systemd only see variables you export yourself

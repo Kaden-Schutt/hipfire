@@ -8,41 +8,9 @@ use std::{
     path::PathBuf,
 };
 
-use serde::Deserialize;
+pub use hipfire_registry::ModelEntry;
 
 use super::HipfirePaths;
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct ModelEntry {
-    #[serde(default)]
-    pub repo: String,
-    #[serde(default)]
-    pub file: String,
-    #[serde(default)]
-    pub size_gb: f64,
-    #[serde(default)]
-    pub min_vram_gb: f64,
-    #[serde(default)]
-    pub desc: String,
-    #[serde(default)]
-    pub triattn: Option<SidecarEntry>,
-    #[serde(default)]
-    pub mtp: Option<SidecarEntry>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct SidecarEntry {
-    #[serde(default)]
-    pub file: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct RegistryFile {
-    #[serde(default)]
-    models: BTreeMap<String, ModelEntry>,
-    #[serde(default)]
-    aliases: BTreeMap<String, String>,
-}
 
 #[derive(Clone, Debug)]
 pub struct RegistryState {
@@ -99,25 +67,19 @@ impl RegistryState {
             .map(|m| m.file.as_str())
             .collect::<std::collections::BTreeSet<_>>();
 
-        let (loaded_path, registry) = match paths.registry_path() {
-            Some(path) => match fs::read_to_string(path) {
-                Ok(raw) => match serde_json::from_str::<RegistryFile>(&raw) {
-                    Ok(registry) => (Some(path.to_path_buf()), registry),
-                    Err(err) => {
-                        warning = Some(format!("registry parse error: {err}"));
-                        (Some(path.to_path_buf()), RegistryFile::default())
-                    }
-                },
-                Err(err) => {
-                    warning = Some(format!("registry read error: {err}"));
-                    (Some(path.to_path_buf()), RegistryFile::default())
-                }
-            },
-            None => {
-                warning = Some("registry.json not found".into());
-                (None, RegistryFile::default())
-            }
+        let registry_paths = hipfire_registry::RegistryPaths {
+            cache: paths.root.join("registry.cache.json"),
         };
+        let loaded = hipfire_registry::load(&registry_paths);
+        if !loaded.warnings.is_empty() {
+            warning = Some(loaded.warnings.join("; "));
+        }
+        let loaded_path = matches!(
+            loaded.source,
+            hipfire_registry::RegistrySource::Cache | hipfire_registry::RegistrySource::StaleCache
+        )
+        .then_some(registry_paths.cache);
+        let registry = loaded.registry;
 
         let registry_file_keys = registry
             .models

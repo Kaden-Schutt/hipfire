@@ -3,7 +3,7 @@ name: registry
 # Dynamic model registry refresh (task #47).
 #
 # Probes the HF Hub API (hipfire-models + schuttdev namespaces and every repo
-# referenced by cli/registry.json) and regenerates registry/v1.json with live
+# referenced by registry/models.json) and regenerates registry/v1.json with live
 # LFS sha256 / size_bytes. The generator is fail-closed: any missing file,
 # missing sha256, or curated-vs-HF size drift aborts without writing, so a
 # broken probe can never replace a good committed registry.

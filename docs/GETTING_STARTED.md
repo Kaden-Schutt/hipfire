@@ -50,7 +50,11 @@ sha256sum /tmp/hipfire-install.sh   # compare to a value you trust
 > the live `master` branch for both the script and the checkout it installs. Use
 > only for throwaway experiments; it is not the ref-pinned default.
 
-The installer detects GPU arch, ensures Bun + HIP, builds or copies the daemon into `~/.hipfire/bin/`, installs the Bun CLI under `~/.hipfire/cli/`, places kernels at `~/.hipfire/bin/kernels/compiled/<arch>/`, and installs a `hipfire` wrapper at `~/.hipfire/bin/hipfire` (it can offer to add `~/.hipfire/bin` to your `PATH`). Reload the shell if `hipfire` is not found.
+The installer detects GPU arch, ensures HIP and Rust build prerequisites, builds
+or copies the daemon, installs the native `hipfire` binary under
+`~/.hipfire/bin/`, and places kernels at
+`~/.hipfire/bin/kernels/compiled/<arch>/`. It can add that bin directory to
+`PATH`; reload the shell afterward if `hipfire` is not found.
 
 ### Windows — pin, download, verify, execute
 
@@ -79,7 +83,10 @@ Get-FileHash "$env:TEMP\hipfire-install.ps1" -Algorithm SHA256
 > **Unverified moving tip:** `irm …/master/scripts/install.ps1 | iex` is a
 > mutable master path for both script and installed tree — not the pinned default.
 
-Uses a GitHub release `daemon.exe` when available; otherwise builds from source under `~\.hipfire\src`. Sets up the Bun CLI and runs `daemon.exe --precompile` into `~\.hipfire\bin\kernels\compiled\<arch>\`. To force a full kernel compile after install:
+Uses a GitHub release `daemon.exe` when available; otherwise builds from source
+under `~\.hipfire\src`. The native CLI is built from the same checkout, and the
+installer runs `daemon.exe --precompile` into
+`~\.hipfire\bin\kernels\compiled\<arch>\`. To force a full kernel compile after install:
 
 ```powershell
 cd ~\.hipfire\src
@@ -94,6 +101,7 @@ Copy-Item .\kernels\compiled\<arch>\* $env:USERPROFILE\.hipfire\bin\kernels\comp
 git clone https://github.com/Kaden-Schutt/hipfire
 cd hipfire
 cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release -p hipfire-cli
 cargo build --release -p hipfire-quantize
 # optional TUI:
 cargo build --release -p hipfire-tui
@@ -150,8 +158,8 @@ HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."
 ## Light configuration
 
 ```bash
-hipfire config                 # global TUI → ~/.hipfire/config.json
-hipfire config qwen3.5:9b      # per-model overlay (catalog: ~/.hipfire/models.json)
+hipfire config                 # global TUI → ~/.hipfire/config.toml
+hipfire config qwen3.5:9b      # per-model overlay → ~/.hipfire/models.toml
 hipfire config set temperature 0.7
 hipfire config list
 ```

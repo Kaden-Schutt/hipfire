@@ -16,6 +16,7 @@
 # Dev / dist
 /dev/
 /dist/
+cli/node_modules/
 
 # Models (large binaries)
 /models/

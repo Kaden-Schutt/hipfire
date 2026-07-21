@@ -269,34 +269,6 @@ if ! $HIP_FOUND; then
     fi
 fi
 
-# ─── Install Bun (needed for CLI) ───────────────────────
-echo ""
-if command -v bun &>/dev/null; then
-    echo "Bun: found ✓"
-else
-    echo "Installing Bun (runtime for hipfire CLI)..."
-    if ! command -v unzip &>/dev/null; then
-        echo "  ERROR: 'unzip' is required by the Bun installer but is not present."
-        echo "  Install it first:  apt install unzip   # or pacman -S unzip / dnf install unzip"
-        echo "  hipfire CLI requires Bun to run."
-        exit 1
-    fi
-    curl -fsSL https://bun.sh/install | bash || {
-        echo "  Bun install failed. Visit https://bun.sh"
-        echo "  hipfire CLI requires Bun to run."
-        exit 1
-    }
-    # Source bun into current session
-    export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
-    export PATH="$BUN_INSTALL/bin:$PATH"
-    if command -v bun &>/dev/null; then
-        echo "  Bun installed ✓"
-    else
-        echo "  Bun installed but not in PATH. Restart your shell or run:"
-        echo "    export PATH=\"\$HOME/.bun/bin:\$PATH\""
-    fi
-fi
-
 # ─── Create directories ─────────────────────────────────
 mkdir -p "$BIN_DIR" "$MODELS_DIR"
 
@@ -385,7 +357,7 @@ TARGET_DIR=$(cd "$REPO_DIR" && cargo metadata --format-version 1 | grep -oE '"ta
 # NOT change this run (SOURCE_UPDATED=0). A leftover binary from a prior build
 # against now-updated source is stale and must be rebuilt. HIPFIRE_FORCE_REBUILD=1
 # (set by `hipfire update`) always forces a rebuild.
-if [ -f "$TARGET_DIR/release/examples/daemon" ] && [ "$SOURCE_UPDATED" = "0" ] && [ "${HIPFIRE_FORCE_REBUILD:-0}" = "0" ]; then
+if [ -f "$TARGET_DIR/release/examples/daemon" ] && [ -f "$TARGET_DIR/release/hipfire" ] && [ "$SOURCE_UPDATED" = "0" ] && [ "${HIPFIRE_FORCE_REBUILD:-0}" = "0" ]; then
     echo "  Pre-built binaries found ✓"
 else
     if [ -f "$TARGET_DIR/release/examples/daemon" ]; then
@@ -399,6 +371,11 @@ else
     (cd "$REPO_DIR" && \
         echo "  cargo build --release (this may take several minutes)..." && \
         cargo build --release --features deltanet --example daemon --example infer --example infer_hfq --example triattn_validate -p hipfire-runtime 2>&1 | tail -5)
+    # The native Rust CLI is part of the mandatory product surface. Without it
+    # model discovery, configuration, and daemon lifecycle are unavailable.
+    (cd "$REPO_DIR" && \
+        echo "  cargo build --release -p hipfire-cli..." && \
+        cargo build --release -p hipfire-cli 2>&1 | tail -5)
     # OPTIONAL build (terminal UI). Run OUTSIDE the fatal chain so a tui build
     # failure does NOT trip `set -e` and abort the whole install after the
     # mandatory binaries already built. Warn clearly; the post-build copy step
@@ -407,7 +384,11 @@ else
         echo "  cargo build --release -p hipfire-tui (terminal UI)..." && \
         cargo build --release -p hipfire-tui 2>&1 | tail -5) \
         || echo "  WARNING: hipfire-tui (terminal UI) build failed — continuing without it."
-    if [ ! -f "$TARGET_DIR/release/examples/daemon" ]; then
+    (cd "$REPO_DIR" && \
+        echo "  cargo build --release -p hipfire-quantize (CPU quantizer)..." && \
+        cargo build --release -p hipfire-quantize 2>&1 | tail -5) \
+        || echo "  WARNING: hipfire-quantize build failed — continuing without quantize support."
+    if [ ! -f "$TARGET_DIR/release/examples/daemon" ] || [ ! -f "$TARGET_DIR/release/hipfire" ]; then
         echo ""
         echo "  BUILD FAILED."
         echo "  Common causes:"
@@ -415,7 +396,7 @@ else
         echo "    - Missing system libs (check error above)"
         echo ""
         echo "  After fixing, re-run this installer or build manually:"
-        echo "    cd $REPO_DIR && cargo build --release --features deltanet --example daemon --example infer --example infer_hfq --example triattn_validate -p hipfire-runtime"
+        echo "    cd $REPO_DIR && cargo build --release --features deltanet --example daemon --example infer --example infer_hfq --example triattn_validate -p hipfire-runtime && cargo build --release -p hipfire-cli"
         exit 1
     fi
     echo "  Build complete ✓"
@@ -423,9 +404,14 @@ fi
 
 # Copy binaries
 cp "$TARGET_DIR/release/examples/daemon" "$BIN_DIR/daemon"
+cp "$TARGET_DIR/release/hipfire" "$BIN_DIR/hipfire"
 cp "$TARGET_DIR/release/examples/infer" "$BIN_DIR/infer" 2>/dev/null || true
 cp "$TARGET_DIR/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/null || true
 cp "$TARGET_DIR/release/examples/triattn_validate" "$BIN_DIR/triattn_validate" 2>/dev/null || true
+if [ ! -f "$TARGET_DIR/release/hipfire-quantize" ] && command -v cargo &>/dev/null; then
+    (cd "$REPO_DIR" && cargo build --release -p hipfire-quantize 2>&1 | tail -3) || true
+fi
+cp "$TARGET_DIR/release/hipfire-quantize" "$BIN_DIR/hipfire-quantize" 2>/dev/null || true
 # Terminal UI (workspace bin — lives under target/release/, not examples/).
 # Build it on demand if the pre-built tree didn't include it. The TUI is
 # OPTIONAL — a failed build (or absent cargo) must not abort the install, but
@@ -447,61 +433,11 @@ else
     echo "           or build directly: \`cargo build --release -p hipfire-tui\`."
 fi
 
-# Copy CLI
-# Recursive copy of the whole cli/ directory, then prune dev/test artifacts
-# that don't belong in a runtime install. New .ts files added to cli/ (a new
-# slash-command module, the next chat helper) are picked up automatically —
-# no install-script edit required. Replaces the previous per-file enumeration
-# that grew stale after PR #129 added chat.ts/chat_pure.ts (issue #163,
-# patched in #165 by adding two more cp lines; this is the structural fix
-# that PR #165 left as a follow-up).
-mkdir -p "$HIPFIRE_DIR/cli"
-# Sanity check: required runtime files must exist before we touch the
-# install dir. JSON-first ordering is preserved at the verification step
-# so a half-pulled checkout fails fast, not mid-copy.
-if [ ! -f "$REPO_DIR/cli/registry.json" ] || [ ! -f "$REPO_DIR/cli/index.ts" ]; then
-    echo "ERROR: cli/registry.json or cli/index.ts missing in $REPO_DIR" >&2
-    echo "       Repo checkout may be incomplete; aborting install." >&2
-    exit 1
-fi
-cp -R "$REPO_DIR/cli/." "$HIPFIRE_DIR/cli/"
-# Prune dev artifacts. The patterns are stable: tests follow `*.test.ts`
-# / `test_*.ts` / `bench_*.ts` (Bun test conventions) and `node_modules`
-# / `.gitignore` are dev-only. Adding a new test file with the same naming
-# requires no install-script change.
-rm -rf "$HIPFIRE_DIR/cli/node_modules" \
-       "$HIPFIRE_DIR/cli/.gitignore" \
-       "$HIPFIRE_DIR/cli/tsconfig.json" \
-       "$HIPFIRE_DIR/cli/README.md" \
-       "$HIPFIRE_DIR/cli/bun.lock"
-find "$HIPFIRE_DIR/cli/" -maxdepth 1 -type f \
-     \( -name '*.test.ts' -o -name 'test_*.ts' -o -name 'bench_*.ts' \) \
-     -delete 2>/dev/null || true
-
-# Create hipfire wrapper. The shim resolves `bun` even when it isn't on
-# $PATH — rustup and bun both install to under-home bindirs that shell
-# profiles load, but non-interactive SSH / cron / systemd sessions often
-# get a minimal PATH. Without this probe the first line that calls the
-# shim dies with "exec: bun: not found" before dep-autodetect inside the
-# TS CLI has a chance to run.
-cat > "$BIN_DIR/hipfire" << 'WRAPPER'
-#!/bin/bash
-set -e
-if command -v bun >/dev/null 2>&1; then
-    BUN=bun
-elif [ -x "$HOME/.bun/bin/bun" ]; then
-    BUN="$HOME/.bun/bin/bun"
-elif [ -x "/usr/local/bin/bun" ]; then
-    BUN="/usr/local/bin/bun"
-else
-    echo "hipfire: 'bun' not found in PATH, ~/.bun/bin/, or /usr/local/bin/." >&2
-    echo "         Install it: curl -fsSL https://bun.sh/install | bash" >&2
-    exit 127
-fi
-exec "$BUN" run "$HOME/.hipfire/cli/index.ts" "$@"
-WRAPPER
+# Remove the retired TypeScript runtime payload from older installations only
+# after the native binary has been copied successfully above.
+rm -rf "$HIPFIRE_DIR/cli"
 chmod +x "$BIN_DIR/hipfire"
-echo "  Binaries + CLI installed to $BIN_DIR/ ✓"
+echo "  Native binaries installed to $BIN_DIR/ ✓"
 
 # ─── Install kernels ────────────────────────────────────
 # Engine probes for kernels at {exe_dir}/kernels/compiled/{arch}/
@@ -541,15 +477,10 @@ if [ -x "$BIN_DIR/daemon" ]; then
 fi
 
 # ─── Config ──────────────────────────────────────────────
-CONFIG="$HIPFIRE_DIR/config.json"
-if [ ! -f "$CONFIG" ]; then
+CONFIG="$HIPFIRE_DIR/config.toml"
+if [ ! -f "$CONFIG" ] && [ ! -f "$HIPFIRE_DIR/config.json" ]; then
     cat > "$CONFIG" << CONF
-{
-  "temperature": 0.3,
-  "top_p": 0.8,
-  "max_tokens": 512,
-  "gpu_arch": "$GPU_ARCH"
-}
+schema_version = 1
 CONF
     echo ""
     echo "Config: $CONFIG"

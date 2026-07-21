@@ -91,7 +91,7 @@ mkdir -p .codeinsight+research/kernel-atlas/tasks
 ## Example commands
 
 Paths and model files must exist on the machine; swap tags/files from
-[`cli/registry.json`](../../../cli/registry.json).
+[`registry/models.json`](../../../registry/models.json).
 
 Collect AR smoke with ISA + dispatch (illustrative):
 

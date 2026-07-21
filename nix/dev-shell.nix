@@ -2,7 +2,6 @@
 , mkShell
 , rust-bin
 , rocmPackages
-, bun
 , pkg-config
 , rocmSupport ? true
 }:
@@ -14,7 +13,6 @@ mkShell {
     (rust-bin.stable.latest.default.override {
       extensions = [ "rust-src" "rust-analyzer" ];
     })
-    bun
     pkg-config
   ] ++ lib.optionals rocmSupport [
     rocmPackages.clr
@@ -43,7 +41,6 @@ mkShell {
   shellHook = ''
     echo "hipfire dev shell"
     echo "  rust: $(rustc --version)"
-    echo "  bun:  $(bun --version)"
     ${lib.optionalString rocmSupport ''
       echo "  hip:  $(hipcc --version 2>&1 | head -1)"
     ''}

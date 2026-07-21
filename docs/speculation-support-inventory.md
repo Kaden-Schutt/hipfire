@@ -57,7 +57,7 @@ Everything else remains plain autoregressive unless source gains a new arm.
 
 ### DFlash (qwen35 and dense generic)
 
-- **CLI default:** `dflash_mode: "off"` in `cli/index.ts`. `"auto"` turns dense
+- **CLI default:** `speculation.dflash = "off"` in `crates/hipfire-config/src/lib.rs`. `"auto"` turns dense
   Qwen3.5-style targets on and A3B/MoE targets off unless a CASK sidecar or
   explicit `on` overrides.
 - **Daemon:** `params.dflash_mode == "off"` skips draft load even if a draft
@@ -128,7 +128,7 @@ Use [`VALIDATION.md`](VALIDATION.md) as the sole claim → route selector.
 | Spec wiring / compile-only | No-GPU routes when no GPU behavior claimed | Assuming GPU parity |
 | Numerical / state parity for a verify path | Path-specific oracle for that arch/surface; **blocked** if none exists | `serve_harness.py` alone |
 | User-facing serve semantics | `scripts/serve_harness.py` with the exact model | Numerical proof |
-| LFM2.5 chat framing / thinking | `scripts/lfm_serve_harness.py` with `lfm2.5:*` | Generic serve harness |
+| LFM2.5 chat framing / thinking | `scripts/serve_harness.py` with the exact `lfm2.5:*` tag | Numerical parity |
 | Perf improvement from a drafter | [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) + stationary matched runs | Single warm run; genre-mismatched prompts |
 | Product default / admission | Row in [`admissions.yml`](admissions.yml) | Speculator present at load; harness exit 0 |
 | Redline-attributed claim | [`REDLINE.md`](REDLINE.md) ladder | Spec-decode success |
@@ -179,7 +179,7 @@ Not in-tree support. Useful when planning; does not admit a route.
 | Carriers (per-arch load + DSpark/build_speculator) | `crates/hipfire-loader/src/carriers.rs` (llama 0/1 DSpark>DFlash>n-gram; deepseek4 DSpark>MTP) |
 | qwen35 DSpark / DFlash / dual MTP load | `crates/hipfire-loader/src/lib.rs` (`dspark_speculator`; `HIPFIRE_QWEN35_MTP` + `.mq4-mtp` → `build_speculator` MTP; native `qwen35_mtp_head` from bundled trailer or sibling `.mtp`) |
 | Daemon generate routing | `crates/hipfire-runtime/examples/daemon.rs` (`generate_dflash`, `generate_spec`, `generate_qwen35_mtp` + `HIPFIRE_QWEN_MTP`/`HIPFIRE_MTP_SAMPLED`, deepseek4/qwen/llama/minimax/lfm/cohere/dots arms) |
-| CLI dflash_mode default | `cli/index.ts` (`dflash_mode: "off"`) |
+| CLI dflash_mode default | `crates/hipfire-config/src/lib.rs` (`speculation.dflash = "off"`) |
 | Per-arch SpecTarget | `crates/hipfire-arch-*/src/spec_impl.rs` |
 | deepseek4 MTP greedy requirement | `crates/hipfire-arch-deepseek4/src/mtp_speculator.rs` — `requires_greedy` |
 | Arch ids | [`architecture-ids.md`](architecture-ids.md) |

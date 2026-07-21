@@ -127,7 +127,7 @@ continuations diverged could net-lose.
 | Qwen 3.6 27B | code (HumanEval/53) | 44.2 | **185.5** | **4.19×** | 9.25 |
 
 **Config context for the snapshot (not a timeless default):** CLI default
-`dflash_mode` is `"off"` (`cli/index.ts`); DFlash is opt-in until a campaign
+`dflash_mode` is `"off"` (`crates/hipfire-config/src/lib.rs`); DFlash is opt-in until a campaign
 proves a broader win. Enable globally with `hipfire config set dflash_mode auto`
 (dense Qwen 3.5+ on, A3B off unless overridden) or per model with
 `hipfire config qwen3.5:27b set dflash_mode on`. The numbers above were measured
@@ -148,7 +148,8 @@ its `prompt_eval_duration` / `eval_duration` reporting via `/api/generate` with
 | Qwen 3.5 4B | **3,304** | 1,972 | **3,321** | 2,670 | **165** | 93 | **1.78×** |
 | Qwen 3.5 9B | **1,920** | 1,428 | 1,919 | **1,970** | **122** | 71 | **1.71×** |
 
-Harness retained for provenance: [`cli/bench_vs_ollama.ts`](../cli/bench_vs_ollama.ts).
+The retired comparison harness remains available in git history; the table is
+historical evidence, not a currently runnable route.
 
 ## Historical: other arches (decode tok/s)
 

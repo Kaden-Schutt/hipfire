@@ -4,7 +4,7 @@
 
 //! Background runner for serve lifecycle commands (start / stop / restart).
 //!
-//! Each command shells out to `bun cli/index.ts <args>` on a dedicated thread,
+//! Each command invokes native `hipfire <args>` on a dedicated thread,
 //! so the UI thread never blocks on a spawn or on the CLI's `/health` readiness
 //! poll. The single outcome arrives on an mpsc channel that the App drains each
 //! frame — the same pattern as chat streaming. The live serve up/down state is
@@ -16,7 +16,7 @@ use std::{
     thread,
 };
 
-use crate::hipfire::cli_command;
+use crate::hipfire::native_cli_command;
 
 /// Result of a serve lifecycle command, surfaced to the user as a toast.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub enum ServeOutcome {
     Failed(String),
 }
 
-/// A serve lifecycle action. `args()` maps it to the `bun cli/index.ts` argv.
+/// A serve lifecycle action. `args()` maps it to the native CLI argv.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServeAction {
     Start,
@@ -42,7 +42,7 @@ impl ServeAction {
         }
     }
 
-    /// Argv for the bun CLI. Start/restart detach (`-d`) so the daemon outlives
+    /// Argv for the native CLI. Start/restart detach (`-d`) so the daemon outlives
     /// the command; stop is synchronous.
     pub fn args(self) -> Vec<String> {
         match self {
@@ -53,7 +53,7 @@ impl ServeAction {
     }
 }
 
-/// Spawn `bun cli/index.ts <action.args()>` on a background thread. The single
+/// Spawn native `hipfire <action.args()>` on a background thread. The single
 /// outcome is sent on the returned receiver when the command exits. Dropping the
 /// receiver (e.g. on quit) silently discards the result; the spawned daemon is
 /// unaffected.
@@ -66,11 +66,11 @@ pub fn run(action: ServeAction) -> Receiver<ServeOutcome> {
 }
 
 fn run_inner(action: ServeAction) -> ServeOutcome {
-    let mut cmd = match cli_command() {
+    let mut cmd = match native_cli_command() {
         Some(c) => c,
         None => {
             return ServeOutcome::Failed(
-                "cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run from the repo root)".into(),
+                "native hipfire binary not found (set HIPFIRE_CLI_BIN or install hipfire)".into(),
             )
         }
     };

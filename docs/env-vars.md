@@ -1,10 +1,9 @@
 # Environment variables
 
 **Owner:** environment-variable inventory (`docs/INDEX.md`).
-**Machine sources:** `HIPFIRE_*` token scan of `*.rs` / `*.ts` / `*.py` / `*.sh` under the repo (excluding `target/`, `.git/`, etc.).
-**Config schema owner:** [`CONFIG.md`](CONFIG.md) (`cli/index.ts` `HipfireConfig` + `crates/hipfire-runtime/src/config.rs` `RuntimeConfig`).
-**Last checked:** 2026-07-19.
-**Inventory count:** 726 unique `HIPFIRE_*` tokens.
+**Machine sources:** `HIPFIRE_*` token scan of Rust, Python, and shell sources under the repo (excluding `target/`, `.git/`, etc.).
+**Config schema owner:** [`CONFIG.md`](CONFIG.md) (`crates/hipfire-config/src/lib.rs` + `crates/hipfire-runtime/src/config.rs`).
+**Last checked:** 2026-07-20.
 
 This page has two layers:
 
@@ -19,11 +18,16 @@ Coverage check for top-level docs: `scripts/check-docs-reliability.py` (every `H
 
 ## Manual — precedence
 
-1. **Per-model overlay (primary)** — `~/.hipfire/models.json` schema v2 (aliases + per-tag keys). Legacy `~/.hipfire/per_model_config.json` is a compatibility seed **merged/folded into the catalog** on refresh; after fold, the catalog is authoritative.
-2. **Registry card** — tag `recommended_settings` from `cli/registry.json` (via `resolveModelConfig`), above global config.
-3. **Global** `~/.hipfire/config.json`, then **built-in defaults** in `CONFIG_DEFAULTS` / `RuntimeConfig::from_env`.
-4. **Process environment** (including vars the CLI exports when spawning the daemon) usually wins over files, but this is **not** universal shell-env precedence. On the CLI apply path, `applyConfigEnv` **overwrites or deletes** inherited `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT`, `HIPFIRE_NORMALIZE_PROMPT`, `HIPFIRE_DFLASH_NGRAM_BLOCK`, `HIPFIRE_MTP_MODE`, and `HIPFIRE_MTP_K` from the resolved config view — ambient process env for those names does not reliably survive CLI apply.
-5. Invoking the daemon binary **without** the CLI skips config files and the registry card; only env applies.
+1. **Built-in typed defaults** in `hipfire-config` / `RuntimeConfig`.
+2. **Registry card** `recommended_settings` from `registry/v1.json`.
+3. **Global** `~/.hipfire/config.toml`.
+4. **Per-model overlay** from `~/.hipfire/models.toml`.
+5. **Compatibility environment layer** for schema-declared `HIPFIRE_*` names.
+6. **One-shot CLI flags** for the current command.
+
+Legacy `config.json`, `models.json`, and `per_model_config.json` are read only
+as migration inputs when their TOML successors do not exist. Invoking the
+daemon binary directly skips the control-plane config and registry layers.
 
 Ladder for speculation selector (product path): `HIPFIRE_SPECULATION` / `--spec` > per-model > global > default `auto`.
 
@@ -33,24 +37,19 @@ Effective sampling send order (run/serve): CLI flags > per-model > registry `rec
 
 ## Manual — product / operator knobs
 
-Values and defaults below match `cli/index.ts` and/or `RuntimeConfig` as of the check date. Full key tables: [`CONFIG.md`](CONFIG.md).
+Values and defaults below match `hipfire-config`, the native CLI, and/or `RuntimeConfig` as of the check date. Full key tables: [`CONFIG.md`](CONFIG.md).
 
 ### Paths and process
 
 | Variable | Role | Notes |
 |---|---|---|
-| `HIPFIRE_DIR` | Script/harness-only | **Not** read by the CLI. Assorted scripts honor it; current CLI storage is hard-coded to `~/.hipfire` (`cli/index.ts` constant). |
-| `HIPFIRE_MODELS_DIR` | Script/harness-only | **Not** read by the CLI. Scripts may point model trees here; CLI derives `MODELS_DIR` from the fixed `HIPFIRE_DIR` constant under `~/.hipfire/models`. |
-| `HIPFIRE_MODELS_CATALOG_PATH` | Alternate models catalog JSON | CLI. |
+| `HIPFIRE_HOME` | Native state/config root | Default `~/.hipfire`; used by config, registry cache, CLI, and TUI. |
+| `HIPFIRE_DIR` | Script/harness compatibility | Not read by the native CLI; prefer `HIPFIRE_HOME`. |
+| `HIPFIRE_MODELS_DIR` | Model discovery/lifecycle root | Overrides list/pull/remove/pre-warm and TUI model paths. |
 | `HIPFIRE_MODEL` | Serve/run model tag or path | Also `default_model` config. |
 | `HIPFIRE_DAEMON_BIN` | Daemon binary override | |
-| `HIPFIRE_DAEMON_NAME` | Process name matchers | Sanitized; see CLI. |
 | `HIPFIRE_TUI_BIN` | TUI binary | |
 | `HIPFIRE_LOCAL=1` | Skip attaching to running serve | One-shot local daemon. |
-| `HIPFIRE_NO_PID_FILE=1` | Do not write serve.pid | |
-| `HIPFIRE_NO_PREWARM=1` | Skip serve pre-warm | |
-| `HIPFIRE_DETACHED=1` | Detached serve child marker | |
-| `HIPFIRE_DEBUG` | CLI debug | |
 | `HIPFIRE_REGISTRY_URL` | Dynamic registry fetch URL | |
 | `HIPFIRE_NO_REGISTRY_FETCH=1` | Pin bundled registry | |
 
@@ -177,7 +176,8 @@ The canonical documentation checker requires every `HIPFIRE_*` token in `AGENTS.
 
 ## Manual — config key → env projection (CLI apply path)
 
-Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (temperature, thinking, …) are **not** env-projected.
+Partial map from the `hipfire-config` schema. Message-field-only keys
+(temperature, thinking, …) are not compatibility-env projected.
 
 | Config key | Env |
 |---|---|
@@ -213,10 +213,10 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 
 ## Generated inventory
 
-**Do not hand-edit rows below** except by re-running the scan.
-**Generation method:** regex `\bHIPFIRE_[A-Z0-9_]+\b` over `*.rs,*.ts,*.py,*.sh` (and `*.tsx,*.js` if present), excluding `target/`, `.git/`, `node_modules/`.
-**Columns:** variable; up to two preferred source paths (`cli/` / `crates/` first).
-**Count:** 726
+**Do not hand-edit rows below** except by re-running the source scan.
+**Generation method:** token scan over visible `*.rs`, `*.py`, and `*.sh`, excluding ignored/generated files.
+**Columns:** variable; up to two lexical source paths.
+**Count:** 714
 
 | Variable | Example source path(s) |
 |---|---|
@@ -232,14 +232,14 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_ALLOW_MQ4_LLOYD` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_ALLOW_UNIT_IMATRIX` | crates/hipfire-quantize/src/main.rs |
-| `HIPFIRE_AR_GRAPH` | cli/index.ts, crates/hipfire-arch-qwen35/src/qwen35.rs |
+| `HIPFIRE_AR_GRAPH` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL` | crates/rdna-compute/src/kernels.rs |
-| `HIPFIRE_ATTN_FLASH` | cli/index.ts, crates/hipfire-arch-qwen35/src/qwen35.rs |
+| `HIPFIRE_ATTN_FLASH` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_AWQ_EXPERTS` | crates/hipfire-quantize/src/main.rs |
-| `HIPFIRE_AWQ_F1_ONLY` | crates/hipfire-quantize/src/main.rs |
+| `HIPFIRE_AWQ_F1_ONLY` | crates/hipfire-quantize/src/main.rs, scripts/awq_alpha_sweep.sh |
 | `HIPFIRE_A_OUT` | scripts/ab-dispatch-validation.sh |
 | `HIPFIRE_A_REF` | scripts/ab-dispatch-validation.sh |
-| `HIPFIRE_BASELINE_ARCH` | crates/hipfire-runtime/examples/coherence_probe.rs |
+| `HIPFIRE_BASELINE_ARCH` | crates/hipfire-runtime/examples/coherence_probe.rs, scripts/kernel_atlas.py |
 | `HIPFIRE_BASELINE_FORMATS` | scripts/baseline_quant_smoke.sh |
 | `HIPFIRE_BASELINE_KV_MODE` | scripts/baseline_quant_smoke.sh |
 | `HIPFIRE_BASELINE_MAX_GEN` | scripts/baseline_quant_smoke.sh |
@@ -250,7 +250,6 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_BASELINE_PROMPT_MODE` | scripts/baseline_quant_smoke.sh |
 | `HIPFIRE_BASELINE_WIDE_MARGIN` | scripts/baseline_quant_smoke.sh |
 | `HIPFIRE_BENCH_AB` | benchmarks/scripts/bench_dflash_27b_gfx906.sh |
-| `HIPFIRE_BENCH_KV` | cli/bench_sweep.ts |
 | `HIPFIRE_BENCH_MAX` | scripts/adaptive_b_bench.sh, scripts/qwen36_bench.sh |
 | `HIPFIRE_BENCH_N` | crates/rdna-compute/examples/bench_indexed_moe_keystone.rs |
 | `HIPFIRE_BENCH_RUNS` | scripts/adaptive_b_bench.sh, scripts/bench_qwen36_ar_dflash.sh |
@@ -268,18 +267,18 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_CANARY_MODEL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_PREFILL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_RUNS` | scripts/gfx906_fallback_canary.sh |
-| `HIPFIRE_CASK_OFF` | cli/index.ts, crates/hipfire-loader/src/lib.rs |
+| `HIPFIRE_CASK_OFF` | crates/hipfire-cli/src/main.rs, crates/hipfire-loader/src/lib.rs |
+| `HIPFIRE_CASK_SIDECAR` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_CHATML` | crates/hipfire-runtime/examples/probe_argmax_agreement.rs |
 | `HIPFIRE_CHAT_CURRENT_DATE` | crates/hipfire-runtime/src/prompt_frame.rs |
-| `HIPFIRE_CHAT_TEMPLATE_FILE` | cli/index.ts, crates/hipfire-loader/src/lib.rs |
-| `HIPFIRE_CHUNK_WRITE_NUDGE` | cli/index.ts |
-| `HIPFIRE_CLI_SCRIPT` | cli/index.ts, crates/hipfire-tui/src/hipfire/doctor.rs |
+| `HIPFIRE_CHAT_TEMPLATE_FILE` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/lib.rs |
+| `HIPFIRE_CLI_BIN` | crates/hipfire-tui/src/hipfire/doctor.rs, crates/hipfire-tui/src/hipfire/mod.rs |
 | `HIPFIRE_COHERE2MOE_Q8_SCALAR` | crates/hipfire-arch-cohere2moe/src/forward.rs |
 | `HIPFIRE_COHERENCE_MAX_SEQ` | scripts/coherence-gate-cohere2moe.sh |
 | `HIPFIRE_COHERENCE_OUT` | scripts/coherence-gate-cohere2moe.sh, scripts/coherence-gate-deepseek4-mtp.sh |
 | `HIPFIRE_COHERENCE_TIMEOUT` | scripts/coherence-gate-deepseek4-mtp.sh, scripts/coherence-gate-deepseek4-recall.sh |
 | `HIPFIRE_COHERE_DEBUG` | crates/hipfire-arch-cohere2moe/src/forward.rs |
-| `HIPFIRE_COMPILER_FLAGS` | crates/rdna-compute/src/compiler.rs, crates/rdna-compute/src/kernels.rs |
+| `HIPFIRE_COMPILER_FLAGS` | autoresearch/ar/certify/cross_arch.py, crates/rdna-compute/src/compiler.rs |
 | `HIPFIRE_COMP_DUMP` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_CONTAINER` | scripts/container-gate.sh |
 | `HIPFIRE_CONV_QKNORM` | crates/hipfire-arch-qwen35/src/qwen35.rs |
@@ -289,20 +288,19 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_CQN_KERNEL` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_CQN_SCALAR_PREP` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_DAEMON` | scripts/test_pr228_spiral_check.sh |
-| `HIPFIRE_DAEMON_BIN` | cli/bench_sweep.ts, cli/index.ts |
-| `HIPFIRE_DAEMON_NAME` | cli/index.ts, cli/serve_admission.ts |
+| `HIPFIRE_DAEMON_BIN` | autoresearch/ar/certify/serve_runner.py, autoresearch/ar/gate/serve_probe.py |
+| `HIPFIRE_DAEMON_NAME` | scripts/serve_harness.py |
 | `HIPFIRE_DDTREE_ASSERT_MASK` | crates/hipfire-arch-qwen35/src/speculative.rs |
-| `HIPFIRE_DDTREE_BUDGET` | cli/index.ts, crates/hipfire-arch-llama/src/spec_impl.rs |
+| `HIPFIRE_DDTREE_BUDGET` | crates/hipfire-arch-llama/src/spec_impl.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs |
 | `HIPFIRE_DDTREE_DUMP_PQ` | crates/hipfire-runtime/examples/ddtree_pq_sim.rs |
 | `HIPFIRE_DDTREE_FORCE_SLOW` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_DDTREE_LOGW_CUTOFF` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_DDTREE_PATH_C_VERBOSE` | scripts/path-c-smoke.sh |
 | `HIPFIRE_DDTREE_TAPE_DUMP` | crates/hipfire-arch-qwen35/src/speculative.rs |
-| `HIPFIRE_DDTREE_TOPK` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/loader_api.rs |
+| `HIPFIRE_DDTREE_TOPK` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs |
 | `HIPFIRE_DDTREE_TREE_LA` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_DDTREE_VERIFY` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/rdna-compute/src/feature_flags.rs |
-| `HIPFIRE_DEBUG` | cli/index.ts |
-| `HIPFIRE_DEBUG_BATCH` | cli/e8_coherence_smoke.ts, cli/e8_longctx_smoke.ts |
+| `HIPFIRE_DEBUG_BATCH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_DEEPSEEK4_AR` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs |
 | `HIPFIRE_DEEPSEEK4_ATTN` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT` | crates/hipfire-arch-deepseek4/src/forward.rs |
@@ -317,8 +315,8 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` | crates/hipfire-arch-deepseek4/src/arch.rs, crates/hipfire-arch-deepseek4/src/deepseek4.rs |
 | `HIPFIRE_DEEPSEEK4_COMP_ROPE_POS` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_DSA_WMMA` | crates/hipfire-arch-deepseek4/src/forward.rs |
-| `HIPFIRE_DEEPSEEK4_DSPARK` | cli/index.ts, crates/hipfire-arch-deepseek4/examples/dspark_bench.rs |
-| `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | cli/index.ts, crates/hipfire-arch-deepseek4/src/dspark_speculator.rs |
+| `HIPFIRE_DEEPSEEK4_DSPARK` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs, crates/hipfire-runtime/src/loader_api.rs |
+| `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | crates/hipfire-arch-deepseek4/src/dspark_speculator.rs |
 | `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DEEPSEEK4_DUMP_STATE` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_DUMP_TOPK` | crates/hipfire-dispatch/src/families/moe.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
@@ -365,17 +363,16 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_DEEPSEEK4_WARMUP` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs |
 | `HIPFIRE_DEEPSEEK4_WO_MULTIROW` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` | crates/rdna-compute/src/gemv.rs |
-| `HIPFIRE_DEFAULT_CHATML` | cli/index.ts |
+| `HIPFIRE_DEFAULT_CHATML` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_DEMOTE_MQ6` | crates/hipfire-runtime/examples/hfq_splice_attn.rs |
-| `HIPFIRE_DETACHED` | cli/index.ts |
 | `HIPFIRE_DETECTED_ARCH` | scripts/_detect-gpu.sh, scripts/test-kernels.sh |
 | `HIPFIRE_DETECTED_NAME` | scripts/_detect-gpu.sh |
 | `HIPFIRE_DETECTED_VRAM_GB` | scripts/_detect-gpu.sh |
-| `HIPFIRE_DETERMINISTIC` | crates/hipfire-runtime/examples/pp_parity_chatml.rs, crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-runtime/examples/pp_parity_chatml.rs |
 | `HIPFIRE_DEVICES` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_DFLASH_DRAFT` | cli/index.ts, crates/hipfire-runtime/src/config.rs |
+| `HIPFIRE_DFLASH_DRAFT` | crates/hipfire-runtime/src/config.rs, scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_LOGIT_DUMP` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_DFLASH_LOOP_BREAK` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
@@ -385,31 +382,30 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_DFLASH_LOOP_BREAK_RP_STEP` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_DFLASH_LOOP_BREAK_TEMP` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
-| `HIPFIRE_DFLASH_MODE` | crates/hipfire-runtime/src/config.rs |
+| `HIPFIRE_DFLASH_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs |
 | `HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` | crates/hipfire-arch-qwen35/src/speculative.rs |
-| `HIPFIRE_DFLASH_NGRAM_BLOCK` | cli/index.ts, crates/hipfire-arch-qwen35/src/speculative.rs |
+| `HIPFIRE_DFLASH_NGRAM_BLOCK` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_DFLASH_OFF` | scripts/serve-loop-gate.sh |
 | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_DFLASH_REFERENCE` | scripts/dflash_ref_spec_test.py, scripts/dflash_spec_debug.py |
-| `HIPFIRE_DFLASH_SEED_ORACLE` | crates/hipfire-arch-qwen35/src/speculative.rs |
+| `HIPFIRE_DFLASH_SEED_ORACLE` | crates/hipfire-arch-qwen35/src/speculative.rs, scripts/seed_oracle_collect.sh |
 | `HIPFIRE_DFLASH_TARGET` | scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_DFLASH_TEMP_SPEC` | crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_DFLASH_TREE` | cli/index.ts, crates/hipfire-runtime/src/dflash_generic.rs |
+| `HIPFIRE_DFLASH_TREE` | crates/hipfire-runtime/src/dflash_generic.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_DFLASH_ZLAB_SAFETENSORS` | scripts/dflash_spec_debug.py |
-| `HIPFIRE_DIR` | cli/index.ts |
+| `HIPFIRE_DIR` | scripts/ab-dispatch-validation.sh, scripts/agentic-gate-jinja-tools.sh |
 | `HIPFIRE_DIVERGENCE_PREFILL` | scripts/gfx906_logit_divergence.sh |
 | `HIPFIRE_DIVERGENCE_TOL` | scripts/gfx906_logit_divergence.sh |
 | `HIPFIRE_DN_REQUANT_PER_TOKEN` | crates/rdna-compute/src/norm.rs |
-| `HIPFIRE_DN_STATE_EF` | crates/hipfire-arch-qwen35/src/qwen35.rs |
+| `HIPFIRE_DN_STATE_EF` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_DOT2_GEMV` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_DOTS_OCR_BF16_RESIDUAL` | crates/hipfire-arch-dots-ocr/src/dots_ocr.rs |
-| `HIPFIRE_DOTS_OCR_DUMP_DIR` | crates/hipfire-arch-dots-ocr/src/dots_ocr.rs |
+| `HIPFIRE_DOTS_OCR_DUMP_DIR` | crates/hipfire-arch-dots-ocr/src/dots_ocr.rs, scripts/diff_dots_ocr_stages.py |
 | `HIPFIRE_DOTS_OCR_TRACE` | crates/hipfire-arch-dots-ocr/src/dots_ocr.rs |
-| `HIPFIRE_DPM_WARMUP_SECS` | cli/bench_sweep.ts, cli/index.ts |
+| `HIPFIRE_DPM_WARMUP_SECS` | crates/hipfire-arch-cohere2moe/examples/infer.rs, crates/hipfire-runtime/examples/bench_qwen35_mq4.rs |
 | `HIPFIRE_DRAFT_F16` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/dflash.rs |
 | `HIPFIRE_DRAFT_GEMM_DUMP` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/dflash.rs |
-| `HIPFIRE_DRAFT_MAX` | cli/index.ts |
 | `HIPFIRE_DRAFT_SUBPHASE` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/dflash.rs |
 | `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | crates/hipfire-runtime/src/dspark_core.rs |
 | `HIPFIRE_DSPARK_DEBUG` | crates/hipfire-runtime/src/dspark_core.rs |
@@ -421,15 +417,13 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_DTOH_DUMP` | crates/hip-bridge/src/ffi.rs |
 | `HIPFIRE_DUMP_HIDDEN` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_DUMP_HIDDEN_POS` | crates/hipfire-arch-qwen35/src/qwen35.rs |
-| `HIPFIRE_DUMP_REQUEST` | cli/index.ts |
 | `HIPFIRE_E8_DGPU_TWIN` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs |
-| `HIPFIRE_E8_GFX12` | cli/e8_coherence_smoke.ts, cli/e8_longctx_smoke.ts |
+| `HIPFIRE_E8_GFX12` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-dispatch/src/families/moe.rs |
 | `HIPFIRE_E8_LDSX` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_E8_ROW_GATE` | crates/hipfire-runtime/examples/collect_e8_hessian_native.rs |
 | `HIPFIRE_E8_SOA_EXPERTS` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_E8_STRIP` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs |
-| `HIPFIRE_EMIT_TOKEN_IDS` | crates/hipfire-arch-cohere2moe/src/spec_emit.rs, crates/hipfire-runtime/examples/coherence_probe.rs |
-| `HIPFIRE_ENV_RE` | scripts/check-docs-reliability.py |
+| `HIPFIRE_EMIT_TOKEN_IDS` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-cohere2moe/src/spec_emit.rs |
 | `HIPFIRE_EP_DECODE_TIMING` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-minimax/src/forward.rs |
 | `HIPFIRE_EP_DUMP_IDX` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_EP_DUMP_POS` | crates/hipfire-arch-deepseek4/src/forward.rs |
@@ -443,11 +437,10 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_EP_PROMPT_REPEAT` | crates/hipfire-runtime/examples/ep_decode_parity.rs |
 | `HIPFIRE_EP_SKIP_ALLREDUCE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_EXPERIMENTAL_` | crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | cli/index.ts, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/src/config.rs |
-| `HIPFIRE_FORCE_A3B_EVICTION` | cli/index.ts |
-| `HIPFIRE_FORCE_ANSWER_SECS` | cli/index.ts |
-| `HIPFIRE_FORCE_REBUILD` | scripts/install.sh |
+| `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh |
+| `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs, scripts/install.sh |
 | `HIPFIRE_FORCE_SPEC_GATE` | scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_FORCE_UNFUSED` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_FORWARD_LOWERED` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-lfm2moe/src/forward.rs |
@@ -521,7 +514,6 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_GFX1151_LM_HEAD_DOT2` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX1151_LM_HEAD_K2048` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs |
-| `HIPFIRE_GFX1151_LM_HEAD_R1_HYBRID_BUFFER` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1151_LM_HEAD_X_BUFFER` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX1151_MOE_GATE_UP_HYBRID_BUFFER` | crates/rdna-compute/src/kernels.rs |
@@ -530,9 +522,8 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_GFX1151_PM4_INITIATOR` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_GFX1151_PM4_INTERLEAVE` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS` | crates/rdna-compute/src/replay.rs |
-| `HIPFIRE_GFX1151_QKVZA_ALL_BUFFER` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL` | crates/rdna-compute/src/gemm.rs |
-| `HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs |
+| `HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX1151_QKVZA_K2048_HOIST` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER` | crates/rdna-compute/src/gemm.rs |
@@ -549,7 +540,6 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_GFX1151_RESIDUAL_K4096` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX1151_RESIDUAL_MULTIROW_R2` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1151_RESIDUAL_ROW1` | crates/rdna-compute/src/gemv.rs |
-| `HIPFIRE_GFX1151_RESIDUAL_RT_LOW` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1151_RESIDUAL_TIGHT_GRID` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1151_RESIDUAL_WAVE64` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1151_WEIGHT_BUFFER_DOWN` | crates/rdna-compute/src/gemv.rs |
@@ -558,9 +548,12 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1151_WEIGHT_BUFFER_RESIDUAL` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1151_WEIGHT_BUFFER_SIGMOID` | crates/rdna-compute/src/gemv.rs |
+| `HIPFIRE_GFX11_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX11_WEIGHT_LOAD_POLICY` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX1201_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE` | crates/rdna-compute/src/kernels.rs |
+| `HIPFIRE_GFX12_WEIGHT_CPOL_AUX` | crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX12_WEIGHT_LOAD_POLICY` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX942_GEMV_V2` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX942_GEMV_V3` | crates/rdna-compute/src/feature_flags.rs |
@@ -575,7 +568,7 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_GPU_TOPK` | crates/hipfire-runtime/examples/infer_qwen35.rs |
 | `HIPFIRE_GQA_CHUNK` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_GQA_FUSED` | crates/hipfire-arch-qwen2/src/qwen2.rs, crates/hipfire-dispatch/src/families/kv_tier.rs |
-| `HIPFIRE_GRAPH` | cli/e8_coherence_smoke.ts, cli/e8_longctx_smoke.ts |
+| `HIPFIRE_GRAPH` | benchmarks/scripts/bench_pp_gfx906.sh, crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_GRAPH_MOE` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GRAPH_PREFILL` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs |
 | `HIPFIRE_HAVE_2_GPU` | crates/hipfire-arch-qwen35/tests/pp_parity.rs |
@@ -596,26 +589,26 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_HFQ6_REAL_M` | crates/rdna-compute/examples/test_moe_grouped_wmma_hfq6.rs |
 | `HIPFIRE_HFQ6_REAL_M_TOTAL` | crates/rdna-compute/examples/test_moe_grouped_wmma_hfq6.rs |
 | `HIPFIRE_HFQ6_REAL_X_ROW_DIV` | crates/rdna-compute/examples/test_moe_grouped_wmma_hfq6.rs |
+| `HIPFIRE_HF_BASE` | crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_HIP_WAIT` | crates/rdna-compute/src/dispatch.rs |
-| `HIPFIRE_HOST_TIMING` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
-| `HIPFIRE_IDLE_TIMEOUT` | cli/index.ts |
+| `HIPFIRE_HOME` | crates/hipfire-config/src/lib.rs, crates/hipfire-registry/src/lib.rs |
+| `HIPFIRE_HOST` | crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_HOST_TIMING` | crates/hipfire-runtime/examples/dflash_spec_demo.rs, scripts/ddtree_verify_profile.sh |
+| `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_IMAGE` | scripts/container-gate.sh |
-| `HIPFIRE_JINJA_CHAT` | cli/index.ts, cli/parse_tool_calls.test.ts |
+| `HIPFIRE_JINJA_CHAT` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/src/prompt_frame.rs |
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh |
-| `HIPFIRE_KERNEL_CACHE` | cli/bench_sweep.ts, cli/index.ts |
+| `HIPFIRE_KERNEL_CACHE` | crates/hipfire-cli/src/main.rs, crates/hipfire-tui/src/hipfire/dashboard.rs |
 | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs |
 | `HIPFIRE_KV` | crates/hipfire-runtime/examples/oracle_xcheck.rs |
-| `HIPFIRE_KV_ADAPTIVE` | cli/index.ts, crates/hipfire-arch-qwen35/src/carrier.rs |
-| `HIPFIRE_KV_MODE` | cli/e8_coherence_smoke.ts, cli/e8_longctx_smoke.ts |
+| `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_KV_MODE` | benchmarks/scripts/bench_pp_gfx906.sh, crates/hipfire-arch-qwen35/src/carrier.rs |
 | `HIPFIRE_KV_PHYSICAL_CAP` | crates/hipfire-loader/src/carriers.rs |
 | `HIPFIRE_KV_V` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-runtime/examples/eval_hipfire.rs |
-| `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | crates/hipfire-arch-lfm2moe/examples/dump_lfm2moe_hidden_states.rs, crates/hipfire-arch-lfm2moe/examples/prefill_batch_parity.rs |
+| `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | crates/hipfire-arch-lfm2moe/examples/dump_lfm2moe_hidden_states.rs, crates/hipfire-arch-lfm2moe/src/forward.rs |
 | `HIPFIRE_LFM2_GRAPH` | crates/hipfire-arch-lfm2moe/examples/graph_parity_lfm2moe.rs, crates/hipfire-arch-lfm2moe/src/forward.rs |
-| `HIPFIRE_LFM2_PREFILL_BATCH` | crates/hipfire-arch-lfm2moe/examples/prefill_batch_parity.rs, crates/hipfire-arch-lfm2moe/src/forward.rs |
-| `HIPFIRE_LFM2_PREFILL_MAX_BATCH` | crates/hipfire-arch-lfm2moe/examples/prefill_batch_parity.rs, crates/hipfire-arch-lfm2moe/src/kernels.rs |
-| `HIPFIRE_LFM_CACHE_TRACE` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs, crates/rdna-compute/examples/test_mq4g256_lloyd_fused_parity.rs |
 | `HIPFIRE_LLOYD_GFX12` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/eval_hipfire.rs |
 | `HIPFIRE_LLOYD_K3` | crates/hipfire-quantize/src/main.rs |
@@ -623,12 +616,12 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_LM_HEAD_F16` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/src/config.rs |
 | `HIPFIRE_LM_HEAD_OVERWRITE` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_LM_HEAD_WMMA` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
-| `HIPFIRE_LOCAL` | cli/index.ts |
+| `HIPFIRE_LOCAL` | crates/hipfire-cli/src/main.rs, tests/e2e_run_reject.sh |
 | `HIPFIRE_LOG` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_LOG_FORMAT` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_MAGIC` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
-| `HIPFIRE_MAX_REQUEST_BYTES` | cli/index.ts, cli/serve_admission.ts |
-| `HIPFIRE_MAX_TOTAL_THINK_TOKENS` | cli/index.ts, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_MAX_REQUEST_BYTES` | crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_MAX_TOTAL_THINK_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_MEMSET_DUMP` | crates/hip-bridge/src/ffi.rs |
 | `HIPFIRE_META_MAX` | scripts/ddtree_meta_sweep.sh |
 | `HIPFIRE_META_RUNS` | scripts/ddtree_meta_sweep.sh |
@@ -644,14 +637,13 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_MINIMAX_MODEL` | scripts/coherence-gate-minimax.sh |
 | `HIPFIRE_MINIMAX_PROMOTE_MQ4` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_MINIMAX_PROMOTE_MQ6` | crates/hipfire-quantize/src/main.rs |
-| `HIPFIRE_MMQ` | cli/index.ts, crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_MMQ` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_MMQ_DUMP` | crates/rdna-compute/examples/test_gfx906_mmq_realdata.rs |
-| `HIPFIRE_MMQ_MIN_BATCH` | crates/rdna-compute/src/feature_flags.rs |
-| `HIPFIRE_MMQ_SCREEN` | crates/hipfire-runtime/examples/channel_test_mmq.rs, crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_MMQ_SCREEN_THRESHOLD` | crates/hipfire-runtime/examples/channel_test_mmq.rs, crates/rdna-compute/src/feature_flags.rs |
-| `HIPFIRE_MODEL` | cli/index.ts |
-| `HIPFIRE_MODELS_CATALOG_PATH` | cli/index.ts, cli/resolve_sampling.verify.test.ts |
+| `HIPFIRE_MMQ_MIN_BATCH` | benchmarks/scripts/bench_dflash_27b_gfx906.sh, crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_MMQ_SCREEN` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/channel_test_mmq.rs |
+| `HIPFIRE_MMQ_SCREEN_THRESHOLD` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/channel_test_mmq.rs |
+| `HIPFIRE_MODEL` | crates/hipfire-config/src/lib.rs, scripts/bench_humaneval_completion.sh |
 | `HIPFIRE_MODELS_DIR` | autoresearch/ar/gate/run.py, benchmarks/scripts/bench_dflash_27b_gfx906.sh |
 | `HIPFIRE_MODEL_PATH` | autoresearch/ar/census.py |
 | `HIPFIRE_MODEL_STORE` | scripts/baseline_quant_smoke.sh |
@@ -706,30 +698,27 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_MTP_DEVICE_TOKEN_CHAIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
 | `HIPFIRE_MTP_GPU_ACCEPT` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
 | `HIPFIRE_MTP_HEAD_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/mtp_head.rs |
-| `HIPFIRE_MTP_K` | cli/index.ts, crates/hipfire-loader/src/carriers.rs |
-| `HIPFIRE_MTP_MODE` | cli/index.ts, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_MTP_K` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs |
+| `HIPFIRE_MTP_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_MTP_PREFIX_CACHE` | scripts/serve_harness.py |
 | `HIPFIRE_MTP_PROPOSAL_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
 | `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_MTP_Q8_VERIFY_WMMA` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
-| `HIPFIRE_MTP_SAMPLED` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_MTP_SAMPLED` | crates/hipfire-runtime/examples/daemon.rs, scripts/serve_harness.py |
 | `HIPFIRE_MTP_SMOKE_HEAD` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs |
 | `HIPFIRE_MTP_SMOKE_TRUNK` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs |
 | `HIPFIRE_MTP_SNAPSHOT_OVERLAP` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
 | `HIPFIRE_MTP_TAPE_REPLAY` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
 | `HIPFIRE_MTP_VERIFY_DECOUPLE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_MW16` | crates/rdna-compute/src/feature_flags.rs |
-| `HIPFIRE_NEW_FLAG` | tests/test_docs_reliability.py |
-| `HIPFIRE_NGRAM_DRAFT` | cli/index.ts, crates/hipfire-arch-qwen2/src/spec_impl.rs |
+| `HIPFIRE_NGRAM_DRAFT` | crates/hipfire-arch-qwen2/src/spec_impl.rs, crates/hipfire-loader/src/carriers.rs |
 | `HIPFIRE_NGRAM_DRAFT_K` | crates/hipfire-loader/src/spec_build.rs, crates/hipfire-runtime/src/loader_api.rs |
 | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/src/config.rs |
 | `HIPFIRE_NGRAM_MIN_COUNT` | crates/hipfire-loader/src/spec_build.rs, crates/hipfire-runtime/src/loader_api.rs |
 | `HIPFIRE_NGRAM_THRESHOLD` | crates/hipfire-runtime/src/arch.rs |
 | `HIPFIRE_NGRAM_WINDOW` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/src/arch.rs |
-| `HIPFIRE_NORMALIZE_PROMPT` | cli/index.ts, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
-| `HIPFIRE_NO_PID_FILE` | cli/chat.ts, cli/index.ts |
-| `HIPFIRE_NO_PREWARM` | cli/index.ts |
-| `HIPFIRE_NO_REGISTRY_FETCH` | cli/index.ts |
+| `HIPFIRE_NORMALIZE_PROMPT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
+| `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-registry/src/lib.rs |
 | `HIPFIRE_NO_SPILL` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_ORACLE_MAX` | scripts/seed_oracle_collect.sh |
 | `HIPFIRE_PARITY_MAX_TOK` | scripts/forward-lowered-parity.sh |
@@ -741,6 +730,7 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_PFLASH_DRAFTER_KV` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PFLASH_SCORE_LAYER` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PFLASH_TARGET` | scripts/pflash-gate.sh |
+| `HIPFIRE_PORT` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_POST_LATCH_ANSWER_TOKENS` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_PP_DFLASH` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_PP_GATE_HETEROGENEOUS` | scripts/pp-gate.sh |
@@ -769,7 +759,7 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_PREFILL_THRESHOLD` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PROFILE` | crates/hipfire-atlas/src/profile_report.rs, crates/hipfire-runtime/examples/bench_qwen35_mq4.rs |
 | `HIPFIRE_PROFILE_CYCLES` | crates/hipfire-runtime/examples/dflash_spec_demo.rs, crates/hipfire-runtime/examples/mtp_only_demo.rs |
-| `HIPFIRE_PROFILE_DECODE` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs |
+| `HIPFIRE_PROFILE_DECODE` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs, scripts/kernel_atlas.py |
 | `HIPFIRE_PROFILE_MAX` | scripts/ddtree_verify_profile.sh |
 | `HIPFIRE_PROFILE_RUNS` | scripts/ddtree_verify_profile.sh |
 | `HIPFIRE_PROMPT_CACHE_CAP` | crates/hipfire-loader/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
@@ -786,7 +776,7 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_QKVZA_KERNEL_NAME` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_QKVZA_SCALAR_PREP` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/rdna-compute/src/kernels.rs |
-| `HIPFIRE_QKVZA_SPLIT_TAIL` | crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_QKVZA_SPLIT_TAIL` | crates/rdna-compute/src/feature_flags.rs, scripts/bench_qwen36_qkvza_split_tail_ab.sh |
 | `HIPFIRE_QKVZA_WAVES_PER_BLOCK` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_QKV_KERNEL_NAME` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_QKV_WITH_BIAS` | crates/rdna-compute/src/kernels.rs |
@@ -799,13 +789,13 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_QWEN35_FA_PREP_FUSE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_QWEN35_FA_PREP_KERNEL` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_QWEN35_FINITE_TRACE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
-| `HIPFIRE_QWEN35_GRAMMAR` | cli/index.ts, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_QWEN35_GRAMMAR` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/src/prompt_frame.rs |
 | `HIPFIRE_QWEN35_MTP` | crates/hipfire-loader/src/lib.rs, crates/hipfire-loader/src/spec_build.rs |
 | `HIPFIRE_QWEN35_MTP_K` | crates/hipfire-loader/src/spec_build.rs |
 | `HIPFIRE_QWEN35_NGRAM_LEN_MIN` | crates/hipfire-arch-qwen35/src/grammar.rs |
 | `HIPFIRE_QWEN35_NGRAM_MIN_REPEATS` | crates/hipfire-arch-qwen35/src/grammar.rs |
 | `HIPFIRE_QWEN3_BENCH_MODE` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
-| `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` | cli/index.ts, crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
+| `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs, crates/hipfire-loader/src/carriers.rs |
 | `HIPFIRE_QWEN3_MAX` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
 | `HIPFIRE_QWEN3_MODEL` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
 | `HIPFIRE_QWEN3_NGRAM_K` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
@@ -815,11 +805,11 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_QWEN3_TOP_K` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
 | `HIPFIRE_QWEN3_TOP_P` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
 | `HIPFIRE_QWEN3_WARMUP` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
-| `HIPFIRE_QWEN_CACHE_TRACE` | cli/index.ts, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_QWEN_CACHE_TRACE` | crates/hipfire-runtime/examples/daemon.rs, scripts/test-qwen35-abort-resume.sh |
 | `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` | scripts/test_pr228_spiral_check.sh |
-| `HIPFIRE_QWEN_MTP` | crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_QWEN_PROMPT_CACHE` | cli/index.ts, crates/hipfire-arch-lfm2moe/src/cache_plan.rs |
-| `HIPFIRE_RDNA2_VARIANT` | cli/index.ts, crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_QWEN_MTP` | crates/hipfire-runtime/examples/daemon.rs, scripts/serve_harness.py |
+| `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_RDNA2_VARIANT` | crates/hipfire-cli/src/main.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE` | crates/rdna-compute/src/feature_flags.rs |
@@ -863,11 +853,11 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_RDNA3_SIGMOID_M2048` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_RDNA3_SIGMOID_ROWS4` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_REAP_PLAN` | crates/hipfire-arch-deepseek4/src/deepseek4.rs, crates/hipfire-arch-lfm2moe/src/config.rs |
-| `HIPFIRE_REGISTRY_URL` | cli/index.ts, cli/registry_loader.ts |
+| `HIPFIRE_REGISTRY_URL` | crates/hipfire-registry/src/lib.rs |
 | `HIPFIRE_REMOTE` | scripts/mi300x_bootstrap.sh |
-| `HIPFIRE_REPLAY_BACKEND` | cli/index.ts, crates/rdna-compute/src/replay.rs |
+| `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-cli/src/main.rs, crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_GRAPH` | crates/hipfire-arch-qwen35/src/speculative.rs |
-| `HIPFIRE_REPLAY_MANUAL_CAPTURE` | crates/rdna-compute/src/replay.rs |
+| `HIPFIRE_REPLAY_MANUAL_CAPTURE` | crates/rdna-compute/src/replay.rs, scripts/redline_daemon_harness.py |
 | `HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_DYNAMIC_GRID` | crates/rdna-compute/src/dispatch.rs |
 | `HIPFIRE_REPLAY_PM4_GCR_TRIM` | crates/rdna-compute/src/replay.rs |
@@ -879,7 +869,7 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_REPLAY_PM4_QUEUES` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_STATEFUL` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_WAIT_POLICY` | crates/rdna-compute/src/replay.rs |
-| `HIPFIRE_REPLAY_TRANSPORT` | cli/index.ts, crates/rdna-compute/src/replay.rs |
+| `HIPFIRE_REPLAY_TRANSPORT` | crates/hipfire-cli/src/main.rs, crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPO` | scripts/quantize-dspark.sh |
 | `HIPFIRE_RESIDUAL_CPOL` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_RESIDUAL_KERNEL` | crates/rdna-compute/src/kernels.rs |
@@ -890,7 +880,7 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_ROCBLAS_MIN_BATCH` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_ROCBLAS_OFF` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
-| `HIPFIRE_ROCPROF_CSV` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs |
+| `HIPFIRE_ROCPROF_CSV` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs, scripts/coverage-audit.py |
 | `HIPFIRE_ROPE_HALFSPLIT` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/norm.rs |
 | `HIPFIRE_ROUTER_EXACT_KERNEL` | crates/rdna-compute/src/kernels.rs |
@@ -902,8 +892,8 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_SERVE_GATE_OUT` | scripts/serve-multiturn-gate.sh |
 | `HIPFIRE_SERVE_GATE_PORT` | scripts/serve-loop-gate.sh |
 | `HIPFIRE_SERVE_LOG` | scripts/test-qwen35-abort-resume.sh, scripts/test-qwen35-think-cap.sh |
-| `HIPFIRE_SERVE_MAX_QUEUE` | cli/index.ts |
-| `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | cli/index.ts |
+| `HIPFIRE_SERVE_MAX_QUEUE` | crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_SKIP_AGENTIC_GATE` | scripts/agentic-gate.sh |
 | `HIPFIRE_SKIP_BUILD` | scripts/container-gate.sh |
 | `HIPFIRE_SKIP_LLAMA_COMMIT_CHECK` | crates/hipfire-runtime/src/eval_common.rs |
@@ -912,38 +902,37 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 | `HIPFIRE_SMOKE_MODE` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/a3b_smoke_forward.rs |
 | `HIPFIRE_SMOKE_PROMPT` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/a3b_smoke_forward.rs |
 | `HIPFIRE_SMOKE_STEPS` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/a3b_smoke_forward.rs |
-| `HIPFIRE_SPECULATION` | cli/index.ts |
+| `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_SWEEP_MAX` | scripts/ddtree_budget_sweep.sh |
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh |
 | `HIPFIRE_SWEEP_PROMPTS_DIR` | scripts/mq3-mq2-sweep.sh |
 | `HIPFIRE_SWEEP_RUNS` | scripts/ddtree_budget_sweep.sh |
-| `HIPFIRE_TARGET_ARCH` | crates/rdna-compute/src/dispatch.rs |
+| `HIPFIRE_TARGET_ARCH` | crates/rdna-compute/src/dispatch.rs, scripts/kernel_atlas.py |
 | `HIPFIRE_TEST_MODEL` | scripts/test-qwen35-abort-resume.sh, scripts/test-qwen35-think-cap.sh |
 | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_TIER_RATIO` | crates/hipfire-quantize/src/main.rs |
-| `HIPFIRE_TP` | cli/index.ts |
 | `HIPFIRE_TP_BENCH_ITERS` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs |
 | `HIPFIRE_TP_BENCH_N` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs |
 | `HIPFIRE_TP_BENCH_WARMUP` | crates/hipfire-runtime/examples/tp_allreduce_smoke.rs |
 | `HIPFIRE_TP_EXPERT_ASSIGN` | crates/hipfire-runtime/src/tp_shard.rs |
 | `HIPFIRE_TP_USE_RCCL` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
-| `HIPFIRE_TUI_BIN` | cli/index.ts |
+| `HIPFIRE_TUI_BIN` | crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_UNIFORM_GATE_UP` | crates/hipfire-runtime/examples/hfq_splice_attn.rs |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
 | `HIPFIRE_VERIFY_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_probe.rs, crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_VERIFY_GRAPH_TIMING` | crates/hipfire-arch-qwen35/src/speculative.rs |
-| `HIPFIRE_VERIFY_GRAPH_TREE` | crates/hipfire-arch-qwen35/src/speculative.rs |
+| `HIPFIRE_VERIFY_GRAPH_TREE` | crates/hipfire-arch-qwen35/src/speculative.rs, scripts/tree_graph_bench.sh |
 | `HIPFIRE_VERSION` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
 | `HIPFIRE_VL_DUMP_DIR` | crates/hipfire-runtime/examples/infer.rs |
-| `HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN` | crates/rdna-compute/src/kernels.rs |
+| `HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_WEIGHT_CACHE_FLAT_GEMV` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_WEIGHT_CPOL_AUX` | crates/rdna-compute/src/kernels.rs |
-| `HIPFIRE_WMMA_FA` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_WMMA_FA` | benchmarks/results/wmma-fa-probe-gfx1100.sh, benchmarks/results/wmma-fa-probe.sh |
 | `HIPFIRE_WMMA_FA_MIN_BATCH` | crates/rdna-compute/src/attention.rs |
-| `HIPFIRE_WO_MMQ` | cli/index.ts, crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_WO_MMQ` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_WO_WMMA_VARIANT` | crates/hipfire-runtime/examples/test_wmma_correctness.rs, crates/rdna-compute/src/feature_flags.rs |
 
 
@@ -952,7 +941,7 @@ Partial map from `cli/index.ts` apply/load helpers. Message-field-only keys (tem
 ## Maintenance
 
 ```bash
-# Independently verify concrete Rust/TypeScript HIPFIRE_* reads against table rows.
+# Independently verify concrete Rust HIPFIRE_* reads against table rows.
 scripts/regen-env-vars-doc.sh
 
 # Canonical staged documentation gate (includes the same source extraction).
@@ -963,9 +952,9 @@ Also match `std::env::var_os("HIPFIRE_…")` (e.g. `HIPFIRE_KERNEL_CACHE` in `co
 
 When adding a user-facing knob:
 
-1. Prefer a `HipfireConfig` key + validation in `cli/index.ts` ([`CONFIG.md`](CONFIG.md)).
+1. Prefer a typed field + validation in `crates/hipfire-config/src/lib.rs` ([`CONFIG.md`](CONFIG.md)).
 2. Add the env name to product docs only if operators must set it outside config.
 3. Re-scan so the generated inventory stays complete.
 4. Do not document unearned or widened LFM defaults here (multi-cohort, path/extension selection, or generic default-on beyond the exact sealed [`admissions.yml`](admissions.yml) row). The earned exact LFM retained-PM4 default and its three opt-outs may be documented; planned broader admissions may not.
 
-**Last inventory generation:** 2026-07-19.
+**Last inventory generation:** 2026-07-20.

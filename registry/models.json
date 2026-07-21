@@ -1,5 +1,5 @@
 {
-  "_comment": "hipfire model registry. Loaded by cli/index.ts at startup. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only (pull short-circuits with a clear message instead of 404'ing). Aliases are simple string\u2192string redirects through the resolver.",
+  "_comment": "Curated hipfire model registry overlay. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only. Aliases are simple string\u2192string redirects. Run scripts/registry_gen.py after editing.",
   "models": {
     "qwen3.5:0.8b": {
       "repo": "schuttdev/hipfire-qwen3.5-0.8b",

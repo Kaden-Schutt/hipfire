@@ -194,7 +194,7 @@ For Windows, source builds, and verifying the install:
 First-class support via Nix flake. See [docs/NIXOS.md](docs/NIXOS.md).
 
 ```bash
-nix develop github:Kaden-Schutt/hipfire  # dev shell with Rust + ROCm + bun
+nix develop github:Kaden-Schutt/hipfire  # dev shell with Rust + ROCm
 nix build github:Kaden-Schutt/hipfire    # build package
 ```
 

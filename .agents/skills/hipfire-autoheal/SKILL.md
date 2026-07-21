@@ -52,7 +52,7 @@ Never blind-kill or delete:
 
 - Confirm the tracked serve via `hipfire ps`, pidfile record, port owner, and/or
   `/health` token before any kill path. Plain `hipfire stop` refuses the
-  **tracked pid** on failed ownership validation (`cli/serve_admission.ts`);
+  **tracked pid** on failed ownership validation (`crates/hipfire-cli/src/main.rs`);
   that guarantee does **not** cover force-reap / restart port cleanup
   (`fuser -k`, exact-name daemon reap). Agents must inspect owners before
   requesting approval for restart/force.
@@ -76,7 +76,7 @@ Never blind-kill or delete:
 
 Default bind: `0.0.0.0:11435`. Pid/log: `~/.hipfire/serve.pid`,
 `~/.hipfire/serve.log`. Install root: `~/.hipfire/` (`bin/daemon`, `models/`,
-`config.json`).
+`config.toml`).
 
 ## References in this skill
 

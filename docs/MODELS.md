@@ -1,14 +1,15 @@
 # Models
 
 **Owner:** registry-backed model surface (`docs/INDEX.md`).
-**Machine source:** `cli/registry.json` (loaded by `cli/index.ts` at startup).
+**Machine sources:** curated `registry/models.json`; generated and bundled
+`registry/v1.json` (loaded by `hipfire-registry`).
 **Last checked:** 2026-07-19 against working tree; greenfield rewrite pin `692a726dde53508cb53de1a74c720e75a7c9f33e` (comparison base `origin/beta@9ffb18da9d1377dfbf759db82641ea039b2e522e`).
 
 This page projects **registry availability**: tags, default artifact filenames, declared download size, and declared VRAM floor. It is **not** a product admission table and **not** a guarantee that every GPU/route runs every tag.
 
 | Concept | Meaning |
 |---|---|
-| Registry tag | Pull/list name resolved through `cli/registry.json` (+ aliases). |
+| Registry tag | Pull/list name resolved through the bundled v1 registry (+ aliases). |
 | Default artifact | `file` field — what `hipfire pull <tag>` fetches into `~/.hipfire/models/`. |
 | Runtime support | Whether the daemon/loader/arch crate can load and run the artifact shape (`arch_id`, kernels, Cargo features). Source-of-truth: runtime crates + [`architecture-ids.md`](architecture-ids.md). |
 | Admission | Explicit product decision in [`admissions.yml`](admissions.yml). Schema v2 holds exactly one evidence-bound record; no inferred admissions beyond that row. |
@@ -29,7 +30,7 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 ---
 
-## Registry tags (from `cli/registry.json`)
+## Registry tags (from `registry/models.json`)
 
 Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (`default_kv_mode` when set; else empty — global `kv_cache=auto` resolves to `q8`), **Notes** (`desc`, truncated).
 
@@ -139,7 +140,9 @@ Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) wit
 
 ## Aliases
 
-String redirects in `cli/registry.json` → `aliases` (not separate downloads). **Partial table** — not exhaustive; for the complete alias surface read `cli/registry.json` → `aliases` (or `hipfire list -r`).
+String redirects in `registry/models.json` → `aliases` (not separate
+downloads). **Partial table** — for the complete surface read that file or run
+`hipfire list -r`.
 
 | Alias | Resolves to |
 |---|---|

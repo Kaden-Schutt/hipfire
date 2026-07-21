@@ -88,7 +88,7 @@ hipfire serve 127.0.0.1:11435 -d
 # scripts/serve-restart.sh 11435 -- -d
 ```
 
-Do **not** start with `pkill -9 daemon bun`. If you must free a port manually
+Do **not** start with a broad `pkill -9 daemon hipfire`. If you must free a port manually
 after approval, prefer `fuser -k <port>/tcp` only when `hipfire stop --force`
 is unavailable, and never delete `/tmp/hipfire-gpu.lock` (flock inode; kernel
 releases on holder death — unlinking breaks exclusion).

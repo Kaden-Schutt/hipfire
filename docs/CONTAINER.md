@@ -11,7 +11,7 @@ Two final targets share a ROCm base:
 | Field | Value |
 |---|---|
 | Base image | `docker.io/rocm/dev-ubuntu-24.04:7.2.4` |
-| Bun pin (build) | `bun-v1.3.13` |
+| Control plane | Native `hipfire-cli` Rust binary |
 | Published port | `11435` (`EXPOSE`) |
 | JIT kernel cache env | `HIPFIRE_KERNEL_CACHE=/var/cache/hipfire` |
 | Daemon path in runtime | `HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon` |
@@ -29,10 +29,8 @@ exercise the image or the GPU.
 - **Kernels JIT on first use.** `.hip` sources and helpers are embedded in
   the daemon via `include_str!`; the runtime image needs `hipcc` + HIP
   headers from the base, not `kernels/src/` on disk.
-- **CLI is `bun build --compile`** — `registry.json` is inlined; the compiled
-  binary has **no runtime dependency on Bun**. The current `runtime` image
-  still inherits Bun from `base-rocm` (present on disk) even though serve/run
-  do not need it.
+- **CLI is native Rust.** `hipfire-registry` embeds `registry/v1.json`; neither
+  the builder nor runtime image installs Bun, Node, or a TypeScript payload.
 - **Models are never baked in** — mount a volume.
 - **No `HSA_OVERRIDE_GFX_VERSION`** is set in the image; arch comes from HIP
   `gcnArchName` at runtime.

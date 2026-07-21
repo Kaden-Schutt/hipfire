@@ -24,9 +24,9 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, json, os, re, signal, subprocess, sys, time, urllib.request
+import argparse, atexit, json, os, re, shutil, signal, subprocess, sys, time, urllib.request
 
-# Mirror of cli/index.ts THINKING_BUDGET (resolved here so the pre-flight shows the
+# Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
 # concrete token cap, not just the preset name).
 THINKING_BUDGET = {"low": 512, "med": 2048, "high": 8192, "xhigh": 24576, "max": 32768, "uncapped": 0}
 
@@ -143,7 +143,7 @@ def show_config(cfg):
 _serve_proc = None
 
 def _kill_serve():
-    """Kill ONLY this harness's own serve tree (the bun serve + its child daemon),
+    """Kill ONLY this harness's own native serve tree (the Rust CLI + its child daemon),
     scoped by process group — NOT a broad `pkill -x daemon`, which would execute
     the parallel autoresearch daemons pinned to OTHER GPUs. spawn_serve starts the
     serve in its own session (start_new_session) so this group kill is exact."""
@@ -156,13 +156,64 @@ def _kill_serve():
             except Exception: pass
     _serve_proc = None
 
+
+def _native_cli():
+    """Resolve the Rust control-plane binary."""
+    candidates = [
+        os.environ.get("HIPFIRE_CLI_BIN"),
+        os.path.join(REPO, "target", "release", "hipfire"),
+        os.path.expanduser("~/.hipfire/bin/hipfire"),
+        shutil.which("hipfire"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    sys.exit("serve_harness: native hipfire CLI not found; build `cargo build --release -p hipfire-cli` "
+             "or set HIPFIRE_CLI_BIN")
+
+
+def _write_native_config(cfg, home):
+    """Write the isolated harness configuration in the native sparse TOML format."""
+    text = f"""[serve]
+host = "127.0.0.1"
+port = {cfg["port"]}
+default_model = {json.dumps(cfg["model"])}
+
+[memory]
+max_seq = {cfg.get("max_seq", 32768)}
+kv_cache = {json.dumps(cfg["kv"])}
+
+[speculation]
+dflash = "off"
+mtp = {json.dumps(cfg["mtp"])}
+ngram = "off"
+
+[generation]
+max_tokens = 16384
+
+[reasoning]
+budget = {json.dumps(cfg["thinking_budget"])}
+"""
+    with open(os.path.join(home, ".hipfire", "config.toml"), "w") as handle:
+        handle.write(text)
+
+
+def _native_service_warm(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
+            health = json.load(response)
+        return bool(health.get("model")) and not health.get("loading_model")
+    except Exception:
+        return False
+
+
 def spawn_serve(cfg, home, log):
-    """Spawn `bun cli/index.ts serve` with the resolved serve config; retry on the flaky
+    """Spawn native `hipfire serve` with the resolved serve config; retry on the flaky
     daemon-spawn; return when warm. The per-request sampling is sent by the driver, so
     one serve handles all recipes/modes."""
     global _serve_proc
     os.makedirs(os.path.join(home, ".hipfire"), exist_ok=True)
-    models = os.path.expanduser("~/.hipfire/models")
+    models = os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
     for ln in ("models", "templates"):
         dst = os.path.join(home, ".hipfire", ln)
         try:
@@ -170,9 +221,7 @@ def spawn_serve(cfg, home, log):
             os.symlink(os.path.join(models, "..", ln) if ln == "templates" else models, dst)
         except OSError:
             pass
-    conf = {"max_seq": cfg.get("max_seq", 32768), "dflash_mode": "off", "mtp_mode": cfg["mtp"],
-            "ngram_mode": "off", "max_tokens": 16384, "thinking_budget": cfg["thinking_budget"]}
-    json.dump(conf, open(os.path.join(home, ".hipfire", "config.json"), "w"))
+    _write_native_config(cfg, home)
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
@@ -181,17 +230,18 @@ def spawn_serve(cfg, home, log):
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1", HIPFIRE_MTP_PREFIX_CACHE="1")
+    cli = _native_cli()
     atexit.register(_kill_serve)
     for attempt in range(1, 5):
         _kill_serve(); time.sleep(3)
         open(log, "w").close()
         _serve_proc = subprocess.Popen(
-            ["/home/kaden/.bun/bin/bun", "cli/index.ts", "serve", "127.0.0.1", str(cfg["port"])],
+            [cli, "serve", "127.0.0.1", str(cfg["port"])],
             cwd=REPO, env=env, stdout=open(log, "a"), stderr=subprocess.STDOUT,
             start_new_session=True)   # own process group so _kill_serve's group-kill is exact + scoped
         for _ in range(90):
             txt = open(log).read() if os.path.exists(log) else ""
-            if "warm-up complete" in txt:
+            if _native_service_warm(cfg["port"]):
                 return True
             if re.search(r"out of memory|error loading|panic", txt, re.I):
                 break
@@ -326,7 +376,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="model file path to serve")
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
-    ap.add_argument("--registry", default=os.path.join(REPO, "cli/registry.json"))
+    ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default="fwht3")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
     ap.add_argument("--thinking", default="med", help="thinking_budget preset key")

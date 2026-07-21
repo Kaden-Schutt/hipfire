@@ -34,7 +34,6 @@ The shape of this file is lifted from
 | [thiserror](https://docs.rs/thiserror) | Error type derivation in the bridge crates. |
 | [image](https://docs.rs/image) | PNG / JPEG decode for vision-model preprocessing. |
 | [libc](https://docs.rs/libc) | ioctl / syscall plumbing for the redline direct-KMD path. |
-| [Bun](https://bun.sh) | TypeScript runtime for the `hipfire` CLI in `cli/`. Picked over Node for fast startup and zero-build single-file scripts. |
 
 ## Papers
 

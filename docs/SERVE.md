@@ -1,8 +1,9 @@
 # Serve (OpenAI-compatible HTTP)
 
-`hipfire serve` starts a Bun HTTP front-end that owns one GPU daemon process
-and exposes an OpenAI-shaped chat API. Defaults come from config
-([CONFIG.md](CONFIG.md)); the HTTP surface is implemented in `cli/index.ts`.
+`hipfire serve` starts the native Rust HTTP control plane, owns one GPU daemon
+process, and exposes an OpenAI-shaped chat API. Defaults come from typed TOML
+configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
+`crates/hipfire-cli` and the shared transport lives in `crates/hipfire-client`.
 
 | Field | Default (source) |
 |---|---|
@@ -20,7 +21,7 @@ implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATI
 
 ## Security (no auth / no TLS)
 
-The current `Bun.serve` handler implements **no authentication and no TLS**.
+The native handler implements **no authentication and no TLS**.
 Anyone who can reach the bind address can call every endpoint, including
 chat completions. Default bind is `0.0.0.0` (all interfaces).
 
@@ -75,27 +76,23 @@ Config and env owners for bind, idle, queue, and body limits:
 
 ## Lifecycle
 
-1. **Bind + pid record.** Unless `HIPFIRE_NO_PID_FILE=1` (used by ephemeral
-   `hipfire chat` daemons), serve writes a pid **record** (pid, start time,
-   host, port, token) to `~/.hipfire/serve.pid`. A live serve on the same bind
-   refuses to start.
+1. **Bind + pid record.** Serve writes its numeric pid to
+   `~/.hipfire/serve.pid`. `stop` verifies that `/proc/<pid>/cmdline` still
+   identifies a native `hipfire serve` process before signaling it.
 2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
-3. **Pre-warm (default).** Loads the chosen model and runs a 1-token warmup
-   generate (discarded), then `reset`. Failures log and leave the process
-   serving; the model loads on the first real request instead.
-4. **HTTP.** `Bun.serve` accepts traffic. Only one generation holds the
+3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
+   and leave the process serving; the model loads on the first real request.
+4. **HTTP.** The native server accepts traffic. Only one generation holds the
    daemon lock at a time (bounded queue).
 5. **Idle eviction.** When `idle_timeout > 0`, an interval unloads the model
    after idle seconds **and** only when no generation is in flight and the
    serve lock is free. Next request reloads.
-6. **Stop.** `hipfire stop` validates pid ownership (live process + port /
-   `/health` token evidence) before SIGTERM (then SIGKILL after 5s). Stale
-   reused pids are **not** killed; the pidfile is removed instead.
+6. **Stop.** `hipfire stop` validates pid ownership before SIGTERM. Stale reused
+   pids are **not** killed; the pidfile is removed instead.
 
-Detached readiness: parent polls `GET /health` for up to **300 seconds**
-(first-run kernel JIT can be slow). `/health` means the Bun process is
-answering — not that a model finished loading if pre-warm was skipped or
-failed.
+Detached readiness: parent polls `GET /health` for up to **60 seconds**.
+`/health` means the native process is answering; inspect `model` and
+`loading_model` to distinguish ready, loading, and unloaded state.
 
 ## Endpoints
 
@@ -103,7 +100,7 @@ Implemented paths (anything else → `404`):
 
 | Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | Liveness JSON: `status`, `model` (path or `null`), `idle_timeout_sec`, `pid`, `token` |
+| `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native` |
 | `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
 | `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
@@ -112,9 +109,8 @@ There is **no** `/v1/completions` route in the current CLI serve.
 
 ### `GET /health`
 
-Always `200` while the HTTP server is up. `model` is the loaded path or
-`null` when idle/unloaded. `token` matches the pidfile token so stop/restart
-can confirm ownership.
+Always `200` while the HTTP server is up. `model` is the loaded tag/path or
+`null` when idle/unloaded; `loading_model` names an asynchronous pre-warm.
 
 ```bash
 # Loopback example (safe default for local smoke):
@@ -197,7 +193,7 @@ container builds or no-GPU CI.
 
 | Claim | Route | Owner |
 |---|---|---|
-| LFM2.5 thinking / framing smoke (branch tree only) | `scripts/lfm_serve_harness.py` with an `lfm2.5:*` tag | [VALIDATION.md](VALIDATION.md) |
+| LFM2.5 thinking / framing smoke | `scripts/serve_harness.py` with an exact `lfm2.5:*` tag | [VALIDATION.md](VALIDATION.md) |
 
 Example (harness spawns its own serve by default on port `11520`):
 
@@ -216,8 +212,8 @@ certifies GPU serve, model coherence, or throughput.
   show a stuck orphan or port holder — those paths are destructive
   (system-wide `pkill -x daemon` + `fuser -k` on the port). Avoid ad-hoc
   `pkill` unless you know the exact process tree.
-- `HIPFIRE_NO_PID_FILE=1` keeps chat-owned daemons out of `serve.pid` so
-  `hipfire stop` does not kill an interactive session.
+- `hipfire chat` starts a tracked detached native service if none is healthy;
+  stop it explicitly with `hipfire stop` when the session is done.
 
 ## Logs and state files
 
@@ -225,9 +221,9 @@ certifies GPU serve, model coherence, or throughput.
 |---|---|
 | `~/.hipfire/serve.log` | Detached stdout/stderr |
 | `~/.hipfire/serve.pid` | Ownership record for stop/ps/restart |
-| `~/.hipfire/config.json` | Global defaults (see [CONFIG.md](CONFIG.md)) |
-| `~/.hipfire/models.json` | Schema v2 catalog: aliases + primary per-model overlays |
-| `~/.hipfire/per_model_config.json` | Legacy overlay seed; folded into the catalog on refresh |
+| `~/.hipfire/config.toml` | Sparse typed global configuration |
+| `~/.hipfire/models.toml` | Local catalog, aliases, registry identities, and per-model overrides |
+| `~/.hipfire/{config,models}.json`, `per_model_config.json` | Legacy migration inputs only |
 
 ```bash
 tail -f ~/.hipfire/serve.log

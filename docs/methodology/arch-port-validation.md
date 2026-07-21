@@ -128,7 +128,7 @@ Only when the port changes observable serve behavior:
 | Harness | Path | Scope |
 |---|---|---|
 | Generic serve | [`scripts/serve_harness.py`](../../scripts/serve_harness.py) | Model-agnostic battery / chain / session |
-| LFM framing | [`scripts/lfm_serve_harness.py`](../../scripts/lfm_serve_harness.py) | `lfm2.5:*` thinking / combined output only |
+| LFM framing | [`scripts/serve_harness.py`](../../scripts/serve_harness.py) with the exact `lfm2.5:*` tag | LFM thinking / combined output only |
 | Maintained wrapper | [`scripts/gates.sh`](../../scripts/gates.sh) | Optional Redline capture + serve + optional `probe_commits.sh`; requires `--model`; **does not** call retired coherence-gate scripts |
 
 Semantics success ≠ numerical parity ≠ product timed-arm / PM4 proof.
