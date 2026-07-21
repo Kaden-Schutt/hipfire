@@ -369,6 +369,33 @@ impl Carrier for Qwen35Carrier {
                     ctx.max_seq
                 };
 
+                // ── COR-006: pre-allocation eviction rejection ──────────
+                // Reject impossible budget/beta/cap combinations before GPU
+                // allocation so a fat-fingered config fails fast rather than
+                // after allocating a full-context KV cache.
+                if let Some(ref sidecar) = ctx.cask.sidecar {
+                    if ctx.cask.budget == 0 {
+                        return Err(format!(
+                            "cask budget must be >0, got {} (sidecar={sidecar})",
+                            ctx.cask.budget
+                        ));
+                    }
+                    if ctx.cask.budget + ctx.cask.beta + 4 > ctx.max_seq {
+                        return Err(format!(
+                            "cask budget ({}) + beta ({}) + 4 = {} exceeds max_seq ({}) — eviction can never fire; reduce budget, increase max_seq, or override physical_cap via HIPFIRE_KV_PHYSICAL_CAP",
+                            ctx.cask.budget,
+                            ctx.cask.beta,
+                            ctx.cask.budget + ctx.cask.beta + 4,
+                            ctx.max_seq
+                        ));
+                    }
+                }
+
+                // ── COR-006: thread eviction physical_cap into KvCache alloc ──
+                if physical_cap < ctx.max_seq {
+                    ctx.kv_physical_cap = Some(physical_cap);
+                }
+
                 // VL detection — loads weights from hfq_file in-place
                 let (vision_config, vision_weights) = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;

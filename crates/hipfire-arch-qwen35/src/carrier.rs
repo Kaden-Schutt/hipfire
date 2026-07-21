@@ -90,7 +90,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
         max_seq: ctx.max_seq,
-        physical_cap: Some(ctx.max_seq),
+        physical_cap: ctx.kv_physical_cap.or(Some(ctx.max_seq)),
     };
     let mut kv =
         KvCache::from_mode(mode, KvTarget::Single(ctx.gpu), &dims).map_err(|e| format!("{e}"))?;

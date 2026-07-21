@@ -1937,6 +1937,7 @@ pub fn load_model(
         mtp_mode,
         mtp_k: normalize_mtp_k(source_arch_id, spec.mtp_k)?,
         spec,
+        kv_physical_cap: None,
         gpu,
     };
 
@@ -3268,6 +3269,361 @@ mod registry_tests {
         assert_eq!(
             after, baseline,
             "sidecar read failure leaked unpublished Qwen35 bundle: baseline={baseline}, after={after}"
+        );
+    }
+
+    /// When a CASK sidecar is present, the KV cache allocation must be sized by
+    /// the resolved `physical_cap` (~296 slots for budget=32, beta=8) rather
+    /// than the full `max_seq` (2048). The VRAM difference between a CASK-bound
+    /// load and a non-CASK load at the same max_seq confirms the KV buffers are
+    /// physically smaller.
+    #[test]
+    #[ignore = "requires an AMD GPU and qwen3.6-27b.mq4 plus TriAttention sidecar"]
+    fn qwen35_cask_physical_cap_reduces_kv_allocation() {
+        use std::path::Path;
+
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_QWEN35_CASK_TEST_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        let sidecar_path = std::env::var("HIPFIRE_TRIATTN_SIDECAR")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/triattn-centers.bin"));
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}; set HIPFIRE_QWEN35_CASK_TEST_TARGET"
+        );
+        if !Path::new(&sidecar_path).is_file() {
+            eprintln!(
+                "  SKIP: TriAttention sidecar not found at {sidecar_path}; \
+                 set HIPFIRE_TRIATTN_SIDECAR to enable VRAM comparison"
+            );
+            return;
+        }
+
+        fn free_vram(gpu: &rdna_compute::Gpu, context: &str) -> Result<usize, String> {
+            gpu.hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .map_err(|e| format!("measure {context}: {e}"))
+        }
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let no_cask = super::CaskConfig::default();
+
+        let cask_config = super::CaskConfig {
+            sidecar: Some(sidecar_path.clone()),
+            cask_m_folding: false,
+            budget: 32,
+            beta: 8,
+            core_frac: 0.5,
+            fold_m: 2,
+        };
+
+        // Use max_seq large enough that budget+beta+safety (32+8+256=296) is <
+        // max_seq, so physical_cap clamping leaves a measurable VRAM gap.
+        const KV_MAX_SEQ: usize = 2048;
+        const EXPECTED_PHYSICAL_CAP: usize = 296; // budget+beta+safety = 32+8+256
+
+        // ── Warmup (max_seq=64, no CASK) ─────────────────────────────
+        let warmup = super::load_model(
+            &target_path,
+            64,
+            None,
+            Some("q8"),
+            None,
+            None,
+            &no_cask,
+            &mesh,
+            None,
+            super::SpecLoadCfg::default(),
+            &mut gpu,
+        )
+        .expect("warmup load");
+        super::unload_model(warmup, &mut gpu);
+        gpu.drain_pool();
+        let baseline = free_vram(&gpu, "after warmup unload").expect("baseline VRAM");
+
+        // ── CASK load (max_seq=2048, budget=32, beta=8) ──────────────
+        let cask_model = super::load_model(
+            &target_path,
+            KV_MAX_SEQ,
+            None,
+            Some("q8"),
+            None,
+            None,
+            &cask_config,
+            &mesh,
+            None,
+            super::SpecLoadCfg::default(),
+            &mut gpu,
+        )
+        .expect("CASK load");
+        let cask_free = free_vram(&gpu, "after CASK load").expect("CASK VRAM");
+        assert!(
+            cask_free < baseline,
+            "CASK load must allocate VRAM: baseline={baseline}, free={cask_free}"
+        );
+        // Check that physical_cap is reflected both in the metadata and the
+        // underlying KvCache.
+        assert_eq!(
+            cask_model.meta.physical_cap, EXPECTED_PHYSICAL_CAP,
+            "CASK load meta.physical_cap = budget+beta+safety, not max_seq"
+        );
+        if let Some(super::ModelState::Qwen35(ref bundle)) = cask_model.state {
+            assert_eq!(
+                bundle.kv_cache.physical_cap, EXPECTED_PHYSICAL_CAP,
+                "CASK load KvCache.physical_cap must match resolved cap"
+            );
+        } else {
+            panic!("CASK load did not produce a Qwen35 bundle");
+        }
+
+        super::unload_model(cask_model, &mut gpu);
+        gpu.drain_pool();
+        let after_cask = free_vram(&gpu, "after CASK unload").expect("post-CASK VRAM");
+        assert_eq!(
+            after_cask, baseline,
+            "CASK unload leaked: baseline={baseline}, after={after_cask}"
+        );
+
+        // ── Non-CASK load (max_seq=2048, no sidecar) ─────────────────
+        let full_model = super::load_model(
+            &target_path,
+            KV_MAX_SEQ,
+            None,
+            Some("q8"),
+            None,
+            None,
+            &no_cask,
+            &mesh,
+            None,
+            super::SpecLoadCfg::default(),
+            &mut gpu,
+        )
+        .expect("non-CASK load");
+        let full_free = free_vram(&gpu, "after non-CASK load").expect("non-CASK VRAM");
+        assert!(
+            full_free < baseline,
+            "non-CASK load must allocate VRAM: baseline={baseline}, free={full_free}"
+        );
+        assert_eq!(
+            full_model.meta.physical_cap, KV_MAX_SEQ,
+            "non-CASK load meta.physical_cap = max_seq"
+        );
+        if let Some(super::ModelState::Qwen35(ref bundle)) = full_model.state {
+            assert_eq!(
+                bundle.kv_cache.physical_cap, KV_MAX_SEQ,
+                "non-CASK load KvCache.physical_cap must be full max_seq"
+            );
+        } else {
+            panic!("non-CASK load did not produce a Qwen35 bundle");
+        }
+
+        super::unload_model(full_model, &mut gpu);
+        gpu.drain_pool();
+        let after_full = free_vram(&gpu, "after non-CASK unload").expect("post-non-CASK VRAM");
+        assert_eq!(
+            after_full, baseline,
+            "non-CASK unload leaked: baseline={baseline}, after={after_full}"
+        );
+
+        // ── CASK must leave more free VRAM than non-CASK ─────────────
+        assert!(
+            cask_free > full_free,
+            "CASK load must leave more free VRAM than non-CASK load: \
+             CASK free={cask_free}, non-CASK free={full_free} \
+             (CASK physical_cap={EXPECTED_PHYSICAL_CAP} < max_seq={KV_MAX_SEQ})"
+        );
+    }
+
+    /// The loader must reject budget/beta/cap combinations where eviction can
+    /// never fire, before any GPU allocation. The budget=0 and budget+beta+4 >
+    /// max_seq checks happen before the sidecar file is opened, so they're
+    /// exercisable with a dummy path.
+    #[test]
+    #[ignore = "requires an AMD GPU and qwen3.6-27b.mq4"]
+    fn qwen35_cask_rejects_impossible_budget_beta() {
+        use std::path::Path;
+
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_QWEN35_CASK_TEST_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}; set HIPFIRE_QWEN35_CASK_TEST_TARGET"
+        );
+
+        // A dummy path that exists; the budget=0 and impossible-config checks
+        // fire BEFORE any sidecar read attempt.
+        let dummy_sidecar = Some("/dev/null".to_string());
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let no_cask = super::CaskConfig::default();
+
+        // Warmup: settle the driver so repeated load_model calls have a
+        // consistent starting state.
+        let warmup = super::load_model(
+            &target_path,
+            64,
+            None,
+            Some("q8"),
+            None,
+            None,
+            &no_cask,
+            &mesh,
+            None,
+            super::SpecLoadCfg::default(),
+            &mut gpu,
+        )
+        .expect("warmup load");
+        super::unload_model(warmup, &mut gpu);
+        gpu.drain_pool();
+
+        // ── budget=0 → must reject ─────────────────────────────────
+        let zero_budget = super::CaskConfig {
+            sidecar: dummy_sidecar.clone(),
+            budget: 0,
+            beta: 8,
+            ..Default::default()
+        };
+        let error = super::load_model(
+            &target_path,
+            64,
+            None,
+            Some("q8"),
+            None,
+            None,
+            &zero_budget,
+            &mesh,
+            None,
+            super::SpecLoadCfg::default(),
+            &mut gpu,
+        )
+        .expect_err("budget=0 must be rejected");
+        assert!(
+            error.contains("cask budget must be >0"),
+            "expected budget=0 error, got: {error}"
+        );
+        gpu.drain_pool();
+
+        // ── budget+beta+4 > max_seq → must reject ───────────────────
+        // budget=32, beta=8 → budget+beta+4=44 > max_seq=40
+        let impossible = super::CaskConfig {
+            sidecar: dummy_sidecar.clone(),
+            budget: 32,
+            beta: 8,
+            ..Default::default()
+        };
+        let error = super::load_model(
+            &target_path,
+            40,
+            None,
+            Some("q8"),
+            None,
+            None,
+            &impossible,
+            &mesh,
+            None,
+            super::SpecLoadCfg::default(),
+            &mut gpu,
+        )
+        .expect_err("impossible budget+beta must be rejected");
+        assert!(
+            error.contains("eviction can never fire"),
+            "expected 'eviction can never fire' error, got: {error}"
+        );
+        gpu.drain_pool();
+    }
+
+    /// Non-eviction (no CASK sidecar) loading must remain byte-identical:
+    /// two loads with the same config must produce the same VRAM footprint.
+    /// This verifies the `kv_physical_cap: None` path leaves allocation
+    /// untouched.
+    #[test]
+    #[ignore = "requires an AMD GPU and qwen3.6-27b.mq4"]
+    fn qwen35_no_eviction_load_unchanged() {
+        use std::path::Path;
+
+        let home = std::env::var("HOME").expect("HOME is required for default model paths");
+        let target_path = std::env::var("HIPFIRE_QWEN35_CASK_TEST_TARGET")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.6-27b.mq4"));
+        assert!(
+            Path::new(&target_path).is_file(),
+            "target fixture not found: {target_path}; set HIPFIRE_QWEN35_CASK_TEST_TARGET"
+        );
+
+        fn free_vram(gpu: &rdna_compute::Gpu, context: &str) -> Result<usize, String> {
+            gpu.hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .map_err(|e| format!("measure {context}: {e}"))
+        }
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let mesh = super::DeviceMesh::single();
+        let no_cask = super::CaskConfig::default();
+        let load = |gpu: &mut rdna_compute::Gpu| {
+            super::load_model(
+                &target_path,
+                64,
+                None,
+                Some("q8"),
+                None,
+                None,
+                &no_cask,
+                &mesh,
+                None,
+                super::SpecLoadCfg::default(),
+                gpu,
+            )
+        };
+
+        // ── Warmup ───────────────────────────────────────────────────
+        let warmup = load(&mut gpu).expect("warmup load");
+        super::unload_model(warmup, &mut gpu);
+        gpu.drain_pool();
+        let baseline = free_vram(&gpu, "after warmup unload").expect("baseline VRAM");
+
+        // ── First load ───────────────────────────────────────────────
+        let model_a = load(&mut gpu).expect("first non-CASK load");
+        let free_a = free_vram(&gpu, "after first non-CASK load").expect("first VRAM");
+        assert_eq!(
+            model_a.meta.physical_cap, 64,
+            "non-CASK load must have physical_cap == max_seq"
+        );
+        super::unload_model(model_a, &mut gpu);
+        gpu.drain_pool();
+        let after_a = free_vram(&gpu, "after first non-CASK unload").expect("post-first VRAM");
+        assert_eq!(
+            after_a, baseline,
+            "first non-CASK load leaked: baseline={baseline}, after={after_a}"
+        );
+
+        // ── Second load (identical config) ───────────────────────────
+        let model_b = load(&mut gpu).expect("second non-CASK load");
+        let free_b = free_vram(&gpu, "after second non-CASK load").expect("second VRAM");
+        assert_eq!(
+            model_b.meta.physical_cap, 64,
+            "second non-CASK load must also have physical_cap == max_seq"
+        );
+
+        // VRAM footprint must match the first load within the ROCm driver
+        // accounting drift envelope.
+        const DRIVER_VRAM_DRIFT_BYTES: usize = 64 * 1024 * 1024; // 64 MB
+        assert!(
+            free_a.abs_diff(free_b) <= DRIVER_VRAM_DRIFT_BYTES,
+            "second non-CASK load has different VRAM footprint than first: \
+             first={free_a}, second={free_b} (drift tolerance={} MB)",
+            DRIVER_VRAM_DRIFT_BYTES / (1024 * 1024)
+        );
+
+        super::unload_model(model_b, &mut gpu);
+        gpu.drain_pool();
+        let after_b = free_vram(&gpu, "after second non-CASK unload").expect("post-second VRAM");
+        assert_eq!(
+            after_b, baseline,
+            "second non-CASK load leaked: baseline={baseline}, after={after_b}"
         );
     }
 
