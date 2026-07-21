@@ -7,18 +7,19 @@
 //! This binary owns hipfire's operator surface and never shells out to a
 //! JavaScript or TypeScript runtime.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
+    Engine, complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat,
 };
 use hipfire_config::{
-    field, fields, load_catalog, load_env_layer, load_global, resolve, write_catalog_toml,
-    write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
-    NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
+    CONFIG_SCHEMA_VERSION, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
+    NamedLayer, ValueRule, canonical_config_key, developer_env_for_key, field, fields,
+    is_developer_key, load_catalog, load_env_layer, load_global, resolve, write_catalog_toml,
+    write_global_toml,
 };
 use hipfire_registry::{
-    load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
+    LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1, load as load_registry,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -30,7 +31,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -479,7 +480,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         ConfigAction::List(output) => {
             let (loaded, resolved) = resolved_global(paths, true)?;
             if output.json {
-                let values = fields()
+                let mut values = fields()
                     .iter()
                     .map(|field| {
                         let resolved = resolved.get(field.key).expect("schema key resolved");
@@ -495,6 +496,22 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                         )
                     })
                     .collect::<serde_json::Map<_, _>>();
+                for (key, item) in resolved
+                    .values
+                    .iter()
+                    .filter(|(key, _)| is_developer_key(key))
+                {
+                    values.insert(
+                        key.clone(),
+                        serde_json::json!({
+                            "legacy_key": null,
+                            "value": item.value,
+                            "default": null,
+                            "source": item.source,
+                            "overridden": loaded.layer.get(key).is_some(),
+                        }),
+                    );
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -526,6 +543,24 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                         source_label(&item.source)
                     );
                 }
+                for (key, item) in resolved
+                    .values
+                    .iter()
+                    .filter(|(key, _)| is_developer_key(key))
+                {
+                    let marker = if loaded.layer.get(key).is_some() {
+                        "override"
+                    } else {
+                        "inherited"
+                    };
+                    println!(
+                        "  {:<43} {:<16} {:<9} {}",
+                        key,
+                        item.value,
+                        marker,
+                        source_label(&item.source)
+                    );
+                }
                 for warning in loaded.warnings {
                     eprintln!("warning: {warning}");
                 }
@@ -534,14 +569,18 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         }
         ConfigAction::Get { key, output } => {
             let (_, resolved) = resolved_global(paths, true)?;
-            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-            let value = resolved.get(schema.key).expect("schema key resolved");
+            let canonical = canonical_config_key(&key)
+                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let schema = field(&canonical);
+            let value = resolved
+                .get(&canonical)
+                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
             if output.json {
                 println!(
                     "{}",
                     serde_json::to_string(&serde_json::json!({
-                        "key": schema.key,
-                        "legacy_key": schema.legacy_key,
+                        "key": canonical,
+                        "legacy_key": schema.map(|schema| schema.legacy_key),
                         "value": value.value,
                         "source": value.source,
                     }))?
@@ -555,9 +594,9 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             let mut loaded = load_global(&paths.config)?;
             loaded.layer.set_cli(&key, &value)?;
             write_global_toml(&paths.config, &loaded.layer)?;
-            let schema = field(&key).expect("set_cli accepted key");
-            let value = loaded.layer.get(schema.key).expect("set value");
-            println!("{} = {}", schema.key, value);
+            let canonical = canonical_config_key(&key).expect("set_cli accepted key");
+            let value = loaded.layer.get(&canonical).expect("set value");
+            println!("{canonical} = {value}");
             if loaded.format == ConfigFormat::LegacyJson {
                 println!(
                     "migrated active configuration to {}; preserved {} as a rollback copy",
@@ -570,14 +609,14 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         ConfigAction::Reset { key } => {
             let mut loaded = load_global(&paths.config)?;
             if let Some(key) = key {
-                let schema =
-                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-                let existed = loaded.layer.remove(schema.key)?.is_some();
+                let canonical = canonical_config_key(&key)
+                    .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let existed = loaded.layer.remove(&canonical)?.is_some();
                 write_global_toml(&paths.config, &loaded.layer)?;
                 if existed {
-                    println!("{} override removed", schema.key);
+                    println!("{canonical} override removed");
                 } else {
-                    println!("{} was already inherited", schema.key);
+                    println!("{canonical} was already inherited");
                 }
             } else {
                 write_global_toml(&paths.config, &ConfigLayer::default())?;
@@ -587,8 +626,56 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         }
         ConfigAction::Explain { key, output } => {
             let (loaded, resolved) = resolved_global(paths, true)?;
-            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-            let value = resolved.get(schema.key).expect("schema key resolved");
+            let canonical = canonical_config_key(&key)
+                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let value = resolved
+                .get(&canonical)
+                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
+            if is_developer_key(&canonical) {
+                let env_compat = developer_env_for_key(&canonical).expect("validated developer key");
+                if output.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "key": canonical,
+                            "legacy_key": null,
+                            "value": value.value,
+                            "source": value.source,
+                            "shadowed": value.shadowed,
+                            "default": null,
+                            "category": "diagnostic",
+                            "scope": "process",
+                            "registry_allowed": false,
+                            "experimental": true,
+                            "env_compat": env_compat,
+                            "help": "Experimental process-scoped override. Prefer a typed field when one exists.",
+                            "config_path": loaded.path,
+                        }))?
+                    );
+                } else {
+                    println!("{canonical}");
+                    println!("  value:       {}", value.value);
+                    println!("  source:      {}", source_label(&value.source));
+                    println!("  default:     unset");
+                    println!("  category:    Diagnostic");
+                    println!("  scope:       Process");
+                    println!("  registry:    false");
+                    println!("  legacy env:  {env_compat}");
+                    println!("  about:       Experimental process-scoped override. Prefer a typed field when one exists.");
+                    if !value.shadowed.is_empty() {
+                        println!("  shadowed:");
+                        for candidate in value.shadowed.iter().rev() {
+                            println!(
+                                "    {:<16} {}",
+                                candidate.value,
+                                source_label(&candidate.source)
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let schema = field(&canonical).expect("stable configuration key");
             if output.json {
                 println!(
                     "{}",
@@ -657,6 +744,14 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "schema_version": CONFIG_SCHEMA_VERSION,
                         "fields": schema,
+                        "developer_namespace": {
+                            "prefix": "developer.",
+                            "scope": "process",
+                            "registry_allowed": false,
+                            "experimental": true,
+                            "value_types": ["boolean", "integer", "number", "string"],
+                            "legacy_mapping": "HIPFIRE_FOO -> developer.foo"
+                        },
                     }))?
                 );
             } else {
@@ -670,6 +765,10 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                         field.help
                     );
                 }
+                println!(
+                    "  {:<48} {:<18} {:<12} Experimental process-scoped overrides (HIPFIRE_FOO -> developer.foo).",
+                    "developer.<name>", "unset", "scalar"
+                );
             }
             Ok(())
         }
@@ -803,6 +902,9 @@ fn model_config_command(
             Ok(())
         }
         ConfigAction::Get { key, output } => {
+            if is_developer_key(&key) {
+                bail!("developer configuration is global process policy; omit the model argument");
+            }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
             let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
             let value = resolved.get(schema.key).expect("schema key resolved");
@@ -823,6 +925,9 @@ fn model_config_command(
             Ok(())
         }
         ConfigAction::Set { key, value } => {
+            if is_developer_key(&key) {
+                bail!("developer configuration is global process policy; omit the model argument");
+            }
             let mut loaded = load_catalog(&paths.config)?;
             let id = loaded
                 .catalog
@@ -854,6 +959,9 @@ fn model_config_command(
             Ok(())
         }
         ConfigAction::Reset { key } => {
+            if key.as_deref().is_some_and(is_developer_key) {
+                bail!("developer configuration is global process policy; omit the model argument");
+            }
             let mut loaded = load_catalog(&paths.config)?;
             let Some(id) = loaded.catalog.model_id(model_name).map(str::to_owned) else {
                 println!("{model_name} has no per-model overrides");
@@ -881,6 +989,9 @@ fn model_config_command(
             Ok(())
         }
         ConfigAction::Explain { key, output } => {
+            if is_developer_key(&key) {
+                bail!("developer configuration is global process policy; omit the model argument");
+            }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
             let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
             let value = resolved.get(schema.key).expect("schema key resolved");
@@ -1472,7 +1583,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     };
     let host = config_string(&resolved, "serve.host")?;
     let port = config_u64(&resolved, "serve.port")? as u16;
-    let force_local = env_truthy("HIPFIRE_LOCAL")
+    let force_local = process_truthy("HIPFIRE_LOCAL")
         || args.image.is_some()
         || args.kv_mode.is_some()
         || args.speculation.is_some()
@@ -1604,8 +1715,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn env_truthy(name: &str) -> bool {
-    env::var(name).ok().is_some_and(|value| {
+fn process_truthy(name: &str) -> bool {
+    hipfire_config::process_value(name).is_some_and(|value| {
         !matches!(
             value.to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "off" | "no"
@@ -2231,47 +2342,50 @@ fn serve_foreground(
     }
     if !shared.idle_timeout.is_zero() {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(1));
-            if shared.admission.inflight() != 0 {
-                continue;
-            }
-            let expired = {
-                let meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                meta.current_model.is_some() && meta.last_activity.elapsed() >= shared.idle_timeout
-            };
-            if !expired {
-                continue;
-            }
-            let unloaded = {
-                let mut runtime = shared
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if runtime.current_path.is_some() {
-                    let result = runtime.engine.unload();
-                    if result.is_ok() {
-                        runtime.current_path = None;
-                        runtime.current_max_seq = 0;
-                        runtime.cache_capable = false;
-                    }
-                    result
-                } else {
-                    Ok(())
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                if shared.admission.inflight() != 0 {
+                    continue;
                 }
-            };
-            if unloaded.is_ok() {
-                let mut meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                meta.current_model = None;
-                meta.loading_model = None;
-                meta.last_activity = Instant::now();
-                eprintln!("[hipfire] unloaded idle model");
+                let expired = {
+                    let meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    meta.current_model.is_some()
+                        && meta.last_activity.elapsed() >= shared.idle_timeout
+                };
+                if !expired {
+                    continue;
+                }
+                let unloaded = {
+                    let mut runtime = shared
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if runtime.current_path.is_some() {
+                        let result = runtime.engine.unload();
+                        if result.is_ok() {
+                            runtime.current_path = None;
+                            runtime.current_max_seq = 0;
+                            runtime.cache_capable = false;
+                        }
+                        result
+                    } else {
+                        Ok(())
+                    }
+                };
+                if unloaded.is_ok() {
+                    let mut meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    meta.current_model = None;
+                    meta.loading_model = None;
+                    meta.last_activity = Instant::now();
+                    eprintln!("[hipfire] unloaded idle model");
+                }
             }
         });
     }
@@ -2914,7 +3028,9 @@ fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
             let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
             if !cmdline.contains("hipfire") || !cmdline.contains("serve") {
                 fs::remove_file(&pid_path)?;
-                bail!("PID {pid} is not a native hipfire serve process; removed stale pidfile without signaling");
+                bail!(
+                    "PID {pid} is not a native hipfire serve process; removed stale pidfile without signaling"
+                );
             }
             let status = Command::new("kill")
                 .arg("-TERM")
@@ -3529,15 +3645,18 @@ fn open_bench_engine(
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
-    let mut environment = BTreeMap::new();
-    if args.redline {
-        environment.insert("HIPFIRE_REPLAY_BACKEND".into(), "auto".into());
-        environment.insert("HIPFIRE_REPLAY_TRANSPORT".into(), "pm4".into());
-        environment.insert("HIPFIRE_AR_GRAPH".into(), "1".into());
-        environment.insert("HIPFIRE_GRAPH".into(), "1".into());
-        environment.insert("HIPFIRE_CASK_OFF".into(), "1".into());
-    }
+    let environment = BTreeMap::new();
     let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    if args.redline {
+        process_config.values.set_cli("replay.backend", "redline")?;
+        process_config.values.set_cli("replay.transport", "pm4")?;
+        process_config
+            .values
+            .set_cli("experimental.graph.ar", "true")?;
+        process_config
+            .values
+            .set_cli("experimental.graph.forward", "true")?;
+    }
     if let Some(variant) = rdna2_variant {
         process_config
             .values

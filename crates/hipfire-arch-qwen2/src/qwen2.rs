@@ -1250,7 +1250,7 @@ fn forward_step_after_x(
         // (2 for dots.ocr), so lower occupancy but eliminates the partials
         // DRAM round-trip + reduce dispatch. Probe of launch-overhead vs
         // occupancy tradeoff.
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let use_fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         if use_fused && n_kv_heads < n_heads {
@@ -1913,7 +1913,7 @@ pub fn forward_verify_block_batched(
 fn qwen2_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally
@@ -2034,7 +2034,7 @@ impl DenseArch for Qwen2Dense<'_> {
         gpu.kv_cache_write(&st.k_cache[l], &st.k, &st.pos_buf, k.kv_dim)?;
         gpu.kv_cache_write(&st.v_cache[l], &st.v, &st.pos_buf, k.kv_dim)?;
         // Attention — 4-way select (exact mirror of the SuperOp run_attend path).
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let use_fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         if use_fused && k.n_kv_heads < k.n_heads {
@@ -2106,7 +2106,7 @@ impl DenseArch for Qwen2Dense<'_> {
         let k = &self.knobs;
         // Read HIPFIRE_GQA_FUSED here, mirroring the hand attend() (which also
         // reads it per layer) — same result, strict no-op.
-        let fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         let pos = self.seq_len - 1;

@@ -2438,13 +2438,13 @@ impl Gpu {
         static GFX1151_QKVZA_WAVE64: OnceLock<bool> = OnceLock::new();
         let gfx1151_wave64 = self.arch_caps.is_gfx1151()
             && *GFX1151_QKVZA_WAVE64.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_WAVE64").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_WAVE64").as_deref() == Ok("1")
             });
         static GFX1151_QKV_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
         let gfx1151_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
             GFX1151_QKV_ALL_BUFFER_CPOL
                 .get_or_init(|| {
-                    std::env::var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL")
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL")
                         .unwrap_or_default()
                         .to_ascii_lowercase()
                 })
@@ -2456,7 +2456,7 @@ impl Gpu {
         let gfx1151_x_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKV_X_BUFFER.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKV_X_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_X_BUFFER").as_deref() == Ok("1")
             });
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
@@ -2845,8 +2845,8 @@ impl Gpu {
         let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
-                    || std::env::var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA").as_deref()
+                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
+                    || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA").as_deref()
                         == Ok("1")
             });
         let gfx1151_k2048_all_buffer = self.arch_caps.is_gfx1151() && k == 2_048;
@@ -2858,13 +2858,13 @@ impl Gpu {
             && k == 2_048
             && total_m > 2_048
             && *GFX1151_QKVZA_X_BUFFER_LARGE.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE").as_deref() == Ok("1")
             });
         static GFX1151_QKVZA_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
         let gfx1151_k2048_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
             GFX1151_QKVZA_ALL_BUFFER_CPOL
                 .get_or_init(|| {
-                    std::env::var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL")
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL")
                         .unwrap_or_default()
                         .to_ascii_lowercase()
                 })
@@ -2876,31 +2876,31 @@ impl Gpu {
         let gfx1151_k2048_ldsx8_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_LDSX8_BUFFER.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER").as_deref() == Ok("1")
             });
         static GFX1151_QKVZA_PAIR_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_pair_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_PAIR_BUFFER.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER").as_deref() == Ok("1")
             });
         static GFX1151_QKVZA_K2048_HOIST: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_hoist = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_K2048_HOIST.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_K2048_HOIST").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_K2048_HOIST").as_deref() == Ok("1")
             });
         static GFX1151_QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_r2 = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_R2.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_R2").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R2").as_deref() == Ok("1")
             });
         static GFX1151_QKVZA_R2_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_r2_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_R2_BUFFER.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_R2_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R2_BUFFER").as_deref() == Ok("1")
             });
         static GFX1151_QKVZA_R4_STREAM: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_r4_stream = self.arch_caps.is_gfx1151()
@@ -2911,23 +2911,23 @@ impl Gpu {
             && beta_m.is_multiple_of(4)
             && alpha_m.is_multiple_of(4)
             && *GFX1151_QKVZA_R4_STREAM.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_R4_STREAM").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R4_STREAM").as_deref() == Ok("1")
             });
         static GFX1151_QKVZA_WAVE64_SHARE_X: OnceLock<bool> = OnceLock::new();
         let gfx1151_wave64_share_x = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_WAVE64_SHARE_X.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X").as_deref() == Ok("1")
             });
         static QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_r2 = rdna3_k2048
             && *QKVZA_R2.get_or_init(|| {
-                std::env::var("HIPFIRE_RDNA3_QKVZA_R2").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_RDNA3_QKVZA_R2").as_deref() == Ok("1")
             });
         static QKVZA_CPOL_SLC: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_cpol_slc = rdna3_k2048
             && *QKVZA_CPOL_SLC.get_or_init(|| {
-                std::env::var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc")
+                hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc")
             });
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
@@ -8725,7 +8725,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/residual).
-        let bt_b: usize = if std::env::var("HIPFIRE_GATE_UP_BT")
+        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(true)
         {
@@ -10448,7 +10448,7 @@ impl Gpu {
         // accumulator chains hide the WMMA latency that caps the 1-acc kernel at ~19%
         // of peak. B = clamp(N/16, 1, 12), capped at 12 (B=16 spills VGPR). Byte-exact
         // vs the 1-acc kernel; +85% at N=192 on gfx1201.
-        let bt_b: usize = if std::env::var("HIPFIRE_GATE_UP_BT")
+        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(true)
         {
@@ -10573,7 +10573,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/qkvza).
-        let bt_b: usize = if std::env::var("HIPFIRE_GATE_UP_BT")
+        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(true)
         {

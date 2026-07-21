@@ -746,6 +746,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 name = "hip-bridge"
 version = "0.3.0"
 dependencies = [
+ "hipfire-config",
  "libloading",
  "thiserror 2.0.18",
 ]
@@ -755,6 +756,7 @@ name = "hipfire-arch-cohere2moe"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
@@ -767,6 +769,7 @@ name = "hipfire-arch-deepseek4"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
@@ -781,6 +784,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
+ "hipfire-config",
  "hipfire-runtime",
  "image",
  "rdna-compute",
@@ -792,6 +796,7 @@ name = "hipfire-arch-lfm2moe"
 version = "0.1.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
@@ -815,6 +820,7 @@ name = "hipfire-arch-minimax"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
@@ -828,6 +834,7 @@ name = "hipfire-arch-qwen2"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
@@ -840,6 +847,7 @@ name = "hipfire-arch-qwen35"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
@@ -931,6 +939,7 @@ name = "hipfire-dispatch"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "rdna-compute",
 ]
 
@@ -957,6 +966,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-config",
  "hipfire-runtime",
  "rdna-compute",
  "serde_json",
@@ -969,6 +979,7 @@ dependencies = [
  "byteorder",
  "clap",
  "half",
+ "hipfire-config",
  "hipfire-reap",
  "hipfire-runtime",
  "libc",
@@ -984,6 +995,7 @@ dependencies = [
 name = "hipfire-reap"
 version = "0.3.0"
 dependencies = [
+ "hipfire-config",
  "hipfire-runtime",
  "serde_json",
  "tempfile",

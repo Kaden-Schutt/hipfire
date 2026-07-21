@@ -1316,7 +1316,7 @@ pub fn vision_forward(
     // names match `benchmarks/references/dots_ocr_smoke_001_activations/`:
     // patch_embed, block_00, block_21, block_41, post_trunk_norm, merger.
     // Each is written as a NumPy `.npy` file in native row-major F32.
-    let dump_dir: Option<std::path::PathBuf> = std::env::var("HIPFIRE_DOTS_OCR_DUMP_DIR")
+    let dump_dir: Option<std::path::PathBuf> = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_DUMP_DIR")
         .ok()
         .map(std::path::PathBuf::from);
     if let Some(ref d) = dump_dir {
@@ -1351,7 +1351,7 @@ pub fn vision_forward(
     //
     // patch_embed_w on GPU is the 4-D conv weight flattened to a
     // `[embed_dim, patch_dim]` linear (verified during load).
-    let trace_pre = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
+    let trace_pre = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
     let dump_stats = |gpu: &Gpu, t: &GpuTensor, label: &str| -> HipResult<()> {
         if !trace_pre {
             return Ok(());
@@ -1414,7 +1414,7 @@ pub fn vision_forward(
     // residual stream is bf16-precision throughout. Emulate that by
     // bf16-truncating at every block boundary (after each residual add).
     // Optional via env var so it can be A/B tested.
-    let bf16_residual = std::env::var("HIPFIRE_DOTS_OCR_BF16_RESIDUAL")
+    let bf16_residual = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_BF16_RESIDUAL")
         .ok()
         .as_deref()
         == Some("1");
@@ -1444,7 +1444,7 @@ pub fn vision_forward(
     // the first failing kernel surfaces directly instead of via a sticky
     // error reported later (HIP errors are async-sticky — the call that
     // reports them is rarely the launch that caused them).
-    let trace = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
+    let trace = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
     macro_rules! probe {
         ($gpu:expr, $msg:literal) => {
             if trace {

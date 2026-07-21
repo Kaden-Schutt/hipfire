@@ -1860,7 +1860,7 @@ pub fn mtp_head_apply_lm_head_batched(
             // the head lm_head is ALSO scalar today — gets the fix too. WMMA
             // needs wave32 (gfx11+) and K%32==0; else fall back to scalar.
             // Opt out with HIPFIRE_MTP_HEAD_LMHEAD_WMMA=0.
-            let use_wmma = std::env::var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA")
+            let use_wmma = hipfire_config::developer_var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA")
                 .ok()
                 .as_deref()
                 != Some("0")

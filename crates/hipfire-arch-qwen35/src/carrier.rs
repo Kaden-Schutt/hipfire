@@ -56,7 +56,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         KvCache::from_mode(mode, KvTarget::Single(ctx.gpu), &dims).map_err(|e| format!("{e}"))?;
 
     // ── V-mode override via env ──────────────────────────────
-    let kv_v_env = std::env::var("HIPFIRE_KV_V").unwrap_or_default();
+    let kv_v_env = hipfire_config::developer_var("HIPFIRE_KV_V").unwrap_or_default();
     let v_mode_override = match kv_v_env.as_str() {
         "lloyd2" => Some(llama::VMode::Lloyd2),
         "lloyd3" => Some(llama::VMode::Lloyd3),

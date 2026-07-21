@@ -50,17 +50,6 @@ pub enum ExpertAssign {
     Stride,
 }
 
-impl ExpertAssign {
-    /// Resolve from `HIPFIRE_TP_EXPERT_ASSIGN` (`contiguous` | `stride`).
-    /// Default `Stride` per TP plan §3.6.
-    pub fn from_env() -> Self {
-        match std::env::var("HIPFIRE_TP_EXPERT_ASSIGN").ok().as_deref() {
-            Some("contiguous") | Some("block") => ExpertAssign::Contiguous,
-            _ => ExpertAssign::Stride,
-        }
-    }
-}
-
 /// Pure-CPU TP shard descriptor. Cheap to clone; carries no GPU handles.
 #[derive(Debug, Clone)]
 pub struct ShardConfig {

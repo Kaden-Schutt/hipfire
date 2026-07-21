@@ -7,6 +7,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 rdna-compute = { path = "../rdna-compute" }

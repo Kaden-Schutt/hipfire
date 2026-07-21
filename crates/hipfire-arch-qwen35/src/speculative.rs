@@ -65,10 +65,10 @@ fn run_spec_gemm_key(
     use hipfire_dispatch::families::gemv::WeightRef;
     use std::cell::RefCell;
     // Cache the DispatchCtx per thread instead of rebuilding it on every call.
-    // `DispatchCtx::new` runs `FeatureFlags::from_env` (41 `env::var` reads under
-    // the process-global env lock) + ArchCaps + ResourceManager, and its own doc
-    // says it is "resolved once ... and shared immutably across all dispatch
-    // calls". This helper is hit ~170×/generation by the DFlash verify+draft
+    // `DispatchCtx::new` lowers the immutable process snapshot into FeatureFlags
+    // plus ArchCaps and ResourceManager; its own doc says it is "resolved once
+    // ... and shared immutably across all dispatch calls". This helper is hit
+    // ~170×/generation by the DFlash verify+draft
     // lm_head loop, so reconstructing the ctx per call cost ~9 tok/s at constant
     // τ (gfx1201, 27B AWQ DFlash). `gemm_family()` is already a OnceLock
     // singleton; this brings the ctx in line. Keyed on `gpu.arch` so a thread
@@ -1109,7 +1109,7 @@ impl GdnTape {
         dn_state: &mut qwen35::DeltaNetState,
         n_steps: usize,
     ) -> HipResult<()> {
-        let graph_enabled = std::env::var("HIPFIRE_REPLAY_GRAPH").ok().as_deref() == Some("1");
+        let graph_enabled = hipfire_config::developer_var("HIPFIRE_REPLAY_GRAPH").ok().as_deref() == Some("1");
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
@@ -2223,7 +2223,7 @@ fn verify_dflash_block_inner(
     // shapes. sub_offset returns a non-owning view; do NOT free these.
     let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
     let tree_verify_present = tree_verify.is_some();
-    let moe_lmhead_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
+    let moe_lmhead_graph_env = hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
     let moe_lmhead_graph_ok =
         dflash_moe_verify_graph_lmhead_eligible(
             target.config.num_experts,
@@ -2270,7 +2270,7 @@ fn verify_dflash_block_inner(
     //
     // Gate kept live so the next session can bisect without re-plumbing.
     let tree_graph_enabled =
-        std::env::var("HIPFIRE_VERIFY_GRAPH_TREE").ok().as_deref() == Some("1");
+        hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH_TREE").ok().as_deref() == Some("1");
     if tree_graph_enabled && tree_verify_present {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -2290,7 +2290,7 @@ fn verify_dflash_block_inner(
     // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
     // would skip a verify-graph that now replays fine and forfeit the long-context
     // spec speedup.
-    let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
+    let verify_graph_ok = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
         && tree_ok_for_graph
         && matches!(
             target.weights.embd_format,
@@ -2303,7 +2303,7 @@ fn verify_dflash_block_inner(
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
     // forward + lm_head; the recorded mode tag distinguishes replay vs
     // warmup-direct vs first-capture vs no-graph-eligible.
-    let vg_timing = std::env::var("HIPFIRE_VERIFY_GRAPH_TIMING").ok().as_deref() == Some("1");
+    let vg_timing = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH_TIMING").ok().as_deref() == Some("1");
     let mut vg_mode = "direct";
     let vg_t0 = if vg_timing {
         gpu.hip.device_synchronize()?;
@@ -2876,7 +2876,7 @@ pub fn spec_step_dflash(
     // of Instant::now() calls.
     static PHASE_ON_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let phase_on = *PHASE_ON_ENV
-        .get_or_init(|| std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1"));
+        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1"));
     if phase_on {
         gpu.hip.device_synchronize()?;
     }
@@ -2922,7 +2922,7 @@ pub fn spec_step_dflash(
     static LOGIT_DUMP_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let logit_dump_active = !use_temp_sampling
         && *LOGIT_DUMP_ENV.get_or_init(|| {
-            std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
+            hipfire_config::developer_var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
         });
     let host_path_active = rp_active || ngram_block_active || logit_dump_active;
     // HIPFIRE_DFLASH_FAST_SAMPLE (default ON, opt out with =0): in the temp>0
@@ -2937,7 +2937,7 @@ pub fn spec_step_dflash(
     // borderline `u*p_d <= p_t` accept) — validated coherent across genres
     // (no attractors), so default-on. Greedy path (temp==0) is never affected.
     let fast_sample_active = use_temp_sampling && gpu.flags.dflash_fast_sample;
-    let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
+    let draft_ffn_graph_env = hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
         ctx_slice.is_some(),
@@ -3823,7 +3823,7 @@ pub fn spec_step_dflash(
     if rej_proxy.is_none() {
         SEED_ORACLE_FULLACCEPT.fetch_add(1, Ordering::Relaxed);
     }
-    if std::env::var("HIPFIRE_DFLASH_SEED_ORACLE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_DFLASH_SEED_ORACLE").ok().as_deref() == Some("1") {
         let s = read_seed_oracle_stats();
         let denom = s.total.max(1) as f32;
         eprintln!(
@@ -5191,7 +5191,7 @@ pub fn spec_step_ddtree_batched(
     // Dual-path proof: download the GPU mask and compare byte-for-byte with
     // the host mask_host computed by linearize_tree_with_parents above.
     // Off by default (costs one D2H per cycle).
-    if std::env::var("HIPFIRE_DDTREE_ASSERT_MASK").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_DDTREE_ASSERT_MASK").ok().as_deref() == Some("1") {
         // Synchronize so the kernel has finished writing before the D2H.
         gpu.hip.device_synchronize()?;
         let n_floats = big_n * big_n;
@@ -5355,7 +5355,7 @@ pub fn spec_step_ddtree_batched(
     // verify to fix KV cache entries at committed slots (topk>1 siblings
     // at same depth otherwise race and the LAST write wins regardless of
     // which sibling was committed).
-    let force_slow = std::env::var("HIPFIRE_DDTREE_FORCE_SLOW").ok().as_deref() == Some("1");
+    let force_slow = hipfire_config::developer_var("HIPFIRE_DDTREE_FORCE_SLOW").ok().as_deref() == Some("1");
     let spine_accept = accepted_node_indices
         .iter()
         .enumerate()
@@ -5374,7 +5374,7 @@ pub fn spec_step_ddtree_batched(
     } else if !force_slow {
         DDTREE_SLOW_COUNT.with(|c| c.set(c.get() + 1));
     }
-    if std::env::var("HIPFIRE_DDTREE_TAPE_DUMP").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_DDTREE_TAPE_DUMP").ok().as_deref() == Some("1") {
         let fast = DDTREE_FAST_COUNT.with(|c| c.get());
         let slow = DDTREE_SLOW_COUNT.with(|c| c.get());
         eprintln!(

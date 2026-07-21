@@ -5301,7 +5301,7 @@ mod dispatch_tests {
     ];
 
     fn make_caps(arch: &str) -> ArchCaps {
-        ArchCaps::new(arch, Arc::new(FeatureFlags::from_env_for_test(arch)))
+        ArchCaps::new(arch, Arc::new(FeatureFlags::for_test(arch)))
     }
 
     #[test]

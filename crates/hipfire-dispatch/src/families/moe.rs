@@ -712,7 +712,7 @@ impl MoeFamily {
     ///
     /// Takes no `DispatchCtx`: the bias-aware path dispatches fixed MQ2-Lloyd
     /// kernels with no arch-gated sub-dispatch, so building a `DispatchCtx`
-    /// per layer per token (an uncached `FeatureFlags::from_env` parse) would
+    /// per layer per token (an uncached generic policy parse) would
     /// be pure waste on the decode hot path.
     pub fn run_bias_aware(
         &self,

@@ -172,7 +172,7 @@ impl MiniMaxConfig {
 /// literal original full-load path — byte-identical to baseline. REAP and EP
 /// sharding are MUTUALLY EXCLUSIVE; that guard lives in `MiniMaxWeights::load`.
 pub fn apply_reap_plan(config: &mut MiniMaxConfig) -> Result<(), String> {
-    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
         "minimax",
         None,
         config.num_hidden_layers,
@@ -662,7 +662,7 @@ impl MiniMaxWeights {
                 &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
                 hidden,
             );
-            if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
+            if hipfire_config::developer_var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
                 // down-AWQ harmful (shared s_down bad approx); opt-in
                 down.awq_scale = load_mm_awq_scale(
                     hfq,
@@ -1367,7 +1367,7 @@ pub fn load_weights_from_safetensors(
             &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
             hidden,
         );
-        if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
+        if hipfire_config::developer_var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
             down.awq_scale = load_mm_awq_scale_from_source(
                 source,
                 gpu,

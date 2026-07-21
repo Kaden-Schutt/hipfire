@@ -155,7 +155,7 @@ pub fn verify_llama_commit(bin: &str, pinned: &str, tool_name: &str) {
     // available llama.cpp build differs from the pinned commit (the KLD value
     // is insensitive to the exact llama.cpp commit). Set
     // HIPFIRE_SKIP_LLAMA_COMMIT_CHECK=1 to bypass.
-    if std::env::var("HIPFIRE_SKIP_LLAMA_COMMIT_CHECK")
+    if hipfire_config::developer_var("HIPFIRE_SKIP_LLAMA_COMMIT_CHECK")
         .ok()
         .as_deref()
         == Some("1")

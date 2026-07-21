@@ -203,7 +203,7 @@ fn load_qwen35_pp(
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
         .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
-    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS")
+    let mut gpus = match hipfire_config::developer_var("HIPFIRE_PP_LAYERS")
         .ok()
         .filter(|s| !s.is_empty())
     {
@@ -348,7 +348,7 @@ impl Carrier for Qwen35Carrier {
 
                 // ── pp=1 path (single-GPU) ────────────────────
                 let physical_cap = if ctx.cask.sidecar.is_some() {
-                    let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP")
+                    let env_override = hipfire_config::developer_var("HIPFIRE_KV_PHYSICAL_CAP")
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok());
                     let safety = 256usize;
@@ -682,7 +682,7 @@ impl Carrier for LlamaCarrier {
             // conf_threshold ladder: env > CLI arg > 0.1
             // Default 0.1 (sweep-tuned): 0.5 over-truncates (1.46/7 proposed);
             // 0.1 proposes ~6.94/7, +16.6% prose tok/s / +7.1% code tok/s.
-            let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
+            let conf_threshold = hipfire_config::developer_var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .or(ctx.spec.dspark_conf_threshold)
@@ -953,7 +953,7 @@ impl Carrier for Deepseek4Carrier {
             }
         };
         let state = deepseek4::DeepseekV4State::new(&config)?;
-        let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+        let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1024);
@@ -1003,7 +1003,7 @@ impl Carrier for Deepseek4Carrier {
         } else if weights.mtp_layer.is_some() {
             // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
             // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
-            let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+            let max_n: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .or_else(|| {

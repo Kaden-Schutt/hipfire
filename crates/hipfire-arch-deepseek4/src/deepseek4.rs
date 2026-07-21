@@ -239,7 +239,7 @@ impl DeepseekV4Config {
         // New generic env HIPFIRE_REAP_PLAN=<dir> (reap_plan.json); legacy
         // HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir> (keep_by_layer.json) is still
         // honored as a keep-only alias via ReapPlan::load_any.
-        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
             "deepseek4",
             Some("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP"),
             config.num_hidden_layers,

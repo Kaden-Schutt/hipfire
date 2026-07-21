@@ -169,7 +169,7 @@ pub struct AsstTurnCache {
 
 impl AsstTurnCache {
     pub fn new_from_env() -> Self {
-        let unbounded = std::env::var("HIPFIRE_PROMPT_CACHE_UNBOUNDED")
+        let unbounded = hipfire_config::developer_var("HIPFIRE_PROMPT_CACHE_UNBOUNDED")
             .ok()
             .as_deref()
             == Some("1");
@@ -177,7 +177,7 @@ impl AsstTurnCache {
             None
         } else {
             Some(
-                std::env::var("HIPFIRE_PROMPT_CACHE_CAP")
+                hipfire_config::developer_var("HIPFIRE_PROMPT_CACHE_CAP")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(32),
@@ -754,7 +754,7 @@ fn finish_qwen35_load(
                                 lm_head.dtype = rdna_compute::DType::F16;
                                 lm_head.shape = vec![vocab];
                                 let conf_threshold =
-                                    std::env::var("HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD")
+                                    hipfire_config::developer_var("HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD")
                                         .ok()
                                         .and_then(|s| s.parse().ok())
                                         .or(ctx.spec.dspark_conf_threshold)
@@ -852,7 +852,7 @@ fn finish_qwen35_load(
         && dspark_speculator.is_none()
         && eviction.is_none()
         && matches!(arch_id, 5 | 6)
-        && std::env::var("HIPFIRE_QWEN35_MTP").ok().as_deref() == Some("1")
+        && hipfire_config::developer_var("HIPFIRE_QWEN35_MTP").ok().as_deref() == Some("1")
         && ctx.path.ends_with(".mq4-mtp")
     {
         match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
@@ -1193,7 +1193,7 @@ fn load_cohere2moe(
 /// real EP load.
 #[cfg(feature = "ep-fault-inject")]
 fn ep_fail_rank() -> Option<usize> {
-    match std::env::var("HIPFIRE_EP_FAIL_RANK").ok() {
+    match hipfire_config::developer_var("HIPFIRE_EP_FAIL_RANK").ok() {
         Some(s) if !s.is_empty() => s.parse::<usize>().ok(),
         _ => None,
     }

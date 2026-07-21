@@ -7,8 +7,8 @@
 
 For persistent user configuration, prefer `hipfire config set ...` and
 `~/.hipfire/config.toml`. Schema-declared environment variables are retained as
-one-shot/compatibility overrides. The native CLI projects explicitly set
-process-wide boolean TOML keys into the daemon snapshot; see
+one-shot/compatibility overrides. The native CLI resolves stable typed fields
+and experimental `[developer]` values into one versioned daemon snapshot; see
 [`CONFIG.md`](CONFIG.md#process-wide-hardware-and-kernel-policy).
 
 This page has two layers:
@@ -35,11 +35,34 @@ somewhere in this file).
 
 Legacy `config.json`, `models.json`, and `per_model_config.json` are read only
 as migration inputs when their TOML successors do not exist. Invoking the
-daemon binary directly skips the control-plane config and registry layers.
+daemon binary directly still resolves local TOML plus compatibility variables
+before GPU initialization, but does not add registry/per-model policy that was
+not supplied by a native client.
 
 Ladder for speculation selector (product path): `HIPFIRE_SPECULATION` / `--spec` > per-model > global > default `auto`.
 
 Effective sampling send order (run/serve): CLI flags > per-model > registry `recommended_settings` > daemon/HFQ/arch fallback (field omitted when only a bare global default would apply). Global-only sampling edits are not sent; registry `sampling` blocks are inert metadata — see [`CONFIG.md`](CONFIG.md) / [`MODELS.md`](MODELS.md). **Chat** keeps a global session snapshot exception ([CHAT.md](CHAT.md)).
+
+### TOML replacement for experimental variables
+
+Production engine code no longer reads the ambient environment for kernel,
+architecture, replay, or diagnostic behavior. Stable controls use typed schema
+keys. Residual experiments use a flat global-only namespace:
+
+```toml
+[developer]
+gfx1151_gate_up_wave64 = true
+deepseek4_attn = "twin"
+```
+
+The generic compatibility rule is `HIPFIRE_FOO=value` →
+`developer.foo = "value"` at startup. This preserves existing harnesses while
+making TOML the persistent and navigable surface. `[developer]` values are
+process-scoped, excluded from registry and per-model policy, and frozen before
+GPU initialization. The only direct production environment reads left are
+bootstrap locations needed to discover config or launch the process (for
+example `HIPFIRE_HOME`, binary paths, registry URL, kernel cache, spill path,
+and quant diagnostic output).
 
 ---
 
@@ -211,6 +234,7 @@ field-only keys (temperature, thinking, …) have no compatibility alias.
 | `max_request_bytes` | `HIPFIRE_MAX_REQUEST_BYTES` |
 | `serve_max_queue` | `HIPFIRE_SERVE_MAX_QUEUE` |
 | `serve_queue_timeout_ms` | `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` |
+| `serve.local` | `HIPFIRE_LOCAL` |
 | `prefill_*` | matching `HIPFIRE_PREFILL_*` |
 | `mmq_screen*` | `HIPFIRE_MMQ_SCREEN*` |
 | `hardware.devices` | `HIPFIRE_DEVICES` |

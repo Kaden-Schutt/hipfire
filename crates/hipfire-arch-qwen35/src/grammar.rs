@@ -132,7 +132,7 @@ fn ngram_min_repeats() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("HIPFIRE_QWEN35_NGRAM_MIN_REPEATS")
+        hipfire_config::developer_var("HIPFIRE_QWEN35_NGRAM_MIN_REPEATS")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n: &usize| n >= 2 && n <= 32)
@@ -144,7 +144,7 @@ fn ngram_len_min() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("HIPFIRE_QWEN35_NGRAM_LEN_MIN")
+        hipfire_config::developer_var("HIPFIRE_QWEN35_NGRAM_LEN_MIN")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n: &usize| n >= 1 && n <= NGRAM_LEN_MAX)

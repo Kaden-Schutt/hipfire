@@ -22,7 +22,7 @@ struct DsparkProfiler {
 
 impl DsparkProfiler {
     fn new() -> Self {
-        let enabled = std::env::var("HIPFIRE_DSPARK_PROFILE")
+        let enabled = hipfire_config::developer_var("HIPFIRE_DSPARK_PROFILE")
             .map(|s| s == "1")
             .unwrap_or(false);
         Self {
@@ -411,7 +411,7 @@ fn gemv_auto_batched_wmma(
             .gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
         DType::Q8_0 => {
-            let wmma_on = std::env::var("HIPFIRE_DSPARK_Q8_WMMA")
+            let wmma_on = hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_WMMA")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on && gpu.arch_caps.is_rdna4() {
@@ -419,7 +419,7 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out = std::env::var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
+                    let opt_out = hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096
@@ -440,7 +440,7 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out_4w = std::env::var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
+                    let opt_out_4w = hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
                     if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
@@ -487,7 +487,7 @@ fn gemv_auto_batched_wmma(
             }
         }
         _ => {
-            let wmma_on = std::env::var("HIPFIRE_DSPARK_HFQ4_WMMA")
+            let wmma_on = hipfire_config::developer_var("HIPFIRE_DSPARK_HFQ4_WMMA")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on {
@@ -1133,7 +1133,7 @@ impl MtpDrafter for DsparkDrafter {
         if self.ctx_positions.is_empty() {
             // Initial window: bootstrap with a 1-token capture-armed forward.
             let hidden_host = target.capture_seed_main_hidden(gpu, seed, position, &layers)?;
-            if std::env::var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
+            if hipfire_config::developer_var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
                 let n = hidden_host.len();
                 let mean = hidden_host.iter().sum::<f32>() / n.max(1) as f32;
                 let rms = (hidden_host.iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32).sqrt();
@@ -1173,7 +1173,7 @@ impl MtpDrafter for DsparkDrafter {
         // DEBUG: HIPFIRE_DSPARK_ZERO_CTX=1 zeros the context main_hidden to test
         // whether the drafter attends to it at all (identical drafts ⇒ ctx unused).
         let _zero_ctx_holder;
-        let main_hidden = if std::env::var("HIPFIRE_DSPARK_ZERO_CTX").as_deref() == Ok("1") {
+        let main_hidden = if hipfire_config::developer_var("HIPFIRE_DSPARK_ZERO_CTX").as_deref() == Ok("1") {
             let n: usize = main_hidden_real.shape.iter().product();
             _zero_ctx_holder = upload_f32(gpu, &vec![0.0f32; n])?;
             &_zero_ctx_holder
@@ -1290,7 +1290,7 @@ impl MtpDrafter for DsparkDrafter {
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
         let t_rest = self.profiler.sync_start(gpu);
-        if std::env::var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
+        if hipfire_config::developer_var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
             eprintln!(
                 "[dspark] pos={position} seed={seed} n_prop={n_proposed} drafts={:?} target_pick={:?} conf={:?}",
                 &drafts,
@@ -1436,7 +1436,7 @@ pub fn build_dspark_speculator(
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
     // Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today).
-    let adaptive = std::env::var("HIPFIRE_DSPARK_ADAPTIVE_BLOCK")
+    let adaptive = hipfire_config::developer_var("HIPFIRE_DSPARK_ADAPTIVE_BLOCK")
         .ok()
         .as_deref()
         != Some("0");

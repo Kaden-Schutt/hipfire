@@ -48,7 +48,7 @@ pub fn restore_gdn_requant_frame_checkpoint(frame: u32) {
 fn dn_requant_per_token() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("HIPFIRE_DN_REQUANT_PER_TOKEN")
+        hipfire_config::developer_var("HIPFIRE_DN_REQUANT_PER_TOKEN")
             .map(|v| {
                 let v = v.trim();
                 !v.is_empty() && v != "0"
@@ -64,7 +64,7 @@ fn dn_requant_per_token() -> bool {
 pub fn gdn_chunked() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("HIPFIRE_GDN_CHUNKED")
+        hipfire_config::developer_var("HIPFIRE_GDN_CHUNKED")
             .map(|v| {
                 let v = v.trim();
                 !v.is_empty() && v != "0"
@@ -79,7 +79,7 @@ pub fn gdn_chunked() -> bool {
 pub fn gdn_chunk_size() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        let cs = std::env::var("HIPFIRE_GDN_CHUNK_SIZE")
+        let cs = hipfire_config::developer_var("HIPFIRE_GDN_CHUNK_SIZE")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(16);
@@ -2390,11 +2390,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let gfx1151_r8 = self.arch_caps.is_gfx1151()
-            && std::env::var("HIPFIRE_GFX1151_GDN_R8").as_deref() == Ok("1");
+            && hipfire_config::developer_var("HIPFIRE_GFX1151_GDN_R8").as_deref() == Ok("1");
         let gfx1151_r4x2 = self.arch_caps.is_gfx1151()
-            && std::env::var("HIPFIRE_GFX1151_GDN_R4X2").as_deref() == Ok("1");
+            && hipfire_config::developer_var("HIPFIRE_GFX1151_GDN_R4X2").as_deref() == Ok("1");
         let gfx1151_dpp = self.arch_caps.is_gfx1151()
-            && std::env::var("HIPFIRE_GFX1151_GDN_DPP").as_deref() == Ok("1");
+            && hipfire_config::developer_var("HIPFIRE_GFX1151_GDN_DPP").as_deref() == Ok("1");
         let (kernel_name, kernel_src, n_tiles, block_size) = if gfx1151_dpp {
             (
                 "gated_delta_net_q8_compact2_dpp_gfx1151",
@@ -2418,7 +2418,7 @@ impl Gpu {
             )
         } else {
             let (kernel_name, kernel_src) =
-                match std::env::var("HIPFIRE_GDN_COMPACT2_SHAPE").ok().as_deref() {
+                match hipfire_config::developer_var("HIPFIRE_GDN_COMPACT2_SHAPE").ok().as_deref() {
                     Some("b2") => (
                         "gated_delta_net_q8_compact2_b2",
                         kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
@@ -3010,7 +3010,7 @@ impl Gpu {
         // blockDim.x: 32 = 1 wave/4-rows-per-lane, 128 = 4 waves (latency
         // hiding + 1 HD row/lane), 256 = 8 waves. Default 128; override for
         // perf sweeps via HIPFIRE_GDN_BLK.
-        let blk: u32 = std::env::var("HIPFIRE_GDN_BLK")
+        let blk: u32 = hipfire_config::developer_var("HIPFIRE_GDN_BLK")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .map(|b| (b.clamp(32, 256) / 32) * 32)
@@ -3477,7 +3477,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let (kernel_name, kernel_src, block) =
-            match std::env::var("HIPFIRE_CONV_QKNORM_SHAPE").ok().as_deref() {
+            match hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok().as_deref() {
                 Some("b32") => (
                     "conv1d_silu_split_qknorm_b32",
                     kernels::CONV1D_SILU_SPLIT_QKNORM_B32_SRC,

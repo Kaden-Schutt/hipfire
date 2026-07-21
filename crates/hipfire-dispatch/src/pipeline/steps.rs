@@ -1283,12 +1283,12 @@ mod tests {
         // the flag set.
         use rdna_compute::feature_flags::FeatureFlags;
         use std::sync::Arc;
-        let mut flags = FeatureFlags::from_env_for_test("gfx1100");
+        let mut flags = FeatureFlags::for_test("gfx1100");
         flags.force_unfused = true;
         let ctx = DispatchCtx {
             arch: rdna_compute::arch_caps::ArchCaps::new(
                 "gfx1100",
-                Arc::new(FeatureFlags::from_env_for_test("gfx1100")),
+                Arc::new(FeatureFlags::for_test("gfx1100")),
             ),
             flags: Arc::new(flags),
             resources: crate::resource::ResourceManager::for_test(),
@@ -1440,12 +1440,12 @@ mod tests {
         // even for empty slices (the guard opens with the early-return).
         use rdna_compute::feature_flags::FeatureFlags;
         use std::sync::Arc;
-        let mut flags = FeatureFlags::from_env_for_test("gfx1100");
+        let mut flags = FeatureFlags::for_test("gfx1100");
         flags.force_unfused = true;
         let ctx = DispatchCtx {
             arch: rdna_compute::arch_caps::ArchCaps::new(
                 "gfx1100",
-                Arc::new(FeatureFlags::from_env_for_test("gfx1100")),
+                Arc::new(FeatureFlags::for_test("gfx1100")),
             ),
             flags: Arc::new(flags),
             resources: crate::resource::ResourceManager::for_test(),

@@ -55,7 +55,7 @@ impl SpecScratch for Deepseek4DsparkScratch {
 /// Max batch for the trunk-side verify PBS (bootstrap 1-token + verify up to
 /// block+1 tokens). Mirror of `Deepseek4DsparkDrafter::pbs_max_batch`.
 fn dspark_verify_pbs_max_batch() -> usize {
-    std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+    hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)

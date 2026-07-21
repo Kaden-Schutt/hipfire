@@ -18,7 +18,7 @@ fn sample_parallel_enabled() -> bool {
     use std::sync::OnceLock;
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var("HIPFIRE_SAMPLE_PARALLEL")
+        hipfire_config::developer_var("HIPFIRE_SAMPLE_PARALLEL")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
@@ -32,7 +32,7 @@ fn sample_fast_stable_enabled() -> bool {
     use std::sync::OnceLock;
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var("HIPFIRE_SAMPLE_FAST")
+        hipfire_config::developer_var("HIPFIRE_SAMPLE_FAST")
             .map(|v| v != "0")
             .unwrap_or(true)
     })

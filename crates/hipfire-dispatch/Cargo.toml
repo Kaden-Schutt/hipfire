@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 
 [features]

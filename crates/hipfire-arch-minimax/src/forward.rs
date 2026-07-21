@@ -109,7 +109,7 @@ pub fn decode_step_with_graph(
     static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
     let env_override =
         *GRAPH_ENV.get_or_init(
-            || match std::env::var("HIPFIRE_MINIMAX_GRAPH").ok().as_deref() {
+            || match hipfire_config::developer_var("HIPFIRE_MINIMAX_GRAPH").ok().as_deref() {
                 Some("1") => Some(true),
                 Some("0") => Some(false),
                 _ => None,
@@ -211,7 +211,7 @@ fn decode_step_body(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
-    let capture_postattn = std::env::var_os("HIPFIRE_MINIMAX_CAPTURE_POSTATTN").is_some();
+    let capture_postattn = hipfire_config::developer_var_os("HIPFIRE_MINIMAX_CAPTURE_POSTATTN").is_some();
 
     // Device position scalar (i32) for rope / kv-write / attention. Staged from
     // the heap-stable `state.pos_host` so the captured memcpy re-reads it on
@@ -999,7 +999,7 @@ fn minimax_lower_program() -> superop::LayerProgram {
 fn minimax_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Pos scalar is
@@ -1667,7 +1667,7 @@ pub fn forward_ep(
     }
 
     // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd).
-    let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
+    let timing = hipfire_config::developer_var("HIPFIRE_EP_DECODE_TIMING").is_ok();
     let t_layers = std::time::Instant::now();
     let program = minimax_lower_program();
     let n_layers = weights_per_rank[0].layers.len();

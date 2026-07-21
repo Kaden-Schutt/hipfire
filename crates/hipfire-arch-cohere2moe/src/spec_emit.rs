@@ -72,7 +72,7 @@ impl<'a> Cohere2MoeEmit<'a> {
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
         let tk = ctx.tokenizer;
         let mark = |s: &str, fb: u32| -> u32 { tk.special_token_id(s).unwrap_or(fb) };
-        let empty_turn_guard = std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
+        let empty_turn_guard = hipfire_config::developer_var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
             .ok()
             .as_deref()
             != Some("0");

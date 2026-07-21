@@ -56,7 +56,7 @@ pub fn q8_flash_tile_size(
     static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
     OVERRIDE
         .get_or_init(|| {
-            std::env::var("HIPFIRE_Q8_FLASH_TILE")
+            hipfire_config::developer_var("HIPFIRE_Q8_FLASH_TILE")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
@@ -86,7 +86,7 @@ fn replay_stable_tile_count(
 fn is_wmma_fa_enabled() -> bool {
     use std::sync::OnceLock;
     static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| std::env::var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1"))
+    *GATE.get_or_init(|| hipfire_config::developer_var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1"))
 }
 
 /// Minimum chunk size to engage the WMMA-FA route.
@@ -94,7 +94,7 @@ fn wmma_fa_min_batch() -> usize {
     use std::sync::OnceLock;
     static GATE: OnceLock<usize> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("HIPFIRE_WMMA_FA_MIN_BATCH")
+        hipfire_config::developer_var("HIPFIRE_WMMA_FA_MIN_BATCH")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(16)
@@ -456,7 +456,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let cs_cap = std::env::var("HIPFIRE_GQA_CHUNK")
+        let cs_cap = hipfire_config::developer_var("HIPFIRE_GQA_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(128);
@@ -631,7 +631,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let cs_cap = std::env::var("HIPFIRE_GQA_CHUNK")
+        let cs_cap = hipfire_config::developer_var("HIPFIRE_GQA_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(128);
@@ -2073,7 +2073,7 @@ impl Gpu {
 
         // ── Tile kernel ──
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
-            && std::env::var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref() == Ok("1");
+            && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref() == Ok("1");
         let (tile_module, tile_src) = if gfx1151_tile_dpp {
             (
                 "attention_flash_q8_0_tile_dpp_gfx1151",

@@ -52,7 +52,7 @@ use rdna_compute::Gpu;
 fn verify_sequential() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_QWEN2_VERIFY_SEQ").as_deref() == Ok("1"))
+    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_QWEN2_VERIFY_SEQ").as_deref() == Ok("1"))
 }
 
 /// Qwen2 verify scratch: nothing persistent. The verify reuses the bundle's own

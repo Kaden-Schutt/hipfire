@@ -35,7 +35,7 @@ impl DispatchCtx {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(arch: &str) -> Self {
         use rdna_compute::feature_flags::FeatureFlags;
-        let flags = Arc::new(FeatureFlags::from_env_for_test(arch));
+        let flags = Arc::new(FeatureFlags::for_test(arch));
         let arch_caps = ArchCaps::new(arch, flags.clone());
         Self {
             arch: arch_caps,

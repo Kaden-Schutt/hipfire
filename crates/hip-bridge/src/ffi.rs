@@ -843,7 +843,7 @@ impl HipRuntime {
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let dump =
-            *DUMP.get_or_init(|| std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
+            *DUMP.get_or_init(|| hipfire_config::developer_var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
         if dump {
             eprintln!(
                 "dtoh bytes={} us={} at {}:{}",
@@ -887,7 +887,7 @@ impl HipRuntime {
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let dump =
-            *DUMP.get_or_init(|| std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
+            *DUMP.get_or_init(|| hipfire_config::developer_var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
         if dump {
             eprintln!(
                 "dtoh_at bytes={} us={} at {}:{}",
@@ -930,7 +930,7 @@ impl HipRuntime {
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let dump =
-            *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
+            *DUMP.get_or_init(|| hipfire_config::developer_var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
         if dump {
             eprintln!(
                 "memset bytes={} us={} at {}:{}",
@@ -961,7 +961,7 @@ impl HipRuntime {
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let dump =
-            *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
+            *DUMP.get_or_init(|| hipfire_config::developer_var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
         if dump {
             eprintln!(
                 "memset_async bytes={} us={} at {}:{}",

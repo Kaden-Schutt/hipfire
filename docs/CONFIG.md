@@ -138,10 +138,35 @@ defaults:
 | `diagnostic.compiler.hipcc_extra_flags` | advanced local compiler-flag string |
 
 Every field currently read by the centralized `RuntimeConfig` and
-`FeatureFlags` snapshots now has a schema mapping. The next migration stage is
-to replace their environment transport with direct typed daemon/runtime
-handoff; compatibility aliases remain active until that handoff has parity
-evidence.
+`FeatureFlags` snapshots has a schema mapping and crosses the CLI/daemon
+boundary in the versioned `ProcessConfig`; no child-environment projection is
+used.
+
+### Experimental developer controls
+
+The long tail of kernel experiments and diagnostics is available in one flat,
+global-only TOML namespace instead of as hundreds of ambient process switches:
+
+```toml
+[developer]
+gfx1151_gate_up_wave64 = true
+deepseek4_attn = "twin"
+replay_pm4_queues = 4
+```
+
+The CLI accepts the same keys (`hipfire config set
+developer.gfx1151_gate_up_wave64 true`) and preserves the supplied scalar
+spelling. A legacy `HIPFIRE_FOO=value` one-shot maps to
+`developer.foo = "value"` during startup resolution. Developer values are
+snapshotted before GPU initialization, sent in `ProcessConfig`, and read only
+from that immutable snapshot. They are never registry-authorized or valid in a
+per-model overlay. Prefer a typed schema key whenever one exists.
+
+Direct production reads of `HIPFIRE_*` are restricted to bootstrap paths that
+must be known before config discovery or process launch: home/model roots,
+binary/registry locations, kernel cache, spill directory, and quant diagnostic
+output. Examples and tests may still inject compatibility variables before
+startup.
 
 ---
 
@@ -188,7 +213,7 @@ else universal fallback **`q8`**. There is no per-arch implicit FWHT table.
 
 `kv_adaptive` is opt-in. With adaptive on, `max_seq` is the context guaranteed at the floor tier. Daemon param overrides `HIPFIRE_KV_ADAPTIVE` when set through CLI load path.
 
-Env projection: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
+Legacy one-shot alias: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
 
 ---
 
@@ -198,7 +223,8 @@ Env projection: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
 |---|---|---|
 | `flash_mode` | `"auto"` | `auto` \| `always` \| `never` |
 
-Projected to `HIPFIRE_ATTN_FLASH` when unset in the environment.
+Lowered directly into the daemon snapshot. `HIPFIRE_ATTN_FLASH` remains a
+legacy one-shot alias.
 
 ---
 
@@ -214,7 +240,7 @@ Only **one** mechanism runs. Canonical selector:
 - **`auto`** — cascade by availability / eligibility; legacy mode knobs filter each mechanism. Under auto, DSpark can win over in-trunk MTP when a DSpark sidecar is present (CLI comments).
 - Forced mechanism names bypass heuristics; missing prerequisites fall back to AR with a warning.
 
-Env: `HIPFIRE_SPECULATION`. CLI: `--spec`.
+Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 
 ### Mechanism knobs
 
@@ -232,7 +258,9 @@ Env: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `ddtree_budget` | `0` | int 0–64 | `0` = chain DFlash (no tree). |
 | `ddtree_topk` | `4` | int 1–8 | |
 
-Legacy env still wins at top of ladder for some knobs (`HIPFIRE_NGRAM_DRAFT*`, `HIPFIRE_DFLASH_*`, DeepSeek MTP/DSpark names) — full list in [`env-vars.md`](env-vars.md).
+Legacy compatibility input still wins at the top of the startup ladder for
+the corresponding knobs, but the engine receives only the resolved immutable
+snapshot. Full aliases: [`env-vars.md`](env-vars.md).
 
 ---
 
@@ -263,7 +291,8 @@ compatibility overrides.
 | `cask_fold_m` | `2` | int 1–16 |
 | `cask_auto_attach` | `true` | bool |
 
-Ops escape: `HIPFIRE_CASK_OFF=1`, `HIPFIRE_FORCE_A3B_EVICTION=1` (env doc).
+Developer escapes use `[developer] cask_off = true` and
+`force_a3b_eviction = true`; the old names remain one-shot aliases.
 
 Sidecar generation: `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
 
@@ -275,7 +304,8 @@ Sidecar generation: `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
 |---|---|---|
 | `prompt_normalize` | `true` | bool |
 
-Collapse `\n{3,}` → `\n\n` at engine entry. Env: `HIPFIRE_NORMALIZE_PROMPT` (`0`/`false`/`off`/`no` disable in runtime config).
+Collapse `\n{3,}` → `\n\n` at engine entry. Legacy alias:
+`HIPFIRE_NORMALIZE_PROMPT` (`0`/`false`/`off`/`no` disable).
 
 ---
 
@@ -296,7 +326,10 @@ Collapse `\n{3,}` → `\n\n` at engine entry. Env: `HIPFIRE_NORMALIZE_PROMPT` (`
 | `prefill_profile` | `false` | bool |
 | `prefill_sparse_threshold` | `32768` | int 0–524288 |
 
-Off by default. Matching `HIPFIRE_PREFILL_*` env names exist for research overrides. Detailed bypass reasons and serve wiring: [`SERVE.md`](SERVE.md) / runtime PFlash module — not restated here.
+Off by default. Typed fields cover product PFlash policy; remaining experiments
+live under `[developer]` and retain matching `HIPFIRE_PREFILL_*` one-shot
+aliases. Detailed bypass reasons and serve wiring: [`SERVE.md`](SERVE.md) /
+runtime PFlash module — not restated here.
 
 ---
 
@@ -308,12 +341,16 @@ Off by default. Matching `HIPFIRE_PREFILL_*` env names exist for research overri
 | `port` | `11435` | int 1–65535 |
 | `idle_timeout` | `300` | int 0–86400 seconds (`0` = never unload) |
 | `default_model` | `"qwen3.5:9b"` | non-empty tag/path string |
+| `serve.local` | `false` | Force the current command to use a locally spawned daemon. |
 | `max_request_bytes` | `67108864` (64 MiB) | int 4096–4GiB |
 | `serve_max_queue` | `64` | int 0–100000 (`0` = uncapped depth) |
 | `serve_queue_timeout_ms` | `30000` | int 0–3600000 (`0` = no wait timeout) |
 | `experimental_budget_alert` | `false` | bool |
 
-Serve HTTP surface: [`SERVE.md`](SERVE.md). Env mirrors: `HIPFIRE_MODEL`, `HIPFIRE_IDLE_TIMEOUT`, `HIPFIRE_MAX_REQUEST_BYTES`, `HIPFIRE_SERVE_MAX_QUEUE`, `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS`, etc.
+Serve HTTP surface: [`SERVE.md`](SERVE.md). The corresponding `HIPFIRE_MODEL`,
+`HIPFIRE_IDLE_TIMEOUT`, `HIPFIRE_MAX_REQUEST_BYTES`,
+`HIPFIRE_SERVE_MAX_QUEUE`, and `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` names are
+legacy one-shot aliases.
 
 ---
 
@@ -324,7 +361,8 @@ Serve HTTP surface: [`SERVE.md`](SERVE.md). Env mirrors: `HIPFIRE_MODEL`, `HIPFI
 | `chat_template` | `""` | empty or existing file path (`~/` expanded); existence + `isFile` only — no readability/access check |
 | `default_chatml` | `true` | bool |
 
-Project to `HIPFIRE_CHAT_TEMPLATE_FILE` / `HIPFIRE_DEFAULT_CHATML` when env unset (see CLI apply path).
+Lowered directly into the startup/load policy. `HIPFIRE_CHAT_TEMPLATE_FILE`
+and `HIPFIRE_DEFAULT_CHATML` remain legacy one-shot aliases.
 
 ---
 
@@ -359,12 +397,15 @@ HIPFIRE_MODEL=qwen3.5:9b
 
 ---
 
-## RuntimeConfig bridge (daemon snapshot)
+## Typed daemon snapshots
 
-`RuntimeConfig::from_env` remains the daemon's immutable compatibility parser.
-The native CLI now feeds its boolean fields from explicit TOML settings; direct
-daemon invocation may still provide environment variables. Nonboolean fields
-remain scheduled for the typed scalar/enum migration.
+The CLI resolves TOML, registry, one-shot flags, and compatibility input into a
+versioned `ProcessConfig` before the GPU is initialized. The daemon revalidates
+that envelope and lowers stable runtime values through
+`RuntimeConfig::from_process_config`; `FeatureFlags` performs the corresponding
+kernel-policy lowering. Direct daemon invocation resolves local TOML plus the
+compatibility environment into the same `ProcessConfig` first. Neither path
+uses ambient variables in engine hot paths.
 
 | Field | TOML key | Legacy env | Default behavior |
 |---|---|---|---|
@@ -383,6 +424,11 @@ remain scheduled for the typed scalar/enum migration.
 | `tp_use_rccl` | `hardware.tp_use_rccl` | `HIPFIRE_TP_USE_RCCL` | unset → RCCL default on; `0`/`false` opt out |
 | `ngram_loop_threshold` | `generation.loop_guard_threshold` | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | **0 (off)** |
 | `ngram_window` | `generation.loop_guard_window` | `HIPFIRE_NGRAM_WINDOW` | 256 |
+| `ngram_draft` | `speculation.ngram` | `HIPFIRE_NGRAM_DRAFT` | off |
+| `ngram_k` | `speculation.ngram_k` | `HIPFIRE_NGRAM_DRAFT_K` | 12 |
+| `ngram_min_count` | `speculation.ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | 2 |
+| `prompt_cache_capacity` | `memory.prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | 32 |
+| `prompt_cache_unbounded` | `memory.prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | false |
 | `devices` | `hardware.devices` | `HIPFIRE_DEVICES` | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |

@@ -497,6 +497,15 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_MODEL"),
         "Model pre-warmed by serve."
     ),
+    process_bool_field!(
+        "serve.local",
+        "local",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_LOCAL",
+        "Force the current command to use a locally spawned daemon."
+    ),
     field!(
         "generation.temperature",
         "temperature",
@@ -886,6 +895,28 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_MMQ_SCREEN_THRESHOLD"),
         "MMQ screening absolute-error threshold."
     ),
+    process_field!(
+        "memory.prompt_cache_capacity",
+        "prompt_cache_capacity",
+        Memory,
+        DefaultValue::Integer(32),
+        ValueRule::Integer {
+            min: 0,
+            max: 1048576
+        },
+        false,
+        "HIPFIRE_PROMPT_CACHE_CAP",
+        "Maximum cached assistant-turn tokenizations; zero keeps no entries."
+    ),
+    process_bool_field!(
+        "memory.prompt_cache_unbounded",
+        "prompt_cache_unbounded",
+        Memory,
+        false,
+        true,
+        "HIPFIRE_PROMPT_CACHE_UNBOUNDED",
+        "Remove the assistant-turn cache capacity bound."
+    ),
     field!(
         "speculation.prefill.mode",
         "prefill_compression",
@@ -1048,6 +1079,29 @@ pub static FIELDS: &[ConfigField] = &[
         "Sparse-attention threshold."
     ),
     field!(
+        "speculation.prefill.drafter_kv",
+        "prefill_drafter_kv",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("q8"),
+        ValueRule::Enum(&["q8", "fwht4", "fwht3", "fwht2"]),
+        true,
+        true,
+        Some("HIPFIRE_PFLASH_DRAFTER_KV"),
+        "KV quantization used by the PFlash drafter scorer."
+    ),
+    diagnostic_field!(
+        "diagnostic.pflash.score_layer",
+        "pflash_score_layer",
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: 65535
+        },
+        "HIPFIRE_PFLASH_SCORE_LAYER",
+        "Override the PFlash scoring layer; null uses model policy."
+    ),
+    field!(
         "speculation.mtp",
         "mtp_mode",
         Speculation,
@@ -1101,10 +1155,10 @@ pub static FIELDS: &[ConfigField] = &[
         Speculation,
         ModelLoad,
         DefaultValue::String("off"),
-        ValueRule::Enum(AUTO_ON_OFF),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
         true,
         false,
-        None,
+        Some("HIPFIRE_NGRAM_DRAFT"),
         "Model-free n-gram speculation policy."
     ),
     field!(
@@ -1116,7 +1170,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 2, max: 32 },
         true,
         false,
-        None,
+        Some("HIPFIRE_NGRAM_DRAFT_K"),
         "N-gram draft window."
     ),
     field!(
@@ -1128,7 +1182,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 1, max: 10 },
         true,
         false,
-        None,
+        Some("HIPFIRE_NGRAM_MIN_COUNT"),
         "Minimum n-gram match count."
     ),
     field!(
@@ -1961,6 +2015,32 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GEMM_DUMP",
         "Dump GEMM routing diagnostics."
     ),
+    process_auto_bool_field!(
+        "experimental.graph.forward",
+        "graph_forward",
+        Experimental,
+        true,
+        "HIPFIRE_GRAPH",
+        "Enable hipGraph forward capture; auto follows architecture policy."
+    ),
+    process_bool_field!(
+        "experimental.graph.ar",
+        "graph_ar",
+        Experimental,
+        true,
+        true,
+        "HIPFIRE_AR_GRAPH",
+        "Allow autoregressive forward graph capture when otherwise eligible."
+    ),
+    process_bool_field!(
+        "experimental.graph.moe",
+        "graph_moe",
+        Experimental,
+        true,
+        true,
+        "HIPFIRE_GRAPH_MOE",
+        "Allow graph capture for supported MoE forward paths."
+    ),
     process_bool_field!(
         "kernel.deterministic",
         "deterministic",
@@ -2103,17 +2183,174 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_FUSE_QKV_BIAS_DEBUG",
         "Log each QKV-bias fold."
     ),
-    field!(
-        "replay.backend",
-        "replay_backend",
+    ConfigField {
+        key: "replay.backend",
+        legacy_key: "replay_backend",
+        category: ConfigCategory::Replay,
+        scope: ConfigScope::Process,
+        default: DefaultValue::String("auto"),
+        rule: ValueRule::Enum(&["auto", "hip", "redline", "shadow", "off"]),
+        registry_allowed: false,
+        experimental: false,
+        env_compat: Some("HIPFIRE_REPLAY_BACKEND"),
+        include_builtin_in_process_config: false,
+        help: "Preferred launch backend, subject to immutable admission policy.",
+    },
+    process_field!(
+        "replay.transport",
+        "replay_transport",
         Replay,
-        ModelLoad,
         DefaultValue::String("auto"),
-        ValueRule::Enum(&["auto", "hip", "redline"]),
+        ValueRule::Enum(&["auto", "aql", "pm4", "pm4_ib", "ib"]),
         true,
+        "HIPFIRE_REPLAY_TRANSPORT",
+        "Retained replay transport; auto follows the certified model route."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.manual_capture",
+        "replay_manual_capture",
         false,
-        None,
-        "Preferred launch backend, subject to immutable admission policy."
+        "HIPFIRE_REPLAY_MANUAL_CAPTURE",
+        "Arm replay recording manually instead of using the model lifecycle."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.pm4_min_parallel_width",
+        "replay_pm4_min_parallel_width",
+        DefaultValue::Integer(2),
+        ValueRule::Integer { min: 2, max: 1024 },
+        "HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WIDTH",
+        "Minimum independent launches required to form a parallel PM4 phase."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.pm4_min_parallel_workgroups",
+        "replay_pm4_min_parallel_workgroups",
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WORKGROUPS",
+        "Minimum aggregate workgroups required to form a parallel PM4 phase."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.pm4_max_parallel_phases",
+        "replay_pm4_max_parallel_phases",
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: i64::MAX
+        },
+        "HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES",
+        "Maximum parallel PM4 phases; null leaves the count unlimited."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.pm4_native_phases",
+        "replay_pm4_native_phases",
+        false,
+        "HIPFIRE_REPLAY_PM4_NATIVE_PHASES",
+        "Use native cross-queue synchronization for parallel PM4 phases."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.pm4_queues",
+        "replay_pm4_queues",
+        DefaultValue::String("1"),
+        ValueRule::Enum(&["1", "2", "4", "auto"]),
+        "HIPFIRE_REPLAY_PM4_QUEUES",
+        "Number of PM4 queues used for retained replay."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.pm4_register_policy",
+        "replay_pm4_stateful",
+        DefaultValue::String("stateful"),
+        ValueRule::Enum(&["legacy", "static", "stateful"]),
+        "HIPFIRE_REPLAY_PM4_STATEFUL",
+        "PM4 register emission policy."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.pm4_wait_policy",
+        "replay_pm4_wait_policy",
+        DefaultValue::String("resource"),
+        ValueRule::Enum(&["allowlist", "resource-audit", "resource"]),
+        "HIPFIRE_REPLAY_PM4_WAIT_POLICY",
+        "Dependency policy for waits between retained PM4 launches."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.pm4_acquire_policy",
+        "replay_pm4_acquire_policy",
+        DefaultValue::String("required-only"),
+        ValueRule::Enum(&[
+            "conservative",
+            "entry-only",
+            "required-only",
+            "without-repeat-interleave",
+            "without-fused-silu-rotate",
+            "without-mq-rotate",
+            "without-rope"
+        ]),
+        "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY",
+        "Cache-acquire policy between retained PM4 launches."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.pm4_gcr_trim",
+        "replay_pm4_gcr_trim",
+        true,
+        "HIPFIRE_REPLAY_PM4_GCR_TRIM",
+        "Trim redundant GCR operations on supported retained PM4 routes."
+    ),
+    process_auto_bool_field!(
+        "replay.pm4_gfx11_vmem_acquire",
+        "replay_pm4_gfx11_vmem_acquire",
+        Replay,
+        true,
+        "HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE",
+        "Enable Radiowave-classified VMEM acquires on gfx11; auto selects gfx1151."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.gfx1151_initiator",
+        "gfx1151_pm4_initiator",
+        DefaultValue::String("legacy"),
+        ValueRule::Enum(&["legacy", "order", "radv"]),
+        "HIPFIRE_GFX1151_PM4_INITIATOR",
+        "gfx1151 PM4 dispatch-initiator policy."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.gfx1151_interleave",
+        "gfx1151_pm4_interleave",
+        DefaultValue::String("inherit"),
+        ValueRule::Enum(&["inherit", "off", "64", "128", "256", "512"]),
+        "HIPFIRE_GFX1151_PM4_INTERLEAVE",
+        "gfx1151 dispatch-interleave threads per shader engine."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.gfx1151_resource_limits",
+        "gfx1151_pm4_resource_limits",
+        DefaultValue::String("legacy"),
+        ValueRule::Enum(&["legacy", "simd-always", "radv"]),
+        "HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS",
+        "gfx1151 compute-resource-limits packet policy."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.gfx1151_cu_count",
+        "gfx1151_redline_cu_count",
+        DefaultValue::String("all"),
+        ValueRule::String,
+        "HIPFIRE_GFX1151_REDLINE_CU_COUNT",
+        "Even gfx1151 CU count below 40, or all."
+    ),
+    diagnostic_field!(
+        "diagnostic.replay.gfx1151_entry_acquire",
+        "gfx1151_pm4_entry_acquire",
+        DefaultValue::String("system"),
+        ValueRule::Enum(&["system", "agent", "vmem", "none"]),
+        "HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE",
+        "gfx1151 PM4 entry cache-acquire scope."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.pm4_dynamic_grid",
+        "replay_pm4_dynamic_grid",
+        false,
+        "HIPFIRE_REPLAY_PM4_DYNAMIC_GRID",
+        "Patch retained PM4 grid dimensions at replay time."
     ),
     field!(
         "fusions.policy",
@@ -2139,6 +2376,50 @@ pub fn field(key: &str) -> Option<&'static ConfigField> {
         .find(|candidate| candidate.key == key || candidate.legacy_key == key)
 }
 
+const DEVELOPER_PREFIX: &str = "developer.";
+const BOOTSTRAP_ENV: &[&str] = &[
+    "HIPFIRE_HOME",
+    "HIPFIRE_MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN",
+    "HIPFIRE_TUI_BIN",
+    "HIPFIRE_CLI_BIN",
+    "HIPFIRE_HF_BASE",
+    "HIPFIRE_REGISTRY_URL",
+    "HIPFIRE_NO_REGISTRY_FETCH",
+    "HIPFIRE_KERNEL_CACHE",
+    "HIPFIRE_SPILL_DIR",
+    "HIPFIRE_QUANT_DIAG_PATH",
+];
+
+pub fn is_developer_key(key: &str) -> bool {
+    key.strip_prefix(DEVELOPER_PREFIX)
+        .is_some_and(valid_developer_suffix)
+}
+
+pub fn developer_key_for_env(name: &str) -> Option<String> {
+    let suffix = name.strip_prefix("HIPFIRE_")?.to_ascii_lowercase();
+    valid_developer_suffix(&suffix).then(|| format!("{DEVELOPER_PREFIX}{suffix}"))
+}
+
+fn valid_developer_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+pub fn canonical_config_key(key: &str) -> Option<String> {
+    field(key)
+        .map(|schema| schema.key.to_owned())
+        .or_else(|| is_developer_key(key).then(|| key.to_owned()))
+}
+
+pub fn developer_env_for_key(key: &str) -> Option<String> {
+    key.strip_prefix(DEVELOPER_PREFIX)
+        .filter(|suffix| valid_developer_suffix(suffix))
+        .map(|suffix| format!("HIPFIRE_{}", suffix.to_ascii_uppercase()))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigLayer {
     pub values: BTreeMap<String, ConfigValue>,
@@ -2146,31 +2427,46 @@ pub struct ConfigLayer {
 
 impl ConfigLayer {
     pub fn set(&mut self, key: &str, value: ConfigValue) -> Result<()> {
-        let field = field(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
-        field.validate(&value)?;
-        self.values.insert(field.key.to_owned(), value);
+        if let Some(field) = field(key) {
+            field.validate(&value)?;
+            self.values.insert(field.key.to_owned(), value);
+        } else if is_developer_key(key) {
+            self.values.insert(key.to_owned(), value);
+        } else {
+            return Err(ConfigError::UnknownKey(key.to_owned()));
+        }
         Ok(())
     }
 
     pub fn set_cli(&mut self, key: &str, raw: &str) -> Result<()> {
-        let field = field(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
-        self.set(field.key, field.parse_cli(raw)?)
+        if let Some(field) = field(key) {
+            self.set(field.key, field.parse_cli(raw)?)
+        } else if is_developer_key(key) {
+            // Preserve the exact legacy spelling. Experimental consumers may
+            // distinguish enum-like values such as `on` from boolean `1`.
+            self.set(key, ConfigValue::String(raw.to_owned()))
+        } else {
+            Err(ConfigError::UnknownKey(key.to_owned()))
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&ConfigValue> {
-        let field = field(key)?;
-        self.values.get(field.key)
+        self.values.get(&canonical_config_key(key)?)
     }
 
     pub fn remove(&mut self, key: &str) -> Result<Option<ConfigValue>> {
-        let field = field(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
-        Ok(self.values.remove(field.key))
+        let key =
+            canonical_config_key(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
+        Ok(self.values.remove(&key))
     }
 
     pub fn validate(&self) -> Result<()> {
         for (key, value) in &self.values {
-            let field = field(key).ok_or_else(|| ConfigError::UnknownKey(key.clone()))?;
-            field.validate(value)?;
+            if let Some(field) = field(key) {
+                field.validate(value)?;
+            } else if !is_developer_key(key) {
+                return Err(ConfigError::UnknownKey(key.clone()));
+            }
         }
         Ok(())
     }
@@ -2224,8 +2520,7 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     pub fn get(&self, key: &str) -> Option<&ResolvedValue> {
-        let field = field(key)?;
-        self.values.get(field.key)
+        self.values.get(&canonical_config_key(key)?)
     }
 
     pub fn legacy_values(&self) -> BTreeMap<String, ConfigValue> {
@@ -2276,6 +2571,11 @@ impl ProcessConfig {
             }
             values.set(schema.key, resolved_value.value.clone())?;
         }
+        for (key, resolved_value) in &resolved.values {
+            if is_developer_key(key) {
+                values.set(key, resolved_value.value.clone())?;
+            }
+        }
         let config = Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             values,
@@ -2296,7 +2596,10 @@ impl ProcessConfig {
         }
         self.values.validate()?;
         for key in self.values.values.keys() {
-            let schema = field(key).expect("ConfigLayer::validate accepted key");
+            if is_developer_key(key) {
+                continue;
+            }
+            let schema = field(key).expect("ConfigLayer::validate accepted stable key");
             if schema.env_compat.is_none() {
                 return Err(ConfigError::InvalidValue {
                     key: key.clone(),
@@ -2311,10 +2614,14 @@ impl ProcessConfig {
     /// parser. This is an in-memory adapter only; it does not mutate or inspect
     /// the ambient process environment.
     pub fn legacy_value(&self, name: &str) -> Option<String> {
-        let schema = FIELDS
+        if let Some(schema) = FIELDS
             .iter()
-            .find(|schema| schema.env_compat == Some(name))?;
-        self.values.get(schema.key).and_then(render_compat_value)
+            .find(|schema| schema.env_compat == Some(name))
+        {
+            return self.values.get(schema.key).and_then(render_compat_value);
+        }
+        let key = developer_key_for_env(name)?;
+        self.values.get(&key).and_then(render_compat_value)
     }
 }
 
@@ -2333,9 +2640,7 @@ pub fn load_local_process_config() -> Result<ProcessConfig> {
     let paths = ConfigPaths::discover();
     let loaded = load_global(&paths)?;
     let mut layers = vec![NamedLayer {
-        source: ConfigSource::GlobalUser {
-            path: loaded.path,
-        },
+        source: ConfigSource::GlobalUser { path: loaded.path },
         layer: loaded.layer,
     }];
     let environment = load_env_layer()?;
@@ -2355,6 +2660,23 @@ pub fn active_or_local_process_config() -> &'static ProcessConfig {
         load_local_process_config()
             .unwrap_or_else(|error| panic!("invalid hipfire process configuration: {error}"))
     })
+}
+
+/// Read one process-start value from the validated in-memory policy. The
+/// argument is the temporary compatibility spelling used by compact runtime
+/// parsers; this function never reads or mutates the ambient environment.
+pub fn process_value(name: &str) -> Option<String> {
+    active_or_local_process_config().legacy_value(name)
+}
+
+/// Compatibility-shaped access for experimental code while its public policy
+/// is being consolidated. Values come exclusively from the process snapshot.
+pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarError> {
+    process_value(name).ok_or(std::env::VarError::NotPresent)
+}
+
+pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
+    process_value(name).map(Into::into)
 }
 
 fn render_compat_value(value: &ConfigValue) -> Option<String> {
@@ -2396,16 +2718,25 @@ pub fn resolve(layers: impl IntoIterator<Item = NamedLayer>) -> Result<ResolvedC
     for named in layers {
         named.layer.validate()?;
         for (key, value) in named.layer.values {
-            let current = out
-                .values
-                .get_mut(&key)
-                .ok_or_else(|| ConfigError::UnknownKey(key.clone()))?;
-            current.shadowed.push(ConfigCandidate {
-                value: current.value.clone(),
-                source: current.source.clone(),
-            });
-            current.value = value;
-            current.source = named.source.clone();
+            if let Some(current) = out.values.get_mut(&key) {
+                current.shadowed.push(ConfigCandidate {
+                    value: current.value.clone(),
+                    source: current.source.clone(),
+                });
+                current.value = value;
+                current.source = named.source.clone();
+            } else if is_developer_key(&key) {
+                out.values.insert(
+                    key,
+                    ResolvedValue {
+                        value,
+                        source: named.source.clone(),
+                        shadowed: Vec::new(),
+                    },
+                );
+            } else {
+                return Err(ConfigError::UnknownKey(key));
+            }
         }
     }
     Ok(out)
@@ -2798,6 +3129,13 @@ pub fn write_catalog_toml(paths: &ConfigPaths, catalog: &ModelCatalog) -> Result
 fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
     layer.validate()?;
     for key in layer.values.keys() {
+        if is_developer_key(key) {
+            return Err(ConfigError::InvalidValue {
+                key: key.clone(),
+                message: "developer fields are global process policy and not valid per-model"
+                    .into(),
+            });
+        }
         let schema = field(key).expect("validated configuration field");
         if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
             return Err(ConfigError::InvalidValue {
@@ -3013,10 +3351,12 @@ fn migrate_legacy_aliases(
 
 pub fn load_env_layer() -> Result<ConfigLayer> {
     let mut layer = ConfigLayer::default();
+    let mut stable_names = BTreeSet::new();
     for field in FIELDS {
         let Some(name) = field.env_compat else {
             continue;
         };
+        stable_names.insert(name);
         let Ok(raw) = env::var(name) else {
             continue;
         };
@@ -3028,6 +3368,24 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
             _ => field.parse_cli(&raw)?,
         };
         layer.set(field.key, value)?;
+    }
+    // Snapshot the experimental long tail once. These values are quarantined
+    // under [developer], excluded from registry/model policy, and read by the
+    // engine only through ProcessConfig after this point.
+    for (name, raw) in env::vars_os() {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if stable_names.contains(name) || BOOTSTRAP_ENV.contains(&name) {
+            continue;
+        }
+        let Some(key) = developer_key_for_env(name) else {
+            continue;
+        };
+        let Ok(raw) = raw.into_string() else {
+            continue;
+        };
+        layer.set(&key, ConfigValue::String(raw))?;
     }
     Ok(layer)
 }
@@ -3284,6 +3642,59 @@ mod tests {
     }
 
     #[test]
+    fn developer_namespace_roundtrips_and_preserves_legacy_spelling() {
+        let root = temp_root("developer-roundtrip");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer
+            .set("developer.gfx1151_gate_up_wave64", ConfigValue::Bool(true))
+            .unwrap();
+        layer
+            .set("developer.pm4_queue_count", ConfigValue::Integer(4))
+            .unwrap();
+        layer.set_cli("developer.experimental_mode", "on").unwrap();
+
+        write_global_toml(&paths, &layer).unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert_eq!(loaded.layer, layer);
+        let rendered = fs::read_to_string(&paths.config_toml).unwrap();
+        assert!(rendered.contains("[developer]"));
+        assert!(rendered.contains("gfx1151_gate_up_wave64 = true"));
+        assert!(rendered.contains("experimental_mode = \"on\""));
+
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: paths.config_toml.clone(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert_eq!(
+            process
+                .legacy_value("HIPFIRE_GFX1151_GATE_UP_WAVE64")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            process
+                .legacy_value("HIPFIRE_EXPERIMENTAL_MODE")
+                .as_deref(),
+            Some("on")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn developer_namespace_is_rejected_per_model() {
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set("developer.gfx1151_gate_up_wave64", ConfigValue::Bool(true))
+            .unwrap();
+        assert!(validate_model_layer(&overrides).is_err());
+    }
+
+    #[test]
     fn typed_runtime_scalars_and_variants_roundtrip() {
         let root = temp_root("runtime-scalars");
         let paths = ConfigPaths::under(&root);
@@ -3411,9 +3822,7 @@ mod tests {
     fn process_config_is_sparse_versioned_and_revalidated() {
         let mut global = ConfigLayer::default();
         global.set_cli("kernel.mw16", "true").unwrap();
-        global
-            .set_cli("diagnostic.kernel.gemv_rows", "4")
-            .unwrap();
+        global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: PathBuf::from("config.toml"),
@@ -3446,10 +3855,12 @@ mod tests {
         let wrong_version = encoded.replace("\"schema_version\":1", "\"schema_version\":2");
         let decoded: ProcessConfig = serde_json::from_str(&wrong_version).unwrap();
         assert!(decoded.validate().is_err());
-        assert!(serde_json::from_str::<ProcessConfig>(
-            r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<ProcessConfig>(
+                r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -204,7 +204,7 @@ impl KernelCompiler {
             .unwrap_or_default();
 
         let gfx1151_cumode_modules = if arch == "gfx1151" {
-            std::env::var("HIPFIRE_GFX1151_CUMODE_MODULES")
+            hipfire_config::developer_var("HIPFIRE_GFX1151_CUMODE_MODULES")
                 .unwrap_or_default()
                 .split(|character: char| {
                     character == ',' || character == ';' || character.is_whitespace()

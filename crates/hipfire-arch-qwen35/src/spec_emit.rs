@@ -52,7 +52,7 @@ pub struct Qwen35Emit<'a> {
 }
 
 fn think_continuation_text() -> String {
-    std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
+    hipfire_config::developer_var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
 }
 
 impl<'a> Qwen35Emit<'a> {

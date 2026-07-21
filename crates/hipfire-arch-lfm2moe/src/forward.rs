@@ -62,7 +62,7 @@ fn graph_enabled() -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
     *ENV.get_or_init(|| {
         matches!(
-            std::env::var("HIPFIRE_LFM2_GRAPH").ok().as_deref(),
+            hipfire_config::developer_var("HIPFIRE_LFM2_GRAPH").ok().as_deref(),
             Some("1")
         )
     })
@@ -137,7 +137,7 @@ fn decode_step_layers_and_head(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
-    let capture_postmixer = std::env::var_os("HIPFIRE_LFM2_CAPTURE_POSTMIXER").is_some();
+    let capture_postmixer = hipfire_config::developer_var_os("HIPFIRE_LFM2_CAPTURE_POSTMIXER").is_some();
 
     // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
     // per-layer decode through the super-op executor (run_layer_program). Skipped
@@ -865,7 +865,7 @@ impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
 fn lfm2_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally

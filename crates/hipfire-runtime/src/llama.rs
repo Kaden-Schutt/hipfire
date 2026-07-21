@@ -3469,7 +3469,7 @@ pub fn forward_scratch_embed(
 fn llama_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
 /// KV-cache write + single-token attention, extracted verbatim from the hand

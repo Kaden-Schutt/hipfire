@@ -417,7 +417,7 @@ mod tests {
     use std::sync::Arc;
 
     fn default_flags() -> Arc<FeatureFlags> {
-        Arc::new(FeatureFlags::from_env_for_test("gfx1100"))
+        Arc::new(FeatureFlags::for_test("gfx1100"))
     }
 
     fn make_caps(arch: &str) -> ArchCaps {

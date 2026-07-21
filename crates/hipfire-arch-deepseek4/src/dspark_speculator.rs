@@ -248,7 +248,7 @@ pub fn build_deepseek4_dspark_speculator(
         .as_ref()
         .ok_or("build_deepseek4_dspark_speculator: mtp_final_norm missing on last stage")?;
 
-    let conf_threshold = std::env::var("HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD")
+    let conf_threshold = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
         .or(conf_threshold)

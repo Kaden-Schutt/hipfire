@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 memmap2 = "0.9"
 safetensors.workspace = true
 half.workspace = true

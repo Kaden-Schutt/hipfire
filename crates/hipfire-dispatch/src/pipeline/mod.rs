@@ -283,7 +283,7 @@ pub fn run_moe_decode(
         && p.expert_dtype_tags.is_none()
         && p.dtypes.routed_down == DType::MQ4G256
         && *DOWN_LAST_COMBINE.get_or_init(|| {
-            std::env::var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
+            hipfire_config::developer_var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
         });
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
@@ -426,7 +426,7 @@ pub fn run_moe_decode(
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
     // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
-    if let Ok(dump_path) = std::env::var("HIPFIRE_DUMP_HIDDEN") {
+    if let Ok(dump_path) = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
         if gpu.hip.device_synchronize().is_ok() {
             if let Ok(all) = gpu.download_f32(p.router_logits) {
                 use std::io::Write;
@@ -444,7 +444,7 @@ pub fn run_moe_decode(
             }
         }
     }
-    let gfx1100_router_mode = std::env::var("HIPFIRE_GFX1100_ROUTER_W64").ok();
+    let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
     let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151();
     let exact_wave64_router = p.n_exp == 256
         && ((ctx.arch.is_gfx1100()
@@ -462,9 +462,9 @@ pub fn run_moe_decode(
         && p.shared_down_w.dtype == DType::MQ4G256
         && p.shared_down_w.awq_scale.is_none()
         && *ROUTER_SHARED_FUSE
-            .get_or_init(|| std::env::var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1"));
+            .get_or_init(|| hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1"));
     let wave64_router = (ctx.arch.is_gfx1201()
-        && std::env::var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
+        && hipfire_config::developer_var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
         || (ctx.arch.is_gfx1100()
             && p.n_exp == 256
             // Research-only: faster on gfx1100, but its routing drift can
@@ -1632,7 +1632,7 @@ pub fn run_moe_decode_bias_aware(
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
     //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
     //    atomicAdd-fused path (nondeterministic; bench only).
-    let deterministic = std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    let deterministic = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
     if deterministic {
         hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
             p.expert_down_ptrs,
@@ -1890,7 +1890,7 @@ pub fn run_moe_prefill_bias_aware(
     }
 
     // DIAG: dump per-layer topk indices ([B, k_top] i32) — off by default.
-    if let Ok(path) = std::env::var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
+    if let Ok(path) = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
         use std::io::Write;
         let raw = hip!(gpu.download_f32(p.topk_indices))?;
         let n = batch_size * k_top;
@@ -1914,25 +1914,25 @@ pub fn run_moe_prefill_bias_aware(
     }
 
     // ── Grouped vs scalar gate ────────────────────────────────────────────────
-    let gate_threshold: usize = std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
+    let gate_threshold: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
     let use_grouped = batch_size >= gate_threshold
-        && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     // Shared research levers (read once; default 4w on gfx11+).
-    let lloyd_4w_base = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+    let lloyd_4w_base = match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
         Ok("0") => Some(false),
         Ok("1") => Some(true),
         _ => None,
     };
     let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
-    let n32 = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
-    let cnd = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
-    let eightw = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
-    let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
-    let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+    let n32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
+    let cnd = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
+    let eightw = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
+    let mmqload_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+    let nosync_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
     // i8 MMQ path (gfx1151 only): 2-bit Lloyd → int8 codebook LUT + i8 WMMA.
     let i8_moe = use_gfx1151_i8_moe(&gpu.arch);
 
@@ -1986,7 +1986,7 @@ pub fn run_moe_prefill_bias_aware(
         )?;
 
         // Unscatter + SwiGLU·clamp.
-        let use_fused_unscatter_silu = std::env::var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
+        let use_fused_unscatter_silu = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
             .map(|s| s != "0")
             .unwrap_or(false);
         if use_fused_unscatter_silu {
@@ -2089,7 +2089,7 @@ pub fn run_moe_prefill_bias_aware(
         // Down: deterministic expanded+combine (default; bit-reproducible for
         // spec-decode) vs non-deterministic atomic-accumulate.
         let deterministic =
-            std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
         if deterministic {
             hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
                 p.expert_down_ptrs,
@@ -2336,7 +2336,7 @@ pub fn run_moe_prefill(
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
-    if std::env::var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[moe-prefill] arch={} shared=({:?},{:?},{:?},{:?}) routed=({:?},{:?}) \
              path2={} force_mq4_fp16={} grouped_i8={:?}",

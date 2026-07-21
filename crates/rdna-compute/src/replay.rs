@@ -19,9 +19,9 @@ use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
-    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy,
-    KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy,
-    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
+    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
+    QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,11 +180,7 @@ impl Pm4Commands {
         }
     }
 
-    fn acquire_entry(
-        &mut self,
-        gfx12_gcr_trim: bool,
-        gfx11_policy: Gfx11EntryAcquirePolicy,
-    ) {
+    fn acquire_entry(&mut self, gfx12_gcr_trim: bool, gfx11_policy: Gfx11EntryAcquirePolicy) {
         match self {
             Self::Legacy { commands, .. } => match gfx11_policy {
                 Gfx11EntryAcquirePolicy::System => commands.acquire_system(),
@@ -568,9 +564,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
-        "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => {
-            Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)])
-        }
+        "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
         "qwen35_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => Some(vec![
             read(0),
             write(8),
@@ -580,9 +581,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        "kv_cache_write_q8_0_pair" => {
-            Some(vec![write(0), write(8), read(16), read(24), read(32)])
-        }
+        "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
@@ -668,18 +667,17 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        "attention_flash_q8_0_tile" => Some(vec![
-            read(0),
-            read(8),
-            read(16),
-            write(24),
-            read(32),
-        ]),
+        "attention_flash_q8_0_tile" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
-        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151" => {
-            Some(vec![read(0), write(8), read(16), read(24), read(32), read(48)])
-        }
+        | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151" => Some(vec![
+            read(0),
+            write(8),
+            read(16),
+            read(24),
+            read(32),
+            read(48),
+        ]),
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
         _ => None,
     }
@@ -984,10 +982,9 @@ fn pm4_phase_plan(
     for indices in antichains {
         let workgroups = indices.iter().fold(0_u64, |total, index| {
             let launch = &recorded[*index];
-            let launch_workgroups = launch
-                .grid
-                .iter()
-                .fold(1_u64, |product, axis| product.saturating_mul(u64::from(*axis)));
+            let launch_workgroups = launch.grid.iter().fold(1_u64, |product, axis| {
+                product.saturating_mul(u64::from(*axis))
+            });
             total.saturating_add(launch_workgroups)
         });
         let parallel = indices.len() >= min_parallel_width
@@ -1005,9 +1002,9 @@ fn pm4_phase_plan(
     phases
 }
 
-fn pm4_min_parallel_width_from_env() -> usize {
-    let value =
-        std::env::var("HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WIDTH").unwrap_or_else(|_| "2".to_owned());
+fn pm4_min_parallel_width_from_config() -> usize {
+    let value = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WIDTH")
+        .unwrap_or_else(|| "2".to_owned());
     value.parse::<usize>().ok().filter(|width| *width >= 2).unwrap_or_else(|| {
         eprintln!(
             "WARNING: HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WIDTH={value:?}: expected integer >= 2; using 2"
@@ -1016,9 +1013,9 @@ fn pm4_min_parallel_width_from_env() -> usize {
     })
 }
 
-fn pm4_min_parallel_workgroups_from_env() -> u64 {
-    let value = std::env::var("HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WORKGROUPS")
-        .unwrap_or_else(|_| "0".to_owned());
+fn pm4_min_parallel_workgroups_from_config() -> u64 {
+    let value = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WORKGROUPS")
+        .unwrap_or_else(|| "0".to_owned());
     value.parse::<u64>().unwrap_or_else(|_| {
         eprintln!(
             "WARNING: HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WORKGROUPS={value:?}: expected nonnegative integer; using 0"
@@ -1027,9 +1024,9 @@ fn pm4_min_parallel_workgroups_from_env() -> u64 {
     })
 }
 
-fn pm4_max_parallel_phases_from_env() -> usize {
-    let value = std::env::var("HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES")
-        .unwrap_or_else(|_| usize::MAX.to_string());
+fn pm4_max_parallel_phases_from_config() -> usize {
+    let value = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES")
+        .unwrap_or_else(|| usize::MAX.to_string());
     value.parse::<usize>().unwrap_or_else(|_| {
         eprintln!(
             "WARNING: HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES={value:?}: expected nonnegative integer; using unlimited"
@@ -1038,16 +1035,16 @@ fn pm4_max_parallel_phases_from_env() -> usize {
     })
 }
 
-fn pm4_native_phase_sync_from_env() -> bool {
-    std::env::var("HIPFIRE_REPLAY_PM4_NATIVE_PHASES")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
-        .unwrap_or(false)
+fn pm4_native_phase_sync_from_config() -> bool {
+    hipfire_config::process_value("HIPFIRE_REPLAY_PM4_NATIVE_PHASES")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
 }
 
-fn pm4_queue_policy_from_env() -> QueuePolicy {
+fn pm4_queue_policy_from_config() -> QueuePolicy {
     // Keep the certified single-IB path as the default. Phase B is explicitly
     // enabled with 2, 4, or auto until hardware shadow and product gates pass.
-    let value = std::env::var("HIPFIRE_REPLAY_PM4_QUEUES").unwrap_or_else(|_| "1".to_owned());
+    let value = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_QUEUES")
+        .unwrap_or_else(|| "1".to_owned());
     value.parse().unwrap_or_else(|error| {
         eprintln!("WARNING: HIPFIRE_REPLAY_PM4_QUEUES={value:?}: {error}; retaining one queue");
         QueuePolicy::One
@@ -1055,9 +1052,9 @@ fn pm4_queue_policy_from_env() -> QueuePolicy {
 }
 
 impl ReplayTransport {
-    fn from_env() -> Self {
-        match std::env::var("HIPFIRE_REPLAY_TRANSPORT")
-            .unwrap_or_else(|_| "aql".to_owned())
+    fn from_config() -> Self {
+        match hipfire_config::process_value("HIPFIRE_REPLAY_TRANSPORT")
+            .unwrap_or_else(|| "aql".to_owned())
             .to_ascii_lowercase()
             .as_str()
         {
@@ -1108,9 +1105,9 @@ impl Pm4RegisterPolicy {
         }
     }
 
-    fn from_env() -> Self {
-        let value =
-            std::env::var("HIPFIRE_REPLAY_PM4_STATEFUL").unwrap_or_else(|_| "stateful".to_owned());
+    fn from_config() -> Self {
+        let value = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_STATEFUL")
+            .unwrap_or_else(|| "stateful".to_owned());
         Self::from_value(&value).unwrap_or_else(|| {
             eprintln!(
                 "WARNING: unknown HIPFIRE_REPLAY_PM4_STATEFUL={value:?}; \
@@ -1125,8 +1122,8 @@ fn gfx10_dispatch_initiator_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx10DispatchInitiatorPolicy {
-    let value =
-        std::env::var("HIPFIRE_GFX1151_PM4_INITIATOR").unwrap_or_else(|_| "legacy".to_owned());
+    let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_INITIATOR")
+        .unwrap_or_else(|| "legacy".to_owned());
     let policy = gfx10_dispatch_initiator_policy_from_value(architecture, device_name, &value)
         .unwrap_or_else(|| {
             eprintln!(
@@ -1163,8 +1160,8 @@ fn gfx1151_dispatch_interleave(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Option<Gfx11DispatchInterleave> {
-    let value =
-        std::env::var("HIPFIRE_GFX1151_PM4_INTERLEAVE").unwrap_or_else(|_| "inherit".to_owned());
+    let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_INTERLEAVE")
+        .unwrap_or_else(|| "inherit".to_owned());
     let interleave = gfx1151_dispatch_interleave_from_value(architecture, device_name, &value)
         .unwrap_or_else(|| {
             eprintln!(
@@ -1205,8 +1202,8 @@ fn gfx1151_resource_limits_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx11ComputeResourceLimitsPolicy {
-    let value = std::env::var("HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS")
-        .unwrap_or_else(|_| "legacy".to_owned());
+    let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS")
+        .unwrap_or_else(|| "legacy".to_owned());
     let policy = gfx1151_resource_limits_policy_from_value(architecture, device_name, &value)
         .unwrap_or_else(|| {
             eprintln!(
@@ -1243,16 +1240,11 @@ fn gfx1151_resource_limits_policy_from_value(
     }
 }
 
-fn gfx1151_cu_mask(
-    architecture: Pm4Architecture,
-    device_name: &str,
-) -> Option<[u32; 2]> {
-    let value =
-        std::env::var("HIPFIRE_GFX1151_REDLINE_CU_COUNT").unwrap_or_else(|_| "all".to_owned());
+fn gfx1151_cu_mask(architecture: Pm4Architecture, device_name: &str) -> Option<[u32; 2]> {
+    let value = hipfire_config::process_value("HIPFIRE_GFX1151_REDLINE_CU_COUNT")
+        .unwrap_or_else(|| "all".to_owned());
     let mask = gfx1151_cu_mask_from_value(architecture, device_name, &value).unwrap_or_else(|| {
-        eprintln!(
-            "WARNING: unknown HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?}; retaining all CUs"
-        );
+        eprintln!("WARNING: unknown HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?}; retaining all CUs");
         None
     });
     if let Some(mask) = mask {
@@ -1298,8 +1290,8 @@ fn gfx1151_entry_acquire_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx11EntryAcquirePolicy {
-    let value = std::env::var("HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE")
-        .unwrap_or_else(|_| "system".to_owned());
+    let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE")
+        .unwrap_or_else(|| "system".to_owned());
     let policy = gfx1151_entry_acquire_policy_from_value(architecture, device_name, &value)
         .unwrap_or_else(|| {
             eprintln!(
@@ -1340,9 +1332,9 @@ impl Pm4WaitPolicy {
         }
     }
 
-    fn from_env() -> Self {
-        let value = std::env::var("HIPFIRE_REPLAY_PM4_WAIT_POLICY")
-            .unwrap_or_else(|_| "resource".to_owned());
+    fn from_config() -> Self {
+        let value = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_WAIT_POLICY")
+            .unwrap_or_else(|| "resource".to_owned());
         Self::from_value(&value).unwrap_or_else(|| {
             eprintln!(
                 "WARNING: unknown HIPFIRE_REPLAY_PM4_WAIT_POLICY={value:?}; \
@@ -1421,9 +1413,9 @@ impl Pm4MidAcquirePolicy {
         }
     }
 
-    fn from_env() -> Self {
-        let value = std::env::var("HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY")
-            .unwrap_or_else(|_| "required-only".to_owned());
+    fn from_config() -> Self {
+        let value = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY")
+            .unwrap_or_else(|| "required-only".to_owned());
         Self::from_value(&value).unwrap_or_else(|| {
             eprintln!(
                 "WARNING: unknown HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY={value:?}; \
@@ -1467,9 +1459,7 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     // still needs the vector-cache acquire before the GEMV reads that buffer.
     // Without it the first divergent launch in the 0.8B tape is this exact
     // pair (launches 12 -> 13); logits, KV, and recurrent state then drift.
-    if previous == "fused_silu_mul_mq_rotate"
-        && current.starts_with("gemv_hfq4g256_residual")
-    {
+    if previous == "fused_silu_mul_mq_rotate" && current.starts_with("gemv_hfq4g256_residual") {
         return true;
     }
     matches!(
@@ -1566,15 +1556,15 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
 }
 
 impl ReplayBackendRequest {
-    fn from_env() -> Self {
-        match std::env::var("HIPFIRE_REPLAY_BACKEND")
-            .unwrap_or_else(|_| "hip".to_owned())
+    fn from_config() -> Self {
+        match hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND")
+            .unwrap_or_else(|| "hip".to_owned())
             .to_ascii_lowercase()
             .as_str()
         {
             "" | "hip" | "off" => Self::Hip,
             "shadow" => Self::Shadow,
-            "auto" => Self::Auto,
+            "auto" | "redline" => Self::Auto,
             value => {
                 eprintln!("WARNING: unknown HIPFIRE_REPLAY_BACKEND={value:?}; falling back to hip");
                 Self::Hip
@@ -1584,9 +1574,8 @@ impl ReplayBackendRequest {
 }
 
 fn manual_capture_requested() -> bool {
-    std::env::var("HIPFIRE_REPLAY_MANUAL_CAPTURE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
-        .unwrap_or(false)
+    hipfire_config::process_value("HIPFIRE_REPLAY_MANUAL_CAPTURE")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1623,11 +1612,7 @@ pub struct RecordedHipLaunch {
 /// The recorded grid remains the hard maximum; replay may only narrow it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayGridBinding {
-    PositionCeilDiv {
-        axis: u8,
-        addend: u32,
-        divisor: u32,
-    },
+    PositionCeilDiv { axis: u8, addend: u32, divisor: u32 },
 }
 
 impl ReplayGridBinding {
@@ -1648,8 +1633,8 @@ impl ReplayGridBinding {
             .checked_add(u64::from(addend))
             .ok_or_else(|| "dynamic replay extent overflow".to_owned())?;
         let units = extent.div_ceil(u64::from(divisor)).max(1);
-        let units = u32::try_from(units)
-            .map_err(|_| format!("dynamic replay grid {units} exceeds u32"))?;
+        let units =
+            u32::try_from(units).map_err(|_| format!("dynamic replay grid {units} exceeds u32"))?;
         let mut bound = recorded;
         bound[axis] = units.min(recorded[axis]);
         Ok(bound)
@@ -1754,9 +1739,9 @@ impl PreparedPm4Graph {
             Self::Single(graph) => graph
                 .patch_dispatch_dimensions(dispatch, dimensions)
                 .map_err(|error| error.to_string()),
-            Self::Phased(_) => Err(
-                "dynamic PM4 geometry requires the certified single-queue replay".to_owned(),
-            ),
+            Self::Phased(_) => {
+                Err("dynamic PM4 geometry requires the certified single-queue replay".to_owned())
+            }
         }
     }
 }
@@ -1796,14 +1781,15 @@ impl PreparedPm4Replay {
             let dimensions = if self.pm4_architecture == Pm4Architecture::Gfx12 {
                 let mut workitems = [0_u32; 3];
                 for axis in 0..3 {
-                    workitems[axis] = workgroups[axis]
-                        .checked_mul(workgroup[axis])
-                        .ok_or_else(|| {
-                            format!(
+                    workitems[axis] =
+                        workgroups[axis]
+                            .checked_mul(workgroup[axis])
+                            .ok_or_else(|| {
+                                format!(
                                 "dynamic PM4 grid overflow axis={axis} workgroups={} workgroup={}",
                                 workgroups[axis], workgroup[axis]
                             )
-                        })?;
+                            })?;
                 }
                 workitems
             } else {
@@ -1884,8 +1870,8 @@ pub struct ReplayController {
 }
 
 impl ReplayController {
-    pub fn from_env() -> Self {
-        let request = ReplayBackendRequest::from_env();
+    pub fn from_config() -> Self {
+        let request = ReplayBackendRequest::from_config();
         let manual = manual_capture_requested();
         let mut controller = if manual {
             Self::new_armed(request)
@@ -1910,11 +1896,11 @@ impl ReplayController {
         };
         Self {
             request,
-            transport: ReplayTransport::from_env(),
-            pm4_mid_acquire_policy: Pm4MidAcquirePolicy::from_env(),
-            pm4_wait_policy: Pm4WaitPolicy::from_env(),
-            pm4_register_policy: Pm4RegisterPolicy::from_env(),
-            pm4_queue_policy: pm4_queue_policy_from_env(),
+            transport: ReplayTransport::from_config(),
+            pm4_mid_acquire_policy: Pm4MidAcquirePolicy::from_config(),
+            pm4_wait_policy: Pm4WaitPolicy::from_config(),
+            pm4_register_policy: Pm4RegisterPolicy::from_config(),
+            pm4_queue_policy: pm4_queue_policy_from_config(),
             state,
             recorded: Vec::new(),
             certified_speedups: Vec::new(),
@@ -1946,21 +1932,27 @@ impl ReplayController {
     /// the PM4 transport choice for diagnostics.
     pub fn configure_model_default(&mut self, enable_gfx12_mq4r: bool) -> bool {
         let manual = manual_capture_requested();
-        if std::env::var_os("HIPFIRE_REPLAY_BACKEND").is_some() || manual {
+        let backend = hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND");
+        let explicit_backend = backend.as_deref().is_some_and(|value| value != "auto");
+        if explicit_backend || manual {
             self.reset_for_model(
-                ReplayBackendRequest::from_env(),
-                ReplayTransport::from_env(),
+                ReplayBackendRequest::from_config(),
+                ReplayTransport::from_config(),
                 !manual,
             );
             return false;
         }
 
-        let transport =
-            if enable_gfx12_mq4r && std::env::var_os("HIPFIRE_REPLAY_TRANSPORT").is_none() {
-                ReplayTransport::Pm4Ib
-            } else {
-                ReplayTransport::from_env()
-            };
+        let transport_override = hipfire_config::process_value("HIPFIRE_REPLAY_TRANSPORT");
+        let transport = if enable_gfx12_mq4r
+            && !transport_override
+                .as_deref()
+                .is_some_and(|value| value != "auto")
+        {
+            ReplayTransport::Pm4Ib
+        } else {
+            ReplayTransport::from_config()
+        };
         self.apply_model_default(enable_gfx12_mq4r, transport);
         true
     }
@@ -2287,8 +2279,7 @@ impl ReplayController {
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
         let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
-        let entry_acquire_policy =
-            gfx1151_entry_acquire_policy(pm4_architecture, device.name());
+        let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -2352,13 +2343,13 @@ impl ReplayController {
             geometries.push(geometry);
         }
 
-        let gfx12_gcr_trim = std::env::var("HIPFIRE_REPLAY_PM4_GCR_TRIM")
+        let gfx12_gcr_trim = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
         let gfx11_vmem_acquire =
-            match std::env::var("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE") {
-                Ok(value) => matches!(value.as_str(), "1" | "true" | "on"),
-                Err(_) => device.name().eq_ignore_ascii_case("gfx1151"),
+            match hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE") {
+                Some(value) if value != "auto" => matches!(value.as_str(), "1" | "true" | "on"),
+                _ => device.name().eq_ignore_ascii_case("gfx1151"),
             };
         let mut wait_audit = Pm4WaitAudit::default();
         let mut audit_frontier = ResourceFrontier::default();
@@ -2456,10 +2447,10 @@ impl ReplayController {
             let graph = commands.create_graph(&device, &pool, cu_mask.as_ref())?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
-            let min_parallel_width = pm4_min_parallel_width_from_env();
-            let min_parallel_workgroups = pm4_min_parallel_workgroups_from_env();
-            let max_parallel_phases = pm4_max_parallel_phases_from_env();
-            let native_phase_sync = pm4_native_phase_sync_from_env();
+            let min_parallel_width = pm4_min_parallel_width_from_config();
+            let min_parallel_workgroups = pm4_min_parallel_workgroups_from_config();
+            let max_parallel_phases = pm4_max_parallel_phases_from_config();
+            let native_phase_sync = pm4_native_phase_sync_from_config();
             let plans = pm4_phase_plan(
                 &self.recorded[..prefix],
                 min_parallel_width,
@@ -2635,10 +2626,7 @@ impl ReplayController {
     ///
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
-    pub unsafe fn replay_pm4(
-        &mut self,
-        position: usize,
-    ) -> Result<GpuMultiQueueTiming, String> {
+    pub unsafe fn replay_pm4(&mut self, position: usize) -> Result<GpuMultiQueueTiming, String> {
         let prepared = self
             .prepared_pm4
             .as_mut()
@@ -3074,12 +3062,9 @@ mod tests {
     #[test]
     fn gfx1151_radiowave_symbols_keep_resource_contracts() {
         let gate = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151";
-        let gate_hybrid =
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
-        let gate_up_paired =
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151";
-        let gate_up_persistent =
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151";
+        let gate_hybrid = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
+        let gate_up_paired = "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151";
+        let gate_up_persistent = "gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151";
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
         let qkvza_hybrid = "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151";
         let qkvza_r4 = "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151";
@@ -3130,16 +3115,8 @@ mod tests {
         for (symbol, kernarg_bytes, pointer_count) in [
             ("gated_norm_mq_rotate_gfx1151", 64, 6),
             ("qwen35_fa_prep_gfx1151", 64, 7),
-            (
-                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
-                64,
-                6,
-            ),
-            (
-                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
-                72,
-                7,
-            ),
+            ("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151", 64, 6),
+            ("moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151", 72, 7),
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(kernarg_bytes));
             assert_eq!(
@@ -3147,7 +3124,10 @@ mod tests {
                 Some(pointer_count)
             );
         }
-        assert_eq!(expected_kernarg_bytes("attention_flash_q8_0_tile"), Some(80));
+        assert_eq!(
+            expected_kernarg_bytes("attention_flash_q8_0_tile"),
+            Some(80)
+        );
         assert_eq!(
             pointer_effects("attention_flash_q8_0_tile").map(|effects| effects.len()),
             Some(5)
@@ -3179,12 +3159,10 @@ mod tests {
             Some(3)
         );
         assert!(radiowave_vmem_only_consumer(residual_rt_low));
-        let down =
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151";
+        let down = "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer_gfx1151";
         assert_eq!(expected_kernarg_bytes(down), Some(48));
         assert_eq!(pointer_effects(down).map(|effects| effects.len()), Some(4));
-        let down_row8 =
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151";
+        let down_row8 = "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151";
         assert_eq!(expected_kernarg_bytes(down_row8), Some(48));
         assert_eq!(
             pointer_effects(down_row8).map(|effects| effects.len()),
@@ -3274,10 +3252,8 @@ mod tests {
         );
         assert!(Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
-            "fused_silu_mul_mq_rotate",
-            "gemv_hfq4g256_residual"
-        ));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256_residual"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_silu_mul_mq_rotate",
             "gemv_hfq4g256_residual_k2048_gfx1201"
@@ -3294,35 +3270,19 @@ mod tests {
     #[test]
     fn gfx1151_dispatch_initiator_policy_is_exact_arch_only() {
         assert_eq!(
-            gfx10_dispatch_initiator_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "order",
-            ),
+            gfx10_dispatch_initiator_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "order",),
             Some(Gfx10DispatchInitiatorPolicy::OrderMode)
         );
         assert_eq!(
-            gfx10_dispatch_initiator_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "radv",
-            ),
+            gfx10_dispatch_initiator_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "radv",),
             Some(Gfx10DispatchInitiatorPolicy::Radv)
         );
         assert_eq!(
-            gfx10_dispatch_initiator_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1100",
-                "radv",
-            ),
+            gfx10_dispatch_initiator_policy_from_value(Pm4Architecture::Gfx11, "gfx1100", "radv",),
             Some(Gfx10DispatchInitiatorPolicy::Legacy)
         );
         assert_eq!(
-            gfx10_dispatch_initiator_policy_from_value(
-                Pm4Architecture::Gfx10,
-                "gfx1030",
-                "radv",
-            ),
+            gfx10_dispatch_initiator_policy_from_value(Pm4Architecture::Gfx10, "gfx1030", "radv",),
             Some(Gfx10DispatchInitiatorPolicy::Legacy)
         );
         assert_eq!(
@@ -3346,11 +3306,7 @@ mod tests {
             Some(Some(Gfx11DispatchInterleave::Disabled))
         );
         assert_eq!(
-            gfx1151_dispatch_interleave_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "inherit",
-            ),
+            gfx1151_dispatch_interleave_from_value(Pm4Architecture::Gfx11, "gfx1151", "inherit",),
             Some(None)
         );
         assert_eq!(
@@ -3373,11 +3329,7 @@ mod tests {
             force_simd_dist_for_single_wave: false,
         };
         assert_eq!(
-            gfx1151_resource_limits_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "radv",
-            ),
+            gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "radv",),
             Some(radv)
         );
         assert_eq!(
@@ -3389,27 +3341,15 @@ mod tests {
             Some(Gfx11ComputeResourceLimitsPolicy::SimdDestAlways)
         );
         assert_eq!(
-            gfx1151_resource_limits_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1100",
-                "radv",
-            ),
+            gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx11, "gfx1100", "radv",),
             Some(Gfx11ComputeResourceLimitsPolicy::Legacy)
         );
         assert_eq!(
-            gfx1151_resource_limits_policy_from_value(
-                Pm4Architecture::Gfx12,
-                "gfx1201",
-                "radv",
-            ),
+            gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx12, "gfx1201", "radv",),
             Some(Gfx11ComputeResourceLimitsPolicy::Legacy)
         );
         assert_eq!(
-            gfx1151_resource_limits_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "invalid",
-            ),
+            gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "invalid",),
             None
         );
     }
@@ -3449,43 +3389,23 @@ mod tests {
     #[test]
     fn gfx1151_entry_acquire_is_exact_arch_only() {
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "agent",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "agent",),
             Some(Gfx11EntryAcquirePolicy::Agent)
         );
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "vmem",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "vmem",),
             Some(Gfx11EntryAcquirePolicy::Vmem)
         );
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1100",
-                "none",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1100", "none",),
             Some(Gfx11EntryAcquirePolicy::System)
         );
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx12,
-                "gfx1201",
-                "agent",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx12, "gfx1201", "agent",),
             Some(Gfx11EntryAcquirePolicy::System)
         );
         assert_eq!(
-            gfx1151_entry_acquire_policy_from_value(
-                Pm4Architecture::Gfx11,
-                "gfx1151",
-                "invalid",
-            ),
+            gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "invalid",),
             None
         );
     }
@@ -3507,9 +3427,7 @@ mod tests {
         );
         assert!(pointer_effects("conv1d_silu_split_qknorm_b256").is_some());
         assert_eq!(
-            expected_kernarg_bytes(
-                "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
-            ),
+            expected_kernarg_bytes("moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"),
             Some(80)
         );
         assert_eq!(
@@ -3535,7 +3453,10 @@ mod tests {
             "fused_gate_up_hfq4g256_k1024_gfx1201",
         ] {
             assert_eq!(expected_kernarg_bytes(kernel), Some(64));
-            assert_eq!(pointer_effects(kernel).map(|effects| effects.len()), Some(5));
+            assert_eq!(
+                pointer_effects(kernel).map(|effects| effects.len()),
+                Some(5)
+            );
         }
         assert!(pointer_effects("unknown_kernel").is_none());
         assert!(expected_kernarg_bytes("unknown_kernel").is_none());
@@ -3623,14 +3544,8 @@ mod tests {
         };
         assert_eq!(binding.bind(0, [16, 16, 1]).unwrap(), [16, 1, 1]);
         assert_eq!(binding.bind(128, [16, 16, 1]).unwrap(), [16, 2, 1]);
-        assert_eq!(
-            binding.bind(2047, [16, 16, 1]).unwrap(),
-            [16, 16, 1]
-        );
-        assert_eq!(
-            binding.bind(4095, [16, 16, 1]).unwrap(),
-            [16, 16, 1]
-        );
+        assert_eq!(binding.bind(2047, [16, 16, 1]).unwrap(), [16, 16, 1]);
+        assert_eq!(binding.bind(4095, [16, 16, 1]).unwrap(), [16, 16, 1]);
     }
 
     #[test]
@@ -3767,12 +3682,7 @@ mod tests {
             }]),
         };
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                2,
-                0,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 0, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: true,
@@ -3800,24 +3710,14 @@ mod tests {
             }]
         );
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                3,
-                0,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 3, 0, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
             }]
         );
         assert_eq!(
-            pm4_phase_plan(
-                &[read("read_a"), read("read_a_again")],
-                2,
-                3,
-                usize::MAX,
-            ),
+            pm4_phase_plan(&[read("read_a"), read("read_a_again")], 2, 3, usize::MAX,),
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,

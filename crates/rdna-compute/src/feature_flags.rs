@@ -163,6 +163,9 @@ pub struct FeatureFlags {
     pub moe_paro_i8_k8: Option<bool>,
 
     // ── Graph / capture / deterministic ─────────────────────────────
+    pub graph_forward: Option<bool>,
+    pub graph_ar: bool,
+    pub graph_moe: bool,
     pub force_blob_path: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
@@ -245,10 +248,6 @@ pub struct FeatureFlags {
 }
 
 impl FeatureFlags {
-    pub fn from_env(arch: &str) -> Self {
-        Self::from_lookup(arch, |name| std::env::var(name).map_err(|_| ()))
-    }
-
     pub fn from_process_config(arch: &str, config: &ProcessConfig) -> Self {
         Self::from_lookup(arch, |name| config.legacy_value(name).ok_or(()))
     }
@@ -257,10 +256,7 @@ impl FeatureFlags {
         Self::from_process_config(arch, hipfire_config::active_or_local_process_config())
     }
 
-    fn from_lookup(
-        arch: &str,
-        value: impl Fn(&str) -> std::result::Result<String, ()>,
-    ) -> Self {
+    fn from_lookup(arch: &str, value: impl Fn(&str) -> std::result::Result<String, ()>) -> Self {
         let parse_bool = |name: &str| -> Option<bool> {
             match value(name).ok().as_deref() {
                 Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") => Some(true),
@@ -303,10 +299,7 @@ impl FeatureFlags {
             hipcc_extra_flags.push_str(flag);
         };
         if arch == "gfx1100" {
-            match value("HIPFIRE_GFX11_WEIGHT_LOAD_POLICY")
-                .ok()
-                .as_deref()
-            {
+            match value("HIPFIRE_GFX11_WEIGHT_LOAD_POLICY").ok().as_deref() {
                 None | Some("") | Some("buffer") => {}
                 Some("global") => append_hipcc_flag("-DHIPFIRE_GFX11_WEIGHT_GLOBAL_LOADS=1"),
                 Some("flat-buffer") => {
@@ -318,10 +311,7 @@ impl FeatureFlags {
             }
         }
         if arch == "gfx1201" {
-            let policy_flag = match value("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY")
-                .ok()
-                .as_deref()
-            {
+            let policy_flag = match value("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY").ok().as_deref() {
                 None | Some("") | Some("rt") => None,
                 Some("global") => Some("-DHIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS=1"),
                 Some("ht") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=18"),
@@ -363,54 +353,32 @@ impl FeatureFlags {
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
-            rdna3_hfq4_qkv_wave64: value("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref()
+            rdna3_hfq4_qkv_wave64: value("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref() == Ok("1"),
+            rdna3_hfq4_qkvza_2wave: value("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref() == Ok("1"),
+            rdna3_hfq4_qkvza_wavepack4: value("HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_2wave: value("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
-                == Ok("1"),
-            rdna3_hfq4_qkvza_wavepack4: value(
-                "HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4",
-            )
-            .as_deref()
-                == Ok("1"),
-            rdna3_hfq4_qkvza_ldsx8: value("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8")
+            rdna3_hfq4_qkvza_ldsx8: value("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8").as_deref() == Ok("1"),
+            rdna3_hfq4_qkvza_reduce_chain: value("HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN")
                 .as_deref()
                 == Ok("1"),
-            rdna3_hfq4_qkvza_reduce_chain: value(
-                "HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN",
-            )
-            .as_deref()
-                == Ok("1"),
-            rdna3_hfq4_qkvza_hoist_x32: value("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32")
-                .as_deref()
+            rdna3_hfq4_qkvza_hoist_x32: value("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32").as_deref()
                 == Ok("1"),
             rdna3_hfq4_qkvza_k2048: parse_bool("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
                 .unwrap_or(arch == "gfx1100"),
             rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
                 .unwrap_or(arch == "gfx1100"),
-            rdna3_hfq4_residual_k2048: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048")
-                .as_deref()
+            rdna3_hfq4_residual_k2048: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_sigmoid_tight_grid: value(
-                "HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID",
-            )
-            .as_deref()
+            rdna3_hfq4_sigmoid_tight_grid: value("HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID")
+                .as_deref()
                 == Ok("1"),
             rdna3_hfq4_sigmoid_buffer: parse_bool("HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER")
                 .unwrap_or(arch == "gfx1100"),
-            rdna3_hfq4_sigmoid_rows4: value(
-                "HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4",
-            )
-            .as_deref()
+            rdna3_hfq4_sigmoid_rows4: value("HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_lm_head_k2048: value(
-                "HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048",
-            )
-            .as_deref()
+            rdna3_hfq4_lm_head_k2048: value("HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048").as_deref()
                 == Ok("1"),
-            rdna3_hfq4_moe_gate_up_k2048: value(
-                "HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048",
-            )
-            .as_deref()
+            rdna3_hfq4_moe_gate_up_k2048: value("HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048").as_deref()
                 == Ok("1"),
             mmq_override: match value("HIPFIRE_MMQ").ok().as_deref() {
                 Some("0") | Some("off") => Some(false),
@@ -422,8 +390,7 @@ impl FeatureFlags {
             fp16_layer_min: parse_usize("HIPFIRE_FP16_LAYER_MIN"),
             fp16_layer_max: parse_usize("HIPFIRE_FP16_LAYER_MAX"),
             wo_mmq: value("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
-            lm_head_wmma_disabled: value("HIPFIRE_LM_HEAD_WMMA")
-                .map_or(false, |v| v == "0"),
+            lm_head_wmma_disabled: value("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0"),
             lm_head_overwrite: value("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
 
             // MMQ screening
@@ -435,9 +402,7 @@ impl FeatureFlags {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(mmq_screen_threshold_default),
-            mmq_diag_quantize_only: value("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY")
-                .ok()
-                .as_deref()
+            mmq_diag_quantize_only: value("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref()
                 == Some("1"),
 
             // Kernel variant overrides
@@ -446,8 +411,7 @@ impl FeatureFlags {
             hfq4g128_mmq: value("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0"),
             hfq3_mmq_layer_min: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MIN"),
             hfq3_mmq_layer_max: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MAX"),
-            hfq4_mmq_gfx906_y64: value("HIPFIRE_HFQ4_MMQ_GFX906_Y64")
-                .map_or(false, |v| v == "1"),
+            hfq4_mmq_gfx906_y64: value("HIPFIRE_HFQ4_MMQ_GFX906_Y64").map_or(false, |v| v == "1"),
             gate_up_variant: value("HIPFIRE_GATE_UP_VARIANT").ok(),
             gate_up_nosync: value("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
             qkvza_split_tail: parse_bool("HIPFIRE_QKVZA_SPLIT_TAIL").unwrap_or(false),
@@ -455,20 +419,13 @@ impl FeatureFlags {
             gfx942_gemv_v3: value("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
                 && value("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
-            rmsnorm_mq_tight_lds: value("HIPFIRE_RMSNORM_MQ_TIGHT_LDS").as_deref()
-                == Ok("1"),
-            rdna3_rmsnorm_wavegrid: value("HIPFIRE_RDNA3_RMSNORM_WAVEGRID")
-                .as_deref()
-                == Ok("1"),
-            rdna3_rmsnorm_split: value("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref()
-                == Ok("1"),
+            rmsnorm_mq_tight_lds: value("HIPFIRE_RMSNORM_MQ_TIGHT_LDS").as_deref() == Ok("1"),
+            rdna3_rmsnorm_wavegrid: value("HIPFIRE_RDNA3_RMSNORM_WAVEGRID").as_deref() == Ok("1"),
+            rdna3_rmsnorm_split: value("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref() == Ok("1"),
             rdna3_rmsnorm_vecsum: parse_bool("HIPFIRE_RDNA3_RMSNORM_VECSUM")
                 .unwrap_or(arch == "gfx1100"),
-            rdna3_rmsnorm_sign_lds: value("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS")
-                .as_deref()
-                == Ok("1"),
-            rdna3_rmsnorm_sign_const: value("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST")
-                .as_deref()
+            rdna3_rmsnorm_sign_lds: value("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS").as_deref() == Ok("1"),
+            rdna3_rmsnorm_sign_const: value("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST").as_deref()
                 == Ok("1"),
             gfx942_mfma_prefill: value("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
             moe_grouped_i8: match value("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
@@ -478,12 +435,10 @@ impl FeatureFlags {
             },
             moe_grouped_i8_k8: value("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1"),
             moe_grouped_i8_k4: value("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() == Ok("1"),
-            moe_grouped_i8_k4_gfx12: value("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref()
-                == Ok("1"),
+            moe_grouped_i8_k4_gfx12: value("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref() == Ok("1"),
             moe_grouped_m2: value("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1"),
             moe_grouped_4w: value("HIPFIRE_MOE_GROUPED_4W").as_deref() == Ok("1"),
-            moe_down_combine_vec4: value("HIPFIRE_MOE_DOWN_COMBINE_VEC4").as_deref()
-                == Ok("1"),
+            moe_down_combine_vec4: value("HIPFIRE_MOE_DOWN_COMBINE_VEC4").as_deref() == Ok("1"),
             moe_hfq6_i8: value("HIPFIRE_MOE_HFQ6_I8").as_deref() == Ok("1"),
             moe_hfq6_v2: value("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
             // MoE prefill (Ship 4.2)
@@ -495,6 +450,9 @@ impl FeatureFlags {
             moe_paro_i8_k8: parse_bool("HIPFIRE_MOE_PARO_I8_K8"),
 
             // Graph / capture / deterministic
+            graph_forward: parse_bool("HIPFIRE_GRAPH"),
+            graph_ar: value("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"),
+            graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
@@ -502,22 +460,17 @@ impl FeatureFlags {
             q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
             deepseek4_q8_wmma_off: value("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
             deepseek4_q8_4w_off: value("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
-            rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY")
-                .ok()
-                .as_deref()
+            rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref()
                 == Some("1"),
             wo_wmma_variant: value("HIPFIRE_WO_WMMA_VARIANT").ok(),
 
             // rocBLAS
-            rocblas_all_archs: value("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref()
-                == Some("1"),
+            rocblas_all_archs: value("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1"),
             rocblas_off: value("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1"),
             rocblas_min_batch: parse_usize("HIPFIRE_ROCBLAS_MIN_BATCH"),
 
             // Kernels.rs
-            lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE")
-                .ok()
-                .as_deref()
+            lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref()
                 == Some("1"),
             rdna2_variant: value("HIPFIRE_RDNA2_VARIANT")
                 .ok()
@@ -625,11 +578,11 @@ impl FeatureFlags {
         self.hfq4_mmq_gfx906_y64
     }
 
-    /// Test-only constructor: reads no env vars, uses defaults for the given arch.
+    /// Test-only constructor: uses defaults for the given arch.
     /// Provides deterministic FeatureFlags for unit tests regardless of the
     /// developer's env-var configuration.
     #[doc(hidden)]
-    pub fn from_env_for_test(arch: &str) -> Self {
+    pub fn for_test(arch: &str) -> Self {
         let is_gfx906 = arch == "gfx906";
 
         let gemv_rows_default: u32 = match arch {
@@ -711,6 +664,9 @@ impl FeatureFlags {
             moe_grouped_gemm: true,
             moe_paro_i8: None,
             moe_paro_i8_k8: None,
+            graph_forward: None,
+            graph_ar: true,
+            graph_moe: true,
             force_blob_path: false,
             gemm_dump: false,
             deterministic: false,
@@ -744,63 +700,31 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_config::{
-        ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve,
-    };
-    use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    const QKVZA_SPLIT_TAIL_ENV: &str = "HIPFIRE_QKVZA_SPLIT_TAIL";
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvRestore(Option<OsString>);
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => std::env::set_var(QKVZA_SPLIT_TAIL_ENV, value),
-                None => std::env::remove_var(QKVZA_SPLIT_TAIL_ENV),
-            }
-        }
-    }
+    use hipfire_config::{ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve};
 
     #[test]
     fn force_unfused_defaults_false_in_test_ctor() {
-        let f = FeatureFlags::from_env_for_test("gfx1151");
+        let f = FeatureFlags::for_test("gfx1151");
         assert!(!f.force_unfused);
     }
 
     #[test]
     fn fuse_qkv_bias_defaults_on_in_test_ctor() {
-        let f = FeatureFlags::from_env_for_test("gfx1151");
+        let f = FeatureFlags::for_test("gfx1151");
         assert!(f.fuse_qkv_bias);
     }
 
     #[test]
     fn qkvza_split_tail_defaults_false_in_test_ctor() {
-        let f = FeatureFlags::from_env_for_test("gfx1100");
+        let f = FeatureFlags::for_test("gfx1100");
         assert!(!f.qkvza_split_tail);
-    }
-
-    #[test]
-    fn qkvza_split_tail_is_resolved_from_env() {
-        let _lock = ENV_LOCK.lock().expect("feature flag env lock poisoned");
-        let _restore = EnvRestore(std::env::var_os(QKVZA_SPLIT_TAIL_ENV));
-
-        std::env::remove_var(QKVZA_SPLIT_TAIL_ENV);
-        assert!(!FeatureFlags::from_env("gfx1100").qkvza_split_tail);
-
-        std::env::set_var(QKVZA_SPLIT_TAIL_ENV, "1");
-        assert!(FeatureFlags::from_env("gfx1100").qkvza_split_tail);
     }
 
     #[test]
     fn process_config_preserves_explicit_and_arch_default_flags() {
         let mut layer = ConfigLayer::default();
         layer.set_cli("kernel.qkvza_split_tail", "true").unwrap();
-        layer
-            .set_cli("diagnostic.kernel.gemv_rows", "4")
-            .unwrap();
+        layer.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),

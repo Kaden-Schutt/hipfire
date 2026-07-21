@@ -73,7 +73,7 @@ impl MtpSamplingConfig {
 fn mtp_device_token_chain_enabled_from_env() -> bool {
     // Default on: this path is token-identical in greedy mode and removes the
     // proposal-loop host data dependency needed for later graph capture.
-    match std::env::var("HIPFIRE_MTP_DEVICE_TOKEN_CHAIN") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_DEVICE_TOKEN_CHAIN") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")
@@ -85,7 +85,7 @@ fn mtp_device_token_chain_enabled_from_env() -> bool {
 fn mtp_snapshot_overlap_enabled_from_env() -> bool {
     // Default off: current gfx1201 benches show this stream split regresses,
     // but the hook is useful as an opt-in cross-arch experiment.
-    match std::env::var("HIPFIRE_MTP_SNAPSHOT_OVERLAP") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_SNAPSHOT_OVERLAP") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             v == "1" || v == "true" || v == "on" || v == "yes"
@@ -98,7 +98,7 @@ fn mtp_gpu_greedy_accept_enabled_from_env() -> bool {
     // Default on for greedy device-token-chain MTP: candidates and verify
     // argmaxes are already on-device, so the prefix accept + bonus selection
     // can stay there until a compact two-int result is needed on host.
-    match std::env::var("HIPFIRE_MTP_GPU_ACCEPT") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_GPU_ACCEPT") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")
@@ -122,7 +122,7 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     // WMMA when the arch/shape supports it, otherwise it falls back to scalar.
     // Prompt-sweep parity is clean; opt out with HIPFIRE_MTP_Q8_VERIFY_WMMA=0.
     mtp_q8_verify_wmma_enabled_from_env_value(
-        std::env::var("HIPFIRE_MTP_Q8_VERIFY_WMMA").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MTP_Q8_VERIFY_WMMA").ok().as_deref(),
     )
 }
 
@@ -138,7 +138,7 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
 /// p_min=0). Override on any arch via HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable
 /// elsewhere, =0 to disable). An explicit `set_p_min` call still overrides this.
 fn default_mtp_p_min(arch: &str) -> f32 {
-    if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
+    if let Some(v) = hipfire_config::developer_var("HIPFIRE_MTP_P_MIN").ok() {
         return v
             .trim()
             .parse::<f32>()
@@ -180,7 +180,7 @@ fn mtp_proposal_graph_policy_from_env_value(value: Option<&str>) -> MtpProposalG
 
 fn mtp_proposal_graph_policy_from_env() -> MtpProposalGraphPolicy {
     mtp_proposal_graph_policy_from_env_value(
-        std::env::var("HIPFIRE_MTP_PROPOSAL_GRAPH").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MTP_PROPOSAL_GRAPH").ok().as_deref(),
     )
 }
 
@@ -1670,7 +1670,7 @@ pub fn spec_step_mtp(
     // HIPFIRE_MTP_TAPE_REPLAY=0 forces the original full-replay path (A/B gate).
     let use_tape_replay = tape_captured
         && advance >= 2
-        && std::env::var("HIPFIRE_MTP_TAPE_REPLAY").ok().as_deref() != Some("0");
+        && hipfire_config::developer_var("HIPFIRE_MTP_TAPE_REPLAY").ok().as_deref() != Some("0");
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
     if use_tape_replay {
         // Batched verify populated the tape this cycle — cheap GDN-only replay.

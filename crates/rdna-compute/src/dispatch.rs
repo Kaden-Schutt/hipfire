@@ -48,9 +48,8 @@ pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 fn pm4_dynamic_grid_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
+        hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
     })
 }
 
@@ -118,7 +117,7 @@ impl GpuTensor {
     /// when `rdna-compute`'s own tests build, making this invisible to dependent
     /// crates' tests (e.g. `hipfire-dispatch`). `#[doc(hidden)]` keeps it out of the
     /// public API surface while remaining reachable cross-crate, matching the
-    /// `FeatureFlags::from_env_for_test` precedent.
+    /// `FeatureFlags::for_test` precedent.
     #[doc(hidden)]
     pub fn null_for_test() -> Self {
         GpuTensor {
@@ -741,7 +740,7 @@ impl Gpu {
                 &format!("device id {id} out of range (count={count})"),
             ));
         }
-        if let Ok(mode) = std::env::var("HIPFIRE_HIP_WAIT") {
+        if let Ok(mode) = hipfire_config::developer_var("HIPFIRE_HIP_WAIT") {
             let mode_lc = mode.to_ascii_lowercase();
             let flags = match mode_lc.as_str() {
                 "auto" => Some(0x00),
@@ -770,7 +769,7 @@ impl Gpu {
         // `gfx10-1-generic` (covers Navi 10/12/14) without per-arch JIT
         // cache fragmentation. Empty / unset preserves prior behavior.
         let detected_arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
-        let arch = std::env::var("HIPFIRE_TARGET_ARCH")
+        let arch = hipfire_config::developer_var("HIPFIRE_TARGET_ARCH")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or(detected_arch);
@@ -849,7 +848,7 @@ impl Gpu {
                 sample_partials: None,
                 sample_partials_bytes: 0,
             },
-            replay: crate::replay::ReplayController::from_env(),
+            replay: crate::replay::ReplayController::from_config(),
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,
@@ -1253,13 +1252,11 @@ impl Gpu {
                         "deinterleave_f32_batched" => {
                             self.compiler.compiled_kernels().get("deinterleave_batched")
                         }
-                        name
-                            if name.starts_with(
-                                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
-                            ) => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_residual_scaled"),
+                        name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
+                            self.compiler
+                                .compiled_kernels()
+                                .get("gemv_hfq4g256_residual_scaled")
+                        }
                         "gemv_hfq4g256_moe_gate_up_k8_indexed" => self
                             .compiler
                             .compiled_kernels()

@@ -53,9 +53,14 @@ pub struct RuntimeConfig {
     pub tp_use_rccl: Option<bool>,
     pub ngram_loop_threshold: usize,
     pub ngram_window: usize,
+    pub ngram_draft: bool,
+    pub ngram_k: usize,
+    pub ngram_min_count: u32,
     pub kv_mode: String,
     pub kv_adaptive: String,
     pub chat_template_file: Option<String>,
+    pub prompt_cache_capacity: usize,
+    pub prompt_cache_unbounded: bool,
     pub experimental_budget_alert: bool,
     pub max_total_think_tokens: usize,
     pub devices: Option<String>,
@@ -82,10 +87,6 @@ pub fn init_with(config: RuntimeConfig) -> std::result::Result<(), RuntimeConfig
 }
 
 impl RuntimeConfig {
-    pub fn from_env() -> Self {
-        Self::from_lookup(|name| std::env::var(name).ok())
-    }
-
     pub fn from_process_config(config: &hipfire_config::ProcessConfig) -> Self {
         Self::from_lookup(|name| config.legacy_value(name))
     }
@@ -134,10 +135,25 @@ impl RuntimeConfig {
             ngram_window: value("HIPFIRE_NGRAM_WINDOW")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
+            ngram_draft: matches!(
+                value("HIPFIRE_NGRAM_DRAFT").as_deref(),
+                Some("1") | Some("on")
+            ),
+            ngram_k: value("HIPFIRE_NGRAM_DRAFT_K")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(12),
+            ngram_min_count: value("HIPFIRE_NGRAM_MIN_COUNT")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
             kv_mode: value("HIPFIRE_KV_MODE").unwrap_or_else(|| "auto".into()),
             kv_adaptive: value("HIPFIRE_KV_ADAPTIVE").unwrap_or_else(|| "off".into()),
             chat_template_file: value("HIPFIRE_CHAT_TEMPLATE_FILE")
                 .filter(|value| !value.is_empty()),
+            prompt_cache_capacity: value("HIPFIRE_PROMPT_CACHE_CAP")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(32),
+            prompt_cache_unbounded: value("HIPFIRE_PROMPT_CACHE_UNBOUNDED").as_deref()
+                == Some("1"),
             experimental_budget_alert: value("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT").as_deref()
                 == Some("1"),
             max_total_think_tokens: value("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
@@ -158,41 +174,31 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::{gfx12_mq4r_redline_default, RuntimeConfig};
-    use hipfire_config::{
-        ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve,
-    };
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
     fn ngram_loop_guard_is_off_by_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD").ok();
-        std::env::remove_var("HIPFIRE_NGRAM_LOOP_THRESHOLD");
-
-        let cfg = RuntimeConfig::from_env();
+        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        let cfg = RuntimeConfig::from_process_config(&process);
         assert_eq!(cfg.ngram_loop_threshold, 0);
-
-        match prev {
-            Some(value) => std::env::set_var("HIPFIRE_NGRAM_LOOP_THRESHOLD", value),
-            None => std::env::remove_var("HIPFIRE_NGRAM_LOOP_THRESHOLD"),
-        }
     }
 
     #[test]
     fn normalize_prompt_accepts_no_as_false() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok();
-        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "no");
-
-        let cfg = RuntimeConfig::from_env();
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("prompt.normalize", "no").unwrap();
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: "config.toml".into(),
+                },
+                layer,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = RuntimeConfig::from_process_config(&process);
         assert!(!cfg.normalize_prompt);
-
-        match prev {
-            Some(value) => std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", value),
-            None => std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT"),
-        }
     }
 
     #[test]

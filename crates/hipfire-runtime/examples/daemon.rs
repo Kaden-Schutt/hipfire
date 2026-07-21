@@ -1040,7 +1040,11 @@ fn receive_startup_config(
     let mut line = String::new();
     loop {
         line.clear();
-        if lock.read_line(&mut line).map_err(|error| error.to_string())? == 0 {
+        if lock
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
             return Ok(None);
         }
         if line.trim().is_empty() {
@@ -1069,12 +1073,9 @@ fn receive_startup_config(
             config.validate().map_err(|error| error.to_string())?;
             return Ok(Some((config, None, true)));
         }
-        let config = hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
-        return Ok(Some((
-            config,
-            Some(DaemonMsg::Regular(msg)),
-            false,
-        )));
+        let config =
+            hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
+        return Ok(Some((config, Some(DaemonMsg::Regular(msg)), false)));
     }
 }
 
@@ -1422,36 +1423,36 @@ fn main() {
                     .get("params")
                     .and_then(|p| p.get("mtp_mode"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("auto")
+                    .unwrap_or(&hipfire_runtime::config::get().mtp_mode)
                     .to_string();
                 let mtp_k: usize = msg
                     .get("params")
                     .and_then(|p| p.get("mtp_k"))
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(3) as usize;
+                    .map(|value| value as usize)
+                    .unwrap_or(hipfire_runtime::config::get().mtp_k);
 
-                // Model-free n-gram speculator config, forwarded by the CLI after
-                // resolving the `speculation` selector + legacy knobs through the
-                // config ladder (env > flag > per-model > global). `ngram_draft`
-                // is the per-load enable; `ngram_k`/`ngram_min_count` tune the
-                // drafter. The loader applies env-wins over these (so a directly
-                // driven daemon with `HIPFIRE_NGRAM_DRAFT=1` still works). Absent
-                // params leave the fields `None` → loader defaults / env.
+                // Model-free n-gram policy normally arrives as per-load params
+                // resolved by the CLI. Direct protocol clients inherit the
+                // daemon's typed process policy instead of ambient env.
                 let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
                     ngram_draft: msg
                         .get("params")
                         .and_then(|p| p.get("ngram_draft"))
-                        .and_then(|v| v.as_bool()),
+                        .and_then(|v| v.as_bool())
+                        .or(Some(hipfire_runtime::config::get().ngram_draft)),
                     ngram_k: msg
                         .get("params")
                         .and_then(|p| p.get("ngram_k"))
                         .and_then(|v| v.as_u64())
-                        .map(|k| k as usize),
+                        .map(|k| k as usize)
+                        .or(Some(hipfire_runtime::config::get().ngram_k)),
                     ngram_min_count: msg
                         .get("params")
                         .and_then(|p| p.get("ngram_min_count"))
                         .and_then(|v| v.as_u64())
-                        .map(|c| c as u32),
+                        .map(|c| c as u32)
+                        .or(Some(hipfire_runtime::config::get().ngram_min_count)),
                     // DDTree draft tuning — same load-param mechanism as ngram_k:
                     // CLI `--ddtree-budget` / `--ddtree-topk` → these load params,
                     // env-wins-else-param in the loader.
@@ -3024,7 +3025,9 @@ fn main() {
                     let weights = m.dots_ocr_weights.as_ref().unwrap();
                     let mut ok = true;
                     for &tok in &synthetic {
-                        if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok).is_err() {
+                        if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok)
+                            .is_err()
+                        {
                             ok = false;
                             break;
                         }
@@ -3615,9 +3618,7 @@ fn main() {
                     // resident model/cache state warm. It is timing-only: exact
                     // shadow remains a separate mandatory harness gate.
                     if steady_state {
-                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
-                            frame_checkpoint,
-                        );
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
                         let loaded = model.as_mut().expect("eligibility checked");
                         let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
                             unreachable!()
@@ -11286,9 +11287,7 @@ fn generate_deepseek4_spec(
     let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
         .ok()
         .and_then(|s| s.parse().ok())
-        .or_else(|| {
-            Some(hipfire_runtime::config::get().mtp_k)
-        })
+        .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
         .unwrap_or(2);
 
     // Prefix-cache plan (ds4 policy: forced-cold on partial, ring-safety length

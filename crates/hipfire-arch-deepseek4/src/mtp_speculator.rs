@@ -117,7 +117,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         // Lazily build the PBS. Sized identically to the loader's deepseek4_pbs
         // (carriers.rs:645-649): HIPFIRE_DEEPSEEK4_PP_BATCH, default 1024.
         if self.pbs.is_none() {
-            let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+            let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1024);

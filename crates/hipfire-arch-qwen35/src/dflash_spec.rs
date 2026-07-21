@@ -543,14 +543,14 @@ impl Speculator for DflashSpeculator {
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
 /// `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
 pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<dyn Speculator> {
-    let resume_enabled = std::env::var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref() != Some("0")
+    let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref() != Some("0")
         && eviction_is_none;
-    let ck_interval = std::env::var("HIPFIRE_CACHE_CKPT_INTERVAL")
+    let ck_interval = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2048usize)
         .max(256);
-    let ck_cap = std::env::var("HIPFIRE_CACHE_CKPT_MAX")
+    let ck_cap = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize)

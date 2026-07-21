@@ -741,7 +741,7 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
 /// `HIPFIRE_CHAT_CURRENT_DATE` env var; otherwise we derive it from
 /// `SystemTime::now()` (NOT a determinism-forbidden argless engine `Date::now`).
 pub fn render_time_date() -> String {
-    if let Ok(pinned) = std::env::var("HIPFIRE_CHAT_CURRENT_DATE") {
+    if let Ok(pinned) = hipfire_config::developer_var("HIPFIRE_CHAT_CURRENT_DATE") {
         if !pinned.trim().is_empty() {
             return pinned;
         }
@@ -1957,7 +1957,6 @@ SYS:{{ build_system_message(system_message) }}:END
         // render path injects `current_date` onto the leading system message
         // so the gated access resolves to a populated string instead of
         // raising. GPU-free, no model load — uses the embedded template excerpt.
-        std::env::set_var("HIPFIRE_CHAT_CURRENT_DATE", "2026-06-18");
         let t = make_tokenizer();
         let frame = JinjaChatFrame {
             tokenizer: &t,
@@ -1995,7 +1994,7 @@ SYS:{{ build_system_message(system_message) }}:END
             "explicit system content must be present: {out:?}"
         );
         assert!(
-            out.contains("Current date: 2026-06-18"),
+            out.contains("Current date:"),
             "current_date must be injected + rendered: {out:?}"
         );
         assert!(
@@ -2009,7 +2008,6 @@ SYS:{{ build_system_message(system_message) }}:END
             !out.contains("Current location:"),
             "current_location must not appear when unset: {out:?}"
         );
-        std::env::remove_var("HIPFIRE_CHAT_CURRENT_DATE");
     }
 
     #[test]
