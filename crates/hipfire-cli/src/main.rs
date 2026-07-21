@@ -3106,9 +3106,17 @@ fn daemon_environment(resolved: &hipfire_config::ResolvedConfig) -> BTreeMap<Str
         if env::var_os(name).is_some() {
             continue;
         }
-        let Some(value) = resolved.get(schema.key).map(|value| &value.value) else {
+        let Some(resolved_value) = resolved.get(schema.key) else {
             continue;
         };
+        // Absence is meaningful to RuntimeConfig and FeatureFlags: several
+        // defaults are selected by architecture. New bridge fields therefore
+        // project only explicit config; established fields retain compatibility.
+        if matches!(resolved_value.source, ConfigSource::BuiltIn) && !schema.project_default_to_env
+        {
+            continue;
+        }
+        let value = &resolved_value.value;
         let rendered = match value {
             hipfire_config::ConfigValue::Bool(value) => {
                 if *value {
@@ -4498,6 +4506,33 @@ fn registry_source(source: RegistrySource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        name: &'static str,
+        value: Option<OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(name: &'static str) -> Self {
+            Self {
+                name,
+                value: env::var_os(name),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.value.take() {
+                Some(value) => env::set_var(self.name, value),
+                None => env::remove_var(self.name),
+            }
+        }
+    }
 
     #[test]
     fn model_suffix_filter_covers_current_formats() {
@@ -4650,6 +4685,34 @@ mod tests {
             request_f64(&resolved, "generation.temperature", Some(0.25)).unwrap(),
             Some(0.25)
         );
+    }
+
+    #[test]
+    fn daemon_environment_projects_only_explicit_config_and_preserves_parent_env() {
+        const NAME: &str = "HIPFIRE_FP16";
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture(NAME);
+
+        env::remove_var(NAME);
+        let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert!(!daemon_environment(&builtins).contains_key(NAME));
+
+        let mut global = ConfigLayer::default();
+        global.set_cli("kernel.fp16", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: global,
+        }])
+        .unwrap();
+        assert_eq!(
+            daemon_environment(&resolved).get(NAME).map(String::as_str),
+            Some("0")
+        );
+
+        env::set_var(NAME, "parent");
+        assert!(!daemon_environment(&resolved).contains_key(NAME));
     }
 
     #[test]

@@ -110,6 +110,8 @@ impl fmt::Display for ConfigValue {
 pub enum ConfigCategory {
     Generation,
     Reasoning,
+    Hardware,
+    Kernel,
     Memory,
     Attention,
     Speculation,
@@ -117,6 +119,7 @@ pub enum ConfigCategory {
     Fusions,
     Prompt,
     Serve,
+    Diagnostic,
     Experimental,
 }
 
@@ -191,6 +194,7 @@ pub struct ConfigField {
     pub registry_allowed: bool,
     pub experimental: bool,
     pub env_compat: Option<&'static str>,
+    pub project_default_to_env: bool,
     pub help: &'static str,
 }
 
@@ -325,6 +329,65 @@ macro_rules! field {
             registry_allowed: $registry,
             experimental: $experimental,
             env_compat: $env,
+            project_default_to_env: true,
+            help: $help,
+        }
+    };
+}
+
+// These fields bridge stable TOML policy into the legacy environment snapshot
+// consumed by hipfire-runtime and rdna-compute. They are process-scoped because
+// those crates resolve the variables once; advertising per-model overrides
+// would be dishonest for a long-lived serve process.
+macro_rules! process_bool_field {
+    ($key:literal, $legacy:literal, $category:ident, $default:expr, $experimental:expr, $env:literal, $help:literal) => {
+        ConfigField {
+            key: $key,
+            legacy_key: $legacy,
+            category: ConfigCategory::$category,
+            scope: ConfigScope::Process,
+            default: DefaultValue::Bool($default),
+            rule: ValueRule::Bool,
+            registry_allowed: false,
+            experimental: $experimental,
+            env_compat: Some($env),
+            project_default_to_env: false,
+            help: $help,
+        }
+    };
+}
+
+macro_rules! process_auto_bool_field {
+    ($key:literal, $legacy:literal, $category:ident, $experimental:expr, $env:literal, $help:literal) => {
+        ConfigField {
+            key: $key,
+            legacy_key: $legacy,
+            category: ConfigCategory::$category,
+            scope: ConfigScope::Process,
+            default: DefaultValue::String("auto"),
+            rule: ValueRule::AutoBool,
+            registry_allowed: false,
+            experimental: $experimental,
+            env_compat: Some($env),
+            project_default_to_env: false,
+            help: $help,
+        }
+    };
+}
+
+macro_rules! diagnostic_bool_field {
+    ($key:literal, $legacy:literal, $default:expr, $env:literal, $help:literal) => {
+        ConfigField {
+            key: $key,
+            legacy_key: $legacy,
+            category: ConfigCategory::Diagnostic,
+            scope: ConfigScope::Diagnostic,
+            default: DefaultValue::Bool($default),
+            rule: ValueRule::Bool,
+            registry_allowed: false,
+            experimental: true,
+            env_compat: Some($env),
+            project_default_to_env: false,
             help: $help,
         }
     };
@@ -1062,6 +1125,693 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DEFAULT_CHATML"),
         "Allow the fallback ChatML frame when no template resolves."
+    ),
+    process_bool_field!(
+        "hardware.allow_mixed_arch",
+        "allow_mixed_arch",
+        Hardware,
+        false,
+        false,
+        "HIPFIRE_ALLOW_MIXED_ARCH",
+        "Allow a multi-GPU topology containing different GPU architectures."
+    ),
+    process_bool_field!(
+        "hardware.tp_use_rccl",
+        "tp_use_rccl",
+        Hardware,
+        true,
+        false,
+        "HIPFIRE_TP_USE_RCCL",
+        "Use RCCL for tensor-parallel all-reduce."
+    ),
+    process_bool_field!(
+        "kernel.prefill_batched",
+        "prefill_batched",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_PREFILL_BATCHED",
+        "Use batched prefill kernels when eligible."
+    ),
+    process_bool_field!(
+        "speculation.draft_f16",
+        "draft_f16",
+        Speculation,
+        true,
+        false,
+        "HIPFIRE_DRAFT_F16",
+        "Keep DFlash draft activations in FP16."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.prompt_token_heat",
+        "prompt_token_heat",
+        false,
+        "HIPFIRE_PROMPT_TOKEN_HEAT",
+        "Emit prompt token-heat diagnostics."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.prompt_heat_json",
+        "prompt_heat_json",
+        false,
+        "HIPFIRE_PROMPT_HEAT_JSON",
+        "Render prompt token-heat diagnostics as JSON."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.draft_gemm_dump",
+        "draft_gemm_dump",
+        false,
+        "HIPFIRE_DRAFT_GEMM_DUMP",
+        "Dump DFlash draft GEMM diagnostics."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.draft_subphase",
+        "draft_subphase",
+        false,
+        "HIPFIRE_DRAFT_SUBPHASE",
+        "Emit DFlash draft subphase timings."
+    ),
+    process_auto_bool_field!(
+        "kernel.gemv_dp4a",
+        "gemv_dp4a",
+        Kernel,
+        false,
+        "HIPFIRE_GEMV_DP4A",
+        "Override the architecture-selected DP4A GEMV route."
+    ),
+    process_auto_bool_field!(
+        "kernel.gemv_prefetch",
+        "gemv_prefetch",
+        Kernel,
+        false,
+        "HIPFIRE_GEMV_PREFETCH",
+        "Override the architecture-selected GEMV prefetch route."
+    ),
+    process_auto_bool_field!(
+        "kernel.gfx942_lds_gemv",
+        "gfx942_lds_gemv",
+        Kernel,
+        true,
+        "HIPFIRE_GFX942_LDS_GEMV",
+        "Override the gfx942 LDS GEMV experiment."
+    ),
+    process_auto_bool_field!(
+        "kernel.hfq3_dp4a",
+        "hfq3_dp4a",
+        Kernel,
+        true,
+        "HIPFIRE_HFQ3_DP4A",
+        "Override HFQ3 DP4A dispatch."
+    ),
+    process_auto_bool_field!(
+        "kernel.hfq3_mmq",
+        "hfq3_mmq",
+        Kernel,
+        true,
+        "HIPFIRE_HFQ3_MMQ",
+        "Override HFQ3 MMQ dispatch."
+    ),
+    process_auto_bool_field!(
+        "kernel.hfq4_mmq_rdna2",
+        "hfq4_mmq_rdna2",
+        Kernel,
+        true,
+        "HIPFIRE_HFQ4_MMQ_RDNA2",
+        "Override HFQ4 MMQ dispatch on RDNA2."
+    ),
+    process_auto_bool_field!(
+        "kernel.gcn5_wave64_hybrid",
+        "gcn5_wave64_hybrid",
+        Kernel,
+        true,
+        "HIPFIRE_GCN5_WAVE64_HYBRID",
+        "Override the GCN5 wave64 hybrid route."
+    ),
+    process_auto_bool_field!(
+        "kernel.mmq",
+        "mmq",
+        Kernel,
+        false,
+        "HIPFIRE_MMQ",
+        "Override architecture-selected MMQ dispatch."
+    ),
+    process_auto_bool_field!(
+        "kernel.gfx942_gemv_v2",
+        "gfx942_gemv_v2",
+        Kernel,
+        true,
+        "HIPFIRE_GFX942_GEMV_V2",
+        "Override gfx942 GEMV v2 dispatch."
+    ),
+    process_auto_bool_field!(
+        "kernel.moe_grouped_i8",
+        "moe_grouped_i8",
+        Kernel,
+        true,
+        "HIPFIRE_MOE_GROUPED_I8",
+        "Override grouped MoE i8 dispatch."
+    ),
+    process_auto_bool_field!(
+        "kernel.moe_paro_i8",
+        "moe_paro_i8",
+        Kernel,
+        true,
+        "HIPFIRE_MOE_PARO_I8",
+        "Override architecture-selected Paro grouped-GEMM i8 dispatch."
+    ),
+    process_auto_bool_field!(
+        "kernel.moe_paro_i8_k8",
+        "moe_paro_i8_k8",
+        Kernel,
+        true,
+        "HIPFIRE_MOE_PARO_I8_K8",
+        "Override architecture-selected Paro grouped-GEMM i8 K8 dispatch."
+    ),
+    process_auto_bool_field!(
+        "kernel.rdna3_hfq4_qkvza_k2048",
+        "rdna3_hfq4_qkvza_k2048",
+        Kernel,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_QKVZA_K2048",
+        "Override the certified gfx1100 fixed-K QKVZA kernel."
+    ),
+    process_auto_bool_field!(
+        "kernel.rdna3_hfq4_residual_stage_x32",
+        "rdna3_hfq4_residual_stage_x32",
+        Kernel,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32",
+        "Override the certified gfx1100 residual activation-staging kernel."
+    ),
+    process_auto_bool_field!(
+        "kernel.rdna3_hfq4_sigmoid_buffer",
+        "rdna3_hfq4_sigmoid_buffer",
+        Kernel,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER",
+        "Override the certified gfx1100 sigmoid buffer-load kernel."
+    ),
+    process_auto_bool_field!(
+        "kernel.rdna3_rmsnorm_vecsum",
+        "rdna3_rmsnorm_vecsum",
+        Kernel,
+        true,
+        "HIPFIRE_RDNA3_RMSNORM_VECSUM",
+        "Override the certified gfx1100 RMSNorm vecsum kernel."
+    ),
+    process_bool_field!(
+        "kernel.fp8_wmma",
+        "fp8_wmma",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_FP8_WMMA",
+        "Enable the experimental FP8 WMMA route."
+    ),
+    process_bool_field!(
+        "kernel.dot2_gemv",
+        "dot2_gemv",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_DOT2_GEMV",
+        "Enable dot2 GEMV dispatch."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_qkv_wave64",
+        "rdna3_hfq4_qkv_wave64",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_QKV_WAVE64",
+        "Enable the RDNA3 wave64 QKV experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_qkvza_2wave",
+        "rdna3_hfq4_qkvza_2wave",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE",
+        "Enable the RDNA3 two-wave QKVZA experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_qkvza_wavepack4",
+        "rdna3_hfq4_qkvza_wavepack4",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4",
+        "Enable the RDNA3 four-wave QKVZA packing experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_qkvza_ldsx8",
+        "rdna3_hfq4_qkvza_ldsx8",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8",
+        "Enable the RDNA3 LDS-staged QKVZA experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_qkvza_reduce_chain",
+        "rdna3_hfq4_qkvza_reduce_chain",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN",
+        "Enable the RDNA3 explicit QKVZA reduction chain."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_qkvza_hoist_x32",
+        "rdna3_hfq4_qkvza_hoist_x32",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32",
+        "Enable the RDNA3 QKVZA activation-hoist experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_residual_k2048",
+        "rdna3_hfq4_residual_k2048",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048",
+        "Enable the RDNA3 fixed-K residual experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_sigmoid_tight_grid",
+        "rdna3_hfq4_sigmoid_tight_grid",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID",
+        "Enable the RDNA3 tight-grid sigmoid kernel."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_sigmoid_rows4",
+        "rdna3_hfq4_sigmoid_rows4",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4",
+        "Enable the RDNA3 four-row sigmoid kernel."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_lm_head_k2048",
+        "rdna3_hfq4_lm_head_k2048",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048",
+        "Enable the RDNA3 fixed-K LM-head experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_hfq4_moe_gate_up_k2048",
+        "rdna3_hfq4_moe_gate_up_k2048",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048",
+        "Enable the RDNA3 fixed-K MoE gate/up experiment."
+    ),
+    process_bool_field!(
+        "kernel.fp16",
+        "fp16",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_FP16",
+        "Allow FP16 kernel routes."
+    ),
+    process_bool_field!(
+        "kernel.wo_mmq",
+        "wo_mmq",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_WO_MMQ",
+        "Enable weight-only MMQ dispatch."
+    ),
+    process_bool_field!(
+        "kernel.lm_head_wmma",
+        "lm_head_wmma",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_LM_HEAD_WMMA",
+        "Allow WMMA LM-head dispatch."
+    ),
+    process_bool_field!(
+        "kernel.lm_head_overwrite",
+        "lm_head_overwrite",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_LM_HEAD_OVERWRITE",
+        "Enable the LM-head overwrite experiment."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.mmq_quantize_only",
+        "mmq_diag_quantize_only",
+        false,
+        "HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY",
+        "Stop MMQ screening after quantization diagnostics."
+    ),
+    process_bool_field!(
+        "kernel.hfq4g128_mmq",
+        "hfq4g128_mmq",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_HFQ4G128_MMQ",
+        "Allow HFQ4G128 MMQ dispatch."
+    ),
+    process_bool_field!(
+        "kernel.hfq4_mmq_gfx906_y64",
+        "hfq4_mmq_gfx906_y64",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_HFQ4_MMQ_GFX906_Y64",
+        "Enable the gfx906 HFQ4 MMQ Y64 experiment."
+    ),
+    process_bool_field!(
+        "kernel.gate_up_nosync",
+        "gate_up_nosync",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GATE_UP_NOSYNC",
+        "Enable the no-sync gate/up experiment."
+    ),
+    process_bool_field!(
+        "kernel.qkvza_split_tail",
+        "qkvza_split_tail",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_QKVZA_SPLIT_TAIL",
+        "Enable the RDNA3 QKVZA split-tail prefill route."
+    ),
+    process_bool_field!(
+        "kernel.gfx942_gemv_v3",
+        "gfx942_gemv_v3",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX942_GEMV_V3",
+        "Enable gfx942 GEMV v3 dispatch."
+    ),
+    process_auto_bool_field!(
+        "kernel.gfx942_rmsnorm_split",
+        "gfx942_rmsnorm_split",
+        Kernel,
+        true,
+        "HIPFIRE_GFX942_RMSNORM_SPLIT",
+        "Override the architecture-selected gfx942 split RMSNorm route."
+    ),
+    process_bool_field!(
+        "kernel.rmsnorm_mq_tight_lds",
+        "rmsnorm_mq_tight_lds",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RMSNORM_MQ_TIGHT_LDS",
+        "Enable the tight-LDS fused RMSNorm MQ route."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_rmsnorm_wavegrid",
+        "rdna3_rmsnorm_wavegrid",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_RMSNORM_WAVEGRID",
+        "Enable the RDNA3 wave-grid RMSNorm experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_rmsnorm_split",
+        "rdna3_rmsnorm_split",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_RMSNORM_SPLIT",
+        "Enable the RDNA3 split RMSNorm experiment."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_rmsnorm_sign_lds",
+        "rdna3_rmsnorm_sign_lds",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_RMSNORM_SIGN_LDS",
+        "Enable LDS-staged MQ sign tables for RDNA3 RMSNorm."
+    ),
+    process_bool_field!(
+        "kernel.rdna3_rmsnorm_sign_const",
+        "rdna3_rmsnorm_sign_const",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_RDNA3_RMSNORM_SIGN_CONST",
+        "Enable packed-constant MQ signs for RDNA3 RMSNorm."
+    ),
+    process_bool_field!(
+        "kernel.moe_grouped_i8_k8",
+        "moe_grouped_i8_k8",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MOE_GROUPED_I8_K8",
+        "Enable grouped MoE i8 K8 dispatch."
+    ),
+    process_bool_field!(
+        "kernel.moe_grouped_i8_k4",
+        "moe_grouped_i8_k4",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MOE_GROUPED_I8_K4",
+        "Enable grouped MoE i8 K4 dispatch."
+    ),
+    process_bool_field!(
+        "kernel.moe_grouped_i8_k4_gfx12",
+        "moe_grouped_i8_k4_gfx12",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MOE_GROUPED_I8_K4_GFX12",
+        "Enable grouped MoE i8 K4 dispatch on gfx12."
+    ),
+    process_bool_field!(
+        "kernel.moe_grouped_m2",
+        "moe_grouped_m2",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MOE_GROUPED_M2",
+        "Enable grouped two-row MoE dispatch."
+    ),
+    process_bool_field!(
+        "kernel.moe_grouped_4w",
+        "moe_grouped_4w",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MOE_GROUPED_4W",
+        "Enable grouped four-wave MoE dispatch."
+    ),
+    process_bool_field!(
+        "kernel.moe_down_combine_vec4",
+        "moe_down_combine_vec4",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MOE_DOWN_COMBINE_VEC4",
+        "Enable four-row MoE down-projection combining."
+    ),
+    process_bool_field!(
+        "kernel.moe_hfq6_i8",
+        "moe_hfq6_i8",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MOE_HFQ6_I8",
+        "Enable HFQ6 grouped MoE i8 dispatch."
+    ),
+    process_bool_field!(
+        "kernel.moe_hfq6_v2",
+        "moe_hfq6_v2",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MOE_HFQ6_V2",
+        "Enable HFQ6 grouped MoE v2 dispatch."
+    ),
+    process_bool_field!(
+        "kernel.moe_grouped_gemm",
+        "moe_grouped_gemm",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_MOE_GROUPED_GEMM",
+        "Allow grouped-GEMM MoE prefill."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.blob_force",
+        "blob_force",
+        false,
+        "HIPFIRE_BLOB_FORCE",
+        "Force the retained kernarg-blob launch path."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.gemm_dump",
+        "gemm_dump",
+        false,
+        "HIPFIRE_GEMM_DUMP",
+        "Dump GEMM routing diagnostics."
+    ),
+    process_bool_field!(
+        "kernel.deterministic",
+        "deterministic",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_DETERMINISTIC",
+        "Select deterministic kernel variants where available."
+    ),
+    process_bool_field!(
+        "kernel.mw16",
+        "mw16",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_MW16",
+        "Enable the MW16 kernel experiment."
+    ),
+    process_bool_field!(
+        "kernel.q8_batched_legacy",
+        "q8_batched_legacy",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_Q8_BATCHED_LEGACY",
+        "Use the legacy batched Q8 route."
+    ),
+    process_bool_field!(
+        "kernel.deepseek4_q8_wmma",
+        "deepseek4_q8_wmma",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_DEEPSEEK4_Q8_WMMA",
+        "Allow DeepSeek4 Q8 WMMA prefill."
+    ),
+    process_bool_field!(
+        "kernel.deepseek4_q8_4w",
+        "deepseek4_q8_4w",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_DEEPSEEK4_Q8_4W",
+        "Allow the DeepSeek4 four-wave Q8 WMMA tile."
+    ),
+    process_bool_field!(
+        "kernel.rope_interleaved_legacy",
+        "rope_interleaved_legacy",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_ROPE_INTERLEAVED_LEGACY",
+        "Use the legacy interleaved RoPE route."
+    ),
+    process_bool_field!(
+        "kernel.rocblas_all_archs",
+        "rocblas_all_archs",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_ROCBLAS_ALL_ARCHS",
+        "Allow rocBLAS dispatch on all architectures."
+    ),
+    process_bool_field!(
+        "kernel.rocblas_off",
+        "rocblas_off",
+        Kernel,
+        false,
+        false,
+        "HIPFIRE_ROCBLAS_OFF",
+        "Disable rocBLAS dispatch."
+    ),
+    process_bool_field!(
+        "kernel.lloyd_force_baseline",
+        "lloyd_force_baseline",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_LLOYD_FORCE_BASELINE",
+        "Force the Lloyd baseline kernel route."
+    ),
+    process_bool_field!(
+        "fusions.force_unfused",
+        "force_unfused",
+        Fusions,
+        false,
+        true,
+        "HIPFIRE_FORCE_UNFUSED",
+        "Force supported projection paths to remain unfused."
+    ),
+    process_bool_field!(
+        "speculation.dflash_tree",
+        "dflash_tree",
+        Speculation,
+        false,
+        true,
+        "HIPFIRE_DFLASH_TREE",
+        "Enable DDTree tree-SWOR verification."
+    ),
+    process_bool_field!(
+        "speculation.ddtree_tree_la",
+        "ddtree_tree_la",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_DDTREE_TREE_LA",
+        "Allow DDTree linearized-ancestor tape replay."
+    ),
+    process_bool_field!(
+        "speculation.dflash_fast_sample",
+        "dflash_fast_sample",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_DFLASH_FAST_SAMPLE",
+        "Allow DFlash GPU sampling on sampled verification."
+    ),
+    process_bool_field!(
+        "speculation.dflash_q8_lmhead_wmma",
+        "dflash_q8_lmhead_wmma",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",
+        "Allow Q8 WMMA LM-head dispatch during DFlash verification."
+    ),
+    process_bool_field!(
+        "fusions.qkv_bias",
+        "fuse_qkv_bias",
+        Fusions,
+        true,
+        false,
+        "HIPFIRE_FUSE_QKV_BIAS",
+        "Fold supported QKV bias additions into fused QKV decode."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.qkv_bias",
+        "fuse_qkv_bias_debug",
+        false,
+        "HIPFIRE_FUSE_QKV_BIAS_DEBUG",
+        "Log each QKV-bias fold."
     ),
     field!(
         "replay.backend",
@@ -2034,6 +2784,7 @@ mod tests {
     fn schema_has_unique_keys_and_legacy_keys() {
         let mut canonical = std::collections::BTreeSet::new();
         let mut legacy = std::collections::BTreeSet::new();
+        let mut environment = std::collections::BTreeSet::new();
         for field in FIELDS {
             assert!(canonical.insert(field.key), "duplicate {}", field.key);
             assert!(
@@ -2041,6 +2792,25 @@ mod tests {
                 "duplicate {}",
                 field.legacy_key
             );
+            if let Some(name) = field.env_compat {
+                assert!(
+                    environment.insert(name),
+                    "duplicate environment alias {name}"
+                );
+            }
+            if !field.project_default_to_env {
+                assert!(field.env_compat.is_some(), "bridge without env alias");
+                assert!(
+                    matches!(field.scope, ConfigScope::Process | ConfigScope::Diagnostic),
+                    "non-process bridge {}",
+                    field.key
+                );
+                assert!(
+                    !field.registry_allowed,
+                    "registry-backed bridge {}",
+                    field.key
+                );
+            }
             field
                 .validate(&field.default.to_value())
                 .unwrap_or_else(|error| panic!("invalid default {}: {error}", field.key));

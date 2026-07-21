@@ -3,7 +3,13 @@
 **Owner:** environment-variable inventory (`docs/INDEX.md`).
 **Machine sources:** `HIPFIRE_*` token scan of Rust, Python, and shell sources under the repo (excluding `target/`, `.git/`, etc.).
 **Config schema owner:** [`CONFIG.md`](CONFIG.md) (`crates/hipfire-config/src/lib.rs` + `crates/hipfire-runtime/src/config.rs`).
-**Last checked:** 2026-07-20.
+**Last checked:** 2026-07-21.
+
+For persistent user configuration, prefer `hipfire config set ...` and
+`~/.hipfire/config.toml`. Schema-declared environment variables are retained as
+one-shot/compatibility overrides. The native CLI projects explicitly set
+process-wide boolean TOML keys into the daemon snapshot; see
+[`CONFIG.md`](CONFIG.md#process-wide-hardware-and-kernel-policy).
 
 This page has two layers:
 
@@ -12,7 +18,9 @@ This page has two layers:
 
 Detailed procedures belong in domain owners ([`CONFIG.md`](CONFIG.md), [`SERVE.md`](SERVE.md), [`multi-gpu.md`](multi-gpu.md), [`REDLINE.md`](REDLINE.md), [`VALIDATION.md`](VALIDATION.md), methodology pages). This file does not host validation matrices or benchmark floors.
 
-Coverage check for top-level docs: `scripts/check-docs-reliability.py` (every `HIPFIRE_*` in `AGENTS.md` / `README.md` / `CONTRIBUTING.md` must appear somewhere in this file).
+Coverage check for top-level docs: `scripts/check-env-docs.py` (every
+`HIPFIRE_*` in `AGENTS.md` / `README.md` / `CONTRIBUTING.md` must appear
+somewhere in this file).
 
 ---
 
