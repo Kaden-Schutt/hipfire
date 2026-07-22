@@ -3212,21 +3212,27 @@ fn completion_json(completion: &Completion) -> serde_json::Value {
 }
 
 fn completion_usage(completion: &Completion) -> serde_json::Value {
+    let cached_tokens = completion
+        .done
+        .get("cached_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let prompt_tokens = completion
         .done
         .get("prompt_tokens")
-        .or_else(|| completion.done.get("prefill_tokens"))
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            completion
+                .done
+                .get("prefill_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(cached_tokens)
+        });
     let completion_tokens = completion
         .done
         .get("tokens")
         .or_else(|| completion.done.get("completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let cached_tokens = completion
-        .done
-        .get("cached_tokens")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     serde_json::json!({
@@ -5476,6 +5482,26 @@ mod tests {
         assert_eq!(json["usage"]["total_tokens"], 19);
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
         assert_eq!(json["timings"]["decode_tok_s"], 115.0);
+
+        let qwen_cached = Completion {
+            id: "chatcmpl_qwen_cached".into(),
+            model: "qwen:test".into(),
+            content: "answer".into(),
+            reasoning_content: String::new(),
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "prefill_tokens": 8,
+                "cached_tokens": 12,
+                "tokens": 7
+            }),
+        };
+        let qwen_json = completion_json(&qwen_cached);
+        assert_eq!(qwen_json["usage"]["prompt_tokens"], 20);
+        assert_eq!(qwen_json["usage"]["total_tokens"], 27);
+        assert_eq!(
+            qwen_json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            12
+        );
     }
 
     #[test]
