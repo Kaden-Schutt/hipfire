@@ -32,6 +32,9 @@ pub struct ScratchState {
     /// f32 RMS value, and three u32 epoch counters, padded to 64 bytes; the
     /// split path uses its first f32 as the RMS handoff.
     pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
+    /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
+    /// Lazily allocated and grown on demand; no other scratch path uses it.
+    pub gemv_residual_tmp: Option<GpuTensor>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -198,6 +201,30 @@ impl ScratchState {
             self.sample_partials_bytes = n_bytes;
         }
         Ok(self.sample_partials.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the dedicated GEMV-residual temporary can hold at least
+    /// `min_elems` F32 values, growing on demand and never shrinking.
+    pub fn ensure_gemv_residual_tmp(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        min_elems: usize,
+    ) -> HipResult<&GpuTensor> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = min_elems * 4;
+        let needs_grow = self
+            .gemv_residual_tmp
+            .as_ref()
+            .map_or(true, |tmp| tmp.buf.size() < needed_bytes);
+        if needs_grow {
+            self.gemv_residual_tmp = Some(GpuTensor {
+                buf: hip.malloc(needed_bytes)?,
+                shape: vec![min_elems],
+                dtype: DType::F32,
+            });
+        }
+        Ok(self.gemv_residual_tmp.as_ref().unwrap())
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).

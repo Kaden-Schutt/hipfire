@@ -833,6 +833,7 @@ impl Gpu {
                 mq_x_q8: None,
                 mq_x_scales: None,
                 mq_rmsnorm_wavegrid_scratch: None,
+                gemv_residual_tmp: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
@@ -1747,6 +1748,17 @@ impl Gpu {
     }
 
     // ── Tensor allocation ───────────────────────────────────────
+
+    pub fn ensure_gemv_residual_tmp(
+        &mut self,
+        min_elems: usize,
+    ) -> HipResult<&GpuTensor> {
+        self.scratch.ensure_gemv_residual_tmp(
+            &self.hip,
+            self.device_id,
+            min_elems,
+        )
+    }
 
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;

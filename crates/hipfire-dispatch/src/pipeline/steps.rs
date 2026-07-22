@@ -798,7 +798,7 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             // fallback path runs a plain GEMV then `residual += result`. `out` may
             // be used as scratch ONLY when it does not alias `residual`; when it
             // does (the common qwen35 o_proj / dn_out case where out == residual ==
-            // &s.x), a fresh temp is allocated instead. See the aliasing guard below.
+            // &s.x), a dedicated persistent temp is used instead.
             // Nothing reads `out` after this step in any model decode path.
             let gemv = GEMV.get_or_init(GemvFamily::new);
             // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
@@ -848,16 +848,22 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 // in that case is WRONG: run_auto would overwrite the residual with
                 // `W·x` and the subsequent `residual += out` would then compute
                 // `2·(W·x)` — the residual is lost. Detect the alias by device pointer
-                // and allocate a fresh scratch when they overlap. When `out` is a
-                // genuinely-distinct buffer, reuse it (no alloc churn).
+                // and use a dedicated persistent scratch when they overlap. When `out`
+                // is a genuinely-distinct buffer, reuse it (no alloc churn).
                 if std::ptr::eq(residual, out) || residual.buf.as_ptr() == out.buf.as_ptr() {
-                    let tmp = gpu
-                        .alloc_tensor(&[w.m], DType::F32)
-                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    let tmp = {
+                        let scratch = gpu
+                            .ensure_gemv_residual_tmp(w.m)
+                            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                        // `gpu` owns this dedicated allocation for the alias's lifetime.
+                        GpuTensor {
+                            buf: unsafe { scratch.buf.alias() },
+                            shape: vec![w.m],
+                            dtype: DType::F32,
+                        }
+                    };
                     gemv.run_auto(ctx, gpu, w, x, &tmp)?;
                     gpu.add_inplace_f32(residual, &tmp)
-                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                    gpu.free_tensor(tmp)
                         .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 } else {
                     gemv.run_auto(ctx, gpu, w, x, out)?;
