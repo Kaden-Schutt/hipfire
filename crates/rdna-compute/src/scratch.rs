@@ -134,7 +134,7 @@ pub(crate) fn launch_maybe_blob(
     grid: [u32; 3],
     block: [u32; 3],
     shared_mem: u32,
-    params: &mut Vec<*mut c_void>,
+    params: &mut [*mut c_void],
     blob_builder: impl FnOnce() -> KernargBlob,
 ) -> HipResult<()> {
     if capture_mode || force_blob_path {

@@ -1180,7 +1180,7 @@ impl Gpu {
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
-        params: &mut Vec<*mut std::ffi::c_void>,
+        params: &mut [*mut std::ffi::c_void],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         self.launch_maybe_blob_bound(
@@ -1203,7 +1203,7 @@ impl Gpu {
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
-        params: &mut Vec<*mut std::ffi::c_void>,
+        params: &mut [*mut std::ffi::c_void],
         axis: u8,
         addend: u32,
         divisor: u32,
@@ -1234,7 +1234,7 @@ impl Gpu {
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
-        params: &mut Vec<*mut std::ffi::c_void>,
+        params: &mut [*mut std::ffi::c_void],
         grid_binding: Option<crate::replay::ReplayGridBinding>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
