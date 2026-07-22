@@ -39,7 +39,7 @@ RECIPES = {
     "nothink": {"temperature": 0.7, "top_p": 0.80, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5,
                 "reasoning_effort": "none"},
 }
-SAMPLE_KEYS = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "reasoning_effort"]
+SAMPLE_KEYS = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty", "reasoning_effort"]
 
 GENRE_BATTERY = [
     ("code",     "Write a Python function `merge_sorted(a, b)` that merges two already-sorted lists "
@@ -56,7 +56,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def resolve_sampling(spec, tag, registry_path):
-    """Return (values_dict, source_dict). spec: 'registry'|'greedy'|'recipe:NAME'|json string."""
+    """Return (values_dict, source_dict). spec: 'registry'|'registry:<mode>'|'greedy'|'recipe:NAME'|json string."""
     src = {}
     if spec == "greedy":
         return {"temperature": 0.0}, {"temperature": "explicit(greedy)"}
@@ -68,22 +68,39 @@ def resolve_sampling(spec, tag, registry_path):
     if spec.startswith("json:"):
         v = json.loads(spec[5:])
         return v, {k: "explicit" for k in v}
-    if spec == "registry":
+    if spec == "registry" or spec.startswith("registry:"):
         # production behavior: the serve applies the model's recommended_settings.
         # We resolve them HERE so they are explicit + visible (and reproducible).
+        # `registry` = the default profile (recommended_settings). `registry:<mode>`
+        # (general|coding|instruct) selects a named per-mode sampling profile;
+        # `general` falls back to recommended_settings when no profile map is set.
+        profile = spec.split(":", 1)[1] if ":" in spec else None
         rec = {}
         try:
             reg = json.load(open(registry_path))["models"]
             entry = reg.get(tag, {})
-            rec = entry.get("recommended_settings", {}) or {}
+            if profile is None:
+                rec = entry.get("recommended_settings", {}) or {}
+            else:
+                profiles = entry.get("sampling_profiles") or {}
+                if profile == "general":
+                    rec = profiles.get("general") or entry.get("recommended_settings", {}) or {}
+                else:
+                    rec = profiles.get(profile, {}) or {}
         except Exception as e:
             print(f"  [warn] could not read registry {registry_path}: {e}", file=sys.stderr)
+        label = f"registry({tag}:{profile})" if profile else f"registry({tag})"
         vals, source = {}, {}
-        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty"]:
+        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
             if k in rec:
-                vals[k] = rec[k]; source[k] = f"registry({tag})"
+                vals[k] = rec[k]; source[k] = label
+        # The instruct profile is the non-thinking mode: drive reasoning_effort=none
+        # through the existing budget machinery (no daemon request-JSON change).
+        if profile == "instruct":
+            vals["reasoning_effort"] = "none"; source["reasoning_effort"] = label
         if not vals:
-            sys.exit(f"  registry has no recommended_settings for tag {tag!r} — refusing to fall back to a "
+            what = f"sampling_profiles.{profile}" if profile else "recommended_settings"
+            sys.exit(f"  registry has no {what} for tag {tag!r} — refusing to fall back to a "
                      f"naive default. Pass --tag <registry-tag> or --sampling recipe:coding explicitly.")
         return vals, source
     sys.exit(f"bad --sampling {spec!r}")
@@ -387,7 +404,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--sampling", default="registry",
-                    help="registry | greedy | recipe:general|coding|nothink | json:{...}")
+                    help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
     ap.add_argument("--session", default="/home/kaden/mv/session_coding.json")
     ap.add_argument("--port", type=int, default=11520)
