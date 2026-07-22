@@ -28,7 +28,7 @@ dflash-fault-inject = [
 
 [dependencies]
 rdna-compute = { path = "../rdna-compute" }
-hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-runtime = { path = "../hipfire-runtime", features = ["loader-internal"] }
 hip-bridge = { path = "../hip-bridge" }
 # Optional arch crate deps — feature-gated.
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", optional = true }
@@ -42,6 +42,9 @@ hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [[test]]
 name = "qwen35_parity_compile"

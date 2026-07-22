@@ -471,6 +471,40 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config,
     config_from_metadata_json(source.metadata_json())
 }
 
+/// VL classification facts extracted from a directory source's metadata JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VlFacts {
+    /// Whether the canonical parser's `is_vl_text` is true:
+    /// `text_config + vision_config` composite format (the standard HF Qwen3.5-VL
+    /// layout).  NOT set for `text_config + visual` (that is a different VL format).
+    pub is_vl_text: bool,
+    /// Whether `vision_config` is present in the config (composite VL format).
+    pub has_vision_config: bool,
+    /// Whether `visual` is present in the config (Qwen2-VL / dots.ocr style).
+    pub has_visual_key: bool,
+}
+
+/// Lightweight VL classification for a safetensors directory source.
+/// Parses only the VL-relevant fields (vision_config vs visual, text_config
+/// presence).  Mirrors the canonical parser's `is_vl_text` semantics exactly:
+/// `is_vl_text = text_config && vision_config` — `visual` alone does NOT set
+/// `is_vl_text`.  Returns `Err` on malformed/unreadable metadata.
+pub fn classify_vl(source: &dyn ModelSource) -> Result<VlFacts, String> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json())
+        .map_err(|e| format!("qwen35: invalid metadata: {e}"))?;
+    let config = meta
+        .get("config")
+        .ok_or_else(|| "qwen35: missing config in metadata".to_string())?;
+    let has_text_config = config.get("text_config").is_some();
+    let has_vision_config = config.get("vision_config").is_some();
+    let has_visual_key = config.get("visual").is_some();
+    Ok(VlFacts {
+        is_vl_text: has_text_config && has_vision_config,
+        has_vision_config,
+        has_visual_key,
+    })
+}
+
 // ─── Weight structs ─────────────────────────────────────────────────────
 
 /// Weights for a DeltaNet (linear attention) layer.

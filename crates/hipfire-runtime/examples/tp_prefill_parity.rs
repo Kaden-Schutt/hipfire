@@ -27,8 +27,8 @@
 //!   cargo run -p hipfire-runtime --release --example tp_prefill_parity -- --model model.mq4
 
 use hipfire_hardware::{DeviceMesh, DimKind};
+use hipfire_loader::ModelParallel;
 use hipfire_runtime::llama::{self, KvCache, LlamaConfig};
-use hipfire_runtime::tp_serve::TpModel;
 
 const MAX_SEQ: usize = 512;
 
@@ -102,14 +102,19 @@ fn main() {
         gpu.download_f32(&scratch.logits).unwrap()
     };
 
-    // ── TP path: TpModel batched prefill. ──
+    // ── TP path: TpModel batched prefill (via loader). ──
     let mesh = DeviceMesh::rect(&[(DimKind::Tp, tp)]);
-    let mut model = match TpModel::load(&model_path, &mesh, MAX_SEQ) {
-        Ok(m) => m,
-        Err(e) => {
-            println!("tp_prefill_parity: SKIPPED (TpModel::load: {e})");
-            return;
-        }
+    let loaded =
+        match hipfire_loader::load_model_tp(&model_path, MAX_SEQ, &mesh, Default::default()) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("tp_prefill_parity: SKIPPED (load_model_tp: {e})");
+                return;
+            }
+        };
+    let mut model = match loaded.parallel {
+        ModelParallel::Tp(tp) => tp,
+        _ => panic!("expected TP model"),
     };
     model.prefill(&toks).expect("tp prefill");
     let tp_logits = model.logits().expect("tp logits");

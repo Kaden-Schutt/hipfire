@@ -15,6 +15,7 @@
 //!
 //! Real order: `Tp > PpDense > Ep > PpQwen35 > Single`.
 
+use crate::parallel_capability::RawParallelRequest;
 use crate::EpState;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::{pp_serve::PpModel, tp_serve::TpModel};
@@ -68,6 +69,21 @@ impl ModelParallel {
     }
     pub fn is_pipelined(&self) -> bool {
         kind_is_pipelined(self.kind())
+    }
+
+    /// Return the concrete topology owned by this model.
+    pub(crate) fn topology(&self) -> RawParallelRequest {
+        match self {
+            ModelParallel::Single => RawParallelRequest::new(1, 1, 1),
+            ModelParallel::Tp(model) => RawParallelRequest::new(1, model.tp(), 1),
+            ModelParallel::Pp(PipelineImpl::Dense(model)) => {
+                RawParallelRequest::new(model.pp(), 1, 1)
+            }
+            ModelParallel::Pp(PipelineImpl::ArchResident(gpus)) => {
+                RawParallelRequest::new(gpus.devices.len(), 1, 1)
+            }
+            ModelParallel::Ep(state) => RawParallelRequest::new(1, 1, state.gpus.devices.len()),
+        }
     }
 }
 

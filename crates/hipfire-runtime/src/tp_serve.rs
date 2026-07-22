@@ -95,15 +95,42 @@ impl TpModel {
         self.config.max_seq_len
     }
 
-    /// Load a dense llama-family HFQ tensor-parallel across `tp` ranks.
+    /// Load a dense llama-family HFQ tensor-parallel across `tp` ranks,
+    /// consuming an already-opened HFQ handle.  Gated behind the
+    /// `loader-internal` feature — only hipfire-loader should call
+    /// this; external consumers use `hipfire_loader::load_admitted`.
+    #[doc(hidden)]
+    #[cfg(feature = "loader-internal")]
+    pub fn load_from_hfq(hfq: &HfqFile, mesh: &DeviceMesh, max_seq: usize) -> Result<Self, String> {
+        Self::load_from_hfq_inner(hfq, mesh, max_seq)
+    }
+
+    /// Open an HFQ and load a dense TP model.
+    ///
+    /// **Deprecated** — use `hipfire_loader::load_model_tp` instead.
+    /// The loader guarantees admitted-source consistency; this direct
+    /// path-opening convenience bypasses the admission guard and will
+    /// be removed before 1.0.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use hipfire_loader::load_model_tp for admitted-source consistency"
+    )]
     pub fn load(path: &str, mesh: &DeviceMesh, max_seq: usize) -> Result<Self, String> {
+        let hfq = HfqFile::open(std::path::Path::new(path)).map_err(|e| format!("{e}"))?;
+        Self::load_from_hfq_inner(&hfq, mesh, max_seq)
+    }
+
+    fn load_from_hfq_inner(
+        hfq: &HfqFile,
+        mesh: &DeviceMesh,
+        max_seq: usize,
+    ) -> Result<Self, String> {
         let tp = mesh.size_of(DimKind::Tp);
         if tp < 2 {
             return Err(format!(
                 "TpModel::load needs a Tp axis with size>=2 (got {tp})"
             ));
         }
-        let hfq = HfqFile::open(std::path::Path::new(path)).map_err(|e| format!("{e}"))?;
         if !matches!(hfq.arch_id, 0 | 1) {
             return Err(format!(
                 "dense TP serve is llama-family only (arch_id 0/1); got arch_id={} — use ep for MoE",
@@ -1178,4 +1205,108 @@ fn build_layer_steps(r: LayerIo<'_>) -> Vec<Step<'_>> {
             dim: r.d,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multi_gpu::{DeviceMesh, DimKind};
+    use std::io::Write;
+
+    /// Write a minimal HFQ fixture for host-only preflight tests.
+    fn write_minimal_hfq(
+        dir: &tempfile::TempDir,
+        name: &str,
+        arch_id: u32,
+        metadata_json: &str,
+    ) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let meta_bytes = metadata_json.as_bytes();
+        let metadata_offset: u64 = 32;
+        let n_tensors: u32 = 0;
+        let index_offset = metadata_offset + meta_bytes.len() as u64;
+        let data_offset = index_offset + 4; // just n_tensors field
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(&arch_id.to_le_bytes()).unwrap();
+        f.write_all(&n_tensors.to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(meta_bytes).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // n_tensors=0
+        f.flush().unwrap();
+        path
+    }
+
+    #[test]
+    fn load_from_hfq_rejects_non_llama_arch_id_before_gpu() {
+        let dir = tempfile::tempdir().unwrap();
+        // DeepSeek4 (arch_id=9) is not llama-family (0|1 expected)
+        let path = write_minimal_hfq(
+            &dir,
+            "ds4.hfq",
+            9,
+            r#"{"config":{"model_type":"deepseek_v4","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"intermediate_size":8192,"vocab_size":32000}}"#,
+        );
+        let hfq = HfqFile::open(&path).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let err = match TpModel::load_from_hfq_inner(&hfq, &mesh, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for non-llama arch_id, got Ok"),
+        };
+        assert!(
+            err.contains("arch_id=9"),
+            "expected arch_id=9 error, got: {err}"
+        );
+        assert!(
+            err.contains("llama-family only"),
+            "expected llama-family error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_from_hfq_rejects_tp_below_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_minimal_hfq(
+            &dir,
+            "llama.hfq",
+            0,
+            r#"{"config":{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}}"#,
+        );
+        let hfq = HfqFile::open(&path).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 1)]);
+        let err = match TpModel::load_from_hfq_inner(&hfq, &mesh, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for tp<2, got Ok"),
+        };
+        assert!(
+            err.contains("Tp axis with size>=2"),
+            "expected tp>=2 error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_from_hfq_rejects_missing_qk_norm() {
+        let dir = tempfile::tempdir().unwrap();
+        // Llama with arch_id=0, no q_norm tensor → passes arch_id check
+        // but fails has_qk_norm. Use a proper llama config.
+        let path = write_minimal_hfq(
+            &dir,
+            "llama_nq.hfq",
+            1, // PlainQwen3 — has arch_id in 0|1
+            r#"{"config":{"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"intermediate_size":8192,"vocab_size":32000}}"#,
+        );
+        let hfq = HfqFile::open(&path).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let err = match TpModel::load_from_hfq_inner(&hfq, &mesh, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("expected qk-norm error for no-q_norm model, got Ok"),
+        };
+        // arch_id=1 is in [0,1], but no q_norm tensor → qk-norm error
+        assert!(
+            err.contains("qk-norm"),
+            "expected qk-norm error for no-q_norm model, got: {err}"
+        );
+    }
 }

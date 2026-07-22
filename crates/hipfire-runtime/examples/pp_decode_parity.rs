@@ -18,8 +18,9 @@
 //!   cargo run -p hipfire-runtime --release --example pp_decode_parity [model.mq4] [steps] [prompt]
 
 use hipfire_hardware::{DeviceMesh, DimKind};
+use hipfire_loader::model_parallel::PipelineImpl;
+use hipfire_loader::ModelParallel;
 use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig};
-use hipfire_runtime::pp_serve::PpModel;
 
 const MAX_SEQ: usize = 512;
 
@@ -101,12 +102,17 @@ fn main() {
 
     // ── PP path: PpModel prefill + greedy decode. ──
     let mesh = DeviceMesh::rect(&[(DimKind::Pp, pp)]);
-    let mut model = match PpModel::load(model_path, &mesh, MAX_SEQ) {
+    let loaded = match hipfire_loader::load_model_pp(model_path, MAX_SEQ, &mesh, Default::default())
+    {
         Ok(m) => m,
         Err(e) => {
-            println!("pp_decode_parity: SKIPPED (PpModel::load: {e})");
+            println!("pp_decode_parity: SKIPPED (load_model_pp: {e})");
             return;
         }
+    };
+    let mut model = match loaded.parallel {
+        ModelParallel::Pp(PipelineImpl::Dense(pp)) => pp,
+        _ => panic!("expected PP dense model"),
     };
     let eos = model.eos_token();
     let mut pp_ids = Vec::with_capacity(steps + 1);

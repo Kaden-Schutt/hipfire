@@ -16,8 +16,9 @@
 //!   cargo run -p hipfire-runtime --release --example pp_prefill_parity -- --model model.mq4
 
 use hipfire_hardware::{DeviceMesh, DimKind};
+use hipfire_loader::model_parallel::PipelineImpl;
+use hipfire_loader::ModelParallel;
 use hipfire_runtime::llama::{self, KvCache, LlamaConfig};
-use hipfire_runtime::pp_serve::PpModel;
 
 const MAX_SEQ: usize = 512;
 
@@ -85,14 +86,19 @@ fn main() {
         llama::prefill_forward(&mut gpu, &weights, &config, &toks, &mut kv).expect("ref prefill")
     };
 
-    // ── PP path: PpModel batched prefill. ──
+    // ── PP path: PpModel batched prefill (via loader). ──
     let mesh = DeviceMesh::rect(&[(DimKind::Pp, pp)]);
-    let mut model = match PpModel::load(&model_path, &mesh, MAX_SEQ) {
-        Ok(m) => m,
-        Err(e) => {
-            println!("pp_prefill_parity: SKIPPED (PpModel::load: {e})");
-            return;
-        }
+    let loaded =
+        match hipfire_loader::load_model_pp(&model_path, MAX_SEQ, &mesh, Default::default()) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("pp_prefill_parity: SKIPPED (load_model_pp: {e})");
+                return;
+            }
+        };
+    let mut model = match loaded.parallel {
+        ModelParallel::Pp(PipelineImpl::Dense(pp)) => pp,
+        _ => panic!("expected PP dense model"),
     };
     model.prefill(&toks).expect("pp prefill");
     let pp_logits = model.logits().expect("pp logits");
