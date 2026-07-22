@@ -1933,6 +1933,94 @@ struct Completion {
     done: serde_json::Value,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ThinkFragment {
+    Content(String),
+    Reasoning(String),
+}
+
+#[derive(Debug, Default)]
+struct ThinkChannelRouter {
+    in_think: bool,
+    pending: String,
+    strip_answer_newlines: bool,
+}
+
+impl ThinkChannelRouter {
+    fn set_started_in_think(&mut self, started: bool) {
+        self.in_think = started;
+    }
+
+    fn push(&mut self, text: &str) -> Vec<ThinkFragment> {
+        self.pending.push_str(text);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> Vec<ThinkFragment> {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, flush: bool) -> Vec<ThinkFragment> {
+        const OPEN: &str = "<think>";
+        const CLOSE: &str = "</think>";
+        let mut out = Vec::new();
+        loop {
+            let marker = if self.in_think { CLOSE } else { OPEN };
+            if let Some(index) = self.pending.find(marker) {
+                let before = self.pending[..index].to_owned();
+                self.emit(before, &mut out);
+                self.pending.drain(..index + marker.len());
+                self.in_think = !self.in_think;
+                if !self.in_think {
+                    self.strip_answer_newlines = true;
+                }
+                continue;
+            }
+
+            let held = if flush {
+                0
+            } else {
+                longest_marker_prefix_suffix(&self.pending, marker)
+            };
+            let emit_len = self.pending.len().saturating_sub(held);
+            if emit_len > 0 {
+                let text = self.pending[..emit_len].to_owned();
+                self.pending.drain(..emit_len);
+                self.emit(text, &mut out);
+            }
+            break;
+        }
+        out
+    }
+
+    fn emit(&mut self, mut text: String, out: &mut Vec<ThinkFragment>) {
+        if !self.in_think && self.strip_answer_newlines {
+            let trimmed = text.trim_start_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                return;
+            }
+            text = trimmed.to_owned();
+            self.strip_answer_newlines = false;
+        }
+        if text.is_empty() {
+            return;
+        }
+        if self.in_think {
+            out.push(ThinkFragment::Reasoning(text));
+        } else {
+            out.push(ThinkFragment::Content(text));
+        }
+    }
+}
+
+fn longest_marker_prefix_suffix(text: &str, marker: &str) -> usize {
+    let max = text.len().min(marker.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|&len| text.ends_with(&marker[..len]))
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Default)]
 struct AdmissionState {
     busy: bool,
@@ -2710,12 +2798,37 @@ fn complete_request(
     let mut content = String::new();
     let mut reasoning_content = String::new();
     let mut tool_calls = Vec::new();
+    let mut think_router = ThinkChannelRouter::default();
     let done = runtime.engine.generate(&generate, |event| {
         match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("gen_start") => {
+                if let Some(started) = event
+                    .get("started_in_think")
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    think_router.set_started_in_think(started);
+                }
+                return Ok(());
+            }
             Some("token") => {
                 if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                    content.push_str(text);
+                    for fragment in think_router.push(text) {
+                        let logical = match fragment {
+                            ThinkFragment::Content(text) => {
+                                content.push_str(&text);
+                                serde_json::json!({ "type": "token", "text": text })
+                            }
+                            ThinkFragment::Reasoning(text) => {
+                                reasoning_content.push_str(&text);
+                                serde_json::json!({ "type": "reasoning", "text": text })
+                            }
+                        };
+                        event_callback(&logical).map_err(|error| {
+                            hipfire_client::ClientError::Protocol(error.to_string())
+                        })?;
+                    }
                 }
+                return Ok(());
             }
             Some("reasoning") => {
                 if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
@@ -2725,6 +2838,23 @@ fn complete_request(
             Some("tool_calls") => {
                 if let Some(calls) = event.get("calls").and_then(serde_json::Value::as_array) {
                     tool_calls.extend(calls.iter().cloned());
+                }
+            }
+            Some("done") => {
+                for fragment in think_router.finish() {
+                    let logical = match fragment {
+                        ThinkFragment::Content(text) => {
+                            content.push_str(&text);
+                            serde_json::json!({ "type": "token", "text": text })
+                        }
+                        ThinkFragment::Reasoning(text) => {
+                            reasoning_content.push_str(&text);
+                            serde_json::json!({ "type": "reasoning", "text": text })
+                        }
+                    };
+                    event_callback(&logical).map_err(|error| {
+                        hipfire_client::ClientError::Protocol(error.to_string())
+                    })?;
                 }
             }
             _ => {}
@@ -4783,6 +4913,32 @@ mod tests {
             ]
         });
         assert_eq!(last_user_prompt(&body).as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn jinja_started_think_routes_reasoning_then_visible_answer() {
+        let mut router = ThinkChannelRouter::default();
+        router.set_started_in_think(true);
+        assert_eq!(
+            router.push("reasoning body"),
+            vec![ThinkFragment::Reasoning("reasoning body".into())]
+        );
+        assert!(router.push("</thi").is_empty());
+        assert_eq!(
+            router.push("nk>\n\nvisible answer"),
+            vec![ThinkFragment::Content("visible answer".into())]
+        );
+        assert!(router.finish().is_empty());
+    }
+
+    #[test]
+    fn plain_jinja_tail_keeps_output_in_content() {
+        let mut router = ThinkChannelRouter::default();
+        router.set_started_in_think(false);
+        assert_eq!(
+            router.push("direct answer"),
+            vec![ThinkFragment::Content("direct answer".into())]
+        );
     }
 
     #[test]

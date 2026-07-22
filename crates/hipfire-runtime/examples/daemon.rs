@@ -699,6 +699,23 @@ fn emit_error_with_id(stdout: &mut std::io::Stdout, id: &str, message: impl std:
     let _ = stdout.flush();
 }
 
+/// Whether the authoritative Jinja generation suffix opens a reasoning span.
+/// This is deliberately tail-only: a literal `<think>` in user content must
+/// not reclassify the assistant's visible answer as reasoning.
+fn render_tail_opens_think(rendered: &str) -> bool {
+    rendered.trim_end().ends_with("<think>")
+}
+
+fn emit_gen_start(stdout: &mut std::io::Stdout, id: &str, started_in_think: bool) {
+    let envelope = serde_json::json!({
+        "type": "gen_start",
+        "id": id,
+        "started_in_think": started_in_think,
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut std::io::Stdout, message: impl std::fmt::Display) {
     let envelope = serde_json::json!({
@@ -9033,6 +9050,10 @@ fn generate(
     // template). The cold-reset further down (`jinja_active && seq_pos > 0`)
     // re-prefills this full render from position 0.
     let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -9084,7 +9105,13 @@ fn generate(
             frame.render()
         };
         match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                // Qwen3's bundled froggeric Jinja owns generation framing.
+                // Its rendered tail, not the template-less ChatFrame prefix,
+                // determines the initial response channel.
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
@@ -9652,6 +9679,7 @@ fn generate(
         _ => None,
     };
     let prefill_tokens = new_tokens.len();
+    emit_gen_start(stdout, id, started_in_think);
     let t0 = Instant::now();
 
     if m.arch_id == 5 || m.arch_id == 6 {
@@ -10253,13 +10281,7 @@ fn generate(
             {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(
-                    raw_str,
-                    matches!(
-                        assistant_prefix,
-                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                    ),
-                );
+                let in_think = currently_in_think(raw_str, started_in_think);
                 // Total-think bound (re-arm-proof). Count every think token; at the
                 // cap, latch force-answer (force-close + block <think>); a margin
                 // past the cap, hard-EOS so a model that keeps re-opening <think>
@@ -10409,13 +10431,7 @@ fn generate(
                 // multi-token sequence in Qwen3.5's vocab.
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(
-                    raw_str,
-                    matches!(
-                        assistant_prefix,
-                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                    ),
-                );
+                let in_think = currently_in_think(raw_str, started_in_think);
                 if !in_think {
                     let _ = writeln!(
                         stdout,
@@ -15225,5 +15241,28 @@ mod tool_call_parser_tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+}
+
+#[cfg(test)]
+mod render_tail_think_tests {
+    use super::render_tail_opens_think;
+
+    #[test]
+    fn qwen_jinja_think_tail_primes_reasoning_channel() {
+        assert!(render_tail_opens_think(
+            "<|im_start|>assistant\n<think>\n"
+        ));
+    }
+
+    #[test]
+    fn plain_closed_and_user_literal_tails_do_not_prime() {
+        assert!(!render_tail_opens_think("<|im_start|>assistant\n"));
+        assert!(!render_tail_opens_think(
+            "<|im_start|>assistant\n<think>\n</think>\n"
+        ));
+        assert!(!render_tail_opens_think(
+            "<|im_start|>user\nliteral <think><|im_end|>\n<|im_start|>assistant\n"
+        ));
     }
 }
