@@ -141,7 +141,8 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
       },
       "desc": "MoE 35B/3B-active. mq4p graded-HQ default (robust on all arches; supersedes the dense-AWQ mq4 which is gfx12-only).",
       "sha256": "8eb3be6912aa9db2dcc89c3233b05ccdfe81a84a8d6ef43202f2098d7f2fc78f",
@@ -155,7 +156,8 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
       },
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "mtp": {
@@ -178,7 +180,8 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
       },
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "mtp": {
@@ -201,7 +204,8 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
       },
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "mtp": {
@@ -224,7 +228,8 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
       },
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "mtp": {
@@ -247,7 +252,8 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
       },
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "mtp": {
@@ -270,7 +276,8 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
       },
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "mtp": {
@@ -293,7 +300,8 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
       },
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "mtp": {
