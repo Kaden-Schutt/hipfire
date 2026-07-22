@@ -171,10 +171,12 @@ and methodology notice.
 | DeepSeek V4 Flash (82 GB MQ2-Lloyd) | 4× R9700, `hipfire serve --tp 4` (EP) | **25.6** |
 | Gemma 4 12B MQ4 | single GPU (integration branch, pre-merge) | **~47** |
 
-CASK-based KV cache eviction lets you run long-context prompts without
-OOM: generate a sidecar with `hipfire sidecar-gen <model>` and enable
-eviction with `hipfire config cask-profile balanced`. See
-[CONFIG.md](docs/CONFIG.md) for details.
+Experimental long-context compression and eviction are opt-in. PFlash is off
+by default, TriAttention sidecars do not auto-attach, and CASK m-folding is
+disabled. Generate a sidecar with `hipfire sidecar-gen <model>`, then set
+`memory.cask.sidecar` to its exact path (or explicitly enable
+`memory.cask.auto_attach`). Set `memory.cask.enabled=true` only when m-folding
+is intended. See [CONFIG.md](docs/CONFIG.md) for details.
 
 ## Install
 

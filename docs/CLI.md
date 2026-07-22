@@ -34,7 +34,7 @@ payloads fall back to cache then the embedded registry. Pin the bundle with
 | `hipfire tui [flags...]` | Launch `hipfire-tui` (Home / Chat / Models / Settings / System). |
 
 ### `hipfire run` flags
-Flags may appear before or after the model. CLI help / `CONFIG_DEFAULTS` list stored globals; **effective `run` sampling** is not “global default unless overridden.” Current send resolution (`resolveSamplingForSend`) transmits only: explicit CLI flags, per-model overlay values, or registry `recommended_settings`. Otherwise the field is **omitted** so daemon/HFQ/arch fallback applies. Global-only `temperature` / `top_p` / `repeat_penalty` are not sent. **Chat** is the exception (global session snapshot — [CHAT.md](CHAT.md)).
+Flags may appear before or after the model. CLI help and the native typed schema list stored globals; **effective `run` sampling** is not “global default unless overridden.” The Rust request resolver transmits only explicit CLI flags, per-model overlay values, or registry `recommended_settings`. Otherwise the field is **omitted** so daemon/HFQ/arch fallback applies. Global-only `temperature` / `top_p` / `repeat_penalty` are not sent. **Chat** is the exception (global session snapshot — [CHAT.md](CHAT.md)).
 
 | Flag | Purpose |
 |---|---|
@@ -80,7 +80,7 @@ Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL=1`, `--kv-mode`, or `--imag
 | Command | Purpose |
 |---|---|
 | `hipfire config` | Global interactive TUI → `~/.hipfire/config.toml`. |
-| `hipfire config <tag>` | Per-model overlay TUI (stored in models catalog). |
+| `hipfire config <tag>` | Print resolved per-model policy and override provenance. |
 | `hipfire config list\|get\|set\|reset ...` | Scriptable global ops (`--json` on list/get). |
 | `hipfire config <tag> list\|get\|set\|reset ...` | Same, scoped to per-model keys. |
 

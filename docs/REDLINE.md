@@ -1,22 +1,20 @@
 # Redline Contributor Guide
 
-Canonical **branch-implemented** procedure for Redline retained replay in
+Canonical **shipped / ref-pinned** procedure for Redline retained replay in
 hipfire. Use it to construct, validate, measure, review, and decide whether a
 retained route may be promoted. Runtime source is authoritative for executable
 behavior. Dated reports are evidence for the fixtures they name only.
 
 | Field | Value |
 |---|---|
-| Page state | **branch-implemented** (see [`INDEX.md`](INDEX.md)) |
-| Inventory date | 2026-07-19 |
-| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
-| Comparison base | `origin/beta` @ `9ffb18da9d1377dfbf759db82641ea039b2e522e` |
+| Page state | **shipped / ref-pinned** (see [`INDEX.md`](INDEX.md)) |
+| Inventory date | 2026-07-22 |
+| Audited source ref | `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
+| Comparison base | `origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
 | Validation routes | [`VALIDATION.md`](VALIDATION.md) |
 | Thin skill hook (non-normative) | [`.agents/skills/redline-retained-replay/SKILL.md`](../.agents/skills/redline-retained-replay/SKILL.md) |
 
-This guide is normative on the working branch. It is **not** an `origin/beta`
-product fact at the comparison base unless and until that base carries the same
-text.
+This guide is normative contributor policy on the audited beta ref.
 
 ## 1. Scope, authority, and evidence classes
 

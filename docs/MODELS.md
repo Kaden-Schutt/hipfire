@@ -3,7 +3,7 @@
 **Owner:** registry-backed model surface (`docs/INDEX.md`).
 **Machine sources:** curated `registry/models.json`; generated and bundled
 `registry/v1.json` (loaded by `hipfire-registry`).
-**Last checked:** 2026-07-19 against working tree; greenfield rewrite pin `692a726dde53508cb53de1a74c720e75a7c9f33e` (comparison base `origin/beta@9ffb18da9d1377dfbf759db82641ea039b2e522e`).
+**Last checked:** 2026-07-22 against `origin/beta@202282de8759dfa6963ea5184ad2bf2b9259cef6`.
 
 This page projects **registry availability**: tags, default artifact filenames, declared download size, and declared VRAM floor. It is **not** a product admission table and **not** a guarantee that every GPU/route runs every tag.
 
@@ -26,7 +26,7 @@ hipfire run qwen3.5:9b "hello"
 hipfire list -r
 ```
 
-Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Per-tag sampling defaults come from registry `recommended_settings` only (applied by the CLI resolver). Registry `sampling` blocks (present on e.g. `deepseek-v4-flash`, `north-mini-code`) are **metadata only today** — not read by `resolveModelConfig` / `resolveSamplingForSend`. See [`CONFIG.md`](CONFIG.md).
+Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Per-tag sampling defaults come from registry `recommended_settings` only (applied by the native CLI request resolver). Registry `sampling` blocks (present on e.g. `deepseek-v4-flash`, `north-mini-code`) are **metadata only today** — they are not promoted by `RecommendedSettings::config_layer` or the native request resolver. See [`CONFIG.md`](CONFIG.md).
 
 ---
 
@@ -185,7 +185,7 @@ Capability features (DFlash, CASK, PP, MTP, batched prefill, n-gram) are **per-p
 
 ### LFM optimized prefill — branch-only scope
 
-**Branch-only; not shipped** on `origin/beta@9ffb18da9d1377dfbf759db82641ea039b2e522e`.
+**Branch-only; not shipped** on `origin/beta@202282de8759dfa6963ea5184ad2bf2b9259cef6`.
 
 Audited branch wording allowed for optimized LFM prefill (and nothing broader):
 

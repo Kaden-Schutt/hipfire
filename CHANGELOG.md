@@ -34,7 +34,22 @@ Contributor deltas staged for this release:
 - #528: DeepSeek V4 DSpark sidecar registration and re-pull discovery.
 - #529: quickstart refresh and historical benchmark labeling.
 
-The release also refreshes the Rust and Bun dependency surface, adds standard
+The user-facing control plane is now Rust-only. `hipfire-cli`,
+`hipfire-config`, `hipfire-registry`, `hipfire-client`, and `hipfire-tui` own
+install, config, model lifecycle, chat, serving, and OpenAI-compatible HTTP;
+the installed binary and runtime images carry no Bun, Node.js, or TypeScript
+payload. Sparse typed TOML is the persistent policy surface, while environment
+variables remain for bootstrap, one-shot compatibility, and explicit developer
+experiments.
+
+Registry `recommended_settings` now lower through the typed config resolver,
+including temperature, top-p, top-k, min-p, presence penalty, repeat penalty,
+and fallback system prompts. The Rust client also restores chat-history
+framing, stable OpenAI response metadata, base64 vision passthrough,
+cached-token accounting, and DeepSeek cache-fingerprint normalization. PFlash,
+TriAttention sidecar auto-attach, and CASK m-folding remain disabled by default.
+
+The release also refreshes the Rust dependency surface, adds standard
 `clap`/`safetensors`/`half`/`tracing` support, introduces Redline property
 coverage, enables `cargo-deny` in CI, removes the stale modular-rebase helper,
 and removes the dead AWQ router exclusion.

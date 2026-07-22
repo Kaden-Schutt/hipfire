@@ -7,12 +7,12 @@ configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
 
 | Field | Default (source) |
 |---|---|
-| Bind host | `0.0.0.0` (`CONFIG_DEFAULTS.host`) |
-| Port | `11435` (`CONFIG_DEFAULTS.port`) |
-| Pre-warm model | `default_model` (`qwen3.5:9b` unless changed) or a positional model arg |
-| Idle unload | `idle_timeout` = `300` s (`0` = never) |
-| Max request body | `max_request_bytes` = 64 MiB |
-| Admission queue | `serve_max_queue` = `64`, `serve_queue_timeout_ms` = `30000` |
+| Bind host | `serve.host = "0.0.0.0"` |
+| Port | `serve.port = 11435` |
+| Pre-warm model | `serve.default_model = "qwen3.5:9b"` or a positional model arg |
+| Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
+| Max request body | `serve.max_request_bytes = 67108864` (64 MiB) |
+| Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 30000` |
 | Pid / log | `~/.hipfire/serve.pid`, `~/.hipfire/serve.log` |
 
 Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
@@ -192,7 +192,7 @@ container builds or no-GPU CI.
 
 ### Branch-only: LFM framing harness
 
-**Branch-implemented** at audited `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e`; **absent** from comparison base `origin/beta@9ffb18da9d1377dfbf759db82641ea039b2e522e`. Not a shipped/ref-pinned HTTP contract on this page.
+**Branch-implemented** at audited `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e`; **absent** from comparison base `origin/beta@202282de8759dfa6963ea5184ad2bf2b9259cef6`. Not a shipped/ref-pinned HTTP contract on this page.
 
 | Claim | Route | Owner |
 |---|---|---|

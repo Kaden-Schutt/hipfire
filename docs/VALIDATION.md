@@ -7,9 +7,9 @@ certification prose live in their owners ([`INDEX.md`](INDEX.md)).
 
 | Field | Value |
 |---|---|
-| Inventory date | 2026-07-19 |
-| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
-| Comparison base | `origin/beta` @ `9ffb18da9d1377dfbf759db82641ea039b2e522e` |
+| Inventory date | 2026-07-22 |
+| Audited source ref | `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
+| Comparison base | `origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
 | Integrated commit / tree hashes | External Git/CI only. |
 
 ## Rules
@@ -28,8 +28,8 @@ certification prose live in their owners ([`INDEX.md`](INDEX.md)).
 
 | Class | When it runs | Authority |
 |---|---|---|
-| **Automatic (no GPU CI)** | PR / push via the no-GPU workflow only | Merge bar for compile, native control-plane/unit tests, and docs reliability. **Not** model coherence, serve semantics, or perf admission. |
-| **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged paths | Always runs documentation reliability first; documentation/governance/tooling-only staged sets exit before runtime/GPU hotspot gates; mixed commits continue through the hotspot guards that match remaining staged paths. **Not** a full product matrix. |
+| **Automatic (no GPU CI)** | PR / push via the no-GPU workflow only | Merge bar for compile, native control-plane/unit tests, CPU tests, and env/docs reference coverage. **Not** model coherence, serve semantics, or perf admission. |
+| **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged runtime paths | Runs the hotspot guards selected by the staged path set. Documentation-only staged sets do not trigger a separate docs hook. **Not** a full product matrix. |
 | **Manual local no-GPU equivalent** | Human/agent invokes `scripts/no-gpu-ci.sh` outside CI | Same checks as the workflow script body; still **manual invocation**, not automatic CI. |
 | **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Required for kernel, dispatch, forward, quant, serve-behavior, Redline, and perf claims. |
 
@@ -40,56 +40,27 @@ Automatic CI green never substitutes for a required manual route. Running the no
 | Route | Path | Role |
 |---|---|---|
 | No-GPU CI workflow | [`.github/workflows/no-gpu-ci.yml`](../.github/workflows/no-gpu-ci.yml) | **Automatic** CI entry that invokes the no-GPU script on PR/push. |
-| Pre-commit hooks | [`.githooks/pre-commit`](../.githooks/pre-commit) | **Automatic** when hooks are installed (`scripts/install-hooks.sh`). Always runs the staged documentation reliability checker, then separates documentation/governance/tooling-only staged sets from runtime paths before HOTSPOT / SERVE_HOTSPOT / PP_HOTSPOT. Docs-only sets exit before those runtime/GPU gates; mixed commits still run every applicable runtime gate. |
+| Pre-commit hooks | [`.githooks/pre-commit`](../.githooks/pre-commit) | **Automatic** when hooks are installed (`scripts/install-hooks.sh`). Selects HOTSPOT / SERVE_HOTSPOT / PP_HOTSPOT runtime guards from staged paths; documentation-only staged sets exit without a separate docs gate. |
 | Dispatch `bind_thread` invariant | [`scripts/verify-bind-thread.sh`](../scripts/verify-bind-thread.sh) (via pre-commit on matching paths) | **Automatic** when hooked: every public `dispatch.rs` entry must bind the HIP thread. Not a kernel numeric test. |
-| Docs reliability checker | [`scripts/check-docs-reliability.py`](../scripts/check-docs-reliability.py) | **Automatic** in no-GPU CI and local pre-commit (staged mode, always before any docs-only early exit). Env-table coverage included. |
+| Env/docs drift check | [`scripts/check-env-docs.py`](../scripts/check-env-docs.py) | **Automatic** through `scripts/no-gpu-ci.sh`; checks that referenced `HIPFIRE_*` names are documented and production reads are config-owned. |
 
 ### Manual local equivalents (not automatic)
 
 | Route | Path | Role |
 |---|---|---|
 | No-GPU script | [`scripts/no-gpu-ci.sh`](../scripts/no-gpu-ci.sh) | Manual local run of the same body CI uses: `cargo check --workspace --examples`; selected no-GPU Rust and native control-plane tests; CPU pytest; env/docs coverage. |
+| Env/docs drift check | [`scripts/check-env-docs.py`](../scripts/check-env-docs.py) | Fast standalone env-name coverage and ownership check. No GPU or model download. |
 
-### Documentation reliability checker
+### Documentation checks
 
-Canonical checker: [`scripts/check-docs-reliability.py`](../scripts/check-docs-reliability.py).
-Stdlib-only. No GPU, no model downloads. It reads a **git snapshot** (explicit
-commit via `--target-ref`, or the current index via `--staged`) against an
-explicit `--base-ref`. It does **not** guess a merge base, and it does **not**
-write commit/tree identity into tracked docs.
-
-The former standalone env-table gate is **subsumed**: env coverage over
-`AGENTS.md` / `README.md` / `CONTRIBUTING.md` vs
-[`env-vars.md`](env-vars.md) runs inside the canonical checker.
-
-| Invocation | Command | When |
-|---|---|---|
-| Focused unit tests | `python3 -m unittest tests.test_docs_reliability` | Local or CI; no GPU. Exercises checker predicates in temp repos. |
-| Staged (index) snapshot | `python3 scripts/check-docs-reliability.py --staged --base-ref HEAD` | Local pre-commit / before commit. Target = current index (`git write-tree`); ignores unstaged worktree noise. |
-| Commit-tree snapshot | `python3 scripts/check-docs-reliability.py --target-ref <commit> --base-ref <commit>` | Local or CI against an explicit integrated commit. Example local same-tree structural check: `--target-ref HEAD --base-ref HEAD`. |
-
-CLI contract (exactly one mode + required base):
-
-```bash
-python3 scripts/check-docs-reliability.py --staged --base-ref <ref>
-python3 scripts/check-docs-reliability.py --target-ref <ref> --base-ref <ref>
-```
-
-**CI identity is external.** The no-GPU workflow fetches the explicit base and
-supplies the final integrated commit and comparison base to the checker (via
-the no-GPU script / `DOCS_DIFF_BASE`). Tracked docs never self-reference the
-integrated commit or tree. CI records in its **job artifact**: commit SHA, tree
-SHA, source refs (target + base), checker exit/results, and the semantic
-matrix outcome for that run. Local invocation stays usable without GPU or
-model downloads; when `DOCS_DIFF_BASE` is unset locally, same-tree checking
-with `--base-ref HEAD` is the structural fallback only.
-
-Enforcement surfaces (implementation lives in hooks/CI; this file only names
-them):
-
-- Pre-commit always runs the **staged** documentation reliability checker, then exits before runtime/GPU hotspot gates when the staged set is documentation/governance/tooling-only. Mixed commits continue through every applicable runtime gate after the checker.
-- No-GPU CI / `scripts/no-gpu-ci.sh` run the focused unit tests and the
-  **commit-tree** form with the externally supplied base.
+The shipped automated documentation-specific check is
+[`scripts/check-env-docs.py`](../scripts/check-env-docs.py). It validates
+environment-variable reference coverage and config ownership; it is not a
+general Markdown link, lifecycle-label, or semantic-drift checker. Beta does
+not currently ship a standalone `check-docs-reliability.py` command or a
+documentation-only pre-commit gate. For documentation-only changes, run the
+env/docs check plus `git diff --check`, and inspect changed links and commands
+against the current tree.
 
 ### Maintained manual harness roles
 
@@ -120,7 +91,7 @@ Use only when the claim class below names them. They are not universal.
 
 | Claim / change class | Minimum route(s) | Evidence kind |
 |---|---|---|
-| Docs, env-var tables, no-GPU Rust/Python/CLI only | Automatic: `.github/workflows/no-gpu-ci.yml` in CI (focused `tests.test_docs_reliability` + `scripts/check-docs-reliability.py` with externally supplied target/base); optional manual local `scripts/no-gpu-ci.sh` or the checker commands above; pre-commit staged mode when hooks are installed | Automatic CI and/or manual local equivalent — **not** GPU/model evidence |
+| Docs, env-var tables, no-GPU Rust/Python/CLI only | Automatic: `.github/workflows/no-gpu-ci.yml` invokes `scripts/no-gpu-ci.sh`; for a fast docs-only local check run `python3 scripts/check-env-docs.py` plus `git diff --check` | Automatic CI and/or manual local equivalent — **not** GPU/model evidence |
 | New/changed `.hip` kernel (numeric) | `test_kernels`; then model-level manual route for the arch under test | Manual + channel |
 | Dispatch `bind_thread` / public `dispatch.rs` bind surface | `.githooks/pre-commit` → `scripts/verify-bind-thread.sh` (or run that script manually) | Automatic hook or manual bind check — **not** `test_kernels` |
 | Forward / fusion / KV **numerical or state parity** | Path-specific parity/state oracle for that arch/surface; **blocked** if no oracle exists | Manual oracle — **not** `serve_harness.py` |

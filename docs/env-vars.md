@@ -137,7 +137,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 | Variable | Status | Scope |
 |---|---|---|
-| `HIPFIRE_LFM2_PREFILL_BATCH` | **opt-in**; require `=1` | **Branch-only; not shipped** as a generic product default. Audited wording: **350M dense MQ4** cohort + **gfx1201** + this flag at `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e` (absent from `origin/beta@9ffb18da…`). Does **not** admit Q8/other cohorts/default-on. |
+| `HIPFIRE_LFM2_PREFILL_BATCH` | **opt-in**; require `=1` | **Branch-only; not shipped** as a generic product default. Audited wording: **350M dense MQ4** cohort + **gfx1201** + this flag at `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e` (absent from `origin/beta@202282de…`). Does **not** admit Q8/other cohorts/default-on. |
 | `HIPFIRE_LFM2_PREFILL_MAX_BATCH` | default 256, cap 512 | Chunk size for batched path |
 | `HIPFIRE_LFM2_GRAPH` | LFM graph experiments | Source in LFM crate/daemon |
 | `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` | default on for eligible fixture; `=0` opts out | Request bit for exact gfx1201 350M dense-MQ4 decode fusion. **Unset or `=1`** requests fusion; **`=0`** (or any other set value) disables the request. Actual enablement still requires verified fixture evidence, gfx1201, graph off, and lowered forward (`lfm2_decode_fusion_enabled`). Listed opt-out of the admitted retained-PM4 product default in [`admissions.yml`](admissions.yml). |
@@ -148,9 +148,13 @@ Eager LFM prefill remains available when the batch flag is off **or** the GPU is
 
 ### CASK / serve / multi-GPU
 
+`HIPFIRE_CASK_OFF` is a retired compatibility name. The current Rust control
+plane does not consume it; use an empty `memory.cask.sidecar` and keep
+`memory.cask.auto_attach=false` instead. The old name remains only in a loader
+diagnostic and developer harness exports pending their cleanup.
+
 | Variable | Notes |
 |---|---|
-| `HIPFIRE_CASK_OFF=1` | Force no auto-attach |
 | `HIPFIRE_FORCE_A3B_EVICTION=1` | Override A3B refusal (not recommended) |
 | `HIPFIRE_IDLE_TIMEOUT` | Serve idle unload seconds |
 | `HIPFIRE_MAX_REQUEST_BYTES` | Body cap |
@@ -163,7 +167,7 @@ Eager LFM prefill remains available when the batch flag is off **or** the GPU is
 
 ### Redline / retained replay
 
-Policy owner: [`REDLINE.md`](REDLINE.md) (**branch-implemented** vs comparison base). Timing is not route-certified without same-report timed-arm proof. Registry admission is not canonical certification.
+Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is not route-certified without same-report timed-arm proof. Registry admission is not canonical certification.
 
 | Variable | Notes |
 |---|---|
@@ -318,7 +322,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_CANARY_MODEL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_PREFILL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_RUNS` | scripts/gfx906_fallback_canary.sh |
-| `HIPFIRE_CASK_OFF` | crates/hipfire-cli/src/main.rs, crates/hipfire-loader/src/lib.rs |
+| `HIPFIRE_CASK_OFF` | crates/hipfire-loader/src/lib.rs, scripts/redline_daemon_harness.py, scripts/redline_product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
 | `HIPFIRE_CASK_SIDECAR` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_CHATML` | crates/hipfire-runtime/examples/probe_argmax_agreement.rs |
 | `HIPFIRE_CHAT_CURRENT_DATE` | crates/hipfire-runtime/src/prompt_frame.rs |
@@ -995,8 +999,8 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 # Independently verify concrete Rust HIPFIRE_* reads against table rows.
 scripts/regen-env-vars-doc.sh
 
-# Canonical staged documentation gate (includes the same source extraction).
-python3 scripts/check-docs-reliability.py --staged --base-ref HEAD
+# Shipped env/docs coverage and production-ownership check.
+python3 scripts/check-env-docs.py
 ```
 
 Also match `std::env::var_os("HIPFIRE_…")` (e.g. `HIPFIRE_KERNEL_CACHE` in `compiler.rs`) — token scan catches the name regardless of `var` vs `var_os`.
@@ -1008,4 +1012,4 @@ When adding a user-facing knob:
 3. Re-scan so the generated inventory stays complete.
 4. Do not document unearned or widened LFM defaults here (multi-cohort, path/extension selection, or generic default-on beyond the exact sealed [`admissions.yml`](admissions.yml) row). The earned exact LFM retained-PM4 default and its three opt-outs may be documented; planned broader admissions may not.
 
-**Last inventory generation:** 2026-07-20.
+**Last inventory verification:** 2026-07-22.

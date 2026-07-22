@@ -158,10 +158,10 @@ HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."
 ## Light configuration
 
 ```bash
-hipfire config                 # global TUI → ~/.hipfire/config.toml
-hipfire config qwen3.5:9b      # per-model overlay → ~/.hipfire/models.toml
-hipfire config set temperature 0.7
-hipfire config list
+hipfire config                                      # global TUI → ~/.hipfire/config.toml
+hipfire config qwen3.5:9b                           # resolved per-model policy
+hipfire config qwen3.5:9b set generation.temperature 0.7
+hipfire config qwen3.5:9b list                      # overlay + provenance
 ```
 
 Defaults that matter on day one (from the native schema; full table in [CONFIG.md](CONFIG.md)). **Sampling send path:** `run` / `serve` transmit explicit request/CLI values, per-model TOML overlays, or the complete registry `recommended_settings` recipe (`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repeat_penalty`, plus fallback `system_prompt`). Otherwise sampling fields are omitted for daemon/HFQ/arch fallback. Bare global sampling values alone are **not** effective `run`/`serve` defaults. **Chat** is the exception — it uses a global config snapshot for the session ([CHAT.md](CHAT.md)).

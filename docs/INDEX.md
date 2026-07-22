@@ -5,10 +5,10 @@ Domain prose lives in the linked owners; this file does not duplicate it.
 
 | Field | Value |
 |---|---|
-| Inventory date | 2026-07-19 |
-| Working branch | `lfm-redline` |
-| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
-| Comparison base | `origin/beta` @ `9ffb18da9d1377dfbf759db82641ea039b2e522e` |
+| Inventory date | 2026-07-22 |
+| Working branch | `beta` |
+| Audited source ref | `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
+| Comparison base | `origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
 | Integrated commit / tree / source hashes | Supplied externally by Git/CI after cutover. Never self-referenced here. |
 
 ## Truth states
@@ -19,7 +19,7 @@ Pick exactly one:
 | State | Meaning |
 |---|---|
 | **shipped / ref-pinned** | Present on the audited source ref and treated as current product or contributor authority for that concern. |
-| **branch-implemented** | Implemented or documented on `lfm-redline` (or another named working branch) but not a fact of `origin/beta` at the comparison base. |
+| **branch-implemented** | Implemented or documented on a named working branch but not present in the audited beta ref. |
 | **measured** | Observation tied to named fixture, binary/model identity, and date. Not a default, floor, or admission. |
 | **planned** | Intent only. No executable authority and no implied schedule. |
 
@@ -64,9 +64,9 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 
 | Concern | Canonical owner | State | Notes |
 |---|---|---|---|
-| Docs navigation, lifecycle labels, ownership map | [`docs/INDEX.md`](INDEX.md) | branch-implemented | This file. Not yet on audited ref / integrated tree. |
-| Human validation route selection | [`docs/VALIDATION.md`](VALIDATION.md) | branch-implemented | Sole route selector. Not yet on audited ref / integrated tree. |
-| Machine admission registry | [`docs/admissions.yml`](admissions.yml) | branch-implemented | Schema v2; exactly one earned record (LFM2.5-350M MQ4 gfx1201 retained-PM4). Not yet on audited ref / integrated tree. |
+| Docs navigation, lifecycle labels, ownership map | [`docs/INDEX.md`](INDEX.md) | shipped / ref-pinned | This file. |
+| Human validation route selection | [`docs/VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Sole route selector. |
+| Machine admission registry | [`docs/admissions.yml`](admissions.yml) | shipped / ref-pinned | Schema v2; exactly one earned record (LFM2.5-350M MQ4 gfx1201 retained-PM4). |
 | Product onboarding | [`docs/GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | |
 | CLI surface and model lifecycle commands | [`docs/CLI.md`](CLI.md) | shipped / ref-pinned | |
 | Daemon / user config keys | [`docs/CONFIG.md`](CONFIG.md) | shipped / ref-pinned | |
@@ -87,8 +87,8 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Arch-port validation procedure (channel / speed) | [`docs/methodology/arch-port-validation.md`](methodology/arch-port-validation.md) | shipped / ref-pinned | Does not restore retired coherence-gate batteries. |
 | Perf-arch working discipline | [`docs/methodology/perf-arch-discipline.md`](methodology/perf-arch-discipline.md) | shipped / ref-pinned | |
 | Kernel Atlas methodology | [`docs/methodology/kernel-atlas.md`](methodology/kernel-atlas.md) | shipped / ref-pinned | |
-| Redline contributor certification and route-proof policy | [`docs/REDLINE.md`](REDLINE.md) | branch-implemented | Normative on this branch; not an `origin/beta` fact at the comparison base. |
-| Thin Redline skill hook (workflow only) | [`.agents/skills/redline-retained-replay/`](../.agents/skills/redline-retained-replay/) | branch-implemented | Must not fork policy from `REDLINE.md`. |
+| Redline contributor certification and route-proof policy | [`docs/REDLINE.md`](REDLINE.md) | shipped / ref-pinned | Normative contributor policy. |
+| Thin Redline skill hook (workflow only) | [`.agents/skills/redline-retained-replay/`](../.agents/skills/redline-retained-replay/) | shipped / ref-pinned | Must not fork policy from `REDLINE.md`. |
 | Executable agent skills root | [`.agents/skills/`](../.agents/skills/) | shipped / ref-pinned | Sole executable skill root. |
 | Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Inventory snapshot; verify in source before product claims. |
 | Spec-decode durability note (2026-06-23) | [`docs/spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated fixture/tables report. |
@@ -119,9 +119,9 @@ Every current top-level page, exactly once.
 
 | Page | State | Owner role |
 |---|---|---|
-| [`INDEX.md`](INDEX.md) | branch-implemented | Navigation, lifecycle, ownership. |
-| [`VALIDATION.md`](VALIDATION.md) | branch-implemented | Validation route selector. |
-| [`admissions.yml`](admissions.yml) | branch-implemented | Admission registry (schema v2; exactly one record). |
+| [`INDEX.md`](INDEX.md) | shipped / ref-pinned | Navigation, lifecycle, ownership. |
+| [`VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Validation route selector. |
+| [`admissions.yml`](admissions.yml) | shipped / ref-pinned | Admission registry (schema v2; exactly one record). |
 | [`GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | Onboarding. |
 | [`CLI.md`](CLI.md) | shipped / ref-pinned | CLI. |
 | [`CONFIG.md`](CONFIG.md) | shipped / ref-pinned | Config keys. |
@@ -136,7 +136,7 @@ Every current top-level page, exactly once.
 | [`multi-gpu.md`](multi-gpu.md) | shipped / ref-pinned | Multi-GPU ops. |
 | [`CONTAINER.md`](CONTAINER.md) | shipped / ref-pinned | Containers. |
 | [`NIXOS.md`](NIXOS.md) | shipped / ref-pinned | NixOS. |
-| [`REDLINE.md`](REDLINE.md) | branch-implemented | Redline certification (branch-only vs `origin/beta`). |
+| [`REDLINE.md`](REDLINE.md) | shipped / ref-pinned | Redline certification policy. |
 | [`BENCHMARKS.md`](BENCHMARKS.md) | historical | Dated/historical bench tables; incomplete manifests stay historical-only. |
 | [`speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Speculation inventory snapshot. |
 | [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated durability fixture/tables. |
@@ -165,11 +165,11 @@ Every current top-level collection, exactly once. Directory policy applies to me
 | [`governance/`](governance/) | historical | Legal/governance records; bodies stay untouched. |
 | [`superpowers/`](superpowers/) | planned | Nested plans/specs only; not an executable skill root. |
 
-## Branch scope
+## Audit scope
 
-- **Audited ref** (`692a726dde53508cb53de1a74c720e75a7c9f33e`): pin for greenfield active prose derived from current source on this branch.
-- **Comparison base** (`origin/beta` @ `9ffb18da9d1377dfbf759db82641ea039b2e522e`): use when labeling branch-only vs already-on-beta facts.
-- Branch-only Redline and LFM surfaces must not be phrased as `origin/beta` product facts.
+- **Audited ref** (`202282de8759dfa6963ea5184ad2bf2b9259cef6`): beta behavior pin used for this inventory refresh.
+- **Comparison base** (`origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6`): use when separating branch-only work from current beta facts.
+- Branch-implemented surfaces must not be phrased as beta product facts.
 - Historical, legal, and measured checkpoint bodies are not rewritten by this index.
 
 ## Explicit non-goals

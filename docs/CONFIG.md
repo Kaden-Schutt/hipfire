@@ -386,7 +386,7 @@ and `HIPFIRE_DEFAULT_CHATML` remain legacy one-shot aliases.
 
 ```bash
 hipfire config qwen3.5:9b set dflash_mode off
-hipfire config qwen3.5:9b          # TUI on overlay
+hipfire config qwen3.5:9b          # list resolved model policy
 ```
 
 Only explicitly set keys are stored; others inherit global. Primary path:
