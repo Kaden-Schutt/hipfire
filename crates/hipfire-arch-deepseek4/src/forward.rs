@@ -3786,25 +3786,35 @@ fn ffn_hash_routed(
             .map_err(|e| format!("hash_router_normalize hash l{layer_idx}: {e:?}"))?;
         }
     } else {
-        // Fallback: d2h + host gather + h2d.
+        // Fallback: d2h + host gather + h2d. Host Vecs live on
+        // `state.hash_topk_host` and are clear+reused across layers.
         let scores_host = gpu
             .download_f32(scores)
             .map_err(|e| format!("d2h scores hash l{layer_idx}: {e:?}"))?;
-        let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k]
-            .iter()
-            .map(|&i| i.min((n_exp - 1) as u32))
-            .collect();
-        let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
+        let scratch = &mut state.hash_topk_host;
+        scratch.clear();
+        scratch.topk_ids.extend(
+            layer.tid2eid_host[row..row + k]
+                .iter()
+                .map(|&i| i.min((n_exp - 1) as u32)),
+        );
+        let wts = match gather_normalized_weights(&scores_host, &scratch.topk_ids) {
             Some(w) => w,
             None => return Ok(()),
         };
-        let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
-        let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-        gpu.memcpy_htod_auto(&topk_idx_dev.buf, &idx_bytes)
+        scratch.idx_i32.extend(scratch.topk_ids.iter().map(|&x| x as i32));
+        scratch
+            .idx_bytes
+            .extend(scratch.idx_i32.iter().flat_map(|i| i.to_le_bytes()));
+        gpu.memcpy_htod_auto(&topk_idx_dev.buf, &scratch.idx_bytes)
             .map_err(|e| format!("htod topk_indices hash l{layer_idx}: {e:?}"))?;
-        let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
-        let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-        gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
+        scratch
+            .w_scaled
+            .extend(wts.iter().map(|&w| w * route_scale_override));
+        scratch
+            .w_bytes
+            .extend(scratch.w_scaled.iter().flat_map(|w| w.to_le_bytes()));
+        gpu.memcpy_htod_auto(&topk_w_dev.buf, &scratch.w_bytes)
             .map_err(|e| format!("htod topk_weights hash l{layer_idx}: {e:?}"))?;
     }
 
