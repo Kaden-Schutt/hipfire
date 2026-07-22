@@ -14,8 +14,8 @@
 //!   cargo run -p hipfire-runtime --release --example tp_multiturn_parity -- --model model.mq4
 
 use hipfire_hardware::{DeviceMesh, DimKind};
+use hipfire_loader::ModelParallel;
 use hipfire_runtime::llama;
-use hipfire_runtime::tp_serve::TpModel;
 
 const MAX_SEQ: usize = 512;
 const TP: usize = 2;
@@ -49,12 +49,17 @@ fn main() {
 
     // ── Cold: one TpModel, prefill the WHOLE sequence at once. ──
     let cold_logits: Vec<f32> = {
-        let mut m = match TpModel::load(&model_path, &mesh, MAX_SEQ) {
-            Ok(m) => m,
-            Err(e) => {
-                println!("tp_multiturn_parity: SKIPPED (TpModel::load: {e})");
-                return;
-            }
+        let loaded =
+            match hipfire_loader::load_model_tp(&model_path, MAX_SEQ, &mesh, Default::default()) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("tp_multiturn_parity: SKIPPED (load_model_tp: {e})");
+                    return;
+                }
+            };
+        let mut m = match loaded.parallel {
+            ModelParallel::Tp(tp) => tp,
+            _ => panic!("expected TP model"),
         };
         m.prefill(&full).expect("cold prefill");
         m.logits().expect("cold logits")
@@ -63,7 +68,12 @@ fn main() {
     // ── Reuse: a second TpModel, prefill PREFIX, then per-token SUFFIX at
     // pos = PREFIX.len()+i (the daemon cache-hit path). ──
     let reuse_logits: Vec<f32> = {
-        let mut m = TpModel::load(&model_path, &mesh, MAX_SEQ).expect("load reuse");
+        let loaded = hipfire_loader::load_model_tp(&model_path, MAX_SEQ, &mesh, Default::default())
+            .expect("load reuse");
+        let mut m = match loaded.parallel {
+            ModelParallel::Tp(tp) => tp,
+            _ => panic!("expected TP model"),
+        };
         m.prefill(PREFIX).expect("prefix prefill");
         for (i, &t) in SUFFIX.iter().enumerate() {
             m.forward_token(t, PREFIX.len() + i)

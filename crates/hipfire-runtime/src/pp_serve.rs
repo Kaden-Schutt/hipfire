@@ -70,15 +70,42 @@ impl PpModel {
         self.pp
     }
 
-    /// Load a dense llama-family HFQ pipeline-parallel across `pp` stages.
+    /// Load a dense llama-family HFQ for pipeline-parallel serving,
+    /// consuming an already-opened HFQ handle.  Gated behind the
+    /// `loader-internal` feature — only hipfire-loader should call
+    /// this; external consumers use `hipfire_loader::load_admitted`.
+    #[doc(hidden)]
+    #[cfg(feature = "loader-internal")]
+    pub fn load_from_hfq(hfq: &HfqFile, mesh: &DeviceMesh, max_seq: usize) -> Result<Self, String> {
+        Self::load_from_hfq_inner(hfq, mesh, max_seq)
+    }
+
+    /// Open an HFQ and load a dense PP model.
+    ///
+    /// **Deprecated** — use `hipfire_loader::load_model_pp` instead.
+    /// The loader guarantees admitted-source consistency; this direct
+    /// path-opening convenience bypasses the admission guard and will
+    /// be removed before 1.0.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use hipfire_loader::load_model_pp for admitted-source consistency"
+    )]
     pub fn load(path: &str, mesh: &DeviceMesh, max_seq: usize) -> Result<Self, String> {
+        let hfq = HfqFile::open(std::path::Path::new(path)).map_err(|e| format!("{e}"))?;
+        Self::load_from_hfq_inner(&hfq, mesh, max_seq)
+    }
+
+    fn load_from_hfq_inner(
+        hfq: &HfqFile,
+        mesh: &DeviceMesh,
+        max_seq: usize,
+    ) -> Result<Self, String> {
         let pp = mesh.size_of(DimKind::Pp);
         if pp < 2 {
             return Err(format!(
                 "PpModel::load needs a Pp axis with size>=2 (got {pp})"
             ));
         }
-        let hfq = HfqFile::open(std::path::Path::new(path)).map_err(|e| format!("{e}"))?;
         if !matches!(hfq.arch_id, 0 | 1) {
             return Err(format!(
                 "dense PP serve is llama-family only (arch_id 0/1); got arch_id={}",
@@ -430,4 +457,84 @@ impl PpModel {
 
 fn herr(e: hip_bridge::HipError) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multi_gpu::{DeviceMesh, DimKind};
+    use std::io::Write;
+
+    /// Write a minimal HFQ fixture for host-only preflight tests.
+    fn write_minimal_hfq(
+        dir: &tempfile::TempDir,
+        name: &str,
+        arch_id: u32,
+        metadata_json: &str,
+    ) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let meta_bytes = metadata_json.as_bytes();
+        let metadata_offset: u64 = 32;
+        let n_tensors: u32 = 0;
+        let index_offset = metadata_offset + meta_bytes.len() as u64;
+        let data_offset = index_offset + 4;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(&arch_id.to_le_bytes()).unwrap();
+        f.write_all(&n_tensors.to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(meta_bytes).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.flush().unwrap();
+        path
+    }
+
+    #[test]
+    fn load_from_hfq_rejects_non_llama_arch_id_before_gpu() {
+        let dir = tempfile::tempdir().unwrap();
+        // DeepSeek4 (arch_id=9) is not llama-family
+        let path = write_minimal_hfq(
+            &dir,
+            "ds4.hfq",
+            9,
+            r#"{"config":{"model_type":"deepseek_v4","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"intermediate_size":8192,"vocab_size":32000}}"#,
+        );
+        let hfq = HfqFile::open(&path).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
+        let err = match PpModel::load_from_hfq_inner(&hfq, &mesh, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for non-llama arch_id, got Ok"),
+        };
+        assert!(
+            err.contains("arch_id=9"),
+            "expected arch_id=9 error, got: {err}"
+        );
+        assert!(
+            err.contains("llama-family only"),
+            "expected llama-family error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_from_hfq_rejects_pp_below_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_minimal_hfq(
+            &dir,
+            "llama.hfq",
+            0,
+            r#"{"config":{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}}"#,
+        );
+        let hfq = HfqFile::open(&path).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 1)]);
+        let err = match PpModel::load_from_hfq_inner(&hfq, &mesh, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for pp<2, got Ok"),
+        };
+        assert!(
+            err.contains("Pp axis with size>=2"),
+            "expected pp>=2 error, got: {err}"
+        );
+    }
 }

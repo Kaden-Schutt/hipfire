@@ -46,7 +46,6 @@ use std::sync::{
 };
 use std::time::Instant;
 
-use hipfire_hardware::DimKind;
 use hipfire_loader::{
     AsstTurnCache, EpArch, EpState, Eviction, LoadedModel, ModelParallel, ModelParallelKind,
     ModelState, PipelineImpl,
@@ -1803,10 +1802,8 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
             .m
             .cohere2moe_mut()
             .ok_or("prefill_forward: no cohere2moe bundle")?;
-        let force_per_token = std::env::var("HIPFIRE_COHERE_PREFILL")
-            .ok()
-            .as_deref()
-            == Some("per_token");
+        let force_per_token =
+            std::env::var("HIPFIRE_COHERE_PREFILL").ok().as_deref() == Some("per_token");
         let batched = self.cold_start
             && !force_per_token
             && cohere2moe::forward::forward_batch_supported(&b.weights);
@@ -2951,8 +2948,70 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
     eprintln!("  Run `hipfire diag` for a full environment report.");
 }
 
-fn validate_load_parallelism(pp: usize, tp: usize, ep: usize) -> Result<(), String> {
-    hipfire_runtime::config::validate_parallel_axes(pp, tp, ep)
+/// Host-only daemon load plan: admission + lifecycle decisions — no GPU,
+/// no mesh construction beyond [`DeviceMesh`], no allocation.
+///
+/// This is the single production entry point for the load handler, called
+/// immediately after parsing raw path + axis degrees from the load message,
+/// **before** any prior-model unload, GPU mutation, secondary-device init,
+/// stream/peer/allocation, or per-axis dispatch.
+///
+/// The daemon's base GPU is pre-initialized by `Gpu::init()` — this helper
+/// does NOT initialize GPUs, build meshes that trigger GPU init, or perform
+/// any hardware work.  It only classifies the model source, resolves policy,
+/// and derives lifecycle booleans from the effective axis.
+///
+/// # Lifecycle
+///
+/// - `defer_unload`: Multi-device axis (TP or EP) defers the prior model's
+///   unload so a partial multi-GPU load failure doesn't orphan VRAM.
+///   Single/PP axes clear the prior model eagerly.
+/// - `pflash_suppressed`: Multi-device axis suppresses PFlash drafter loading
+///   (TP/EP archs bypass PFlash entirely; loading a drafter would waste GPU
+///   memory on a device that doesn't serve the generate loop).
+/// - `effective_mesh`: built solely from effective degrees. Dense EP has
+///   already been normalised to (1,1,1) by admission, so it gets a single-
+///   device mesh — the EP secondary device / collective path is never entered.
+///
+/// On error the string carries `[CAP-001]`/`[COMP-001]` tags and is suitable
+/// for the daemon's JSON error envelope.
+#[derive(Debug)]
+struct DaemonLoadPlan {
+    admitted: hipfire_loader::AdmittedLoad,
+    effective: hipfire_loader::parallel_capability::RawParallelRequest,
+    effective_mesh: hipfire_hardware::DeviceMesh,
+    /// True when the effective axis is multi-device (TP or EP) — prior
+    /// model unload is deferred until after the new load succeeds.
+    defer_unload: bool,
+    /// True when PFlash drafter loading should be suppressed (multi-device
+    /// TP or EP path).
+    pflash_suppressed: bool,
+}
+
+fn daemon_load_plan(path: &str, pp: usize, tp: usize, ep: usize) -> Result<DaemonLoadPlan, String> {
+    let raw = hipfire_loader::parallel_capability::RawParallelRequest::new(pp, tp, ep);
+    let admitted = hipfire_loader::admit_path(path, raw)?;
+    let effective = admitted.admission().effective();
+    let effective_mesh =
+        hipfire_runtime::config::resolve_mesh(effective.pp, effective.tp, effective.ep, None);
+    let is_multi_device = effective.tp > 1 || effective.ep > 1;
+    Ok(DaemonLoadPlan {
+        admitted,
+        effective,
+        effective_mesh,
+        defer_unload: is_multi_device,
+        pflash_suppressed: is_multi_device,
+    })
+}
+
+/// Parse `HIPFIRE_PP_LAYERS` into PP layer bands for the daemon load handler.
+///
+/// Currently always returns `None` because no `load_admitted` consumer
+/// accepts pp_bands yet.  When a consumer is wired, this will parse the
+/// env var and validate it so stale/invalid env cannot reject a valid load.
+fn pp_bands_from_env() -> Option<Vec<usize>> {
+    let _raw = std::env::var("HIPFIRE_PP_LAYERS");
+    None
 }
 
 fn main() {
@@ -3144,49 +3203,77 @@ fn main() {
 
         match msg_type {
             "load" => {
-                // FIX #1 (transactional EP load): the unload of the prior model
-                // is deferred for the EP (tp>1) path until AFTER the new load
-                // succeeds, so a partial EP load failure leaves the prior model
-                // intact (and load_model_ep's staging guard frees the partial
-                // ranks). For the single-GPU / pp path the prior model is
-                // unloaded eagerly here as before (load_model uses the daemon's
-                // `gpu` directly, so it can't be deferred without a major
-                // refactor). The multi-GPU SHARD degree (expert-parallel `ep` OR
-                // tensor-parallel `tp`) is parsed authoritatively below; peek the
-                // max here (either shard path defers the prior-model unload).
-                let load_tp = {
-                    let peek = |k: &str| {
-                        msg.get("params")
-                            .and_then(|p| p.get(k))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(1) as usize
-                    };
-                    peek("ep").max(peek("tp"))
-                };
-                // Unload previous if any. PFlash drafter goes first so
-                // its tensors join the pool before unload_model drains
-                // it -- otherwise free_tensor would queue them into the
-                // pool just-emptied by drain_pool with no follow-up
-                // drain, leaving drafter VRAM resident across the next
-                // load (the explicit "unload" handler has the same
-                // ordering for the same reason).
+                // ── CAP-001 Task 4: pre-mesh admission ──────────────────────────
                 //
-                // FIX (transactional pflash teardown): pflash_state is part of
-                // the PRIOR model (it holds that model's PFlash drafter). For
-                // the deferred tp>1 EP path it must NOT be torn down here —
-                // otherwise a partial EP load failure (whose FIX #1 deferral
-                // keeps `model` alive) would leave the surviving prior model
-                // stripped of its drafter. Defer it to the success branch
-                // alongside the deferred model unload. For load_tp <= 1 the
-                // prior model is unloaded eagerly, so tear pflash down here in
-                // the original order. (EP archs are ds4/minimax and refuse
-                // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
-                // the outgoing model's drafter at the deferred site.)
-                if load_tp <= 1 {
+                // Parse path + raw axis degrees FIRST, before any prior-model
+                // unload, GPU mutation, or load side-effect.  The base GPU is
+                // already initialized by `Gpu::init()` above — this is not a
+                // GPU-init site.  Admission precedes all load-triggered work:
+                // mesh construction, secondary-device init (Gpus::from_mesh),
+                // stream/peer allocation, collectives, unload, and per-axis
+                // dispatch.
+                let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_pp = msg
+                    .get("params")
+                    .and_then(|p| p.get("pp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let raw_tp = msg
+                    .get("params")
+                    .and_then(|p| p.get("tp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let raw_ep = msg
+                    .get("params")
+                    .and_then(|p| p.get("ep"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+
+                let admit_result = match daemon_load_plan(path, raw_pp, raw_tp, raw_ep) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // Preserve current JSON error envelope.
+                        // Error carries [CAP-001] / [COMP-001] tags from the loader.
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type": "error", "message": e})
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let effective_pp = admit_result.effective.pp;
+                let effective_tp = admit_result.effective.tp;
+                let effective_ep = admit_result.effective.ep;
+
+                // Lifecycle decisions come from daemon_load_plan, not ad-hoc
+                // axis recomputation.  defer_unload: multi-device (TP or EP)
+                // defers prior model unload so a partial multi-GPU load failure
+                // doesn't orphan VRAM.  Single/PP use eager unload (the prior
+                // model is freed before the new load begins).
+                let is_deferred = admit_result.defer_unload;
+
+                // Unload previous model if any, using the lifecycle decision.
+                // PFlash drafter goes first so its tensors join the pool
+                // before unload_model drains it — otherwise free_tensor
+                // would queue them into the pool just-emptied by drain_pool
+                // with no follow-up drain, leaving drafter VRAM resident
+                // across the next load.
+                //
+                // For deferred EP: pflash_state is part of the PRIOR model.
+                // It must NOT be torn down here — otherwise a partial EP
+                // load failure (whose deferral keeps `model` alive) would
+                // leave the surviving prior model stripped of its drafter.
+                // Defer it to the success branch alongside the deferred
+                // model unload below.  (EP archs are ds4/minimax and refuse
+                // PFlash drafters, so on a SUCCESSFUL EP load this just
+                // frees the outgoing model's drafter at the deferred site.)
+                if !is_deferred {
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
                             dg.bind_thread_or_warn();
-                            pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                            pf.unload_drafter(&mut dg);
                             gpu.bind_thread_or_warn();
                         } else {
                             pf.unload_drafter(&mut gpu);
@@ -3198,7 +3285,6 @@ fn main() {
                     }
                 }
 
-                let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 // hunt3 H-D: clamp request-driven max_seq to the config ceiling
                 // (MAX_REQUESTED_SEQ = 512K). Without this an unvalidated 10M
                 // max_seq drives a multi-GB KV allocation and OOMs the daemon at
@@ -3285,21 +3371,14 @@ fn main() {
                     }
                 };
                 let mtp_k_param = msg.get("params").and_then(|p| p.get("mtp_k"));
-                let source_arch_id = match hipfire_runtime::loader_api::ModelSource::from_path(path)
-                {
-                    Ok(hipfire_runtime::loader_api::ModelSource::Hfq(hfq)) => hfq.arch_id,
-                    Ok(hipfire_runtime::loader_api::ModelSource::Dir(source)) => source.arch_id(),
-                    Err(error) => {
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({ "type": "error", "message": error })
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                };
-                let mtp_k = match resolve_mtp_k(mtp_k_param, source_arch_id == 9) {
+                // Derive DeepSeek/MTP decisions from the admission variant,
+                // avoiding a redundant ModelSource open — admit_path already
+                // classified the source.
+                let is_deepseek = matches!(
+                    admit_result.admitted.admission().variant(),
+                    hipfire_loader::parallel_capability::ModelVariant::Deepseek4
+                );
+                let mtp_k = match resolve_mtp_k(mtp_k_param, is_deepseek) {
                     Ok(k) => k,
                     Err(error) => {
                         let _ = writeln!(
@@ -3534,69 +3613,27 @@ fn main() {
                         None
                     };
 
-                // Pipeline-parallel degree (Stage 7 of #58). Default 1 =
-                // single-GPU (no behavior change). pp > 1 routes through
-                // Gpus + *_multi paths and refuses VL / DFlash / CASK /
-                // PFlash at load time. v1 supports Qwen3.5 dense + MoE
-                // only — see load_model_pp for the arch_id check.
-                let pp = msg
-                    .get("params")
-                    .and_then(|p| p.get("pp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                // Multi-GPU sharding, EP↔TP disentangled (PB-TP5 prep):
-                //   `ep` = expert-parallel (Ep axis, MoE routed experts, load_model_ep),
-                //   `tp` = tensor-parallel (Tp axis, dense row/col, load_model_tp).
-                // Back-compat: a legacy `tp>1` on an EP-capable MoE arch (9/10)
-                // means EP (the `--tp` serve flag historically drove EP), so `tp`
-                // reads as "shard across N GPUs; the arch picks the axis".
-                let tp = msg
-                    .get("params")
-                    .and_then(|p| p.get("tp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                let ep = msg
-                    .get("params")
-                    .and_then(|p| p.get("ep"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                // Reject raw TP×EP before EP-wins remapping (COMP-001).
-                if let Err(message) = validate_load_parallelism(pp, tp, ep) {
-                    let _ = writeln!(stdout, r#"{{"type":"error","message":"{message}"}}"#);
-                    let _ = stdout.flush();
-                    continue;
-                }
-                // Peek the arch to route a legacy `tp` correctly (MoE → EP).
-                let moe_arch = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(
-                    msg.get("model").and_then(|v| v.as_str()).unwrap_or(""),
-                ))
-                .map(|h| matches!(h.arch_id, 9 | 10))
-                .unwrap_or(false);
-                let (ep, tp) = if ep > 1 {
-                    (ep, 1) // explicit expert-parallel
-                } else if tp > 1 && moe_arch {
-                    (tp, 1) // legacy: --tp on a MoE arch == expert-parallel
-                } else {
-                    (1, tp) // dense: real tensor-parallel (Tp axis)
-                };
-                if (ep > 1 || tp > 1) && pp > 1 {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"error","message":"tp/ep (tensor/expert-parallel) and pp (pipeline-parallel) are mutually exclusive; set only one."}}"#
-                    );
-                    let _ = stdout.flush();
-                    continue;
-                }
-                if (ep > 1 || tp > 1) && draft_path.is_some() {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"error","message":"EP/TP serving (ep>1 or tp>1) does not support DFlash drafters in v1; reload without a draft."}}"#
-                    );
-                    let _ = stdout.flush();
-                    continue;
-                }
-                if pp > 1 {
-                    if draft_path.is_some()
+                // ── Guards use effective degrees, not raw request ────────────
+                // At this point admission has resolved composition, legacy remap,
+                // and dense-EP normalisation — at most one axis exceeds 1.
+                // The daemon's base GPU is already initialized; this guard section
+                // does NOT trigger GPU work — it emits JSON errors and continues.
+                let has_pp = effective_pp > 1;
+
+                // DFlash guard: combined EP/TP message selected from effective
+                // multi-device axis.  Multi-GPU paths refuse DFlash drafters in
+                // v1 (the draft tensor format family and the spec-decode dispatch
+                // are single-GPU only).  PP+DFlash has an experimental opt-in.
+                if draft_path.is_some() {
+                    if effective_tp > 1 || effective_ep > 1 {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","message":"EP/TP serving (ep>1 or tp>1) does not support DFlash drafters in v1; reload without a draft."}}"#
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    if effective_pp > 1
                         && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
                     {
                         let _ = writeln!(
@@ -3606,24 +3643,27 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    if cask.sidecar.is_some() {
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"error","message":"CASK / TriAttention eviction requires pp=1 in v1; see issue #58 v1.1 roadmap"}}"#
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                    if (pflash_drafter.is_some() || pflash_mode_str != "off")
-                        && std::env::var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
-                    {
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap"}}"#
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
+                }
+                // CASK guard: eviction requires pp=1 in v1.
+                if has_pp && cask.sidecar.is_some() {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"CASK / TriAttention eviction requires pp=1 in v1; see issue #58 v1.1 roadmap"}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                // PFlash guard: compression requires pp=1 in v1.
+                if has_pp
+                    && (pflash_drafter.is_some() || pflash_mode_str != "off")
+                    && std::env::var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
+                {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap"}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
                 }
 
                 let state_quant_override = msg
@@ -3633,75 +3673,68 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                // One mesh from the (already remapped + guarded) scalars. The
-                // remap forces ep/tp mutually exclusive and the guard rejects
-                // (ep|tp)>1 with pp>1, so at most one axis is >1 here — routing
-                // is byte-identical to the old ep>1 / tp>1 / pp chain.
+                // The effective mesh is already part of the load plan.  Dense EP>1
+                // has been normalised to (1,1,1) by admission, so it gets a single-
+                // device mesh — no EP secondary device / collective path.
                 // emulate=None is load-bearing: passing Some(_) would auto-promote
                 // a plain serve on a HIPFIRE_EMULATE_GPUS box into EP-2.
-                let mesh = hipfire_runtime::config::resolve_mesh(pp, tp, ep, None);
-                // Dense llama-family (arch 0/1) + Pp axis → the P-C driver-owned
-                // PP path (PpModel). qwen35 (5/6) keeps its hand-coded multi-path
-                // via load_model below.
-                let dense_llama_pp = mesh.has_axis(DimKind::Pp)
-                    && hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
-                        .map(|h| matches!(h.arch_id, 0 | 1))
-                        .unwrap_or(false);
-                // Ragged PP bands (qwen35 arm only): parse + length-validate at
-                // the edge. EP/TP are excluded by the earlier mutual-exclusion
-                // guard, and dense llama-PP ignores HIPFIRE_PP_LAYERS (uniform).
-                let pp_bands: Option<Vec<usize>> = if pp > 1 && !dense_llama_pp {
-                    match hipfire_runtime::config::parse_pp_layers(
-                        std::env::var("HIPFIRE_PP_LAYERS").ok(),
-                        pp,
-                    ) {
-                        Ok(bands) => bands,
-                        Err(msg) => {
-                            let _ = writeln!(stdout, r#"{{"type":"error","message":"{}"}}"#, msg);
-                            let _ = stdout.flush();
-                            continue;
-                        }
-                    }
+                let effective_mesh = &admit_result.effective_mesh;
+                // PP layer bands: retrieved via the env helper.  Currently
+                // always returns `None` because no `load_admitted` consumer
+                // accepts pp_bands yet.  Valid dense PP loads are unaffected
+                // by stale env values.
+                let pp_bands = pp_bands_from_env();
+
+                // Route through `load_admitted` with the admitted token and
+                // effective mesh.  The effective axis determines whether a GPU
+                // handle is needed: Single passes `Some(&mut gpu)`;
+                // TP/PP/EP manage their own mesh via `Gpus::from_mesh`.
+                let effective_axis = admit_result.effective.axis();
+                let gpu_opt: Option<&mut rdna_compute::Gpu> = if matches!(
+                    effective_axis,
+                    hipfire_loader::parallel_capability::ParallelAxis::Single
+                ) {
+                    Some(&mut gpu)
                 } else {
                     None
                 };
-                let loaded = if mesh.has_axis(DimKind::Ep) {
-                    hipfire_loader::load_model_ep(path, max_seq, &mesh, spec_cfg)
-                } else if mesh.has_axis(DimKind::Tp) {
-                    hipfire_loader::load_model_tp(path, max_seq, &mesh, spec_cfg)
-                } else if dense_llama_pp {
-                    hipfire_loader::load_model_pp(path, max_seq, &mesh, spec_cfg)
-                } else {
-                    // NOT single-GPU only: this arm still carries qwen35 (arch 5/6)
-                    // pp>1 pipeline-parallel serving. qwen35 PP: mesh carries pp
-                    // via size_of(Pp); pp_bands carries the ragged HIPFIRE_PP_LAYERS
-                    // split, parsed + length-validated at the edge above.
-                    hipfire_loader::load_model(
-                        path,
-                        max_seq,
-                        draft_path.as_deref(),
-                        kv_mode_override.as_deref(),
-                        kv_adaptive_override.as_deref(),
-                        state_quant_override.as_deref(),
-                        &cask,
-                        &mesh,
-                        pp_bands.as_deref(),
-                        spec_cfg,
-                        &mut gpu,
-                    )
-                };
+                let mut opts = hipfire_loader::ModelLoadOptions::new(max_seq)
+                    .with_cask(&cask)
+                    .with_spec(spec_cfg);
+                if let Some(dp) = draft_path.as_deref() {
+                    opts = opts.with_draft_path(dp);
+                }
+                if let Some(kv) = kv_mode_override.as_deref() {
+                    opts = opts.with_kv_mode_override(kv);
+                }
+                if let Some(kv) = kv_adaptive_override.as_deref() {
+                    opts = opts.with_kv_adaptive_override(kv);
+                }
+                if let Some(sq) = state_quant_override.as_deref() {
+                    opts = opts.with_state_quant_override(sq);
+                }
+                if let Some(bands) = pp_bands.as_deref() {
+                    opts = opts.with_pp_bands(bands);
+                }
+                let loaded = hipfire_loader::load_admitted(
+                    admit_result.admitted,
+                    &effective_mesh,
+                    opts,
+                    gpu_opt,
+                );
                 match loaded {
                     Ok(m) => {
-                        // FIX #1 (deferred EP unload): the new EP model loaded
-                        // successfully — NOW it's safe to free the prior model
-                        // (single-GPU/pp models were already unloaded eagerly
-                        // above; this branch only fires for the deferred tp>1
-                        // path). The prior model's PFlash drafter (pflash_state)
-                        // is part of that prior model, so it's torn down here in
+                        // FIX #1 (deferred multi-device unload): the new TP/EP
+                        // model loaded successfully — NOW it's safe to free the
+                        // prior model (single-GPU/pp models were already unloaded
+                        // eagerly above; this branch only fires for the deferred
+                        // multi-device path). The prior model's PFlash drafter
+                        // (pflash_state) is part of that prior model, so it's
+                        // torn down here in
                         // the same drainer-before-unload order used elsewhere:
                         // unload_drafter queues the drafter tensors into the
                         // pool, then unload_model drains it.
-                        if load_tp > 1 {
+                        if is_deferred {
                             if let Some(mut pf) = pflash_state.take() {
                                 if let Some(mut dg) = pflash_drafter_gpu.take() {
                                     dg.bind_thread_or_warn();
@@ -3814,19 +3847,17 @@ fn main() {
                         // compression isn't" signal rather than losing
                         // the entire session.
                         //
-                        // EP guard (load_tp > 1): the EP path serves through
-                        // `generate_ep`, which bypasses PFlash entirely (the
-                        // EP archs ds4/minimax refuse/ignore PFlash drafters).
-                        // Loading a drafter here would just pin GPU memory it
-                        // never reads until unload, so skip the load outright.
-                        // Warn once if the operator actually supplied a drafter
-                        // so the silent no-op is visible.
-                        if load_tp > 1 {
+                        // Multi-device guard (pflash_suppressed): TP/EP paths serve
+                        // through `generate_multi` / `generate_ep`, which bypass
+                        // PFlash entirely.  Loading a drafter here would just pin
+                        // GPU memory it never reads until unload, so skip the load
+                        // outright.  Warn once if the operator actually supplied a
+                        // drafter so the silent no-op is visible.
+                        if admit_result.pflash_suppressed {
                             if pflash_drafter.is_some() && pflash_mode_str != "off" {
                                 eprintln!(
-                                    "[pflash] WARN: ignoring PFlash drafter on EP (tp={}) model \
-                                     — generate_ep bypasses PFlash; drafter would only waste GPU memory",
-                                    load_tp
+                                    "[pflash] WARN: ignoring PFlash drafter on multi-device model \
+                                     — generate_multi bypasses PFlash; drafter would only waste GPU memory"
                                 );
                             }
                         } else if let Some(ref pf_drafter_path) = pflash_drafter {
@@ -4366,7 +4397,8 @@ fn main() {
                     match generation_result {
                         GenerateResult::Complete => {}
                         GenerateResult::Deferred(terminal) => {
-                            if let Err(error) = reset_then_emit(m, &mut gpu, &mut stdout, terminal) {
+                            if let Err(error) = reset_then_emit(m, &mut gpu, &mut stdout, terminal)
+                            {
                                 poison_model_slot(
                                     &mut model,
                                     &mut pflash_state,
@@ -4527,12 +4559,9 @@ fn main() {
                         GenerateResult::Complete => {}
                         GenerateResult::Deferred(terminal) => {
                             if let Some(current) = model.as_mut() {
-                                if let Err(error) = reset_then_emit(
-                                    current,
-                                    &mut gpu,
-                                    &mut stdout,
-                                    terminal,
-                                ) {
+                                if let Err(error) =
+                                    reset_then_emit(current, &mut gpu, &mut stdout, terminal)
+                                {
                                     poison_model_slot(
                                         &mut model,
                                         &mut pflash_state,
@@ -4569,9 +4598,7 @@ fn main() {
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("[qwen-cache RESET] daemon received reset");
                     }
-                    let reset_result = model
-                        .as_mut()
-                        .map(|m| model_reset_context(m, &mut gpu));
+                    let reset_result = model.as_mut().map(|m| model_reset_context(m, &mut gpu));
                     match reset_result {
                         Some(Ok(())) | None => {
                             let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
@@ -5736,7 +5763,11 @@ fn vl_image_state(pixels: &[f32], height: usize, width: usize) -> u64 {
         .to_le_bytes()
         .into_iter()
         .chain((width as u64).to_le_bytes())
-        .chain(pixels.iter().flat_map(|value| value.to_bits().to_le_bytes()))
+        .chain(
+            pixels
+                .iter()
+                .flat_map(|value| value.to_bits().to_le_bytes()),
+        )
     {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
@@ -5748,10 +5779,7 @@ fn vl_image_state(pixels: &[f32], height: usize, width: usize) -> u64 {
 /// Keeping this seam separate makes the image-turn isolation contract testable
 /// without a vision model or a GPU, while `model_reset_context` remains the
 /// authority for device and architecture state.
-fn prepare_vl_request_state(
-    session: &mut hipfire_loader::SessionState,
-    image_state: u64,
-) -> bool {
+fn prepare_vl_request_state(session: &mut hipfire_loader::SessionState, image_state: u64) -> bool {
     if vl_request_requires_cold_reset(true, session.seq_pos, session.vl_image_state) {
         session.reset_cpu();
         session.vl_image_state = Some(image_state);
@@ -5771,8 +5799,7 @@ fn reset_error_json_message(id: &str, message: &str) -> String {
     format!(
         r#"{{"type":"error","id":{},"message":{}}}"#,
         serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string()),
-        serde_json::to_string(message)
-            .unwrap_or_else(|_| "\"context reset failed\"".to_string())
+        serde_json::to_string(message).unwrap_or_else(|_| "\"context reset failed\"".to_string())
     )
 }
 
@@ -5838,7 +5865,10 @@ enum DeferredTerminal {
 enum GenerateResult {
     Complete,
     Deferred(DeferredTerminal),
-    ResetFailed { id: String, message: String },
+    ResetFailed {
+        id: String,
+        message: String,
+    },
     /// Produced by the borrowed PP worker. The outer wrapper owns the model
     /// again and must perform the optional reset before publishing `done`.
     PpCompletion {
@@ -5886,7 +5916,8 @@ fn reset_then_emit(
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"done","id":{},"finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
-                serde_json::to_string(&id).unwrap_or_else(|_| "\"\"".to_string()), generated
+                serde_json::to_string(&id).unwrap_or_else(|_| "\"\"".to_string()),
+                generated
             );
         }
         DeferredTerminal::Error { id, message } => {
@@ -6969,7 +7000,7 @@ fn generate_spec(
                     break 'spec discard_spec_emit(
                         emit,
                         SpecRunOutcome::Failed(
-                        "post-prefill eviction: missing KvCache after compaction".into(),
+                            "post-prefill eviction: missing KvCache after compaction".into(),
                         ),
                     );
                 }
@@ -7174,8 +7205,8 @@ fn generate_spec(
                                 break 'spec discard_spec_emit(
                                     emit,
                                     SpecRunOutcome::Failed(
-                                    "speculative grammar violation during forced continuation"
-                                        .into(),
+                                        "speculative grammar violation during forced continuation"
+                                            .into(),
                                     ),
                                 );
                             }
@@ -7341,9 +7372,9 @@ fn generate_spec(
                         &mut *qwen_cache_ptr,
                         finalized,
                         run.target_reusable,
-            );
-        }
-    }
+                    );
+                }
+            }
         },
         |envelope| emit_spec_terminal_envelope(stdout, id, envelope),
     )
@@ -7487,8 +7518,8 @@ mod spec_emit_lifecycle_tests {
     use super::{
         admit_spec_prefill, admit_spec_prefill_before_output, deepseek4_abort_json,
         finish_spec_caller_after_guard, reset_error_json, reset_error_json_message,
-        settle_spec_emit_for_outcome, spec_emit_disposition, SpecEmitDisposition,
-        GenerateResult, SpecRun, SpecRunOutcome, SpecTerminalEnvelope,
+        settle_spec_emit_for_outcome, spec_emit_disposition, GenerateResult, SpecEmitDisposition,
+        SpecRun, SpecRunOutcome, SpecTerminalEnvelope,
     };
     use hipfire_runtime::spec::{
         EmitOutcome, FinishSummary, PrefillOutcome, SpecEmit, SpecTargetGuard,
@@ -9834,9 +9865,9 @@ fn ar_generate(
             };
         }
 
-    while generated < max_tokens {
-        if check_abort(id) {
-            // Client cancelled mid-decode — full cold reset (mirrors DFlash abort).
+        while generated < max_tokens {
+            if check_abort(id) {
+                // Client cancelled mid-decode — full cold reset (mirrors DFlash abort).
                 break 'decode route_ar_decode_outcome(false, None);
             }
             if decode_limit_reached(
@@ -9847,16 +9878,16 @@ fn ar_generate(
                 dispatch.has_eviction(),
             ) {
                 break 'decode route_ar_decode_outcome(true, None);
-        }
-        // ── eos / im_end pre-decision (BEFORE commit) ────────────────────────
-        // A sampled eos consults the parser's discipline. `CommitAndStop` (the
-        // simple-arch default) falls through to commit+forward+emit the eos then
-        // break — byte-identical to the legacy inline eos break. `Inject` (cohere2moe
-        // empty-turn guard) enqueues continuation markers and continues WITHOUT
-        // committing the eos (the markers surface via next_forced next iter). `Stop`
-        // breaks without committing. Forced tokens are never eos.
-        let mut eos_commit_and_stop = false;
-        if !was_forced && (dispatch.is_eos(next_token) || im_end_token == Some(next_token)) {
+            }
+            // ── eos / im_end pre-decision (BEFORE commit) ────────────────────────
+            // A sampled eos consults the parser's discipline. `CommitAndStop` (the
+            // simple-arch default) falls through to commit+forward+emit the eos then
+            // break — byte-identical to the legacy inline eos break. `Inject` (cohere2moe
+            // empty-turn guard) enqueues continuation markers and continues WITHOUT
+            // committing the eos (the markers surface via next_forced next iter). `Stop`
+            // breaks without committing. Forced tokens are never eos.
+            let mut eos_commit_and_stop = false;
+            if !was_forced && (dispatch.is_eos(next_token) || im_end_token == Some(next_token)) {
                 match ar_sampled_eos(parser.as_mut()) {
                     ArSampledEos::Stop => {
                         break 'decode route_ar_decode_outcome(true, None);
@@ -9865,136 +9896,136 @@ fn ar_generate(
                         eos_commit_and_stop = true;
                     }
                     ArSampledEos::Forced(f) => {
-                            next_token = f;
-                            was_forced = true;
-                            continue;
-                        }
+                        next_token = f;
+                        was_forced = true;
+                        continue;
+                    }
                     ArSampledEos::Error(message) => {
                         break 'decode route_ar_decode_outcome(false, Some(message));
+                    }
                 }
             }
-        }
-        generated += 1;
-        dispatch.conversation_tokens_mut().push(next_token);
-        streamed_tokens.push(next_token);
-        if let Some(t) = tape.as_deref_mut() {
-            t.push(next_token);
-        }
-        emit_committed_event(
-            stdout,
-            id,
-            next_token,
-            streamed_tokens.len() - 1,
-            t0.elapsed().as_millis() as u64,
-        );
-        // Running-vector byte delta (BPE detok is non-local → whole-vector diff, the
-        // exact stream the legacy filter consumed). The parser owns its EosFilter.
-        let new_bytes: Vec<u8> = {
-            let all_bytes = dispatch.tokenizer().decode_bytes(&streamed_tokens);
-            let nb = all_bytes[bytes_fed_to_filter..].to_vec();
-            bytes_fed_to_filter = all_bytes.len();
-            nb
-        };
+            generated += 1;
+            dispatch.conversation_tokens_mut().push(next_token);
+            streamed_tokens.push(next_token);
+            if let Some(t) = tape.as_deref_mut() {
+                t.push(next_token);
+            }
+            emit_committed_event(
+                stdout,
+                id,
+                next_token,
+                streamed_tokens.len() - 1,
+                t0.elapsed().as_millis() as u64,
+            );
+            // Running-vector byte delta (BPE detok is non-local → whole-vector diff, the
+            // exact stream the legacy filter consumed). The parser owns its EosFilter.
+            let new_bytes: Vec<u8> = {
+                let all_bytes = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+                let nb = all_bytes[bytes_fed_to_filter..].to_vec();
+                bytes_fed_to_filter = all_bytes.len();
+                nb
+            };
 
             hook_or_fail!(
                 dispatch.decode_step_forward(ctx.reborrow(), next_token, seq_pos),
                 "token forward"
             );
-        seq_pos += 1;
-        if ckpt_resume_enabled() {
-            dispatch.take_prefill_checkpoint(ctx.reborrow(), seq_pos);
-        }
-        if let Some(new_phys) =
-            hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
-        {
-            seq_pos = new_phys;
-        }
-        dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
-
-        // ── Terminal eos (CommitAndStop, decided pre-commit above) ───────────
-        // The eos token has now been committed + forwarded; emit it through the filter
-        // (display-suppressed) then break — byte-identical to the legacy inline eos break.
-        if eos_commit_and_stop {
-            for act in parser.emit_only(next_token, &new_bytes) {
-                exec_stream_action!(act);
+            seq_pos += 1;
+            if ckpt_resume_enabled() {
+                dispatch.take_prefill_checkpoint(ctx.reborrow(), seq_pos);
             }
-                break 'decode route_ar_decode_outcome(true, None);
-        }
+            if let Some(new_phys) =
+                hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction")
+            {
+                seq_pos = new_phys;
+            }
+            dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
 
-        // ── Output shaping + guards ──────────────────────────────────────────
-        // Forced tokens (think-cap continuation splice) bypass the guards via
-        // `emit_only` (the legacy inline splice forwarded them without re-running the
-        // guards). Sampled tokens go through `feed` (emit + stop-seq + think-cap enqueue
-        // + n-gram); a `Stop` action breaks the loop.
-        if was_forced {
+            // ── Terminal eos (CommitAndStop, decided pre-commit above) ───────────
+            // The eos token has now been committed + forwarded; emit it through the filter
+            // (display-suppressed) then break — byte-identical to the legacy inline eos break.
+            if eos_commit_and_stop {
+                for act in parser.emit_only(next_token, &new_bytes) {
+                    exec_stream_action!(act);
+                }
+                break 'decode route_ar_decode_outcome(true, None);
+            }
+
+            // ── Output shaping + guards ──────────────────────────────────────────
+            // Forced tokens (think-cap continuation splice) bypass the guards via
+            // `emit_only` (the legacy inline splice forwarded them without re-running the
+            // guards). Sampled tokens go through `feed` (emit + stop-seq + think-cap enqueue
+            // + n-gram); a `Stop` action breaks the loop.
+            if was_forced {
                 let actions = parser.emit_only(next_token, &new_bytes);
                 let stop = stream_stop(&actions);
                 for act in actions {
                     if !matches!(act, hipfire_runtime::stream_parser::StreamAction::Stop) {
-                exec_stream_action!(act);
-            }
+                        exec_stream_action!(act);
+                    }
                 }
                 if stop {
                     break 'decode route_ar_decode_outcome(true, None);
                 }
-        } else {
-            parser.note_force_answer(check_force_answer(id));
+            } else {
+                parser.note_force_answer(check_force_answer(id));
                 let actions = parser.feed(next_token, &new_bytes);
                 let stop = stream_stop(&actions);
                 for act in actions {
                     if !matches!(act, hipfire_runtime::stream_parser::StreamAction::Stop) {
-                    exec_stream_action!(act);
+                        exec_stream_action!(act);
+                    }
                 }
-            }
                 if stop {
                     break 'decode route_ar_decode_outcome(true, None);
+                }
             }
-        }
 
-        // Budget-alert injection.
-        if !alert_fired
-            && budget_alert_at_tok > 0
-            && generated >= budget_alert_at_tok
-            && !budget_alert_text.is_empty()
-        {
-            alert_fired = true;
-            let raw_so_far = dispatch.tokenizer().decode_bytes(&streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(
-                raw_str,
-                matches!(
-                    assistant_prefix,
-                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                ),
-            );
-            if !in_think {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#,
-                    id
+            // Budget-alert injection.
+            if !alert_fired
+                && budget_alert_at_tok > 0
+                && generated >= budget_alert_at_tok
+                && !budget_alert_text.is_empty()
+            {
+                alert_fired = true;
+                let raw_so_far = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let in_think = currently_in_think(
+                    raw_str,
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
                 );
-                let _ = stdout.flush();
-                let ngram_scope: &[u32] = &streamed_tokens;
-                let mut blocked: Vec<u32> = Vec::new();
-                sampler::collect_unclosed_attractor_blocks(
-                    ngram_scope,
-                    &attractor_pairs,
-                    20,
-                    2,
-                    &mut blocked,
-                );
-                let cfg = SamplerConfig {
-                    temperature: temp,
-                    top_p,
-                    repeat_penalty,
-                    repeat_window: repeat_buf_cap,
-                    presence_penalty,
-                    frequency_penalty,
-                    blocked_tokens: blocked,
-                    top_k,
-                    min_p,
-                };
-                next_token = {
+                if !in_think {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#,
+                        id
+                    );
+                    let _ = stdout.flush();
+                    let ngram_scope: &[u32] = &streamed_tokens;
+                    let mut blocked: Vec<u32> = Vec::new();
+                    sampler::collect_unclosed_attractor_blocks(
+                        ngram_scope,
+                        &attractor_pairs,
+                        20,
+                        2,
+                        &mut blocked,
+                    );
+                    let cfg = SamplerConfig {
+                        temperature: temp,
+                        top_p,
+                        repeat_penalty,
+                        repeat_window: repeat_buf_cap,
+                        presence_penalty,
+                        frequency_penalty,
+                        blocked_tokens: blocked,
+                        top_k,
+                        min_p,
+                    };
+                    next_token = {
                         let mask = match grammar_mask_for_sample(
                             grammar_active,
                             matcher.as_deref(),
@@ -10009,153 +10040,153 @@ fn ar_generate(
                                 );
                             }
                         };
-                    hook_or_fail!(
-                        dispatch.sample(
-                            ctx.reborrow(),
-                            &cfg,
-                            vocab_size,
-                            ngram_scope,
-                            mask,
-                            &mut rng_state
-                        ),
-                        "sample"
-                    )
-                };
-                if grammar_active {
-                    let text = dispatch.tokenizer().decode(&[next_token]);
+                        hook_or_fail!(
+                            dispatch.sample(
+                                ctx.reborrow(),
+                                &cfg,
+                                vocab_size,
+                                ngram_scope,
+                                mask,
+                                &mut rng_state
+                            ),
+                            "sample"
+                        )
+                    };
+                    if grammar_active {
+                        let text = dispatch.tokenizer().decode(&[next_token]);
                         if let Err(message) = advance_grammar(grammar_active, &mut matcher, &text) {
                             break 'decode route_ar_decode_outcome(
                                 false,
                                 Some(format!("grammar advance: {message}")),
                             );
                         }
+                    }
+                    was_forced = false;
+                    continue;
                 }
-                was_forced = false;
-                continue;
-            }
-            let nudge_tokens = dispatch.tokenizer().encode(budget_alert_text);
-            let budget_left = max_tokens.saturating_sub(generated);
-            let nudge_len = nudge_tokens.len().min(budget_left);
-            let need_kv = seq_pos
-                .saturating_add(nudge_len)
-                .saturating_add(
-                    max_tokens
-                        .saturating_sub(generated)
-                        .saturating_sub(nudge_len),
-                )
-                .saturating_add(nl.len());
+                let nudge_tokens = dispatch.tokenizer().encode(budget_alert_text);
+                let budget_left = max_tokens.saturating_sub(generated);
+                let nudge_len = nudge_tokens.len().min(budget_left);
+                let need_kv = seq_pos
+                    .saturating_add(nudge_len)
+                    .saturating_add(
+                        max_tokens
+                            .saturating_sub(generated)
+                            .saturating_sub(nudge_len),
+                    )
+                    .saturating_add(nl.len());
                 if nudge_len > 0 && (dispatch.has_eviction() || need_kv <= dispatch.physical_cap())
                 {
-                for &tok in &nudge_tokens[..nudge_len] {
-                    dispatch.conversation_tokens_mut().push(tok);
-                    streamed_tokens.push(tok);
-                    if let Some(tp) = tape.as_deref_mut() {
-                        tp.push(tok);
-                    }
-                    emit_committed_event(
-                        stdout,
-                        id,
-                        tok,
-                        streamed_tokens.len() - 1,
-                        t0.elapsed().as_millis() as u64,
-                    );
-                    let new_bytes2: Vec<u8> = {
-                        let all_bytes2 = dispatch.tokenizer().decode_bytes(&streamed_tokens);
-                        let nb = all_bytes2[bytes_fed_to_filter..].to_vec();
-                        bytes_fed_to_filter = all_bytes2.len();
-                        nb
-                    };
-                    // Nudge tokens bypass the guards (like the think-cap splice) — emit
-                    // through the parser's filter, no feed().
+                    for &tok in &nudge_tokens[..nudge_len] {
+                        dispatch.conversation_tokens_mut().push(tok);
+                        streamed_tokens.push(tok);
+                        if let Some(tp) = tape.as_deref_mut() {
+                            tp.push(tok);
+                        }
+                        emit_committed_event(
+                            stdout,
+                            id,
+                            tok,
+                            streamed_tokens.len() - 1,
+                            t0.elapsed().as_millis() as u64,
+                        );
+                        let new_bytes2: Vec<u8> = {
+                            let all_bytes2 = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+                            let nb = all_bytes2[bytes_fed_to_filter..].to_vec();
+                            bytes_fed_to_filter = all_bytes2.len();
+                            nb
+                        };
+                        // Nudge tokens bypass the guards (like the think-cap splice) — emit
+                        // through the parser's filter, no feed().
                         let actions = parser.emit_only(tok, &new_bytes2);
                         let stop = stream_stop(&actions);
                         for act in actions {
                             if !matches!(act, hipfire_runtime::stream_parser::StreamAction::Stop) {
-                        exec_stream_action!(act);
-                    }
+                                exec_stream_action!(act);
+                            }
                         }
-                    hook_or_fail!(
-                        dispatch.decode_step_forward(ctx.reborrow(), tok, seq_pos),
+                        hook_or_fail!(
+                            dispatch.decode_step_forward(ctx.reborrow(), tok, seq_pos),
                             "budget nudge forward"
-                    );
-                    seq_pos += 1;
+                        );
+                        seq_pos += 1;
                         if let Some(new_phys) = hook_or_fail!(
                             dispatch.maybe_evict(ctx.reborrow(), seq_pos),
                             "kv eviction"
                         ) {
-                        seq_pos = new_phys;
-                    }
-                    generated += 1;
+                            seq_pos = new_phys;
+                        }
+                        generated += 1;
                         if stop {
                             break 'decode route_ar_decode_outcome(true, None);
                         }
+                    }
+                } else if nudge_len < nudge_tokens.len() {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#,
+                        id, nudge_len, budget_left
+                    );
+                    let _ = stdout.flush();
+                } else {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#,
+                        id
+                    );
+                    let _ = stdout.flush();
                 }
-            } else if nudge_len < nudge_tokens.len() {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#,
-                    id, nudge_len, budget_left
-                );
-                let _ = stdout.flush();
-            } else {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#,
-                    id
-                );
-                let _ = stdout.flush();
-            }
-            if generated >= max_tokens {
+                if generated >= max_tokens {
                     break 'decode route_ar_decode_outcome(true, None);
+                }
             }
-        }
 
-        // Next token: forced (think-cap continuation splice, drained one at a time) or
-        // the steady-state sample. Forced tokens are emit-only at the top of the next
-        // iteration (was_forced), matching the legacy inline splice.
-        if let Some(f) = parser.next_forced() {
-            next_token = f;
-            was_forced = true;
-            if grammar_active {
-                let text = dispatch.tokenizer().decode(&[f]);
+            // Next token: forced (think-cap continuation splice, drained one at a time) or
+            // the steady-state sample. Forced tokens are emit-only at the top of the next
+            // iteration (was_forced), matching the legacy inline splice.
+            if let Some(f) = parser.next_forced() {
+                next_token = f;
+                was_forced = true;
+                if grammar_active {
+                    let text = dispatch.tokenizer().decode(&[f]);
                     if let Err(message) = advance_grammar(grammar_active, &mut matcher, &text) {
                         break 'decode route_ar_decode_outcome(
                             false,
                             Some(format!("grammar advance: {message}")),
                         );
                     }
+                }
+                continue;
             }
-            continue;
-        }
-        was_forced = false;
+            was_forced = false;
 
-        // Steady-state sample.
-        let ngram_scope: &[u32] = &streamed_tokens;
-        let mut blocked: Vec<u32> = Vec::new();
-        sampler::collect_unclosed_attractor_blocks(
-            ngram_scope,
-            &attractor_pairs,
-            20,
-            2,
-            &mut blocked,
-        );
-        if parser.force_answer_latched() {
-            if let Some(t) = think_open_tok {
-                blocked.push(t);
+            // Steady-state sample.
+            let ngram_scope: &[u32] = &streamed_tokens;
+            let mut blocked: Vec<u32> = Vec::new();
+            sampler::collect_unclosed_attractor_blocks(
+                ngram_scope,
+                &attractor_pairs,
+                20,
+                2,
+                &mut blocked,
+            );
+            if parser.force_answer_latched() {
+                if let Some(t) = think_open_tok {
+                    blocked.push(t);
+                }
             }
-        }
-        let cfg = SamplerConfig {
-            temperature: temp,
-            top_p,
-            repeat_penalty,
-            repeat_window: repeat_buf_cap,
-            presence_penalty,
-            frequency_penalty,
-            blocked_tokens: blocked,
-            top_k,
-            min_p,
-        };
-        next_token = {
+            let cfg = SamplerConfig {
+                temperature: temp,
+                top_p,
+                repeat_penalty,
+                repeat_window: repeat_buf_cap,
+                presence_penalty,
+                frequency_penalty,
+                blocked_tokens: blocked,
+                top_k,
+                min_p,
+            };
+            next_token = {
                 let mask = match grammar_mask_for_sample(
                     grammar_active,
                     matcher.as_deref(),
@@ -10169,21 +10200,21 @@ fn ar_generate(
                             Some(format!("grammar mask: {message}")),
                         );
                     }
+                };
+                hook_or_fail!(
+                    dispatch.sample(
+                        ctx.reborrow(),
+                        &cfg,
+                        vocab_size,
+                        ngram_scope,
+                        mask,
+                        &mut rng_state
+                    ),
+                    "sample"
+                )
             };
-            hook_or_fail!(
-                dispatch.sample(
-                    ctx.reborrow(),
-                    &cfg,
-                    vocab_size,
-                    ngram_scope,
-                    mask,
-                    &mut rng_state
-                ),
-                "sample"
-            )
-        };
-        if grammar_active {
-            let text = dispatch.tokenizer().decode(&[next_token]);
+            if grammar_active {
+                let text = dispatch.tokenizer().decode(&[next_token]);
                 let (was_detected, is_detected) =
                     match advance_grammar(grammar_active, &mut matcher, &text) {
                         Ok(states) => states,
@@ -10195,13 +10226,13 @@ fn ar_generate(
                         }
                     };
                 if !was_detected && is_detected {
-                eprintln!(
+                    eprintln!(
                     "[grammar-ngram] attractor detected in tool_call args at gen={} — forcing close",
                     generated,
                 );
+                }
             }
         }
-    }
 
         route_ar_decode_outcome(true, None)
     };
@@ -10224,7 +10255,7 @@ fn ar_generate(
                 .map_err(|e| format!("kv eviction: {e}"))?
             {
                 next_position = new_phys;
-    }
+            }
             dispatch.conversation_tokens_mut().push(token);
             Ok(next_position)
         },
@@ -10240,7 +10271,7 @@ fn ar_generate(
                 id: id.to_string(),
                 generated,
             });
-            }
+        }
         ArDecodeOutcome::Error(message) => {
             return GenerateResult::Deferred(DeferredTerminal::Error {
                 id: id.to_string(),
@@ -10523,7 +10554,6 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-
     }
     if m.meta.arch_id == 7 {
         // Silence the qwen35/llama-only params we deliberately don't
@@ -10621,7 +10651,6 @@ fn generate(
                 messages_history,
             );
         }
-
     }
     // arch_id=11 (LFM2.5-MoE) with an opt-in model-free n-gram speculator loaded
     // (lfm2moe `SpecTarget`, conv-state snapshot/rollback) routes to the
@@ -10654,7 +10683,6 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-
     }
     if m.meta.arch_id == 11 {
         // arch_id=11 (LFM2.5-8B-A1B). Standalone bring-up — same shape as
@@ -10685,7 +10713,6 @@ fn generate(
             tools,
             messages_history,
         );
-
     }
     // arch_id=12 (Cohere2-MoE) with an opt-in model-free n-gram speculator loaded
     // (cohere2moe `SpecTarget` + `Cohere2MoeEmit`, which ports the agentic-marker
@@ -10719,7 +10746,6 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-
     }
     if m.meta.arch_id == 12 {
         // arch_id=12 (Cohere2-MoE / North-Mini-Code). Standalone bring-up
@@ -10749,7 +10775,6 @@ fn generate(
             tools,
             messages_history,
         );
-
     }
     // arch_id=10 (MiniMax-M2) with an opt-in model-free n-gram speculator loaded
     // (minimax `SpecTarget`) routes to the arch-generic spec loop, exactly like
@@ -10782,7 +10807,6 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-
     }
     if m.meta.arch_id == 10 {
         // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
@@ -10814,7 +10838,6 @@ fn generate(
             tools,
             messages_history,
         );
-
     }
     // Expert-parallel dispatch (task #26). ep.is_some() → generate_ep (AR via
     // forward_ep, full sampler on rank-0 logits). Refusals enforced at load.
@@ -10848,7 +10871,6 @@ fn generate(
             messages_history,
             stop, // hunt3 M-F: thread user stop sequences into the pp>1 path
         );
-
     }
     // DFlash fast path -- only when a draft model is loaded. DFlash now serves
     // BOTH greedy (temp≈0 → argmax-accept) AND temp>0 (lossless rejection-
@@ -11023,7 +11045,6 @@ fn generate(
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (chain path; recipe → folded into tau)
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
-
     }
 
     // Auto-reset on multi-turn rollover. When eviction is active (operator
@@ -11057,8 +11078,7 @@ fn generate(
             return reset_failed(id, error);
         }
     }
-    let cache_kill_switch =
-        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_kill_switch = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     let pflash_active = pflash_cfg
         .map(|c| !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off))
         .unwrap_or(false);
@@ -12516,13 +12536,13 @@ fn generate_deepseek4(
     let eos_tok = match m.state.as_ref() {
         Some(ModelState::Deepseek4(b)) => b.eos_tok,
         _ => {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
-            id
-        );
-        let _ = stdout.flush();
-        return GenerateResult::Complete;
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
+                id
+            );
+            let _ = stdout.flush();
+            return GenerateResult::Complete;
         }
     };
 
@@ -13046,7 +13066,7 @@ fn generate_deepseek4(
                     if let Err(reset_error) = model_reset_context(m, gpu) {
                         return reset_failed(id, reset_error);
                     } else {
-                    emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
+                        emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
                     }
                     let _ = stdout.flush();
                     return GenerateResult::Complete;
@@ -14057,16 +14077,16 @@ impl hipfire_runtime::stream_parser::StreamParser for Cohere2MoeStreamParser {
         if recovered.is_empty() && !self.tool_calls_emitted {
             recovered = cohere2moe::spec_emit::parse_cohere_action(&self.vis_buf);
         }
-            if !recovered.is_empty() {
-                cohere2moe::spec_emit::snap_call_names(
-                    &mut recovered,
-                    &self.known_tools,
-                    &self.tool_params,
-                );
+        if !recovered.is_empty() {
+            cohere2moe::spec_emit::snap_call_names(
+                &mut recovered,
+                &self.known_tools,
+                &self.tool_params,
+            );
             self.action_buf.clear();
             self.vis_buf.clear();
-                return vec![StreamAction::ToolCalls(serde_json::json!(recovered))];
-            }
+            return vec![StreamAction::ToolCalls(serde_json::json!(recovered))];
+        }
         self.action_buf.clear();
         self.vis_buf.clear();
         Vec::new()
@@ -14248,7 +14268,7 @@ fn generate_cohere2moe(
         if let Err(error) = model_reset_context(m, gpu) {
             return reset_failed(id, error);
         } else {
-        emit_error_with_id(
+            emit_error_with_id(
             stdout,
             id,
             format!(
@@ -14573,7 +14593,11 @@ fn generate_vl(
                 (image_pad, vision_start, vision_end)
             }
             _ => {
-                write_error(stdout, id, "VL tokenizer is missing a required vision token");
+                write_error(
+                    stdout,
+                    id,
+                    "VL tokenizer is missing a required vision token",
+                );
                 return GenerateResult::Complete;
             }
         }
@@ -14646,9 +14670,7 @@ fn generate_vl(
 
     let image_state = vl_image_state(&pixels, img_h, img_w);
     if prepare_vl_request_state(&mut m.session, image_state) {
-        eprintln!(
-            "[daemon/vl] replacing prior image turn (image_state={image_state:016x})"
-        );
+        eprintln!("[daemon/vl] replacing prior image turn (image_state={image_state:016x})");
         if let Err(error) = model_reset_context(m, gpu) {
             return reset_failed(id, error);
         }
@@ -14892,8 +14914,7 @@ fn generate_vl(
                         message: format!("VL prefill eviction failed: {error:?}"),
                     });
                 }
-            }
-            {
+            } {
                 m.session.seq_pos = new_phys;
             }
         }
@@ -15068,8 +15089,7 @@ fn generate_vl(
                         message: format!("VL eviction failed: {error:?}"),
                     });
                 }
-            }
-            {
+            } {
                 m.session.seq_pos = new_phys;
             }
         }
@@ -15144,11 +15164,12 @@ fn generate_vl(
                                 Err(error) => {
                                     return GenerateResult::Deferred(DeferredTerminal::Error {
                                         id: id.to_string(),
-                                        message: format!("VL think-close eviction failed: {error:?}"),
+                                        message: format!(
+                                            "VL think-close eviction failed: {error:?}"
+                                        ),
                                     });
                                 }
-                            }
-                            {
+                            } {
                                 m.session.seq_pos = new_phys;
                             }
                         }
@@ -15200,7 +15221,9 @@ fn generate_vl(
                         Err(error) => {
                             return GenerateResult::Deferred(DeferredTerminal::Error {
                                 id: id.to_string(),
-                                message: format!("VL think-close logits download failed: {error:?}"),
+                                message: format!(
+                                    "VL think-close logits download failed: {error:?}"
+                                ),
                             });
                         }
                     };
@@ -15226,16 +15249,9 @@ fn generate_vl(
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
     if im_end_token == Some(*m.session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
-            if let Err(error) = qwen35::forward_scratch(
-                gpu,
-                weights,
-                config,
-                t,
-                m.session.seq_pos,
-                kv,
-                dn,
-                scratch,
-            ) {
+            if let Err(error) =
+                qwen35::forward_scratch(gpu, weights, config, t, m.session.seq_pos, kv, dn, scratch)
+            {
                 return GenerateResult::Deferred(DeferredTerminal::Error {
                     id: id.to_string(),
                     message: format!("VL EOS-boundary forward failed: {error:?}"),
@@ -15254,8 +15270,7 @@ fn generate_vl(
                             message: format!("VL EOS-boundary eviction failed: {error:?}"),
                         });
                     }
-                }
-                {
+                } {
                     m.session.seq_pos = new_phys;
                 }
             }
@@ -15370,9 +15385,7 @@ fn generate_vl_dots_ocr(
     };
     let image_state = vl_image_state(&img.patches, img.resized_h, img.resized_w);
     if prepare_vl_request_state(&mut m.session, image_state) {
-        eprintln!(
-            "[daemon/vl] replacing prior image turn (image_state={image_state:016x})"
-        );
+        eprintln!("[daemon/vl] replacing prior image turn (image_state={image_state:016x})");
         if let Err(error) = model_reset_context(m, gpu) {
             return reset_failed(id, error);
         }
@@ -16070,8 +16083,8 @@ mod tool_call_parser_tests {
 #[cfg(test)]
 mod ar_parser_lifecycle_tests {
     use super::{
-        ar_sampled_eos, complete_ar_decode, decode_limit_reached, route_ar_decode_outcome,
-        reset_failed_message, stream_stop, ArDecodeOutcome, ArSampledEos, DeferredTerminal,
+        ar_sampled_eos, complete_ar_decode, decode_limit_reached, reset_failed_message,
+        route_ar_decode_outcome, stream_stop, ArDecodeOutcome, ArSampledEos, DeferredTerminal,
         GenerateResult,
     };
     use hipfire_runtime::stream_parser::{EosDecision, StreamAction, StreamParser};
@@ -16991,8 +17004,16 @@ mod vl_request_state_tests {
         assert!(!prepare_vl_request_state(&mut fresh, image_b));
 
         assert_eq!(
-            (reused.seq_pos, reused.conversation_tokens, reused.vl_image_state),
-            (fresh.seq_pos, fresh.conversation_tokens, fresh.vl_image_state)
+            (
+                reused.seq_pos,
+                reused.conversation_tokens,
+                reused.vl_image_state
+            ),
+            (
+                fresh.seq_pos,
+                fresh.conversation_tokens,
+                fresh.vl_image_state
+            )
         );
     }
 }
@@ -17032,14 +17053,495 @@ mod lifecycle_matrix_tests {
     }
 }
 
+/// Host-only daemon load plan tests — no GPU, no hardware.
+///
+/// These tests exercise the `daemon_load_plan` helper which is the
+/// pre-mesh admission + lifecycle call for the daemon load path.  Every
+/// test creates a minimal HFQ fixture and verifies that admission (or
+/// refusal) returns a valid [`DaemonLoadPlan`] with correct lifecycle
+/// flags and effective mesh before any GPU work.  These tests do NOT
+/// prove full end-to-end integration (no GPU, no model → no
+/// `load_admitted` execution) — they guard the load-planning phase.
+///
+/// # RED/GREEN contract
+///
+/// - **RED**: the old daemon code used `HfqFile::open` peeks + manual
+///   TP→EP remap + raw-degree guards, which would NOT catch VL PP,
+///   dense EP normalisation, or composition correctly BEFORE mesh build.
+/// - **GREEN**: the daemon load handler uses `daemon_load_plan` which
+///   classifies the source, resolves policy, and returns lifecycle
+///   decisions before any GPU mutation.
 #[cfg(test)]
-mod load_parallelism_tests {
-    use super::validate_load_parallelism;
+mod daemon_load_plan_tests {
+    use super::*;
+    use hipfire_hardware::DimKind;
+    use std::io::Write;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // ── Minimal HFQ fixture writer (mirrors loader test infrastructure) ──
+
+    fn write_hfq(
+        dir: &Path,
+        name: &str,
+        arch_id: u32,
+        metadata_json: &str,
+        tensor_payload_sizes: &[(&str, u64)],
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        let meta_val: serde_json::Value =
+            serde_json::from_str(metadata_json).expect("metadata must be valid JSON");
+        let wrapped = if meta_val.get("config").is_some() {
+            metadata_json.to_string()
+        } else {
+            format!(r#"{{"architecture":"test","config":{metadata_json}}}"#)
+        };
+        let meta_bytes = wrapped.as_bytes();
+        let n_tensors = tensor_payload_sizes.len() as u32;
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&n_tensors.to_le_bytes());
+        for (tname, data_size) in tensor_payload_sizes {
+            let nb = tname.as_bytes();
+            idx.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            idx.extend_from_slice(nb);
+            idx.push(1); // quant_type
+            idx.push(1); // n_dims
+            idx.extend_from_slice(&4u32.to_le_bytes()); // shape[0]
+            idx.extend_from_slice(&0u32.to_le_bytes()); // group_size
+            idx.extend_from_slice(&data_size.to_le_bytes());
+        }
+        let metadata_offset: u64 = 32;
+        let data_offset: u64 = metadata_offset + meta_bytes.len() as u64 + idx.len() as u64;
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(&arch_id.to_le_bytes()).unwrap();
+        f.write_all(&n_tensors.to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(meta_bytes).unwrap();
+        f.write_all(&idx).unwrap();
+        for &(_, data_size) in tensor_payload_sizes {
+            let payload = vec![0u8; data_size as usize];
+            f.write_all(&payload).unwrap();
+        }
+        f.flush().unwrap();
+        path
+    }
+
+    fn tmp_dir() -> TempDir {
+        TempDir::new().unwrap()
+    }
+
+    fn vl_tensors() -> Vec<(&'static str, u64)> {
+        vec![("model.visual.patch_embed.proj.weight", 12)]
+    }
+
+    fn llama_cfg() -> String {
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "intermediate_size": 11008,
+            "vocab_size": 32000,
+        })
+        .to_string()
+    }
+
+    fn deepseek4_cfg() -> String {
+        serde_json::json!({
+            "model_type": "deepseek_v4",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "intermediate_size": 11008,
+            "vocab_size": 32000,
+        })
+        .to_string()
+    }
+
+    fn minimax_cfg() -> String {
+        serde_json::json!({
+            "model_type": "minimax_m2",
+            "vocab_size": 32000,
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 8192,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+        })
+        .to_string()
+    }
+
+    fn qwen3_cfg() -> String {
+        serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "intermediate_size": 11008,
+            "vocab_size": 32000,
+        })
+        .to_string()
+    }
+
+    // ── Admission error tests (refusal before mesh/GPU) ───────────────
 
     #[test]
-    fn load_rejects_tp_ep_before_ep_wins_remap() {
-        let error = validate_load_parallelism(1, 2, 2).unwrap_err();
-        assert!(error.contains("mutually exclusive"));
-        assert!(error.contains("COMP-001"));
+    fn rejects_qwen35_vl_pp() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "q35vl.hfq",
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":24,"num_attention_heads":16,"vocab_size":152064,"vision_config":{"hidden_size":1024}}"#,
+            &vl_tensors(),
+        );
+        let err = daemon_load_plan(path.to_str().unwrap(), 2, 1, 1).unwrap_err();
+        assert!(err.contains("AXIS-004"), "expected AXIS-004, got: {err}");
+        // Admission fails BEFORE mesh building — if the daemon used raw
+        // pp/tp to build the mesh, it would have a Pp mesh without ever
+        // checking the VL PP policy.
+    }
+
+    #[test]
+    fn rejects_tp_ep_composition() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "llama.hfq", 0, &llama_cfg(), &[]);
+        let err = daemon_load_plan(path.to_str().unwrap(), 1, 2, 2).unwrap_err();
+        assert!(err.contains("COMP-001"), "expected COMP-001, got: {err}");
+        // Composition is caught before any arch classification or mesh.
+    }
+
+    #[test]
+    fn rejects_pp_tp_composition() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "llama.hfq", 0, &llama_cfg(), &[]);
+        let err = daemon_load_plan(path.to_str().unwrap(), 2, 2, 1).unwrap_err();
+        assert!(
+            err.contains("PP cannot"),
+            "expected PP+TP rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_degree() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "llama.hfq", 0, &llama_cfg(), &[]);
+        let err = daemon_load_plan(path.to_str().unwrap(), 0, 1, 1).unwrap_err();
+        assert!(err.contains("degree"), "expected degree error, got: {err}");
+    }
+
+    #[test]
+    fn cap_001_error_carries_cap_tag() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "q35vl.hfq",
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":24,"num_attention_heads":16,"vocab_size":152064,"vision_config":{"hidden_size":1024}}"#,
+            &vl_tensors(),
+        );
+        let err = daemon_load_plan(path.to_str().unwrap(), 2, 1, 1).unwrap_err();
+        assert!(
+            err.contains("[CAP-001]"),
+            "error should carry [CAP-001]: {err}"
+        );
+    }
+
+    #[test]
+    fn composition_error_carries_comp_tag() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "llama.hfq", 0, &llama_cfg(), &[]);
+        let err = daemon_load_plan(path.to_str().unwrap(), 1, 2, 2).unwrap_err();
+        assert!(
+            err.contains("COMP-001"),
+            "error should carry [COMP-001]: {err}"
+        );
+    }
+
+    // ── Dense EP normalisation → Single mesh + eager lifecycle ─────────
+    //
+    // Dense EP (arch that normalises EP→Single) must produce:
+    //   - effective (1,1,1) — normalised to Single
+    //   - single-device mesh (no EP axis)
+    //   - defer_unload = false (eager lifecycle — no multi-GPU EP)
+    //   - pflash_suppressed = false (no EP guard)
+
+    #[test]
+    fn dense_ep_normalises_to_single() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "llama.hfq", 0, &llama_cfg(), &[]);
+        let plan = daemon_load_plan(path.to_str().unwrap(), 1, 1, 4).unwrap();
+        // Effective degrees normalised
+        assert_eq!(
+            plan.effective,
+            hipfire_loader::parallel_capability::RawParallelRequest::new(1, 1, 1),
+            "dense EP should normalise to Single (1,1,1)"
+        );
+        // Single-device mesh, no EP axis
+        let mesh = &plan.effective_mesh;
+        assert_eq!(mesh.n_devices(), 1, "normalised mesh must be single-device");
+        assert!(
+            !mesh.has_axis(DimKind::Ep),
+            "normalised mesh must not have EP axis"
+        );
+        // Eager lifecycle
+        assert!(
+            !plan.defer_unload,
+            "dense EP normalised Single must not defer unload"
+        );
+        assert!(
+            !plan.pflash_suppressed,
+            "dense EP normalised Single must not suppress PFlash"
+        );
+        // Admitted token preserved for load_admitted
+        let _ = plan.admitted;
+    }
+
+    // ── Legacy TP→EP remap → EP mesh + deferred lifecycle ─────────────
+    //
+    // DeepSeek4 / MiniMax with tp=2,ep=1 produce:
+    //   - effective (1,1,2) — EP axis
+    //   - EP mesh (ep=2)
+    //   - defer_unload = true (transactional multi-GPU EP lifecycle)
+    //   - pflash_suppressed = true (EP guards PFlash)
+
+    #[test]
+    fn deepseek4_tp_remaps_to_ep() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "ds4.hfq", 9, &deepseek4_cfg(), &[]);
+        let plan = daemon_load_plan(path.to_str().unwrap(), 1, 2, 1).unwrap();
+        // Effective degrees after remap
+        assert_eq!(plan.effective.tp, 1, "DS4 TP must be normalised to 1");
+        assert_eq!(plan.effective.ep, 2, "DS4 EP must be 2 after TP→EP remap");
+        assert_eq!(plan.effective.pp, 1, "DS4 PP must be 1");
+        // EP mesh
+        let mesh = &plan.effective_mesh;
+        assert!(mesh.has_axis(DimKind::Ep), "DS4 remap must produce EP mesh");
+        assert_eq!(mesh.n_devices(), 2, "DS4 remap mesh must have 2 devices");
+        // Deferred lifecycle
+        assert!(plan.defer_unload, "DS4 EP must defer unload");
+        assert!(plan.pflash_suppressed, "DS4 EP must suppress PFlash");
+    }
+
+    #[test]
+    fn minimax_tp_remaps_to_ep() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "minimax.hfq", 10, &minimax_cfg(), &[]);
+        let plan = daemon_load_plan(path.to_str().unwrap(), 1, 2, 1).unwrap();
+        // Effective degrees after remap
+        assert_eq!(plan.effective.tp, 1, "MiniMax TP must be normalised to 1");
+        assert_eq!(
+            plan.effective.ep, 2,
+            "MiniMax EP must be 2 after TP→EP remap"
+        );
+        // EP mesh
+        let mesh = &plan.effective_mesh;
+        assert!(
+            mesh.has_axis(DimKind::Ep),
+            "MiniMax remap must produce EP mesh"
+        );
+        assert_eq!(
+            mesh.n_devices(),
+            2,
+            "MiniMax remap mesh must have 2 devices"
+        );
+        // Deferred lifecycle
+        assert!(plan.defer_unload, "MiniMax EP must defer unload");
+        assert!(plan.pflash_suppressed, "MiniMax EP must suppress PFlash");
+    }
+
+    // ── TP mesh + deferred lifecycle ───────────────────────────────────
+    //
+    // A dense model loaded with tp=2,ep=1 produces:
+    //   - effective (1,2,1) — TP axis
+    //   - TP mesh (tp=2)
+    //   - defer_unload = true (transactional multi-GPU TP lifecycle)
+    //   - pflash_suppressed = true (multi-device guards PFlash)
+
+    #[test]
+    fn tp_mesh_defers_and_suppresses() {
+        let dir = tmp_dir();
+        // PlainQwen3 (arch_id=1, model_type=qwen3) supports TP.
+        let path = write_hfq(dir.path(), "qwen3.hfq", 1, &qwen3_cfg(), &[]);
+        let plan = daemon_load_plan(path.to_str().unwrap(), 1, 2, 1).unwrap();
+        // Effective degrees unchanged (dense model, no EP remap)
+        assert_eq!(plan.effective.tp, 2, "TP mesh must preserve effective tp=2");
+        assert_eq!(plan.effective.ep, 1, "TP mesh must have ep=1");
+        assert_eq!(plan.effective.pp, 1, "TP mesh must have pp=1");
+        // TP mesh
+        let mesh = &plan.effective_mesh;
+        assert!(mesh.has_axis(DimKind::Tp), "TP mesh must have TP axis");
+        assert_eq!(mesh.n_devices(), 2, "TP mesh must have 2 devices");
+        // Deferred lifecycle (multi-device)
+        assert!(plan.defer_unload, "TP mesh must defer unload");
+        assert!(plan.pflash_suppressed, "TP mesh must suppress PFlash");
+    }
+
+    // ── Single-GPU passthrough ─────────────────────────────────────────
+
+    #[test]
+    fn single_passes() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "llama.hfq", 0, &llama_cfg(), &[]);
+        let plan = daemon_load_plan(path.to_str().unwrap(), 1, 1, 1).unwrap();
+        assert_eq!(
+            plan.effective,
+            hipfire_loader::parallel_capability::RawParallelRequest::new(1, 1, 1),
+        );
+        assert!(!plan.defer_unload, "Single must not defer unload");
+        assert!(!plan.pflash_suppressed, "Single must not suppress PFlash");
+    }
+
+    // ── Admitted PP topology + lifecycle ────────────────────────────────
+    //
+    // PP = 2 on an admitted model (llama QK-norm, arch_id=0) produces:
+    //   - effective (2,1,1) — PP axis
+    //   - PP mesh (pp=2)
+    //   - defer_unload = false (eager lifecycle — PP unloads the prior model
+    //     before the new load, same as Single)
+    //   - pflash_suppressed = false (PP does not suppress PFlash)
+
+    #[test]
+    fn pp_load_plan_topology_lifecycle() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "llama.hfq", 0, &llama_cfg(), &[]);
+        let plan = daemon_load_plan(path.to_str().unwrap(), 2, 1, 1).unwrap();
+        // Effective degrees
+        assert_eq!(
+            plan.effective,
+            hipfire_loader::parallel_capability::RawParallelRequest::new(2, 1, 1),
+            "PP admission must preserve pp=2"
+        );
+        // PP mesh
+        let mesh = &plan.effective_mesh;
+        assert!(mesh.has_axis(DimKind::Pp), "PP mesh must have Pp axis");
+        assert_eq!(mesh.n_devices(), 2, "PP mesh must have 2 devices");
+        // Eager lifecycle (same as Single — no multi-device deferral)
+        assert!(!plan.defer_unload, "PP must not defer unload");
+        assert!(!plan.pflash_suppressed, "PP must not suppress PFlash");
+        // Admitted token preserved for load_admitted
+        let _ = plan.admitted;
+    }
+
+    // ── Environment lock for parallel-safe env var tests ────────────────
+
+    /// Process-wide mutex for tests that mutate env vars.
+    /// Acquired before `EnvGuard::set()` to prevent races between
+    /// concurrent test functions in the same binary.
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores an env var to its prior value on drop.
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let old = std::env::var(key).ok();
+            std::env::set_var(key, val);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    // ── HIPFIRE_PP_LAYERS helper returns None (no consumer yet) ──────────
+    //
+    // `pp_bands_from_env` is the production-connected helper used by the
+    // real daemon load handler to decide PP bands.  It currently returns
+    // `None` for all env values because no `load_admitted` consumer
+    // accepts pp_bands yet.  Stale/invalid env cannot reject a valid load.
+
+    #[test]
+    fn invalid_pp_layers_helper_returns_none() {
+        let _env_lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("HIPFIRE_PP_LAYERS", "x,y,z");
+        assert!(pp_bands_from_env().is_none());
+    }
+
+    #[test]
+    fn garbage_pp_layers_helper_returns_none() {
+        let _env_lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("HIPFIRE_PP_LAYERS", "garbage");
+        assert!(pp_bands_from_env().is_none());
+    }
+
+    // ── Admission error JSON envelope shape ──────────────────────────────
+    //
+    // Every error from `daemon_load_plan` must be a plain string suitable
+    // for `{"type":"error","message":"..."}`.  Errors must carry the
+    // `[CAP-001]` or `[COMP-001]` diagnostic tag and must not contain
+    // raw JSON, unescaped quotes that would break the envelope, or be
+    // empty.
+
+    #[test]
+    fn admission_error_is_plain_string_with_diagnostic_tag() {
+        // Composition error (COMP-001 tag)
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "llama.hfq", 0, &llama_cfg(), &[]);
+        let err = daemon_load_plan(path.to_str().unwrap(), 1, 2, 2).unwrap_err();
+        assert!(!err.is_empty(), "error must not be empty");
+        assert!(
+            err.contains("COMP-001"),
+            "composition error must carry COMP-001 tag: {err}"
+        );
+        assert!(
+            err.contains("TP and EP"),
+            "composition error must describe the conflict: {err}"
+        );
+        // Verify error is a single-line plain string (no internal newlines)
+        assert!(
+            !err.contains('\n'),
+            "error must be a single line for JSON envelope: {err}"
+        );
+
+        // Planned cell error (CAP-001 tag) — Qwen35 MoE PP=2
+        let path_q35 = write_hfq(
+            dir.path(),
+            "q35moe.hfq",
+            6,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":24,"num_attention_heads":16,"vocab_size":152064}"#,
+            &[],
+        );
+        let err2 = daemon_load_plan(path_q35.to_str().unwrap(), 2, 1, 1).unwrap_err();
+        assert!(!err2.is_empty(), "planned error must not be empty");
+        assert!(
+            err2.contains("[CAP-001]"),
+            "planned error must carry [CAP-001] tag: {err2}"
+        );
+        assert!(
+            !err2.contains('\n'),
+            "planned error must be single-line: {err2}"
+        );
+
+        // Degree-zero error (CAP-001 tag)
+        let err3 = daemon_load_plan(path.to_str().unwrap(), 0, 1, 1).unwrap_err();
+        assert!(!err3.is_empty(), "degree-zero error must not be empty");
+        assert!(
+            err3.contains("[CAP-001]"),
+            "degree error must carry [CAP-001] tag: {err3}"
+        );
+        assert!(
+            err3.contains("degree"),
+            "degree error must mention degree: {err3}"
+        );
+        assert!(
+            !err3.contains('\n'),
+            "degree error must be single-line: {err3}"
+        );
     }
 }

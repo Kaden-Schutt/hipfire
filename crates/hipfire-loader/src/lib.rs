@@ -11,6 +11,7 @@ pub use carriers::*;
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
 /// both `LoadedModel`/`ModelState` and the arch crates are in scope.
 pub mod model_parallel;
+pub mod parallel_capability;
 pub mod spec_build;
 pub use model_parallel::{ModelParallel, ModelParallelKind, PipelineImpl};
 
@@ -28,6 +29,9 @@ use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg}
 use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind, Gpus};
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
+use parallel_capability::{
+    resolve, ModelVariant, ParallelAdmission, ParallelAxis, RawParallelRequest,
+};
 use rdna_compute::Gpu;
 use std::path::Path;
 
@@ -47,7 +51,12 @@ pub trait Carrier: Send + Sync {
     fn probe(&self, src: &ModelSource) -> bool {
         matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String>;
 
     /// Borrow this model's spec-decode target out of `state`, arch-erased as a
     /// [`SpecTargetGuard`]. This is the daemon's single dispatch for the
@@ -72,6 +81,30 @@ pub trait Carrier: Send + Sync {
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
         Err(format!("{}: spec emitter unsupported", self.name()))
     }
+
+    /// Source-aware parallel variant classification (CAP-001 Task 2).
+    ///
+    /// Each carrier inspects the concrete [`ModelSource`] (HFQ vs safetensors
+    /// Dir) to produce the fine-grained [`ModelVariant`] needed for the
+    /// parallel capability policy table. Default rejects — carriers that want
+    /// classification override this method.
+    ///
+    /// # Classification scope
+    ///
+    /// Carriers classify **family and source facts only**: arch_id (HFQ header
+    /// vs `derive_arch_id` namespace), tensor existence (VL tower, QK-norm),
+    /// and config fields (expert count). They do NOT encode parallelism
+    /// policy, axis choice, or normalisation.
+    fn classify_parallel_variant(
+        &self,
+        src: &ModelSource,
+    ) -> Result<crate::parallel_capability::ModelVariant, String> {
+        Err(format!(
+            "{}: CAP-001 variant classification unsupported for {}",
+            self.name(),
+            src.describe()
+        ))
+    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the
@@ -86,6 +119,53 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
         .iter()
         .copied()
         .find(|c| c.claims_arch_id(arch_id, false))
+}
+
+/// Source-aware carrier + variant resolution (CAP-001 Task 2).
+///
+/// Resolves a concrete [`ModelSource`] to the matching [`Carrier`] (via
+/// [`Carrier::probe`], which respects HFQ vs safetensors namespaces) and
+/// then calls [`Carrier::classify_parallel_variant`] to produce the fine-
+/// grained [`ModelVariant`] for the parallel capability policy table.
+///
+/// # Errors
+///
+/// - `"no carrier for ..."` when zero carriers claim the source's arch_id.
+/// - `"ambiguous carrier ..."` when multiple carriers match (arch_id
+///   collision in the registry).
+/// - Carries through any error from [`Carrier::classify_parallel_variant`].
+pub fn classify_source(
+    src: &ModelSource,
+) -> Result<
+    (
+        &'static dyn Carrier,
+        crate::parallel_capability::ModelVariant,
+    ),
+    String,
+> {
+    let arch_id = src
+        .arch_id()
+        .ok_or_else(|| format!("no arch_id in source: {}", src.describe()))?;
+    let matching: Vec<&&dyn Carrier> = REGISTRY.iter().filter(|c| c.probe(src)).collect();
+    if matching.is_empty() {
+        return Err(format!(
+            "no carrier for arch_id {} ({})",
+            arch_id,
+            src.describe()
+        ));
+    }
+    if matching.len() > 1 {
+        let names: Vec<&str> = matching.iter().map(|c| c.name()).collect();
+        return Err(format!(
+            "ambiguous carrier for arch_id {} ({}): carriers {:?} match",
+            arch_id,
+            src.describe(),
+            names,
+        ));
+    }
+    let carrier = matching[0];
+    let variant = carrier.classify_parallel_variant(src)?;
+    Ok((*carrier, variant))
 }
 
 // ─── Registry ─────────────────────────────────────────────────────────
@@ -506,6 +586,9 @@ pub struct PersistState {
 /// finalization, and the daemon load-message handler (mtp_*) — never per-request. Pub
 /// fields: it crosses into the daemon crate, so immutability is by convention, not
 /// enforced (hence `ModelMeta`, not `ImmutableMeta`).
+///
+/// CAP-001 Task 5: the private admission record retains the opaque
+/// [`AdmittedLoad`] resolution and is populated exactly once at construction.
 pub struct ModelMeta {
     pub arch_id: u32,
     pub model_path: String,
@@ -522,6 +605,54 @@ pub struct ModelMeta {
     pub rec_top_k: Option<f32>,
     pub rec_min_p: Option<f32>,
     pub rec_presence_penalty: Option<f32>,
+    admission: AdmissionRecord,
+}
+
+impl ModelMeta {
+    pub(crate) fn admission(&self) -> &AdmissionRecord {
+        &self.admission
+    }
+}
+
+/// Immutable load-time admission snapshot.  Its fields cannot be fabricated by
+/// callers; only the resolver-owned [`AdmittedLoad`] can create one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdmissionRecord {
+    admission: ParallelAdmission,
+}
+
+impl AdmissionRecord {
+    fn from_admission(admission: ParallelAdmission) -> Self {
+        Self { admission }
+    }
+
+    fn variant(self) -> ModelVariant {
+        self.admission.variant()
+    }
+
+    fn requested(self) -> RawParallelRequest {
+        self.admission.requested()
+    }
+
+    fn effective(self) -> RawParallelRequest {
+        self.admission.effective()
+    }
+}
+
+/// Public type required by the carrier contract, but intentionally
+/// unconstructable outside this crate.
+pub struct CarrierLoadToken {
+    record: AdmissionRecord,
+}
+
+impl CarrierLoadToken {
+    fn from_record(record: AdmissionRecord) -> Self {
+        Self { record }
+    }
+
+    fn record(&self) -> AdmissionRecord {
+        self.record
+    }
 }
 
 pub struct LoadedModel {
@@ -561,7 +692,7 @@ impl LoadedModel {
     /// Shared-field skeleton: arch state None, pp = 1, all non-core arch slots
     /// None, collections empty, mtp defaults, asst cache from env. Callers set
     /// only the fields they own via struct-update (`..LoadedModel::skeleton(..)`).
-    pub fn skeleton(
+    pub(crate) fn skeleton(
         arch_id: u32,
         tokenizer: hipfire_runtime::tokenizer::Tokenizer,
         max_seq: usize,
@@ -570,6 +701,7 @@ impl LoadedModel {
         chat_template: Option<String>,
         mtp_mode: &str,
         mtp_k: usize,
+        record: AdmissionRecord,
     ) -> Self {
         LoadedModel {
             parallel: ModelParallel::Single,
@@ -597,6 +729,7 @@ impl LoadedModel {
                 rec_top_k: None,
                 rec_min_p: None,
                 rec_presence_penalty: None,
+                admission: record,
             },
         }
     }
@@ -703,10 +836,20 @@ impl LoadedModel {
     /// dense PP, and EP own it in `parallel`. The latter two dense drivers have
     /// no physical KV reset primitive: their next prefill overwrites KV from
     /// position zero, so their physical state is intentionally left alone.
+    ///
+    /// CAP-001 Task 5: admission consistency validates the stored effective axis
+    /// against the actual [`ModelParallelKind`] — no policy-table re-query.
     pub fn reset_context(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), ResetError> {
         let state_kind = self.state.as_ref().map(ModelStateKind::from);
         reset_ownership_kind(self.parallel.kind(), state_kind, self.meta.arch_id)?;
         validate_reset_layout(&self.parallel, &self.state, self.meta.arch_id)?;
+        validate_admission_consistency(
+            self.parallel.kind(),
+            state_kind,
+            self.meta.arch_id,
+            self.parallel.topology(),
+            self.meta.admission(),
+        )?;
 
         map_session_reset(self.session.reset_checked(gpu))?;
         if let Some(speculator) = self.speculator.as_mut() {
@@ -735,7 +878,7 @@ impl LoadedModel {
     /// cannot be set piecemeal. The qwen35 PP scratch is carried inside
     /// `Qwen35Bundle.pipeline`; the mesh is carried in `parallel` as
     /// `Pp(ArchResident(gpus))`.
-    pub fn skeleton_pp(
+    pub(crate) fn skeleton_pp(
         arch_id: u32,
         tokenizer: hipfire_runtime::tokenizer::Tokenizer,
         max_seq: usize,
@@ -745,6 +888,7 @@ impl LoadedModel {
         mtp_mode: &str,
         mtp_k: usize,
         gpus: Gpus,
+        record: AdmissionRecord,
     ) -> Self {
         LoadedModel {
             parallel: ModelParallel::Pp(crate::model_parallel::PipelineImpl::ArchResident(gpus)),
@@ -757,6 +901,7 @@ impl LoadedModel {
                 chat_template,
                 mtp_mode,
                 mtp_k,
+                record,
             )
         }
     }
@@ -1252,6 +1397,83 @@ fn validate_reset_layout(
     }
 }
 
+/// Validate the concrete parallel owner, state owner, and topology against the
+/// immutable admission snapshot.  This deliberately does not re-query policy.
+fn validate_admission_consistency(
+    actual: ModelParallelKind,
+    state: Option<ModelStateKind>,
+    arch_id: u32,
+    observed: RawParallelRequest,
+    record: &AdmissionRecord,
+) -> Result<(), ResetError> {
+    let effective = record.effective();
+    let expected_kind = match (effective.axis(), record.variant()) {
+        (ParallelAxis::Single, _) => ModelParallelKind::Single,
+        (ParallelAxis::Tp, _) => ModelParallelKind::Tp,
+        (ParallelAxis::Pp, ModelVariant::Qwen35Dense | ModelVariant::Qwen35Moe) => {
+            ModelParallelKind::PpQwen35
+        }
+        (ParallelAxis::Pp, _) => ModelParallelKind::PpDense,
+        (ParallelAxis::Ep, _) => ModelParallelKind::Ep,
+    };
+
+    let state_matches = match actual {
+        ModelParallelKind::Tp | ModelParallelKind::PpDense => {
+            state.is_none()
+                && matches!(
+                    record.variant(),
+                    ModelVariant::LlamaQkNorm
+                        | ModelVariant::LlamaNoQkNorm
+                        | ModelVariant::PlainQwen3
+                )
+        }
+        ModelParallelKind::PpQwen35 => {
+            state == Some(ModelStateKind::Qwen35)
+                && matches!(
+                    record.variant(),
+                    ModelVariant::Qwen35Dense | ModelVariant::Qwen35Moe
+                )
+        }
+        ModelParallelKind::Ep => {
+            state.is_none()
+                && matches!(
+                    record.variant(),
+                    ModelVariant::Deepseek4 | ModelVariant::Minimax
+                )
+        }
+        ModelParallelKind::Single => match record.variant() {
+            ModelVariant::LlamaQkNorm | ModelVariant::LlamaNoQkNorm | ModelVariant::PlainQwen3 => {
+                state == Some(ModelStateKind::Llama)
+            }
+            ModelVariant::Qwen35Dense | ModelVariant::Qwen35Moe | ModelVariant::Qwen35Vl => {
+                state == Some(ModelStateKind::Qwen35)
+            }
+            ModelVariant::Qwen2 => state == Some(ModelStateKind::Qwen2),
+            ModelVariant::DotsOcr => state == Some(ModelStateKind::DotsOcr),
+            ModelVariant::Deepseek4 => state == Some(ModelStateKind::Deepseek4),
+            ModelVariant::Minimax => state == Some(ModelStateKind::Minimax),
+            ModelVariant::Lfm2Dense | ModelVariant::Lfm2Moe => {
+                state == Some(ModelStateKind::Lfm2Moe)
+            }
+            ModelVariant::Cohere2Moe => state == Some(ModelStateKind::Cohere2Moe),
+        },
+    };
+
+    if observed != effective || actual != expected_kind || !state_matches {
+        return Err(ResetError::Architecture {
+            parallel: actual,
+            state,
+            arch_id,
+            message: format!(
+                "admission consistency: actual {actual:?} state {state:?} topology {observed:?} is incompatible with effective {effective:?}, expected kind {expected_kind:?}, variant {:?}, requested {:?}",
+                record.variant(),
+                record.requested(),
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn reset_owned_arch_state(
     parallel: &mut ModelParallel,
     state: &mut Option<ModelState>,
@@ -1490,6 +1712,7 @@ fn finish_qwen35_load(
     ctx: &mut LoadCtx,
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
+    token: &CarrierLoadToken,
 ) -> Result<LoadedModel, String> {
     use hipfire_arch_qwen35::qwen35::LayerType;
     let mut bundle = Some(bundle);
@@ -1766,6 +1989,7 @@ fn finish_qwen35_load(
                 chat_template,
                 ctx.mtp_mode,
                 ctx.mtp_k,
+                token.record(),
             )
         })
     })();
@@ -1788,73 +2012,370 @@ fn finish_qwen35_load(
     }
 }
 
-// ─── Main public API ──────────────────────────────────────────────────
+// ─── CAP-001 Task 3: host-only admission guard (loader boundary) ──────
+//
+// `admit_path` opens a model source and classifies its parallelism
+// capability before any GPU/tokenizer/allocation work.  The returned
+// `AdmittedLoad` token is consumed by `load_admitted`, which routes to
+// the appropriate private axis-specific constructor.
+//
+// This is a **conventional high-level loader boundary**: external
+// callers interact only with `admit_path` and `load_admitted`.  The
+// raw TP/PP constructors are gated behind the `loader-internal`
+// feature and `#[doc(hidden)]` — internal/unsupported by convention.
+// Cargo feature gating / `#[doc(hidden)]` is not access control.
 
-fn normalize_mtp_k(arch_id: u32, mtp_k: Option<usize>) -> Result<usize, String> {
-    let _ = arch_id;
-    let value = mtp_k.unwrap_or(3);
-    if (1..=8).contains(&value) {
-        Ok(value)
-    } else {
-        Err(format!("MTP K must be in 1..=8, got {value}"))
+/// Admission result that retains the opened model path, source, and
+/// resolved parallelism.  Public but **opaque**: no public access to
+/// the underlying path, source, or carrier — only the resolved
+/// admission token ([`Self::admission`]).
+///
+/// The source is consumed by [`load_admitted`] via the crate-private
+/// [`Self::into_parts`].  Callers call [`admit_path`] for the token,
+/// then pass it to [`load_admitted`] with a matching mesh.
+pub struct AdmittedLoad {
+    /// Original model path (file or directory).  Used by the private
+    /// load helpers to populate `model_path` in [`LoadedModel`] metadata
+    /// and for sidecar discovery.
+    path: String,
+    source: ModelSource,
+    carrier: &'static dyn Carrier,
+    admission: ParallelAdmission,
+}
+
+impl std::fmt::Debug for AdmittedLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmittedLoad")
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
     }
 }
 
-pub(crate) fn reject_qwen_native_mtp(mtp_mode: &str) -> Result<(), String> {
-    if mtp_mode == "on" {
-        Err("Qwen native MTP is disabled pending SPEC-003".into())
-    } else {
-        Ok(())
+impl AdmittedLoad {
+    /// The resolved parallelism admission — variant, effective degrees,
+    /// and whether normalisation was applied.  This is the only public
+    /// accessor; the path, source, and carrier remain private.
+    pub fn admission(&self) -> ParallelAdmission {
+        self.admission
+    }
+
+    fn record(&self) -> AdmissionRecord {
+        AdmissionRecord::from_admission(self.admission)
+    }
+
+    /// The model path that was admitted.  Crate-private — used by
+    /// `load_admitted` dispatch.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Borrow the opened model source (HFQ or safetensors directory).
+    pub(crate) fn source_ref(&self) -> &ModelSource {
+        &self.source
+    }
+
+    /// Consume the `AdmittedLoad`, returning its owned parts.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (String, ModelSource, &'static dyn Carrier, ParallelAdmission) {
+        (self.path, self.source, self.carrier, self.admission)
     }
 }
 
-fn mtp_mode_from_spec(spec: SpecLoadCfg) -> &'static str {
-    match spec.mtp_mode {
-        Some(true) => "on",
-        Some(false) => "off",
-        None => "auto",
-    }
+/// Open a model source, classify its architecture, and resolve the
+/// parallelism request.  Returns a source-owning [`AdmittedLoad`]
+/// token.  No GPU / tokenizer / allocation work is performed.
+///
+/// Errors are prefixed with `[CAP-001]` and include the exact path.
+pub fn admit_path(
+    path: impl AsRef<std::path::Path>,
+    request: RawParallelRequest,
+) -> Result<AdmittedLoad, String> {
+    let path = path.as_ref();
+    // Reject non-UTF-8 paths at the boundary — a lossy replacement would
+    // obscure the real filesystem path in diagnostics.  The canonical
+    // loader path (HFQ + safetensors) is always valid UTF-8 on Linux.
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| format!("[CAP-001] non-UTF-8 model path: {}", path.display()))?;
+    let src = ModelSource::from_path(path_str)
+        .map_err(|e| format!("[CAP-001] failed to open model source '{path_str}': {e}"))?;
+    let (carrier, variant) = classify_source(&src)
+        .map_err(|e| format!("[CAP-001] failed to classify '{path_str}': {e}"))?;
+    let admission = resolve(variant, request)
+        .map_err(|e| format!("[CAP-001] admission refused '{path_str}': {e}"))?;
+    Ok(AdmittedLoad {
+        path: path_str.to_string(),
+        source: src,
+        carrier,
+        admission,
+    })
 }
 
-/// Load a model from an HFQ file (or safetensors directory). This is the
-/// single arch-dispatch point via the carrier registry.
-#[allow(clippy::too_many_arguments)]
-pub fn load_model(
+/// Internal admission of an already-opened [`ModelSource`] with a known
+/// path.  Like [`admit_path`] but skips the open step.  Used only in
+/// tests (the production wrappers use [`admit_path`] directly).
+#[cfg(test)]
+fn admit_source(
     path: &str,
+    src: ModelSource,
+    request: RawParallelRequest,
+) -> Result<AdmittedLoad, String> {
+    let (carrier, variant) = classify_source(&src)?;
+    let admission = resolve(variant, request).map_err(|e| e.to_string())?;
+    Ok(AdmittedLoad {
+        path: path.to_string(),
+        source: src,
+        carrier,
+        admission,
+    })
+}
+
+/// Derive a [`RawParallelRequest`] from a [`DeviceMesh`] — the three
+/// parallelism degrees (pp, tp, ep) that the mesh requests.
+fn raw_request(mesh: &DeviceMesh) -> RawParallelRequest {
+    RawParallelRequest::new(
+        mesh.size_of(DimKind::Pp),
+        mesh.size_of(DimKind::Tp),
+        mesh.size_of(DimKind::Ep),
+    )
+}
+
+fn effective_load_mesh(admitted: &AdmittedLoad) -> DeviceMesh {
+    let effective = admitted.admission().effective();
+    DeviceMesh::rect(&[
+        (DimKind::Pp, effective.pp),
+        (DimKind::Tp, effective.tp),
+        (DimKind::Ep, effective.ep),
+    ])
+}
+
+fn select_load_mesh<'a>(
+    admitted: &AdmittedLoad,
+    mesh: &'a DeviceMesh,
+) -> std::borrow::Cow<'a, DeviceMesh> {
+    if admitted.admission().was_normalized() {
+        std::borrow::Cow::Owned(effective_load_mesh(admitted))
+    } else {
+        std::borrow::Cow::Borrowed(mesh)
+    }
+}
+
+// ─── ModelLoadOptions ──────────────────────────────────────────────────
+
+/// Aggregated load options passed to [`load_admitted`] alongside the
+/// admitted token and mesh.
+///
+/// Construct via [`ModelLoadOptions::new`] and optional setters.
+/// This struct is `#[non_exhaustive]` — new fields may be added in
+/// minor releases without a breaking change.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct ModelLoadOptions<'a> {
+    /// Maximum sequence length for KV cache allocation.  Required.
     max_seq: usize,
-    draft_path: Option<&str>,
-    kv_mode_override: Option<&str>,
-    kv_adaptive_override: Option<&str>,
-    state_quant_override: Option<&str>,
-    cask: &CaskConfig,
-    mesh: &DeviceMesh,
-    pp_bands: Option<&[usize]>,
+    /// Optional DFlash drafter path.  Default: `None`.
+    draft_path: Option<&'a str>,
+    /// Override KV cache quantization mode.  Default: `None` (auto).
+    kv_mode_override: Option<&'a str>,
+    /// Override adaptive KV mode.  Default: `None` (auto).
+    kv_adaptive_override: Option<&'a str>,
+    /// Override DeltaNet state quantization.  Default: `None` (auto).
+    state_quant_override: Option<&'a str>,
+    /// CASK eviction config.  Default: a no-eviction config.
+    cask: &'a CaskConfig,
+    /// PP layer bands (Qwen35 PP).  Default: `None` (uniform split).
+    pp_bands: Option<&'a [usize]>,
+    /// Speculative decoding config.  Default: `SpecLoadCfg::default()`.
     spec: SpecLoadCfg,
-    gpu: &mut rdna_compute::Gpu,
+}
+
+impl<'a> ModelLoadOptions<'a> {
+    /// Create options with the required `max_seq`.  All optional fields
+    /// use their defaults:
+    /// - `draft_path`: `None`
+    /// - `kv_mode_override`: `None`
+    /// - `kv_adaptive_override`: `None`
+    /// - `state_quant_override`: `None`
+    /// - `cask`: a no-eviction config (`budget=0`, `beta=0`)
+    /// - `pp_bands`: `None`
+    /// - `spec`: `SpecLoadCfg::default()`
+    pub fn new(max_seq: usize) -> Self {
+        Self {
+            max_seq,
+            draft_path: None,
+            kv_mode_override: None,
+            kv_adaptive_override: None,
+            state_quant_override: None,
+            cask: &DEFAULT_CASK,
+            pp_bands: None,
+            spec: SpecLoadCfg::default(),
+        }
+    }
+
+    // ── Accessors for internal use ──
+    pub(crate) fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+    pub(crate) fn draft_path(&self) -> Option<&'a str> {
+        self.draft_path
+    }
+    pub(crate) fn kv_mode_override(&self) -> Option<&'a str> {
+        self.kv_mode_override
+    }
+    pub(crate) fn kv_adaptive_override(&self) -> Option<&'a str> {
+        self.kv_adaptive_override
+    }
+    pub(crate) fn state_quant_override(&self) -> Option<&'a str> {
+        self.state_quant_override
+    }
+    pub(crate) fn cask(&self) -> &'a CaskConfig {
+        self.cask
+    }
+    pub(crate) fn pp_bands(&self) -> Option<&'a [usize]> {
+        self.pp_bands
+    }
+    pub(crate) fn spec(&self) -> SpecLoadCfg {
+        self.spec
+    }
+
+    // ── Fluent setters ──
+    /// Set the DFlash drafter path.
+    pub fn with_draft_path(mut self, draft_path: &'a str) -> Self {
+        self.draft_path = Some(draft_path);
+        self
+    }
+    /// Override KV cache quantization mode.
+    pub fn with_kv_mode_override(mut self, mode: &'a str) -> Self {
+        self.kv_mode_override = Some(mode);
+        self
+    }
+    /// Override adaptive KV mode.
+    pub fn with_kv_adaptive_override(mut self, mode: &'a str) -> Self {
+        self.kv_adaptive_override = Some(mode);
+        self
+    }
+    /// Override DeltaNet state quantization.
+    pub fn with_state_quant_override(mut self, quant: &'a str) -> Self {
+        self.state_quant_override = Some(quant);
+        self
+    }
+    /// Set CASK eviction config.
+    pub fn with_cask(mut self, cask: &'a CaskConfig) -> Self {
+        self.cask = cask;
+        self
+    }
+    /// Set PP layer bands.
+    pub fn with_pp_bands(mut self, bands: &'a [usize]) -> Self {
+        self.pp_bands = Some(bands);
+        self
+    }
+    /// Set speculative decoding config.
+    pub fn with_spec(mut self, spec: SpecLoadCfg) -> Self {
+        self.spec = spec;
+        self
+    }
+}
+
+// Static default for wrappers that don't need eviction config.
+static DEFAULT_CASK: CaskConfig = CaskConfig {
+    sidecar: None,
+    cask_m_folding: false,
+    budget: 0,
+    beta: 0,
+    core_frac: 0.0,
+    fold_m: 0,
+};
+
+// ─── Single public consumer ────────────────────────────────────────────
+
+/// Load a model from an already-admitted source token.  This is the
+/// single public entry point for all parallelism axes.
+///
+/// `gpu` is required for Single-axis loads and unused for TP/PP/EP
+/// (those axes manage their own GPU mesh via `Gpus::from_mesh`).
+///
+/// # Errors
+///
+/// - Topology mismatch: `raw_request(mesh) != admitted.admission().effective()`
+/// - Single axis with `None` GPU: `[CAP-001] Single load requires a GPU`
+/// - Axis routing: the effective axis is dispatched to the appropriate
+///   private `load_*_admitted` helper.
+pub fn load_admitted(
+    admitted: AdmittedLoad,
+    mesh: &DeviceMesh,
+    opts: ModelLoadOptions,
+    gpu: Option<&mut rdna_compute::Gpu>,
 ) -> Result<LoadedModel, String> {
-    let src = ModelSource::from_path(path)?;
-    let source_arch_id = match &src {
+    let raw = raw_request(mesh);
+    let effective = admitted.admission().effective();
+
+    // Topology equality: the mesh must match the admission's effective degrees.
+    if effective != raw {
+        return Err(format!(
+            "[CAP-001] load_admitted: mesh request ({:?}) does not match \
+             admission effective ({:?})",
+            raw, effective,
+        ));
+    }
+
+    let axis = effective.axis();
+
+    // CAP-001 Task 5: record dispatch decision at the load_admitted boundary
+    // (cfg(test) only — zero cost in production).
+    #[cfg(test)]
+    crate::construction_recorder::record(crate::construction_recorder::RecordedEvent::RoutedTo {
+        axis,
+        variant: admitted.admission().variant(),
+        effective,
+    });
+
+    // Route by effective axis.
+    match axis {
+        ParallelAxis::Single => load_single_admitted(admitted, mesh, opts, gpu),
+        ParallelAxis::Tp => load_tp_admitted(admitted, mesh, opts),
+        ParallelAxis::Pp => load_pp_admitted(admitted, mesh, opts),
+        ParallelAxis::Ep => load_ep_admitted(admitted, mesh, opts),
+    }
+}
+
+// ─── Private axis-specific consumers ───────────────────────────────────
+
+/// Single-GPU load from an admitted source.  Every existing argument in
+/// `load_model` is threaded through [`ModelLoadOptions`].
+fn load_single_admitted(
+    admitted: AdmittedLoad,
+    mesh: &DeviceMesh,
+    opts: ModelLoadOptions,
+    gpu: Option<&mut rdna_compute::Gpu>,
+) -> Result<LoadedModel, String> {
+    #[cfg(test)]
+    crate::construction_recorder::record(
+        crate::construction_recorder::RecordedEvent::EnteredConstructor {
+            axis: crate::parallel_capability::ParallelAxis::Single,
+        },
+    );
+    let record = admitted.record();
+    let token = CarrierLoadToken::from_record(record);
+    let gpu = gpu.ok_or_else(|| "[CAP-001] Single load requires a GPU (got None)".to_string())?;
+    let (path, source, carrier, _admission) = admitted.into_parts();
+
+    let source_arch_id = match &source {
         ModelSource::Hfq(hfq) => hfq.arch_id,
         ModelSource::Dir(source) => source.arch_id(),
     };
 
     // Author-recommended sampling defaults (temp/top_p/top_k from the .hfq's baked
     // `generation_config`). Extract HERE, from the already-open source, BEFORE the
-    // carrier allocates any GPU buffers. The `metadata_json` parse churns the host
-    // heap; doing it AFTER allocation but BEFORE the first-warmup AR hipGraph
-    // capture perturbs buffer placement and — on gfx12 / ROCm 7.2, which snapshots
-    // kernarg/buffer addresses at graph-instantiate — makes the captured graph
-    // replay ~2× slower (gfx12 MoE A3B 99→50; bisected to config-inheritance commit
-    // 2a7a1c8b). Parsing pre-allocation lets the heap settle. HFQ sources only;
-    // raw-safetensors PP carries no generation_config.
-    let rec_sampling = match &src {
+    // carrier allocates any GPU buffers.
+    let rec_sampling = match &source {
         ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
         _ => None,
     };
 
     // DFlash lm_head quant check — only for HFQ sources
-    if draft_path.is_some() {
-        if let ModelSource::Hfq(ref hfq) = src {
+    if let Some(draft_path) = opts.draft_path() {
+        if let ModelSource::Hfq(ref hfq) = source {
             let lm_qt = hfq
                 .tensor_data("lm_head.weight")
                 .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
@@ -1920,52 +2441,302 @@ pub fn load_model(
                      HFQ4 / Q8 target.",
                 ));
             }
+            let _ = draft_path;
         }
     }
 
-    let mtp_mode = mtp_mode_from_spec(spec);
+    let mtp_mode = mtp_mode_from_spec(opts.spec());
     let mut ctx = LoadCtx {
-        path,
-        max_seq,
-        draft_path,
-        kv_mode_override,
-        kv_adaptive_override,
-        state_quant_override,
-        cask,
+        path: &path,
+        max_seq: opts.max_seq(),
+        draft_path: opts.draft_path(),
+        kv_mode_override: opts.kv_mode_override(),
+        kv_adaptive_override: opts.kv_adaptive_override(),
+        state_quant_override: opts.state_quant_override(),
+        cask: opts.cask(),
         pp: mesh.size_of(DimKind::Pp),
-        pp_bands,
+        pp_bands: opts.pp_bands(),
         mtp_mode,
-        mtp_k: normalize_mtp_k(source_arch_id, spec.mtp_k)?,
-        spec,
+        mtp_k: normalize_mtp_k(source_arch_id, opts.spec().mtp_k)?,
+        spec: opts.spec(),
         kv_physical_cap: None,
         gpu,
     };
 
-    // Carrier registry dispatch. Collect all matches so an overlap between
-    // two carriers' `claims_arch_id` fails loudly here instead of silently
-    // resolving to whichever was registered first.
-    let mut matches = REGISTRY.iter().filter(|c| c.probe(&src));
-    let carrier = matches
-        .next()
-        .ok_or_else(|| format!("no carrier for {}", src.describe()))?;
-    if let Some(other) = matches.next() {
-        return Err(format!(
-            "ambiguous carrier dispatch for {}: '{}' and '{}' both claim it",
-            src.describe(),
-            carrier.name(),
-            other.name()
-        ));
-    }
-    let mut result = carrier.load(src, &mut ctx)?;
-    // Apply the author-recommended sampling extracted pre-allocation (see above).
-    // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
-    // is the gfx12 hipGraph-replay regression root-caused above.
+    let mut result = carrier.load(source, &mut ctx, &token)?;
     if let Some(rec) = rec_sampling {
         result.meta.rec_temperature = rec.temperature;
         result.meta.rec_top_p = rec.top_p;
         result.meta.rec_top_k = rec.top_k.map(|k| k as f32);
     }
     Ok(result)
+}
+
+/// TP load from an admitted source.  Topology/axis enforcement is in
+/// [`load_admitted`] — this helper assumes a valid TP admission.
+fn load_tp_admitted(
+    admitted: AdmittedLoad,
+    mesh: &DeviceMesh,
+    opts: ModelLoadOptions,
+) -> Result<LoadedModel, String> {
+    #[cfg(test)]
+    crate::construction_recorder::record(
+        crate::construction_recorder::RecordedEvent::EnteredConstructor {
+            axis: crate::parallel_capability::ParallelAxis::Tp,
+        },
+    );
+    let record = admitted.record();
+    let path = admitted.path();
+    let hfq_ref = match admitted.source_ref() {
+        ModelSource::Hfq(hfq) => hfq,
+        _ => return Err("load_model_tp: TP load requires HFQ source".into()),
+    };
+    let arch_id = hfq_ref.arch_id;
+    let mtp_mode = mtp_mode_from_spec(opts.spec());
+    let mtp_k = normalize_mtp_k(arch_id, opts.spec().mtp_k)?;
+    #[cfg(feature = "arch-qwen35")]
+    if matches!(arch_id, 5 | 6) {
+        let config =
+            <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(
+                hfq_ref,
+            )?;
+        hipfire_arch_qwen35::arch::qwen35_tp_preflight(&config, mesh.size_of(DimKind::Tp))?;
+    }
+    let tokenizer =
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq_ref.metadata_json)
+            .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let chat_template = resolve_chat_template(hfq_ref, path);
+    let rec = hfq_ref.recommended_sampling();
+    let tp_model =
+        hipfire_runtime::tp_serve::TpModel::load_from_hfq(hfq_ref, mesh, opts.max_seq())?;
+    let eos_tok = tp_model.eos_token();
+
+    Ok(LoadedModel {
+        parallel: ModelParallel::Tp(tp_model),
+        meta: ModelMeta {
+            arch_id,
+            model_path: path.to_string(),
+            chat_template: chat_template.clone(),
+            max_seq: opts.max_seq(),
+            physical_cap: opts.max_seq(),
+            eos_tok,
+            mtp_mode: mtp_mode.to_string(),
+            mtp_k,
+            rec_temperature: rec.and_then(|r| r.temperature),
+            rec_top_p: rec.and_then(|r| r.top_p),
+            rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+            rec_min_p: None,
+            rec_presence_penalty: None,
+            admission: record,
+        },
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            opts.max_seq(),
+            opts.max_seq(),
+            String::new(),
+            chat_template,
+            mtp_mode,
+            mtp_k,
+            record,
+        )
+    })
+}
+
+/// PP load from an admitted source.  Topology/axis enforcement is in
+/// [`load_admitted`].
+fn load_pp_admitted(
+    admitted: AdmittedLoad,
+    mesh: &DeviceMesh,
+    opts: ModelLoadOptions,
+) -> Result<LoadedModel, String> {
+    #[cfg(test)]
+    crate::construction_recorder::record(
+        crate::construction_recorder::RecordedEvent::EnteredConstructor {
+            axis: crate::parallel_capability::ParallelAxis::Pp,
+        },
+    );
+    let record = admitted.record();
+    let path = admitted.path();
+    let hfq_ref = match admitted.source_ref() {
+        ModelSource::Hfq(hfq) => hfq,
+        _ => return Err("load_model_pp: PP load requires HFQ source".into()),
+    };
+    let arch_id = hfq_ref.arch_id;
+    let mtp_mode = mtp_mode_from_spec(opts.spec());
+    let mtp_k = normalize_mtp_k(arch_id, opts.spec().mtp_k)?;
+    let tokenizer =
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq_ref.metadata_json)
+            .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let chat_template = resolve_chat_template(hfq_ref, path);
+    let rec = hfq_ref.recommended_sampling();
+    let pp_model =
+        hipfire_runtime::pp_serve::PpModel::load_from_hfq(hfq_ref, mesh, opts.max_seq())?;
+    let eos_tok = pp_model.eos_token();
+
+    Ok(LoadedModel {
+        parallel: ModelParallel::Pp(crate::model_parallel::PipelineImpl::Dense(pp_model)),
+        meta: ModelMeta {
+            arch_id,
+            model_path: path.to_string(),
+            chat_template: chat_template.clone(),
+            max_seq: opts.max_seq(),
+            physical_cap: opts.max_seq(),
+            eos_tok,
+            mtp_mode: mtp_mode.to_string(),
+            mtp_k,
+            rec_temperature: rec.and_then(|r| r.temperature),
+            rec_top_p: rec.and_then(|r| r.top_p),
+            rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+            rec_min_p: None,
+            rec_presence_penalty: None,
+            admission: record,
+        },
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            opts.max_seq(),
+            opts.max_seq(),
+            String::new(),
+            chat_template,
+            mtp_mode,
+            mtp_k,
+            record,
+        )
+    })
+}
+
+/// EP load from an admitted source.  Consumes the source so every rank
+/// weight load uses the SAME HfqFile.  Topology/axis enforcement is in
+/// [`load_admitted`].
+fn load_ep_admitted(
+    admitted: AdmittedLoad,
+    mesh: &DeviceMesh,
+    opts: ModelLoadOptions,
+) -> Result<LoadedModel, String> {
+    #[cfg(test)]
+    crate::construction_recorder::record(
+        crate::construction_recorder::RecordedEvent::EnteredConstructor {
+            axis: crate::parallel_capability::ParallelAxis::Ep,
+        },
+    );
+    let mtp_mode = mtp_mode_from_spec(opts.spec());
+    let mtp_k = normalize_mtp_k(0, opts.spec().mtp_k)?;
+    let record = admitted.record();
+    let variant = record.variant();
+    let (path, source, _carrier, _) = admitted.into_parts();
+    let mut hfq = match source {
+        ModelSource::Hfq(hfq) => hfq,
+        _ => return Err("load_model_ep: EP load requires HFQ source".into()),
+    };
+    let model = match variant {
+        ModelVariant::Deepseek4 => load_model_ep_ds4(
+            &mut hfq,
+            &path,
+            opts.max_seq(),
+            mesh,
+            mtp_mode,
+            mtp_k,
+            record,
+        ),
+        ModelVariant::Minimax => load_model_ep_minimax(
+            &mut hfq,
+            &path,
+            opts.max_seq(),
+            mesh,
+            mtp_mode,
+            mtp_k,
+            record,
+        ),
+        v => Err(format!(
+            "EP not supported for {v:?} (expected Deepseek4 or Minimax)"
+        )),
+    }?;
+    Ok(model)
+}
+
+/// Host-only admission routing seam: the generic `load_model` entry point
+/// accepts only Single-axis loads (no TP/PP/EP parallelism).  Checks the
+/// effective axis and returns the [`AdmittedLoad`] on success.  Every
+/// continuation inside `load_model` is preceded by this seam — no GPU or
+/// tokenizer work happens before it passes.
+pub(crate) fn route_generic_single(admitted: AdmittedLoad) -> Result<AdmittedLoad, String> {
+    if admitted.admission().effective().axis() != ParallelAxis::Single {
+        return Err(format!(
+            "load_model: effective axis is {:?}, expected Single; use \
+             load_model_tp (TP), load_model_pp (PP), or load_model_ep (EP)",
+            admitted.admission().effective().axis(),
+        ));
+    }
+    Ok(admitted)
+}
+
+// ─── Main public API ──────────────────────────────────────────────────
+
+fn normalize_mtp_k(arch_id: u32, mtp_k: Option<usize>) -> Result<usize, String> {
+    let _ = arch_id;
+    let value = mtp_k.unwrap_or(3);
+    if (1..=8).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("MTP K must be in 1..=8, got {value}"))
+    }
+}
+
+pub(crate) fn reject_qwen_native_mtp(mtp_mode: &str) -> Result<(), String> {
+    if mtp_mode == "on" {
+        Err("Qwen native MTP is disabled pending SPEC-003".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn mtp_mode_from_spec(spec: SpecLoadCfg) -> &'static str {
+    match spec.mtp_mode {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    }
+}
+
+/// Load a model from an HFQ file (or safetensors directory).  Self-admits
+/// via [`admit_path`] then delegates to [`load_admitted`].
+#[allow(clippy::too_many_arguments)]
+pub fn load_model(
+    path: &str,
+    max_seq: usize,
+    draft_path: Option<&str>,
+    kv_mode_override: Option<&str>,
+    kv_adaptive_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    mesh: &DeviceMesh,
+    pp_bands: Option<&[usize]>,
+    spec: SpecLoadCfg,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<LoadedModel, String> {
+    let raw = raw_request(mesh);
+    let admitted = route_generic_single(admit_path(path, raw)?)?;
+    let load_mesh = select_load_mesh(&admitted, mesh);
+    let mut opts = ModelLoadOptions::new(max_seq)
+        .with_cask(cask)
+        .with_spec(spec);
+    if let Some(dp) = draft_path {
+        opts = opts.with_draft_path(dp);
+    }
+    if let Some(kv) = kv_mode_override {
+        opts = opts.with_kv_mode_override(kv);
+    }
+    if let Some(kv) = kv_adaptive_override {
+        opts = opts.with_kv_adaptive_override(kv);
+    }
+    if let Some(sq) = state_quant_override {
+        opts = opts.with_state_quant_override(sq);
+    }
+    if let Some(bands) = pp_bands {
+        opts = opts.with_pp_bands(bands);
+    }
+    load_admitted(admitted, load_mesh.as_ref(), opts, Some(gpu))
 }
 
 fn load_cohere2moe(
@@ -1976,6 +2747,7 @@ fn load_cohere2moe(
     path: &str,
     mtp_mode: &str,
     mtp_k: usize,
+    record: AdmissionRecord,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     let config = <cohere2moe::Cohere2Moe as Architecture>::config_from_hfq(&hfq)?;
@@ -2013,6 +2785,7 @@ fn load_cohere2moe(
             chat_template,
             mtp_mode,
             mtp_k,
+            record,
         )
     })
 }
@@ -2234,86 +3007,24 @@ pub fn load_model_ep(
     mesh: &DeviceMesh,
     spec: SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    let mtp_mode = mtp_mode_from_spec(spec);
-    let mtp_k = normalize_mtp_k(hfq.arch_id, spec.mtp_k)?;
-    match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, mesh, mtp_mode, mtp_k),
-        10 => load_model_ep_minimax(path, max_seq, mesh, mtp_mode, mtp_k),
-        id => Err(format!(
-            "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
-        )),
-    }
+    let admitted = admit_path(path, raw_request(mesh))?;
+    let opts = ModelLoadOptions::new(max_seq).with_spec(spec);
+    load_admitted(admitted, mesh, opts, None)
 }
 
 /// Load a model for **real tensor-parallel (TP)** serving — dense row/col
 /// sharding across `tp` GPUs (the `Tp` axis), distinct from expert-parallel
 /// ([`load_model_ep`], the `Ep` axis). This is the daemon entry the EP↔TP
 /// disentanglement reserves for the dense TP serve path.
-///
-/// The TP *forward* is validated end-to-end (see the `tp_*_parity` examples:
-/// `execute_steps_tp` + the store→forward bridge reproduce single-GPU logits at
-/// Tp-2). Wiring it into a served [`LoadedModel`] — per-rank sharded
-/// `LlamaWeights` from a `WeightStore`, per-rank scratch/KV, a `Gpus`-threaded
-/// decode loop, and `tp_decode_parity` — is **PB-TP5** and not yet done, so this
-/// returns a clear error rather than silently falling back to single-GPU.
 pub fn load_model_tp(
     path: &str,
     max_seq: usize,
     mesh: &DeviceMesh,
     spec: SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
-    // Host-side metadata BEFORE GPU allocation (chat template + recommended
-    // sampling), matching the ds4/minimax EP loaders.
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    let arch_id = hfq.arch_id;
-    let mtp_mode = mtp_mode_from_spec(spec);
-    let mtp_k = normalize_mtp_k(arch_id, spec.mtp_k)?;
-    #[cfg(feature = "arch-qwen35")]
-    if matches!(arch_id, 5 | 6) {
-        let config =
-            <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(
-                &hfq,
-            )?;
-        hipfire_arch_qwen35::arch::qwen35_tp_preflight(&config, mesh.size_of(DimKind::Tp))?;
-    }
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|e| format!("tokenizer not found: {e}"))?;
-    let chat_template = resolve_chat_template(&hfq, path);
-    let rec = hfq.recommended_sampling();
-    drop(hfq); // TpModel::load reopens; free this handle before GPU work.
-
-    let tp_model = hipfire_runtime::tp_serve::TpModel::load(path, mesh, max_seq)?;
-    let eos_tok = tp_model.eos_token();
-
-    Ok(LoadedModel {
-        parallel: ModelParallel::Tp(tp_model), // Task 3: TP axis migrated from m.tp
-        meta: ModelMeta {
-            arch_id,
-            model_path: path.to_string(),
-            chat_template: chat_template.clone(),
-            max_seq,
-            physical_cap: max_seq,
-            eos_tok,
-            mtp_mode: mtp_mode.to_string(),
-            mtp_k,
-            rec_temperature: rec.and_then(|r| r.temperature),
-            rec_top_p: rec.and_then(|r| r.top_p),
-            rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
-            rec_min_p: None,
-            rec_presence_penalty: None,
-        },
-        ..LoadedModel::skeleton(
-            arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-            mtp_mode,
-            mtp_k,
-        )
-    })
+    let admitted = admit_path(path, raw_request(mesh))?;
+    let opts = ModelLoadOptions::new(max_seq).with_spec(spec);
+    load_admitted(admitted, mesh, opts, None)
 }
 
 /// Load a dense llama-family HFQ for **pipeline-parallel (PP)** serving — layers
@@ -2328,63 +3039,26 @@ pub fn load_model_pp(
     mesh: &DeviceMesh,
     spec: SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    let arch_id = hfq.arch_id;
-    let mtp_mode = mtp_mode_from_spec(spec);
-    let mtp_k = normalize_mtp_k(arch_id, spec.mtp_k)?;
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|e| format!("tokenizer not found: {e}"))?;
-    let chat_template = resolve_chat_template(&hfq, path);
-    let rec = hfq.recommended_sampling();
-    drop(hfq); // PpModel::load reopens; free this handle before GPU work.
-
-    let pp_model = hipfire_runtime::pp_serve::PpModel::load(path, mesh, max_seq)?;
-    let eos_tok = pp_model.eos_token();
-
-    Ok(LoadedModel {
-        parallel: ModelParallel::Pp(crate::model_parallel::PipelineImpl::Dense(pp_model)),
-        meta: ModelMeta {
-            arch_id,
-            model_path: path.to_string(),
-            chat_template: chat_template.clone(),
-            max_seq,
-            physical_cap: max_seq,
-            eos_tok,
-            mtp_mode: mtp_mode.to_string(),
-            mtp_k,
-            rec_temperature: rec.and_then(|r| r.temperature),
-            rec_top_p: rec.and_then(|r| r.top_p),
-            rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
-            rec_min_p: None,
-            rec_presence_penalty: None,
-        },
-        ..LoadedModel::skeleton(
-            arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-            mtp_mode,
-            mtp_k,
-        )
-    })
+    let admitted = admit_path(path, raw_request(mesh))?;
+    let opts = ModelLoadOptions::new(max_seq).with_spec(spec);
+    load_admitted(admitted, mesh, opts, None)
 }
 
 fn load_model_ep_ds4(
+    hfq: &mut HfqFile,
     path: &str,
     max_seq: usize,
     mesh: &DeviceMesh,
     mtp_mode: &str,
     mtp_k: usize,
+    record: AdmissionRecord,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
-    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(hfq)?;
     let arch_id = hfq.arch_id;
     let n_exp = config.n_routed_experts;
 
@@ -2397,7 +3071,7 @@ fn load_model_ep_ds4(
     // ds4 EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP graph
     // itself (deepseek4 forward.rs begin_graph_capture) is untouched — it still
     // captures + engages; this only settles the heap before it instantiates.
-    let chat_template = resolve_chat_template(&hfq, path);
+    let chat_template = resolve_chat_template(hfq, path);
     let rec = hfq.recommended_sampling();
 
     let ep = mesh.size_of(DimKind::Ep);
@@ -2423,13 +3097,13 @@ fn load_model_ep_ds4(
     let fail_rank = ep_fail_rank();
     let _ = fail_rank;
     let mut staging = Ds4EpStaging::new(gpus);
+    // Weight-load loop (admitted source, not reopened path).
     for r in 0..n {
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
-        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, dev, &shard, r)
+        let w = deepseek4::DeepseekV4::load_weights_sharded(hfq, &config, dev, &shard, r)
             .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         // Deterministic partial-load fault for testing the cleanup path. Fires
@@ -2501,6 +3175,7 @@ fn load_model_ep_ds4(
             rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
             rec_min_p: None,
             rec_presence_penalty: None,
+            admission: record,
         },
         ..LoadedModel::skeleton(
             arch_id,
@@ -2511,24 +3186,26 @@ fn load_model_ep_ds4(
             chat_template,
             mtp_mode,
             mtp_k,
+            record,
         )
     })
 }
 
 fn load_model_ep_minimax(
+    hfq: &mut HfqFile,
     path: &str,
     max_seq: usize,
     mesh: &DeviceMesh,
     mtp_mode: &str,
     mtp_k: usize,
+    record: AdmissionRecord,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
-    let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
+    let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(hfq)?;
     let arch_id = hfq.arch_id;
     let n_exp = config.num_local_experts;
 
@@ -2541,7 +3218,7 @@ fn load_model_ep_minimax(
     // minimax EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP
     // graph itself (minimax forward.rs begin_graph_capture) is untouched — it still
     // captures + engages; this only settles the heap before it instantiates.
-    let chat_template = resolve_chat_template(&hfq, path);
+    let chat_template = resolve_chat_template(hfq, path);
     let rec = hfq.recommended_sampling();
 
     let ep = mesh.size_of(DimKind::Ep);
@@ -2568,9 +3245,8 @@ fn load_model_ep_minimax(
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
-        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = minimax::MiniMaxWeights::load(&mut h, &config, dev, Some((&shard, r)), None)
+        let w = minimax::MiniMaxWeights::load(hfq, &config, dev, Some((&shard, r)), None)
             .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         if fail_rank == Some(r) {
@@ -2650,6 +3326,7 @@ fn load_model_ep_minimax(
             rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
             rec_min_p: None,
             rec_presence_penalty: None,
+            admission: record,
         },
         ..LoadedModel::skeleton(
             arch_id,
@@ -2660,6 +3337,7 @@ fn load_model_ep_minimax(
             chat_template,
             mtp_mode,
             mtp_k,
+            record,
         )
     })
 }
@@ -2866,7 +3544,17 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
 
 #[cfg(test)]
 mod registry_tests {
-    use super::{LoadedModel, REGISTRY};
+    use super::{
+        AdmissionRecord, LoadedModel, ModelVariant, ParallelAdmission, RawParallelRequest, REGISTRY,
+    };
+
+    fn test_record() -> AdmissionRecord {
+        AdmissionRecord::from_admission(ParallelAdmission::new(
+            ModelVariant::Qwen35Dense,
+            RawParallelRequest::new(1, 1, 1),
+            RawParallelRequest::new(1, 1, 1),
+        ))
+    }
 
     #[test]
     fn cask_m_folding_is_disabled_for_drafts() {
@@ -2893,6 +3581,7 @@ mod registry_tests {
             None,
             "auto",
             6,
+            test_record(),
         );
 
         assert_eq!(model.meta.mtp_k, 6);
@@ -2909,6 +3598,7 @@ mod registry_tests {
             None,
             "on",
             6,
+            test_record(),
         );
 
         assert_eq!(model.meta.mtp_mode, "on");
@@ -2925,6 +3615,7 @@ mod registry_tests {
             None,
             "auto",
             3,
+            test_record(),
         );
 
         assert_eq!(model.meta.mtp_k, 3);
@@ -3480,6 +4171,8 @@ mod registry_tests {
         super::unload_model(warmup, &mut gpu);
         gpu.drain_pool();
 
+        // Manual `match` avoids `expect_err`'s `LoadedModel: Debug` bound.
+
         // ── budget=0 → must reject ─────────────────────────────────
         let zero_budget = super::CaskConfig {
             sidecar: dummy_sidecar.clone(),
@@ -3487,7 +4180,7 @@ mod registry_tests {
             beta: 8,
             ..Default::default()
         };
-        let error = super::load_model(
+        let error = match super::load_model(
             &target_path,
             64,
             None,
@@ -3499,8 +4192,10 @@ mod registry_tests {
             None,
             super::SpecLoadCfg::default(),
             &mut gpu,
-        )
-        .expect_err("budget=0 must be rejected");
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("budget=0 must be rejected"),
+        };
         assert!(
             error.contains("cask budget must be >0"),
             "expected budget=0 error, got: {error}"
@@ -3515,7 +4210,7 @@ mod registry_tests {
             beta: 8,
             ..Default::default()
         };
-        let error = super::load_model(
+        let error = match super::load_model(
             &target_path,
             40,
             None,
@@ -3527,8 +4222,10 @@ mod registry_tests {
             None,
             super::SpecLoadCfg::default(),
             &mut gpu,
-        )
-        .expect_err("impossible budget+beta must be rejected");
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("impossible budget+beta must be rejected"),
+        };
         assert!(
             error.contains("eviction can never fire"),
             "expected 'eviction can never fire' error, got: {error}"
@@ -4710,17 +5407,1456 @@ mod qwen35_tp_loader_tests {
             Ok(_) => panic!("Qwen35 Tp=2 must be rejected before GPU work"),
             Err(error) => error,
         };
-        assert_eq!(
-            error,
-            "qwen35: Tp=2 is unsupported for DeltaNet wqkv (layer 0)"
+        // CAP-001 Task 3: admission guard now catches TP for Qwen35 dense
+        // (AXIS-002 Planned) before any TP preflight check runs.
+        assert!(
+            error.contains("AXIS-002") || error.contains("planned"),
+            "expected AXIS-002 / planned error from admission guard, got: {error}"
         );
         std::fs::remove_file(path).unwrap();
     }
 }
 
+// ─── CAP-001 Task 5: construction-order recorder ─────────────────────
+//
+// The cfg(test) recorder below observes the load_admitted → private-helper
+// boundary.  It is NOT a test-only policy duplicate: it sits in production
+// code (gated by #[cfg(test)]), records real dispatch decisions, and proves
+// that admission refusals (Planned, Unsupported, InvalidDegree) never enter
+// mesh / GPU / collective / peer / allocation / stream construction.
+//
+// Lifecycle:
+//   - `record()` is called from `load_admitted` (RoutedTo) and the private
+//     `load_*_admitted` helpers (EnteredConstructor).
+//   - Tests call `take()` to drain recorded events for assertion.
+//   - `clear()` resets state between test cases.
+
+#[cfg(test)]
+pub(crate) mod construction_recorder {
+    use crate::parallel_capability::{ModelVariant, ParallelAxis, RawParallelRequest};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RecordedEvent {
+        /// The dispatch decision in `load_admitted` — the axis that was
+        /// selected for routing.  Fires BEFORE the GPU check for Single
+        /// axis, so it is observable with `gpu=None`.
+        RoutedTo {
+            axis: ParallelAxis,
+            variant: ModelVariant,
+            effective: RawParallelRequest,
+        },
+        /// The private constructor was entered.  Fires at the top of each
+        /// `load_*_admitted` helper, before any mesh/GPU/tokenizer work.
+        EnteredConstructor { axis: ParallelAxis },
+    }
+
+    // Thread-local storage so parallel test execution does not mix events.
+    // Each test thread gets its own independent event Vec.
+    use std::cell::RefCell;
+    thread_local! {
+        static RECORDED: RefCell<Vec<RecordedEvent>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn record(event: RecordedEvent) {
+        RECORDED.with(|d| d.borrow_mut().push(event));
+    }
+
+    /// Drain all recorded events for the current thread.
+    pub fn take() -> Vec<RecordedEvent> {
+        RECORDED.with(|d| d.borrow_mut().drain(..).collect())
+    }
+
+    /// Clear all recorded events for the current thread.
+    pub fn clear() {
+        RECORDED.with(|d| d.borrow_mut().clear());
+    }
+}
+
+// ─── CAP-001 Task 3 + Task 5 admission tests ────────────────────────
+
+#[cfg(test)]
+mod cap_001_loader_tests {
+    use super::*;
+    use crate::parallel_capability::{ModelVariant, ParallelAxis, RawParallelRequest};
+    use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind};
+    use std::io::Write;
+    use std::path::Path;
+
+    // ── Minimal HFQ fixture writer ───────────────────────────────────
+
+    fn write_hfq(
+        dir: &Path,
+        name: &str,
+        arch_id: u32,
+        metadata_json: &str,
+        tensor_payload_sizes: &[(&str, u64)],
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        write_hfq_at(&path, arch_id, metadata_json, tensor_payload_sizes);
+        path
+    }
+
+    fn tmp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn qwen35_vl_cfg() -> String {
+        serde_json::json!({
+            "model_type": "qwen3.5", "hidden_size": 2048,
+            "num_hidden_layers": 24, "num_attention_heads": 16,
+            "vocab_size": 152064,
+            "vision_config": {"hidden_size": 1024, "num_layers": 6},
+        })
+        .to_string()
+    }
+
+    fn lfm2_cfg(num_experts: u64, model_type: &str) -> String {
+        serde_json::json!({
+            "model_type": model_type, "hidden_size": 2048,
+            "num_hidden_layers": 4, "num_attention_heads": 16,
+            "num_key_value_heads": 16, "intermediate_size": 8192,
+            "vocab_size": 32000, "num_experts": num_experts,
+        })
+        .to_string()
+    }
+
+    fn vl_tensors() -> Vec<(&'static str, u64)> {
+        vec![("model.visual.patch_embed.proj.weight", 12)]
+    }
+
+    // ── admit_path direct tests (public API) ─────────────────────────
+
+    #[test]
+    fn rejects_qwen35_vl_pp_with_axis004() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "q35vl.hfq", 5, &qwen35_vl_cfg(), &vl_tensors());
+        let err = admit_path(path.to_str().unwrap(), RawParallelRequest::new(2, 1, 1)).unwrap_err();
+        assert!(err.contains("AXIS-004"), "expected AXIS-004, got: {err}");
+        assert!(err.contains("PP"), "expected PP mention, got: {err}");
+    }
+
+    #[test]
+    fn admits_qwen35_vl_single() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "q35vl.hfq", 5, &qwen35_vl_cfg(), &vl_tensors());
+        let a = admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 1)).unwrap();
+        assert_eq!(a.admission().variant(), ModelVariant::Qwen35Vl);
+        assert_eq!(a.admission().effective(), RawParallelRequest::new(1, 1, 1));
+    }
+
+    /// LFM2 dense EP normalises to Single → same Planned error as explicit Single.
+    #[test]
+    fn dense_ep_normalises_to_single_same_error() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "lfm2_d.hfq", 11, &lfm2_cfg(0, "lfm2"), &[]);
+        let ep_err =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 2)).unwrap_err();
+        let single_err =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 1)).unwrap_err();
+        assert!(ep_err.contains("AXIS-003"), "EP: {ep_err}");
+        assert!(single_err.contains("AXIS-003"), "Single: {single_err}");
+        // Both fail at the same policy cell — the normalised-to-Single path
+        // evaluates the same (Lfm2Dense, Single) cell as an explicit Single request.
+        assert!(ep_err.contains("planned admission"), "EP: {ep_err}");
+        assert!(
+            single_err.contains("planned admission"),
+            "Single: {single_err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_degree() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "zero.hfq",
+            5,
+            &r#"{"model_type":"qwen3.5"}"#,
+            &[],
+        );
+        let err = admit_path(path.to_str().unwrap(), RawParallelRequest::new(0, 1, 1)).unwrap_err();
+        assert!(err.contains("degree"), "expected degree error, got: {err}");
+    }
+
+    // ── Axis enforcement: effective axis must match loader entry axis ──
+
+    /// `load_model_ep` rejects when the effective axis is not EP.
+    /// DeepSeek4 TP→EP remap preserves the EP effective axis, so it passes
+    /// axis enforcement.  A non-EP request (e.g. LlamaNoQkNorm Single) fails.
+    #[test]
+    fn load_model_ep_requires_effective_ep() {
+        let dir = tmp_dir();
+        // Complete LLaMA config (no QK-norm → LlamaNoQkNorm, Single Admitted)
+        let meta = r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "llama.hfq", 0, meta, &[]);
+        // LlamaNoQkNorm with tp=1, ep=1 → effective axis = Single → fails
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 1), (DimKind::Ep, 1)]);
+        let err = match load_model_ep(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected axis enforcement error, got Ok"),
+        };
+        assert!(
+            err.contains("GPU") || err.contains("Single"),
+            "expected Single/GPU error from load_admitted, got: {err}"
+        );
+    }
+
+    /// `load_model_tp` rejects DeepSeek4 TP→EP remap: topology
+    /// equality (effective != raw) centralized in [`load_admitted`].
+    #[test]
+    fn load_model_tp_rejects_deepseek4_remap() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "ds4.hfq",
+            9,
+            &r#"{"model_type":"deepseek_v4"}"#,
+            &[],
+        );
+        // tp=2, ep=1 → DeepSeek4 remap → effective (1,1,2) != raw (1,2,1)
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Ep, 1)]);
+        let err = match load_model_tp(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected topology mismatch error, got Ok"),
+        };
+        assert!(
+            err.contains("does not match"),
+            "expected topology mismatch error from load_admitted, got: {err}"
+        );
+    }
+
+    /// `load_model_pp` rejects normalised dense EP (resolved to Single)
+    /// before reaching PpModel construction.
+    #[test]
+    fn load_model_pp_rejects_normalised_dense_ep_via_axis() {
+        let dir = tmp_dir();
+        // Complete LLaMA config → LlamaNoQkNorm, (NoQkNorm, Ep) → NormalizeToSingle
+        let meta = r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "llama_ep.hfq", 0, meta, &[]);
+        // LlamaNoQkNorm with ep=2 → NormalizeToSingle → effective (1,1,1) != raw (1,1,2)
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+        let err = match load_model_pp(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected topology mismatch error, got Ok"),
+        };
+        assert!(
+            err.contains("does not match"),
+            "expected topology mismatch error from load_admitted, got: {err}"
+        );
+    }
+
+    // ── Real entry-point guards (Qwen35-VL PP→AXIS-004) ──────────────
+
+    /// `load_model_tp` with Qwen35-VL + Tp=2 → AXIS-004 before tokenizer.
+    #[test]
+    fn tp_rejects_qwen35_vl_before_tokenizer() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "tpvl.hfq", 5, &qwen35_vl_cfg(), &vl_tensors());
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let err = match load_model_tp(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected AXIS-004 error, got Ok"),
+        };
+        assert!(err.contains("AXIS-004"), "expected AXIS-004, got: {err}");
+    }
+
+    /// `load_model_pp` with Qwen35-VL + Pp=2 → AXIS-004 before tokenizer.
+    #[test]
+    fn pp_rejects_qwen35_vl_before_tokenizer() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "ppvl.hfq", 5, &qwen35_vl_cfg(), &vl_tensors());
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
+        let err = match load_model_pp(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected AXIS-004 error, got Ok"),
+        };
+        assert!(err.contains("AXIS-004"), "expected AXIS-004, got: {err}");
+    }
+
+    /// `load_model_ep` with LFM2 dense + Ep=2 → AXIS-003 (Planned) via
+    /// admission (not axis enforcement), before any GPU work.
+    #[test]
+    fn ep_rejects_lfm2_dense_before_gpu() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "l2ep.hfq", 11, &lfm2_cfg(0, "lfm2"), &[]);
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+        let err = match load_model_ep(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected AXIS-003 error, got Ok"),
+        };
+        assert!(err.contains("AXIS-003"), "expected AXIS-003, got: {err}");
+    }
+
+    // ── Admitted source consumed ─────────────────────────────────────
+    //
+    // Verify that the admission result's variant matches expectations for
+    // each loader's dispatching axis.  These use `admit_source` directly
+    // (the same private function the loaders call), proving the source is
+    // inspected once and the carrier/variant are correctly resolved.
+
+    #[test]
+    fn deepseek4_ep_admission_has_correct_variant() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "ds4.hfq",
+            9,
+            &r#"{"model_type":"deepseek_v4"}"#,
+            &[],
+        );
+        let path_str = path.to_str().unwrap();
+        let src = ModelSource::from_path(path_str).unwrap();
+        let admitted = admit_source(path_str, src, RawParallelRequest::new(1, 1, 2)).unwrap();
+        assert_eq!(admitted.admission().variant(), ModelVariant::Deepseek4);
+        assert_eq!(admitted.admission().effective().axis(), ParallelAxis::Ep);
+    }
+
+    // ── A→B pathname replacement proof ───────────────────────────────
+    //
+    // Prove that the admitted source carries artifact A's data even after
+    // the file at the path is replaced with artifact B.  Every loader entry
+    // point must consume the already-admitted source, not reopen the path.
+
+    /// Write an HFQ fixture to an exact path (not dir+name).
+    fn write_hfq_at(
+        path: &Path,
+        arch_id: u32,
+        metadata_json: &str,
+        tensor_payload_sizes: &[(&str, u64)],
+    ) {
+        let mut f = std::fs::File::create(path).unwrap();
+        let meta_val: serde_json::Value =
+            serde_json::from_str(metadata_json).expect("metadata must be valid JSON");
+        let wrapped = if meta_val.get("config").is_some() {
+            metadata_json.to_string()
+        } else {
+            format!(r#"{{"architecture":"test","config":{metadata_json}}}"#)
+        };
+        let meta_bytes = wrapped.as_bytes();
+        let n_tensors = tensor_payload_sizes.len() as u32;
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&n_tensors.to_le_bytes());
+        for (tname, data_size) in tensor_payload_sizes {
+            let nb = tname.as_bytes();
+            idx.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            idx.extend_from_slice(nb);
+            idx.push(1);
+            idx.push(1);
+            idx.extend_from_slice(&4u32.to_le_bytes());
+            idx.extend_from_slice(&0u32.to_le_bytes());
+            idx.extend_from_slice(&data_size.to_le_bytes());
+        }
+        let metadata_offset: u64 = 32;
+        let data_offset: u64 = metadata_offset + meta_bytes.len() as u64 + idx.len() as u64;
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(&arch_id.to_le_bytes()).unwrap();
+        f.write_all(&n_tensors.to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(meta_bytes).unwrap();
+        f.write_all(&idx).unwrap();
+        for &(_, data_size) in tensor_payload_sizes {
+            let payload = vec![0u8; data_size as usize];
+            f.write_all(&payload).unwrap();
+        }
+        f.flush().unwrap();
+    }
+
+    /// Admitted source carries artifact A's arch_id after the on-disk
+    /// file at path is replaced with artifact B (different arch_id).
+    /// Proves the admission mechanism preserves the originally opened
+    /// source and does NOT reopen the path.
+    #[test]
+    fn admitted_source_arch_id_survives_path_swap() {
+        let dir = tmp_dir();
+        let path = dir.path().join("swap.hfq");
+
+        // Write artifact A (arch_id=9 = DeepSeek4)
+        write_hfq_at(&path, 9, &r#"{"model_type":"deepseek_v4"}"#, &[]);
+
+        // Admit source from A — opens and classifies the file
+        let src_path = path.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(1, 1, 2)).unwrap();
+        assert_eq!(
+            admitted.admission().variant(),
+            ModelVariant::Deepseek4,
+            "pre-swap: variant must be Deepseek4"
+        );
+
+        // Replace the on-disk file with artifact B (arch_id=5 = Qwen35Dense)
+        write_hfq_at(
+            &path,
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":24,"num_attention_heads":16,"vocab_size":152064}"#,
+            &[],
+        );
+
+        // THE PROOF: consume the admitted source and verify it still
+        // carries A's arch_id (9), NOT the replaced file's arch_id (5).
+        let (_path, source, _carrier, admission) = admitted.into_parts();
+        assert_eq!(
+            admission.variant(),
+            ModelVariant::Deepseek4,
+            "post-swap: admission variant must still be Deepseek4 (artifact A)"
+        );
+        match source {
+            ModelSource::Hfq(hfq) => {
+                assert_eq!(
+                    hfq.arch_id, 9,
+                    "post-swap: HfqFile.arch_id must be 9 (artifact A, not 5 from replaced file)"
+                );
+            }
+            _ => panic!("expected Hfq source"),
+        }
+    }
+
+    /// Admitted source carries artifact A's data (via `admit_path`) after
+    /// the on-disk path is replaced with artifact B. Proves the admitted
+    /// source is consumed from the admission token, not reopened.
+    #[test]
+    fn continuation_sees_artifact_a_after_path_swap() {
+        let dir = tmp_dir();
+        let path = dir.path().join("swap2.hfq");
+
+        // Write artifact A (arch_id=9, DeepSeek4)
+        write_hfq_at(&path, 9, &r#"{"model_type":"deepseek_v4"}"#, &[]);
+
+        let raw = RawParallelRequest::new(1, 1, 2);
+        let path_str = path.to_str().unwrap();
+        let admitted = admit_path(path_str, raw).unwrap();
+
+        // Replace the file at the SAME path with artifact B (arch_id=5)
+        write_hfq_at(
+            &path,
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":24,"num_attention_heads":16,"vocab_size":152064}"#,
+            &[],
+        );
+
+        // The admitted source was opened from A; check its arch_id NOT
+        // the replaced file's arch_id.
+        assert_eq!(
+            admitted.source_ref().arch_id(),
+            Some(9),
+            "admitted source arch_id must be 9 (A), not 5 (B)"
+        );
+        assert_eq!(
+            admitted.admission().variant(),
+            ModelVariant::Deepseek4,
+            "variant must still be Deepseek4 (A)"
+        );
+    }
+
+    // ── load_model_ep topology equality (effective EP != raw) ──────────
+
+    /// `load_model_ep` rejects DeepSeek4 with a raw TP mesh (tp=2, ep=1)
+    /// where the legacy TP→EP remap makes effective (1,1,2) != raw (1,2,1).
+    /// The topology equality check fires BEFORE any GPU work.
+    #[test]
+    fn load_model_ep_rejects_deepseek4_tp_remap_topology_mismatch() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "ds4_tp.hfq",
+            9,
+            &r#"{"model_type":"deepseek_v4"}"#,
+            &[],
+        );
+        // tp=2, ep=1 → DeepSeek4 remap → effective (1,1,2) != raw (1,2,1)
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Ep, 1)]);
+        let err = match load_model_ep(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected topology mismatch error, got Ok"),
+        };
+        assert!(
+            err.contains("does not match"),
+            "expected topology mismatch error, got: {err}"
+        );
+    }
+
+    /// `load_model_ep` rejects Minimax TP→EP remap the same way: raw
+    /// tp=2 after remap makes effective != raw, topology equality fires.
+    #[test]
+    fn load_model_ep_rejects_minimax_tp_remap_topology_mismatch() {
+        let dir = tmp_dir();
+        // Minimal Minimax config (arch_id=10)
+        let meta = r#"{"config":{"model_type":"minimax","vocab_size":32000,"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":16,"intermediate_size":8192,"num_local_experts":8,"num_experts_per_tok":2}}"#;
+        let path = write_hfq(dir.path(), "mm_tp.hfq", 10, meta, &[]);
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Ep, 1)]);
+        let err = match load_model_ep(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected topology mismatch error, got Ok"),
+        };
+        assert!(
+            err.contains("does not match"),
+            "expected topology mismatch from load_admitted for Minimax TP→EP remap, got: {err}"
+        );
+    }
+
+    // ── Malformed-tokenizer CAP error before continuation/GPU ────────
+
+    // ── Generic load routing seam (route_generic_single) ──────────
+
+    /// Normalized dense EP is accepted as effective Single, retaining source.
+    #[test]
+    fn route_generic_single_accepts_normalized_dense_ep() {
+        let dir = tmp_dir();
+        let meta = r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "dense_ep.hfq", 0, meta, &[]);
+        let src_path = path.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        // LlamaNoQkNorm + ep=2 → NormalizeToSingle → effective (1,1,1) Single
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(1, 1, 2)).unwrap();
+        assert_eq!(
+            admitted.admission().effective().axis(),
+            ParallelAxis::Single
+        );
+        let readmitted = route_generic_single(admitted).unwrap();
+        // Source retained, variant preserved
+        assert_eq!(
+            readmitted.admission().variant(),
+            ModelVariant::LlamaNoQkNorm
+        );
+        assert_eq!(
+            readmitted.admission().effective(),
+            RawParallelRequest::new(1, 1, 1)
+        );
+        assert!(readmitted.source_ref().arch_id().is_some());
+    }
+
+    /// The public `load_model` continuation must replace a normalized raw EP
+    /// mesh with the admitted effective Single mesh before `load_admitted`.
+    #[test]
+    fn load_model_uses_effective_mesh_for_qwen35_dense_ep() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "qwen35_dense_ep.hfq",
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"vocab_size":152064}"#,
+            &[],
+        );
+        let admitted = route_generic_single(
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 2)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(admitted.admission().variant(), ModelVariant::Qwen35Dense);
+        assert_eq!(
+            admitted.admission().effective(),
+            RawParallelRequest::new(1, 1, 1)
+        );
+
+        let effective_mesh = effective_load_mesh(&admitted);
+        assert_eq!(
+            raw_request(&effective_mesh),
+            admitted.admission().effective()
+        );
+        assert_eq!(effective_mesh.size_of(DimKind::Pp), 1);
+        assert_eq!(effective_mesh.size_of(DimKind::Tp), 1);
+        assert_eq!(effective_mesh.size_of(DimKind::Ep), 1);
+    }
+
+    /// A normal Single admission must borrow the caller's mesh, preserving its
+    /// exact axis representation rather than replacing it with a canonical mesh.
+    #[test]
+    fn load_model_preserves_original_mesh_for_normal_admission() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "qwen35_single.hfq",
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"vocab_size":152064}"#,
+            &[],
+        );
+
+        for mesh in [
+            DeviceMesh::single(),
+            DeviceMesh::rect(&[(DimKind::Ep, 1), (DimKind::Tp, 1)]),
+        ] {
+            let admitted = route_generic_single(
+                admit_path(path.to_str().unwrap(), raw_request(&mesh)).unwrap(),
+            )
+            .unwrap();
+            assert!(!admitted.admission().was_normalized());
+
+            let selected = select_load_mesh(&admitted, &mesh);
+            assert!(std::ptr::eq(selected.as_ref(), &mesh));
+            assert_eq!(selected.axes(), mesh.axes());
+        }
+    }
+
+    /// Admitted Qwen3 TP is rejected (route_generic_single expects Single).
+    #[test]
+    fn route_generic_single_rejects_qwen3_tp() {
+        let dir = tmp_dir();
+        // PlainQwen3 (arch_id=1) with TP=2 is Admitted
+        let meta = r#"{"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"intermediate_size":8192,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "q3tp.hfq", 1, meta, &[]);
+        let src_path = path.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(1, 2, 1)).unwrap();
+        assert_eq!(admitted.admission().effective().axis(), ParallelAxis::Tp);
+        let err = match route_generic_single(admitted) {
+            Err(e) => e,
+            Ok(_) => panic!("route_generic_single must reject Qwen3 TP"),
+        };
+        assert!(
+            err.contains("Single"),
+            "expected Single rejection for TP, got: {err}"
+        );
+        assert!(
+            err.contains("load_model_tp"),
+            "expected load_model_tp hint, got: {err}"
+        );
+    }
+
+    /// Admitted DeepSeek EP is rejected (route_generic_single expects Single).
+    #[test]
+    fn route_generic_single_rejects_deepseek4_ep() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "ds4ep.hfq",
+            9,
+            &r#"{"model_type":"deepseek_v4"}"#,
+            &[],
+        );
+        let src_path = path.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(1, 1, 2)).unwrap();
+        assert_eq!(admitted.admission().effective().axis(), ParallelAxis::Ep);
+        let err = match route_generic_single(admitted) {
+            Err(e) => e,
+            Ok(_) => panic!("route_generic_single must reject DeepSeek EP"),
+        };
+        assert!(
+            err.contains("Single"),
+            "expected Single rejection for EP, got: {err}"
+        );
+        assert!(
+            err.contains("load_model_ep"),
+            "expected load_model_ep hint, got: {err}"
+        );
+    }
+
+    /// Effective topology mismatch: DeepSeek4 TP with raw (1,2,1) and
+    /// effective (1,1,2) fails the topology-equality check in load_model_ep.
+    /// The error must identify the mismatch, not fire a generic admission
+    /// refusal.
+    #[test]
+    fn load_model_ep_topology_mismatch_error_is_explicit() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "ds4_tp2.hfq",
+            9,
+            &r#"{"model_type":"deepseek_v4"}"#,
+            &[],
+        );
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Ep, 1)]);
+        let err = match load_model_ep(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected topology mismatch error, got Ok"),
+        };
+        assert!(
+            err.contains("does not match"),
+            "expected 'topology mismatch', got: {err}"
+        );
+    }
+
+    // ── Public load_admitted with Option<Gpu> ─────────────────────────
+
+    /// Mismatched mesh with `None` GPU: topology mismatch before GPU.
+    #[test]
+    fn load_admitted_mesh_mismatch_rejected_before_gpu() {
+        let dir = tmp_dir();
+        let meta = r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "llama_single.hfq", 0, meta, &[]);
+        // Admit with Single request — effective (1,1,1).
+        let admitted =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 1)).unwrap();
+        // Deliberately mismatched mesh: Tp=2 → raw=(1,2,1) != effective=(1,1,1)
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let err = match load_admitted(
+            admitted,
+            &mesh,
+            ModelLoadOptions::new(64).with_spec(SpecLoadCfg::default()),
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected mesh/effective mismatch error, got Ok"),
+        };
+        assert!(
+            err.contains("mesh request") && err.contains("does not match"),
+            "expected mesh/effective mismatch error, got: {err}"
+        );
+    }
+
+    /// Matching Single admission with `None` GPU: GPU-required before
+    /// source/GPU construction.
+    #[test]
+    fn load_admitted_single_requires_gpu() {
+        let dir = tmp_dir();
+        let meta = r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "llama_single_gpu.hfq", 0, meta, &[]);
+        let admitted =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 1)).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 1)]);
+        let err = match load_admitted(
+            admitted,
+            &mesh,
+            ModelLoadOptions::new(64).with_spec(SpecLoadCfg::default()),
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected GPU-required error, got Ok"),
+        };
+        assert!(
+            err.contains("Single load requires a GPU"),
+            "expected GPU-required error, got: {err}"
+        );
+    }
+
+    // ── Admitted source carry-forward (direct rank loop proof) ───────
+
+    /// Admit/open A, write B to a temp then `rename(B, A_path)`, invoke
+    /// a direct `for` loop (the EP rank pattern) for 3 iterations, and
+    /// assert each iteration observes A-specific metadata.  No
+    /// `File::create` truncation of A.
+    #[test]
+    fn admitted_source_survives_path_swap_in_direct_rank_loop() {
+        let dir = tmp_dir();
+        let path_a = dir.path().join("ep_iter.hfq");
+
+        // Artifact A: DeepSeek4 (arch_id=9)
+        write_hfq_at(&path_a, 9, &r#"{"model_type":"deepseek_v4"}"#, &[]);
+
+        // Open/admit A
+        let src_path = path_a.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(1, 1, 1)).unwrap();
+        let (_path, source, _carrier, _) = admitted.into_parts();
+        let hfq = match source {
+            ModelSource::Hfq(hfq) => hfq,
+            _ => panic!("expected Hfq source"),
+        };
+
+        // Write B to a temp path (arch_id=5, Qwen35Dense — different
+        // from A's arch_id=9).  Do NOT open B — only write it to disk.
+        let path_b = dir.path().join("ep_iter_b.hfq");
+        write_hfq_at(
+            &path_b,
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":24,"num_attention_heads":16,"vocab_size":152064}"#,
+            &[],
+        );
+
+        // Atomically replace A with B (rename, not File::create).
+        std::fs::rename(&path_b, &path_a).unwrap();
+
+        // Invoke a direct `for` loop (mirroring the EP rank-weight load
+        // pattern in `load_model_ep_ds4`).  Each iteration must observe
+        // A-specific metadata (arch_id=9), not B.
+        let mut call_count = 0usize;
+        for r in 0..3 {
+            call_count += 1;
+            assert_eq!(
+                hfq.arch_id, 9,
+                "rank {r}: expected arch_id=9 (artifact A), not B"
+            );
+        }
+        assert_eq!(call_count, 3, "expected 3 rank iterations");
+    }
+
+    // ── Atomic A→B TP constructor proof ──────────────────────────────
+    //
+    // Admit A (PlainQwen3, no q_norm tensor), replace on-disk path with
+    // artifact B (arch_id=9), call TpModel::load_from_hfq(&A_hfq, ...),
+    // assert A-specific qk-norm preflight error — NOT B's arch-id error.
+
+    #[test]
+    fn tp_load_from_hfq_sees_artifact_a_after_path_swap() {
+        use hipfire_runtime::tp_serve::TpModel;
+        let dir = tmp_dir();
+        let path_a = dir.path().join("tp_swap.hfq");
+
+        // Artifact A: PlainQwen3 (arch_id=1), valid Qwen3 config,
+        // NO q_norm tensor.  This config is full enough to reach the
+        // qk-norm check inside `TpModel::load_from_hfq_inner`.
+        write_hfq_at(
+            &path_a,
+            1,
+            &r#"{"config":{"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"intermediate_size":8192,"vocab_size":32000}}"#,
+            &[],
+        );
+
+        // Open/admit A
+        let src_path = path_a.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(1, 2, 1)).unwrap();
+        let hfq_ref = match admitted.source_ref() {
+            ModelSource::Hfq(hfq) => hfq,
+            _ => panic!("expected Hfq source"),
+        };
+
+        // Write B to temp path (arch_id=9 DeepSeek4, different artifact)
+        let path_b = dir.path().join("tp_swap_b.hfq");
+        write_hfq_at(
+            &path_b,
+            9,
+            &r#"{"config":{"model_type":"deepseek_v4","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"intermediate_size":8192,"vocab_size":32000}}"#,
+            &[],
+        );
+
+        // Atomically replace A with B
+        std::fs::rename(&path_b, &path_a).unwrap();
+
+        // Call TpModel::load_from_hfq with the already-opened A HfqFile.
+        // A has arch_id=1 (in range 0|1) but no q_norm tensor.
+        // Expected: qk-norm error (A-specific), NOT arch_id=9 (B's error).
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let err = match TpModel::load_from_hfq(hfq_ref, &mesh, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("expected qk-norm error, got Ok"),
+        };
+        assert!(
+            err.contains("qk-norm"),
+            "expected A-specific qk-norm error, got: {err}"
+        );
+        assert!(
+            !err.contains("arch_id=9"),
+            "error must NOT reference B's arch_id=9, got: {err}"
+        );
+    }
+
+    /// A MiniMax EP fixture with valid config but NO "tokenizer" in the
+    /// metadata must fail at tokenizer creation inside the EP constructor,
+    /// BEFORE any GPU allocation. The error must mention "tokenizer".
+    #[test]
+    fn malformed_tokenizer_cap_error_before_ep_gpu() {
+        let dir = tmp_dir();
+        // Valid Minimax config but NO tokenizer key in metadata.
+        // config is the MINIMAL set required by RawMiniMaxConfig.
+        let meta = r#"{"config":{"model_type":"minimax","vocab_size":32000,"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":16,"intermediate_size":8192,"num_local_experts":8,"num_experts_per_tok":2}}"#;
+        let path = write_hfq(dir.path(), "mm_notok.hfq", 10, meta, &[]);
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+        let err = match load_model_ep(
+            path.to_str().unwrap(),
+            64,
+            &mesh,
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected tokenizer error before GPU, got Ok"),
+        };
+        assert!(
+            err.contains("tokenizer"),
+            "expected tokenizer error (no 'tokenizer' key in metadata), got: {err}"
+        );
+        // Confirm the error is NOT a GPU-related message (no "gpu",
+        // "hipMalloc", "VRAM", "bind", "graph capture" etc.)
+        let gpu_hints = ["gpu", "hipMalloc", "VRAM", "bind", "graph"];
+        for hint in &gpu_hints {
+            assert!(
+                !err.to_lowercase().contains(hint),
+                "tokenizer error must NOT reference GPU ({hint}), got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn llama_tp_admission_has_correct_variant() {
+        let dir = tmp_dir();
+        // LlamaQkNorm (arch_id=0) with Tp=2 - need QK-norm tensor for LlamaQkNorm
+        let meta = r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}"#;
+        let path = write_hfq(
+            dir.path(),
+            "llama.hfq",
+            0,
+            meta,
+            &[("model.layers.0.self_attn.q_norm.weight", 4)],
+        );
+        let src_path = path.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(1, 2, 1)).unwrap();
+        assert_eq!(admitted.admission().variant(), ModelVariant::LlamaQkNorm);
+        assert_eq!(admitted.admission().effective().axis(), ParallelAxis::Tp);
+    }
+
+    // ── admit_path admission tests ────────────────────────────────────
+
+    /// `admit_path` returns correct admission state (variant + effective).
+    #[test]
+    fn admit_path_returns_correct_admission() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "ds4.hfq",
+            9,
+            &r#"{"model_type":"deepseek_v4"}"#,
+            &[],
+        );
+        let admitted =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 2, 1)).unwrap();
+        assert_eq!(admitted.admission().variant(), ModelVariant::Deepseek4);
+        // DeepSeek4 TP→EP remap effective (1,1,2)
+        assert_eq!(
+            admitted.admission().effective(),
+            RawParallelRequest::new(1, 1, 2)
+        );
+    }
+
+    /// Dense EP normalisation via `admit_path` — effective (1,1,1).
+    #[test]
+    fn admit_path_dense_ep_normalises_to_single() {
+        let dir = tmp_dir();
+        let meta = r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "llama_ep.hfq", 0, meta, &[]);
+        // LlamaNoQkNorm + ep=2 → NormalizeToSingle → effective (1,1,1), axis=Single
+        let admitted =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 2)).unwrap();
+        assert_eq!(
+            admitted.admission().effective(),
+            RawParallelRequest::new(1, 1, 1)
+        );
+        assert_eq!(admitted.admission().variant(), ModelVariant::LlamaNoQkNorm);
+        assert_eq!(
+            admitted.admission().effective().axis(),
+            ParallelAxis::Single
+        );
+    }
+
+    /// Qwen35Dense EP=2 normalizes to Single before construction. The integrated
+    /// path must retain the normalized admission and enter the Single boundary.
+    #[test]
+    fn qwen35_dense_ep_normalizes_to_single_and_records_single_route() {
+        crate::construction_recorder::clear();
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "qwen35_ep.hfq",
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"vocab_size":152064}"#,
+            &[],
+        );
+
+        let admitted = admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 2))
+            .expect("dense Qwen35 EP admission");
+        assert_eq!(admitted.admission().variant(), ModelVariant::Qwen35Dense);
+        assert_eq!(
+            admitted.admission().effective(),
+            RawParallelRequest::new(1, 1, 1)
+        );
+
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 1)]);
+        let _err = load_admitted(admitted, &mesh, ModelLoadOptions::new(64), None);
+        assert_eq!(
+            crate::construction_recorder::take(),
+            vec![
+                crate::construction_recorder::RecordedEvent::RoutedTo {
+                    axis: ParallelAxis::Single,
+                    variant: ModelVariant::Qwen35Dense,
+                    effective: RawParallelRequest::new(1, 1, 1),
+                },
+                crate::construction_recorder::RecordedEvent::EnteredConstructor {
+                    axis: ParallelAxis::Single,
+                },
+            ]
+        );
+    }
+
+    /// Qwen35-VL PP → AXIS-004 error from `admit_path`.
+    #[test]
+    fn admit_path_rejects_qwen35_vl_pp() {
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "q35vl.hfq", 5, &qwen35_vl_cfg(), &vl_tensors());
+        let err = admit_path(path.to_str().unwrap(), RawParallelRequest::new(2, 1, 1)).unwrap_err();
+        assert!(err.contains("AXIS-004"), "expected AXIS-004, got: {err}");
+    }
+
+    /// Source consumption proof: the admitted source carries the expected
+    /// arch_id.  Verifies the source is consumed from AdmittedLoad, not
+    /// reopened.
+    #[test]
+    fn admitted_source_consumed() {
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "ds4_src.hfq",
+            9,
+            &r#"{"model_type":"deepseek_v4"}"#,
+            &[],
+        );
+        let src_path = path.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(1, 1, 2)).unwrap();
+        // The source's arch_id must match the admitted variant's expectation
+        assert_eq!(admitted.source_ref().arch_id(), Some(9));
+        assert_eq!(admitted.admission().variant(), ModelVariant::Deepseek4);
+        // consume via into_parts to prove ownership transfer
+        let (_path, _source, _carrier, _admission) = admitted.into_parts();
+    }
+
+    #[test]
+    fn llama_pp_admission_has_correct_variant() {
+        let dir = tmp_dir();
+        // No QK-norm tensor → LlamaNoQkNorm variant
+        let meta = r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":32,"num_attention_heads":32,"intermediate_size":11008,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "llama.hfq", 0, meta, &[]);
+        let src_path = path.to_str().unwrap();
+        let src = ModelSource::from_path(src_path).unwrap();
+        let admitted = admit_source(src_path, src, RawParallelRequest::new(2, 1, 1)).unwrap();
+        assert_eq!(admitted.admission().variant(), ModelVariant::LlamaNoQkNorm);
+        assert_eq!(admitted.admission().effective().axis(), ParallelAxis::Pp);
+    }
+
+    // ── CAP-001 Task 5: construction recorder ────────────────────────
+
+    /// Admitted Single via `load_admitted(gpu=None)` records the dispatch and
+    /// constructor boundary in order, including the constructor event before
+    /// the GPU-required failure.
+    #[test]
+    fn construction_recorder_single_gpu_none_fires_routed_to_only() {
+        crate::construction_recorder::clear();
+        let dir = tmp_dir();
+        // Qwen35Dense (arch_id=5) Single is Admitted — no QK-norm, no VL config needed
+        let path = write_hfq(
+            dir.path(),
+            "rec_single.hfq",
+            5,
+            &r#"{"model_type":"qwen3.5","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"vocab_size":152064}"#,
+            &[],
+        );
+        let admitted =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 1)).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 1)]);
+        let _err = load_admitted(admitted, &mesh, ModelLoadOptions::new(64), None);
+
+        let events = crate::construction_recorder::take();
+        assert_eq!(
+            events,
+            vec![
+                crate::construction_recorder::RecordedEvent::RoutedTo {
+                    axis: ParallelAxis::Single,
+                    variant: ModelVariant::Qwen35Dense,
+                    effective: RawParallelRequest::new(1, 1, 1),
+                },
+                crate::construction_recorder::RecordedEvent::EnteredConstructor {
+                    axis: ParallelAxis::Single,
+                },
+            ]
+        );
+    }
+
+    /// Admitted TP via `load_admitted(gpu=None)` records BOTH `RoutedTo Tp`
+    /// and `EnteredConstructor Tp` — TP doesn't need a GPU, so the dispatch
+    /// reaches the private constructor (which then fails at tokenizer).
+    #[test]
+    fn construction_recorder_tp_fires_routed_to_and_entered() {
+        crate::construction_recorder::clear();
+        let dir = tmp_dir();
+        // PlainQwen3 (arch_id=1) with Tp=2 is Admitted.
+        let meta = r#"{"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"intermediate_size":8192,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "rec_tp.hfq", 1, meta, &[]);
+        let admitted =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 2, 1)).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let _err = load_admitted(admitted, &mesh, ModelLoadOptions::new(64), None);
+
+        let events = crate::construction_recorder::take();
+        assert_eq!(
+            events,
+            vec![
+                crate::construction_recorder::RecordedEvent::RoutedTo {
+                    axis: ParallelAxis::Tp,
+                    variant: ModelVariant::PlainQwen3,
+                    effective: RawParallelRequest::new(1, 2, 1),
+                },
+                crate::construction_recorder::RecordedEvent::EnteredConstructor {
+                    axis: ParallelAxis::Tp,
+                },
+            ]
+        );
+    }
+
+    /// Admitted PP via `load_admitted(gpu=None)` records BOTH `RoutedTo Pp`
+    /// and `EnteredConstructor Pp`.
+    #[test]
+    fn construction_recorder_pp_fires_routed_to_and_entered() {
+        crate::construction_recorder::clear();
+        let dir = tmp_dir();
+        // PlainQwen3 (arch_id=1) with Pp=2 is Admitted.
+        let meta = r#"{"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"intermediate_size":8192,"vocab_size":32000}"#;
+        let path = write_hfq(dir.path(), "rec_pp.hfq", 1, meta, &[]);
+        let admitted =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(2, 1, 1)).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
+        let _err = load_admitted(admitted, &mesh, ModelLoadOptions::new(64), None);
+
+        let events = crate::construction_recorder::take();
+        assert_eq!(
+            events,
+            vec![
+                crate::construction_recorder::RecordedEvent::RoutedTo {
+                    axis: ParallelAxis::Pp,
+                    variant: ModelVariant::PlainQwen3,
+                    effective: RawParallelRequest::new(2, 1, 1),
+                },
+                crate::construction_recorder::RecordedEvent::EnteredConstructor {
+                    axis: ParallelAxis::Pp,
+                },
+            ]
+        );
+    }
+
+    /// Admitted EP via `load_admitted` records both `RoutedTo Ep` and
+    /// `EnteredConstructor Ep`.
+    #[test]
+    fn construction_recorder_ep_fires_routed_to_and_entered() {
+        crate::construction_recorder::clear();
+        let dir = tmp_dir();
+        // DeepSeek4 (arch_id=9) with Ep=2 is Admitted.
+        let path = write_hfq(
+            dir.path(),
+            "rec_ep.hfq",
+            9,
+            &r#"{"model_type":"deepseek_v4"}"#,
+            &[],
+        );
+        let admitted =
+            admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 2)).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+        let _err = load_admitted(admitted, &mesh, ModelLoadOptions::new(64), None);
+
+        let events = crate::construction_recorder::take();
+        assert_eq!(
+            events,
+            vec![
+                crate::construction_recorder::RecordedEvent::RoutedTo {
+                    axis: ParallelAxis::Ep,
+                    variant: ModelVariant::Deepseek4,
+                    effective: RawParallelRequest::new(1, 1, 2),
+                },
+                crate::construction_recorder::RecordedEvent::EnteredConstructor {
+                    axis: ParallelAxis::Ep,
+                },
+            ]
+        );
+    }
+
+    /// Dense EP (LFM2Dense + Ep=2) normalises to Single, but Single for
+    /// LFM2Dense is Planned — `admit_path` refuses before `load_admitted`.
+    /// The recorder must be EMPTY — proof that no construction boundary
+    /// was ever entered.
+    #[test]
+    fn dense_ep_refusal_never_enters_construction() {
+        crate::construction_recorder::clear();
+        let dir = tmp_dir();
+        let path = write_hfq(dir.path(), "rec_lfm2_ep.hfq", 11, &lfm2_cfg(0, "lfm2"), &[]);
+        let err = admit_path(path.to_str().unwrap(), RawParallelRequest::new(1, 1, 2)).unwrap_err();
+        assert!(
+            err.contains("AXIS-003"),
+            "expected AXIS-003 (Planned), got: {err}"
+        );
+
+        let events = crate::construction_recorder::take();
+        assert_eq!(
+            events,
+            Vec::<crate::construction_recorder::RecordedEvent>::new()
+        );
+    }
+
+    /// Qwen35-VL PP (Planned Axis-004) — `admit_path` refuses before
+    /// `load_admitted`. The recorder must be EMPTY.
+    #[test]
+    fn planned_vl_pp_refusal_never_enters_construction() {
+        crate::construction_recorder::clear();
+        let dir = tmp_dir();
+        let path = write_hfq(
+            dir.path(),
+            "rec_vl_pp.hfq",
+            5,
+            &qwen35_vl_cfg(),
+            &vl_tensors(),
+        );
+        let err = admit_path(path.to_str().unwrap(), RawParallelRequest::new(2, 1, 1)).unwrap_err();
+        assert!(
+            err.contains("AXIS-004"),
+            "expected AXIS-004 (Planned), got: {err}"
+        );
+
+        let events = crate::construction_recorder::take();
+        assert_eq!(
+            events,
+            Vec::<crate::construction_recorder::RecordedEvent>::new()
+        );
+    }
+
+    // ── CAP-001 Task 5: validate_admission_consistency pure-function tests ──
+
+    fn record(
+        variant: ModelVariant,
+        requested: RawParallelRequest,
+        effective: RawParallelRequest,
+    ) -> AdmissionRecord {
+        AdmissionRecord::from_admission(ParallelAdmission::new(variant, requested, effective))
+    }
+
+    /// The validator must accept a complete, internally consistent Single
+    /// snapshot rather than inferring ownership from only the effective axis.
+    #[test]
+    fn admission_consistency_single_valid() {
+        let admission = record(
+            ModelVariant::Qwen35Dense,
+            RawParallelRequest::new(1, 1, 2),
+            RawParallelRequest::new(1, 1, 1),
+        );
+        assert!(super::validate_admission_consistency(
+            ModelParallelKind::Single,
+            Some(ModelStateKind::Qwen35),
+            5,
+            RawParallelRequest::new(1, 1, 1),
+            &admission,
+        )
+        .is_ok());
+    }
+
+    /// The validator must accept a TP topology whose observed degrees match
+    /// the admitted TP4 topology exactly.
+    #[test]
+    fn admission_consistency_tp4_actual_tp4_valid() {
+        let admission = record(
+            ModelVariant::LlamaNoQkNorm,
+            RawParallelRequest::new(1, 4, 1),
+            RawParallelRequest::new(1, 4, 1),
+        );
+        assert!(super::validate_admission_consistency(
+            ModelParallelKind::Tp,
+            None,
+            0,
+            RawParallelRequest::new(1, 4, 1),
+            &admission,
+        )
+        .is_ok());
+    }
+
+    /// Dense PP owns no model state in the loader; a matching PP topology and
+    /// admitted variant must therefore pass the consistency check.
+    #[test]
+    fn admission_consistency_pp_dense_valid() {
+        let admission = record(
+            ModelVariant::PlainQwen3,
+            RawParallelRequest::new(2, 1, 1),
+            RawParallelRequest::new(2, 1, 1),
+        );
+        assert!(super::validate_admission_consistency(
+            ModelParallelKind::PpDense,
+            None,
+            1,
+            RawParallelRequest::new(2, 1, 1),
+            &admission,
+        )
+        .is_ok());
+    }
+
+    /// EP owns no loader-level model state; a matching DeepSeek4 EP topology
+    /// must pass the consistency check.
+    #[test]
+    fn admission_consistency_ep_valid() {
+        let admission = record(
+            ModelVariant::Deepseek4,
+            RawParallelRequest::new(1, 1, 2),
+            RawParallelRequest::new(1, 1, 2),
+        );
+        assert!(super::validate_admission_consistency(
+            ModelParallelKind::Ep,
+            None,
+            9,
+            RawParallelRequest::new(1, 1, 2),
+            &admission,
+        )
+        .is_ok());
+    }
+
+    /// A dense EP request normalised to effective Single must not be allowed
+    /// to own an actual EP state or topology.
+    #[test]
+    fn admission_consistency_effective_single_actual_ep_refused() {
+        let admission = record(
+            ModelVariant::Qwen35Dense,
+            RawParallelRequest::new(1, 1, 2),
+            RawParallelRequest::new(1, 1, 1),
+        );
+        let result = super::validate_admission_consistency(
+            ModelParallelKind::Ep,
+            None,
+            5,
+            RawParallelRequest::new(1, 1, 2),
+            &admission,
+        );
+        let Err(ResetError::Architecture {
+            parallel,
+            state,
+            arch_id,
+            message,
+            ..
+        }) = result
+        else {
+            panic!("expected architecture refusal, got {result:?}");
+        };
+        assert_eq!(parallel, ModelParallelKind::Ep);
+        assert_eq!(state, None);
+        assert_eq!(arch_id, 5);
+        assert!(message.contains("actual"), "{message}");
+        assert!(message.contains("effective"), "{message}");
+        assert!(message.contains("Ep"), "{message}");
+        assert!(message.contains("Single"), "{message}");
+        assert!(
+            message.contains("tp: 1") || message.contains("tp=1"),
+            "{message}"
+        );
+        assert!(
+            message.contains("ep: 2") || message.contains("ep=2"),
+            "{message}"
+        );
+    }
+
+    /// The validator must compare actual degrees, not merely the dominant
+    /// axis: an effective TP4 admission cannot reset an actual TP2 model.
+    #[test]
+    fn admission_consistency_effective_tp4_actual_tp2_refused() {
+        let admission = record(
+            ModelVariant::LlamaNoQkNorm,
+            RawParallelRequest::new(1, 4, 1),
+            RawParallelRequest::new(1, 4, 1),
+        );
+        let result = super::validate_admission_consistency(
+            ModelParallelKind::Tp,
+            None,
+            0,
+            RawParallelRequest::new(1, 2, 1),
+            &admission,
+        );
+        let Err(ResetError::Architecture {
+            parallel,
+            state,
+            arch_id,
+            message,
+            ..
+        }) = result
+        else {
+            panic!("expected architecture refusal, got {result:?}");
+        };
+        assert_eq!(parallel, ModelParallelKind::Tp);
+        assert_eq!(state, None);
+        assert_eq!(arch_id, 0);
+        assert!(message.contains("actual"), "{message}");
+        assert!(message.contains("effective"), "{message}");
+        assert!(
+            message.contains("tp: 2") || message.contains("tp=2"),
+            "{message}"
+        );
+        assert!(
+            message.contains("tp: 4") || message.contains("tp=4"),
+            "{message}"
+        );
+    }
+
+    /// A Qwen35 state cannot be paired with an admission record for a
+    /// LlamaNoQkNorm variant, even when the Single topology itself matches.
+    #[test]
+    fn admission_consistency_variant_state_mismatch_refused() {
+        let admission = record(
+            ModelVariant::LlamaNoQkNorm,
+            RawParallelRequest::new(1, 1, 1),
+            RawParallelRequest::new(1, 1, 1),
+        );
+        let result = super::validate_admission_consistency(
+            ModelParallelKind::Single,
+            Some(ModelStateKind::Qwen35),
+            0,
+            RawParallelRequest::new(1, 1, 1),
+            &admission,
+        );
+        let Err(ResetError::Architecture {
+            parallel,
+            state,
+            arch_id,
+            message,
+            ..
+        }) = result
+        else {
+            panic!("expected architecture refusal, got {result:?}");
+        };
+        assert_eq!(parallel, ModelParallelKind::Single);
+        assert_eq!(state, Some(ModelStateKind::Qwen35));
+        assert_eq!(arch_id, 0);
+        assert!(message.contains("Qwen35"), "{message}");
+        assert!(message.contains("LlamaNoQkNorm"), "{message}");
+    }
+}
+
 #[cfg(test)]
 mod session_state_tests {
-    use super::{map_session_reset, map_speculator_reset, LoadedModel, ResetError, SessionState};
+    use super::{
+        map_session_reset, map_speculator_reset, AdmissionRecord, LoadedModel, ModelVariant,
+        ParallelAdmission, RawParallelRequest, ResetError, SessionState,
+    };
+
+    fn test_record() -> AdmissionRecord {
+        AdmissionRecord::from_admission(ParallelAdmission::new(
+            ModelVariant::Qwen35Dense,
+            RawParallelRequest::new(1, 1, 1),
+            RawParallelRequest::new(1, 1, 1),
+        ))
+    }
 
     fn test_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
         hipfire_runtime::tokenizer::Tokenizer::from_hf_json(
@@ -4766,6 +6902,7 @@ mod session_state_tests {
             Some("template".to_string()),
             "auto",
             3,
+            test_record(),
         );
         model.session.seq_pos = 9;
         model.persist.asst_turn_cache.insert(7, vec![11, 12]);

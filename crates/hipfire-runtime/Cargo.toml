@@ -60,6 +60,11 @@ ep-fault-inject = []
 # dflash-fault-inject: enables test-only deterministic DFlash allocation faults.
 # It is intentionally excluded from default/release feature sets.
 dflash-fault-inject = []
+# loader-internal: exposes raw TP/PP HFQ constructors (`load_from_hfq`)
+# that are consumed by hipfire-loader's CAP-001 Task 3 admitted-load path.
+# Not in default — only hipfire-loader activates it.  External consumers
+# should use `hipfire_loader::admit_path` + `load_admitted` instead.
+loader-internal = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

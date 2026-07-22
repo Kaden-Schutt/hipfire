@@ -451,13 +451,13 @@ them toward completion.
 
 ### CAP-001 Architecture Capability Contract And Dense-EP Normalization
 
-- **Status:** blocked
+- **Status:** complete
 - **Dependencies:** PAR-001
 - **Goal:** Implement the central architecture capability contract used by loader selection, ownership validation, and daemon dispatch; canonicalize dense `EP>1` to effective `EP=1` before mesh, device, allocation, or collective construction.
 - **Acceptance criteria:** Each shipped family declares PP/TP/EP capabilities; planned cells refuse early before GPU allocation with the axis, family, and owning task ID; unsupported cells refuse early before GPU allocation with the axis, family, and technical reason; dense `EP>1` is canonicalized to `normalized-to-single(CAP-001)` before mesh, device, allocation, or collective construction, creates no extra logical device, allocation, collective, or EP support claim, and matches one-replica output.
 - **Validation:** Run capability-table selection/refusal tests, dense-EP allocation-inventory tests, one-replica parity tests, and loader/daemon tests; prove canonicalization occurs before mesh/device/allocation/collective setup. No hardware required.
 - **Hardware:** None.
-- **Evidence:** Pending
+- **Evidence:** See `.agent-progress/cap-001-evidence-2026-07-22.md` for exact commands, named pre-mesh proofs, fixture/prompt/binary digests, parsed-token parity output, and fresh validation results.
 
 ### PAR-002 Implement Required Additional PP/TP/EP Paths
 

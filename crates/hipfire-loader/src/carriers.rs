@@ -4,12 +4,13 @@
 //! Per-arch carrier structs with object-safe [`Carrier`] impls.
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
+use crate::parallel_capability::ModelVariant;
 use crate::spec_build::Qwen35SlotGuard;
-use crate::Carrier;
 use crate::{
     finish_qwen35_load, reject_qwen_native_mtp, resolve_chat_template,
     resolve_chat_template_overrides, LoadedModel, ModelState,
 };
+use crate::{Carrier, CarrierLoadToken};
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
@@ -150,7 +151,15 @@ impl Carrier for Qwen2Carrier {
         // llama-family Dir loader drops them).
         arch_id == 7
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Qwen2)
+    }
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("qwen2: pipeline-parallel (pp>1) unsupported".into());
         }
@@ -173,6 +182,7 @@ impl Carrier for Qwen2Carrier {
                 meta.chat_template,
                 ctx.mtp_mode,
                 ctx.mtp_k,
+                token.record(),
             )
         })
     }
@@ -217,6 +227,7 @@ fn load_qwen35_pp(
     mut hfq_file: hipfire_runtime::hfq::HfqFile,
     meta: SourceMeta,
     ctx: &mut LoadCtx,
+    token: &CarrierLoadToken,
 ) -> Result<LoadedModel, String> {
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
@@ -308,6 +319,7 @@ fn load_qwen35_pp(
             ctx.mtp_mode,
             ctx.mtp_k,
             gpus,
+            token.record(),
         )
     })
 }
@@ -336,7 +348,65 @@ impl Carrier for Qwen35Carrier {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
         matches!(arch_id, 5 | 6)
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        match src {
+            ModelSource::Hfq(hfq) => match hfq.arch_id {
+                6 => Ok(ModelVariant::Qwen35Moe),
+                5 => {
+                    // Match production loader: use tensor_data (not find_tensor_info)
+                    // so that only tensors with physically present data count.
+                    let has_vision_tower = hfq
+                        .tensor_data("model.visual.patch_embed.proj.weight")
+                        .is_some();
+                    if has_vision_tower {
+                        Ok(ModelVariant::Qwen35Vl)
+                    } else {
+                        Ok(ModelVariant::Qwen35Dense)
+                    }
+                }
+                other => Err(format!("qwen35: unexpected HFQ arch_id {}", other)),
+            },
+            ModelSource::Dir(source) => {
+                let arch_id = source.arch_id();
+                match arch_id {
+                    6 => {
+                        let _facts = hipfire_arch_qwen35::qwen35::classify_vl(source)?;
+                        Ok(ModelVariant::Qwen35Moe)
+                    }
+                    5 => {
+                        // Use the architecture-owned VL helper (no raw metadata
+                        // or substring checks in the carrier).
+                        let facts = hipfire_arch_qwen35::qwen35::classify_vl(source)?;
+
+                        if facts.is_vl_text {
+                            return Ok(ModelVariant::Qwen35Vl);
+                        }
+                        if source
+                            .tensor_info("model.visual.patch_embed.proj.weight")
+                            .is_some()
+                        {
+                            return Ok(ModelVariant::Qwen35Vl);
+                        }
+                        // Unclassifiable: has VL indicator but composite + tensor
+                        // both fail to confirm.
+                        if facts.has_vision_config || facts.has_visual_key {
+                            return Err("qwen35: VL indicator present but unclassifiable \
+                                 (no text_config+vision_config composite and no VL tensor)"
+                                .to_string());
+                        }
+                        Ok(ModelVariant::Qwen35Dense)
+                    }
+                    other => Err(format!("qwen35 safetensors: unexpected arch_id {}", other)),
+                }
+            }
+        }
+    }
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String> {
         reject_qwen_native_mtp(ctx.mtp_mode)?;
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
@@ -353,7 +423,7 @@ impl Carrier for Qwen35Carrier {
             ModelSource::Hfq(mut hfq_file) => {
                 // ── pp>1 path (pipeline-parallel) — extracted helper ──
                 if ctx.pp > 1 {
-                    return load_qwen35_pp(hfq_file, meta, ctx);
+                    return load_qwen35_pp(hfq_file, meta, ctx, token);
                 }
 
                 // ── pp=1 path (single-GPU) ────────────────────
@@ -430,6 +500,7 @@ impl Carrier for Qwen35Carrier {
                     ctx,
                     vision_config,
                     vision_weights,
+                    token,
                 )
             }
             ModelSource::Dir(source) => {
@@ -548,6 +619,7 @@ impl Carrier for Qwen35Carrier {
                         meta.chat_template,
                         ctx.mtp_mode,
                         ctx.mtp_k,
+                        token.record(),
                     )
                 })
             }
@@ -584,7 +656,41 @@ impl Carrier for LlamaCarrier {
         // swallow any future HFQ id in 2..=4 into the llama path).
         matches!(arch_id, 0 | 1)
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        match src {
+            ModelSource::Hfq(hfq) => {
+                // config_from_hfq already prefixes errors with "llama: " —
+                // propagate without adding another prefix to avoid "llama: llama:".
+                let config = hipfire_runtime::hfq::config_from_hfq(hfq)?;
+                // Architecture check first: Qwen3 (arch_id=1) is always PlainQwen3
+                // regardless of any QK-norm tensors that might be present.
+                // has_qk_norm only applies to LLaMA/Mistral (arch_id=0).
+                if config.arch == hipfire_runtime::llama::ModelArch::Qwen3 {
+                    Ok(ModelVariant::PlainQwen3)
+                } else if config.has_qk_norm {
+                    Ok(ModelVariant::LlamaQkNorm)
+                } else {
+                    Ok(ModelVariant::LlamaNoQkNorm)
+                }
+            }
+            ModelSource::Dir(source) => {
+                let config = hipfire_runtime::hfq::config_from_safetensors_llama(source)?;
+                if config.arch == hipfire_runtime::llama::ModelArch::Qwen3 {
+                    Ok(ModelVariant::PlainQwen3)
+                } else if config.has_qk_norm {
+                    Ok(ModelVariant::LlamaQkNorm)
+                } else {
+                    Ok(ModelVariant::LlamaNoQkNorm)
+                }
+            }
+        }
+    }
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "llama: pipeline-parallel (pp>1) unsupported",
@@ -916,6 +1022,7 @@ impl Carrier for LlamaCarrier {
                 meta.chat_template,
                 ctx.mtp_mode,
                 ctx.mtp_k,
+                token.record(),
             )
         })
     }
@@ -957,7 +1064,15 @@ impl Carrier for DotsOcrCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 8
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::DotsOcr)
+    }
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "dots_ocr: pipeline-parallel (pp>1) unsupported",
@@ -1016,6 +1131,7 @@ impl Carrier for DotsOcrCarrier {
                 meta.chat_template,
                 ctx.mtp_mode,
                 ctx.mtp_k,
+                token.record(),
             )
         })
     }
@@ -1049,7 +1165,15 @@ impl Carrier for Deepseek4Carrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 9
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Deepseek4)
+    }
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "deepseek4: pipeline-parallel (pp>1) unsupported",
@@ -1168,6 +1292,7 @@ impl Carrier for Deepseek4Carrier {
                 meta.chat_template,
                 ctx.mtp_mode,
                 ctx.mtp_k,
+                token.record(),
             )
         })
     }
@@ -1201,7 +1326,15 @@ impl Carrier for MinimaxCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 10
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Minimax)
+    }
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             // Preserve the two per-source error strings byte-for-byte.
             return Err(match &src {
@@ -1268,6 +1401,7 @@ impl Carrier for MinimaxCarrier {
                 meta.chat_template,
                 ctx.mtp_mode,
                 ctx.mtp_k,
+                token.record(),
             )
         })
     }
@@ -1301,7 +1435,35 @@ impl Carrier for Lfm2MoeCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 11
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        // Dense vs MoE is determined by `num_experts` in the config.
+        // Extract the concrete source so we can pass it to the
+        // architecture-owned helper (which expects &dyn model_source::ModelSource).
+        match src {
+            ModelSource::Hfq(hfq) => {
+                let is_moe = hipfire_arch_lfm2moe::config::classify_is_moe(hfq)?;
+                Ok(if is_moe {
+                    ModelVariant::Lfm2Moe
+                } else {
+                    ModelVariant::Lfm2Dense
+                })
+            }
+            ModelSource::Dir(s) => {
+                let is_moe = hipfire_arch_lfm2moe::config::classify_is_moe(s)?;
+                Ok(if is_moe {
+                    ModelVariant::Lfm2Moe
+                } else {
+                    ModelVariant::Lfm2Dense
+                })
+            }
+        }
+    }
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "lfm2moe: pipeline-parallel (pp>1) unsupported",
@@ -1355,6 +1517,7 @@ impl Carrier for Lfm2MoeCarrier {
                 meta.chat_template,
                 ctx.mtp_mode,
                 ctx.mtp_k,
+                token.record(),
             )
         })
     }
@@ -1395,7 +1558,15 @@ impl Carrier for Cohere2MoeCarrier {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
     }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Cohere2Moe)
+    }
+    fn load(
+        &self,
+        src: ModelSource,
+        ctx: &mut LoadCtx,
+        token: &CarrierLoadToken,
+    ) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("cohere2moe: pp>1 unsupported via registry".into());
         }
@@ -1414,6 +1585,7 @@ impl Carrier for Cohere2MoeCarrier {
                     ctx.path,
                     ctx.mtp_mode,
                     ctx.mtp_k,
+                    token.record(),
                 )?;
                 // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1).
                 lm.speculator = crate::spec_build::build_speculator(
@@ -1467,9 +1639,700 @@ impl Carrier for Cohere2MoeCarrier {
                         meta.chat_template,
                         ctx.mtp_mode,
                         ctx.mtp_k,
+                        token.record(),
                     )
                 })
             }
         }
+    }
+}
+
+// ─── Classification tests ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    use crate::parallel_capability::ModelVariant;
+    use crate::{classify_source, Carrier};
+    use hipfire_runtime::loader_api::ModelSource;
+    use std::io::Write;
+
+    // ── Fixture helpers ─────────────────────────────────────────────
+
+    /// Build a complete LLaMA config JSON using `serde_json::Value` (no string
+    /// splicing).  `overrides` are applied on top of the base — duplicate keys
+    /// overwrite rather than producing malformed JSON.
+    fn llama_cfg(overrides: &[(&str, &serde_json::Value)]) -> String {
+        let mut cfg = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "intermediate_size": 11008,
+            "vocab_size": 32000,
+        });
+        for (k, v) in overrides {
+            cfg[k] = (*v).clone();
+        }
+        cfg.to_string()
+    }
+
+    /// Build a complete Qwen3.5 config JSON.
+    fn qwen35_cfg(overrides: &[(&str, &serde_json::Value)]) -> String {
+        let mut cfg = serde_json::json!({
+            "model_type": "qwen3.5",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "vocab_size": 152064,
+        });
+        for (k, v) in overrides {
+            cfg[k] = (*v).clone();
+        }
+        cfg.to_string()
+    }
+
+    /// Build a complete Qwen3 config JSON.
+    fn qwen3_cfg(overrides: &[(&str, &serde_json::Value)]) -> String {
+        let mut cfg = serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "intermediate_size": 8192,
+            "vocab_size": 152064,
+        });
+        for (k, v) in overrides {
+            cfg[k] = (*v).clone();
+        }
+        cfg.to_string()
+    }
+
+    /// Build a complete LFM2 config JSON.
+    fn lfm2_cfg(overrides: &[(&str, &serde_json::Value)]) -> String {
+        let mut cfg = serde_json::json!({
+            "model_type": "lfm2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 8192,
+            "vocab_size": 32000,
+            "layer_types": ["full_attention", "full_attention", "full_attention", "full_attention"],
+        });
+        for (k, v) in overrides {
+            cfg[k] = (*v).clone();
+        }
+        cfg.to_string()
+    }
+
+    /// Wrap a config JSON body inside the `{"config":…}` envelope that
+    /// `write_hfq_fixture` expects when its argument already has a `"config"` key.
+    fn config_wrapped(cfg_body: &str) -> String {
+        format!(r#"{{"config":{cfg_body}}}"#)
+    }
+
+    fn write_hfq_fixture(
+        dir: &std::path::Path,
+        name: &str,
+        arch_id: u32,
+        metadata_json: &str,
+        tensor_names: &[&str],
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        // Must be valid JSON with a "config" wrapper key. Panic early so
+        // a misconstructed fixture fast-fails rather than creating a corrupt file.
+        let meta_val: serde_json::Value =
+            serde_json::from_str(metadata_json).expect("fixture metadata must be valid JSON");
+        let wrapped = if meta_val.get("config").is_some() {
+            metadata_json.to_string()
+        } else {
+            format!(r#"{{"architecture":"test","config":{}}}"#, metadata_json)
+        };
+        let meta_bytes = wrapped.as_bytes();
+        let n_tensors = tensor_names.len() as u32;
+
+        // Each indexed tensor must have nonzero data_size and matching
+        // payload bytes so that tensor_data() returns a non-empty slice.
+        // The payload itself is 12 zero bytes — enough to prove existence
+        // without resembling any real weight data.
+        const TENSOR_PAYLOAD_SIZE: u64 = 12;
+        const TENSOR_PAYLOAD: [u8; TENSOR_PAYLOAD_SIZE as usize] = [0u8; 12];
+
+        let mut idx_bytes: Vec<u8> = Vec::new();
+        idx_bytes.extend_from_slice(&n_tensors.to_le_bytes());
+        for tname in tensor_names {
+            let name_bytes = tname.as_bytes();
+            let name_len = name_bytes.len() as u16;
+            idx_bytes.extend_from_slice(&name_len.to_le_bytes());
+            idx_bytes.extend_from_slice(name_bytes);
+            idx_bytes.push(1); // quant_type
+            idx_bytes.push(1); // n_dims
+            idx_bytes.extend_from_slice(&4u32.to_le_bytes()); // shape[0] = 4
+            idx_bytes.extend_from_slice(&0u32.to_le_bytes()); // group_size
+            idx_bytes.extend_from_slice(&TENSOR_PAYLOAD_SIZE.to_le_bytes());
+        }
+
+        let metadata_offset: u64 = 32;
+        let data_offset: u64 = metadata_offset + meta_bytes.len() as u64 + idx_bytes.len() as u64;
+
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(&arch_id.to_le_bytes()).unwrap();
+        f.write_all(&n_tensors.to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(meta_bytes).unwrap();
+        f.write_all(&idx_bytes).unwrap();
+        // Write nonzero payload data so tensor_data() returns non-empty slices
+        for _ in tensor_names {
+            f.write_all(&TENSOR_PAYLOAD).unwrap();
+        }
+        f.flush().unwrap();
+        path
+    }
+
+    /// Write a safetensors directory with an optional single named F16 tensor
+    /// (shape [4], 8 zero bytes of payload).  `None` writes an empty header `{}`;
+    /// `Some(name)` writes exactly that tensor into the safetensors header so
+    /// the fixture looks like a real dir-format model.
+    fn write_safetensors_dir(
+        dir: &std::path::Path,
+        name: &str,
+        config_json: &str,
+        tensor_name: Option<&str>,
+    ) -> std::path::PathBuf {
+        let model_dir = dir.join(name);
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("config.json"), config_json).unwrap();
+
+        let mut st = std::fs::File::create(model_dir.join("model.safetensors")).unwrap();
+        match tensor_name {
+            None => {
+                // Empty safetensors file with minimal header {}
+                st.write_all(&2u64.to_le_bytes()).unwrap();
+                st.write_all(b"{}").unwrap();
+            }
+            Some(tname) => {
+                let header = serde_json::json!(
+                    {tname: {"dtype": "F16", "shape": [4], "data_offsets": [0, 8]}}
+                );
+                let hdr = header.to_string();
+                let hdr_bytes = hdr.as_bytes();
+                st.write_all(&(hdr_bytes.len() as u64).to_le_bytes())
+                    .unwrap();
+                st.write_all(hdr_bytes).unwrap();
+                st.write_all(&[0u8; 8]).unwrap();
+            }
+        }
+        st.flush().unwrap();
+        model_dir
+    }
+
+    fn tmp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    // ── classify_source error tests ──────────────────────────────────
+
+    /// Zero carrier match → `classify_source` must return an error.
+    #[test]
+    fn classify_source_zero_carrier() {
+        let dir = tmp_dir();
+        let path = write_hfq_fixture(
+            dir.path(),
+            "unknown.hfq",
+            99,
+            &config_wrapped(&r#"{"model_type":"unknown"}"#),
+            &[],
+        );
+        let src = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+        let err = match classify_source(&src) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for unknown arch_id, got Ok"),
+        };
+        assert!(
+            err.contains("no carrier"),
+            "expected 'no carrier' error, got: {err}"
+        );
+    }
+
+    // ── Cross-namespace consistency ──────────────────────────────────
+
+    #[test]
+    fn source_namespace_behavior_hfq_vs_dir() {
+        let dir = tmp_dir();
+
+        let phfq = write_hfq_fixture(
+            dir.path(),
+            "hfq_qk.hfq",
+            0,
+            &config_wrapped(&llama_cfg(&[])),
+            &["model.layers.0.self_attn.q_norm.weight"],
+        );
+        let shfq = ModelSource::from_path(phfq.to_str().unwrap()).unwrap();
+
+        let pdir = write_safetensors_dir(
+            dir.path(),
+            "hfqvsdir_llama_qk",
+            &llama_cfg(&[("architectures", &serde_json::json!(["LlamaForCausalLM"]))]),
+            Some("model.layers.0.self_attn.q_norm.weight"),
+        );
+        let sdir = ModelSource::from_path(pdir.to_str().unwrap()).unwrap();
+
+        let hfq_variant = classify_source(&shfq).unwrap().1;
+        let dir_variant = classify_source(&sdir).unwrap().1;
+        assert_eq!(
+            hfq_variant, dir_variant,
+            "HFQ and Dir QK-norm LLaMA must produce the same variant, got HFQ={hfq_variant:?} Dir={dir_variant:?}"
+        );
+        assert_eq!(hfq_variant, ModelVariant::LlamaQkNorm);
+    }
+
+    // ── Focused test: None vs Some tensor in safetensors dir ──────────
+
+    #[test]
+    fn safetensors_dir_none_vs_some_tensor() {
+        let dir = tmp_dir();
+
+        // None → empty safetensors header
+        let none_dir = write_safetensors_dir(dir.path(), "none_tensor", "{}", None);
+        let none_bytes = std::fs::read(none_dir.join("model.safetensors")).unwrap();
+        let hdr_len = u64::from_le_bytes(none_bytes[0..8].try_into().unwrap());
+        assert_eq!(
+            &none_bytes[8..8 + hdr_len as usize],
+            b"{}",
+            "None must produce empty header {{}}"
+        );
+
+        // Some("test.weight") → single-entry header
+        let some_dir = write_safetensors_dir(dir.path(), "some_tensor", "{}", Some("test.weight"));
+        let some_bytes = std::fs::read(some_dir.join("model.safetensors")).unwrap();
+        let hdr_len2 = u64::from_le_bytes(some_bytes[0..8].try_into().unwrap());
+        let hdr_val: serde_json::Value =
+            serde_json::from_slice(&some_bytes[8..8 + hdr_len2 as usize]).unwrap();
+        assert!(
+            hdr_val.get("test.weight").is_some(),
+            "Some must produce header with 'test.weight' key, got: {hdr_val}"
+        );
+        // Exactly one entry — no extra tensors
+        assert_eq!(
+            hdr_val.as_object().map(|m| m.len()),
+            Some(1),
+            "Some must produce exactly one tensor entry"
+        );
+    }
+
+    // ── Table-driven registry-seam classify_source tests ──────────────
+
+    /// Each case builds a source through `from_path`, resolves it through
+    /// `classify_source`, and asserts the expected carrier name + variant.
+    #[test]
+    fn classify_source_table() {
+        struct Case {
+            name: &'static str,
+            /// Callback that writes fixture files and returns a path string.
+            build: fn(&std::path::Path) -> String,
+            expect_carrier: &'static str,
+            expect_variant: ModelVariant,
+        }
+
+        fn hfq_path(dir: &std::path::Path, arch_id: u32, meta: &str, tensors: &[&str]) -> String {
+            write_hfq_fixture(dir, "m.hfq", arch_id, meta, tensors)
+                .to_string_lossy()
+                .to_string()
+        }
+
+        fn dir_path(dir: &std::path::Path, name: &str, cfg: &str) -> String {
+            write_safetensors_dir(dir, name, cfg, None)
+                .to_string_lossy()
+                .to_string()
+        }
+
+        let cases: &[Case] = &[
+            // ── HFQ carriers (arch_id namespace) ──────────────────────
+            Case {
+                name: "qwen35-hfq-dense",
+                build: |d| hfq_path(d, 5, &config_wrapped(&qwen35_cfg(&[])), &[]),
+                expect_carrier: "qwen35",
+                expect_variant: ModelVariant::Qwen35Dense,
+            },
+            Case {
+                name: "qwen35-hfq-moe",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        6,
+                        &config_wrapped(&qwen35_cfg(&[("num_experts", &serde_json::json!(8))])),
+                        &[],
+                    )
+                },
+                expect_carrier: "qwen35",
+                expect_variant: ModelVariant::Qwen35Moe,
+            },
+            Case {
+                name: "qwen35-hfq-vl",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        5,
+                        &config_wrapped(&qwen35_cfg(&[(
+                            "vision_config",
+                            &serde_json::json!({"hidden_size": 1024}),
+                        )])),
+                        &["model.visual.patch_embed.proj.weight"],
+                    )
+                },
+                expect_carrier: "qwen35",
+                expect_variant: ModelVariant::Qwen35Vl,
+            },
+            Case {
+                name: "llama-hfq-qknorm",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        0,
+                        &config_wrapped(&llama_cfg(&[])),
+                        &["model.layers.0.self_attn.q_norm.weight"],
+                    )
+                },
+                expect_carrier: "llama",
+                expect_variant: ModelVariant::LlamaQkNorm,
+            },
+            Case {
+                name: "llama-hfq-noqknorm",
+                build: |d| hfq_path(d, 0, &config_wrapped(&llama_cfg(&[])), &[]),
+                expect_carrier: "llama",
+                expect_variant: ModelVariant::LlamaNoQkNorm,
+            },
+            Case {
+                name: "llama-hfq-qwen3",
+                build: |d| hfq_path(d, 1, &config_wrapped(&qwen3_cfg(&[])), &[]),
+                expect_carrier: "llama",
+                expect_variant: ModelVariant::PlainQwen3,
+            },
+            // Qwen3 (arch_id=1) with QK-norm tensor present must remain
+            // PlainQwen3 — has_qk_norm only applies to LLaMA/Mistral.
+            Case {
+                name: "qwen3-hfq-qknorm-still-plain",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        1,
+                        &config_wrapped(&qwen3_cfg(&[])),
+                        &["model.layers.0.self_attn.q_norm.weight"],
+                    )
+                },
+                expect_carrier: "llama",
+                expect_variant: ModelVariant::PlainQwen3,
+            },
+            Case {
+                name: "lfm2-hfq-dense",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        11,
+                        &config_wrapped(&lfm2_cfg(&[
+                            ("num_experts", &serde_json::json!(0)),
+                            ("model_type", &serde_json::json!("lfm2")),
+                        ])),
+                        &[],
+                    )
+                },
+                expect_carrier: "lfm2moe",
+                expect_variant: ModelVariant::Lfm2Dense,
+            },
+            Case {
+                name: "lfm2-hfq-moe",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        11,
+                        &config_wrapped(&lfm2_cfg(&[
+                            ("model_type", &serde_json::json!("lfm2_moe")),
+                            ("num_experts", &serde_json::json!(8)),
+                            ("num_experts_per_tok", &serde_json::json!(2)),
+                            ("moe_intermediate_size", &serde_json::json!(1024)),
+                        ])),
+                        &[],
+                    )
+                },
+                expect_carrier: "lfm2moe",
+                expect_variant: ModelVariant::Lfm2Moe,
+            },
+            Case {
+                name: "deepseek4-hfq",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        9,
+                        &config_wrapped(&r#"{"model_type":"deepseek_v4"}"#),
+                        &[],
+                    )
+                },
+                expect_carrier: "deepseek4",
+                expect_variant: ModelVariant::Deepseek4,
+            },
+            Case {
+                name: "minimax-hfq",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        10,
+                        &config_wrapped(&r#"{"model_type":"minimax_m2"}"#),
+                        &[],
+                    )
+                },
+                expect_carrier: "minimax",
+                expect_variant: ModelVariant::Minimax,
+            },
+            Case {
+                name: "qwen2-hfq",
+                build: |d| hfq_path(d, 7, &config_wrapped(&r#"{"model_type":"qwen2"}"#), &[]),
+                expect_carrier: "qwen2",
+                expect_variant: ModelVariant::Qwen2,
+            },
+            Case {
+                name: "dots_ocr-hfq",
+                build: |d| hfq_path(d, 8, &config_wrapped(&r#"{"model_type":"dots_ocr"}"#), &[]),
+                expect_carrier: "dots_ocr",
+                expect_variant: ModelVariant::DotsOcr,
+            },
+            Case {
+                name: "cohere2moe-hfq",
+                build: |d| {
+                    hfq_path(
+                        d,
+                        12,
+                        &config_wrapped(&r#"{"model_type":"cohere2_moe"}"#),
+                        &[],
+                    )
+                },
+                expect_carrier: "cohere2moe",
+                expect_variant: ModelVariant::Cohere2Moe,
+            },
+            Case {
+                name: "qwen2-dir",
+                build: |d| dir_path(d, "qw2d", &r#"{"model_type":"qwen2"}"#),
+                expect_carrier: "qwen2",
+                expect_variant: ModelVariant::Qwen2,
+            },
+            // ── Dir carriers (namespace routing) ──────────────────────
+            Case {
+                name: "qwen35-dir-dense",
+                build: |d| dir_path(d, "q35dd", &qwen35_cfg(&[])),
+                expect_carrier: "qwen35",
+                expect_variant: ModelVariant::Qwen35Dense,
+            },
+            Case {
+                name: "qwen35-dir-moe",
+                build: |d| {
+                    dir_path(
+                        d,
+                        "q35dm",
+                        &qwen35_cfg(&[("num_experts", &serde_json::json!(8))]),
+                    )
+                },
+                expect_carrier: "qwen35",
+                expect_variant: ModelVariant::Qwen35Moe,
+            },
+            Case {
+                name: "qwen35-dir-vl",
+                // Composite VL format: text_config + vision_config.
+                // This is the canonical format where Qwen35Config.is_vl_text=true.
+                build: |d| {
+                    let cfg = r#"{"model_type":"qwen3.5","text_config":{"hidden_size":2048,"num_hidden_layers":24,"num_attention_heads":16,"vocab_size":152064},"vision_config":{"hidden_size":1024}}"#;
+                    dir_path(d, "q35dv", cfg)
+                },
+                expect_carrier: "qwen35",
+                expect_variant: ModelVariant::Qwen35Vl,
+            },
+            Case {
+                name: "llama-dir-qknorm",
+                build: |d| {
+                    write_safetensors_dir(
+                        d,
+                        "llama_dqk",
+                        &llama_cfg(&[]),
+                        Some("model.layers.0.self_attn.q_norm.weight"),
+                    )
+                    .to_string_lossy()
+                    .to_string()
+                },
+                expect_carrier: "llama",
+                expect_variant: ModelVariant::LlamaQkNorm,
+            },
+            Case {
+                name: "llama-dir-noqknorm",
+                build: |d| dir_path(d, "llama_dnqk", &llama_cfg(&[])),
+                expect_carrier: "llama",
+                expect_variant: ModelVariant::LlamaNoQkNorm,
+            },
+            // Qwen3 directory (arch_id=1) with QK-norm tensor must remain
+            // PlainQwen3 — has_qk_norm only applies to LLaMA/Mistral.
+            Case {
+                name: "qwen3-dir-qknorm-still-plain",
+                build: |d| {
+                    write_safetensors_dir(
+                        d,
+                        "qw3dqk",
+                        &qwen3_cfg(&[]),
+                        Some("model.layers.0.self_attn.q_norm.weight"),
+                    )
+                    .to_string_lossy()
+                    .to_string()
+                },
+                expect_carrier: "llama",
+                expect_variant: ModelVariant::PlainQwen3,
+            },
+            Case {
+                name: "lfm2-dir-dense",
+                build: |d| {
+                    dir_path(
+                        d,
+                        "lfm2dd",
+                        &lfm2_cfg(&[
+                            ("num_experts", &serde_json::json!(0)),
+                            ("model_type", &serde_json::json!("lfm2")),
+                        ]),
+                    )
+                },
+                expect_carrier: "lfm2moe",
+                expect_variant: ModelVariant::Lfm2Dense,
+            },
+            Case {
+                name: "lfm2-dir-moe",
+                build: |d| {
+                    dir_path(
+                        d,
+                        "lfm2dm",
+                        &lfm2_cfg(&[
+                            ("model_type", &serde_json::json!("lfm2_moe")),
+                            ("num_experts", &serde_json::json!(8)),
+                            ("num_experts_per_tok", &serde_json::json!(2)),
+                            ("moe_intermediate_size", &serde_json::json!(1024)),
+                        ]),
+                    )
+                },
+                expect_carrier: "lfm2moe",
+                expect_variant: ModelVariant::Lfm2Moe,
+            },
+        ];
+
+        for case in cases {
+            let dir = tmp_dir();
+            let path_str = (case.build)(dir.path());
+            let src = ModelSource::from_path(&path_str)
+                .unwrap_or_else(|e| panic!("{}: from_path failed: {}", case.name, e));
+            let result = classify_source(&src);
+            let (carrier, variant) =
+                result.unwrap_or_else(|e| panic!("{}: classify_source failed: {}", case.name, e));
+            assert_eq!(
+                carrier.name(),
+                case.expect_carrier,
+                "{}: carrier name mismatch",
+                case.name
+            );
+            assert_eq!(
+                variant, case.expect_variant,
+                "{}: variant mismatch",
+                case.name
+            );
+        }
+    }
+
+    /// HFQ fixture writer must produce nonzero data_size so that tensor_data
+    /// returns a non-empty slice for each indexed tensor.  This test proves the
+    /// VL tensor payload is physically present.
+    #[test]
+    fn hfq_vl_tensor_data_nonempty() {
+        let dir = tmp_dir();
+        let path = write_hfq_fixture(
+            dir.path(),
+            "vl_test.hfq",
+            5,
+            &config_wrapped(&qwen35_cfg(&[(
+                "vision_config",
+                &serde_json::json!({"hidden_size": 1024}),
+            )])),
+            &["model.visual.patch_embed.proj.weight"],
+        );
+        use hipfire_runtime::hfq::HfqFile;
+        let hfq = HfqFile::open(&path).unwrap();
+        let (info, data) = hfq
+            .tensor_data("model.visual.patch_embed.proj.weight")
+            .expect("VL tensor must be found");
+        assert!(
+            !data.is_empty(),
+            "VL tensor payload must be non-empty, got {} bytes (data_size={})",
+            data.len(),
+            info.data_size,
+        );
+    }
+
+    /// A flat VL directory (vision_config without text_config and without VL tensor)
+    /// must be rejected as unclassifiable, not silently classified as dense.
+    #[test]
+    fn malformed_vl_directory_rejected() {
+        let dir = tmp_dir();
+        // Flat config: vision_config but NO text_config → unclassifiable VL
+        let cfg = &qwen35_cfg(&[("vision_config", &serde_json::json!({"hidden_size": 1024}))]);
+        let model_dir = write_safetensors_dir(dir.path(), "q35_bad_vl", cfg, None);
+        let src = ModelSource::from_path(model_dir.to_str().unwrap()).unwrap();
+        let err = match classify_source(&src) {
+            Err(e) => e,
+            Ok(_) => panic!("expected unclassifiable VL error, got Ok"),
+        };
+        assert!(
+            err.contains("unclassifiable"),
+            "must mention unclassifiable, got: {err}"
+        );
+    }
+
+    /// A carrier using the DEFAULT `classify_parallel_variant` must produce an
+    /// error that includes `CAP-001`, `self.name()`, and `src.describe()`.
+    #[test]
+    fn default_classify_rejection_includes_cap001_name_and_describe() {
+        // Use a carrier with NO override (default trait method).
+        // The test itself creates one via a carrier that doesn't override.
+        // Actually, every carrier in the registry overrides classify_parallel_variant
+        // (some return fixed Ok). We need a synthetic carrier that uses the default.
+        struct DefaultCarrier;
+        impl Carrier for DefaultCarrier {
+            fn name(&self) -> &'static str {
+                "test_default"
+            }
+            fn claims_arch_id(&self, _arch_id: u32, _is_dir: bool) -> bool {
+                true
+            }
+            fn load(
+                &self,
+                _src: ModelSource,
+                _ctx: &mut LoadCtx,
+                _token: &CarrierLoadToken,
+            ) -> Result<LoadedModel, String> {
+                Err("unused".into())
+            }
+        }
+
+        let dir = tmp_dir();
+        let path = write_hfq_fixture(
+            dir.path(),
+            "dummy.hfq",
+            42,
+            &config_wrapped(&r#"{"model_type":"dummy"}"#),
+            &[],
+        );
+        let src = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+        let result = DefaultCarrier.classify_parallel_variant(&src);
+        let err = result.unwrap_err();
+        let want = format!(
+            "{}: CAP-001 variant classification unsupported for {}",
+            DefaultCarrier.name(),
+            src.describe()
+        );
+        assert_eq!(err, want, "default error must match exactly");
     }
 }

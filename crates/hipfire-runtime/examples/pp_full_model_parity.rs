@@ -17,8 +17,9 @@
 //!   cargo run -p hipfire-runtime --release --example pp_full_model_parity [model.mq4] [token] [pp]
 
 use hipfire_hardware::{DeviceMesh, DimKind};
+use hipfire_loader::model_parallel::PipelineImpl;
+use hipfire_loader::ModelParallel;
 use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig};
-use hipfire_runtime::pp_serve::PpModel;
 
 const MAX_SEQ: usize = 512;
 
@@ -62,12 +63,17 @@ fn main() {
 
     // ── PP path: PpModel banded forward across `pp` stages. ──
     let mesh = DeviceMesh::rect(&[(DimKind::Pp, pp)]);
-    let mut model = match PpModel::load(model_path, &mesh, MAX_SEQ) {
+    let loaded = match hipfire_loader::load_model_pp(model_path, MAX_SEQ, &mesh, Default::default())
+    {
         Ok(m) => m,
         Err(e) => {
-            println!("pp_full_model_parity: SKIPPED (PpModel::load: {e})");
+            println!("pp_full_model_parity: SKIPPED (load_model_pp: {e})");
             return;
         }
+    };
+    let mut model = match loaded.parallel {
+        ModelParallel::Pp(PipelineImpl::Dense(pp)) => pp,
+        _ => panic!("expected PP dense model"),
     };
     model.forward_token(token, 0).expect("pp forward");
     let logits_pp = model.logits().expect("pp logits");
