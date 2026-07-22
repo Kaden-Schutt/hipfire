@@ -635,6 +635,16 @@ fn strip_think_for_fingerprint(s: &str) -> String {
     out
 }
 
+/// Apply the same visible-content transformation before every assistant-turn
+/// cache lookup and store. Keeping this centralized prevents the model's raw
+/// emission (which can contain thinking markers and prompt-normalized
+/// whitespace) from hashing differently than the history content returned by
+/// an OpenAI-compatible client on the next turn.
+fn normalize_asst_turn_for_fingerprint(s: &str) -> String {
+    let stripped = strip_think_for_fingerprint(s);
+    hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned()
+}
+
 /// Walk a [`serde_json::Value`] and produce a canonical-key
 /// representation: objects emit keys in lexical order (recursively),
 /// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
@@ -4668,7 +4678,8 @@ fn ep_serve_ds4(
     let have_replayable_payload =
         !emit_text_buf.trim().is_empty() || !emit_tool_calls_buf.is_empty();
     if have_replayable_payload && generated > 0 && !local_emitted_ids.is_empty() {
-        let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
+        let normalized = normalize_asst_turn_for_fingerprint(&emit_text_buf);
+        let fp = asst_turn_fingerprint(&normalized, &emit_tool_calls_buf);
         if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
             .ok()
             .as_deref()
@@ -9230,9 +9241,7 @@ fn generate(
                 history,
                 tools,
                 |msg| {
-                    let stripped = strip_think_for_fingerprint(&msg.content);
-                    let normalized =
-                        hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
                     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
                     let hit = cache_ref.get(&fp).map(|cached| {
                         let mut v = primer.clone();
@@ -10736,14 +10745,12 @@ fn generate(
                 }
             }
             if !cached_seq.is_empty() {
-                let stripped = strip_think_for_fingerprint(&decoded_full);
                 // Normalize symmetrically with the lookup-side msg.content
                 // normalization (done at message-parse time). Without this,
                 // the store-side fp from a raw-text emission diverges from
                 // the lookup-side fp computed on the normalized msg.content
                 // the CLI sends back next turn.
-                let emit_text =
-                    hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                let emit_text = normalize_asst_turn_for_fingerprint(&decoded_full);
                 let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
                 if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                     eprintln!(
@@ -12089,7 +12096,8 @@ fn generate_deepseek4(
             && m.conversation_tokens.len() > decode_start_tokens_idx
         {
             let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
-            let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
+            let normalized = normalize_asst_turn_for_fingerprint(&emit_text_buf);
+            let fp = asst_turn_fingerprint(&normalized, &emit_tool_calls_buf);
             if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
                 .as_deref()
@@ -15246,7 +15254,9 @@ mod tool_call_parser_tests {
 
 #[cfg(test)]
 mod render_tail_think_tests {
-    use super::render_tail_opens_think;
+    use super::{
+        asst_turn_fingerprint, normalize_asst_turn_for_fingerprint, render_tail_opens_think,
+    };
 
     #[test]
     fn qwen_jinja_think_tail_primes_reasoning_channel() {
@@ -15264,5 +15274,16 @@ mod render_tail_think_tests {
         assert!(!render_tail_opens_think(
             "<|im_start|>user\nliteral <think><|im_end|>\n<|im_start|>assistant\n"
         ));
+    }
+
+    #[test]
+    fn assistant_cache_fingerprint_matches_client_visible_content() {
+        let raw = "hidden reasoning</think>\n\nvisible answer<|im_end|>";
+        let normalized = normalize_asst_turn_for_fingerprint(raw);
+        assert_eq!(normalized, "visible answer");
+        assert_eq!(
+            asst_turn_fingerprint(&normalized, &[]),
+            asst_turn_fingerprint("visible answer", &[])
+        );
     }
 }
