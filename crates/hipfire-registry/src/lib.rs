@@ -135,6 +135,24 @@ impl RecommendedSettings {
     }
 }
 
+/// Per-mode sampling profiles for a model, mirroring the model card's
+/// documented modes. Each is a full [`RecommendedSettings`] blob. `general`
+/// is the thinking-mode default (equals the entry's `recommended_settings`);
+/// `coding` is the precise thinking-coding profile; `instruct` is the
+/// non-thinking profile. Profiles are entry-level metadata and are selected
+/// client-side (e.g. serve_harness `--sampling registry:<profile>`), lowering
+/// through the same `generation.*` config keys — no daemon request-JSON change.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingProfiles {
+    #[serde(default)]
+    pub general: Option<RecommendedSettings>,
+    #[serde(default)]
+    pub coding: Option<RecommendedSettings>,
+    #[serde(default)]
+    pub instruct: Option<RecommendedSettings>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelEntry {
@@ -160,6 +178,8 @@ pub struct ModelEntry {
     #[serde(default)]
     pub recommended_settings: Option<RecommendedSettings>,
     #[serde(default)]
+    pub sampling_profiles: Option<SamplingProfiles>,
+    #[serde(default)]
     pub sha256: Option<String>,
     #[serde(default)]
     pub size_bytes: Option<u64>,
@@ -167,6 +187,23 @@ pub struct ModelEntry {
     pub arch_id: Option<u32>,
     #[serde(default)]
     pub quant: Option<String>,
+}
+
+impl ModelEntry {
+    /// Resolve a named sampling profile (`general` | `coding` | `instruct`).
+    /// `general` falls back to `recommended_settings` (the default profile)
+    /// when no explicit profile map is present. Unknown names return `None`.
+    pub fn sampling_profile(&self, name: &str) -> Option<&RecommendedSettings> {
+        let profiles = self.sampling_profiles.as_ref();
+        match name {
+            "general" => profiles
+                .and_then(|p| p.general.as_ref())
+                .or(self.recommended_settings.as_ref()),
+            "coding" => profiles.and_then(|p| p.coding.as_ref()),
+            "instruct" => profiles.and_then(|p| p.instruct.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -254,6 +291,21 @@ impl RegistryV1 {
                 settings
                     .config_layer()
                     .map_err(|error| fail(format!("model '{tag}': {error}")))?;
+            }
+            if let Some(profiles) = &entry.sampling_profiles {
+                for (name, settings) in [
+                    ("general", &profiles.general),
+                    ("coding", &profiles.coding),
+                    ("instruct", &profiles.instruct),
+                ] {
+                    if let Some(settings) = settings {
+                        validate_recommendations(tag, settings)
+                            .map_err(|error| fail(format!("model '{tag}' profile '{name}': {error}")))?;
+                        settings
+                            .config_layer()
+                            .map_err(|error| fail(format!("model '{tag}' profile '{name}': {error}")))?;
+                    }
+                }
             }
         }
         Ok(())
@@ -618,5 +670,46 @@ mod tests {
             registry: bundled().unwrap(),
         };
         assert!(!cache_is_fresh(&cache, 100, REGISTRY_CACHE_TTL));
+    }
+
+    #[test]
+    fn sampling_profiles_resolve_per_mode_with_general_fallback() {
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"m":{
+                "repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x",
+                "recommended_settings":{"temperature":1.0,"presence_penalty":1.5},
+                "sampling_profiles":{
+                    "coding":{"temperature":0.6,"presence_penalty":0.0},
+                    "instruct":{"temperature":0.7,"top_p":0.8}
+                }
+            }},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (_, entry) = registry.model("m").unwrap();
+        assert_eq!(entry.sampling_profile("coding").unwrap().temperature, Some(0.6));
+        assert_eq!(entry.sampling_profile("instruct").unwrap().top_p, Some(0.8));
+        // general has no explicit profile → falls back to recommended_settings.
+        assert_eq!(
+            entry.sampling_profile("general").unwrap().presence_penalty,
+            Some(1.5)
+        );
+        assert!(entry.sampling_profile("nope").is_none());
+    }
+
+    #[test]
+    fn out_of_range_sampling_profile_rejects_the_whole_registry() {
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"m":{
+                "repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x",
+                "sampling_profiles":{"coding":{"temperature":9.0}}
+            }},
+            "aliases":{}
+        }"#;
+        assert!(RegistryV1::parse(raw, "test").is_err());
     }
 }

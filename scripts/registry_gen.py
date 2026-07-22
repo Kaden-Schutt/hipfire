@@ -330,6 +330,23 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
         # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)
 
+        # Optional per-mode sampling_profiles (carried verbatim by deepcopy).
+        # Validate each present profile with the same bounds — fail-closed,
+        # matching hipfire-registry's SamplingProfiles parser.
+        profiles = entry.get("sampling_profiles")
+        if profiles is not None:
+            if not isinstance(profiles, dict):
+                errors.append(f"{tag}: sampling_profiles must be an object")
+            else:
+                for mode, rs in profiles.items():
+                    if mode not in ("general", "coding", "instruct"):
+                        errors.append(
+                            f"{tag}: sampling_profiles has unknown mode {mode!r} "
+                            f"(allowed: ['coding', 'general', 'instruct'])"
+                        )
+                        continue
+                    validate_recommended_settings(f"{tag} sampling_profiles.{mode}", rs, errors)
+
         repo = entry.get("repo", "")
         if not repo:
             # Local-only entry (pull short-circuits). Nothing to probe.
