@@ -123,8 +123,8 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 |---|---|
 | `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). |
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--redline`). |
-| `hipfire profile [model] [--kernel substr] [--json]` | Compiled-kernel inventory for the detected architecture. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
-| `hipfire diag` | GPU, HIP, kernels, models, config overrides. |
+| `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
+| `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
 | `hipfire update` | **Linux only:** fetch `master`, rebuild daemon/CLI/kernels. Other platforms: re-run the platform installer or build from source. |
 
 Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md). Published tables are measured/historical: [BENCHMARKS.md](BENCHMARKS.md).

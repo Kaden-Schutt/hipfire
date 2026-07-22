@@ -144,6 +144,7 @@ through to per-model / registry / daemon defaults when omitted):
 |---|---|
 | `model` | Tag or path; triggers reload if different from resident model |
 | `messages` | OpenAI chat messages (required for useful chat) |
+| `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied |
 | `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |

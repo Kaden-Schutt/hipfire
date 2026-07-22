@@ -175,8 +175,9 @@ hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
 ```
 
 Writes `my-finetune.mq4.triattn.bin` beside the model by default. The daemon
-auto-discovers it when CASK is enabled (for example,
-`hipfire config set memory.cask.enabled true`). See [CONFIG.md](CONFIG.md).
+does not attach it by default. Set `cask_sidecar` to the exact path, or opt into
+sibling discovery with `cask_auto_attach=true`. Set `cask=true` separately only
+when core-aware m-folding is intended. See [CONFIG.md](CONFIG.md).
 
 ## Related
 

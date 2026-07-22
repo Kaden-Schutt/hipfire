@@ -7,21 +7,21 @@
 //! This binary owns hipfire's operator surface and never shells out to a
 //! JavaScript or TypeScript runtime.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    Engine, complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat,
+    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
 };
 use hipfire_config::{
-    CONFIG_SCHEMA_VERSION, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
-    NamedLayer, ValueRule, canonical_config_key, developer_env_for_key, field, fields,
-    is_developer_key, load_catalog, load_env_layer, load_global, resolve, write_catalog_toml,
-    write_global_toml,
+    canonical_config_key, developer_env_for_key, field, fields, is_developer_key, load_catalog,
+    load_env_layer, load_global, resolve, write_catalog_toml, write_global_toml, CatalogFormat,
+    ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer, ValueRule,
+    CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
-    LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1, load as load_registry,
+    load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,7 +31,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{mpsc, Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -80,7 +80,7 @@ enum Commands {
     #[command(alias = "remove")]
     Rm(RmArgs),
     /// Launch the Rust terminal UI.
-    Tui,
+    Tui(TuiArgs),
     /// Report local GPU/runtime/model/control-plane readiness.
     Diag(OutputArgs),
     /// Show the native service process and loaded model.
@@ -204,21 +204,34 @@ struct RmArgs {
     yes: bool,
 }
 
+#[derive(Args, Debug, Default)]
+struct TuiArgs {
+    /// Arguments forwarded to hipfire-tui, such as --check.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    arguments: Vec<String>,
+}
+
 #[derive(Args, Debug)]
 struct RunArgs {
+    /// Registry tag, local alias, filename, or model path.
     model: String,
     /// Prompt words. Quote the prompt to preserve exact whitespace.
-    #[arg(trailing_var_arg = true)]
+    #[arg(num_args = 0..)]
     prompt: Vec<String>,
     #[arg(short = 't', long)]
+    /// Sampling temperature in 0..=2.
     temp: Option<f64>,
     #[arg(long)]
+    /// Nucleus probability in (0, 1].
     top_p: Option<f64>,
     #[arg(long)]
+    /// Multiplicative repetition penalty.
     repeat_penalty: Option<f64>,
     #[arg(short = 'n', long)]
+    /// Maximum generated tokens.
     max_tokens: Option<u64>,
     #[arg(long)]
+    /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
@@ -233,12 +246,16 @@ struct RunArgs {
     #[arg(long)]
     dspark_conf_threshold: Option<f64>,
     #[arg(long)]
+    /// Override the resolved system prompt.
     system: Option<String>,
     #[arg(long)]
+    /// Local image path for a vision-language model.
     image: Option<PathBuf>,
     #[arg(short = 'j', long)]
+    /// Emit one JSON result object.
     json: bool,
     #[arg(long)]
+    /// Buffer visible output instead of streaming it.
     no_stream: bool,
 }
 
@@ -297,7 +314,7 @@ struct BenchArgs {
     #[arg(long)]
     redline: bool,
     /// Prompt words for the standard benchmark.
-    #[arg(trailing_var_arg = true)]
+    #[arg(num_args = 0..)]
     prompt: Vec<String>,
 }
 
@@ -312,24 +329,34 @@ struct ProfileArgs {
 
 #[derive(Args, Debug)]
 struct QuantizeArgs {
+    /// Hugging Face model ID, local safetensors directory, or GGUF file.
     input: String,
     #[arg(long = "format")]
+    /// Repeatable output format: mq4, mq6, q8, q8f16, hf4, or hf6.
     formats: Vec<String>,
     #[arg(long)]
+    /// Produce both MQ4 and MQ6.
     both: bool,
     #[arg(short = 'o', long)]
+    /// Exact output path; valid with one format only.
     output: Option<PathBuf>,
     #[arg(long)]
+    /// Output directory for one or more formats.
     output_dir: Option<PathBuf>,
     #[arg(long)]
+    /// Override the output filename stem.
     stem: Option<String>,
     #[arg(long)]
+    /// Upload completed artifacts to owner/repo on Hugging Face.
     upload: Option<String>,
     #[arg(long)]
+    /// Create the Hugging Face model repository if needed.
     create_repo: bool,
     #[arg(long)]
+    /// Copy completed artifacts into ~/.hipfire/models.
     install: bool,
     #[arg(long)]
+    /// Register a local model alias in models.toml.
     register: Option<String>,
 }
 
@@ -432,7 +459,8 @@ fn run() -> Result<()> {
     }));
     let paths = Paths::discover();
     match cli.command {
-        None | Some(Commands::Tui) => launch_tui(&paths),
+        None => launch_tui(&paths, &[]),
+        Some(Commands::Tui(args)) => launch_tui(&paths, &args.arguments),
         Some(Commands::Config(args)) => config_command(&paths, args),
         Some(Commands::Registry(args)) => registry_command(&paths, args),
         Some(Commands::List(args)) => list_command(&paths, args),
@@ -474,7 +502,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         return model_config_command(paths, &model, args.action);
     }
     let Some(action) = args.action else {
-        return launch_tui(paths);
+        return launch_tui(paths, &[]);
     };
     match action {
         ConfigAction::List(output) => {
@@ -632,7 +660,8 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 .get(&canonical)
                 .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
             if is_developer_key(&canonical) {
-                let env_compat = developer_env_for_key(&canonical).expect("validated developer key");
+                let env_compat =
+                    developer_env_for_key(&canonical).expect("validated developer key");
                 if output.json {
                     println!(
                         "{}",
@@ -661,7 +690,9 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                     println!("  scope:       Process");
                     println!("  registry:    false");
                     println!("  legacy env:  {env_compat}");
-                    println!("  about:       Experimental process-scoped override. Prefer a typed field when one exists.");
+                    println!(
+                        "  about:       Experimental process-scoped override. Prefer a typed field when one exists."
+                    );
                     if !value.shadowed.is_empty() {
                         println!("  shadowed:");
                         for candidate in value.shadowed.iter().rev() {
@@ -1257,19 +1288,30 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
 }
 
 fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
-    let entries = match fs::read_dir(&paths.models) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).context("failed to list model directory"),
-    };
+    let mut candidates = local_model_paths(paths)?;
+    if let Ok(catalog) = load_catalog(&paths.config) {
+        candidates.extend(
+            catalog
+                .catalog
+                .models
+                .values()
+                .filter_map(|model| model.path.clone())
+                .filter(|path| path.is_file()),
+        );
+    }
+    let mut seen = BTreeSet::new();
     let mut models = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if !metadata.is_file() {
+    for path in candidates {
+        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        if !seen.insert(canonical.clone()) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let metadata = fs::metadata(&canonical)?;
+        let name = canonical
+            .file_name()
+            .and_then(|file| file.to_str())
+            .unwrap_or_default()
+            .to_owned();
         if !is_model_file(&name) {
             continue;
         }
@@ -1279,12 +1321,48 @@ fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalMo
             .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()));
         models.push(LocalModel {
             name,
-            path: entry.path(),
+            path: canonical,
             size_bytes: metadata.len(),
             registry_tag,
         });
     }
     models.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(models)
+}
+
+fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(&paths.models) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("failed to list model directory"),
+    };
+    let mut models = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(is_model_file)
+            {
+                models.push(path);
+            }
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(children) = fs::read_dir(path) else {
+            continue;
+        };
+        models.extend(children.flatten().map(|entry| entry.path()).filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|file| file.to_str())
+                    .is_some_and(is_model_file)
+        }));
+    }
     Ok(models)
 }
 
@@ -1472,18 +1550,12 @@ fn report_progress(downloaded: u64, total: Option<u64>, elapsed: Duration) {
 fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
     let loaded = load_registry(&paths.registry);
     let resolved = loaded.registry.model(&args.model);
-    let file = resolved
-        .map(|(_, entry)| entry.file.clone())
-        .unwrap_or_else(|| args.model.clone());
-    let path = if Path::new(&file).is_absolute() {
-        PathBuf::from(&file)
-    } else {
-        paths.models.join(&file)
-    };
+    let path = find_model_path(paths, &loaded.registry, &args.model)
+        .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
         bail!("model not found: {}", path.display());
     }
-    let mut targets = vec![path];
+    let mut targets = BTreeSet::from([path.clone()]);
     if let Some((_, entry)) = resolved {
         targets.extend(
             [&entry.triattn, &entry.mtp, &entry.dspark]
@@ -1492,6 +1564,33 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
                 .map(|sidecar| paths.models.join(&sidecar.file))
                 .filter(|path| path.is_file()),
         );
+    }
+    if let (Some(parent), Some(file)) = (
+        path.parent(),
+        path.file_name().and_then(|file| file.to_str()),
+    ) {
+        let stem = file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file);
+        if let Ok(entries) = fs::read_dir(parent) {
+            targets.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|candidate| {
+                        let Some(name) = candidate.file_name().and_then(|name| name.to_str())
+                        else {
+                            return false;
+                        };
+                        candidate.is_file()
+                            && name != file
+                            && ((name.starts_with(&format!("{stem}.triattn"))
+                                && name.ends_with(".bin"))
+                                || (name.starts_with(stem)
+                                    && (name.ends_with(".mtp")
+                                        || name.contains("-mtp.")
+                                        || name.contains("-dspark."))))
+                    }),
+            );
+        }
     }
     if !args.yes {
         eprint!("Remove {} file(s)? [y/N] ", targets.len());
@@ -1622,7 +1721,13 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
     engine.ping()?;
-    let mut params = load_params(&resolved, entry, max_tokens, args.kv_mode.as_deref())?;
+    let mut params = load_params(
+        &resolved,
+        entry,
+        &model_path,
+        max_tokens,
+        args.kv_mode.as_deref(),
+    )?;
     let selector = args
         .speculation
         .clone()
@@ -1915,10 +2020,24 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
 struct ServeMeta {
     current_model: Option<String>,
     loading_model: Option<String>,
+    instance_token: String,
     requests_served: u64,
     recent_tok_s: Option<f64>,
     started: Instant,
     last_activity: Instant,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ServePidRecord {
+    pid: u32,
+    #[serde(default)]
+    start_time: Option<u64>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(skip)]
+    legacy: bool,
 }
 
 struct ServeRuntime {
@@ -1943,9 +2062,11 @@ struct ServeShared {
 #[derive(Debug)]
 struct Completion {
     id: String,
+    created: u64,
     model: String,
     content: String,
     reasoning_content: String,
+    preserve_thinking: bool,
     tool_calls: Vec<serde_json::Value>,
     done: serde_json::Value,
 }
@@ -2470,6 +2591,7 @@ fn serve_foreground(
         .model
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
+    let instance_token = serve_instance_token();
     let shared = Arc::new(ServeShared {
         runtime: Mutex::new(ServeRuntime {
             engine,
@@ -2484,6 +2606,7 @@ fn serve_foreground(
         meta: Mutex::new(ServeMeta {
             current_model: None,
             loading_model: None,
+            instance_token: instance_token.clone(),
             requests_served: 0,
             recent_tok_s: None,
             started: Instant::now(),
@@ -2498,7 +2621,17 @@ fn serve_foreground(
     let server = Server::http(&bind).map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
     fs::create_dir_all(&paths.root)?;
     let pid_path = paths.root.join("serve.pid");
-    fs::write(&pid_path, format!("{}\n", std::process::id()))?;
+    let pid_record = ServePidRecord {
+        pid: std::process::id(),
+        start_time: proc_start_time(std::process::id()),
+        port: Some(port),
+        token: Some(instance_token),
+        legacy: false,
+    };
+    fs::write(
+        &pid_path,
+        format!("{}\n", serde_json::to_string(&pid_record)?),
+    )?;
     let cleanup = pid_path.clone();
     ctrlc::set_handler(move || {
         let _ = fs::remove_file(&cleanup);
@@ -2532,50 +2665,47 @@ fn serve_foreground(
     }
     if !shared.idle_timeout.is_zero() {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                if shared.admission.inflight() != 0 {
-                    continue;
-                }
-                let expired = {
-                    let meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    meta.current_model.is_some()
-                        && meta.last_activity.elapsed() >= shared.idle_timeout
-                };
-                if !expired {
-                    continue;
-                }
-                let unloaded = {
-                    let mut runtime = shared
-                        .runtime
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if runtime.current_path.is_some() {
-                        let result = runtime.engine.unload();
-                        if result.is_ok() {
-                            runtime.current_path = None;
-                            runtime.current_max_seq = 0;
-                            runtime.cache_capable = false;
-                        }
-                        result
-                    } else {
-                        Ok(())
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(1));
+            if shared.admission.inflight() != 0 {
+                continue;
+            }
+            let expired = {
+                let meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                meta.current_model.is_some() && meta.last_activity.elapsed() >= shared.idle_timeout
+            };
+            if !expired {
+                continue;
+            }
+            let unloaded = {
+                let mut runtime = shared
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if runtime.current_path.is_some() {
+                    let result = runtime.engine.unload();
+                    if result.is_ok() {
+                        runtime.current_path = None;
+                        runtime.current_max_seq = 0;
+                        runtime.cache_capable = false;
                     }
-                };
-                if unloaded.is_ok() {
-                    let mut meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    meta.current_model = None;
-                    meta.loading_model = None;
-                    meta.last_activity = Instant::now();
-                    eprintln!("[hipfire] unloaded idle model");
+                    result
+                } else {
+                    Ok(())
                 }
+            };
+            if unloaded.is_ok() {
+                let mut meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                meta.current_model = None;
+                meta.loading_model = None;
+                meta.last_activity = Instant::now();
+                eprintln!("[hipfire] unloaded idle model");
             }
         });
     }
@@ -2618,6 +2748,7 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
                     "model": meta.current_model,
                     "loading_model": meta.loading_model,
                     "pid": std::process::id(),
+                    "token": meta.instance_token,
                     "native": true,
                 }),
                 200,
@@ -2692,7 +2823,7 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
             if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
                 respond_streaming(request, shared, body, guard)?;
             } else {
-                let completion = complete_request(&shared, &body, guard, |_| Ok(()));
+                let completion = complete_request(&shared, &body, guard, None, |_| Ok(()));
                 match completion {
                     Ok(completion) => {
                         request.respond(json_response(completion_json(&completion), 200))?
@@ -2754,6 +2885,11 @@ fn respond_streaming(
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
     thread::spawn(move || {
         let id = request_id();
+        let created = unix_timestamp();
+        let include_usage = body
+            .pointer("/stream_options/include_usage")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
         let model = body
             .get("model")
             .and_then(serde_json::Value::as_str)
@@ -2762,34 +2898,42 @@ fn respond_streaming(
         let first = serde_json::json!({
             "id": id,
             "object": "chat.completion.chunk",
+            "created": created,
             "model": model,
             "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
         });
         let _ = sender.send(sse_data(&first));
-        let result = complete_request(&shared, &body, guard, |event| {
-            let delta = match event.get("type").and_then(serde_json::Value::as_str) {
-                Some("token") => event
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|text| serde_json::json!({ "content": text })),
-                Some("reasoning") => event
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|text| serde_json::json!({ "reasoning_content": text })),
-                Some("tool_calls") => event.get("calls").map(openai_tool_call_delta),
-                _ => None,
-            };
-            if let Some(delta) = delta {
-                let chunk = serde_json::json!({
-                    "id": id,
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
-                });
-                sender.send(sse_data(&chunk)).ok();
-            }
-            Ok(())
-        });
+        let result = complete_request(
+            &shared,
+            &body,
+            guard,
+            Some((id.clone(), created)),
+            |event| {
+                let delta = match event.get("type").and_then(serde_json::Value::as_str) {
+                    Some("token") => event
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|text| serde_json::json!({ "content": text })),
+                    Some("reasoning") => event
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|text| serde_json::json!({ "reasoning_content": text })),
+                    Some("tool_calls") => event.get("calls").map(openai_tool_call_delta),
+                    _ => None,
+                };
+                if let Some(delta) = delta {
+                    let chunk = serde_json::json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                    });
+                    sender.send(sse_data(&chunk)).ok();
+                }
+                Ok(())
+            },
+        );
         match result {
             Ok(completion) => {
                 let finish_reason = if completion.tool_calls.is_empty() {
@@ -2801,14 +2945,17 @@ fn respond_streaming(
                 } else {
                     "tool_calls"
                 };
-                let final_chunk = serde_json::json!({
+                let mut final_chunk = serde_json::json!({
                     "id": completion.id,
                     "object": "chat.completion.chunk",
+                    "created": completion.created,
                     "model": completion.model,
                     "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
-                    "usage": completion_usage(&completion),
                     "timings": completion_timings(&completion),
                 });
+                if include_usage {
+                    final_chunk["usage"] = completion_usage(&completion);
+                }
                 let _ = sender.send(sse_data(&final_chunk));
             }
             Err(error) => {
@@ -2838,6 +2985,7 @@ fn complete_request(
     shared: &ServeShared,
     body: &serde_json::Value,
     _guard: AdmissionGuard,
+    request_identity: Option<(String, u64)>,
     mut event_callback: impl FnMut(&serde_json::Value) -> Result<()>,
 ) -> Result<Completion> {
     let model = body
@@ -2845,6 +2993,7 @@ fn complete_request(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow!("model is required"))?
         .to_owned();
+    let image_base64 = request_image_base64(body.get("messages"))?;
     let mut runtime = shared
         .runtime
         .lock()
@@ -2872,6 +3021,9 @@ fn complete_request(
         "messages": normalized_messages,
         "max_tokens": max_tokens,
     });
+    if let Some(image) = image_base64 {
+        generate["image_base64"] = serde_json::Value::String(image);
+    }
     for (key, config_key) in [
         ("temperature", "generation.temperature"),
         ("top_p", "generation.top_p"),
@@ -2919,7 +3071,8 @@ fn complete_request(
         }
     }
     apply_http_reasoning_request(body, &resolved, &mut generate)?;
-    let id = generate["id"].as_str().unwrap_or("chat").to_owned();
+    let (id, created) = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
+    generate["id"] = serde_json::Value::String(id.clone());
     let mut content = String::new();
     let mut reasoning_content = String::new();
     let mut tool_calls = Vec::new();
@@ -2937,9 +3090,7 @@ fn complete_request(
             }
             Some("token") => {
                 if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                    let fragments = if event
-                        .get("reasoning")
-                        .and_then(serde_json::Value::as_bool)
+                    let fragments = if event.get("reasoning").and_then(serde_json::Value::as_bool)
                         == Some(true)
                     {
                         think_router.push_semantic(text, true)
@@ -2997,9 +3148,14 @@ fn complete_request(
     meta.last_activity = Instant::now();
     Ok(Completion {
         id,
+        created,
         model,
         content,
         reasoning_content,
+        preserve_thinking: body
+            .pointer("/chat_template_kwargs/preserve_thinking")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
         tool_calls,
         done,
     })
@@ -3058,8 +3214,13 @@ impl ServeRuntime {
             let max_tokens = minimum_max_seq
                 .map(|minimum| minimum.saturating_sub(1024))
                 .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-            let mut params =
-                load_params(&resolved, entry, max_tokens, self.kv_override.as_deref())?;
+            let mut params = load_params(
+                &resolved,
+                entry,
+                &path,
+                max_tokens,
+                self.kv_override.as_deref(),
+            )?;
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
             }
@@ -3093,6 +3254,44 @@ fn openai_content_text(content: Option<&serde_json::Value>) -> String {
             .collect(),
         Some(other) => other.to_string(),
     }
+}
+
+fn request_image_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let mut image = None;
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(serde_json::Value::as_str) != Some("image_url") {
+                continue;
+            }
+            let url = part
+                .pointer("/image_url/url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("image_url content part requires image_url.url"))?;
+            let payload = ["data:image/png;base64,", "data:image/jpeg;base64,"]
+                .into_iter()
+                .find_map(|prefix| url.strip_prefix(prefix))
+                .ok_or_else(|| {
+                    if url.starts_with("data:") {
+                        anyhow!("only base64 PNG and JPEG image_url data URIs are supported")
+                    } else {
+                        anyhow!("remote image_url values are unsupported; send a base64 data URI")
+                    }
+                })?;
+            if payload.is_empty() {
+                bail!("image_url data URI has an empty base64 payload");
+            }
+            if image.replace(payload.to_owned()).is_some() {
+                bail!("at most one image_url is supported per request");
+            }
+        }
+    }
+    Ok(image)
 }
 
 fn strip_inline_thinking(text: &str) -> String {
@@ -3239,11 +3438,20 @@ fn completion_json(completion: &Completion) -> serde_json::Value {
     } else {
         "tool_calls"
     };
+    let visible_content =
+        if completion.preserve_thinking && !completion.reasoning_content.is_empty() {
+            format!(
+                "<think>{}</think>\n{}",
+                completion.reasoning_content, completion.content
+            )
+        } else {
+            completion.content.clone()
+        };
     let mut message = serde_json::json!({
         "role": "assistant",
-        "content": completion.content,
+        "content": visible_content,
     });
-    if !completion.reasoning_content.is_empty() {
+    if !completion.preserve_thinking && !completion.reasoning_content.is_empty() {
         message["reasoning_content"] =
             serde_json::Value::String(completion.reasoning_content.clone());
     }
@@ -3253,6 +3461,7 @@ fn completion_json(completion: &Completion) -> serde_json::Value {
     serde_json::json!({
         "id": completion.id,
         "object": "chat.completion",
+        "created": completion.created,
         "model": completion.model,
         "choices": [{
             "index": 0,
@@ -3383,9 +3592,14 @@ fn json_response(value: serde_json::Value, status: u16) -> Response<std::io::Cur
 }
 
 fn openai_error(message: &str, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
+    let error_type = if (400..500).contains(&status) {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
     json_response(
         serde_json::json!({
-            "error": { "message": message, "type": "server_error" }
+            "error": { "message": message, "type": error_type }
         }),
         status,
     )
@@ -3427,36 +3641,158 @@ impl Read for ChannelReader {
     }
 }
 
+fn serve_instance_token() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut digest = Sha256::new();
+    digest.update(std::process::id().to_le_bytes());
+    digest.update(now.to_le_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
+    let mut listen_inodes = BTreeSet::new();
+    let port_hex = format!("{port:04X}");
+    let mut read_any = false;
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(raw) = fs::read_to_string(table) else {
+            continue;
+        };
+        read_any = true;
+        for line in raw.lines().skip(1) {
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            if columns.len() < 10 || columns[3] != "0A" {
+                continue;
+            }
+            let Some((_, local_port)) = columns[1].rsplit_once(':') else {
+                continue;
+            };
+            if local_port.eq_ignore_ascii_case(&port_hex) {
+                listen_inodes.insert(columns[9].to_owned());
+            }
+        }
+    }
+    if !read_any {
+        return None;
+    }
+    if listen_inodes.is_empty() {
+        return Some(false);
+    }
+    let entries = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for entry in entries.flatten() {
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            if listen_inodes.contains(inode) {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+fn validate_serve_pid(record: &ServePidRecord, host: &str, fallback_port: u16) -> Result<()> {
+    let proc_dir = PathBuf::from(format!("/proc/{}", record.pid));
+    if !proc_dir.is_dir() {
+        bail!("tracked serve PID {} is no longer alive", record.pid);
+    }
+    let cmdline = fs::read(proc_dir.join("cmdline")).unwrap_or_default();
+    let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+    if !cmdline.contains("hipfire") || !cmdline.contains("serve") {
+        bail!("PID {} is not a hipfire serve process", record.pid);
+    }
+    if let Some(expected) = record.start_time {
+        if proc_start_time(record.pid) != Some(expected) {
+            bail!("PID {} was reused after serve.pid was written", record.pid);
+        }
+    }
+
+    let port = record.port.unwrap_or(fallback_port);
+    let owns_port = pid_owns_listen_port(record.pid, port);
+    if owns_port == Some(false) {
+        bail!(
+            "PID {} does not own the tracked serve port {port}",
+            record.pid
+        );
+    }
+    let health_matches = record.token.as_deref().is_some_and(|expected| {
+        http_get_json(host, port, "/health").is_some_and(|health| {
+            health.get("pid").and_then(serde_json::Value::as_u64) == Some(record.pid as u64)
+                && health.get("token").and_then(serde_json::Value::as_str) == Some(expected)
+        })
+    });
+    if owns_port == Some(true) || health_matches || record.legacy && owns_port.is_none() {
+        Ok(())
+    } else {
+        bail!(
+            "could not prove ownership of PID {} with port or health token",
+            record.pid
+        )
+    }
+}
+
 fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
     let pid_path = paths.root.join("serve.pid");
     match fs::read_to_string(&pid_path) {
         Ok(raw) => {
-            let pid = parse_pid_record(&raw)
+            let record = parse_pid_record(&raw)
                 .ok_or_else(|| anyhow!("invalid serve.pid; refusing to signal"))?;
-            let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-            let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-            if !cmdline.contains("hipfire") || !cmdline.contains("serve") {
+            let resolved = resolved_global(paths, true)
+                .ok()
+                .map(|(_, resolved)| resolved);
+            let host = resolved
+                .as_ref()
+                .and_then(|resolved| config_string(resolved, "serve.host").ok())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            let fallback_port = args
+                .port
+                .or_else(|| {
+                    resolved.as_ref().and_then(|resolved| {
+                        config_u64(resolved, "serve.port")
+                            .ok()
+                            .and_then(|port| u16::try_from(port).ok())
+                    })
+                })
+                .unwrap_or(11435);
+            if let Err(error) = validate_serve_pid(&record, probe_host(&host), fallback_port) {
                 fs::remove_file(&pid_path)?;
-                bail!(
-                    "PID {pid} is not a native hipfire serve process; removed stale pidfile without signaling"
-                );
-            }
-            let status = Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .status()
-                .context("failed to invoke kill")?;
-            if !status.success() {
-                bail!("failed to stop native serve PID {pid}");
-            }
-            for _ in 0..50 {
-                if !Path::new(&format!("/proc/{pid}")).exists() {
-                    break;
+                if !args.force {
+                    bail!("{error}; removed stale pidfile without signaling");
                 }
-                thread::sleep(Duration::from_millis(100));
+                eprintln!(
+                    "warning: {error}; refusing direct PID signal and continuing forced reap"
+                );
+            } else {
+                let status = Command::new("kill")
+                    .arg("-TERM")
+                    .arg(record.pid.to_string())
+                    .status()
+                    .context("failed to invoke kill")?;
+                if !status.success() {
+                    bail!("failed to stop native serve PID {}", record.pid);
+                }
+                for _ in 0..50 {
+                    if !Path::new(&format!("/proc/{}", record.pid)).exists() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                let _ = fs::remove_file(&pid_path);
+                println!("hipfire serve stopped (PID {})", record.pid);
             }
-            let _ = fs::remove_file(&pid_path);
-            println!("hipfire serve stopped (PID {pid})");
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             println!("hipfire serve is not running");
@@ -3482,14 +3818,19 @@ fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
     Ok(())
 }
 
-fn parse_pid_record(raw: &str) -> Option<u32> {
-    raw.trim().parse().ok().or_else(|| {
-        serde_json::from_str::<serde_json::Value>(raw)
-            .ok()?
-            .get("pid")?
-            .as_u64()
-            .and_then(|pid| u32::try_from(pid).ok())
-    })
+fn parse_pid_record(raw: &str) -> Option<ServePidRecord> {
+    if let Ok(pid) = raw.trim().parse() {
+        return Some(ServePidRecord {
+            pid,
+            start_time: None,
+            port: None,
+            token: None,
+            legacy: true,
+        });
+    }
+    let mut record = serde_json::from_str::<ServePidRecord>(raw).ok()?;
+    record.legacy = record.start_time.is_none() && record.port.is_none() && record.token.is_none();
+    Some(record)
 }
 
 fn resolved_for_model(
@@ -3566,12 +3907,45 @@ fn find_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Option<
         }
     }
     let path = paths.models.join(model);
-    path.is_file().then_some(path)
+    if path.is_file() {
+        return Some(path);
+    }
+    let search = model.replace(':', "-").to_ascii_lowercase();
+    let explicit_quant = MODEL_SUFFIXES.iter().any(|suffix| search.ends_with(suffix));
+    let mut candidates = local_model_paths(paths)
+        .ok()?
+        .into_iter()
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            name == search || name.contains(&search)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        let name = path
+            .file_name()
+            .and_then(|file| file.to_str())
+            .unwrap_or_default();
+        if explicit_quant || name.ends_with(".mq4r") {
+            0
+        } else if name.ends_with(".mq4") {
+            1
+        } else if name.ends_with(".hf4") || name.ends_with(".hfq") {
+            2
+        } else {
+            3
+        }
+    });
+    candidates.into_iter().next()
 }
 
 fn load_params(
     resolved: &hipfire_config::ResolvedConfig,
     entry: Option<&ModelEntry>,
+    model_path: &Path,
     max_tokens: u64,
     kv_override: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -3587,6 +3961,18 @@ fn load_params(
     field("memory.kv_cache")
         .expect("schema field")
         .parse_cli(&kv_mode)?;
+    let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
+    if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
+        if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
+            let candidate = model_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&sidecar.file);
+            if candidate.is_file() {
+                cask_sidecar = candidate.display().to_string();
+            }
+        }
+    }
     let mut params = serde_json::json!({
         "max_seq": max_seq,
         "kv_mode": kv_mode,
@@ -3600,7 +3986,7 @@ fn load_params(
         "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,
         "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
         "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
-        "cask_sidecar": config_string(resolved, "memory.cask.sidecar")?,
+        "cask_sidecar": cask_sidecar,
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
         "cask_beta": config_u64(resolved, "memory.cask.beta")?,
@@ -3779,7 +4165,7 @@ fn config_f64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<f6
     }
 }
 
-fn launch_tui(paths: &Paths) -> Result<()> {
+fn launch_tui(paths: &Paths, arguments: &[String]) -> Result<()> {
     let executable = env::var_os("HIPFIRE_TUI_BIN")
         .map(PathBuf::from)
         .or_else(|| {
@@ -3798,6 +4184,7 @@ fn launch_tui(paths: &Paths) -> Result<()> {
             )
         })?;
     let status = Command::new(&executable)
+        .args(arguments)
         .status()
         .with_context(|| format!("failed to launch {}", executable.display()))?;
     if status.success() {
@@ -3807,24 +4194,92 @@ fn launch_tui(paths: &Paths) -> Result<()> {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ProcessRecord {
+    pid: u32,
+    rss_mb: u64,
+    command: String,
+}
+
+fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
+    let mut quantize = Vec::new();
+    let mut uploads = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return (quantize, uploads);
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let Ok(raw) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let command = String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .trim()
+            .to_owned();
+        if command.is_empty() {
+            continue;
+        }
+        let rss_mb = fs::read_to_string(entry.path().join("status"))
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmRSS:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+            })
+            .unwrap_or(0)
+            / 1024;
+        let record = ProcessRecord {
+            pid,
+            rss_mb,
+            command,
+        };
+        if record.command.contains("hf upload") {
+            uploads.push(record);
+        } else if record.command.contains("hipfire-quantize")
+            || record.command.contains("hipfire quantize")
+        {
+            quantize.push(record);
+        }
+    }
+    (quantize, uploads)
+}
+
 fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
     let port = config_u64(&resolved, "serve.port")? as u16;
     let pid_path = paths.root.join("serve.pid");
-    let pid = fs::read_to_string(&pid_path)
+    let pid_record = fs::read_to_string(&pid_path)
         .ok()
         .and_then(|raw| parse_pid_record(&raw));
+    let pid = pid_record.as_ref().map(|record| record.pid);
     let alive = pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
     let health = http_get_json(&host, port, "/health");
     let stats = http_get_json(&host, port, "/stats");
+    let (quantize, uploads) = scan_auxiliary_processes();
     let report = serde_json::json!({
         "running": health.is_some(),
         "pid": pid,
+        "pid_record": pid_record,
         "pid_alive": alive,
         "endpoint": service_url(&host, port, ""),
         "health": health,
         "stats": stats,
+        "quantize": quantize,
+        "uploads": uploads,
     });
     if output.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3866,6 +4321,14 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     } else {
         println!("hipfire serve is not running");
     }
+    for (label, records) in [("quantize", &quantize), ("HF upload", &uploads)] {
+        for process in records {
+            println!(
+                "{label}: PID {}  {} MB  {}",
+                process.pid, process.rss_mb, process.command
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3898,7 +4361,7 @@ fn sample_stats(values: &[f64]) -> Option<SampleStats> {
     }
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
-    let median = if sorted.len() % 2 == 0 {
+    let median = if sorted.len().is_multiple_of(2) {
         (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
     } else {
         sorted[sorted.len() / 2]
@@ -4087,6 +4550,7 @@ fn open_bench_engine(
     let mut params = load_params(
         &resolved,
         entry.as_ref(),
+        &path,
         max_tokens,
         args.kv_mode.as_deref(),
     )?;
@@ -4303,15 +4767,8 @@ fn print_sample_row(label: &str, stats: Option<SampleStats>) {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct KernelArtifact {
-    name: String,
-    path: PathBuf,
-    size_bytes: u64,
-}
-
 fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
-    if let Some(model) = args.model.as_deref() {
+    let mut engine = if let Some(model) = args.model.as_deref() {
         eprintln!("loading {model} once so its kernels are present in the inventory...");
         let bench = BenchArgs {
             model: model.to_owned(),
@@ -4331,91 +4788,108 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
+        engine
+    } else {
+        let (_, resolved) = resolved_global(paths, true)?;
+        let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+        let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+        let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+        engine.ping()?;
+        engine
+    };
+    let mut report = engine.request(&serde_json::json!({ "type": "profile" }))?;
+    if report.get("type").and_then(serde_json::Value::as_str) != Some("profile") {
+        bail!(
+            "daemon profile failed: {}",
+            report
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unexpected response")
+        );
     }
-
-    let arches = detect_gpu_arches();
-    let mut roots = vec![paths.root.join("bin/kernels/compiled")];
-    if let Some(cache) = env::var_os("HIPFIRE_KERNEL_CACHE") {
-        roots.push(PathBuf::from(cache));
+    if let Some(filter) = args.kernel.as_deref() {
+        let filtered = report
+            .get("kernels")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|kernel| {
+                kernel
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name.contains(filter))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        report["kernels"] = serde_json::Value::Array(filtered);
     }
-    roots.push(env::current_dir()?.join(".hipfire_kernels"));
-    let mut artifacts = Vec::new();
-    let mut seen = BTreeSet::new();
-    for root in roots {
-        collect_hsacos(&root, args.kernel.as_deref(), &mut seen, &mut artifacts)?;
-    }
-    artifacts.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
-    let report = serde_json::json!({
-        "gpu_arches": arches,
-        "kernel_filter": args.kernel,
-        "count": artifacts.len(),
-        "total_bytes": artifacts.iter().map(|item| item.size_bytes).sum::<u64>(),
-        "artifacts": artifacts,
-        "note": "This is a compiled-kernel inventory. Use hipfire-atlas for phase-aware ISA fit and roofline evidence.",
-    });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("hipfire compiled-kernel profile");
+        let gpu = &report["gpu"];
         println!(
-            "  GPU targets: {}",
-            if arches.is_empty() {
-                "unknown".into()
-            } else {
-                arches.join(", ")
-            }
+            "GPU: {} ({})",
+            gpu.get("arch")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            gpu.get("generation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
         );
-        println!("  HSACOs:      {}", artifacts.len());
         println!(
-            "  total:       {:.2} MB",
-            artifacts.iter().map(|item| item.size_bytes).sum::<u64>() as f64 / 1e6
+            "{} CUs | peak BW {:.0} GB/s | boost {} MHz | ridge {:.1} FLOP/byte",
+            gpu.get("cu_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            gpu.get("peak_bw_gbs")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            gpu.get("boost_clock_mhz")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            gpu.get("ridge_point")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
         );
-        for artifact in artifacts {
+        let kernels = report["kernels"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        println!("\nKernel report ({} kernels):", kernels.len());
+        println!(
+            "  {:<38} {:>5} {:>5} {:>8} {:>10}  limiter",
+            "kernel", "VGPR", "SGPR", "LDS", "occupancy"
+        );
+        for kernel in kernels {
             println!(
-                "  {:>9.2} KB  {}",
-                artifact.size_bytes as f64 / 1e3,
-                artifact.path.display()
+                "  {:<38} {:>5} {:>5} {:>8} {:>9.1}%  {}",
+                kernel
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                kernel
+                    .get("vgprs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                kernel
+                    .get("sgprs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                kernel
+                    .get("lds_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                kernel
+                    .pointer("/occupancy/pct")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+                kernel
+                    .pointer("/occupancy/limiter")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
             );
         }
-        println!("\nFor phase-aware ISA fit and roofline evidence, run hipfire-atlas.");
-    }
-    Ok(())
-}
-
-fn collect_hsacos(
-    root: &Path,
-    filter: Option<&str>,
-    seen: &mut BTreeSet<PathBuf>,
-    out: &mut Vec<KernelArtifact>,
-) -> Result<()> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Ok(());
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_hsacos(&path, filter, seen, out)?;
-            continue;
-        }
-        if path.extension().and_then(|value| value.to_str()) != Some("hsaco") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if filter.is_some_and(|filter| !name.contains(filter)) {
-            continue;
-        }
-        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if !seen.insert(canonical.clone()) {
-            continue;
-        }
-        out.push(KernelArtifact {
-            name: name.to_owned(),
-            size_bytes: fs::metadata(&canonical).map(|meta| meta.len()).unwrap_or(0),
-            path: canonical,
-        });
+        println!("\nFor phase-aware ISA fit evidence, run hipfire-atlas.");
     }
     Ok(())
 }
@@ -4767,7 +5241,16 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let gpu_arches = detect_gpu_arches();
     let gpus = detect_amd_drm_cards();
     let hipcc = command_version("hipcc", "--version");
-    let daemon = find_daemon(paths).map(|path| path.display().to_string());
+    let daemon_path = find_daemon(paths);
+    let daemon = daemon_path.as_ref().map(|path| path.display().to_string());
+    let live_gpu = daemon_path.as_ref().and_then(|daemon| {
+        let (_, resolved) = resolved_global(paths, true).ok()?;
+        let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).ok()?;
+        let mut engine =
+            Engine::spawn_configured(daemon, &BTreeMap::new(), &process_config).ok()?;
+        engine.ping().ok()?;
+        engine.request(&serde_json::json!({ "type": "diag" })).ok()
+    });
     let gpu = gpu_arches
         .first()
         .map(|arch| serde_json::json!({ "arch": arch }))
@@ -4790,6 +5273,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         "amdgpu_loaded": amdgpu_loaded,
         "rocm": { "hipcc": hipcc },
         "daemon": daemon,
+        "live_gpu": live_gpu,
         "models": models,
         "gpu": gpu,
         "config_path": loaded_config.path,
@@ -4830,8 +5314,46 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
             loaded_config.format
         );
         println!("daemon:        {}", daemon.as_deref().unwrap_or("missing"));
+        if let Some(live) = report.get("live_gpu").filter(|value| !value.is_null()) {
+            println!(
+                "HIP GPU:       {} (HIP {})",
+                live.get("arch")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                live.get("hip_version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+            );
+            println!(
+                "VRAM:          {} MB free / {} MB total",
+                live.get("vram_free_mb")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                live.get("vram_total_mb")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            );
+            if matches!(
+                live.get("arch").and_then(serde_json::Value::as_str),
+                Some("gfx1150" | "gfx1151" | "gfx1152")
+            ) && live
+                .get("hip_version")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_major_minor)
+                .is_some_and(|version| version < (7, 2))
+            {
+                println!("WARNING: RDNA 3.5 requires ROCm/HIP 7.2 or newer.");
+            }
+        } else if daemon.is_some() {
+            println!("HIP probe:     failed (run the daemon directly for detailed startup errors)");
+        }
     }
     Ok(())
+}
+
+fn parse_major_minor(value: &str) -> Option<(u64, u64)> {
+    let mut parts = value.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 fn detect_gpu_arches() -> Vec<String> {
@@ -4868,10 +5390,10 @@ fn gfx_version_to_arch(version: u32) -> Option<&'static str> {
         90006 => Some("gfx906"),
         90008 => Some("gfx908"),
         90010 => Some("gfx90a"),
-        90400 | 90401 | 90402 => Some("gfx94x"),
+        90400..=90402 => Some("gfx94x"),
         100100 => Some("gfx1010"),
         100300 | 100302 => Some("gfx1030"),
-        110000 | 110001 | 110002 => Some("gfx1100"),
+        110000..=110002 => Some("gfx1100"),
         110500 => Some("gfx1150"),
         110501 => Some("gfx1151"),
         120000 => Some("gfx1200"),
@@ -5180,6 +5702,26 @@ fn registry_source(source: RegistrySource) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_paths(label: &str) -> Paths {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "hipfire-cli-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = ConfigPaths::under(&root);
+        Paths {
+            models: config.models.clone(),
+            registry: RegistryPaths {
+                cache: root.join("registry.cache.json"),
+            },
+            root,
+            config,
+        }
+    }
+
     #[test]
     fn model_suffix_filter_covers_current_formats() {
         assert!(is_model_file("qwen3.6-35b-a3b.mq4r"));
@@ -5187,6 +5729,63 @@ mod tests {
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
+    }
+
+    #[test]
+    fn nested_model_discovery_matches_native_registry_layout() {
+        let paths = test_paths("nested-models");
+        let nested = paths.models.join("community").join("example-model.mq4r");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        assert_eq!(
+            find_model_path(&paths, &registry, "example-model"),
+            Some(fs::canonicalize(&nested).unwrap())
+        );
+        assert!(list_local_models(&paths, &registry)
+            .unwrap()
+            .iter()
+            .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn cask_triattn_and_pflash_remain_opt_in_at_load() {
+        let paths = test_paths("experimental-defaults");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+        let entry = registry
+            .models
+            .values()
+            .find(|entry| entry.triattn.is_some())
+            .expect("bundled registry should retain a TriAttention sidecar");
+        let model_path = paths.models.join(&entry.file);
+        fs::write(&model_path, b"model").unwrap();
+        let triattn = entry.triattn.as_ref().unwrap();
+        let sidecar_path = paths.models.join(&triattn.file);
+        fs::write(&sidecar_path, b"sidecar").unwrap();
+
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let params = load_params(&defaults, Some(entry), &model_path, 64, None).unwrap();
+        assert_eq!(params["cask"], false);
+        assert_eq!(params["cask_sidecar"], "");
+        assert_eq!(params["prefill_compression"], "off");
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("memory.cask.auto_attach", "true").unwrap();
+        let enabled = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "memory.cask.auto_attach=true".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(&enabled, Some(entry), &model_path, 64, None).unwrap();
+        assert_eq!(params["cask"], false);
+        assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
+        assert_eq!(params["prefill_compression"], "off");
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     #[test]
@@ -5233,8 +5832,31 @@ mod tests {
             parse_bind(Some("[::1]:12001"), None, "0.0.0.0", 11435).unwrap(),
             ("::1".into(), 12001)
         );
-        assert_eq!(parse_pid_record("42\n"), Some(42));
-        assert_eq!(parse_pid_record(r#"{"pid":43,"token":"old"}"#), Some(43));
+        let legacy = parse_pid_record("42\n").unwrap();
+        assert_eq!(legacy.pid, 42);
+        assert!(legacy.legacy);
+        let json = parse_pid_record(r#"{"pid":43,"token":"old"}"#).unwrap();
+        assert_eq!(json.pid, 43);
+        assert_eq!(json.token.as_deref(), Some("old"));
+        assert!(!json.legacy);
+    }
+
+    #[test]
+    fn run_options_after_prompt_and_tui_passthrough_parse() {
+        let cli =
+            Cli::try_parse_from(["hipfire", "run", "qwen:test", "hello", "--max-tokens", "7"])
+                .unwrap();
+        let Some(Commands::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.prompt, ["hello"]);
+        assert_eq!(args.max_tokens, Some(7));
+
+        let cli = Cli::try_parse_from(["hipfire", "tui", "--check"]).unwrap();
+        let Some(Commands::Tui(args)) = cli.command else {
+            panic!("expected tui command");
+        };
+        assert_eq!(args.arguments, ["--check"]);
     }
 
     #[test]
@@ -5250,6 +5872,29 @@ mod tests {
         });
         let messages = normalize_openai_messages(body.get("messages"));
         assert_eq!(last_user_prompt(&messages).as_deref(), Some("onetwo"));
+    }
+
+    #[test]
+    fn openai_images_forward_one_base64_payload_and_reject_unsafe_shapes() {
+        let messages = serde_json::json!([{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,YWJj" } }
+            ]
+        }]);
+        assert_eq!(
+            request_image_base64(Some(&messages)).unwrap().as_deref(),
+            Some("YWJj")
+        );
+        let remote = serde_json::json!([{
+            "role": "user",
+            "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
+        }]);
+        assert!(request_image_base64(Some(&remote))
+            .unwrap_err()
+            .to_string()
+            .contains("remote"));
     }
 
     #[test]
@@ -5633,9 +6278,11 @@ mod tests {
 
         let completion = Completion {
             id: "chatcmpl_test".into(),
+            created: 7,
             model: "qwen:test".into(),
             content: "answer".into(),
             reasoning_content: "reason".into(),
+            preserve_thinking: false,
             tool_calls: Vec::new(),
             done: serde_json::json!({
                 "prompt_tokens": 12,
@@ -5650,12 +6297,15 @@ mod tests {
         assert_eq!(json["usage"]["total_tokens"], 19);
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
         assert_eq!(json["timings"]["decode_tok_s"], 115.0);
+        assert_eq!(json["created"], 7);
 
         let qwen_cached = Completion {
             id: "chatcmpl_qwen_cached".into(),
+            created: 8,
             model: "qwen:test".into(),
             content: "answer".into(),
             reasoning_content: String::new(),
+            preserve_thinking: false,
             tool_calls: Vec::new(),
             done: serde_json::json!({
                 "prefill_tokens": 8,
@@ -5670,6 +6320,20 @@ mod tests {
             qwen_json["usage"]["prompt_tokens_details"]["cached_tokens"],
             12
         );
+
+        let preserved = Completion {
+            preserve_thinking: true,
+            reasoning_content: "private chain".into(),
+            ..qwen_cached
+        };
+        let preserved_json = completion_json(&preserved);
+        assert_eq!(
+            preserved_json["choices"][0]["message"]["content"],
+            "<think>private chain</think>\nanswer"
+        );
+        assert!(preserved_json["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none());
     }
 
     #[test]

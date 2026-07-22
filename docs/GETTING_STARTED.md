@@ -186,11 +186,13 @@ hipfire config set dflash_mode auto    # or on / per-model
 
 ## Long context (optional)
 
-CASK/TriAttention eviction is **not** required for short prompts. When you need long context on limited VRAM:
+CASK/TriAttention eviction is experimental and disabled by default. It is
+**not** required for short prompts. When deliberately testing it for long
+context on limited VRAM:
 
 1. Prefer models whose `pull` ships a `.triattn.bin` sidecar, **or** generate one: `hipfire sidecar-gen <model>`.
-2. Pick a profile: `hipfire config cask-profile balanced` (or `conservative` / `aggressive-vram` / `off`).
-3. Read constraints (A3B, DFlash + m-fold) in [CONFIG.md](CONFIG.md) before enabling on MoE or with DFlash.
+2. Set `cask_sidecar` to that exact path. Enable `cask` separately only when m-folding is intended.
+3. Read constraints (A3B, DFlash + m-fold) in [CONFIG.md](CONFIG.md) before enabling on MoE or with DFlash. `cask_auto_attach` remains `false` unless explicitly opted in.
 
 ## If something fails
 
@@ -216,6 +218,6 @@ tail -f ~/.hipfire/serve.log
 | [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
 | [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |
 | [MODELS.md](MODELS.md) | Tags, VRAM, BYO quantize, thinking/templates |
-| [CONFIG.md](CONFIG.md) | All config keys and CASK profiles |
+| [CONFIG.md](CONFIG.md) | All config keys and experimental CASK/TriAttention opt-ins |
 | [QUANTIZE.md](QUANTIZE.md) | `hipfire quantize` operator guide |
 | [INDEX.md](INDEX.md) | Ownership map for the rest of `docs/` |

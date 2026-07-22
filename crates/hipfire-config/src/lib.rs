@@ -440,9 +440,7 @@ macro_rules! process_field {
 
 macro_rules! diagnostic_field {
     ($key:literal, $legacy:literal, $default:expr, $rule:expr, $env:literal, $help:literal) => {
-        bridge_field!(
-            $key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help
-        )
+        bridge_field!($key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help)
     };
 }
 
@@ -895,12 +893,12 @@ pub static FIELDS: &[ConfigField] = &[
         "cask_auto_attach",
         Memory,
         ModelLoad,
-        DefaultValue::Bool(true),
+        DefaultValue::Bool(false),
         ValueRule::Bool,
         true,
         false,
         None,
-        "Discover a matching TriAttention sidecar."
+        "Discover a matching TriAttention sidecar when explicitly enabled."
     ),
     field!(
         "prompt.normalize",
@@ -1153,10 +1151,7 @@ pub static FIELDS: &[ConfigField] = &[
         "diagnostic.pflash.score_layer",
         "pflash_score_layer",
         DefaultValue::Null,
-        ValueRule::NullableInteger {
-            min: 0,
-            max: 65535
-        },
+        ValueRule::NullableInteger { min: 0, max: 65535 },
         "HIPFIRE_PFLASH_SCORE_LAYER",
         "Override the PFlash scoring layer; null uses model policy."
     ),
@@ -2684,10 +2679,7 @@ impl ProcessConfig {
     /// parser. This is an in-memory adapter only; it does not mutate or inspect
     /// the ambient process environment.
     pub fn legacy_value(&self, name: &str) -> Option<String> {
-        if let Some(schema) = FIELDS
-            .iter()
-            .find(|schema| schema.env_compat == Some(name))
-        {
+        if let Some(schema) = FIELDS.iter().find(|schema| schema.env_compat == Some(name)) {
             return self.values.get(schema.key).and_then(render_compat_value);
         }
         let key = developer_key_for_env(name)?;
@@ -2717,9 +2709,7 @@ pub fn synchronized_device_visibility(
     }
 
     let hip = hip_visible.map(normalize_device_visibility).transpose()?;
-    let rocr = rocr_visible
-        .map(normalize_device_visibility)
-        .transpose()?;
+    let rocr = rocr_visible.map(normalize_device_visibility).transpose()?;
     match (hip, rocr) {
         (Some(hip), Some(rocr)) => {
             let expected_hip = logical_device_list(device_count(&rocr));
@@ -3767,6 +3757,29 @@ mod tests {
     }
 
     #[test]
+    fn experimental_memory_and_prefill_features_default_off() {
+        assert_eq!(
+            field("memory.cask.enabled").unwrap().default.to_value(),
+            ConfigValue::Bool(false)
+        );
+        assert_eq!(
+            field("memory.cask.auto_attach").unwrap().default.to_value(),
+            ConfigValue::Bool(false)
+        );
+        assert_eq!(
+            field("memory.cask.sidecar").unwrap().default.to_value(),
+            ConfigValue::String(String::new())
+        );
+        assert_eq!(
+            field("speculation.prefill.mode")
+                .unwrap()
+                .default
+                .to_value(),
+            ConfigValue::String("off".into())
+        );
+    }
+
+    #[test]
     fn legacy_json_maps_to_canonical_keys() {
         let root = temp_root("legacy");
         fs::create_dir_all(&root).unwrap();
@@ -3818,12 +3831,8 @@ mod tests {
         layer.set_cli("generation.top_p", "0.95").unwrap();
         layer.set_cli("generation.top_k", "40").unwrap();
         layer.set_cli("generation.min_p", "0.05").unwrap();
-        layer
-            .set_cli("generation.presence_penalty", "1.5")
-            .unwrap();
-        layer
-            .set_cli("generation.repeat_penalty", "1.05")
-            .unwrap();
+        layer.set_cli("generation.presence_penalty", "1.5").unwrap();
+        layer.set_cli("generation.repeat_penalty", "1.05").unwrap();
         layer
             .set_cli("prompt.system", "Registry-compatible system prompt")
             .unwrap();
@@ -3875,9 +3884,7 @@ mod tests {
             Some("1")
         );
         assert_eq!(
-            process
-                .legacy_value("HIPFIRE_EXPERIMENTAL_MODE")
-                .as_deref(),
+            process.legacy_value("HIPFIRE_EXPERIMENTAL_MODE").as_deref(),
             Some("on")
         );
         let _ = fs::remove_dir_all(root);
@@ -3908,16 +3915,12 @@ mod tests {
             .set_cli("diagnostic.kernel.rdna2_variant", "5")
             .unwrap();
         layer.set_cli("kernel.lm_head_f16", "f32").unwrap();
-        assert!(
-            layer
-                .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
-                .is_err()
-        );
-        assert!(
-            layer
-                .set_cli("diagnostic.kernel.rdna2_variant", "6")
-                .is_err()
-        );
+        assert!(layer
+            .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
+            .is_err());
+        assert!(layer
+            .set_cli("diagnostic.kernel.rdna2_variant", "6")
+            .is_err());
 
         write_global_toml(&paths, &layer).unwrap();
         let loaded = load_global(&paths).unwrap();
@@ -4053,12 +4056,10 @@ mod tests {
         let wrong_version = encoded.replace("\"schema_version\":1", "\"schema_version\":2");
         let decoded: ProcessConfig = serde_json::from_str(&wrong_version).unwrap();
         assert!(decoded.validate().is_err());
-        assert!(
-            serde_json::from_str::<ProcessConfig>(
-                r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_str::<ProcessConfig>(
+            r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
+        )
+        .is_err());
     }
 
     #[test]

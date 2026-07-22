@@ -28,8 +28,10 @@ Current scope:
 - The Models tab groups registry entries and local-only model files by family.
   `Enter` expands/collapses a family, and `Enter` on a model selects it for
   this TUI session without mutating config.
-- Settings are read-only in this spike. Tools such as quantizer, AWQ import,
-  and TriAttention sidecar workflows are intentionally visible only as runway.
+- Settings edit and persist global typed TOML values. Per-model overlays remain
+  available through `hipfire config <tag> set ...`. Tools such as quantizer,
+  AWQ import, and TriAttention sidecar workflows are intentionally outside the
+  default TUI path.
 
 Out of scope for this spike:
 

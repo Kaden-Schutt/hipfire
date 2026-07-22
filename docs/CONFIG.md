@@ -23,7 +23,9 @@ Copyable sparse profiles for users, kernel developers, and retained-PM4 work
 live in [`docs/configs/`](configs/README.md). They include direct mappings from
 historical `HIPFIRE_*` inputs to their persistent TOML keys.
 
-Edit interactively: `hipfire config` or `hipfire config <tag>`. Non-interactive: `hipfire config set <key> <value>` / `hipfire config <tag> set <key> <value>`.
+Edit global settings interactively with `hipfire config`. Per-model overlays use
+the typed commands: `hipfire config <tag> list|get|set|reset ...`. Global
+non-interactive edits use `hipfire config list|get|set|reset ...`.
 
 **Precedence (operator view):** one-shot CLI values **>** legacy-compatible
 process env **>** per-model override **>** global TOML **>** registry card
@@ -44,7 +46,9 @@ Process and diagnostic keys are global-only. `hipfire config <model> set ...`
 rejects them because the daemon snapshots these values once; claiming a
 per-model override inside a long-lived serve process would be misleading.
 
-This page is the normative **key/default/enum** table. Procedures for CASK profiles, PFlash bypass reasons, and multi-GPU topology live in linked owners — not duplicated matrices here.
+This page is the normative **key/default/enum** table. CASK/TriAttention and
+PFlash are experimental opt-ins; multi-GPU topology lives in its linked owner
+rather than a duplicated matrix here.
 
 ---
 
@@ -298,12 +302,15 @@ compatibility overrides.
 | `cask_beta` | `128` | int 0–65536 |
 | `cask_core_frac` | `0.5` | number 0.0–1.0 |
 | `cask_fold_m` | `2` | int 1–16 |
-| `cask_auto_attach` | `true` | bool |
+| `cask_auto_attach` | `false` | bool |
 
 Developer escapes use `[developer] cask_off = true` and
 `force_a3b_eviction = true`; the old names remain one-shot aliases.
 
-Sidecar generation: `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
+TriAttention and CASK are experimental, opt-in features. A downloaded sidecar
+does not attach by default. To experiment, set `cask_sidecar` explicitly or set
+`cask_auto_attach=true`; set `cask=true` only when core-aware m-folding is also
+intended. Sidecar generation: `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
 
 ---
 
