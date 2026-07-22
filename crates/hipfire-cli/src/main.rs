@@ -1944,6 +1944,9 @@ struct ThinkChannelRouter {
     in_think: bool,
     pending: String,
     strip_answer_newlines: bool,
+    semantic_split: bool,
+    semantic_pending: String,
+    semantic_reasoning: Option<bool>,
 }
 
 impl ThinkChannelRouter {
@@ -1952,12 +1955,33 @@ impl ThinkChannelRouter {
     }
 
     fn push(&mut self, text: &str) -> Vec<ThinkFragment> {
+        if self.semantic_split {
+            return self.push_semantic(text, false);
+        }
         self.pending.push_str(text);
         self.drain(false)
     }
 
+    fn push_semantic(&mut self, text: &str, reasoning: bool) -> Vec<ThinkFragment> {
+        let mut out = if self.pending.is_empty() {
+            Vec::new()
+        } else {
+            self.drain(true)
+        };
+        self.semantic_split = true;
+        if self.semantic_reasoning != Some(reasoning) {
+            out.extend(self.drain_semantic(true));
+            self.semantic_reasoning = Some(reasoning);
+        }
+        self.semantic_pending.push_str(text);
+        out.extend(self.drain_semantic(false));
+        out
+    }
+
     fn finish(&mut self) -> Vec<ThinkFragment> {
-        self.drain(true)
+        let mut out = self.drain(true);
+        out.extend(self.drain_semantic(true));
+        out
     }
 
     fn drain(&mut self, flush: bool) -> Vec<ThinkFragment> {
@@ -1965,14 +1989,17 @@ impl ThinkChannelRouter {
         const CLOSE: &str = "</think>";
         let mut out = Vec::new();
         loop {
-            let marker = if self.in_think { CLOSE } else { OPEN };
-            if let Some(index) = self.pending.find(marker) {
+            if let Some((index, marker)) = next_control_marker(&self.pending) {
                 let before = self.pending[..index].to_owned();
                 self.emit(before, &mut out);
                 self.pending.drain(..index + marker.len());
-                self.in_think = !self.in_think;
-                if !self.in_think {
-                    self.strip_answer_newlines = true;
+                match marker {
+                    OPEN => self.in_think = true,
+                    CLOSE => {
+                        self.in_think = false;
+                        self.strip_answer_newlines = true;
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -1980,13 +2007,38 @@ impl ThinkChannelRouter {
             let held = if flush {
                 0
             } else {
-                longest_marker_prefix_suffix(&self.pending, marker)
+                longest_control_prefix_suffix(&self.pending)
             };
             let emit_len = self.pending.len().saturating_sub(held);
             if emit_len > 0 {
                 let text = self.pending[..emit_len].to_owned();
                 self.pending.drain(..emit_len);
                 self.emit(text, &mut out);
+            }
+            break;
+        }
+        out
+    }
+
+    fn drain_semantic(&mut self, flush: bool) -> Vec<ThinkFragment> {
+        let mut out = Vec::new();
+        loop {
+            if let Some((index, marker)) = next_control_marker(&self.semantic_pending) {
+                let before = self.semantic_pending[..index].to_owned();
+                self.emit_semantic(before, &mut out);
+                self.semantic_pending.drain(..index + marker.len());
+                continue;
+            }
+            let held = if flush {
+                0
+            } else {
+                longest_control_prefix_suffix(&self.semantic_pending)
+            };
+            let emit_len = self.semantic_pending.len().saturating_sub(held);
+            if emit_len > 0 {
+                let text = self.semantic_pending[..emit_len].to_owned();
+                self.semantic_pending.drain(..emit_len);
+                self.emit_semantic(text, &mut out);
             }
             break;
         }
@@ -2011,13 +2063,46 @@ impl ThinkChannelRouter {
             out.push(ThinkFragment::Content(text));
         }
     }
+
+    fn emit_semantic(&self, text: String, out: &mut Vec<ThinkFragment>) {
+        if text.is_empty() {
+            return;
+        }
+        if self.semantic_reasoning == Some(true) {
+            out.push(ThinkFragment::Reasoning(text));
+        } else {
+            out.push(ThinkFragment::Content(text));
+        }
+    }
 }
 
-fn longest_marker_prefix_suffix(text: &str, marker: &str) -> usize {
-    let max = text.len().min(marker.len().saturating_sub(1));
-    (1..=max)
-        .rev()
-        .find(|&len| text.ends_with(&marker[..len]))
+const OUTPUT_CONTROL_MARKERS: &[&str] = &[
+    "<think>",
+    "</think>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|end_of_text|>",
+    "<|eot_id|>",
+];
+
+fn next_control_marker(text: &str) -> Option<(usize, &'static str)> {
+    OUTPUT_CONTROL_MARKERS
+        .iter()
+        .filter_map(|marker| text.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn longest_control_prefix_suffix(text: &str) -> usize {
+    OUTPUT_CONTROL_MARKERS
+        .iter()
+        .map(|marker| {
+            let max = text.len().min(marker.len().saturating_sub(1));
+            (1..=max)
+                .rev()
+                .find(|&len| text.ends_with(&marker[..len]))
+                .unwrap_or(0)
+        })
+        .max()
         .unwrap_or(0)
 }
 
@@ -2813,28 +2898,36 @@ fn complete_request(
             }
             Some("token") => {
                 if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                    for fragment in think_router.push(text) {
-                        let logical = match fragment {
-                            ThinkFragment::Content(text) => {
-                                content.push_str(&text);
-                                serde_json::json!({ "type": "token", "text": text })
-                            }
-                            ThinkFragment::Reasoning(text) => {
-                                reasoning_content.push_str(&text);
-                                serde_json::json!({ "type": "reasoning", "text": text })
-                            }
-                        };
-                        event_callback(&logical).map_err(|error| {
-                            hipfire_client::ClientError::Protocol(error.to_string())
-                        })?;
-                    }
+                    let fragments = if event
+                        .get("reasoning")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        think_router.push_semantic(text, true)
+                    } else {
+                        think_router.push(text)
+                    };
+                    forward_think_fragments(
+                        fragments,
+                        &mut content,
+                        &mut reasoning_content,
+                        &mut event_callback,
+                    )
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
                 }
                 return Ok(());
             }
             Some("reasoning") => {
                 if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                    reasoning_content.push_str(text);
+                    forward_think_fragments(
+                        think_router.push_semantic(text, true),
+                        &mut content,
+                        &mut reasoning_content,
+                        &mut event_callback,
+                    )
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
                 }
+                return Ok(());
             }
             Some("tool_calls") => {
                 if let Some(calls) = event.get("calls").and_then(serde_json::Value::as_array) {
@@ -2842,21 +2935,13 @@ fn complete_request(
                 }
             }
             Some("done") => {
-                for fragment in think_router.finish() {
-                    let logical = match fragment {
-                        ThinkFragment::Content(text) => {
-                            content.push_str(&text);
-                            serde_json::json!({ "type": "token", "text": text })
-                        }
-                        ThinkFragment::Reasoning(text) => {
-                            reasoning_content.push_str(&text);
-                            serde_json::json!({ "type": "reasoning", "text": text })
-                        }
-                    };
-                    event_callback(&logical).map_err(|error| {
-                        hipfire_client::ClientError::Protocol(error.to_string())
-                    })?;
-                }
+                forward_think_fragments(
+                    think_router.finish(),
+                    &mut content,
+                    &mut reasoning_content,
+                    &mut event_callback,
+                )
+                .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
             }
             _ => {}
         }
@@ -2879,6 +2964,28 @@ fn complete_request(
         tool_calls,
         done,
     })
+}
+
+fn forward_think_fragments(
+    fragments: Vec<ThinkFragment>,
+    content: &mut String,
+    reasoning_content: &mut String,
+    event_callback: &mut impl FnMut(&serde_json::Value) -> Result<()>,
+) -> Result<()> {
+    for fragment in fragments {
+        let logical = match fragment {
+            ThinkFragment::Content(text) => {
+                content.push_str(&text);
+                serde_json::json!({ "type": "token", "text": text })
+            }
+            ThinkFragment::Reasoning(text) => {
+                reasoning_content.push_str(&text);
+                serde_json::json!({ "type": "reasoning", "text": text })
+            }
+        };
+        event_callback(&logical)?;
+    }
+    Ok(())
 }
 
 impl ServeRuntime {
@@ -5109,6 +5216,62 @@ mod tests {
         assert_eq!(
             router.push("direct answer"),
             vec![ThinkFragment::Content("direct answer".into())]
+        );
+    }
+
+    #[test]
+    fn model_literal_think_frames_route_consistently() {
+        for family in ["qwen", "lfm", "minimax"] {
+            let mut router = ThinkChannelRouter::default();
+            router.set_started_in_think(true);
+            let mut fragments = router.push(&format!("{family} reasoning</thi"));
+            fragments.extend(router.push("nk>\n\nvisible<|im_"));
+            fragments.extend(router.push("end|>"));
+            fragments.extend(router.finish());
+            assert_eq!(
+                fragments,
+                vec![
+                    ThinkFragment::Reasoning(format!("{family} reasoning")),
+                    ThinkFragment::Content("visible".into()),
+                ],
+                "{family}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_semantic_channels_override_literal_think_state() {
+        for family in ["deepseek", "cohere"] {
+            let mut router = ThinkChannelRouter::default();
+            router.set_started_in_think(true);
+            let mut fragments = router.push_semantic(&format!("{family} reason<|im_"), true);
+            fragments.extend(router.push_semantic("end|>", true));
+            fragments.extend(router.push("visible answer"));
+            fragments.extend(router.finish());
+            assert_eq!(
+                fragments,
+                vec![
+                    ThinkFragment::Reasoning(format!("{family} reason")),
+                    ThinkFragment::Content("visible answer".into()),
+                ],
+                "{family}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_router_removes_orphan_close_and_split_terminators() {
+        let mut router = ThinkChannelRouter::default();
+        let mut fragments = router.push("</thi");
+        fragments.extend(router.push("nk>\n\nanswer<|endof"));
+        fragments.extend(router.push("text|>tail"));
+        fragments.extend(router.finish());
+        assert_eq!(
+            fragments,
+            vec![
+                ThinkFragment::Content("answer".into()),
+                ThinkFragment::Content("tail".into()),
+            ]
         );
     }
 
