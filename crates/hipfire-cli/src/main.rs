@@ -2760,11 +2760,12 @@ fn complete_request(
     if runtime.current_max_seq < required_max_seq {
         runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
     }
+    let normalized_messages = normalize_openai_messages(body.get("messages"));
     let mut generate = serde_json::json!({
         "type": "generate",
         "id": request_id(),
-        "prompt": last_user_prompt(body).unwrap_or_else(|| "Hello".into()),
-        "messages": body.get("messages").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
+        "messages": normalized_messages,
         "max_tokens": max_tokens,
     });
     for (key, config_key) in [
@@ -2935,24 +2936,131 @@ impl ServeRuntime {
     }
 }
 
-fn last_user_prompt(body: &serde_json::Value) -> Option<String> {
-    body.get("messages")?
+fn openai_content_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn strip_inline_thinking(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut visible = String::new();
+    let mut remaining = text;
+    while let Some(open) = remaining.find(OPEN) {
+        visible.push_str(&remaining[..open]);
+        let after_open = &remaining[open + OPEN.len()..];
+        let Some(close) = after_open.find(CLOSE) else {
+            return visible;
+        };
+        remaining = after_open[close + CLOSE.len()..].trim_start();
+    }
+    visible.push_str(remaining);
+    visible
+}
+
+fn inline_thinking(text: &str) -> Option<String> {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let after_open = text.split_once(OPEN)?.1;
+    let reasoning = after_open.split_once(CLOSE)?.0.trim();
+    (!reasoning.is_empty()).then(|| reasoning.to_owned())
+}
+
+fn normalize_openai_tool_call(call: &serde_json::Value) -> serde_json::Value {
+    let function = call.get("function").unwrap_or(call);
+    let name = function
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let arguments = match function.get("arguments") {
+        Some(serde_json::Value::String(raw)) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({ "_raw": raw }))
+        }
+        Some(value) => value.clone(),
+        None => serde_json::json!({}),
+    };
+    serde_json::json!({ "name": name, "arguments": arguments })
+}
+
+fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return serde_json::json!([]);
+    };
+    let normalized = messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.get("role").and_then(serde_json::Value::as_str)? {
+                "developer" => "system",
+                "toolResult" | "tool_result" => "tool",
+                role @ ("system" | "user" | "assistant" | "tool") => role,
+                _ => return None,
+            };
+            let raw_content = openai_content_text(message.get("content"));
+            let mut entry = serde_json::json!({
+                "role": role,
+                "content": if role == "assistant" {
+                    strip_inline_thinking(&raw_content)
+                } else {
+                    raw_content.clone()
+                },
+            });
+            if role == "assistant" {
+                let reasoning = message
+                    .get("reasoning")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .or_else(|| {
+                        message
+                            .get("reasoning_content")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|text| !text.is_empty())
+                    })
+                    .map(str::to_owned)
+                    .or_else(|| inline_thinking(&raw_content));
+                if let Some(reasoning) = reasoning {
+                    entry["tool_plan"] = serde_json::Value::String(reasoning);
+                }
+                if let Some(calls) = message
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|calls| !calls.is_empty())
+                {
+                    entry["tool_calls"] = serde_json::Value::Array(
+                        calls.iter().map(normalize_openai_tool_call).collect(),
+                    );
+                }
+            } else if role == "tool" {
+                if let Some(tool_call_id) = message
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    entry["tool_call_id"] = serde_json::Value::String(tool_call_id.to_owned());
+                }
+            }
+            Some(entry)
+        })
+        .collect();
+    serde_json::Value::Array(normalized)
+}
+
+fn last_user_prompt(messages: &serde_json::Value) -> Option<String> {
+    messages
         .as_array()?
         .iter()
         .rev()
         .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
         .and_then(|message| message.get("content"))
-        .and_then(|content| match content {
-            serde_json::Value::String(text) => Some(text.clone()),
-            serde_json::Value::Array(parts) => Some(
-                parts
-                    .iter()
-                    .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            _ => None,
-        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn completion_json(completion: &Completion) -> serde_json::Value {
@@ -4912,7 +5020,70 @@ mod tests {
                 ] }
             ]
         });
-        assert_eq!(last_user_prompt(&body).as_deref(), Some("one\ntwo"));
+        let messages = normalize_openai_messages(body.get("messages"));
+        assert_eq!(last_user_prompt(&messages).as_deref(), Some("onetwo"));
+    }
+
+    #[test]
+    fn openai_messages_normalize_roles_content_and_tool_history() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "developer", "content": "system policy" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "first" },
+                    { "type": "image_url", "image_url": { "url": "ignored" } },
+                    { "type": "text", "text": " second" }
+                ] },
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "tool reasoning",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\"}"
+                        }
+                    }]
+                },
+                { "role": "toolResult", "tool_call_id": "call_1", "content": "done" },
+                { "role": "unsupported", "content": "drop me" }
+            ]
+        });
+        let normalized = normalize_openai_messages(body.get("messages"));
+        assert_eq!(normalized.as_array().unwrap().len(), 4);
+        assert_eq!(normalized[0]["role"], "system");
+        assert_eq!(normalized[1]["content"], "first second");
+        assert_eq!(normalized[2]["content"], "");
+        assert_eq!(normalized[2]["tool_plan"], "tool reasoning");
+        assert_eq!(normalized[2]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(
+            normalized[2]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "path": "README.md" })
+        );
+        assert_eq!(normalized[3]["role"], "tool");
+        assert_eq!(normalized[3]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn openai_assistant_history_strips_thinking_and_preserves_fallback_arguments() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>private plan</think>\n\nvisible answer",
+                "tool_calls": [{
+                    "function": { "name": "broken", "arguments": "not-json" }
+                }]
+            }]
+        });
+        let normalized = normalize_openai_messages(body.get("messages"));
+        assert_eq!(normalized[0]["content"], "visible answer");
+        assert_eq!(normalized[0]["tool_plan"], "private plan");
+        assert_eq!(
+            normalized[0]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "_raw": "not-json" })
+        );
     }
 
     #[test]
