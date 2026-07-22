@@ -129,7 +129,11 @@ def show_config(cfg):
     print(f"  kv_mode       : {cfg['kv']}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {cfg['thinking_cap_tokens']} tok (CONCRETE cap)")
-    print(f"  max_tokens     : {cfg['max_tokens']}  ({'>cap, model can answer' if cfg['max_tokens'] > cfg['thinking_cap_tokens'] or cfg['thinking_cap_tokens']==0 else 'WARNING: <= think cap -> empty/think-only risk'})")
+    _cap = cfg['thinking_cap_tokens']
+    _note = ('uncapped think budget' if _cap == 0
+             else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
+             else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail')
+    print(f"  max_tokens     : {cfg['max_tokens']}  ({_note})")
     print("  sampling (what IS set):")
     for k in SAMPLE_KEYS:
         if k in cfg["sampling"]:
@@ -403,6 +407,14 @@ def main():
     show_config(cfg)
     if args.show_config:
         return
+    if cfg['thinking_cap_tokens'] and args.max_tokens <= cfg['thinking_cap_tokens']:
+        sys.exit(
+            f"serve_harness: max_tokens ({args.max_tokens}) <= thinking budget "
+            f"'{cfg['thinking_budget']}' ({cfg['thinking_cap_tokens']} tok) guarantees "
+            f"think-only output with zero visible answer. Raise --max-tokens above "
+            f"{cfg['thinking_cap_tokens']}, lower --thinking (low={THINKING_BUDGET['low']}), "
+            f"or use --thinking uncapped."
+        )
     if not args.no_spawn:
         if not spawn_serve(cfg, args.home, args.serve_log):
             sys.exit("serve_harness: serve failed to warm after retries")
