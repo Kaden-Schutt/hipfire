@@ -29,9 +29,10 @@ use crate::types::*;
 
 // ── MoE eligibility lattice ────────────────────────────
 
-/// Routed-expert tiers the mixed-tier bucketed decode path can execute: the
-/// tiers for which per-tier indexed gate_up/down GEMV kernels exist (see
-/// `run_moe_decode_mixed`). A per-expert tier table containing any other DType
+/// Routed-expert tiers the mixed-tier graded decode path can execute: the
+/// tiers for which per-tier indexed gate_up/down GEMV kernels exist (served
+/// on-device via `run_moe_decode`'s `expert_dtype_tags` branch). A per-expert
+/// tier table containing any other DType
 /// cannot be served by the mixed path and is rejected up front with a clear
 /// error rather than failing deep in the per-bucket dispatch.
 pub const MIXED_SUPPORTED_TIERS: [DType; 3] = [DType::MQ4G256, DType::MQ6G256, DType::ParoQ4G128];
