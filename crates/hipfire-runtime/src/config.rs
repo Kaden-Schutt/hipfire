@@ -159,7 +159,17 @@ impl RuntimeConfig {
             max_total_think_tokens: value("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
-            devices: value("HIPFIRE_DEVICES").filter(|value| !value.is_empty()),
+            // `hardware.devices` is installed as physical ROCr selectors and
+            // matching logical HIP selectors before GPU initialization. The
+            // engine therefore addresses the filtered set as logical 0..N-1.
+            devices: value("HIPFIRE_DEVICES")
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    (0..value.split(',').count())
+                        .map(|device| device.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }),
             allow_mixed_arch: value("HIPFIRE_ALLOW_MIXED_ARCH").as_deref() == Some("1"),
             uniform_vram_tolerance_gb: value("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
                 .and_then(|s| s.parse().ok()),
@@ -221,7 +231,7 @@ mod tests {
 
         assert!(!config.normalize_prompt);
         assert_eq!(config.ngram_loop_threshold, 12);
-        assert_eq!(config.devices.as_deref(), Some("2,3"));
+        assert_eq!(config.devices.as_deref(), Some("0,1"));
         assert!(config.prefill_batched, "sparse arch defaults remain intact");
     }
 

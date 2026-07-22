@@ -87,8 +87,9 @@ pub struct Gpus {
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
 
 impl Gpus {
-    /// Construct `n_devices` `Gpu` instances bound to logical IDs taken from
-    /// `HIPFIRE_DEVICES` (or the first N visible if unset). Layers are split
+    /// Construct `n_devices` `Gpu` instances bound to logical IDs derived from
+    /// synchronized `hardware.devices` visibility (or the first N visible if
+    /// unset). Layers are split
     /// uniformly: max-min ≤ 1 layer per band. Pre-flight VRAM check enforces
     /// arch match and bounded VRAM delta (override
     /// `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB`, default 2 GiB).
@@ -658,9 +659,9 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Resolve the device IDs to use. Logical IDs post-`HIP_VISIBLE_DEVICES`:
-/// `HIPFIRE_DEVICES=0,1` selects the first two HIP-visible devices. When
-/// unset, takes the first `n_devices` visible IDs.
+/// Resolve logical device IDs after the physical `hardware.devices` list has
+/// been installed as `ROCR_VISIBLE_DEVICES` and HIP has received the matching
+/// post-filter logical IDs. When unset, take the first `n_devices` visible IDs.
 fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
     if let Some(ref s) = crate::config::get().devices {
         let ids: Vec<i32> = s
@@ -669,12 +670,12 @@ fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
             .filter(|p| !p.is_empty())
             .map(|p| p.parse::<i32>())
             .collect::<Result<_, _>>()
-            .map_err(|e| HipError::new(0, &format!("HIPFIRE_DEVICES parse: {e}")))?;
+            .map_err(|e| HipError::new(0, &format!("hardware.devices parse: {e}")))?;
         if ids.len() < n_devices {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "HIPFIRE_DEVICES has {} ids but n_devices = {n_devices}",
+                    "hardware.devices exposes {} ids but n_devices = {n_devices}",
                     ids.len(),
                 ),
             ));

@@ -235,7 +235,27 @@ impl Engine {
         environment: &BTreeMap<String, String>,
         config: &hipfire_config::ProcessConfig,
     ) -> Result<Self> {
-        let mut engine = Self::spawn(daemon, environment)?;
+        let mut environment = environment.clone();
+        let hip = environment
+            .get(hipfire_config::HIP_VISIBLE_DEVICES)
+            .cloned()
+            .or_else(|| std::env::var(hipfire_config::HIP_VISIBLE_DEVICES).ok());
+        let rocr = environment
+            .get(hipfire_config::ROCR_VISIBLE_DEVICES)
+            .cloned()
+            .or_else(|| std::env::var(hipfire_config::ROCR_VISIBLE_DEVICES).ok());
+        let visibility = hipfire_config::synchronized_device_visibility(
+            config,
+            hip.as_deref(),
+            rocr.as_deref(),
+        )
+        .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        if let Some(visibility) = visibility {
+            environment.insert(hipfire_config::HIP_VISIBLE_DEVICES.into(), visibility.hip);
+            environment.insert(hipfire_config::ROCR_VISIBLE_DEVICES.into(), visibility.rocr);
+        }
+
+        let mut engine = Self::spawn(daemon, &environment)?;
         let response = engine.request(&serde_json::json!({
             "type": "configure",
             "config": config,
@@ -411,11 +431,19 @@ mod tests {
         let daemon = root.join("daemon");
         fs::write(
             &daemon,
-            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) configured=1; echo '{\"type\":\"configured\"}' ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
+            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) if [ \"$HIP_VISIBLE_DEVICES\" = '0,1' ] && [ \"$ROCR_VISIBLE_DEVICES\" = '2,3' ]; then configured=1; echo '{\"type\":\"configured\"}'; else echo '{\"type\":\"error\",\"message\":\"device visibility is not synchronized\"}'; fi ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
         )
         .unwrap();
         fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
-        let resolved = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let mut layer = hipfire_config::ConfigLayer::default();
+        layer.set_cli("hardware.devices", "2,3").unwrap();
+        let resolved = hipfire_config::resolve([hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::GlobalUser {
+                path: root.join("config.toml"),
+            },
+            layer,
+        }])
+        .unwrap();
         let config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
         let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &config).unwrap();
         engine.ping().unwrap();

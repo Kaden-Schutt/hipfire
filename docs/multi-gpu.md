@@ -49,9 +49,10 @@ raw daemon JSONL `load` (or any client that builds that message). Examples and
 
 Source of truth: `Gpus` in `multi_gpu.rs`.
 
-1. **Device pick** — logical IDs after `HIP_VISIBLE_DEVICES` /
-   `ROCR_VISIBLE_DEVICES`. Optional `HIPFIRE_DEVICES=0,1,…` selects among the
-   already-visible set (`resolve_device_ids`). Unset → first `N` visible IDs.
+1. **Device pick** — `hardware.devices = "0,1,..."` is the physical visibility
+   list. Startup installs it as `ROCR_VISIBLE_DEVICES` and gives HIP the
+   matching post-filter logical list `0..N-1`; this avoids compounded nonzero
+   filters while keeping both backends on the same physical GPUs.
 2. **Layer map**
    - Default: `Gpus::init_uniform(pp, n_layers)` — contiguous bands,
      `base = n_layers / N`, remainder distributed so max−min ≤ 1 layer.
@@ -106,11 +107,8 @@ load; copies fall back to host staging.
 Example process:
 
 ```sh
-# Restrict visible dGPUs (drop iGPU if needed)
-export HIP_VISIBLE_DEVICES=0,1
-
-# Optional: pin logical IDs after the visible filter
-export HIPFIRE_DEVICES=0,1
+# Persist one physical device list for both HIP and ROCr.
+hipfire config set hardware.devices 0,1
 
 # Optional: asymmetric bands (must sum to n_layers, length == pp)
 # export HIPFIRE_PP_LAYERS=16,16
@@ -138,8 +136,9 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 
 | Variable | Role |
 |---|---|
-| `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` | ROCm device filter (host) |
-| `HIPFIRE_DEVICES` | Logical IDs among visible devices |
+| `hardware.devices` | Persistent physical device list; lowers to ROCr physical selectors and matching HIP logical selectors before initialization |
+| `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` | Legacy one-shot filters; compatible pairs are normalized and ambiguous pairs fail closed |
+| `HIPFIRE_DEVICES` | Legacy compatibility alias for `hardware.devices` |
 | `HIPFIRE_PP_LAYERS` | Explicit per-device layer counts for PP |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | `init_uniform` / `init_tp` free-VRAM delta |
 | `HIPFIRE_ALLOW_MIXED_ARCH` | Opt into mixed-arch device sets |
@@ -395,7 +394,7 @@ Direct daemon JSON (driving without the CLI):
 
 | Variable | Effect |
 |----------|--------|
-| `HIP_VISIBLE_DEVICES=0,1` | HIP runtime device filter (standard ROCm) |
+| `hardware.devices = "3,1"` | ROCr physical filter `3,1`; HIP and the engine receive matching logical devices `0,1` |
 | `HIPFIRE_DETERMINISTIC=1` | Force k2 WMMA reduction (no atomicAdd) — bit-identical across processes/pp configs at ~33% perf cost on small-batch decode |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB=N` | Pre-flight VRAM-asymmetry tolerance for `Gpus::init_uniform` (default 2.0) |
 | `HIPFIRE_PREFILL_BATCHED=0` | Disable batched WMMA prefill (per-token fallback). Diagnostic for ksplit non-det isolation |
@@ -482,4 +481,4 @@ should work. If not, hipfire falls back to host-staging via pinned buffers (slow
 
 - DFlash + PP integration scope — pending maintainer guidance on issue #58
 - Whether mixed-arch should be soft-warn or hard-fail — currently hard-fail
-- API surface for `HIPFIRE_DEVICES` — current direction is logical IDs post-VISIBLE
+- `hardware.devices` is the physical visibility source of truth; startup lowers ROCr physical selectors to matching HIP logical `0..N-1`

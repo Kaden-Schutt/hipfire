@@ -156,7 +156,7 @@ Eager LFM prefill remains available when the batch flag is off **or** the GPU is
 | `HIPFIRE_MAX_REQUEST_BYTES` | Body cap |
 | `HIPFIRE_SERVE_MAX_QUEUE` / `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | Admission queue |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | Research budget nudge |
-| `HIPFIRE_DEVICES` / `HIPFIRE_TP` / `HIPFIRE_TP_USE_RCCL` | Multi-GPU / TP |
+| `HIPFIRE_DEVICES` / `HIPFIRE_TP` / `HIPFIRE_TP_USE_RCCL` | Multi-GPU / TP. `HIPFIRE_DEVICES` is the compatibility alias for `hardware.devices`; startup lowers its physical list to ROCr selectors plus matching HIP logical selectors. |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
@@ -240,7 +240,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `serve.local` | `HIPFIRE_LOCAL` |
 | `prefill_*` | matching `HIPFIRE_PREFILL_*` |
 | `mmq_screen*` | `HIPFIRE_MMQ_SCREEN*` |
-| `hardware.devices` | `HIPFIRE_DEVICES` |
+| `hardware.devices` | `HIPFIRE_DEVICES`; synchronizes `ROCR_VISIBLE_DEVICES=<physical list>` with `HIP_VISIBLE_DEVICES=0..N-1` before GPU initialization |
 | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` |
 | `hardware.tp_use_rccl` | `HIPFIRE_TP_USE_RCCL` |
 | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` |

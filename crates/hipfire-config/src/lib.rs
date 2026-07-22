@@ -1241,7 +1241,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::NullableString,
         false,
         "HIPFIRE_DEVICES",
-        "Comma-separated GPU device IDs used when no explicit topology is supplied."
+        "Physical GPU list lowered to ROCr selectors and matching HIP logical selectors before GPU initialization."
     ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
@@ -2551,6 +2551,17 @@ pub struct ProcessConfig {
 
 static ACTIVE_PROCESS_CONFIG: OnceLock<ProcessConfig> = OnceLock::new();
 
+pub const HIP_VISIBLE_DEVICES: &str = "HIP_VISIBLE_DEVICES";
+pub const ROCR_VISIBLE_DEVICES: &str = "ROCR_VISIBLE_DEVICES";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceVisibility {
+    /// Physical selectors consumed by ROCr.
+    pub rocr: String,
+    /// Logical selectors inside the ROCr-filtered set consumed by HIP.
+    pub hip: String,
+}
+
 impl ProcessConfig {
     pub fn from_resolved(resolved: &ResolvedConfig) -> Result<Self> {
         let mut values = ConfigLayer::default();
@@ -2627,6 +2638,104 @@ impl ProcessConfig {
 
 pub fn install_process_config(config: ProcessConfig) -> std::result::Result<(), ProcessConfig> {
     ACTIVE_PROCESS_CONFIG.set(config)
+}
+
+/// Resolve one physical GPU set for both ROCm frontends.
+///
+/// ROCr consumes the configured physical selectors. HIP consumes logical
+/// `0..N-1` inside that already-filtered set; giving both runtimes the same
+/// non-zero index can compound their filters into an empty device set.
+/// Explicit `hardware.devices` policy wins. Compatible legacy pairs are
+/// normalized, while ambiguous inherited pairs fail closed.
+pub fn synchronized_device_visibility(
+    config: &ProcessConfig,
+    hip_visible: Option<&str>,
+    rocr_visible: Option<&str>,
+) -> Result<Option<DeviceVisibility>> {
+    let configured = config.legacy_value("HIPFIRE_DEVICES");
+    if let Some(configured) = configured.as_deref() {
+        return visibility_from_physical(configured).map(Some);
+    }
+
+    let hip = hip_visible.map(normalize_device_visibility).transpose()?;
+    let rocr = rocr_visible
+        .map(normalize_device_visibility)
+        .transpose()?;
+    match (hip, rocr) {
+        (Some(hip), Some(rocr)) => {
+            let expected_hip = logical_device_list(device_count(&rocr));
+            if hip == expected_hip || hip == rocr {
+                Ok(Some(DeviceVisibility {
+                    rocr,
+                    hip: expected_hip,
+                }))
+            } else {
+                Err(ConfigError::InvalidValue {
+                    key: "hardware.devices".into(),
+                    message: format!(
+                        "{ROCR_VISIBLE_DEVICES}={rocr:?} requires {HIP_VISIBLE_DEVICES}={expected_hip:?}, but inherited {hip:?}; set hardware.devices to one physical device list"
+                    ),
+                })
+            }
+        }
+        (Some(hip), None) => visibility_from_physical(&hip).map(Some),
+        (None, Some(rocr)) => visibility_from_physical(&rocr).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Install synchronized HIP/ROCr visibility before either GPU runtime is
+/// initialized. Callers must invoke this during single-threaded startup.
+pub fn apply_device_visibility(config: &ProcessConfig) -> Result<Option<DeviceVisibility>> {
+    let hip = unicode_environment(HIP_VISIBLE_DEVICES)?;
+    let rocr = unicode_environment(ROCR_VISIBLE_DEVICES)?;
+    let visibility = synchronized_device_visibility(config, hip.as_deref(), rocr.as_deref())?;
+    if let Some(visibility) = &visibility {
+        std::env::set_var(HIP_VISIBLE_DEVICES, &visibility.hip);
+        std::env::set_var(ROCR_VISIBLE_DEVICES, &visibility.rocr);
+    }
+    Ok(visibility)
+}
+
+fn unicode_environment(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidValue {
+            key: "hardware.devices".into(),
+            message: format!("{name} is not valid Unicode"),
+        }),
+    }
+}
+
+fn normalize_device_visibility(value: &str) -> Result<String> {
+    let devices = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if devices.is_empty() || devices.iter().any(|device| device.is_empty()) {
+        return Err(ConfigError::InvalidValue {
+            key: "hardware.devices".into(),
+            message: "expected a non-empty comma-separated physical device list".into(),
+        });
+    }
+    Ok(devices.join(","))
+}
+
+fn visibility_from_physical(value: &str) -> Result<DeviceVisibility> {
+    let rocr = normalize_device_visibility(value)?;
+    Ok(DeviceVisibility {
+        hip: logical_device_list(device_count(&rocr)),
+        rocr,
+    })
+}
+
+fn device_count(value: &str) -> usize {
+    value.split(',').count()
+}
+
+fn logical_device_list(count: usize) -> String {
+    (0..count)
+        .map(|device| device.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn active_process_config() -> Option<&'static ProcessConfig> {
@@ -3861,6 +3970,48 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn device_visibility_is_one_synchronized_physical_list() {
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("hardware.devices", " 3, 1 ").unwrap();
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: PathBuf::from("config.toml"),
+                },
+                layer,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            synchronized_device_visibility(&process, Some("0"), Some("2")).unwrap(),
+            Some(DeviceVisibility {
+                rocr: "3,1".into(),
+                hip: "0,1".into(),
+            }),
+            "explicit TOML overrides and synchronizes both inherited backends"
+        );
+
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert_eq!(
+            synchronized_device_visibility(&defaults, Some("2"), None).unwrap(),
+            Some(DeviceVisibility {
+                rocr: "2".into(),
+                hip: "0".into(),
+            }),
+            "a lone physical filter is lowered to ROCr physical plus HIP logical"
+        );
+        assert_eq!(
+            synchronized_device_visibility(&defaults, Some("0"), Some("2")).unwrap(),
+            Some(DeviceVisibility {
+                rocr: "2".into(),
+                hip: "0".into(),
+            })
+        );
+        assert!(synchronized_device_visibility(&defaults, Some("1"), Some("2")).is_err());
     }
 
     #[test]

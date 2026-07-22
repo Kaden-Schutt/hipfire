@@ -113,7 +113,7 @@ Process-wide scalar policy is typed as well:
 
 | Key | Default | Values / purpose |
 |---|---:|---|
-| `hardware.devices` | `null` | Comma-separated device IDs; unset uses normal discovery. |
+| `hardware.devices` | `null` | Physical device list installed as `ROCR_VISIBLE_DEVICES`; HIP receives matching post-filter logical selectors `0..N-1` before initialization, avoiding compounded nonzero filters. |
 | `hardware.uniform_vram_tolerance_gb` | `null` | Free-VRAM spread override; unset uses the compiled default. |
 | `generation.loop_guard_threshold` | `0` | Repeated 4-gram count that forces EOS; zero disables. |
 | `generation.loop_guard_window` | `256` | Token window inspected by the loop guard. |

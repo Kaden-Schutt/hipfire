@@ -3,7 +3,9 @@
 schema_version = 1
 
 [hardware]
-# Replaces HIPFIRE_DEVICES=0. Use a comma-separated string for multiple GPUs.
+# One physical list drives ROCr and the matching post-filter HIP logical IDs.
+# Replaces HIPFIRE_DEVICES=0. Use a comma-separated string for multiple GPUs;
+# the selected devices are exposed to the engine as logical 0..N-1.
 devices = "0"
 allow_mixed_arch = false
 tp_use_rccl = true
