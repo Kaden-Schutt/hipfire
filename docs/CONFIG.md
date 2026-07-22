@@ -180,6 +180,9 @@ startup.
 |---|---|---|---|
 | `temperature` | `0.30` | number 0.0–2.0 | Stored default only; see send path below. |
 | `top_p` | `0.80` | number (0, 1] | Stored default only; see send path below. |
+| `top_k` | `20` | int 1–100000 | Registry/TOML/request top-K cutoff; the built-in is omitted so daemon/model fallback remains authoritative. |
+| `min_p` | `0.0` | number 0.0–1.0 | Relative-probability cutoff; zero disables it. |
+| `presence_penalty` | `0.0` | number 0.0–2.0 | OpenAI-style flat penalty over the repeat window; zero disables it. |
 | `repeat_penalty` | `1.05` | number 1.0–3.0 | Kept low; higher values harm some MQ4 greedy paths (source comment). Stored default only; see send path below. |
 | `max_tokens` | `4096` | int 1–131072 | Per-turn generation cap for run / OpenAI fallback. |
 | `max_seq` | `32768` | int 512–524288 | KV logical capacity at load. |
@@ -199,7 +202,9 @@ startup.
 | `max` | 32768 |
 | `uncapped` | 0 (unlimited) |
 
-**Effective sampling send order** (`request_f64` / `run`): explicit CLI flags **>** per-model overlay **>** registry `recommended_settings` **>** daemon/HFQ/arch fallback. Global `temperature` / `top_p` / `repeat_penalty` changed only in global `config.toml` are deliberately not transmitted on the current run/serve path; if a global value shadows a registry recommendation, the registry value is recovered for the request. Registry entry `sampling` blocks are metadata only today — the resolver reads `recommended_settings`; see [`MODELS.md`](MODELS.md).
+**Effective sampling send order** (`request_f64` / `request_u64` / `run`): explicit CLI or HTTP request **>** per-model TOML overlay **>** registry `recommended_settings` **>** daemon/HFQ/arch fallback. This applies to `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, and `repeat_penalty`. Bare global sampling values are deliberately not transmitted on the current run/serve path; if one shadows a registry recommendation, the card value is recovered for that model. Registry entry `sampling` blocks are legacy metadata — the resolver reads `recommended_settings`; see [`MODELS.md`](MODELS.md).
+
+`prompt.system` (legacy spelling `system_prompt`) is the corresponding request-scoped framing default. A client-supplied `system` or `developer` message wins; otherwise a per-model TOML value or registry-card `system_prompt` is inserted before the first user message.
 
 ---
 

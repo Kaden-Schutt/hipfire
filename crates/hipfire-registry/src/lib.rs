@@ -105,9 +105,30 @@ impl RecommendedSettings {
                 .set("generation.top_p", ConfigValue::Float(value))
                 .map_err(|error| error.to_string())?;
         }
+        if let Some(value) = self.top_k {
+            let value = i64::try_from(value).map_err(|_| "top_k is too large".to_owned())?;
+            layer
+                .set("generation.top_k", ConfigValue::Integer(value))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(value) = self.min_p {
+            layer
+                .set("generation.min_p", ConfigValue::Float(value))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(value) = self.presence_penalty {
+            layer
+                .set("generation.presence_penalty", ConfigValue::Float(value))
+                .map_err(|error| error.to_string())?;
+        }
         if let Some(value) = self.repeat_penalty {
             layer
                 .set("generation.repeat_penalty", ConfigValue::Float(value))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(value) = &self.system_prompt {
+            layer
+                .set("prompt.system", ConfigValue::String(value.clone()))
                 .map_err(|error| error.to_string())?;
         }
         Ok(layer)
@@ -520,6 +541,48 @@ mod tests {
         assert_eq!(
             registry.resolve_tag("qwen3.6-35b-a3b.mq4r"),
             "qwen3.6:35b-a3b-mq4r"
+        );
+    }
+
+    #[test]
+    fn recommended_settings_lower_the_full_sampling_contract_to_config() {
+        let settings = RecommendedSettings {
+            temperature: Some(1.0),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            min_p: Some(0.05),
+            presence_penalty: Some(1.5),
+            repeat_penalty: Some(1.05),
+            system_prompt: Some("You are MiniMax.".into()),
+        };
+        let layer = settings.config_layer().unwrap();
+        assert_eq!(
+            layer.get("generation.temperature"),
+            Some(&ConfigValue::Float(1.0))
+        );
+        assert_eq!(
+            layer.get("generation.top_p"),
+            Some(&ConfigValue::Float(0.95))
+        );
+        assert_eq!(
+            layer.get("generation.top_k"),
+            Some(&ConfigValue::Integer(40))
+        );
+        assert_eq!(
+            layer.get("generation.min_p"),
+            Some(&ConfigValue::Float(0.05))
+        );
+        assert_eq!(
+            layer.get("generation.presence_penalty"),
+            Some(&ConfigValue::Float(1.5))
+        );
+        assert_eq!(
+            layer.get("generation.repeat_penalty"),
+            Some(&ConfigValue::Float(1.05))
+        );
+        assert_eq!(
+            layer.get("prompt.system"),
+            Some(&ConfigValue::String("You are MiniMax.".into()))
         );
     }
 

@@ -1561,7 +1561,12 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     }
     let temperature = request_f64(&resolved, "generation.temperature", args.temp)?;
     let top_p = request_f64(&resolved, "generation.top_p", args.top_p)?;
+    let top_k = request_u64(&resolved, "generation.top_k", None)?;
+    let min_p = request_f64(&resolved, "generation.min_p", None)?;
+    let presence_penalty = request_f64(&resolved, "generation.presence_penalty", None)?;
     let repeat_penalty = request_f64(&resolved, "generation.repeat_penalty", args.repeat_penalty)?;
+    let system_prompt = request_string(&resolved, "prompt.system", args.system.clone())?
+        .filter(|value| !value.is_empty());
     if temperature.is_some_and(|value| !(0.0..=2.0).contains(&value)) {
         bail!("--temp must be between 0 and 2");
     }
@@ -1596,9 +1601,12 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             port,
             &args.model,
             &prompt,
-            args.system.as_deref(),
+            system_prompt.as_deref(),
             temperature,
             top_p,
+            top_k,
+            min_p,
+            presence_penalty,
             repeat_penalty,
             max_tokens,
             args.json,
@@ -1673,8 +1681,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     });
     insert_optional_f64(&mut request, "temperature", temperature);
     insert_optional_f64(&mut request, "top_p", top_p);
+    insert_optional_u64(&mut request, "top_k", top_k);
+    insert_optional_f64(&mut request, "min_p", min_p);
+    insert_optional_f64(&mut request, "presence_penalty", presence_penalty);
     insert_optional_f64(&mut request, "repeat_penalty", repeat_penalty);
-    if let Some(system) = args.system {
+    if let Some(system) = system_prompt {
         request["system"] = serde_json::Value::String(system);
     }
     if let Some(image) = args.image {
@@ -1733,6 +1744,9 @@ fn run_via_http(
     system: Option<&str>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<u64>,
+    min_p: Option<f64>,
+    presence_penalty: Option<f64>,
     repeat_penalty: Option<f64>,
     max_tokens: u64,
     json: bool,
@@ -1750,6 +1764,9 @@ fn run_via_http(
     });
     insert_optional_f64(&mut body, "temperature", temperature);
     insert_optional_f64(&mut body, "top_p", top_p);
+    insert_optional_u64(&mut body, "top_k", top_k);
+    insert_optional_f64(&mut body, "min_p", min_p);
+    insert_optional_f64(&mut body, "presence_penalty", presence_penalty);
     insert_optional_f64(&mut body, "repeat_penalty", repeat_penalty);
     let timeout = Duration::from_secs(60 * 60);
     if json || no_stream {
@@ -2845,7 +2862,9 @@ fn complete_request(
     if runtime.current_max_seq < required_max_seq {
         runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
     }
-    let normalized_messages = normalize_openai_messages(body.get("messages"));
+    let mut normalized_messages = normalize_openai_messages(body.get("messages"));
+    let default_system = request_string(&resolved, "prompt.system", None)?;
+    inject_default_system_message(&mut normalized_messages, default_system.as_deref());
     let mut generate = serde_json::json!({
         "type": "generate",
         "id": request_id(),
@@ -2868,15 +2887,35 @@ fn complete_request(
     for name in [
         "tools",
         "tool_choice",
-        "top_k",
-        "min_p",
-        "presence_penalty",
         "frequency_penalty",
         "stop",
         "reasoning_effort",
     ] {
         if let Some(value) = body.get(name) {
             generate[name] = value.clone();
+        }
+    }
+    if let Some(value) = body.get("top_k") {
+        generate["top_k"] = value.clone();
+    } else {
+        insert_optional_u64(
+            &mut generate,
+            "top_k",
+            request_u64(&resolved, "generation.top_k", None)?,
+        );
+    }
+    for (key, config_key) in [
+        ("min_p", "generation.min_p"),
+        ("presence_penalty", "generation.presence_penalty"),
+    ] {
+        if let Some(value) = body.get(key) {
+            generate[key] = value.clone();
+        } else {
+            insert_optional_f64(
+                &mut generate,
+                key,
+                request_f64(&resolved, config_key, None)?,
+            );
         }
     }
     apply_http_reasoning_request(body, &resolved, &mut generate)?;
@@ -3157,6 +3196,25 @@ fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json
         })
         .collect();
     serde_json::Value::Array(normalized)
+}
+
+fn inject_default_system_message(messages: &mut serde_json::Value, system: Option<&str>) {
+    let Some(system) = system.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let Some(messages) = messages.as_array_mut() else {
+        return;
+    };
+    if messages
+        .iter()
+        .any(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+    {
+        return;
+    }
+    messages.insert(
+        0,
+        serde_json::json!({ "role": "system", "content": system }),
+    );
 }
 
 fn last_user_prompt(messages: &serde_json::Value) -> Option<String> {
@@ -4894,12 +4952,53 @@ fn request_f64(
     if explicit.is_some() {
         return Ok(explicit);
     }
+    request_config_value(resolved, key)?
+        .map(|value| config_value_f64(value, key))
+        .transpose()
+}
+
+fn request_u64(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+    explicit: Option<u64>,
+) -> Result<Option<u64>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    request_config_value(resolved, key)?
+        .map(|value| config_value_u64(value, key))
+        .transpose()
+}
+
+fn request_string(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+    explicit: Option<String>,
+) -> Result<Option<String>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    request_config_value(resolved, key)?
+        .map(|value| match value {
+            hipfire_config::ConfigValue::String(value) => Ok(value.clone()),
+            value => bail!(
+                "configuration key '{key}' resolved as {}, expected string",
+                value.kind()
+            ),
+        })
+        .transpose()
+}
+
+fn request_config_value<'a>(
+    resolved: &'a hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<&'a hipfire_config::ConfigValue>> {
     let value = resolved
         .get(key)
         .ok_or_else(|| anyhow!("configuration key '{key}' is not resolved"))?;
     match &value.source {
         ConfigSource::BuiltIn => Ok(None),
-        ConfigSource::GlobalUser { .. } => value
+        ConfigSource::GlobalUser { .. } => Ok(value
             .shadowed
             .iter()
             .rev()
@@ -4909,9 +5008,8 @@ fn request_f64(
                     ConfigSource::RegistryModel { .. } | ConfigSource::RegistryTarget { .. }
                 )
             })
-            .map(|candidate| config_value_f64(&candidate.value, key))
-            .transpose(),
-        _ => Ok(Some(config_f64(resolved, key)?)),
+            .map(|candidate| &candidate.value)),
+        _ => Ok(Some(&value.value)),
     }
 }
 
@@ -4923,7 +5021,24 @@ fn config_value_f64(value: &hipfire_config::ConfigValue, key: &str) -> Result<f6
     }
 }
 
+fn config_value_u64(value: &hipfire_config::ConfigValue, key: &str) -> Result<u64> {
+    match value {
+        hipfire_config::ConfigValue::Integer(value) => u64::try_from(*value)
+            .map_err(|_| anyhow!("configuration key '{key}' cannot be negative")),
+        value => bail!(
+            "configuration key '{key}' resolved as {}, expected integer",
+            value.kind()
+        ),
+    }
+}
+
 fn insert_optional_f64(target: &mut serde_json::Value, key: &str, value: Option<f64>) {
+    if let Some(value) = value {
+        target[key] = serde_json::json!(value);
+    }
+}
+
+fn insert_optional_u64(target: &mut serde_json::Value, key: &str, value: Option<u64>) {
     if let Some(value) = value {
         target[key] = serde_json::json!(value);
     }
@@ -5180,6 +5295,25 @@ mod tests {
     }
 
     #[test]
+    fn registry_system_prompt_is_injected_only_when_client_omits_one() {
+        let mut messages = normalize_openai_messages(Some(&serde_json::json!([
+            { "role": "user", "content": "hello" }
+        ])));
+        inject_default_system_message(&mut messages, Some("registry identity"));
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "registry identity");
+
+        let mut messages = normalize_openai_messages(Some(&serde_json::json!([
+            { "role": "developer", "content": "client policy" },
+            { "role": "user", "content": "hello" }
+        ])));
+        inject_default_system_message(&mut messages, Some("registry identity"));
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "client policy");
+    }
+
+    #[test]
     fn openai_assistant_history_strips_thinking_and_preserves_fallback_arguments() {
         let body = serde_json::json!({
             "messages": [{
@@ -5363,8 +5497,22 @@ mod tests {
 
         let mut registry = ConfigLayer::default();
         registry.set_cli("generation.temperature", "1.0").unwrap();
+        registry.set_cli("generation.top_k", "40").unwrap();
+        registry.set_cli("generation.min_p", "0.05").unwrap();
+        registry
+            .set_cli("generation.presence_penalty", "1.5")
+            .unwrap();
+        registry
+            .set_cli("prompt.system", "registry identity")
+            .unwrap();
         let mut global = ConfigLayer::default();
         global.set_cli("generation.temperature", "0.7").unwrap();
+        global.set_cli("generation.top_k", "10").unwrap();
+        global.set_cli("generation.min_p", "0.1").unwrap();
+        global
+            .set_cli("generation.presence_penalty", "0.5")
+            .unwrap();
+        global.set_cli("prompt.system", "global identity").unwrap();
         let resolved = resolve([
             NamedLayer {
                 source: ConfigSource::RegistryModel {
@@ -5388,6 +5536,26 @@ mod tests {
         assert_eq!(
             request_f64(&resolved, "generation.temperature", Some(0.25)).unwrap(),
             Some(0.25)
+        );
+        assert_eq!(
+            request_u64(&resolved, "generation.top_k", None).unwrap(),
+            Some(40)
+        );
+        assert_eq!(
+            request_f64(&resolved, "generation.min_p", None).unwrap(),
+            Some(0.05)
+        );
+        assert_eq!(
+            request_f64(&resolved, "generation.presence_penalty", None).unwrap(),
+            Some(1.5)
+        );
+        assert_eq!(
+            request_string(&resolved, "prompt.system", None).unwrap(),
+            Some("registry identity".into())
+        );
+        assert_eq!(
+            request_string(&resolved, "prompt.system", Some("explicit".into())).unwrap(),
+            Some("explicit".into())
         );
     }
 

@@ -539,6 +539,53 @@ pub static FIELDS: &[ConfigField] = &[
         "Nucleus sampling probability."
     ),
     field!(
+        "generation.top_k",
+        "top_k",
+        Generation,
+        Request,
+        DefaultValue::Integer(20),
+        ValueRule::Integer {
+            min: 1,
+            max: 100000
+        },
+        true,
+        false,
+        None,
+        "Maximum number of highest-probability tokens retained for sampling."
+    ),
+    field!(
+        "generation.min_p",
+        "min_p",
+        Generation,
+        Request,
+        DefaultValue::Float(0.0),
+        ValueRule::Float {
+            min: 0.0,
+            max: 1.0,
+            min_inclusive: true
+        },
+        true,
+        false,
+        None,
+        "Minimum probability relative to the highest-probability token; zero disables."
+    ),
+    field!(
+        "generation.presence_penalty",
+        "presence_penalty",
+        Generation,
+        Request,
+        DefaultValue::Float(0.0),
+        ValueRule::Float {
+            min: 0.0,
+            max: 2.0,
+            min_inclusive: true
+        },
+        true,
+        false,
+        None,
+        "OpenAI-style flat penalty for tokens already present in the repeat window."
+    ),
+    field!(
         "generation.repeat_penalty",
         "repeat_penalty",
         Generation,
@@ -866,6 +913,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_NORMALIZE_PROMPT"),
         "Collapse runs of three or more newlines before tokenization."
+    ),
+    field!(
+        "prompt.system",
+        "system_prompt",
+        Prompt,
+        Request,
+        DefaultValue::String(""),
+        ValueRule::String,
+        true,
+        false,
+        None,
+        "Default system prompt used only when a request supplies no system or developer message."
     ),
     field!(
         "memory.mmq.screen",
@@ -3747,6 +3806,36 @@ mod tests {
         assert!(rendered.contains("[generation]"));
         assert!(rendered.contains("[memory]"));
         assert!(!rendered.contains("temperature"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_sampling_surface_roundtrips_through_toml() {
+        let root = temp_root("sampling-roundtrip");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("generation.temperature", "1.0").unwrap();
+        layer.set_cli("generation.top_p", "0.95").unwrap();
+        layer.set_cli("generation.top_k", "40").unwrap();
+        layer.set_cli("generation.min_p", "0.05").unwrap();
+        layer
+            .set_cli("generation.presence_penalty", "1.5")
+            .unwrap();
+        layer
+            .set_cli("generation.repeat_penalty", "1.05")
+            .unwrap();
+        layer
+            .set_cli("prompt.system", "Registry-compatible system prompt")
+            .unwrap();
+
+        write_global_toml(&paths, &layer).unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert_eq!(loaded.layer, layer);
+        let rendered = fs::read_to_string(&paths.config_toml).unwrap();
+        assert!(rendered.contains("top_k = 40"));
+        assert!(rendered.contains("min_p = 0.05"));
+        assert!(rendered.contains("presence_penalty = 1.5"));
+        assert!(rendered.contains("system = \"Registry-compatible system prompt\""));
         let _ = fs::remove_dir_all(root);
     }
 

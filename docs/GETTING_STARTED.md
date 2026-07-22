@@ -164,7 +164,7 @@ hipfire config set temperature 0.7
 hipfire config list
 ```
 
-Defaults that matter on day one (from CLI `CONFIG_DEFAULTS`; full table in [CONFIG.md](CONFIG.md)). **Sampling send path:** `run` / `serve` transmit only explicit request/CLI sampling values, per-model overlays, or registry `recommended_settings`; otherwise those fields are omitted for daemon/HFQ/arch fallback. Global `temperature` / `top_p` / `repeat_penalty` alone are **not** effective `run`/`serve` defaults. **Chat** is the exception — it uses a global config snapshot for the session ([CHAT.md](CHAT.md)).
+Defaults that matter on day one (from the native schema; full table in [CONFIG.md](CONFIG.md)). **Sampling send path:** `run` / `serve` transmit explicit request/CLI values, per-model TOML overlays, or the complete registry `recommended_settings` recipe (`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repeat_penalty`, plus fallback `system_prompt`). Otherwise sampling fields are omitted for daemon/HFQ/arch fallback. Bare global sampling values alone are **not** effective `run`/`serve` defaults. **Chat** is the exception — it uses a global config snapshot for the session ([CHAT.md](CHAT.md)).
 
 | Key | Default | Note |
 |---|---|---|
