@@ -5433,7 +5433,7 @@ pub fn forward_scratch(
     if gpu.replay.should_route_aql() {
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        let replay = unsafe { gpu.replay.replay_linear_aql() };
+        let replay = unsafe { gpu.replay.replay_linear_aql(pos) };
         return match replay {
             Ok(_) => Ok(()),
             Err(reason) => {

@@ -1648,6 +1648,25 @@ pub struct ReplayCaptureSummary {
     pub sequence_hash: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReplayObservation {
+    pub count: u64,
+    pub first_position: Option<usize>,
+    pub last_position: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedReplayIdentity {
+    pub dispatch_count: usize,
+    pub packet_count: Option<usize>,
+    pub queue_id: u64,
+    pub command_dwords: Option<u32>,
+}
+
+fn pm4_packet_identity(queue_count: usize, phase_count: usize) -> Option<usize> {
+    (queue_count == 1 && phase_count == 1).then_some(1)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AqlContractProbe {
     pub kernel: String,
@@ -1867,6 +1886,7 @@ pub struct ReplayController {
     prepared_pm4: Option<PreparedPm4Replay>,
     auto_lifecycle: bool,
     forward_eligible: bool,
+    replay_observation: ReplayObservation,
 }
 
 impl ReplayController {
@@ -1911,6 +1931,7 @@ impl ReplayController {
             prepared_pm4: None,
             auto_lifecycle: false,
             forward_eligible: true,
+            replay_observation: ReplayObservation::default(),
         }
     }
 
@@ -1986,6 +2007,7 @@ impl ReplayController {
         self.prepared_pm4 = None;
         self.auto_lifecycle = auto_lifecycle;
         self.forward_eligible = true;
+        self.replay_observation = ReplayObservation::default();
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -2015,6 +2037,43 @@ impl ReplayController {
         self.prepared_pm4
             .as_ref()
             .map(|prepared| (prepared.queue_count(), prepared.phase_count()))
+    }
+
+    pub fn prepared_route_identity(&self) -> Option<PreparedReplayIdentity> {
+        match self.transport {
+            ReplayTransport::AqlPackets => {
+                self.prepared
+                    .as_ref()
+                    .map(|prepared| PreparedReplayIdentity {
+                        dispatch_count: prepared.dispatch_count(),
+                        packet_count: Some(prepared.packet_count()),
+                        queue_id: prepared.queue_id(),
+                        command_dwords: None,
+                    })
+            }
+            ReplayTransport::Pm4Ib => {
+                self.prepared_pm4
+                    .as_ref()
+                    .map(|prepared| PreparedReplayIdentity {
+                        dispatch_count: prepared.dispatch_count(),
+                        packet_count: pm4_packet_identity(
+                            prepared.queue_count(),
+                            prepared.phase_count(),
+                        ),
+                        queue_id: prepared.queue_id(),
+                        command_dwords: Some(prepared.command_dwords()),
+                    })
+            }
+        }
+    }
+
+    pub fn replay_observation(&self) -> ReplayObservation {
+        self.replay_observation
+    }
+
+    /// Start a request-local route-proof window without changing replay state.
+    pub fn begin_replay_observation_window(&mut self) {
+        self.replay_observation = ReplayObservation::default();
     }
 
     pub fn is_recording(&self) -> bool {
@@ -2613,13 +2672,16 @@ impl ReplayController {
     ///
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
-    pub unsafe fn replay_linear_aql(&mut self) -> Result<GpuBatchTiming, String> {
-        let prepared = self
-            .prepared
-            .as_mut()
-            .ok_or_else(|| "no prepared AQL replay".to_owned())?;
-        // SAFETY: forwarded from the model owner.
-        unsafe { prepared.replay_and_wait() }
+    pub unsafe fn replay_linear_aql(&mut self, position: usize) -> Result<GpuBatchTiming, String> {
+        let result = {
+            let prepared = self
+                .prepared
+                .as_mut()
+                .ok_or_else(|| "no prepared AQL replay".to_owned())?;
+            // SAFETY: forwarded from the model owner.
+            unsafe { prepared.replay_and_wait() }
+        };
+        self.observe_replay_result(position, result)
     }
 
     /// # Safety
@@ -2627,12 +2689,29 @@ impl ReplayController {
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
     pub unsafe fn replay_pm4(&mut self, position: usize) -> Result<GpuMultiQueueTiming, String> {
-        let prepared = self
-            .prepared_pm4
-            .as_mut()
-            .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
-        // SAFETY: forwarded from the model owner.
-        unsafe { prepared.replay_and_wait(position) }
+        let result = {
+            let prepared = self
+                .prepared_pm4
+                .as_mut()
+                .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
+            // SAFETY: forwarded from the model owner.
+            unsafe { prepared.replay_and_wait(position) }
+        };
+        self.observe_replay_result(position, result)
+    }
+
+    fn observe_replay_result<T>(
+        &mut self,
+        position: usize,
+        result: Result<T, String>,
+    ) -> Result<T, String> {
+        let value = result?;
+        self.replay_observation.count = self.replay_observation.count.saturating_add(1);
+        self.replay_observation
+            .first_position
+            .get_or_insert(position);
+        self.replay_observation.last_position = Some(position);
+        Ok(value)
     }
 
     /// Start one explicitly delimited prefill or decode capture. This clears
@@ -3756,6 +3835,65 @@ mod tests {
         assert_eq!(controller.state(), ReplayState::Hip);
         assert_eq!(controller.transport_name(), "aql");
         assert!(!controller.is_enabled());
+    }
+
+    #[test]
+    fn route_observation_records_only_success_and_resets() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        let failed: Result<(), String> = Err("dispatch failed".to_owned());
+        assert!(controller.observe_replay_result(127, failed).is_err());
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation::default()
+        );
+
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        controller.observe_replay_result(128, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation {
+                count: 2,
+                first_position: Some(127),
+                last_position: Some(128),
+            }
+        );
+
+        controller.apply_model_default(false, ReplayTransport::AqlPackets);
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation::default()
+        );
+    }
+
+    #[test]
+    fn route_observation_windows_are_request_local() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        controller.observe_replay_result(128, Ok(())).unwrap();
+
+        controller.begin_replay_observation_window();
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation::default()
+        );
+
+        controller.observe_replay_result(512, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation(),
+            ReplayObservation {
+                count: 1,
+                first_position: Some(512),
+                last_position: Some(512),
+            }
+        );
+    }
+
+    #[test]
+    fn pm4_packet_identity_fails_closed_for_phased_or_multiqueue() {
+        assert_eq!(pm4_packet_identity(1, 1), Some(1));
+        assert_eq!(pm4_packet_identity(1, 2), None);
+        assert_eq!(pm4_packet_identity(2, 1), None);
+        assert_eq!(pm4_packet_identity(2, 2), None);
     }
 
     #[test]

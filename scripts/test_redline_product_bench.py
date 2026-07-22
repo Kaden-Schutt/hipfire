@@ -5,7 +5,7 @@
 
 import unittest
 
-from redline_product_bench import analyze_stationarity
+from redline_product_bench import analyze_stationarity, validate_route_proof
 
 
 DEFAULTS = {
@@ -51,6 +51,73 @@ class StationarityTests(unittest.TestCase):
         values = [100.0 + i * 0.2 for i in range(60)]
         result = analyze_stationarity(values, **DEFAULTS)
         self.assertFalse(result["stationary"])
+
+
+class RouteProofTests(unittest.TestCase):
+    @staticmethod
+    def route_row(iterations, delta, retained, transport="pm4"):
+        return {
+            "context_tokens": 129,
+            "iterations": iterations,
+            "redline_route": {
+                "requested_backend": "auto",
+                "transport": transport,
+                "state": "ready",
+                "fallback_reason": None,
+                "execution_mode": "plain_ar",
+                "prepared": {
+                    "dispatches": 604,
+                    "packets": 1,
+                    "queue_id": 7,
+                    "command_dwords": 16832 if transport == "pm4" else None,
+                },
+                "sequence": {
+                    "launches": 604,
+                    "unique_kernels": 22,
+                    "hash": "440bb2b5df220117",
+                },
+                "observed": {
+                    "count_delta": delta,
+                    "first_position": 129 if delta else None,
+                    "last_position": 129 + delta - 1 if delta else None,
+                },
+                "retained_replay_observed": retained,
+            },
+        }
+
+    def test_timed_rows_require_one_replay_per_iteration(self):
+        rows = [
+            self.route_row(iterations=8, delta=8, retained=True),
+            self.route_row(iterations=8, delta=8, retained=True),
+        ]
+        timed = validate_route_proof(
+            rows, "auto", "pm4", require_complete_replay=True
+        )
+        self.assertTrue(timed["valid"], timed["errors"])
+
+    def test_timed_rows_reject_partial_replay(self):
+        rows = [
+            self.route_row(iterations=8, delta=8, retained=True),
+            self.route_row(iterations=8, delta=0, retained=False),
+        ]
+        timed = validate_route_proof(
+            rows, "auto", "pm4", require_complete_replay=True
+        )
+        self.assertFalse(timed["valid"])
+        self.assertTrue(
+            any("timed row observed no retained replay" in error for error in timed["errors"])
+        )
+
+    def test_timed_rows_reject_cumulative_position_evidence(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["observed"]["first_position"] = 128
+        timed = validate_route_proof(
+            [row], "auto", "pm4", require_complete_replay=True
+        )
+        self.assertFalse(timed["valid"])
+        self.assertTrue(
+            any("first replay position 128 != 129" in error for error in timed["errors"])
+        )
 
 
 if __name__ == "__main__":

@@ -185,6 +185,154 @@ def validate_measurement(values, settlement, args):
     }
 
 
+def validate_route_proof(
+    rows, backend, transport, require_complete_replay=False
+):
+    errors = []
+    proofs = []
+    identities = set()
+    sequences = set()
+    observed_positions = set()
+    retained_rows = 0
+
+    for index, row in enumerate(rows):
+        proof = row.get("redline_route")
+        if not isinstance(proof, dict):
+            errors.append(f"row {index}: missing redline_route")
+            continue
+        proofs.append(proof)
+        if proof.get("requested_backend") != backend:
+            errors.append(
+                f"row {index}: backend={proof.get('requested_backend')!r}, expected {backend!r}"
+            )
+        if proof.get("transport") != transport:
+            errors.append(
+                f"row {index}: transport={proof.get('transport')!r}, expected {transport!r}"
+            )
+        if proof.get("fallback_reason") is not None:
+            errors.append(f"row {index}: fallback={proof['fallback_reason']!r}")
+
+        observed = proof.get("observed") or {}
+        delta = observed.get("count_delta")
+        if not isinstance(delta, int) or delta < 0:
+            errors.append(f"row {index}: invalid observed count delta {delta!r}")
+            delta = 0
+        for key in ("first_position", "last_position"):
+            position = observed.get(key)
+            if isinstance(position, int):
+                observed_positions.add(position)
+
+        prepared = proof.get("prepared")
+        sequence = proof.get("sequence") or {}
+        if backend == "hip":
+            if proof.get("state") != "hip":
+                errors.append(f"row {index}: HIP baseline state={proof.get('state')!r}")
+            if proof.get("retained_replay_observed") or delta:
+                errors.append(f"row {index}: HIP baseline observed retained replay")
+            if prepared is not None:
+                errors.append(f"row {index}: HIP baseline owns a prepared route")
+            continue
+
+        if proof.get("state") != "ready":
+            errors.append(f"row {index}: automatic route state={proof.get('state')!r}")
+        if proof.get("execution_mode") != "plain_ar":
+            errors.append(f"row {index}: automatic route was not plain AR")
+        if require_complete_replay:
+            iterations = row.get("iterations")
+            if not proof.get("retained_replay_observed"):
+                errors.append(f"row {index}: timed row observed no retained replay")
+            if not isinstance(iterations, int) or iterations <= 0:
+                errors.append(
+                    f"row {index}: invalid timed iteration count {iterations!r}"
+                )
+            elif delta != iterations:
+                errors.append(
+                    f"row {index}: observed {delta} retained replays for "
+                    f"{iterations} timed iterations"
+                )
+            context = row.get("context_tokens")
+            if not isinstance(context, int) or context <= 0:
+                errors.append(
+                    f"row {index}: invalid timed context position {context!r}"
+                )
+            elif isinstance(iterations, int) and iterations > 0:
+                first_position = observed.get("first_position")
+                last_position = observed.get("last_position")
+                expected_last = context + iterations - 1
+                if first_position != context:
+                    errors.append(
+                        f"row {index}: first replay position {first_position!r} "
+                        f"!= {context}"
+                    )
+                if last_position != expected_last:
+                    errors.append(
+                        f"row {index}: last replay position {last_position!r} "
+                        f"!= {expected_last}"
+                    )
+        if not isinstance(prepared, dict):
+            errors.append(f"row {index}: automatic route has no prepared identity")
+            continue
+        packets = prepared.get("packets")
+        if not isinstance(packets, int) or packets <= 0:
+            errors.append(f"row {index}: packet identity unavailable")
+        dispatches = prepared.get("dispatches")
+        if not isinstance(dispatches, int) or dispatches <= 0:
+            errors.append(f"row {index}: invalid dispatch count {dispatches!r}")
+        command_dwords = prepared.get("command_dwords")
+        if transport == "pm4" and (
+            not isinstance(command_dwords, int) or command_dwords <= 0
+        ):
+            errors.append(f"row {index}: PM4 command identity unavailable")
+        if transport == "aql" and command_dwords is not None:
+            errors.append(f"row {index}: AQL row unexpectedly reports PM4 commands")
+        identities.add(
+            (
+                dispatches,
+                packets,
+                prepared.get("queue_id"),
+                command_dwords,
+            )
+        )
+        launches = sequence.get("launches")
+        sequence_hash = sequence.get("hash")
+        if launches != dispatches:
+            errors.append(
+                f"row {index}: sequence launches {launches!r} != dispatches {dispatches!r}"
+            )
+        if not isinstance(sequence_hash, str) or sequence_hash == "0000000000000000":
+            errors.append(f"row {index}: invalid sequence hash {sequence_hash!r}")
+        sequences.add(
+            (launches, sequence.get("unique_kernels"), sequence_hash)
+        )
+        if proof.get("retained_replay_observed") and delta > 0:
+            retained_rows += 1
+
+    if not proofs:
+        errors.append("no route-proof rows")
+    if backend == "auto":
+        if retained_rows == 0:
+            errors.append("automatic arm observed no successful retained replay")
+        if len(observed_positions) < 2:
+            errors.append("automatic arm did not observe multiple replay positions")
+        if len(identities) != 1:
+            errors.append(f"prepared identity changed across rows: {sorted(identities)!r}")
+        if len(sequences) != 1:
+            errors.append(f"sequence identity changed across rows: {sorted(sequences)!r}")
+
+    return {
+        "valid": not errors,
+        "backend": backend,
+        "transport": transport,
+        "rows": len(proofs),
+        "require_complete_replay": require_complete_replay,
+        "retained_rows": retained_rows,
+        "observed_positions": sorted(observed_positions),
+        "prepared_identities": [list(identity) for identity in sorted(identities)],
+        "sequences": [list(sequence) for sequence in sorted(sequences)],
+        "errors": errors,
+    }
+
+
 class Daemon:
     def __init__(
         self,
@@ -276,11 +424,13 @@ def run_arm(args, backend):
             "type": "bench_decode",
             "context_tokens": args.context,
             "iterations": args.warmup_iterations,
+            "redline_product_route": True,
         }
         request = {
             "type": "bench_decode",
             "context_tokens": args.context,
             "iterations": args.iterations,
+            "redline_product_route": True,
         }
         warmup_started = time.monotonic()
         warmups = [daemon.request(warmup_request) for _ in range(args.warmups)]
@@ -326,6 +476,22 @@ def run_arm(args, backend):
             f"valid={measurement_validation['valid']}",
             flush=True,
         )
+        lifecycle_route_proof = validate_route_proof(
+            warmups + settling_rows + rows, backend, args.transport
+        )
+        route_proof = validate_route_proof(
+            rows,
+            backend,
+            args.transport,
+            require_complete_replay=backend == "auto",
+        )
+        print(
+            f"{backend}: timed route proof valid={route_proof['valid']} "
+            f"retained_rows={route_proof['retained_rows']} "
+            f"positions={route_proof['observed_positions']} "
+            f"lifecycle_valid={lifecycle_route_proof['valid']}",
+            flush=True,
+        )
         return {
             "loaded": loaded,
             "warmups": warmups,
@@ -342,6 +508,8 @@ def run_arm(args, backend):
                 "max": max(values),
             },
             "measurement_validation": measurement_validation,
+            "lifecycle_route_proof": lifecycle_route_proof,
+            "route_proof": route_proof,
         }
     finally:
         daemon.close()
@@ -473,9 +641,14 @@ def main():
     hip = report["hip"]["tok_s"]["median"]
     auto = report["auto"]["tok_s"]["median"]
     report["speedup"] = auto / hip
-    report["valid"] = report["hip"]["measurement_validation"]["valid"] and report[
-        "auto"
-    ]["measurement_validation"]["valid"]
+    report["valid"] = (
+        report["hip"]["measurement_validation"]["valid"]
+        and report["auto"]["measurement_validation"]["valid"]
+        and report["hip"]["route_proof"]["valid"]
+        and report["auto"]["route_proof"]["valid"]
+        and report["hip"]["lifecycle_route_proof"]["valid"]
+        and report["auto"]["lifecycle_route_proof"]["valid"]
+    )
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + "\n")
@@ -484,7 +657,7 @@ def main():
         f"speedup={report['speedup']:.5f} valid={report['valid']} report={output}"
     )
     if not report["valid"]:
-        raise SystemExit("benchmark samples drifted after settlement; report is invalid")
+        raise SystemExit("benchmark samples or route proof are invalid")
 
 
 if __name__ == "__main__":

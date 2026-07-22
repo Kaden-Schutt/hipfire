@@ -3134,10 +3134,23 @@ fn main() {
                     .get("redline_capture")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let product_route = msg
+                    .get("redline_product_route")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let capture_detail = msg
                     .get("redline_detail")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if capture && product_route {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        r#"{"type":"error","message":"redline_capture and redline_product_route are mutually exclusive"}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if context == 0 || iterations == 0 {
                     let _ = writeln!(
                         stdout,
@@ -3214,6 +3227,10 @@ fn main() {
                     }
                 }
 
+                if product_route {
+                    gpu.replay.begin_replay_observation_window();
+                }
+                let replay_before = gpu.replay.replay_observation();
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let run_ok = {
@@ -3243,6 +3260,7 @@ fn main() {
                 };
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
+                let replay_after = gpu.replay.replay_observation();
                 let capture_summary = if capture {
                     match gpu.replay.finish_capture() {
                         Ok(summary) => Some(summary),
@@ -3280,6 +3298,39 @@ fn main() {
                     if let Some(summary) = capture_summary {
                         response["redline_capture"] =
                             redline_capture_json(&gpu, summary, capture_detail);
+                    }
+                    if product_route {
+                        let prepared = gpu.replay.prepared_route_identity().map(|identity| {
+                            serde_json::json!({
+                                "dispatches": identity.dispatch_count,
+                                "packets": identity.packet_count,
+                                "queue_id": identity.queue_id,
+                                "command_dwords": identity.command_dwords,
+                            })
+                        });
+                        let sequence = gpu.replay.capture_summary();
+                        let replay_delta = replay_after.count.saturating_sub(replay_before.count);
+                        response["redline_route"] = serde_json::json!({
+                            "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
+                            "transport": gpu.replay.transport_name(),
+                            "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
+                            "fallback_reason": gpu.replay.fallback_reason(),
+                            "execution_mode": "plain_ar",
+                            "prepared": prepared,
+                            "sequence": {
+                                "launches": sequence.launch_count,
+                                "unique_kernels": sequence.unique_kernel_count,
+                                "hash": format!("{:016x}", sequence.sequence_hash),
+                            },
+                            "observed": {
+                                "count_before": replay_before.count,
+                                "count_after": replay_after.count,
+                                "count_delta": replay_delta,
+                                "first_position": replay_after.first_position,
+                                "last_position": replay_after.last_position,
+                            },
+                            "retained_replay_observed": replay_delta > 0,
+                        });
                     }
                     let _ = writeln!(stdout, "{response}");
                 } else {
@@ -3409,7 +3460,7 @@ fn main() {
                             let timing = unsafe { gpu.replay.replay_pm4(context + i) }?;
                             gpu_us += timing.span_microseconds();
                         } else {
-                            let timing = unsafe { gpu.replay.replay_linear_aql() }?;
+                            let timing = unsafe { gpu.replay.replay_linear_aql(context + i) }?;
                             gpu_us += timing.span_microseconds();
                         }
                     }
@@ -3781,7 +3832,7 @@ fn main() {
                     if pm4 {
                         unsafe { gpu.replay.replay_pm4(context) }?;
                     } else {
-                        unsafe { gpu.replay.replay_linear_aql() }?;
+                        unsafe { gpu.replay.replay_linear_aql(context) }?;
                     }
                     gpu.hip
                         .device_synchronize()
