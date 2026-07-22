@@ -4,11 +4,11 @@
 """Resident HipGraph-vs-Redline product decode benchmark.
 
 Unlike redline_daemon_harness.py (manual shadow capture), this drives the real
-default-off product lifecycle: HIPFIRE_REPLAY_BACKEND=auto records one ordinary
-AR forward and routes later forwards through the prepared AQL replay. The HIP
-arm leaves the existing AR HipGraph enabled. Models stay resident within each
-arm, clocks are never modified, and every row uses the daemon's full Qwen reset
-and prefill-prime path.
+default-off product lifecycle: the explicit ``redline`` backend records one
+ordinary AR forward and routes later forwards through the prepared replay. The
+HIP arm leaves the existing AR HipGraph enabled. Models stay resident within
+each arm, clocks are never modified, and every row uses the daemon's full Qwen
+reset and prefill-prime path.
 """
 
 import argparse
@@ -26,6 +26,11 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+def backend_config_value(backend):
+    """Map report-arm vocabulary to the typed replay config vocabulary."""
+    return "redline" if backend == "auto" else backend
 
 
 def sha256_file(path):
@@ -348,8 +353,13 @@ class Daemon:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = log_path.open("w")
         env = dict(os.environ)
+        # ``auto`` is the report-arm name and ReplayBackendRequest value. In
+        # the typed config surface it means "follow immutable model admission";
+        # ``redline`` is the explicit opt-in required to certify an unadmitted
+        # architecture without changing product defaults first.
+        configured_backend = backend_config_value(backend)
         env.update(
-            HIPFIRE_REPLAY_BACKEND=backend,
+            HIPFIRE_REPLAY_BACKEND=configured_backend,
             HIPFIRE_REPLAY_TRANSPORT=transport,
             HIPFIRE_KV_MODE=kv_mode,
             HIPFIRE_CASK_OFF="1",

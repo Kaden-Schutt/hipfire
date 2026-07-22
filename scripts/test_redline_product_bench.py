@@ -5,7 +5,11 @@
 
 import unittest
 
-from redline_product_bench import analyze_stationarity, validate_route_proof
+from redline_product_bench import (
+    analyze_stationarity,
+    backend_config_value,
+    validate_route_proof,
+)
 
 
 DEFAULTS = {
@@ -51,6 +55,12 @@ class StationarityTests(unittest.TestCase):
         values = [100.0 + i * 0.2 for i in range(60)]
         result = analyze_stationarity(values, **DEFAULTS)
         self.assertFalse(result["stationary"])
+
+
+class BackendConfigTests(unittest.TestCase):
+    def test_auto_report_arm_explicitly_opts_into_redline(self):
+        self.assertEqual(backend_config_value("auto"), "redline")
+        self.assertEqual(backend_config_value("hip"), "hip")
 
 
 class RouteProofTests(unittest.TestCase):
