@@ -137,3 +137,6 @@ docs/investigations/*/sources/
 *_results.csv
 *.rocpd
 *.pftrace
+
+# Agentic review local provider overrides (per-developer, not checked in)
+.github/agentic-review/providers.local.json

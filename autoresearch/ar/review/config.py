@@ -23,6 +23,7 @@ _CONFIG_DIR = ".github/agentic-review"
 _PROVIDERS = f"{_CONFIG_DIR}/providers.json"
 _CAPABILITIES = f"{_CONFIG_DIR}/capabilities-v1.json"
 _TRUSTED = f"{_CONFIG_DIR}/trusted-publishers.json"
+_PROVIDERS_LOCAL = f"{_CONFIG_DIR}/providers.local.json"
 _OPERATOR = f"{_CONFIG_DIR}/operator-credentials.json"
 _REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 _WRITE_PERMISSION_NAMES = {"issues", "pull_requests"}
@@ -145,6 +146,41 @@ def _safe_path(root: str | Path, override: str) -> Path:
         raise ValueError("configuration path escapes repository root") from exc
     return candidate
 
+def _merge_providers(base: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
+    """Merge local provider overrides into the base provider policy.
+
+    Providers from ``local`` with an ``id`` already present in ``base`` replace
+    the checked-in entry.  New ids are appended.  Schema/version come from base.
+    """
+    if not isinstance(base, Mapping) or not isinstance(local, Mapping):
+        raise ValueError("provider policies must be objects")
+    if base.get("schema") != "hipfire.agentic-review.providers" or base.get("version") != 1:
+        raise ValueError("base provider policy has invalid schema or version")
+    if local.get("schema") != "hipfire.agentic-review.providers" or local.get("version") != 1:
+        raise ValueError("local provider policy has invalid schema or version")
+    base_providers = list(base.get("providers", []))
+    local_providers = list(local.get("providers", []))
+    if not all(isinstance(p, Mapping) and isinstance(p.get("id"), str) for p in base_providers):
+        raise ValueError("base provider entries must have an id")
+    if not all(isinstance(p, Mapping) and isinstance(p.get("id"), str) for p in local_providers):
+        raise ValueError("local provider entries must have an id")
+    # Build id→entry map from base, then overlay local entries
+    merged_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for p in base_providers:
+        pid = p["id"]
+        merged_by_id[pid] = dict(p)
+        order.append(pid)
+    for p in local_providers:
+        pid = p["id"]
+        merged_by_id[pid] = dict(p)
+        if pid not in order:
+            order.append(pid)
+    result = dict(base)
+    result["providers"] = [merged_by_id[pid] for pid in order]
+    return result
+
+
 
 def load_review_configuration(
     repository_root: str | Path,
@@ -164,6 +200,15 @@ def load_review_configuration(
     capabilities_bytes = capability_file.read_bytes()
     trusted_bytes = trusted_file.read_bytes()
     provider_policy = json.loads(provider_bytes)
+
+    # Merge local provider overrides if present (gitignored, per-developer).
+    # The local file has the same schema; its providers replace checked-in
+    # entries with the same id and append new ids.  The config digest still
+    # covers only the checked-in file so the authenticated boundary holds.
+    local_file = _safe_path(repository_root, _PROVIDERS_LOCAL)
+    if local_file.exists():
+        provider_policy = _merge_providers(provider_policy, json.loads(local_file.read_bytes()))
+
     validate_provider_policy(provider_policy)
     configuration = ReviewConfiguration(
         providers=provider_policy,
