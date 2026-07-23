@@ -3328,8 +3328,15 @@ impl Gpu {
     ) -> HipResult<()> {
         // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
+        let artifact = self
+            .compiler
+            .compiled_kernels()
+            .get("gemv_mq4g256")
+            .cloned();
         self.scratch.rotate_x_mq_batched(
             &self.hip,
+            &mut self.replay,
+            artifact,
             &self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,

@@ -786,6 +786,8 @@ impl ScratchState {
     pub fn rotate_x_mq_batched(
         &mut self,
         hip: &HipRuntime,
+        replay: &mut crate::replay::ReplayController,
+        artifact: Option<std::path::PathBuf>,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
@@ -817,6 +819,31 @@ impl ScratchState {
         ];
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_batched", bytes);
+        if !replay.admit_diagnostic_launch() {
+            return Err(hip_bridge::HipError::new(
+                crate::replay::DIAGNOSTIC_PREFIX_COMPLETE_CODE,
+                "diagnostic launch prefix complete",
+            ));
+        }
+        if replay.is_recording() {
+            let mut blob = KernargBlob::new();
+            blob.push_ptr(xp);
+            blob.push_ptr(xrp);
+            blob.push_ptr(s1);
+            blob.push_ptr(s2);
+            blob.push_i32(kv);
+            blob.pad_to(16);
+            replay.record_hip_launch_typed_bound(
+                hip,
+                "mq_rotate_x",
+                artifact,
+                [n_groups, batch_size as u32, 1],
+                [32, 1, 1],
+                0,
+                blob.as_bytes(),
+                None,
+            );
+        }
         let result = launch_maybe_blob(
             hip,
             functions,
