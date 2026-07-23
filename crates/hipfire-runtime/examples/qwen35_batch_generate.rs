@@ -1495,6 +1495,8 @@ fn main() -> Result<(), String> {
     }
     writer.flush().map_err(|e| format!("flush output: {e}"))?;
     let wall = wall_start.elapsed();
+    let replay_observation = gpu.replay.replay_observation();
+    let replay_identity = gpu.replay.prepared_route_identity();
     eprintln!(
         "done: completions={} tokens={} batched_tokens={} decode_model={:.1} tok/s wall={:.1} tok/s model_time={:.3}s wall={:.3}s",
         completed,
@@ -1508,6 +1510,18 @@ fn main() -> Result<(), String> {
         generated as f64 / wall.as_secs_f64().max(1e-9),
         model_time.as_secs_f64(),
         wall.as_secs_f64(),
+    );
+    eprintln!(
+        "redline: request={:?} state={:?} transport={} retained_replays={} first_position={:?} last_position={:?} dispatches={:?} packets={:?} command_dwords={:?}",
+        gpu.replay.request(),
+        gpu.replay.state(),
+        gpu.replay.transport_name(),
+        replay_observation.count,
+        replay_observation.first_position,
+        replay_observation.last_position,
+        replay_identity.map(|identity| identity.dispatch_count),
+        replay_identity.and_then(|identity| identity.packet_count),
+        replay_identity.and_then(|identity| identity.command_dwords),
     );
     Ok(())
 }
