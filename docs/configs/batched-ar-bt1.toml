@@ -1,0 +1,25 @@
+# Batch-width diagnostic: retain the gfx12 one-accumulator WMMA family at
+# widths where the default adaptive-B selector would move to bt4/bt8/bt12.
+schema_version = 1
+
+[replay]
+backend = "hip"
+transport = "auto"
+
+[diagnostic.replay]
+independent_batch = false
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[memory]
+kv_cache = "q8"
+
+[generation]
+loop_guard_threshold = 0
+
+[developer]
+gate_up_bt = false
