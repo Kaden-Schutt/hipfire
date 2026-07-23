@@ -1439,7 +1439,10 @@ impl Pm4MidAcquirePolicy {
 
     fn acquire_between(self, previous: &str, current: &str) -> bool {
         match self {
-            Self::Conservative => conservative_mid_acquire_except(previous, current, None),
+            // Correctness oracle: pair every serialized dependency wait with
+            // a cache acquire. Fence-trimming experiments use the narrower
+            // policies below only after this profile is bit-exact.
+            Self::Conservative => true,
             Self::EntryOnly => false,
             Self::RequiredOnly => required_mid_acquire(previous, current),
             Self::WithoutRepeatInterleave => {
@@ -3417,7 +3420,7 @@ mod tests {
             .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
         assert!(!Pm4MidAcquirePolicy::EntryOnly
             .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(!Pm4MidAcquirePolicy::Conservative.acquire_between("rmsnorm_f32", "gemv_hfq4g256"));
+        assert!(Pm4MidAcquirePolicy::Conservative.acquire_between("rmsnorm_f32", "gemv_hfq4g256"));
         assert!(!Pm4MidAcquirePolicy::WithoutRope
             .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
         assert!(Pm4MidAcquirePolicy::WithoutRope
