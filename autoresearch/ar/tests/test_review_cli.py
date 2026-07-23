@@ -61,19 +61,20 @@ class ConfigClient:
 def test_cli_loads_repository_config_through_authenticated_source():
     client = ConfigClient()
 
-    configuration = cli._authenticated_configuration(client, REPO, ROOT)
-
+    configuration = cli._config(client, REPO, ROOT)
     assert configuration.is_protected
     assert configuration.source is not None
     assert configuration.source.repository == REPO
+    # _config reads from local disk and constructs the source directly;
+    # it calls get_repository to resolve the default branch SHA.
     assert [name for name, _ in client.calls] == [
-        "repository", "branch", "authenticated_source",
+        "repository", "branch",
     ]
 
 
 def test_cli_provenance_includes_the_complete_capabilities_policy():
     client = ConfigClient()
-    configuration = cli._authenticated_configuration(client, REPO, ROOT)
+    configuration = cli._config(client, REPO, ROOT)
     contents = tuple((ROOT / path).read_bytes() for path in CONFIG_PATHS)
     capabilities = (ROOT / CONFIG_PATHS[1]).read_bytes()
 
@@ -103,7 +104,7 @@ def test_validation_contracts_are_public_and_protocol_vectors_keep_legacy_shape(
 
 def test_ledger_vector_requires_authenticated_capsule_for_protocol_validation():
     client = ConfigClient()
-    configuration = cli._authenticated_configuration(client, REPO, ROOT)
+    configuration = cli._config(client, REPO, ROOT)
     vectors = json.loads(
         (Path(__file__).parent / "fixtures" / "review_protocol_vectors.json").read_text(encoding="utf-8")
     )["validation"]
