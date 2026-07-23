@@ -501,6 +501,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]);
     }
     match kernel {
+        "convert_f32_to_f16" => Some(vec![read(0), write(8)]),
         "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -758,7 +759,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     match kernel {
         "softmax_f32" => Some(16),
-        "fused_qk_l2_norm_scale_f32"
+        "convert_f32_to_f16"
+        | "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"

@@ -378,6 +378,7 @@ impl ScratchState {
     pub fn ensure_fp16_x(
         &mut self,
         hip: &HipRuntime,
+        replay: &mut crate::replay::ReplayController,
         compiler: &mut crate::compiler::KernelCompiler,
         modules: &mut HashMap<String, Module>,
         functions: &mut HashMap<String, Function>,
@@ -422,6 +423,26 @@ impl ScratchState {
                 &mut n_val_m as *mut _ as *mut c_void,
             ];
             let grid = ((n_elems + 255) / 256) as u32;
+            if replay.is_recording() {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(in_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(n_val);
+                blob.pad_to(16);
+                replay.record_hip_launch_typed_bound(
+                    hip,
+                    "convert_f32_to_f16",
+                    compiler
+                        .compiled_kernels()
+                        .get("convert_f32_to_f16")
+                        .cloned(),
+                    [grid, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    blob.as_bytes(),
+                    None,
+                );
+            }
             launch_maybe_blob(
                 hip,
                 functions,

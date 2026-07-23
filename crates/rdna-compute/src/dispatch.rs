@@ -1491,6 +1491,7 @@ impl Gpu {
     ) -> HipResult<*mut c_void> {
         self.scratch.ensure_fp16_x(
             &self.hip,
+            &mut self.replay,
             &mut self.compiler,
             &mut self.modules,
             &mut self.functions,
