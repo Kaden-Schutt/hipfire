@@ -1240,7 +1240,10 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         if !self.replay.admit_diagnostic_launch() {
-            return Ok(());
+            return Err(hip_bridge::HipError::new(
+                crate::replay::DIAGNOSTIC_PREFIX_COMPLETE_CODE,
+                "diagnostic launch prefix complete",
+            ));
         }
         let record = self.replay.is_recording();
         if record || self.graphs.capture_mode || self.flags.force_blob_path {

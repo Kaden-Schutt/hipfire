@@ -491,7 +491,11 @@ fn run_batch_prefix_arm(
             gpu, weights, config, tokens, positions, position, state, scratch,
         );
         let admitted = gpu.replay.finish_diagnostic_launch_prefix();
-        result.map_err(|error| format!("execute ordinary HIP prefix {prefix}: {error}"))?;
+        if let Err(error) = result {
+            if error.code != rdna_compute::replay::DIAGNOSTIC_PREFIX_COMPLETE_CODE {
+                return Err(format!("execute ordinary HIP prefix {prefix}: {error}"));
+            }
+        }
         if admitted != prefix {
             return Err(format!(
                 "ordinary HIP prefix admitted {admitted} launches, expected {prefix}"

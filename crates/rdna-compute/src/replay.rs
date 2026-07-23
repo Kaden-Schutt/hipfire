@@ -24,6 +24,8 @@ use redline_dispatch::aql::{
     QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
+pub const DIAGNOSTIC_PREFIX_COMPLETE_CODE: u32 = u32::MAX - 1;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayBackendRequest {
     Hip,
