@@ -6,6 +6,7 @@ MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.6-35b-a3b.mq4r}"
 CONFIG="${CONFIG:-docs/configs/batched-redline-pm4-product.toml}"
 BIN="${BIN:-target/release/examples/qwen35_batch_generate}"
 LOCK_ROOT="${XDG_RUNTIME_DIR:-$HOME/.cache/hipfire}/hipfire-locks"
+MAX_JOB_ATTEMPTS="${MAX_JOB_ATTEMPTS:-3}"
 
 if ! command -v hipcc >/dev/null 2>&1; then
     for rocm_bin in /opt/rocm/bin /opt/rocm/core-*/bin; do
@@ -22,9 +23,8 @@ command -v hipcc >/dev/null 2>&1 || {
 
 mkdir -p "$ROOT/completions" "$ROOT/logs" "$LOCK_ROOT"
 
-if [[ ! -x "$BIN" ]]; then
-    cargo build --release -p hipfire-runtime --example qwen35_batch_generate
-fi
+# Incremental when unchanged, and guarantees `--resume` support after a pull.
+cargo build --release -p hipfire-runtime --example qwen35_batch_generate
 
 warm_kernel_cache() {
     local input="$ROOT/jobs/short-greedy.jsonl"
@@ -116,8 +116,9 @@ run_job() {
                 --frequency-penalty 0.0 \
                 --repeat-window 128 \
                 --wave-refill \
+                --resume \
                 >"$ROOT/logs/$stem.gpu$gpu.stdout" \
-                2>"$ROOT/logs/$stem.gpu$gpu.stderr"
+                2>>"$ROOT/logs/$stem.gpu$gpu.stderr"
         ) &
         pids+=("$!")
     done
@@ -132,6 +133,14 @@ warm_kernel_cache
 
 for bucket in short medium long; do
     for profile in serve fastmtp greedy; do
-        run_job "$bucket" "$profile"
+        attempt=1
+        until run_job "$bucket" "$profile"; do
+            if (( attempt >= MAX_JOB_ATTEMPTS )); then
+                echo "job ${bucket}-${profile} failed after $attempt attempts" >&2
+                exit 1
+            fi
+            attempt=$((attempt + 1))
+            echo "retrying ${bucket}-${profile} from durable output rows (attempt $attempt/$MAX_JOB_ATTEMPTS)" >&2
+        done
     done
 done

@@ -26,9 +26,9 @@ use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,7 @@ struct Args {
     shadow_iterations: Option<usize>,
     batched_seed: bool,
     wave_refill: bool,
+    resume: bool,
 }
 
 impl Args {
@@ -92,6 +93,7 @@ impl Args {
             shadow_iterations: None,
             batched_seed: true,
             wave_refill: false,
+            resume: false,
         };
         while let Some(flag) = it.next() {
             let value = |it: &mut std::iter::Skip<std::env::Args>, flag: &str| {
@@ -142,6 +144,7 @@ impl Args {
                 "--raw-prompt" => args.raw_prompt = true,
                 "--sequential-seed" => args.batched_seed = false,
                 "--wave-refill" => args.wave_refill = true,
+                "--resume" => args.resume = true,
                 "--help" | "-h" => {
                     return Err(
                         "usage: qwen35_batch_generate MODEL --input IN.jsonl --output OUT.jsonl \
@@ -153,7 +156,7 @@ impl Args {
                          [--config CONFIG.toml] [--device PHYSICAL_ID] \
                          [--shadow-iterations N] \
                          [--shard-index I --shard-count N] [--raw-prompt] \
-                         [--sequential-seed] [--wave-refill]"
+                         [--sequential-seed] [--wave-refill] [--resume]"
                             .to_string(),
                     )
                 }
@@ -185,6 +188,9 @@ impl Args {
         }
         if args.shadow_iterations == Some(0) {
             return Err("--shadow-iterations must be non-zero".to_string());
+        }
+        if args.resume && args.shadow_iterations.is_some() {
+            return Err("--resume cannot be combined with --shadow-iterations".to_string());
         }
         Ok(args)
     }
@@ -1180,15 +1186,131 @@ fn row_tokens(row: &InputRow, tokenizer: &Tokenizer, raw_prompt: bool) -> Result
     Ok(tokens)
 }
 
-fn load_jobs(args: &Args, tokenizer: &Tokenizer) -> Result<VecDeque<Job>, String> {
+fn expected_sampling(args: &Args) -> Value {
+    json!({
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p.unwrap_or(0.0),
+        "repeat_penalty": args.repeat_penalty,
+        "presence_penalty": args.presence_penalty,
+        "frequency_penalty": args.frequency_penalty,
+        "repeat_window": args.repeat_window,
+    })
+}
+
+fn load_completed_indices(args: &Args) -> Result<HashSet<usize>, String> {
+    if !args.resume || !args.output.exists() {
+        return Ok(HashSet::new());
+    }
+    let file = File::open(&args.output).map_err(|e| format!("open resume output: {e}"))?;
+    let expected = expected_sampling(args);
+    let mut completed = HashSet::new();
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| {
+            format!(
+                "read resume output {} line {}: {e}",
+                args.output.display(),
+                line_index + 1
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(&line).map_err(|e| {
+            format!(
+                "parse resume output {} line {}: {e}",
+                args.output.display(),
+                line_index + 1
+            )
+        })?;
+        let index = row
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                format!(
+                    "resume output {} line {} has no valid index",
+                    args.output.display(),
+                    line_index + 1
+                )
+            })?;
+        if index % args.shard_count != args.shard_index {
+            return Err(format!(
+                "resume output {} line {} index {} belongs to shard {}/{}",
+                args.output.display(),
+                line_index + 1,
+                index,
+                index % args.shard_count,
+                args.shard_count
+            ));
+        }
+        if row.get("sampling") != Some(&expected) {
+            return Err(format!(
+                "resume output {} line {} has different sampling parameters",
+                args.output.display(),
+                line_index + 1
+            ));
+        }
+        if !completed.insert(index) {
+            return Err(format!(
+                "resume output {} contains duplicate index {index}",
+                args.output.display()
+            ));
+        }
+    }
+    Ok(completed)
+}
+
+fn open_output(args: &Args) -> Result<File, String> {
+    if !args.resume {
+        return File::create(&args.output).map_err(|e| format!("create output: {e}"));
+    }
+    let mut output = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&args.output)
+        .map_err(|e| format!("open resume output: {e}"))?;
+    let length = output
+        .metadata()
+        .map_err(|e| format!("stat resume output: {e}"))?
+        .len();
+    if length > 0 {
+        output
+            .seek(SeekFrom::End(-1))
+            .map_err(|e| format!("seek resume output: {e}"))?;
+        let mut final_byte = [0u8; 1];
+        output
+            .read_exact(&mut final_byte)
+            .map_err(|e| format!("read resume output tail: {e}"))?;
+        if final_byte[0] != b'\n' {
+            output
+                .write_all(b"\n")
+                .and_then(|_| output.flush())
+                .map_err(|e| format!("terminate resume output: {e}"))?;
+        }
+    }
+    Ok(output)
+}
+
+fn load_jobs(
+    args: &Args,
+    tokenizer: &Tokenizer,
+    completed: &HashSet<usize>,
+) -> Result<VecDeque<Job>, String> {
     let file = File::open(&args.input).map_err(|e| format!("open input: {e}"))?;
     let mut jobs = VecDeque::new();
+    let mut unmatched = completed.clone();
     for (index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|e| format!("read input line {}: {e}", index + 1))?;
         if line.trim().is_empty() {
             continue;
         }
         if index % args.shard_count != args.shard_index {
+            continue;
+        }
+        if unmatched.remove(&index) {
             continue;
         }
         let row: InputRow = if line.trim_start().starts_with('"') {
@@ -1223,6 +1345,15 @@ fn load_jobs(args: &Args, tokenizer: &Tokenizer) -> Result<VecDeque<Job>, String
             output_tokens: Vec::with_capacity(max_new),
             max_new,
         });
+    }
+    if !unmatched.is_empty() {
+        let mut indices: Vec<_> = unmatched.into_iter().collect();
+        indices.sort_unstable();
+        return Err(format!(
+            "resume output contains {} indices absent from this input shard; first={:?}",
+            indices.len(),
+            &indices[..indices.len().min(8)]
+        ));
     }
     Ok(jobs)
 }
@@ -1416,15 +1547,21 @@ fn main() -> Result<(), String> {
     let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("read config: {e}"))?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("load tokenizer: {e}"))?;
-    let mut jobs = load_jobs(&args, &tokenizer)?;
+    let completed_before_start = load_completed_indices(&args)?;
+    let mut jobs = load_jobs(&args, &tokenizer, &completed_before_start)?;
     if jobs.is_empty() {
-        File::create(&args.output).map_err(|e| format!("create output: {e}"))?;
+        open_output(&args)?;
+        eprintln!(
+            "batch-generator: already complete, resumed={}",
+            completed_before_start.len()
+        );
         return Ok(());
     }
 
     eprintln!(
-        "batch-generator: jobs={} batch={} shard={}/{} max_seq={} max_new={} temp={} top_p={} top_k={:?} min_p={} repeat={} presence={} frequency={} window={}",
+        "batch-generator: jobs={} resumed={} batch={} shard={}/{} max_seq={} max_new={} temp={} top_p={} top_k={:?} min_p={} repeat={} presence={} frequency={} window={}",
         jobs.len(),
+        completed_before_start.len(),
         args.batch,
         args.shard_index,
         args.shard_count,
@@ -1451,7 +1588,7 @@ fn main() -> Result<(), String> {
     let active_n = args.batch.min(jobs.len());
     let mut state = Qwen35DecodeBatchState::new(&mut gpu, &config, active_n, args.max_seq)
         .map_err(|e| format!("allocate batch state: {e}"))?;
-    let output = File::create(&args.output).map_err(|e| format!("create output: {e}"))?;
+    let output = open_output(&args)?;
     let mut writer = BufWriter::new(output);
     let eos = config.eos_token;
     let im_end = tokenizer.encode("<|im_end|>");
@@ -1517,7 +1654,7 @@ fn main() -> Result<(), String> {
     let mut model_time = Duration::ZERO;
     let mut generated = 0usize;
     let mut batched_generated = 0usize;
-    let mut completed = 0usize;
+    let mut completed = completed_before_start.len();
     let mut refill_time = Duration::ZERO;
     let mut output_time = Duration::ZERO;
     loop {
