@@ -1,3 +1,5 @@
+<img width="1774" height="887" alt="image" src="https://github.com/user-attachments/assets/2013c1ae-6011-477c-a8de-5e90751bed74" />
+
 # hipfire
 
 Fast local LLM inference for AMD GPUs. Rust + HIP + Redline. No Python
