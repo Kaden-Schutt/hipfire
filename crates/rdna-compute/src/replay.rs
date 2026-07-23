@@ -300,6 +300,7 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
             | "moe_topk_renorm_k8"
             | "mq_rotate_x"
             | "repeat_interleave_qk_f32"
+            | "repeat_interleave_qk_f32_batched"
             | "rmsnorm_f32"
             | "sigmoid_mul_f32"
     )
@@ -554,7 +555,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(40),
         ]),
         "fused_qk_l2_norm_scale_f32" => Some(vec![write(0), write(8)]),
-        "repeat_interleave_qk_f32" => Some(vec![read(0), read(8), write(16), write(24)]),
+        "repeat_interleave_qk_f32" | "repeat_interleave_qk_f32_batched" => {
+            Some(vec![read(0), read(8), write(16), write(24)])
+        }
         "gated_delta_net_q8_fast" => Some(vec![
             read(0),
             read(8),
@@ -814,6 +817,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
+        | "repeat_interleave_qk_f32_batched"
         | "rope_partial_halfsplit_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
@@ -1470,10 +1474,14 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     }
     matches!(
         previous,
-        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+        "repeat_interleave_qk_f32"
+            | "repeat_interleave_qk_f32_batched"
+            | "rope_partial_halfsplit_f32"
     ) || matches!(
         current,
-        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+        "repeat_interleave_qk_f32"
+            | "repeat_interleave_qk_f32_batched"
+            | "rope_partial_halfsplit_f32"
     )
 }
 
@@ -1483,18 +1491,28 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
     {
         return true;
     }
-    (Some(previous) != excluded
+    let is_excluded = |kernel: &str| match excluded {
+        Some("repeat_interleave_qk_f32") => matches!(
+            kernel,
+            "repeat_interleave_qk_f32" | "repeat_interleave_qk_f32_batched"
+        ),
+        Some(excluded) => kernel == excluded,
+        None => false,
+    };
+    (!is_excluded(previous)
         && matches!(
             previous,
             "repeat_interleave_qk_f32"
+                | "repeat_interleave_qk_f32_batched"
                 | "fused_silu_mul_mq_rotate"
                 | "mq_rotate_x"
                 | "rope_partial_halfsplit_f32"
         ))
-        || (Some(current) != excluded
+        || (!is_excluded(current)
             && matches!(
                 current,
                 "repeat_interleave_qk_f32"
+                    | "repeat_interleave_qk_f32_batched"
                     | "fused_silu_mul_mq_rotate"
                     | "rope_partial_halfsplit_f32"
             ))
@@ -2303,24 +2321,29 @@ impl ReplayController {
         let independent_batch_shadow =
             hipfire_config::process_value("HIPFIRE_BATCH_REPLAY_UNSAFE")
                 .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
-        if !independent_batch_shadow {
-            for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
-                if launch.kernel == "repeat_interleave_qk_f32" {
-                    headers[index] = HeaderPolicy::RECORDED_DISPATCH;
-                    if index + 1 < headers.len() {
-                        headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
-                    }
-                } else if matches!(
+        for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
+            if matches!(
+                launch.kernel.as_str(),
+                "repeat_interleave_qk_f32" | "repeat_interleave_qk_f32_batched"
+            ) {
+                headers[index] = HeaderPolicy::RECORDED_DISPATCH;
+                if index + 1 < headers.len() {
+                    headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+                }
+            } else if !independent_batch_shadow
+                && matches!(
                     launch.kernel.as_str(),
                     "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
-                ) {
-                    headers[index] = if launch.kernel == "mq_rotate_x" {
-                        HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
-                    } else {
-                        HeaderPolicy::RECORDED_DISPATCH
-                    };
-                }
+                )
+            {
+                headers[index] = if launch.kernel == "mq_rotate_x" {
+                    HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
+                } else {
+                    HeaderPolicy::RECORDED_DISPATCH
+                };
             }
+        }
+        if !independent_batch_shadow {
             for index in 1..headers.len() {
                 let previous = self.recorded[index - 1].kernel.as_str();
                 let current = self.recorded[index].kernel.as_str();
@@ -3107,6 +3130,7 @@ mod tests {
         "conv1d_silu_split_qknorm_b256_scalar_prep",
         "fused_qk_l2_norm_scale_f32",
         "repeat_interleave_qk_f32",
+        "repeat_interleave_qk_f32_batched",
         "gated_delta_net_q8_fast",
         "gated_norm_f32",
         "gated_norm_mq_rotate_gfx1100",
@@ -3403,6 +3427,14 @@ mod tests {
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "gated_delta_net_q8_compact2_b2"
+        ));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+            "fused_qk_l2_norm_scale_f32",
+            "repeat_interleave_qk_f32_batched"
+        ));
+        assert!(!Pm4MidAcquirePolicy::WithoutRepeatInterleave.acquire_between(
+            "fused_qk_l2_norm_scale_f32",
+            "repeat_interleave_qk_f32_batched"
         ));
         assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
     }
