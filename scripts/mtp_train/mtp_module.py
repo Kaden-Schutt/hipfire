@@ -32,6 +32,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5RMSNorm,
     Qwen3_5TextRotaryEmbedding,
 )
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeDecoderLayer,
+    Qwen3_5MoeRMSNorm,
+    Qwen3_5MoeTextRotaryEmbedding,
+)
 
 
 class Qwen35MtpBlock(nn.Module):
@@ -52,19 +57,24 @@ class Qwen35MtpBlock(nn.Module):
         self.config = cfg
         H = cfg.hidden_size
 
-        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(H, eps=cfg.rms_norm_eps)
-        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(H, eps=cfg.rms_norm_eps)
+        is_moe = hasattr(cfg, "num_experts")
+        norm_cls = Qwen3_5MoeRMSNorm if is_moe else Qwen3_5RMSNorm
+        decoder_cls = Qwen3_5MoeDecoderLayer if is_moe else Qwen3_5DecoderLayer
+        rotary_cls = Qwen3_5MoeTextRotaryEmbedding if is_moe else Qwen3_5TextRotaryEmbedding
+
+        self.pre_fc_norm_embedding = norm_cls(H, eps=cfg.rms_norm_eps)
+        self.pre_fc_norm_hidden = norm_cls(H, eps=cfg.rms_norm_eps)
         # fc: concat(emb, hidden) -> hidden, so input dim = 2H
         self.fc = nn.Linear(2 * H, H, bias=False)
 
         # The actual transformer layer (full_attention)
-        self.layers = nn.ModuleList([Qwen3_5DecoderLayer(cfg, layer_idx=0)])
+        self.layers = nn.ModuleList([decoder_cls(cfg, layer_idx=0)])
 
-        self.norm = Qwen3_5RMSNorm(H, eps=cfg.rms_norm_eps)
+        self.norm = norm_cls(H, eps=cfg.rms_norm_eps)
 
         # Rotary embedding for the decoder layer (shared with trunk in
         # principle, but cheap to re-instantiate)
-        self.rotary_emb = Qwen3_5TextRotaryEmbedding(cfg)
+        self.rotary_emb = rotary_cls(cfg)
 
     def load_pretrained_(self, mtp_state_dict: dict):
         """Load weights from a state_dict with keys like 'mtp.fc.weight'.
