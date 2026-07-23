@@ -28,3 +28,8 @@ kv_cache = "q8"
 
 [generation]
 loop_guard_threshold = 0
+
+[developer]
+# The adaptive bt4 family regresses this exact A3B batch shape at B64.
+# Retaining bt1 removes that cliff and is a no-op below B64.
+gate_up_bt = false
