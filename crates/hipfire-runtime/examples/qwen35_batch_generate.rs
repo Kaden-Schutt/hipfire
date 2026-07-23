@@ -406,17 +406,27 @@ fn run_batch_shadow_gate(
 
     // Capture exactly one ordinary HIP batch forward. Shadow mode can prepare
     // and execute this tape explicitly, but can never change the model route.
-    gpu.replay
-        .begin_capture()
-        .map_err(|reason| format!("begin batch shadow capture: {reason}"))?;
-    gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
-    gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
-    qwen35::forward_decode_batch(
+    let capture_position = qwen35::prepare_decode_batch_inputs(
         gpu,
         weights,
         config,
         &initial_tokens,
         &initial_positions,
+        state,
+    )
+    .map_err(|error| format!("prepare batch shadow capture inputs: {error}"))?;
+    gpu.replay
+        .begin_capture()
+        .map_err(|reason| format!("begin batch shadow capture: {reason}"))?;
+    gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+    gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
+    qwen35::forward_decode_batch_prepared(
+        gpu,
+        weights,
+        config,
+        &initial_tokens,
+        &initial_positions,
+        capture_position,
         state,
         scratch,
     )

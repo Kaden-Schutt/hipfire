@@ -6736,7 +6736,40 @@ pub fn forward_decode_batch(
         return Ok(());
     }
     let position = prepare_decode_batch_inputs(gpu, weights, config, tokens, positions, state)?;
+    forward_decode_batch_prepared(
+        gpu, weights, config, tokens, positions, position, state, scratch,
+    )
+}
 
+/// Execute an independent batch whose embeddings and position buffer were
+/// already populated by [`prepare_decode_batch_inputs`].
+///
+/// The split entry point lets a manual shadow adapter prepare changing inputs
+/// while the recorder is still armed, then begin capture at the exact immutable
+/// model-body boundary. Product callers should use [`forward_decode_batch`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_decode_batch_prepared(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    positions: &[usize],
+    position: usize,
+    state: &mut Qwen35DecodeBatchState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let n = tokens.len();
+    if n == 0
+        || n > state.max_batch
+        || positions.len() != n
+        || positions.iter().any(|&value| value >= state.lane_capacity)
+        || position != positions.iter().copied().max().unwrap_or(0)
+    {
+        return Err(HipError::new(
+            0,
+            "prepared independent batch inputs do not match the admitted shape",
+        ));
+    }
     // Independent batched HIP execution is exact, but immutable replay of
     // this tape has not passed token-parity certification yet. Keep Redline
     // fail-closed unless a developer explicitly opts into the unsafe oracle.
