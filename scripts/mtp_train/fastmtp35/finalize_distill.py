@@ -44,6 +44,7 @@ def main() -> None:
     }
     counts = {split: 0 for split in outputs}
     rejected: dict[str, int] = {}
+    accepted_finish_reasons: dict[str, int] = {}
     seen_outputs: set[int] = set()
 
     try:
@@ -71,11 +72,14 @@ def main() -> None:
                                 f"{completion['index']}"
                             )
                         tokens = [int(token) for token in completion["completion_tokens"]]
-                        reason = completion.get("finish_reason")
+                        reason = str(completion.get("finish_reason") or "unknown")
                         reject_reason = None
-                        if reason == "length":
-                            reject_reason = "truncated"
-                        elif len(tokens) < 32:
+                        # A length-capped trunk trajectory is valid MTP
+                        # supervision: training masks the final recursive
+                        # targets instead of requiring an EOS-complete SFT
+                        # answer. Reject only trajectories whose tokens are
+                        # intrinsically unusable.
+                        if len(tokens) < 32:
                             reject_reason = "too_short"
                         elif repeated(tokens):
                             reject_reason = "repetitive"
@@ -94,11 +98,15 @@ def main() -> None:
                             "input_ids": input_ids,
                             "assistant_start": len(prompt["tokens"]),
                             "completion_tokens": len(tokens),
+                            "finish_reason": reason,
                             "sampling": completion["sampling"],
                         }
                         split = split_for(prompt["id"])
                         outputs[split].write(json.dumps(row, ensure_ascii=False) + "\n")
                         counts[split] += 1
+                        accepted_finish_reasons[reason] = (
+                            accepted_finish_reasons.get(reason, 0) + 1
+                        )
     finally:
         for handle in outputs.values():
             handle.close()
@@ -110,6 +118,7 @@ def main() -> None:
         "target": args.target,
         "shortfall": max(0, args.target - accepted),
         "splits": counts,
+        "accepted_finish_reasons": accepted_finish_reasons,
         "rejected": rejected,
     }
     (args.output / "manifest.json").write_text(

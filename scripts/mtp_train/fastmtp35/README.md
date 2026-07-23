@@ -58,6 +58,8 @@ sampled, and greedy profiles.
   --target 400000
 ```
 
-The finalizer rejects truncated, very short, repetitive, and duplicate
-responses and emits deterministic 98/1/1 train/validation/test splits.
+The finalizer rejects very short, repetitive, and duplicate trajectories and
+emits deterministic 98/1/1 train/validation/test splits. Length-capped trunk
+trajectories remain valid MTP supervision; the trainer masks their final
+recursive targets rather than requiring an EOS-complete SFT answer.
 `training.json` pins the initial K=3 FastMTP optimization recipe.
