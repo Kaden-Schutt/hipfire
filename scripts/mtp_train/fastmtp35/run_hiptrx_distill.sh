@@ -26,6 +26,49 @@ if [[ ! -x "$BIN" ]]; then
     cargo build --release -p hipfire-runtime --example qwen35_batch_generate
 fi
 
+warm_kernel_cache() {
+    local input="$ROOT/jobs/short-greedy.jsonl"
+    local warm_input="$ROOT/.kernel-warmup-input.jsonl"
+    local warm_output="$ROOT/.kernel-warmup-output.jsonl"
+    python3 - "$input" "$warm_input" <<'PY'
+import json
+import sys
+
+source, destination = sys.argv[1:]
+with open(source, encoding="utf-8") as reader, open(
+    destination, "w", encoding="utf-8"
+) as writer:
+    for _, line in zip(range(100), reader):
+        row = json.loads(line)
+        row["max_new_tokens"] = 1
+        writer.write(json.dumps(row, ensure_ascii=False) + "\n")
+PY
+    (
+        export HIPFIRE_GPU_LOCKFILE="$LOCK_ROOT/gpu-0.lock"
+        source scripts/gpu-lock.sh
+        gpu_acquire "fastmtp-kernel-warmup-gpu0"
+        trap 'gpu_release; rm -f "$warm_input" "$warm_output"' EXIT
+        "$BIN" "$MODEL" \
+            --input "$warm_input" \
+            --output "$warm_output" \
+            --config "$CONFIG" \
+            --device 0 \
+            --batch 100 \
+            --max-seq 1024 \
+            --max-new 1 \
+            --temperature 0.0 \
+            --top-p 1.0 \
+            --top-k 0 \
+            --presence-penalty 0.0 \
+            --repeat-penalty 1.0 \
+            --frequency-penalty 0.0 \
+            --repeat-window 128 \
+            --wave-refill \
+            >"$ROOT/logs/kernel-warmup.stdout" \
+            2>"$ROOT/logs/kernel-warmup.stderr"
+    )
+}
+
 run_job() {
     local bucket="$1"
     local profile="$2"
@@ -84,6 +127,8 @@ run_job() {
     done
     (( failed == 0 )) || return 1
 }
+
+warm_kernel_cache
 
 for bucket in short medium long; do
     for profile in serve fastmtp greedy; do
