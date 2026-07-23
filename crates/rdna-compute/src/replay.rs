@@ -304,6 +304,7 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
             | "repeat_interleave_qk_f32_batched"
             | "rmsnorm_f32"
             | "sigmoid_mul_f32"
+            | "softmax_f32"
     )
 }
 
@@ -1479,12 +1480,14 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
             | "repeat_interleave_qk_f32"
             | "repeat_interleave_qk_f32_batched"
             | "rope_partial_halfsplit_f32"
+            | "softmax_f32"
     ) || matches!(
         current,
         "convert_f32_to_f16"
             | "repeat_interleave_qk_f32"
             | "repeat_interleave_qk_f32_batched"
             | "rope_partial_halfsplit_f32"
+            | "softmax_f32"
     )
 }
 
@@ -1510,6 +1513,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
                 | "fused_silu_mul_mq_rotate"
                 | "mq_rotate_x"
                 | "rope_partial_halfsplit_f32"
+                | "softmax_f32"
         ))
         || (!is_excluded(current)
             && matches!(
@@ -1518,6 +1522,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
                     | "repeat_interleave_qk_f32_batched"
                     | "fused_silu_mul_mq_rotate"
                     | "rope_partial_halfsplit_f32"
+                    | "softmax_f32"
             ))
 }
 
@@ -3442,6 +3447,10 @@ mod tests {
             .acquire_between("moe_down_combine_k8_batched", "convert_f32_to_f16"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("convert_f32_to_f16", "gemm_hfq4g256"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("gemm_q8_0_batched_chunked", "softmax_f32"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("softmax_f32", "moe_topk_renorm_k8"));
         assert!(!Pm4MidAcquirePolicy::WithoutRepeatInterleave.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "repeat_interleave_qk_f32_batched"
