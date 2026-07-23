@@ -6436,8 +6436,9 @@ pub fn forward_decode_batch(
         gpu.replay
             .begin_auto_capture_if_armed()
             .map_err(|reason| HipError::new(0, reason))?;
+        let position = positions.iter().copied().max().unwrap_or(0);
         if gpu.replay.should_route_aql() {
-            return unsafe { gpu.replay.replay_linear_aql() }
+            return unsafe { gpu.replay.replay_linear_aql(position) }
                 .map(|_| ())
                 .map_err(|reason| {
                     gpu.replay
@@ -6446,7 +6447,6 @@ pub fn forward_decode_batch(
                 });
         }
         if gpu.replay.should_route_pm4() {
-            let position = positions.iter().copied().max().unwrap_or(0);
             return unsafe { gpu.replay.replay_pm4(position) }
                 .map(|_| ())
                 .map_err(|reason| {
