@@ -6,6 +6,7 @@
 import unittest
 
 from redline_product_bench import (
+    CERTIFIED_PM4_POLICY,
     analyze_stationarity,
     backend_config_value,
     validate_route_proof,
@@ -61,6 +62,14 @@ class BackendConfigTests(unittest.TestCase):
     def test_auto_report_arm_explicitly_opts_into_redline(self):
         self.assertEqual(backend_config_value("auto"), "redline")
         self.assertEqual(backend_config_value("hip"), "hip")
+
+    def test_product_policy_reemits_dynamic_gfx12_registers(self):
+        self.assertEqual(CERTIFIED_PM4_POLICY["HIPFIRE_REPLAY_PM4_STATEFUL"], "static")
+        self.assertEqual(CERTIFIED_PM4_POLICY["HIPFIRE_REPLAY_PM4_QUEUES"], "1")
+        self.assertEqual(
+            CERTIFIED_PM4_POLICY["HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY"],
+            "required-only",
+        )
 
 
 class RouteProofTests(unittest.TestCase):

@@ -18,7 +18,9 @@ pm4_min_parallel_workgroups = 0
 pm4_native_phases = false
 # Enum strings are intentional: "1", "2", "4", or "auto".
 pm4_queues = "1"
-pm4_register_policy = "stateful"
+# Cache queue-global invariants only. Fully stateful dynamic-register elision
+# is a diagnostic experiment and is not portable across gfx12 toolchains.
+pm4_register_policy = "static"
 pm4_wait_policy = "resource"
 pm4_acquire_policy = "required-only"
 pm4_gcr_trim = true

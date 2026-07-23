@@ -2315,10 +2315,10 @@ pub static FIELDS: &[ConfigField] = &[
     diagnostic_field!(
         "diagnostic.replay.pm4_register_policy",
         "replay_pm4_stateful",
-        DefaultValue::String("stateful"),
+        DefaultValue::String("static"),
         ValueRule::Enum(&["legacy", "static", "stateful"]),
         "HIPFIRE_REPLAY_PM4_STATEFUL",
-        "PM4 register emission policy."
+        "PM4 register emission policy; static is the gfx12-safe product default and caches only queue-global invariants."
     ),
     diagnostic_field!(
         "diagnostic.replay.pm4_wait_policy",

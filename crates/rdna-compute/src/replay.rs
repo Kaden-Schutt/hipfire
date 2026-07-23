@@ -1107,7 +1107,7 @@ impl Pm4RegisterPolicy {
 
     fn from_config() -> Self {
         let value = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_STATEFUL")
-            .unwrap_or_else(|| "stateful".to_owned());
+            .unwrap_or_else(|| "static".to_owned());
         Self::from_value(&value).unwrap_or_else(|| {
             eprintln!(
                 "WARNING: unknown HIPFIRE_REPLAY_PM4_STATEFUL={value:?}; \

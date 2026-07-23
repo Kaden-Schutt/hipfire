@@ -27,6 +27,22 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+# Product certification must not inherit an old PM4 experiment from the
+# caller's environment or ~/.hipfire/config.toml. In particular, fully
+# stateful gfx12 register elision depends on compiler-produced descriptor
+# equality and has produced shorter, slower IBs on otherwise identical
+# gfx1201 tapes. Static mode retains only queue-global invariant registers and
+# re-emits program/resource/workgroup/user-data state for every dispatch.
+CERTIFIED_PM4_POLICY = {
+    "HIPFIRE_REPLAY_PM4_QUEUES": "1",
+    "HIPFIRE_REPLAY_PM4_STATEFUL": "static",
+    "HIPFIRE_REPLAY_PM4_WAIT_POLICY": "resource",
+    "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY": "required-only",
+    "HIPFIRE_REPLAY_PM4_GCR_TRIM": "1",
+    "HIPFIRE_REPLAY_PM4_NATIVE_PHASES": "0",
+    "HIPFIRE_REPLAY_PM4_DYNAMIC_GRID": "0",
+}
+
 
 def backend_config_value(backend):
     """Map report-arm vocabulary to the typed replay config vocabulary."""
@@ -367,6 +383,7 @@ class Daemon:
             HIPFIRE_GRAPH="1",
             HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
         )
+        env.update(CERTIFIED_PM4_POLICY)
         env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -644,6 +661,7 @@ def main():
         "dpm_warmup_secs": args.dpm_warmup_secs,
         "runs": args.runs,
         "transport": args.transport,
+        "pm4_policy": dict(CERTIFIED_PM4_POLICY),
         "kv_mode": args.kv_mode,
         "hip": run_arm(args, "hip"),
         "auto": run_arm(args, "auto"),
