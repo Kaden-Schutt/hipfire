@@ -231,6 +231,14 @@ def render_tokens(tokenizer: Any, messages: list[dict[str, str]]) -> list[int]:
         tokens = tokenizer.apply_chat_template(messages, enable_thinking=True, **kwargs)
     except TypeError:
         tokens = tokenizer.apply_chat_template(messages, **kwargs)
+    # Transformers 5 returns a BatchEncoding here even without tensors, while
+    # Transformers 4 returned the input-id list directly.
+    if hasattr(tokens, "get"):
+        input_ids = tokens.get("input_ids")
+        if input_ids is not None:
+            tokens = input_ids
+    if tokens and hasattr(tokens[0], "ids"):
+        tokens = tokens[0].ids
     if tokens and isinstance(tokens[0], list):
         tokens = tokens[0]
     return [int(token) for token in tokens]
@@ -340,8 +348,16 @@ def main() -> int:
                 continue
             try:
                 tokens = render_tokens(tokenizer, messages)
-            except Exception:
-                rejected["tokenizer"] += 1
+            except Exception as error:
+                rejection = f"tokenizer:{type(error).__name__}"
+                rejected[rejection] += 1
+                if rejected[rejection] <= 3:
+                    print(
+                        f"{name}: rejected row {row_index} after tokenizer "
+                        f"{type(error).__name__}: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 continue
             token_len = len(tokens)
             compatible = {
