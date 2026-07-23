@@ -425,6 +425,10 @@ impl QuantChoice {
 struct Args {
     hf_dir: PathBuf,
     output: PathBuf,
+    /// Optional trained `mtp.*` safetensors file. It is searched before the
+    /// official checkpoint shards for MTP tensors; the official checkpoint
+    /// still supplies config, embeddings, and the compressed LM-head rows.
+    mtp_override: Option<PathBuf>,
     quant: QuantChoice,
     verbose: bool,
     /// Optional FastMTP-style vocab-compression sidecar JSON. When set, we
@@ -541,6 +545,7 @@ fn parse_args() -> Args {
     let mut quant = QuantChoice::Mq4;
     let mut verbose = false;
     let mut vocab_sidecar: Option<String> = None;
+    let mut mtp_override: Option<String> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -564,6 +569,10 @@ fn parse_args() -> Args {
                 vocab_sidecar = Some(argv[i + 1].clone());
                 i += 2;
             }
+            "--mtp-override" => {
+                mtp_override = Some(argv[i + 1].clone());
+                i += 2;
+            }
             "--verbose" | "-v" => {
                 verbose = true;
                 i += 1;
@@ -571,7 +580,8 @@ fn parse_args() -> Args {
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: mtp_extract --hf-dir <safetensors_dir> --output <out.mtp> \
-                     [--quant mq4|q8] [--vocab-sidecar <sidecar.json>] [--verbose]"
+                     [--quant mq4|q8] [--mtp-override <trained.safetensors>] \
+                     [--vocab-sidecar <sidecar.json>] [--verbose]"
                 );
                 std::process::exit(0);
             }
@@ -584,6 +594,7 @@ fn parse_args() -> Args {
     Args {
         hf_dir: PathBuf::from(hf_dir.expect("--hf-dir required")),
         output: PathBuf::from(output.expect("--output required")),
+        mtp_override: mtp_override.map(PathBuf::from),
         quant,
         verbose,
         vocab_sidecar: vocab_sidecar.map(PathBuf::from),
@@ -711,6 +722,9 @@ fn main() {
     eprintln!("  hf-dir : {}", args.hf_dir.display());
     eprintln!("  output : {}", args.output.display());
     eprintln!("  quant  : {} (norms always F32)", args.quant.label());
+    if let Some(path) = &args.mtp_override {
+        eprintln!("  MTP override: {}", path.display());
+    }
 
     // Read config.json — needed for metadata + quant-correctness sanity checks.
     let config_path = args.hf_dir.join("config.json");
@@ -842,7 +856,7 @@ fn main() {
     if st_paths.is_empty() {
         panic!("no .safetensors files found in {}", args.hf_dir.display());
     }
-    let st_files: Vec<SafetensorsFile> = st_paths
+    let mut st_files: Vec<SafetensorsFile> = st_paths
         .iter()
         .inspect(|p| {
             if args.verbose {
@@ -851,6 +865,18 @@ fn main() {
         })
         .map(|p| SafetensorsFile::open(p).expect("safetensors open"))
         .collect();
+    if let Some(path) = &args.mtp_override {
+        let override_file =
+            SafetensorsFile::open(path).expect("trained MTP override safetensors open");
+        let has_mtp = override_file.tensor_data("mtp.fc.weight").is_some();
+        assert!(
+            has_mtp,
+            "trained MTP override does not contain canonical mtp.* tensors"
+        );
+        // `find_tensor` returns the first match. The trained head shadows only
+        // names it carries; config and the trunk's lm_head remain official.
+        st_files.insert(0, override_file);
+    }
     eprintln!("  shards : {}", st_files.len());
 
     // FWHT seeds — MUST match engine `Gpu::ensure_mq_signs()` in

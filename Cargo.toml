@@ -18,6 +18,7 @@ members = [
     "crates/hipfire-quantize",
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
+    "crates/hipfire-mtp-data",
     "crates/redline",
     "crates/redline-rocr",
     "crates/redline-dispatch",

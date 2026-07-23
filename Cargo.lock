@@ -849,6 +849,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-mtp-data",
  "hipfire-reap",
  "hipfire-runtime",
  "rdna-compute",
@@ -970,6 +971,16 @@ dependencies = [
  "hipfire-runtime",
  "rdna-compute",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-mtp-data"
+version = "0.3.0"
+dependencies = [
+ "half",
+ "serde",
+ "serde_json",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2990,6 +3001,12 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "zerocopy"

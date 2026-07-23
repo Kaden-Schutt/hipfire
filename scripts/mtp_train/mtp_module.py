@@ -78,7 +78,13 @@ class Qwen35MtpBlock(nn.Module):
         missing, unexpected = self.load_state_dict(stripped, strict=False)
         return missing, unexpected
 
-    def forward(self, prev_token_emb, trunk_hidden, position_ids=None):
+    def forward(
+        self,
+        prev_token_emb,
+        trunk_hidden,
+        position_ids=None,
+        attention_mask=None,
+    ):
         """
         prev_token_emb: [B, T, H] — embeddings of input tokens shifted by -1
                         (or whatever convention the caller uses; we just
@@ -106,7 +112,7 @@ class Qwen35MtpBlock(nn.Module):
         x = self.layers[0](
             hidden_states=x,
             position_embeddings=position_embeddings,
-            attention_mask=None,  # causal handled inside if needed
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
         )

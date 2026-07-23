@@ -6,8 +6,22 @@
   "trainable_parameters": ["mtp.*"],
   "frozen_parameters": ["model.*", "lm_head.*", "embed_tokens.*"],
   "max_length": 4096,
+  "features": {
+    "format": "HFMTPF01",
+    "hidden_dtype": "bf16-le",
+    "record_checksum": "xxh3-64",
+    "hidden_dim": 2048,
+    "window_rows": 128,
+    "windows_per_trajectory": 2,
+    "target_hidden_rows": 100000000,
+    "estimated_storage_gb": 410,
+    "kv_mode": "q8",
+    "state_quant": "q8"
+  },
   "epochs": 3,
   "global_batch_size": 64,
+  "micro_batch_size_per_gpu": 1,
+  "data_parallel_gpus": 4,
   "precision": "bf16",
   "optimizer": {
     "name": "AdamW",
@@ -20,8 +34,20 @@
     "warmup_ratio": 0.05
   },
   "mtp": {
+    "compressed_vocab_size": 16384,
+    "vocab_map_source": "deployed .mtp sidecar",
     "recursive_steps": 3,
     "loss_decay_beta": 0.6,
-    "normalized_loss_weights": [0.5102040816, 0.3061224490, 0.1836734694]
+    "normalized_loss_weights": [0.5102040816, 0.3061224490, 0.1836734694],
+    "mask_targets_outside_compressed_vocab": true
+  },
+  "certification": {
+    "harness": "scripts/serve_harness.py",
+    "sampling": "registry",
+    "thinking": "med",
+    "max_tokens": 4096,
+    "turns": 8,
+    "comparators": ["ar", "stock_mtp", "trained_mtp"],
+    "redline_shadow_iterations": 15
   }
 }
