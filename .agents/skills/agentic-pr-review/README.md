@@ -1,3 +1,8 @@
+---
+name: agentic-pr-review
+description: Full lifecycle skill for the agentic PR review workflow. Orchestrates preflight, discovery, one-shot review (build capsule → LLM inference → publish), and capsule inspection. Produces review comments with hardware validation triage and verify-<arch> labels. Use as the top-level entry point for automated PR review.
+---
+
 # Agentic PR review
 
 Full lifecycle skill for the hipfire agentic PR review workflow.

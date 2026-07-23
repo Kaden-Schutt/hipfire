@@ -1,3 +1,8 @@
+---
+name: agentic-pr-discovery
+description: Scan open pull requests and reconcile the needs-review label. Use before running agentic-pr-static-review to find PRs needing a review pass. Outputs JSON with reviewed, needs_review, labelled, clean, incomplete, and error arrays.
+---
+
 # Agentic PR discovery
 
 This skill is **manual-only**. It scans open pull requests, including

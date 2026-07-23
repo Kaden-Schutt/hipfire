@@ -1,3 +1,8 @@
+---
+name: agentic-pr-static-review
+description: Run bounded toolless inference on a review capsule and produce a review proposal with hardware validation triage. Use when a review capsule has been built and needs inference, or to run the full inspect pipeline (build → infer) on a PR. Outputs a structured ReviewProposal with triage data for downstream agent consumption.
+---
+
 # Agentic PR static review
 
 This skill is **manual-only** and operates as a read-only controller: it
