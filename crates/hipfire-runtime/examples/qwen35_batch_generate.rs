@@ -510,6 +510,48 @@ fn run_batch_prefix_arm(
     batch_prefix_hashes(gpu, state)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_batch_retained_prefix_arm(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &Qwen35Scratch,
+    state: &mut Qwen35DecodeBatchState,
+    slots: &[Slot],
+    tokens: &[u32],
+    positions: &[usize],
+    prefix: usize,
+    arm_checkpoint: u32,
+    decode_checkpoint: u32,
+) -> Result<BTreeMap<String, String>, String> {
+    if gpu.replay.uses_pm4_transport() {
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, prefix)
+            .map_err(|reason| format!("prepare PM4 prefix {prefix}: {reason}"))?;
+    } else {
+        gpu.replay
+            .prepare_linear_aql_prefix(gpu.device_id as usize, prefix)
+            .map_err(|reason| format!("prepare AQL prefix {prefix}: {reason}"))?;
+    }
+    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
+    reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
+    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(decode_checkpoint);
+    let position =
+        qwen35::prepare_decode_batch_inputs(gpu, weights, config, tokens, positions, state)
+            .map_err(|error| format!("prepare retained prefix inputs: {error}"))?;
+    if gpu.replay.uses_pm4_transport() {
+        unsafe { gpu.replay.replay_pm4(position) }
+            .map_err(|reason| format!("execute PM4 prefix {prefix}: {reason}"))?;
+    } else {
+        unsafe { gpu.replay.replay_linear_aql(position) }
+            .map_err(|reason| format!("execute AQL prefix {prefix}: {reason}"))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| format!("synchronize retained prefix {prefix}: {error}"))?;
+    batch_prefix_hashes(gpu, state)
+}
+
 fn advance_shadow_tokens(tokens: &mut [u32], observation: usize, step: usize, vocab: usize) {
     for (lane, token) in tokens.iter_mut().enumerate() {
         let delta = 17 + observation * 29 + step * 13 + lane * 3;
@@ -790,9 +832,7 @@ fn run_batch_shadow_gate(
     let recorded_hip_bit_exact = observations
         .iter()
         .all(|row| row["recorded_hip_bit_exact"].as_bool() == Some(true));
-    let prefix_localization = if recorded_hip_bit_exact {
-        Value::Null
-    } else {
+    let prefix_localization = if !recorded_hip_bit_exact {
         let arm_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
         rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
         reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
@@ -892,6 +932,7 @@ fn run_batch_shadow_gate(
                     upper = mid;
                 }
             }
+            last_equal = lower;
             first_different = Some(upper);
         }
         let first_kernel = first_different.and_then(|divergence| {
@@ -901,11 +942,132 @@ fn run_batch_shadow_gate(
                 .map(|launch| launch.kernel.clone())
         });
         json!({
+            "stage": "ordinary_hip_to_captured_hip",
             "last_equal_prefix": last_equal,
             "first_different_prefix": first_different,
             "first_different_kernel": first_kernel,
             "probes": rows,
         })
+    } else if !bit_exact {
+        let arm_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
+        reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
+        let decode_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+        let mut rows = Vec::new();
+        let mut last_equal = 1usize;
+        let mut first_different = None;
+        let mut prefix = 2usize.min(capture.launch_count);
+        while prefix <= capture.launch_count {
+            let recorded = run_batch_prefix_arm(
+                gpu,
+                weights,
+                config,
+                scratch,
+                state,
+                slots,
+                &initial_tokens,
+                &initial_positions,
+                prefix,
+                true,
+                arm_checkpoint,
+                decode_checkpoint,
+            )?;
+            let retained = run_batch_retained_prefix_arm(
+                gpu,
+                weights,
+                config,
+                scratch,
+                state,
+                slots,
+                &initial_tokens,
+                &initial_positions,
+                prefix,
+                arm_checkpoint,
+                decode_checkpoint,
+            )?;
+            let differing = recorded
+                .iter()
+                .filter_map(|(name, hash)| (retained.get(name) != Some(hash)).then(|| name.clone()))
+                .collect::<Vec<_>>();
+            let equal = differing.is_empty();
+            rows.push(json!({"prefix": prefix, "equal": equal, "differing": differing}));
+            if !equal {
+                first_different = Some(prefix);
+                break;
+            }
+            last_equal = prefix;
+            if prefix == capture.launch_count {
+                break;
+            }
+            prefix = prefix.saturating_mul(2).min(capture.launch_count);
+        }
+        if let Some(mut upper) = first_different {
+            let mut lower = last_equal;
+            while lower + 1 < upper {
+                let mid = lower + (upper - lower) / 2;
+                let recorded = run_batch_prefix_arm(
+                    gpu,
+                    weights,
+                    config,
+                    scratch,
+                    state,
+                    slots,
+                    &initial_tokens,
+                    &initial_positions,
+                    mid,
+                    true,
+                    arm_checkpoint,
+                    decode_checkpoint,
+                )?;
+                let retained = run_batch_retained_prefix_arm(
+                    gpu,
+                    weights,
+                    config,
+                    scratch,
+                    state,
+                    slots,
+                    &initial_tokens,
+                    &initial_positions,
+                    mid,
+                    arm_checkpoint,
+                    decode_checkpoint,
+                )?;
+                let differing = recorded
+                    .iter()
+                    .filter_map(|(name, hash)| {
+                        (retained.get(name) != Some(hash)).then(|| name.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let equal = differing.is_empty();
+                rows.push(json!({"prefix": mid, "equal": equal, "differing": differing}));
+                if equal {
+                    lower = mid;
+                } else {
+                    upper = mid;
+                }
+            }
+            last_equal = lower;
+            first_different = Some(upper);
+        }
+        let first_kernel = first_different.and_then(|divergence| {
+            gpu.replay
+                .recorded_launches()
+                .get(divergence - 1)
+                .map(|launch| launch.kernel.clone())
+        });
+        json!({
+            "stage": if gpu.replay.uses_pm4_transport() {
+                "captured_hip_to_pm4"
+            } else {
+                "captured_hip_to_aql"
+            },
+            "last_equal_prefix": last_equal,
+            "first_different_prefix": first_different,
+            "first_different_kernel": first_kernel,
+            "probes": rows,
+        })
+    } else {
+        Value::Null
     };
     Ok(json!({
         "type": "qwen35_batch_shadow_result",
