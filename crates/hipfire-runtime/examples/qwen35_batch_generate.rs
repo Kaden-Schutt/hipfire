@@ -503,6 +503,54 @@ fn run_batch_shadow_gate(
         let direct_host_us = direct_started.elapsed().as_secs_f64() * 1_000_000.0;
         let direct = batch_shadow_snapshot(gpu, state)?;
 
+        // Before blaming either retained transport, replay the captured launch
+        // blobs through ordinary HIP. This isolates capture fidelity from AQL
+        // or PM4 lowering: if this arm differs, the tape itself is not yet a
+        // valid shadow oracle.
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
+        reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(decode_checkpoint);
+        let mut recorded_tokens = initial_tokens.clone();
+        let mut recorded_positions = initial_positions.clone();
+        if observation != 0 {
+            advance_shadow_tokens(
+                &mut recorded_tokens,
+                observation,
+                997,
+                config.vocab_size,
+            );
+        }
+        let recorded_started = Instant::now();
+        for step in 0..iterations {
+            qwen35::prepare_decode_batch_inputs(
+                gpu,
+                weights,
+                config,
+                &recorded_tokens,
+                &recorded_positions,
+                state,
+            )
+            .map_err(|error| format!("prepare recorded HIP batch inputs: {error}"))?;
+            gpu.replay_recorded_hip_prefix(capture.launch_count)
+                .map_err(|error| format!("execute recorded HIP shadow: {error}"))?;
+            if step + 1 != iterations {
+                advance_shadow_tokens(
+                    &mut recorded_tokens,
+                    observation,
+                    step,
+                    config.vocab_size,
+                );
+                for position in &mut recorded_positions {
+                    *position += 1;
+                }
+            }
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| format!("synchronize recorded HIP shadow arm: {error}"))?;
+        let recorded_host_us = recorded_started.elapsed().as_secs_f64() * 1_000_000.0;
+        let recorded = batch_shadow_snapshot(gpu, state)?;
+
         rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
         reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
         rdna_compute::norm::restore_gdn_requant_frame_checkpoint(decode_checkpoint);
@@ -557,17 +605,27 @@ fn run_batch_shadow_gate(
         let logits_equal = direct.logits == replay.logits;
         let kv_equal = direct.kv == replay.kv;
         let recurrent_equal = direct.recurrent == replay.recurrent;
+        let recorded_logits_equal = direct.logits == recorded.logits;
+        let recorded_kv_equal = direct.kv == recorded.kv;
+        let recorded_recurrent_equal = direct.recurrent == recorded.recurrent;
         observations.push(json!({
             "observation": observation,
             "iterations": iterations,
             "bit_exact": logits_equal && kv_equal && recurrent_equal,
+            "recorded_hip_bit_exact":
+                recorded_logits_equal && recorded_kv_equal && recorded_recurrent_equal,
+            "recorded_hip_logits_equal": recorded_logits_equal,
+            "recorded_hip_kv_equal": recorded_kv_equal,
+            "recorded_hip_recurrent_equal": recorded_recurrent_equal,
             "logits_equal": logits_equal,
             "kv_equal": kv_equal,
             "recurrent_equal": recurrent_equal,
             "direct_host_us": direct_host_us,
+            "recorded_hip_host_us": recorded_host_us,
             "replay_host_us": replay_host_us,
             "replay_gpu_us": replay_gpu_us,
             "direct": direct.json(),
+            "recorded_hip": recorded.json(),
             "replay": replay.json(),
         }));
     }
