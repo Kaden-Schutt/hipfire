@@ -1,0 +1,3 @@
+datasets>=4.0,<5
+pyarrow>=18,<23
+xxhash>=3.5,<4

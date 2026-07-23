@@ -1,0 +1,114 @@
+schema_version = 1
+seed = 20260723
+tokenizer = "Qwen/Qwen3.6-35B-A3B"
+raw_examples = 440000
+final_examples = 400000
+
+# Source answers are never used. The assembler retains only the prompt or
+# conversation prefix and the deployed MQ4R trunk generates a fresh answer.
+
+[[source]]
+name = "ultrachat"
+dataset = "HuggingFaceH4/ultrachat_200k"
+config = "default"
+split = "train_sft"
+license = "MIT"
+category = "general"
+raw_count = 184800
+bucket_mix = [0.80, 0.18, 0.02]
+
+[[source]]
+name = "openmath"
+dataset = "nvidia/OpenMathInstruct-2"
+config = "default"
+split = "train_1M"
+license = "CC-BY-4.0"
+category = "math"
+raw_count = 79200
+bucket_mix = [0.85, 0.12, 0.03]
+
+[[source]]
+name = "opencode"
+dataset = "nvidia/OpenCodeInstruct"
+config = "train"
+split = "train"
+license = "CC-BY-4.0"
+category = "code"
+raw_count = 57200
+bucket_mix = [0.85, 0.12, 0.03]
+
+[[source]]
+name = "chinese_r1"
+dataset = "Congliu/Chinese-DeepSeek-R1-Distill-data-110k"
+config = "default"
+split = "train"
+license = "Apache-2.0"
+category = "chinese"
+raw_count = 52800
+bucket_mix = [0.75, 0.20, 0.05]
+
+[[source]]
+name = "aya"
+dataset = "CohereLabs/aya_dataset"
+config = "default"
+split = "train"
+license = "Apache-2.0"
+category = "multilingual"
+raw_count = 22000
+bucket_mix = [0.90, 0.08, 0.02]
+
+[[source]]
+name = "rag"
+dataset = "FreedomIntelligence/RAG-Instruct"
+config = "default"
+split = "train"
+license = "Apache-2.0"
+category = "rag"
+raw_count = 30800
+bucket_mix = [0.10, 0.70, 0.20]
+
+[[source]]
+name = "hermes_agent"
+dataset = "lambda/hermes-agent-reasoning-traces"
+config = "kimi,glm-5.1"
+split = "train"
+license = "Apache-2.0"
+category = "agent"
+raw_count = 13200
+bucket_mix = [0.20, 0.60, 0.20]
+
+[profiles.serve]
+fraction = 0.70
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 1.5
+
+[profiles.fastmtp]
+fraction = 0.20
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[profiles.greedy]
+fraction = 0.10
+temperature = 0.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+
+[buckets.short]
+max_prompt_tokens = 512
+max_new_tokens = 512
+max_seq = 1024
+
+[buckets.medium]
+max_prompt_tokens = 3072
+max_new_tokens = 1024
+max_seq = 4096
+
+[buckets.long]
+max_prompt_tokens = 2048
+max_new_tokens = 2048
+max_seq = 4096

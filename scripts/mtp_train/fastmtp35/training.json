@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "model": "Qwen/Qwen3.6-35B-A3B",
+  "deployed_trunk": "~/.hipfire/models/qwen3.6-35b-a3b.mq4r",
+  "warm_start": "official mtp.* tensors",
+  "trainable_parameters": ["mtp.*"],
+  "frozen_parameters": ["model.*", "lm_head.*", "embed_tokens.*"],
+  "max_length": 4096,
+  "epochs": 3,
+  "global_batch_size": 64,
+  "precision": "bf16",
+  "optimizer": {
+    "name": "AdamW",
+    "learning_rate": 5e-5,
+    "beta1": 0.9,
+    "beta2": 0.95
+  },
+  "scheduler": {
+    "name": "cosine",
+    "warmup_ratio": 0.05
+  },
+  "mtp": {
+    "recursive_steps": 3,
+    "loss_decay_beta": 0.6,
+    "normalized_loss_weights": [0.5102040816, 0.3061224490, 0.1836734694]
+  }
+}
