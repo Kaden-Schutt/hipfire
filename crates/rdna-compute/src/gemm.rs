@@ -16339,6 +16339,15 @@ impl Gpu {
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
+            if arch.starts_with("gfx12") {
+                // This dedicated kernel overwrites Y and therefore does not
+                // require the host-side memset used by residual WMMA. Besides
+                // preserving its validated dirty-output contract, that keeps
+                // the complete lm-head tail visible to Redline capture.
+                self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+                return self
+                    .gemm_hfq4g256_lmhead_wmma_gfx12(a_raw, x, y, m, k, batch_size);
+            }
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
                 Some(stream) => self
@@ -16346,11 +16355,7 @@ impl Gpu {
                     .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
             }
-            return if arch.starts_with("gfx12") {
-                self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
-            } else {
-                self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
-            };
+            return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
     }

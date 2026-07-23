@@ -586,7 +586,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
-        "gemv_hfq4g256"
+        "gemm_hfq4g256_lmhead_wmma_gfx12"
+        | "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_k2048"
@@ -789,6 +790,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rmsnorm_reduce_gfx1100"
         | "sigmoid_mul_f32" => Some(32),
         "attention_flash_q8_0_reduce"
+        | "gemm_hfq4g256_lmhead_wmma_gfx12"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
