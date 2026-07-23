@@ -8,13 +8,35 @@ provider may receive tools or execute repository commands.
 The controller must not run `git checkout`; test execution is out of scope.
 It does not inspect arbitrary branches or invoke a shell-backed coding agent.
 
-Run the inspector with:
+## Commands
+
+### Build a capsule from a PR (no inference, no provider key needed):
 
 ```text
-python3 -m autoresearch.ar.review.cli inspect --capsule FILE --proposal FILE
+python3 -m autoresearch.ar.review.cli inspect --pr 123 --repository OWNER/REPO --capsule capsule.json
+```
+
+### Build capsule + run inference + save proposal:
+
+```text
+export REVIEW_API_KEY="sk-..."
+python3 -m autoresearch.ar.review.cli inspect --pr 123 --repository OWNER/REPO \
+  --capsule capsule.json --proposal proposal.json --provider review-adapter
+```
+
+### Full one-shot review (build + infer + publish):
+
+```text
+export REVIEW_API_KEY="sk-..."
+python3 -m autoresearch.ar.review.cli review --pr 123 --repository OWNER/REPO \
+  --operator .github/agentic-review/operator-credentials.json --provider review-adapter
 ```
 
 Use `preflight.sh` in `controller` mode to validate protected configuration,
 read-only API access, and capsule source access before inspection. The
 controller and publisher are separate: only a publisher with the required
 write-permission operator credential may perform GitHub mutations.
+
+The `--config-ref <branch>` flag points config authentication at a non-default
+branch (needed when policy files haven't been merged yet). All commands accept
+`--token <ghx_...>` to override the GitHub token.
