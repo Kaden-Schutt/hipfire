@@ -5,8 +5,9 @@ ROOT="${1:-$HOME/.hipfire/datasets/fastmtp-qwen36-a3b-v1}"
 MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.6-35b-a3b.mq4r}"
 CONFIG="${CONFIG:-docs/configs/batched-redline-pm4-product.toml}"
 BIN="${BIN:-target/release/examples/qwen35_batch_generate}"
+LOCK_ROOT="${XDG_RUNTIME_DIR:-$HOME/.cache/hipfire}/hipfire-locks"
 
-mkdir -p "$ROOT/completions" "$ROOT/logs"
+mkdir -p "$ROOT/completions" "$ROOT/logs" "$LOCK_ROOT"
 
 if [[ ! -x "$BIN" ]]; then
     cargo build --release -p hipfire-runtime --example qwen35_batch_generate
@@ -35,7 +36,7 @@ run_job() {
     local pids=()
     for gpu in 0 1 2 3; do
         (
-            export HIPFIRE_GPU_LOCKFILE="/tmp/hipfire-gpu-${gpu}.lock"
+            export HIPFIRE_GPU_LOCKFILE="$LOCK_ROOT/gpu-${gpu}.lock"
             source scripts/gpu-lock.sh
             gpu_acquire "fastmtp-${stem}-gpu${gpu}"
             trap gpu_release EXIT

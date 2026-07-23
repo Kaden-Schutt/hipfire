@@ -23,9 +23,12 @@ ROOT=~/.hipfire/datasets/fastmtp-qwen36-a3b-v1
 Use a small deterministic smoke before the full assembly:
 
 ```bash
+SMOKE=~/.hipfire/datasets/.fastmtp-qwen36-a3b-v1-smoke
+rm -rf "$SMOKE"
 .venv/bin/python scripts/mtp_train/fastmtp35/assemble_prompts.py \
   --scale 0.001 \
-  --output /tmp/fastmtp35-assembly-smoke
+  --output "$SMOKE"
+rm -rf "$SMOKE"
 ```
 
 `manifest.json` pins source counts, tokenizer, Git head, job hashes, sampling
