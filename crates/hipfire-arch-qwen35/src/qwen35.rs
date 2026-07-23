@@ -6860,6 +6860,268 @@ pub fn forward_decode_batch_prepared(
     Ok(())
 }
 
+/// Prepare changing token and position inputs on every rank of an independent
+/// expert-parallel batch.
+///
+/// The immutable model body remains rank-local: every rank owns stable
+/// allocations for its sharded weights and replicated mutable state. This
+/// boundary mirrors [`prepare_decode_batch_inputs`] so a future multi-rank
+/// retained-PM4 adapter can capture only the fixed model phases.
+pub fn prepare_decode_batch_inputs_ep(
+    gpus: &mut Gpus,
+    weights_per_rank: &[Qwen35Weights],
+    config: &Qwen35Config,
+    tokens: &[u32],
+    positions: &[usize],
+    state_per_rank: &[Qwen35DecodeBatchState],
+) -> HipResult<usize> {
+    let n_rank = gpus.devices.len();
+    if n_rank == 0
+        || weights_per_rank.len() != n_rank
+        || state_per_rank.len() != n_rank
+        || tokens.is_empty()
+        || positions.len() != tokens.len()
+    {
+        return Err(HipError::new(
+            0,
+            "independent EP batch inputs do not match the rank or lane shape",
+        ));
+    }
+
+    let mut prepared_position = None;
+    for rank in 0..n_rank {
+        gpus.devices[rank].bind_thread()?;
+        let position = prepare_decode_batch_inputs(
+            &mut gpus.devices[rank],
+            &weights_per_rank[rank],
+            config,
+            tokens,
+            positions,
+            &state_per_rank[rank],
+        )?;
+        if prepared_position.replace(position).is_some_and(|prior| prior != position) {
+            return Err(HipError::new(
+                0,
+                "independent EP ranks prepared different decode positions",
+            ));
+        }
+    }
+    Ok(prepared_position.expect("nonempty rank set prepared a position"))
+}
+
+/// Advance one token in every lane of an expert-parallel independent batch.
+///
+/// Attention, recurrent work, router/shared-expert work, and mutable state are
+/// replicated on every rank. Routed experts remain sharded. Each MoE layer is
+/// therefore executed in three phases:
+///
+/// 1. every rank computes its owned routed-expert contribution into a disjoint
+///    `[batch, dim]` partial;
+/// 2. the partials are peer-all-reduced;
+/// 3. every rank adds the reduced result before advancing to the next layer.
+///
+/// This is deliberately a separate entry point from the certified single-GPU
+/// batch route. It establishes the exact layer boundary needed by EP2 retained
+/// PM4 without changing DP behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_decode_batch_ep(
+    gpus: &mut Gpus,
+    weights_per_rank: &[Qwen35Weights],
+    config: &Qwen35Config,
+    tokens: &[u32],
+    positions: &[usize],
+    state_per_rank: &mut [Qwen35DecodeBatchState],
+    scratch_per_rank: &[Qwen35Scratch],
+    partials: &[GpuTensor],
+) -> HipResult<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let position = prepare_decode_batch_inputs_ep(
+        gpus,
+        weights_per_rank,
+        config,
+        tokens,
+        positions,
+        state_per_rank,
+    )?;
+    forward_decode_batch_ep_prepared(
+        gpus,
+        weights_per_rank,
+        config,
+        tokens,
+        positions,
+        position,
+        state_per_rank,
+        scratch_per_rank,
+        partials,
+    )
+}
+
+/// Model-body half of [`forward_decode_batch_ep`], after all ranks have
+/// materialized embeddings and positions.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_decode_batch_ep_prepared(
+    gpus: &mut Gpus,
+    weights_per_rank: &[Qwen35Weights],
+    config: &Qwen35Config,
+    tokens: &[u32],
+    positions: &[usize],
+    position: usize,
+    state_per_rank: &mut [Qwen35DecodeBatchState],
+    scratch_per_rank: &[Qwen35Scratch],
+    partials: &[GpuTensor],
+) -> HipResult<()> {
+    let n_rank = gpus.devices.len();
+    let n = tokens.len();
+    if n_rank == 0
+        || weights_per_rank.len() != n_rank
+        || state_per_rank.len() != n_rank
+        || scratch_per_rank.len() != n_rank
+        || partials.len() != n_rank
+        || n == 0
+        || positions.len() != n
+        || position != positions.iter().copied().max().unwrap_or(0)
+    {
+        return Err(HipError::new(
+            0,
+            "prepared independent EP batch does not match the admitted rank or lane shape",
+        ));
+    }
+    let lane_capacity = state_per_rank[0].lane_capacity;
+    if state_per_rank.iter().any(|state| {
+        state.max_batch < n
+            || state.lane_capacity != lane_capacity
+            || positions.iter().any(|&value| value >= state.lane_capacity)
+    }) || partials
+        .iter()
+        .any(|partial| partial.buf.size() < n * config.dim * 4)
+    {
+        return Err(HipError::new(
+            0,
+            "prepared independent EP batch exceeds a rank's state or partial capacity",
+        ));
+    }
+
+    let peer_all_reduce =
+        hipfire_config::developer_var("HIPFIRE_EP_BATCH_PEER_ALLREDUCE").as_deref() != Ok("0");
+    let dim = config.dim;
+    let mut delta_layer_offset = 0usize;
+    let mut kv_layer_offset = 0usize;
+
+    for layer_idx in 0..config.n_layers {
+        let is_moe = matches!(
+            &weights_per_rank[0].layers[layer_idx],
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+        );
+
+        if is_moe {
+            for rank in 0..n_rank {
+                gpus.devices[rank].bind_thread()?;
+                let stream = gpus.devices[rank].active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        "forward_decode_batch_ep requires ensure_rank_streams",
+                    )
+                })?;
+                gpus.devices[rank]
+                    .hip
+                    .memset_async(&partials[rank].buf, 0, n * dim * 4, stream)?;
+            }
+        }
+
+        for rank in 0..n_rank {
+            gpus.devices[rank].bind_thread()?;
+            let band = PrefillBandCtx {
+                layer_start: layer_idx,
+                layer_end: layer_idx + 1,
+                delta_layer_offset,
+                kv_layer_offset,
+                is_first_band: layer_idx == 0,
+                is_last_band: false,
+                givens_cos: None,
+                givens_sin: None,
+            };
+            let routed_out = is_moe.then_some(&partials[rank]);
+            let state = &mut state_per_rank[rank];
+            forward_batch_chunk_impl(
+                &mut gpus.devices[rank],
+                &weights_per_rank[rank],
+                config,
+                tokens,
+                0,
+                &mut state.kv_cache,
+                &mut state.dn_state,
+                &scratch_per_rank[rank],
+                &state.pbs,
+                None,
+                None,
+                None,
+                0,
+                None,
+                true,
+                true,
+                Some(&band),
+                None,
+                false,
+                None,
+                routed_out,
+                BatchSemantics::Independent {
+                    positions,
+                    lane_capacity,
+                },
+            )?;
+        }
+
+        if is_moe {
+            let refs: Vec<&hip_bridge::DeviceBuffer> =
+                partials.iter().map(|partial| &partial.buf).collect();
+            if peer_all_reduce {
+                gpus.all_reduce_sum_f32_peer(&refs, n * dim)
+                    .map_err(|error| HipError::new(0, &error.to_string()))?;
+            } else {
+                gpus.all_reduce_sum_f32(&refs, n * dim)
+                    .map_err(|error| HipError::new(0, &error.to_string()))?;
+            }
+            for rank in 0..n_rank {
+                gpus.devices[rank].bind_thread()?;
+                let residual = state_per_rank[rank].pbs.x_batch.sub_offset(0, n * dim);
+                let routed = partials[rank].sub_offset(0, n * dim);
+                gpus.devices[rank].add_inplace_f32(&residual, &routed)?;
+            }
+        }
+
+        match config.layer_types[layer_idx] {
+            LayerType::LinearAttention => delta_layer_offset += 1,
+            LayerType::FullAttention => kv_layer_offset += 1,
+        }
+    }
+
+    // Only rank 0 needs logits. Its final hidden is already the all-reduced,
+    // replicated residual, so the output norm/head remain single-copy work.
+    gpus.devices[0].bind_thread()?;
+    let state = &state_per_rank[0];
+    let hidden = state.final_hidden.sub_offset(0, n * dim);
+    let logits = state.logits.sub_offset(0, n * config.vocab_size);
+    let lm_rot = state.lm_rot.sub_offset(0, n * dim);
+    gpus.devices[0].rmsnorm_batched(
+        &state.pbs.x_batch,
+        &weights_per_rank[0].output_norm,
+        &hidden,
+        n,
+        dim,
+        config.norm_eps,
+    )?;
+    lm_head_batched(
+        &mut gpus.devices[0],
+        &weights_per_rank[0].output,
+        &hidden,
+        &lm_rot,
+        &logits,
+        n,
+    )
+}
+
 /// Batched prefill entry point: processes N prompt tokens in one call,
 /// writing the last token's logits into `scratch.logits` and leaving
 /// the KV cache + DeltaNet state advanced by N positions.
@@ -9443,10 +9705,10 @@ fn forward_batch_chunk_impl(
                 "independent decode currently requires Q8 DeltaNet state and Q8 KV",
             ));
         }
-        if tree_verify.is_some() || band.is_some() || gdn_tape.is_some() {
+        if tree_verify.is_some() || gdn_tape.is_some() {
             return Err(HipError::new(
                 0,
-                "independent decode does not support tree, PP/EP band, or GDN tape modes",
+                "independent decode does not support tree or GDN tape modes",
             ));
         }
     }

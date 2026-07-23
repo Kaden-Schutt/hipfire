@@ -1,0 +1,35 @@
+# Experimental Qwen3.6 A3B independent-batch EP2 characterization.
+#
+# This does not alter the certified single-GPU DP/Redline route. Start with
+# ordinary HIP to establish the sharding/all-reduce cost, then change only the
+# retained queue policy for the PM4 overlap ablation.
+schema_version = 1
+
+[replay]
+backend = "hip"
+transport = "pm4"
+
+[diagnostic.replay]
+independent_batch = false
+manual_capture = false
+pm4_queues = "1"
+pm4_register_policy = "static"
+pm4_wait_policy = "resource"
+pm4_acquire_policy = "required-only"
+pm4_gcr_trim = true
+pm4_dynamic_grid = false
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[memory]
+kv_cache = "q8"
+
+[generation]
+loop_guard_threshold = 0
+
+[developer]
+gate_up_bt = false
