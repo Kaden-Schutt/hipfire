@@ -20,6 +20,49 @@
 //! The rectangular mesh is the "all sub-trees identical" special case, so the
 //! tree is a future superset, not a rewrite.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonically-increasing epoch counter for identity-sensitive comparison.
+/// Each call to [`DeviceMesh::rect`] or [`DeviceMesh::single`] bumps the
+/// counter and assigns the new value as the mesh's epoch.
+static NEXT_MESH_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate the next [`MeshEpoch`] from the global counter.
+///
+/// Uses a CAS loop (not a blind `fetch_add`) so that we never advance past
+/// `u64::MAX`.  The value `u64::MAX` is reserved as exhaustion sentinel and is
+/// never issued; only values through `u64::MAX - 1` are issuable.  When the
+/// counter reaches the sentinel the function panics — there is no recovery path
+/// because reissuing epochs would silently break identity-sensitive equality.
+/// The check happens *before* the CAS, so even if a panic is caught the global
+/// state is never left wrapping around.
+fn next_epoch() -> MeshEpoch {
+    let mut current = NEXT_MESH_EPOCH.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            panic!("MeshEpoch exhausted: no remaining issuable epochs");
+        }
+        match NEXT_MESH_EPOCH.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return MeshEpoch(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Opaque epoch identifier that distinguishes independently-constructed meshes.
+///
+/// Two [`DeviceMesh`] values compare equal only when they share the same epoch
+/// (i.e., one was derived from the other via [`Clone`] or
+/// [`DeviceMesh::squeezed`]).  The tuple field is private; the type itself is
+/// public.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct MeshEpoch(u64);
+
 /// The parallelism axes a device coordinate can range over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum DimKind {
@@ -60,15 +103,32 @@ pub struct Axis {
 /// A rectangular device mesh: an ordered list of typed axes. A global device id
 /// is the row-major flattening of a coordinate tuple over the axes (last axis
 /// varies fastest). An empty axis list is the single-device (1×1) mesh.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Equality is **identity-sensitive**: two meshes compare equal only when they
+/// share the same [`MeshEpoch`] — i.e., one was derived from the other via
+/// [`Clone`] or [`DeviceMesh::squeezed`].  Independently constructed meshes
+/// that happen to have the same shape are *not* equal.
+#[derive(Clone, Debug)]
 pub struct DeviceMesh {
     axes: Vec<Axis>,
+    epoch: MeshEpoch,
 }
+
+impl PartialEq for DeviceMesh {
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+    }
+}
+
+impl Eq for DeviceMesh {}
 
 impl DeviceMesh {
     /// Build a rectangular mesh from `(kind, size)` pairs. Sizes must be ≥ 1;
     /// size-1 axes are kept (so `group_along` over them is a singleton) — call
     /// [`DeviceMesh::squeezed`] to drop them if you want a minimal shape.
+    ///
+    /// Each call issues a fresh [`MeshEpoch`] so that independently constructed
+    /// meshes never compare equal, even when their axes are identical.
     pub fn rect(axes: &[(DimKind, usize)]) -> Self {
         let axes = axes
             .iter()
@@ -77,17 +137,32 @@ impl DeviceMesh {
                 size: size.max(1),
             })
             .collect();
-        Self { axes }
+        Self {
+            axes,
+            epoch: next_epoch(),
+        }
     }
 
     /// The single-device (1×1) mesh — no axes, exactly one device. This is what
     /// the unified `run_layer_program` runs the single-GPU path as.
+    ///
+    /// Each call issues a fresh [`MeshEpoch`] (same identity-sensitivity rule
+    /// as [`rect`](Self::rect)).
     pub fn single() -> Self {
-        Self { axes: Vec::new() }
+        Self {
+            axes: Vec::new(),
+            epoch: next_epoch(),
+        }
     }
 
     pub fn axes(&self) -> &[Axis] {
         &self.axes
+    }
+
+    /// The opaque epoch that distinguishes this mesh instance from
+    /// independently-constructed meshes — even those with identical topology.
+    pub fn epoch(&self) -> MeshEpoch {
+        self.epoch
     }
 
     /// Total number of logical devices = product of axis sizes (1 for a mesh
@@ -193,9 +268,12 @@ impl DeviceMesh {
     }
 
     /// Drop size-1 axes, yielding the minimal equivalent shape.
+    /// The returned mesh retains the same [`MeshEpoch`] — topology normalization
+    /// is the same mesh identity.
     pub fn squeezed(&self) -> Self {
         Self {
             axes: self.axes.iter().copied().filter(|a| a.size > 1).collect(),
+            epoch: self.epoch,
         }
     }
 
@@ -224,6 +302,46 @@ impl Default for DeviceMesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_clone_preserved() {
+        let m = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        assert_eq!(m.epoch(), m.clone().epoch());
+        // Clone preserves PartialEq equality (same epoch).
+        assert_eq!(m, m.clone());
+    }
+
+    #[test]
+    fn epoch_rect_independent_instances_distinct() {
+        let a = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let b = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        assert_ne!(a.epoch(), b.epoch());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn epoch_single_independent_instances_distinct() {
+        let a = DeviceMesh::single();
+        let b = DeviceMesh::single();
+        assert_ne!(a.epoch(), b.epoch());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn epoch_squeezed_preserves_epoch_and_equality() {
+        let m = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Ep, 1)]);
+        let sq = m.squeezed();
+        assert_eq!(m.epoch(), sq.epoch());
+        assert_eq!(m, sq);
+        // Squeezed axes are minimal; verify shape was normalized.
+        assert_eq!(
+            sq.axes(),
+            &[Axis {
+                kind: DimKind::Tp,
+                size: 2
+            }]
+        );
+    }
 
     #[test]
     fn single_is_one_device_no_axes() {

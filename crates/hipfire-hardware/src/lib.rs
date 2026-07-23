@@ -21,7 +21,7 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 pub mod mesh;
-pub use mesh::{Axis, CollectiveHint, DeviceMesh, DimKind};
+pub use mesh::{Axis, CollectiveHint, DeviceMesh, DimKind, MeshEpoch};
 
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,
@@ -64,6 +64,94 @@ impl DeviceResolveOpts {
         }
     }
 }
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Pool-epoch counter for [`WeightPoolEpoch`] allocation.
+static NEXT_POOL_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate the next [`WeightPoolEpoch`] via a checked CAS loop.
+/// Panics on exhaustion (same sentinel discipline as [`MeshEpoch`]).
+fn next_pool_epoch() -> WeightPoolEpoch {
+    let mut current = NEXT_POOL_EPOCH.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            panic!("WeightPoolEpoch exhausted: no remaining issuable epochs");
+        }
+        match NEXT_POOL_EPOCH.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return WeightPoolEpoch(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Opaque epoch for a weight-allocation domain — one per logical rank.
+///
+/// Two allocation origins compare equal only when they share the same pool
+/// epoch (i.e., they reference the same allocation-domain generation on the
+/// same logical rank of the same mesh).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct WeightPoolEpoch(u64);
+
+/// Identifies a weight-allocation event: which mesh instance, which logical
+/// rank, which physical device, and which pool epoch within that rank.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WeightAllocationOrigin {
+    mesh_epoch: MeshEpoch,
+    logical_rank: usize,
+    physical_device: i32,
+    pool_epoch: WeightPoolEpoch,
+}
+
+impl WeightAllocationOrigin {
+    /// The mesh epoch of the [`DeviceMesh`] that was bound at construction.
+    pub fn mesh_epoch(&self) -> MeshEpoch {
+        self.mesh_epoch
+    }
+    /// The logical rank within the mesh (0-based).
+    pub fn logical_rank(&self) -> usize {
+        self.logical_rank
+    }
+    /// The physical HIP device id that the logical rank maps to.
+    pub fn physical_device(&self) -> i32 {
+        self.physical_device
+    }
+    /// The per-rank pool epoch that distinguishes this allocation domain
+    /// generation from prior or subsequent ones on the same rank.
+    pub fn pool_epoch(&self) -> WeightPoolEpoch {
+        self.pool_epoch
+    }
+}
+
+/// Errors from [`Gpus::weight_origin`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WeightOriginError {
+    /// The `Gpus` was not constructed from a [`DeviceMesh`]; call
+    /// [`Gpus::from_mesh`] first.
+    UnboundMesh,
+    /// The given logical rank is out of range for this `Gpus`.
+    UnknownRank(usize),
+}
+
+impl std::fmt::Display for WeightOriginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeightOriginError::UnboundMesh => {
+                write!(f, "Gpus was not constructed from a DeviceMesh")
+            }
+            WeightOriginError::UnknownRank(r) => {
+                write!(f, "logical rank {r} is out of range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WeightOriginError {}
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
@@ -121,6 +209,14 @@ pub struct Gpus {
     /// `count` seen. Leaked on teardown (raw `DeviceBuffer`, no Drop-free).
     peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
     peer_ar_tmp_bytes: usize,
+
+    // ── mesh / weight-allocation identity ─────────────────────────────
+    /// `Some(mesh.epoch())` when constructed via [`Gpus::from_mesh`];
+    /// `None` for single / uniform / TP constructors.
+    mesh_epoch: Option<MeshEpoch>,
+    /// One pool epoch per logical rank, issued at construction by
+    /// [`Gpus::from_mesh`]. Empty when `mesh_epoch` is `None`.
+    pool_epochs: Vec<WeightPoolEpoch>,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -192,6 +288,9 @@ impl Gpus {
 
     /// PP=1 back-compat path: wrap an existing single `Gpu` into a `Gpus`
     /// with all layers on dev 0. `output_device = 0`.
+    ///
+    /// The returned instance is **unbound** ([`weight_origin`] returns
+    /// [`WeightOriginError::UnboundMesh`]).
     pub fn single(gpu: Gpu, n_layers: usize) -> Self {
         Self {
             rccl_comms: None,
@@ -204,6 +303,8 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            mesh_epoch: None,
+            pool_epochs: Vec::new(),
         }
     }
 
@@ -253,6 +354,8 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            mesh_epoch: None,
+            pool_epochs: Vec::new(),
         })
     }
 
@@ -269,20 +372,28 @@ impl Gpus {
     /// bare `Gpu` + `load_model`. Precedence `Ep > Tp > Pp` matches the daemon
     /// routing chain; the daemon guarantees at most one axis is >1, so the order
     /// only fixes a convention.
+    ///
+    /// Binds [`mesh.epoch()`](DeviceMesh::epoch) and issues a distinct
+    /// [`WeightPoolEpoch`] for each logical rank.
     pub fn from_mesh(mesh: &DeviceMesh, n_layers: usize) -> HipResult<Self> {
-        if mesh.has_axis(DimKind::Ep) {
-            Self::init_tp(mesh.size_of(DimKind::Ep), n_layers)
+        let mut gpus = if mesh.has_axis(DimKind::Ep) {
+            Self::init_tp(mesh.size_of(DimKind::Ep), n_layers)?
         } else if mesh.has_axis(DimKind::Tp) {
-            Self::init_uniform(mesh.size_of(DimKind::Tp), n_layers)
+            Self::init_uniform(mesh.size_of(DimKind::Tp), n_layers)?
         } else if mesh.has_axis(DimKind::Pp) {
-            Self::init_uniform(mesh.size_of(DimKind::Pp), n_layers)
+            Self::init_uniform(mesh.size_of(DimKind::Pp), n_layers)?
         } else {
-            Err(HipError::new(
+            return Err(HipError::new(
                 0,
                 "from_mesh: single-device (1×1) mesh has no multi-device axis; \
                  use Gpus::single / load_model for the single-GPU path",
-            ))
-        }
+            ));
+        };
+        Self::validate_mesh_device_count(mesh, gpus.devices.len())?;
+        let n = gpus.devices.len();
+        gpus.mesh_epoch = Some(mesh.epoch());
+        gpus.pool_epochs = (0..n).map(|_| next_pool_epoch()).collect();
+        Ok(gpus)
     }
 
     /// Bidirectional `hipDeviceEnablePeerAccess` between every pair of
@@ -501,6 +612,8 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            mesh_epoch: None,
+            pool_epochs: Vec::new(),
         })
     }
 
@@ -851,6 +964,68 @@ impl Gpus {
         }
         Ok(())
     }
+
+    // ── weight-allocation origin ──────────────────────────────────────
+
+    /// Assemble a [`WeightAllocationOrigin`] from already-resolved
+    /// components.  Pure helper — no `&self`, no GPU access required.
+    fn assemble_origin(
+        mesh_epoch: MeshEpoch,
+        logical_rank: usize,
+        physical_device: i32,
+        pool_epoch: WeightPoolEpoch,
+    ) -> WeightAllocationOrigin {
+        WeightAllocationOrigin {
+            mesh_epoch,
+            logical_rank,
+            physical_device,
+            pool_epoch,
+        }
+    }
+
+    /// Validate that `mesh.n_devices()` matches the number of constructed
+    /// GPU devices (`devices_len`).  Must be called after the per-axis
+    /// primitive has been dispatched but before binding mesh/pool identities.
+    fn validate_mesh_device_count(mesh: &DeviceMesh, devices_len: usize) -> HipResult<()> {
+        let mesh_n = mesh.n_devices();
+        if mesh_n != devices_len {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "from_mesh: mesh has {mesh_n} device{} but Gpus has {devices_len} device{}",
+                    if mesh_n == 1 { "" } else { "s" },
+                    if devices_len == 1 { "" } else { "s" },
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return the [`WeightAllocationOrigin`] for `rank`, or a descriptive
+    /// error if this `Gpus` was never bound to a [`DeviceMesh`] or `rank` is
+    /// out of range.
+    ///
+    /// The physical device id is always read from
+    /// `self.devices[rank].device_id` — no synthetic fallback exists.
+    pub fn weight_origin(&self, rank: usize) -> Result<WeightAllocationOrigin, WeightOriginError> {
+        let mesh_epoch = self.mesh_epoch.ok_or(WeightOriginError::UnboundMesh)?;
+        let pool_epoch = self
+            .pool_epochs
+            .get(rank)
+            .copied()
+            .ok_or(WeightOriginError::UnknownRank(rank))?;
+        let physical_device = self
+            .devices
+            .get(rank)
+            .map(|d| d.device_id)
+            .ok_or(WeightOriginError::UnknownRank(rank))?;
+        Ok(Self::assemble_origin(
+            mesh_epoch,
+            rank,
+            physical_device,
+            pool_epoch,
+        ))
+    }
 }
 
 /// `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` selects the RCCL-free peer-direct
@@ -989,6 +1164,40 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
 mod tests {
     use super::*;
 
+    // ── assemble_origin (pure helper, no Gpu required) ────────────────
+
+    #[test]
+    fn assemble_origin_constructs_correctly() {
+        let mesh_epoch = DeviceMesh::single().epoch();
+        let pool_epoch = next_pool_epoch();
+        let origin = Gpus::assemble_origin(mesh_epoch, 7, 42, pool_epoch);
+        assert_eq!(origin.mesh_epoch(), mesh_epoch);
+        assert_eq!(origin.logical_rank(), 7);
+        assert_eq!(origin.physical_device(), 42);
+        assert_eq!(origin.pool_epoch(), pool_epoch);
+    }
+
+    // ── validate_mesh_device_count (pure helper, no Gpu required) ──────
+
+    #[test]
+    fn validate_mesh_n_devices_accepts_single_axis() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 4)]);
+        assert!(Gpus::validate_mesh_device_count(&mesh, 4).is_ok());
+    }
+
+    #[test]
+    fn validate_mesh_n_devices_rejects_composed_2x2() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2), (DimKind::Ep, 2)]);
+        let err = Gpus::validate_mesh_device_count(&mesh, 2).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mesh has 4 devices but Gpus has 2 devices"),
+            "error message: {msg}",
+        );
+    }
+
+    // ── pre-existing tests ────────────────────────────────────────────
+
     #[test]
     fn alias_ids_maps_into_physical_range() {
         assert_eq!(alias_ids(&[0, 1], 1), vec![0, 0]); // 2 logical -> 1 physical
@@ -1016,5 +1225,23 @@ mod tests {
                 assert!(mx - mn <= 1, "split {split:?} for {n_devices}/{n_layers}");
             }
         }
+    }
+
+    #[test]
+    fn weight_allocation_origin_equality_observes_all_four_fields() {
+        let me1 = DeviceMesh::single().epoch();
+        let me2 = DeviceMesh::rect(&[(DimKind::Tp, 2)]).epoch();
+        let pe1 = next_pool_epoch();
+        let pe2 = next_pool_epoch();
+        let base = Gpus::assemble_origin(me1, 0, 0, pe1);
+        // Vary each field independently.
+        assert_ne!(base, Gpus::assemble_origin(me2, 0, 0, pe1), "mesh epoch");
+        assert_ne!(base, Gpus::assemble_origin(me1, 1, 0, pe1), "logical rank");
+        assert_ne!(
+            base,
+            Gpus::assemble_origin(me1, 0, 1, pe1),
+            "physical device"
+        );
+        assert_ne!(base, Gpus::assemble_origin(me1, 0, 0, pe2), "pool epoch");
     }
 }
