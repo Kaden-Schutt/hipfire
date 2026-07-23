@@ -1,0 +1,30 @@
+# Fence-policy isolator for fixed-slot sampled batch replay.
+# Differs from the trimmed product candidate only by retaining legacy
+# per-dispatch register emission.
+schema_version = 1
+
+[replay]
+backend = "shadow"
+transport = "pm4"
+
+[diagnostic.replay]
+independent_batch = true
+manual_capture = true
+pm4_queues = "1"
+pm4_register_policy = "legacy"
+pm4_wait_policy = "resource"
+pm4_acquire_policy = "required-only"
+pm4_gcr_trim = true
+pm4_dynamic_grid = false
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[memory]
+kv_cache = "q8"
+
+[generation]
+loop_guard_threshold = 0
