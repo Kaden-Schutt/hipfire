@@ -3207,7 +3207,7 @@ fn main() {
                 m.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-                let prime_ok = {
+                let prime_error = {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -3225,14 +3225,17 @@ fn main() {
                         None,
                         None,
                     )
-                    .is_ok()
+                    .err()
                 };
                 let _ = gpu.hip.device_synchronize();
-                if !prime_ok {
+                if let Some(error) = prime_error {
                     let _ = writeln!(
                         stdout,
                         "{}",
-                        r#"{"type":"error","message":"bench_decode prefill prime failed"}"#
+                        serde_json::json!({
+                            "type": "error",
+                            "message": format!("bench_decode prefill prime failed: {error:?}"),
+                        })
                     );
                     let _ = stdout.flush();
                     continue;
