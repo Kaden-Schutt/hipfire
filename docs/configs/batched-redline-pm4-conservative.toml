@@ -1,0 +1,29 @@
+# Maximum-dependency PM4 diagnostic for fixed-slot sampled batch replay.
+# This is a correctness isolator, not the intended performance profile.
+schema_version = 1
+
+[replay]
+backend = "redline"
+transport = "pm4"
+
+[diagnostic.replay]
+independent_batch = true
+manual_capture = false
+pm4_queues = "1"
+pm4_register_policy = "legacy"
+pm4_wait_policy = "allowlist"
+pm4_acquire_policy = "conservative"
+pm4_gcr_trim = false
+pm4_dynamic_grid = false
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[memory]
+kv_cache = "q8"
+
+[generation]
+loop_guard_threshold = 0
