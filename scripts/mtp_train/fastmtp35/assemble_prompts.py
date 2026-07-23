@@ -486,4 +486,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    # Python 3.14 plus the HF/Arrow stack on hiptrx can leave native worker
+    # pools blocked in interpreter teardown after every artifact is closed.
+    # The assembler is a one-shot CLI, so bypass extension finalizers only
+    # after a successful main() and explicit stream flush.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)
