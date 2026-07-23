@@ -1889,6 +1889,8 @@ pub struct ReplayController {
     auto_lifecycle: bool,
     forward_eligible: bool,
     replay_observation: ReplayObservation,
+    diagnostic_prefix_limit: Option<usize>,
+    diagnostic_prefix_count: usize,
 }
 
 impl ReplayController {
@@ -1934,6 +1936,8 @@ impl ReplayController {
             auto_lifecycle: false,
             forward_eligible: true,
             replay_observation: ReplayObservation::default(),
+            diagnostic_prefix_limit: None,
+            diagnostic_prefix_count: 0,
         }
     }
 
@@ -2010,6 +2014,8 @@ impl ReplayController {
         self.auto_lifecycle = auto_lifecycle;
         self.forward_eligible = true;
         self.replay_observation = ReplayObservation::default();
+        self.diagnostic_prefix_limit = None;
+        self.diagnostic_prefix_count = 0;
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -2029,6 +2035,30 @@ impl ReplayController {
 
     pub fn recorded_launches(&self) -> &[RecordedHipLaunch] {
         &self.recorded
+    }
+
+    /// Limit the next ordinary HIP model-body traversal to its first `limit`
+    /// recordable launches. This is a shadow-only localization aid: wrappers
+    /// beyond the limit return success without submitting work.
+    pub fn begin_diagnostic_launch_prefix(&mut self, limit: usize) {
+        self.diagnostic_prefix_limit = Some(limit);
+        self.diagnostic_prefix_count = 0;
+    }
+
+    pub fn finish_diagnostic_launch_prefix(&mut self) -> usize {
+        self.diagnostic_prefix_limit = None;
+        std::mem::take(&mut self.diagnostic_prefix_count)
+    }
+
+    pub(crate) fn admit_diagnostic_launch(&mut self) -> bool {
+        let Some(limit) = self.diagnostic_prefix_limit else {
+            return true;
+        };
+        if self.diagnostic_prefix_count >= limit {
+            return false;
+        }
+        self.diagnostic_prefix_count += 1;
+        true
     }
 
     pub fn pm4_queue_policy(&self) -> QueuePolicy {

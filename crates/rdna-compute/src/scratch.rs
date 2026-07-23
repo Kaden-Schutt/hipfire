@@ -423,6 +423,10 @@ impl ScratchState {
                 &mut n_val_m as *mut _ as *mut c_void,
             ];
             let grid = ((n_elems + 255) / 256) as u32;
+            if !replay.admit_diagnostic_launch() {
+                self.fp16_x_source_ptr = src_ptr;
+                return Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr());
+            }
             if replay.is_recording() {
                 let mut blob = KernargBlob::new();
                 blob.push_ptr(in_ptr);

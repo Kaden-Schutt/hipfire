@@ -1239,6 +1239,9 @@ impl Gpu {
         grid_binding: Option<crate::replay::ReplayGridBinding>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        if !self.replay.admit_diagnostic_launch() {
+            return Ok(());
+        }
         let record = self.replay.is_recording();
         if record || self.graphs.capture_mode || self.flags.force_blob_path {
             let mut blob = blob_builder();

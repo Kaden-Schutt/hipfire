@@ -26,7 +26,7 @@ use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -339,6 +339,88 @@ fn batch_shadow_snapshot(
     })
 }
 
+fn batch_prefix_hashes(
+    gpu: &Gpu,
+    state: &Qwen35DecodeBatchState,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut hashes = BTreeMap::new();
+    macro_rules! hash_tensor {
+        ($name:expr, $tensor:expr) => {{
+            let mut bytes = Vec::new();
+            append_shadow_buffer(gpu, &mut bytes, &$tensor.buf)?;
+            hashes.insert($name.to_string(), format!("{:016x}", shadow_hash(&bytes)));
+        }};
+    }
+    for (name, tensor) in [
+        ("x_batch", &state.pbs.x_batch),
+        ("x_rot_batch", &state.pbs.x_rot_batch),
+        ("x_norm_batch", &state.pbs.x_norm_batch),
+        ("dn_qkv_batch", &state.pbs.dn_qkv_batch),
+        ("dn_z_batch", &state.pbs.dn_z_batch),
+        ("dn_alpha_batch", &state.pbs.dn_alpha_batch),
+        ("dn_beta_batch", &state.pbs.dn_beta_batch),
+        ("dn_q_raw_batch", &state.pbs.dn_q_raw_batch),
+        ("dn_k_raw_batch", &state.pbs.dn_k_raw_batch),
+        ("dn_v_batch", &state.pbs.dn_v_batch),
+        ("dn_q_batch", &state.pbs.dn_q_batch),
+        ("dn_k_batch", &state.pbs.dn_k_batch),
+        ("dn_attn_out_batch", &state.pbs.dn_attn_out_batch),
+        ("dn_normed_batch", &state.pbs.dn_normed_batch),
+        ("gate_ffn_batch", &state.pbs.gate_ffn_batch),
+        ("up_batch", &state.pbs.up_batch),
+        ("ffn_hidden_batch", &state.pbs.ffn_hidden_batch),
+        ("dn_normed_rot_batch", &state.pbs.dn_normed_rot_batch),
+        ("positions", &state.pbs.positions),
+        ("tokens", &state.pbs.tokens),
+        ("fa_q_full_batch", &state.pbs.fa_q_full_batch),
+        ("fa_q_batch", &state.pbs.fa_q_batch),
+        ("fa_gate_batch", &state.pbs.fa_gate_batch),
+        ("fa_k_batch", &state.pbs.fa_k_batch),
+        ("fa_v_batch", &state.pbs.fa_v_batch),
+        ("fa_attn_out_batch", &state.pbs.fa_attn_out_batch),
+        ("fa_attn_out_rot_batch", &state.pbs.fa_attn_out_rot_batch),
+        ("final_hidden", &state.final_hidden),
+        ("logits", &state.logits),
+        ("lm_rot", &state.lm_rot),
+    ] {
+        hash_tensor!(name, tensor);
+    }
+    for (name, tensor) in [
+        ("moe_router_logits_batch", state.pbs.moe_router_logits_batch.as_ref()),
+        ("moe_shared_scalar_batch", state.pbs.moe_shared_scalar_batch.as_ref()),
+        ("moe_shared_gate_batch", state.pbs.moe_shared_gate_batch.as_ref()),
+        ("moe_shared_up_batch", state.pbs.moe_shared_up_batch.as_ref()),
+        ("moe_shared_rot_batch", state.pbs.moe_shared_rot_batch.as_ref()),
+        ("moe_topk_indices_batch", state.pbs.moe_topk_indices_batch.as_ref()),
+        ("moe_topk_weights_batch", state.pbs.moe_topk_weights_batch.as_ref()),
+        ("moe_gate_batch", state.pbs.moe_gate_batch.as_ref()),
+        ("moe_up_batch", state.pbs.moe_up_batch.as_ref()),
+        ("moe_rot_batch", state.pbs.moe_rot_batch.as_ref()),
+        ("moe_down_expanded_batch", state.pbs.moe_down_expanded_batch.as_ref()),
+        ("moe_expert_token_counts", state.pbs.moe_expert_token_counts.as_ref()),
+        ("moe_expert_offsets", state.pbs.moe_expert_offsets.as_ref()),
+        ("moe_sorted_slot_index", state.pbs.moe_sorted_slot_index.as_ref()),
+        ("moe_inverse_perm", state.pbs.moe_inverse_perm.as_ref()),
+        ("moe_expert_tile_ids", state.pbs.moe_expert_tile_ids.as_ref()),
+        ("moe_y_gate_up_grouped", state.pbs.moe_y_gate_up_grouped.as_ref()),
+        ("moe_y_down_grouped", state.pbs.moe_y_down_grouped.as_ref()),
+    ] {
+        if let Some(tensor) = tensor {
+            hash_tensor!(name, tensor);
+        }
+    }
+    let model = batch_shadow_snapshot(gpu, state)?;
+    hashes.insert(
+        "kv_state".to_string(),
+        format!("{:016x}", shadow_hash(&model.kv)),
+    );
+    hashes.insert(
+        "recurrent_state".to_string(),
+        format!("{:016x}", shadow_hash(&model.recurrent)),
+    );
+    Ok(hashes)
+}
+
 fn reset_shadow_state(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -377,6 +459,49 @@ fn reset_shadow_state(
     gpu.hip
         .device_synchronize()
         .map_err(|error| format!("synchronize restored shadow state: {error}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_batch_prefix_arm(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &Qwen35Scratch,
+    state: &mut Qwen35DecodeBatchState,
+    slots: &[Slot],
+    tokens: &[u32],
+    positions: &[usize],
+    prefix: usize,
+    recorded: bool,
+    arm_checkpoint: u32,
+    decode_checkpoint: u32,
+) -> Result<BTreeMap<String, String>, String> {
+    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
+    reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
+    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(decode_checkpoint);
+    let position =
+        qwen35::prepare_decode_batch_inputs(gpu, weights, config, tokens, positions, state)
+            .map_err(|error| format!("prepare batch prefix inputs: {error}"))?;
+    if recorded {
+        gpu.replay_recorded_hip_prefix(prefix)
+            .map_err(|error| format!("execute recorded HIP prefix {prefix}: {error}"))?;
+    } else {
+        gpu.replay.begin_diagnostic_launch_prefix(prefix);
+        let result = qwen35::forward_decode_batch_prepared(
+            gpu, weights, config, tokens, positions, position, state, scratch,
+        );
+        let admitted = gpu.replay.finish_diagnostic_launch_prefix();
+        result.map_err(|error| format!("execute ordinary HIP prefix {prefix}: {error}"))?;
+        if admitted != prefix {
+            return Err(format!(
+                "ordinary HIP prefix admitted {admitted} launches, expected {prefix}"
+            ));
+        }
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| format!("synchronize batch prefix {prefix}: {error}"))?;
+    batch_prefix_hashes(gpu, state)
 }
 
 fn advance_shadow_tokens(tokens: &mut [u32], observation: usize, step: usize, vocab: usize) {
@@ -656,6 +781,126 @@ fn run_batch_shadow_gate(
     let bit_exact = observations
         .iter()
         .all(|row| row["bit_exact"].as_bool() == Some(true));
+    let recorded_hip_bit_exact = observations
+        .iter()
+        .all(|row| row["recorded_hip_bit_exact"].as_bool() == Some(true));
+    let prefix_localization = if recorded_hip_bit_exact {
+        Value::Null
+    } else {
+        let arm_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
+        reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
+        let decode_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+        let mut rows = Vec::new();
+        let mut last_equal = 0usize;
+        let mut first_different = None;
+        let mut prefix = 1usize;
+        while prefix <= capture.launch_count {
+            let direct = run_batch_prefix_arm(
+                gpu,
+                weights,
+                config,
+                scratch,
+                state,
+                slots,
+                &initial_tokens,
+                &initial_positions,
+                prefix,
+                false,
+                arm_checkpoint,
+                decode_checkpoint,
+            )?;
+            let recorded = run_batch_prefix_arm(
+                gpu,
+                weights,
+                config,
+                scratch,
+                state,
+                slots,
+                &initial_tokens,
+                &initial_positions,
+                prefix,
+                true,
+                arm_checkpoint,
+                decode_checkpoint,
+            )?;
+            let differing = direct
+                .iter()
+                .filter_map(|(name, hash)| (recorded.get(name) != Some(hash)).then(|| name.clone()))
+                .collect::<Vec<_>>();
+            let equal = differing.is_empty();
+            rows.push(json!({"prefix": prefix, "equal": equal, "differing": differing}));
+            if !equal {
+                first_different = Some(prefix);
+                break;
+            }
+            last_equal = prefix;
+            if prefix == capture.launch_count {
+                break;
+            }
+            prefix = prefix.saturating_mul(2).min(capture.launch_count);
+        }
+        if let Some(mut upper) = first_different {
+            let mut lower = last_equal;
+            while lower + 1 < upper {
+                let mid = lower + (upper - lower) / 2;
+                let direct = run_batch_prefix_arm(
+                    gpu,
+                    weights,
+                    config,
+                    scratch,
+                    state,
+                    slots,
+                    &initial_tokens,
+                    &initial_positions,
+                    mid,
+                    false,
+                    arm_checkpoint,
+                    decode_checkpoint,
+                )?;
+                let recorded = run_batch_prefix_arm(
+                    gpu,
+                    weights,
+                    config,
+                    scratch,
+                    state,
+                    slots,
+                    &initial_tokens,
+                    &initial_positions,
+                    mid,
+                    true,
+                    arm_checkpoint,
+                    decode_checkpoint,
+                )?;
+                let differing = direct
+                    .iter()
+                    .filter_map(|(name, hash)| {
+                        (recorded.get(name) != Some(hash)).then(|| name.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let equal = differing.is_empty();
+                rows.push(json!({"prefix": mid, "equal": equal, "differing": differing}));
+                if equal {
+                    lower = mid;
+                } else {
+                    upper = mid;
+                }
+            }
+            first_different = Some(upper);
+        }
+        let first_kernel = first_different.and_then(|divergence| {
+            gpu.replay
+                .recorded_launches()
+                .get(divergence - 1)
+                .map(|launch| launch.kernel.clone())
+        });
+        json!({
+            "last_equal_prefix": last_equal,
+            "first_different_prefix": first_different,
+            "first_different_kernel": first_kernel,
+            "probes": rows,
+        })
+    };
     Ok(json!({
         "type": "qwen35_batch_shadow_result",
         "backend": if gpu.replay.uses_pm4_transport() { "pm4_ib" } else { "aql_packets" },
@@ -685,6 +930,7 @@ fn run_batch_shadow_gate(
             "queue_id": identity.queue_id,
             "command_dwords": identity.command_dwords,
         },
+        "prefix_localization": prefix_localization,
         "observations": observations,
     }))
 }
