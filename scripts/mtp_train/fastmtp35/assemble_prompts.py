@@ -193,7 +193,10 @@ def adapt_row(name: str, row: dict[str, Any], row_index: int) -> tuple[list[dict
         source_id = str(row_index)
         attrs["document_count"] = len(documents)
     elif name == "hermes_agent":
-        messages = strip_final_assistant(row.get("conversations") or [])
+        # The trace's system message embeds a large, Hermes-specific tool
+        # catalog and harness contract. Retain the actual task, then let the
+        # deployed trunk produce a clean response for our runtime instead.
+        messages = [{"role": "user", "content": str(row.get("task", ""))}]
         source_id = str(row.get("id") or row_index)
         attrs["category"] = row.get("category")
         attrs["subcategory"] = row.get("subcategory")
