@@ -13,6 +13,19 @@ provider may receive tools or execute repository commands.
 The controller must not run `git checkout`; test execution is out of scope.
 It does not inspect arbitrary branches or invoke a shell-backed coding agent.
 
+## Provider configuration
+
+Credentials and endpoints are configured in `.github/agentic-review/providers.json`.
+For local per-developer overrides (not checked in), create
+`.github/agentic-review/providers.local.json` with the same schema — it merges
+into the checked-in provider list (same `id` replaces, new `id` appends).
+See `.agents/skills/agentic-pr-review/README.md` for examples.
+
+The `api_key_env` field names the environment variable to read the API key from.
+For DeepSeek this is typically `DEEPSEEK_TOKEN`; set it with:
+`export DEEPSEEK_TOKEN="sk-..."`.  The examples below use `REVIEW_API_KEY` as a
+generic var — substitute your provider's actual env var name.
+
 ## Commands
 
 ### Build a capsule from a PR (no inference, no provider key needed):
