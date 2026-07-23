@@ -47,8 +47,10 @@ extern "C" __global__ void moe_down_combine_grouped_k8(
         if (k < K_TOP) {
             const int slot = inverse_perm[flat_base + k];
             const float w  = topk_weights[weights_base + k];
-            const float v  = Y_down_grouped[(long long)slot * dim + m_col];
-            acc += w * v;
+            if (slot >= 0) {
+                const float v = Y_down_grouped[(long long)slot * dim + m_col];
+                acc += w * v;
+            }
         }
     }
 

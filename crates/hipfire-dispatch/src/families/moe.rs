@@ -510,6 +510,11 @@ pub struct MoePrefillParams<'a> {
     // routed gate_up/down pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// EP-only global `u8[n_exp]` expert-owner table. When present, grouped
+    /// scatter drops assignments not owned by `owner_rank`, so each rank
+    /// executes only its routed-expert share.
+    pub expert_owners: Option<&'a GpuTensor>,
+    pub owner_rank: usize,
     /// Route A MoE-AWQ: per-routed-expert down `awq_scale` pointer table (see
     /// [`MoeParams::expert_down_awq_ptrs`]). When `Some`, the prefill silu+rotate
     /// uses the indexed AWQ kernel (per-slot scale via `topk_indices`),

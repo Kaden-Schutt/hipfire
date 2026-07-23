@@ -365,6 +365,8 @@ impl Gpu {
         sorted_slot_index: &GpuTensor,   // [m_total_max] i32, out
         expert_tile_ids: &GpuTensor,     // [m_total / block_m] i32, out
         inverse_perm: &GpuTensor,        // [total_slots] i32, out
+        expert_owners: Option<&GpuTensor>, // EP: [num_experts] u8, global expert -> rank
+        owner_rank: usize,
         total_slots: usize,
         num_experts: usize,
         m_total_max: usize,
@@ -382,6 +384,10 @@ impl Gpu {
         let sp = sorted_slot_index.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let invp = inverse_perm.buf.as_ptr();
+        let eop = expert_owners
+            .map(|owners| owners.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut::<c_void>());
+        let rank_val = owner_rank as i32;
         let ts_val = total_slots as i32;
         let ne_val = num_experts as i32;
         let mtm_val = m_total_max as i32;
@@ -393,6 +399,8 @@ impl Gpu {
             &sp as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
             &invp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &rank_val as *const _ as *mut c_void,
             &ts_val as *const _ as *mut c_void,
             &ne_val as *const _ as *mut c_void,
             &mtm_val as *const _ as *mut c_void,
@@ -416,6 +424,8 @@ impl Gpu {
                 b.push_ptr(sp);
                 b.push_ptr(tp);
                 b.push_ptr(invp);
+                b.push_ptr(eop);
+                b.push_i32(rank_val);
                 b.push_i32(ts_val);
                 b.push_i32(ne_val);
                 b.push_i32(mtm_val);

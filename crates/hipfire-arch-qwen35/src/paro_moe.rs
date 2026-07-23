@@ -211,6 +211,8 @@ pub(crate) fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        ep_expert_owners: None,
+        ep_rank: 0,
         expert_down_awq_ptrs: None,
         expert_dtype_tags: None,
         layer_idx,

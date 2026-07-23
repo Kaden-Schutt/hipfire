@@ -28,6 +28,8 @@ extern "C" __global__ void moe_scatter_fused_k8(
     int*       __restrict__ sorted_slot_index,   // [m_total_max] (-1 padding)
     int*       __restrict__ expert_tile_ids,     // [m_total_max / block_m]
     int*       __restrict__ inverse_perm,        // [total_slots]
+    const unsigned char* __restrict__ expert_owners, // [E], nullptr outside EP
+    int        owner_rank,
     int        total_slots,
     int        num_experts,
     int        m_total_max,                      // upper bound for -1 init
@@ -48,6 +50,11 @@ extern "C" __global__ void moe_scatter_fused_k8(
     for (int i = tid; i < m_total_max; i += bdim) {
         sorted_slot_index[i] = -1;
     }
+    // Non-owned EP assignments never enter the grouped layout. Their inverse
+    // entries remain -1 so the weighted combine can omit them safely.
+    for (int i = tid; i < total_slots; i += bdim) {
+        inverse_perm[i] = -1;
+    }
     // Init expert_tile_ids upper bound to -1 sentinel. The grouped-GEMM
     // dispatcher launches with slot_tiles = m_total_max / block_m to
     // avoid the m_total dtoh sync; tiles beyond the live m_total / block_m
@@ -61,7 +68,8 @@ extern "C" __global__ void moe_scatter_fused_k8(
 
     for (int i = tid; i < total_slots; i += bdim) {
         const int e = topk_indices[i];
-        if (e >= 0 && e < num_experts) {
+        if (e >= 0 && e < num_experts
+            && (!expert_owners || expert_owners[e] == owner_rank)) {
             atomicAdd(&s_workspace[e], 1);
         }
     }
@@ -90,7 +98,8 @@ extern "C" __global__ void moe_scatter_fused_k8(
     // ── Phase 3b: scatter ──
     for (int i = tid; i < total_slots; i += bdim) {
         const int e = topk_indices[i];
-        if (e >= 0 && e < num_experts) {
+        if (e >= 0 && e < num_experts
+            && (!expert_owners || expert_owners[e] == owner_rank)) {
             const int pos_in_bucket = atomicAdd(&s_workspace[e], 1);
             const int base = expert_offsets[e];
             const int sorted_pos = base + pos_in_bucket;

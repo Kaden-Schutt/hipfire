@@ -586,6 +586,13 @@ pub struct MoeFfnWeights {
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
+    /// EP-only global expert-owner table (`u8[num_experts]`). The grouped
+    /// scatter kernel uses it to omit non-owned assignments entirely instead
+    /// of running them through zero-dummy weights. `None` on the ordinary
+    /// single-GPU path.
+    pub ep_expert_owners: Option<GpuTensor>,
+    /// Local rank encoded in [`Self::ep_expert_owners`].
+    pub ep_rank: usize,
 
     /// Route A MoE-AWQ: per-expert down `awq_scale` pointer table
     /// (`[num_experts * 2]` f32 = num_experts × u64). `Some` only when the
@@ -932,6 +939,9 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     ffn.shared_expert.down.free_all(gpu);
     let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
     let _ = gpu.free_tensor(ffn.expert_down_ptrs);
+    if let Some(t) = ffn.ep_expert_owners {
+        let _ = gpu.free_tensor(t);
+    }
     // Non-owning pointer table — free the buffer only; the per-expert scales it
     // points into are owned by `experts[i].down.awq_scale` and freed below via
     // `e.down.free_all`.
@@ -2390,6 +2400,8 @@ fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        ep_expert_owners: None,
+        ep_rank: 0,
         // ParoQuant routed experts use shared per-layer Givens sidecars, not
         // per-expert MQ4 AWQ scales — no MoE-AWQ table.
         expert_down_awq_ptrs: None,
@@ -4150,6 +4162,15 @@ pub(crate) fn load_moe_ffn(
     let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
+    let ep_expert_owners = if let Some((shard, _)) = ep_shard.as_ref() {
+        let owners = gpu.alloc_tensor(&[n_exp], DType::Raw)?;
+        gpu.hip
+            .memcpy_htod(&owners.buf, shard.expert_to_rank.as_slice())?;
+        Some(owners)
+    } else {
+        None
+    };
+    let ep_rank = ep_shard.as_ref().map_or(0, |(_, rank)| *rank);
 
     // Route A MoE-AWQ: when every expert carries a down.awq_scale sidecar
     // (auto-loaded by load_weight_tensor for MQ4G256, which supports_awq_sidecar),
@@ -4298,6 +4319,8 @@ pub(crate) fn load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        ep_expert_owners,
+        ep_rank,
         expert_down_awq_ptrs,
         expert_dtype_tags,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
@@ -9426,6 +9449,8 @@ fn prefill_moe_ffn_body_batched(
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_owners: ffn.ep_expert_owners.as_ref(),
+        owner_rank: ffn.ep_rank,
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
         gate_batch,
@@ -14887,6 +14912,13 @@ pub fn shard_moe_experts(
     let dn_b: Vec<u8> = dn.iter().flat_map(|p| p.to_ne_bytes()).collect();
     gpu.hip.memcpy_htod(&ffn.expert_gate_up_ptrs.buf, &gu_b)?;
     gpu.hip.memcpy_htod(&ffn.expert_down_ptrs.buf, &dn_b)?;
+    let owners = gpu.alloc_tensor(&[n_exp], DType::Raw)?;
+    gpu.hip
+        .memcpy_htod(&owners.buf, shard.expert_to_rank.as_slice())?;
+    if let Some(old) = ffn.ep_expert_owners.replace(owners) {
+        let _ = gpu.free_tensor(old);
+    }
+    ffn.ep_rank = rank;
 
     // Route A MoE-AWQ under EP: rebuild the per-expert down.awq_scale pointer
     // table over the compacted set. Non-owned slots get a valid dummy pointer

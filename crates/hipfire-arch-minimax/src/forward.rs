@@ -1357,6 +1357,8 @@ pub fn forward_batch(
                 g_sorted,
                 g_tiles,
                 g_inv,
+                None,
+                0,
                 b * k_top,
                 n_exp,
                 m_total_max,
