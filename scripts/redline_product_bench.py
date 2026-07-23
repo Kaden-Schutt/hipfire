@@ -584,8 +584,8 @@ def main():
     parser.add_argument(
         "--settle-max-runs",
         type=int,
-        default=60,
-        help="fail instead of reporting if stationarity is absent (default: 60)",
+        default=120,
+        help="fail instead of reporting if stationarity is absent (default: 120)",
     )
     parser.add_argument(
         "--settle-max-slope-pct",
@@ -622,6 +622,10 @@ def main():
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--work-dir", default=str(REPO / ".redline-work"))
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--expected-model-sha256",
+        help="fail before loading the GPU when the model digest differs",
+    )
     args = parser.parse_args()
 
     if args.settle_window < 3:
@@ -639,12 +643,22 @@ def main():
 
     model = Path(args.model).expanduser().resolve()
     daemon = Path(args.daemon).expanduser().resolve()
+    model_sha256 = sha256_file(model)
+    if (
+        args.expected_model_sha256 is not None
+        and model_sha256.lower() != args.expected_model_sha256.lower()
+    ):
+        raise SystemExit(
+            "model SHA-256 mismatch: "
+            f"expected {args.expected_model_sha256.lower()}, got {model_sha256}"
+        )
     report = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "host": socket.gethostname(),
         "git_commit": git_head(),
         "model": str(model),
         "model_bytes": model.stat().st_size,
+        "model_sha256": model_sha256,
         "daemon": str(daemon),
         "daemon_sha256": sha256_file(daemon),
         "device_visibility": {

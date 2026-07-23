@@ -107,6 +107,10 @@ Implemented paths (anything else → `404`):
 
 There is **no** `/v1/completions` route in the current CLI serve.
 
+For the sealed MQ4R reproduction, default-model handoff, and copyable Hermes
+Agent / Pi custom-provider configuration, see
+[`GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md).
+
 ### `GET /health`
 
 Always `200` while the HTTP server is up. `model` is the loaded tag/path or

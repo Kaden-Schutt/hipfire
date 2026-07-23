@@ -80,6 +80,11 @@ The gfx1201 campaign raised ordinary MQ4R autoregressive decode from
 approximately 110 tok/s to 203.9 tok/s. See the
 [gfx1201 campaign report](docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md)
 and [Redline integration boundary](crates/redline-dispatch/HIPFIRE-GRAFT.md).
+To reproduce the sealed TG128 route, model, and sampling fixture on a supported
+GPU, run `python3 scripts/golden-redline.py`; the
+[Golden Redline guide](docs/GOLDEN-REDLINE.md) also covers making the validated
+fixture the serve default and connecting Hermes, Pi, or another
+OpenAI-compatible client.
 
 ## Curated model registry
 

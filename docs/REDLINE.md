@@ -482,6 +482,13 @@ prepared/tape identity, and positive replay-position deltas. Older reports
 without those fields remain discovery evidence and cannot be stitched to a
 separate daemon-harness fingerprint.
 
+`scripts/golden-redline.py` is a narrow sealed-fixture wrapper around that
+product harness. It pins the MQ4R model, TG128 parameters, PM4 policy,
+architecture-specific prepared/tape identity, registry sampling snapshot, and
+stationary acceptance floor recorded in `registry/redline-golden-v1.json`.
+Its pass means that exact existing fixture reproduced; it does not certify a
+new route, replace any gate in this section, or create an admission.
+
 ### Minimum route-proof record per arm
 
 | Field | Required content |
@@ -852,6 +859,7 @@ Prefer paths and symbols over line numbers.
 | Architecture PM4 builders | `crates/redline-rocr/src/pm4.rs`; `crates/redline-rocr/src/pm4_gfx10.rs` |
 | Manual capture/shadow diagnostic | `scripts/redline_daemon_harness.py` |
 | Product stationary comparison | `scripts/redline_product_bench.py` |
+| Sealed MQ4R fixture reproduction | `scripts/golden-redline.py`; `registry/redline-golden-v1.json`; `docs/GOLDEN-REDLINE.md` |
 | Claim → validation route selector | [`VALIDATION.md`](VALIDATION.md) |
 | Graft and ABI provenance | `crates/redline-dispatch/HIPFIRE-GRAFT.md`; `crates/redline-rocr/PROVENANCE.md` |
 | Positive dated gfx1201 evidence | `docs/perf-checkpoints/2026-07-11-redline-qwen36-a3b-ar.md`; `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` |

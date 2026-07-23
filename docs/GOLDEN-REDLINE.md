@@ -1,0 +1,229 @@
+# Golden Redline reproduction
+
+One-command, fail-closed reproduction of the measured Qwen 3.6 35B-A3B MQ4R
+retained-PM4 routes on gfx1100, gfx1151, and gfx1201.
+
+| Field | Value |
+|---|---|
+| Page state | **branch-implemented** |
+| Fixture registry | [`registry/redline-golden-v1.json`](../registry/redline-golden-v1.json) |
+| Runner | [`scripts/golden-redline.py`](../scripts/golden-redline.py) |
+| Product harness | [`scripts/redline_product_bench.py`](../scripts/redline_product_bench.py) |
+| Certification policy | [`REDLINE.md`](REDLINE.md) |
+
+This runner is developer orchestration. Persistent product configuration still
+goes through the native Rust `hipfire` CLI. Passing a golden reproduction does
+not create a model/route admission; admissions remain owned exclusively by
+[`admissions.yml`](admissions.yml).
+
+## Run it
+
+From a source checkout:
+
+```bash
+python3 scripts/golden-redline.py
+```
+
+The runner:
+
+1. selects the fixture for the physical GPU selected by `--device`;
+2. filters that physical device through ROCr and exposes it to HIP as logical
+   device zero;
+3. verifies the checked-in MQ4R registry card and sampling-profile hashes;
+4. verifies the exact 18.7 GB model size and SHA-256 before GPU load;
+5. builds the release daemon when it is absent;
+6. runs the product TG128 HIP-versus-retained-PM4 benchmark with the sealed
+   Q8, context, warmup, stationarity, transport, and PM4-policy parameters;
+7. requires positive timed-arm route proof and the exact architecture-specific
+   tape/prepared identity;
+8. checks the architecture-specific throughput and speedup floors; and
+9. writes both the raw product report and a hashed golden attestation under
+   `.redline-work/golden/`.
+
+Useful forms:
+
+```bash
+# Show fixtures without touching a GPU.
+python3 scripts/golden-redline.py --list
+
+# Pull the model when absent and pin it as the default after a pass.
+python3 scripts/golden-redline.py --pull --set-default --yes
+
+# Select a physical device on a multi-GPU host.
+python3 scripts/golden-redline.py --device 3
+
+# Print the exact command without building, hashing, loading, or running.
+python3 scripts/golden-redline.py --arch gfx1201 --dry-run
+
+# Audit an existing report; exact source and daemon hashes are mandatory here.
+python3 scripts/golden-redline.py \
+  --arch gfx1100 \
+  --report /path/to/report.json \
+  --strict-binary
+```
+
+The stationarity ceiling is 120 TG128 rows. This preserves the existing slope,
+spread, confirmation, and median-drift criteria while allowing slow cold-start
+clock convergence. It does not relax the acceptance gates.
+
+## What counts as a pass
+
+Identity is exact. Performance is an evidence-bound floor rather than a demand
+that every board produce the same final decimal.
+
+| Architecture | Route-proof reference | Acceptance floor | Required tape |
+|---|---:|---:|---|
+| gfx1100 | 251.798 tok/s | 245.000 tok/s and 1.08x | 604 launches / 22 kernels / `43754a60ca25f47c` |
+| gfx1151 | 115.290 tok/s | 115.021 tok/s and 1.10x | 604 launches / 23 kernels / `42f566b752920679` |
+| gfx1201 | 202.460 tok/s | 197.000 tok/s and 1.10x | 733 launches / 23 kernels / `3318ffca3daf2338` |
+
+The README headline measurements—253.31, 115.10, and 203.93 tok/s—remain
+recorded in the fixture registry as historical measured context. The table
+above uses the newer positive route-proof reports where available. The
+gfx1151 record also pins the sealed certification payload, HIP-source
+aggregate, dispatch-source aggregate, 23-HSACO manifest, model, and daemon
+hashes.
+
+Results are classified explicitly:
+
+- `exact-reference-binary`: source commit, daemon bytes, model, benchmark
+  contract, route identity, and performance gates all match.
+- `route-compatible-reproduction`: source or daemon is newer, but the exact
+  model, benchmark contract, route identity, and performance gates pass.
+- `failed`: any required identity, route-proof, stationarity, throughput, or
+  speedup gate fails.
+
+Use `--strict-binary` when only the exact pinned source and daemon bytes count.
+
+## Make the validated model the default
+
+After a successful interactive run, the script offers:
+
+```text
+Set this model as the hipfire default with its pinned registry sampling profile and Q8 KV? [y/N]
+```
+
+Accepting it, or passing `--set-default`, uses the native CLI to set
+`serve.default_model` to `qwen3.6:35b-a3b-mq4r` and copy the validated
+registry profile into that model's TOML overlay. A global generation override
+would otherwise take precedence over registry defaults; the model-specific
+layer makes this handoff deterministic without deleting unrelated global
+preferences.
+
+| Setting | Value |
+|---|---:|
+| temperature | 1.0 |
+| top-p | 0.95 |
+| top-k | 20 |
+| min-p | 0.0 |
+| presence penalty | 1.5 |
+| repeat penalty | 1.0 |
+| KV mode | q8 |
+
+Explicit OpenAI request fields still win. A third-party client that sends its
+own sampling values overrides these registry values; omit those fields or
+configure the client to match the table when exact sampling behavior matters.
+
+## Serve it
+
+```bash
+hipfire serve qwen3.6:35b-a3b-mq4r 127.0.0.1:11435 -d
+curl http://127.0.0.1:11435/v1/models
+```
+
+Client settings:
+
+| Field | Value |
+|---|---|
+| OpenAI base URL | `http://127.0.0.1:11435/v1` |
+| API key | Any non-empty placeholder if the client requires one |
+| Model | `qwen3.6:35b-a3b-mq4r` |
+| API shape | OpenAI Chat Completions |
+
+The server has no built-in authentication or TLS. Keep it on loopback, or put
+an authenticated TLS reverse proxy in front of it before remote access.
+
+### Hermes Agent
+
+Use Hermes' custom OpenAI-compatible provider:
+
+```bash
+hermes model
+# Select: Custom endpoint
+# API base URL: http://127.0.0.1:11435/v1
+# API key: hipfire-local
+# Model name: qwen3.6:35b-a3b-mq4r
+```
+
+The equivalent `~/.hermes/config.yaml` model block is:
+
+```yaml
+model:
+  default: qwen3.6:35b-a3b-mq4r
+  provider: custom
+  base_url: http://127.0.0.1:11435/v1
+```
+
+Set Hermes' advertised context length to the same value as Hipfire's effective
+`max_seq`; do not advertise a larger context merely to satisfy a client
+default. Official Hermes custom-endpoint guidance:
+<https://github.com/NousResearch/hermes-agent/blob/main/website/docs/reference/faq.md#can-i-use-it-offline--with-local-models>.
+
+### Pi
+
+Add a provider to `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "hipfire": {
+      "baseUrl": "http://127.0.0.1:11435/v1",
+      "api": "openai-completions",
+      "apiKey": "hipfire-local",
+      "compat": {
+        "supportsDeveloperRole": true,
+        "supportsReasoningEffort": true,
+        "supportsUsageInStreaming": true,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "qwen3.6:35b-a3b-mq4r",
+          "name": "Hipfire Qwen 3.6 35B-A3B MQ4R",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 4096
+        }
+      ]
+    }
+  }
+}
+```
+
+Adjust `contextWindow` and `maxTokens` to match the Hipfire configuration you
+actually serve. Pi's current custom-model schema is documented at
+<https://pi.dev/docs/latest/models>.
+
+### Other clients
+
+Any client that can target an OpenAI Chat Completions base URL can use the same
+endpoint/model pair. Hipfire supports streaming, usage on stream end, system
+and developer roles, tools, `reasoning_effort`, `max_tokens`, and the registry
+sampling fallback described in [`SERVE.md`](SERVE.md).
+
+## What this says about board variance
+
+A few percent of throughput spread alone is not evidence of silicon lottery.
+Automatic clocks, thermal and power state, ROCm/compiler builds, host load,
+container policy, and cold-start convergence can move results. A faster HIP
+control paired with a slower retained-PM4 arm especially points away from a
+uniformly faster or slower chip.
+
+The golden runner makes that distinction inspectable:
+
+- a different tape/prepared identity is a software or route mismatch;
+- a matching identity below the stationary floor is an environment, runtime,
+  or hardware investigation;
+- a matching identity and passing floor is a reproduction even when the final
+  decimal differs from the reference board.

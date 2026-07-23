@@ -88,6 +88,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Perf-arch working discipline | [`docs/methodology/perf-arch-discipline.md`](methodology/perf-arch-discipline.md) | shipped / ref-pinned | |
 | Kernel Atlas methodology | [`docs/methodology/kernel-atlas.md`](methodology/kernel-atlas.md) | shipped / ref-pinned | |
 | Redline contributor certification and route-proof policy | [`docs/REDLINE.md`](REDLINE.md) | shipped / ref-pinned | Normative contributor policy. |
+| Golden Redline fixture reproduction and client setup | [`docs/GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed measured fixtures; does not create admission. |
 | Thin Redline skill hook (workflow only) | [`.agents/skills/redline-retained-replay/`](../.agents/skills/redline-retained-replay/) | shipped / ref-pinned | Must not fork policy from `REDLINE.md`. |
 | Executable agent skills root | [`.agents/skills/`](../.agents/skills/) | shipped / ref-pinned | Sole executable skill root. |
 | Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Inventory snapshot; verify in source before product claims. |
@@ -137,6 +138,7 @@ Every current top-level page, exactly once.
 | [`CONTAINER.md`](CONTAINER.md) | shipped / ref-pinned | Containers. |
 | [`NIXOS.md`](NIXOS.md) | shipped / ref-pinned | NixOS. |
 | [`REDLINE.md`](REDLINE.md) | shipped / ref-pinned | Redline certification policy. |
+| [`GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed fixture reproduction and OpenAI-client setup. |
 | [`BENCHMARKS.md`](BENCHMARKS.md) | historical | Dated/historical bench tables; incomplete manifests stay historical-only. |
 | [`speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Speculation inventory snapshot. |
 | [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated durability fixture/tables. |
