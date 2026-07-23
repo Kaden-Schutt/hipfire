@@ -125,7 +125,11 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--redline`). |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
-| `hipfire update` | **Linux only:** fetch `master`, rebuild daemon/CLI/kernels. Other platforms: re-run the platform installer or build from source. |
+| `hipfire --version` | Concise semver + build commit + source ref identity. |
+| `hipfire version [--json]` | Detailed build/source match, checkout state, target, config schema, and installed-daemon SHA-256. |
+| `hipfire update [@REF]` | **Linux managed installs:** advance the current branch or auto-detect and install a branch/tag/commit. |
+| `hipfire update --branch NAME` | Switch to and track a remote branch such as `master` or `beta`. |
+| `hipfire update --tag TAG` / `--commit SHA` | Install an immutable detached revision. A later explicit selector moves away from the pin. |
 
 Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md). Published tables are measured/historical: [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -182,7 +186,8 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 | Model missing | `hipfire list` / `pull` |
 | Serve already running | `hipfire stop` or `restart` |
 | Stale pid / port busy | `hipfire stop --force`; inspect `serve.log` |
-| `update` on non-Linux | Use install script / source build |
+| `update` on non-Linux | Re-run `install.ps1 -Branch/-Tag/-Commit` or use a source build |
+| `update` from a detached pin | Choose the next target explicitly, e.g. `hipfire update @beta` |
 | Need HTTP API detail | [SERVE.md](SERVE.md) |
 | Need chat UX | [CHAT.md](CHAT.md) |
 | Need onboarding | [GETTING_STARTED.md](GETTING_STARTED.md) |

@@ -13,42 +13,39 @@ Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list
 
 ## Install
 
-### Linux (recommended) — pin, download, verify, execute
+### Linux — master or beta in one command
 
-Do **not** pipe a mutable branch URL into a shell. Pin a release tag or full
-commit, fetch the installer from that pin, inspect it, then run it against a
-checkout of the **same** pin (local mode). The installer script hard-codes
-`GITHUB_BRANCH=master` for remote clone mode, so a remote-only curl of a pinned
-script still installs the moving `master` tip unless you use a local checkout.
+The revision selector controls the managed source checkout under
+`~/.hipfire/src`; no installer editing is needed:
 
 ```bash
-# Replace PIN with a release tag (e.g. v0.2.1) or full commit SHA.
-PIN=v0.2.1
-git clone --depth 1 --branch "$PIN" https://github.com/Kaden-Schutt/hipfire.git
-cd hipfire
-# Optional integrity check: record/compare sha256 of scripts/install.sh yourself.
-sha256sum scripts/install.sh
-# Inspect, then execute from the pinned tree (local mode wires CLI + PATH):
-less scripts/install.sh
-./scripts/install.sh
+# Current master:
+curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+
+# Integration/testing branch:
+curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh \
+  | bash -s -- --branch beta
 ```
 
-Download-only variant (still requires a same-pin checkout before execute if you
-want the installed tree pinned — do not `curl … | bash`):
+Branch installs remain on that branch when `hipfire update` is run without a
+selector. The equivalent generic form is `--ref beta`; it auto-detects a
+branch, tag, or commit. `HIPFIRE_INSTALL_REF=beta` is available for automation.
+
+Both `master` and `beta` are mutable. For a reproducible install, pin and
+inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
 PIN=v0.2.1
 curl -fsSL "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
-sha256sum /tmp/hipfire-install.sh   # compare to a value you trust
-# Review the script, then either:
-#   (A) preferred — clone PIN and run ./scripts/install.sh from that tree, or
-#   (B) bash /tmp/hipfire-install.sh  # remote mode clones master tip (not PIN)
+sha256sum /tmp/hipfire-install.sh
+less /tmp/hipfire-install.sh
+bash /tmp/hipfire-install.sh --ref "$PIN"
 ```
 
-> **Unverified moving tip:** `curl -L …/master/scripts/install.sh | bash` follows
-> the live `master` branch for both the script and the checkout it installs. Use
-> only for throwaway experiments; it is not the ref-pinned default.
+Use `--tag v0.2.1` when the kind is known, or `--commit <full-sha>` for an
+immutable commit. Fetching a pinned script but omitting the selector installs
+`master`, so keep the two pins together.
 
 The installer detects GPU arch, ensures HIP and Rust build prerequisites, builds
 or copies the daemon, installs the native `hipfire` binary under
@@ -56,32 +53,32 @@ or copies the daemon, installs the native `hipfire` binary under
 `~/.hipfire/bin/kernels/compiled/<arch>/`. It can add that bin directory to
 `PATH`; reload the shell afterward if `hipfire` is not found.
 
-### Windows — pin, download, verify, execute
+### Windows — select a branch, tag, or commit
 
 ```powershell
-# Replace $Pin with a release tag (e.g. v0.2.1) or full commit SHA.
-$Pin = "v0.2.1"
-git clone --depth 1 --branch $Pin https://github.com/Kaden-Schutt/hipfire.git
-cd hipfire
-Get-FileHash .\scripts\install.ps1 -Algorithm SHA256   # record/compare yourself
-# Inspect, then run from the pinned tree (local mode):
-notepad .\scripts\install.ps1
-.\scripts\install.ps1
+# Current master:
+iex (irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1)
+
+# Integration/testing branch:
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1))) `
+  -Branch beta
 ```
 
-Download-only (do not `irm … | iex` for production). Remote mode in the script
-uses `$GithubBranch = "master"` for the checkout it installs:
+For a reviewed, pinned installation:
 
 ```powershell
 $Pin = "v0.2.1"
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/$Pin/scripts/install.ps1" `
   -OutFile "$env:TEMP\hipfire-install.ps1"
 Get-FileHash "$env:TEMP\hipfire-install.ps1" -Algorithm SHA256
-# Review, then prefer running install.ps1 from a git clone of $Pin.
+notepad "$env:TEMP\hipfire-install.ps1"
+& "$env:TEMP\hipfire-install.ps1" -Ref $Pin
 ```
 
-> **Unverified moving tip:** `irm …/master/scripts/install.ps1 | iex` is a
-> mutable master path for both script and installed tree — not the pinned default.
+PowerShell also accepts `-Branch beta`, `-Tag v0.2.1`, and `-Commit <sha>`.
+The native `hipfire update` command remains Linux-only because Windows cannot
+atomically replace the running executable; re-run `install.ps1` with the
+desired selector instead.
 
 Uses a GitHub release `daemon.exe` when available; otherwise builds from source
 under `~\.hipfire\src`. The native CLI is built from the same checkout, and the
@@ -113,10 +110,31 @@ Other packaging: [NIXOS.md](NIXOS.md), [CONTAINER.md](CONTAINER.md).
 ## Verify
 
 ```bash
+hipfire --version
+hipfire version
 hipfire diag
 ```
 
-Reports GPU arch, VRAM, HIP/ROCm, kernel locations, model dir, and config overrides. Prefer this over guessing when a later command fails.
+`--version` prints the release, source commit, and source ref in one line.
+`hipfire version` additionally reports whether the managed checkout still
+matches the binary and hashes the installed daemon; add `--json` for support
+reports. `diag` reports GPU arch, VRAM, HIP/ROCm, kernel locations, model dir,
+and config overrides.
+
+### Update or switch channels on Linux
+
+```bash
+hipfire update                  # advance the currently selected branch
+hipfire update @beta            # auto-detect branch/tag/commit
+hipfire update --branch master
+hipfire update --tag v0.2.1
+hipfire update --commit <sha>
+```
+
+Tags and commits are detached, immutable pins; a later selector is required to
+move away from them. Before switching, the updater retains the previous commit
+under `refs/hipfire/backups/` and stashes dirty files with a recoverable
+`hipfire-update-*` label.
 
 ## First inference
 

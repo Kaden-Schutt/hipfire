@@ -188,10 +188,18 @@ is intended. See [CONFIG.md](docs/CONFIG.md) for details.
 Linux with ROCm 6 or newer:
 
 ```bash
-curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+
+# Or install the integration branch for testing:
+curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh \
+  | bash -s -- --branch beta
 ```
 
 RDNA4 requires ROCm 6.4 or newer. gfx1151 requires ROCm 7.2 or newer.
+Run `hipfire --version` for a concise build ID or `hipfire version` to compare
+the installed binary, managed source checkout, and daemon. Managed Linux
+installs can switch revisions with `hipfire update @beta`,
+`hipfire update --tag v0.2.1`, or `hipfire update --commit <sha>`.
 
 For Windows, source builds, and verifying the install:
 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).

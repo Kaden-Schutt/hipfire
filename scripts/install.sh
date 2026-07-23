@@ -4,8 +4,9 @@
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
 
-# hipfire installer — detects GPU, installs deps, downloads binary + kernels.
-# Usage: curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+# hipfire installer — detects GPU, installs deps, builds native binaries + kernels.
+# Usage: curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+# Branch: curl -fsSL .../master/scripts/install.sh | bash -s -- --branch beta
 set -euo pipefail
 
 HIPFIRE_DIR="$HOME/.hipfire"
@@ -13,9 +14,81 @@ BIN_DIR="$HIPFIRE_DIR/bin"
 MODELS_DIR="$HIPFIRE_DIR/models"
 SRC_DIR="$HIPFIRE_DIR/src"
 GITHUB_REPO="Kaden-Schutt/hipfire"
-GITHUB_BRANCH="master"
+INSTALL_REF="${HIPFIRE_INSTALL_REF:-master}"
+INSTALL_REF_KIND=$([ -n "${HIPFIRE_INSTALL_REF:-}" ] && echo "auto" || echo "branch")
+REF_EXPLICIT=$([ -n "${HIPFIRE_INSTALL_REF:-}" ] && echo "1" || echo "0")
+SELECTOR_COUNT=0
+
+usage() {
+    cat <<'EOF'
+hipfire installer
+
+Usage:
+  install.sh [--ref REF | --branch NAME | --tag TAG | --commit SHA]
+
+Revision selectors:
+  --ref REF       Auto-detect a branch, tag, or commit (leading @ optional)
+  --branch NAME   Install and track a remote branch
+  --tag TAG       Install a pinned tag
+  --commit SHA    Install a pinned 7-40 character commit
+
+Examples:
+  curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash -s -- --branch beta
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ref|--branch|--tag|--commit)
+            [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+            SELECTOR_COUNT=$((SELECTOR_COUNT + 1))
+            INSTALL_REF="$2"
+            case "$1" in
+                --ref) INSTALL_REF_KIND="auto" ;;
+                --branch) INSTALL_REF_KIND="branch" ;;
+                --tag) INSTALL_REF_KIND="tag" ;;
+                --commit) INSTALL_REF_KIND="commit" ;;
+            esac
+            REF_EXPLICIT=1
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown installer option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+[ "$SELECTOR_COUNT" -le 1 ] || {
+    echo "ERROR: choose only one --ref, --branch, --tag, or --commit" >&2
+    exit 2
+}
+
+INSTALL_REF="${INSTALL_REF#@}"
+case "$INSTALL_REF" in
+    refs/heads/*) INSTALL_REF="${INSTALL_REF#refs/heads/}"; INSTALL_REF_KIND="branch" ;;
+    refs/tags/*) INSTALL_REF="${INSTALL_REF#refs/tags/}"; INSTALL_REF_KIND="tag" ;;
+    origin/*) INSTALL_REF="${INSTALL_REF#origin/}"; [ "$INSTALL_REF_KIND" != "auto" ] || INSTALL_REF_KIND="branch" ;;
+esac
+case "$INSTALL_REF" in
+    ""|-*|.*|/*|*..*|*@\{*|*//*|*/|*.|*\\*|*:*|*'?'*|*'*'*|*'['*|*'^'*|*'~'*|*" "*|*$'\t'*|*$'\r'*|*$'\n'*)
+        echo "ERROR: unsafe or invalid git revision: '$INSTALL_REF'" >&2
+        exit 2
+        ;;
+esac
+if [ "$INSTALL_REF_KIND" = "commit" ] && ! [[ "$INSTALL_REF" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    echo "ERROR: --commit requires a 7-40 character hexadecimal git commit" >&2
+    exit 2
+fi
 
 echo "=== hipfire installer ==="
+echo "Requested source: $INSTALL_REF_KIND '$INSTALL_REF'"
 echo ""
 
 # ─── Interactive prompts (safe for curl|bash) ────────────
@@ -30,6 +103,52 @@ ask() {
     else
         echo "$default"
     fi
+}
+
+remote_ref_exists() {
+    local repo="$1" reference="$2"
+    git -C "$repo" ls-remote --exit-code origin "$reference" >/dev/null 2>&1
+}
+
+checkout_install_ref() {
+    local repo="$1" kind="$INSTALL_REF_KIND"
+    if [ "$kind" = "auto" ]; then
+        if remote_ref_exists "$repo" "refs/heads/$INSTALL_REF"; then
+            kind="branch"
+        elif remote_ref_exists "$repo" "refs/tags/$INSTALL_REF"; then
+            kind="tag"
+        else
+            kind="commit"
+        fi
+    fi
+    case "$kind" in
+        branch)
+            remote_ref_exists "$repo" "refs/heads/$INSTALL_REF" || {
+                echo "  ERROR: origin has no branch '$INSTALL_REF'" >&2
+                return 1
+            }
+            git -C "$repo" fetch --depth 1 origin \
+                "+refs/heads/$INSTALL_REF:refs/remotes/origin/$INSTALL_REF"
+            git -C "$repo" checkout -B "$INSTALL_REF" "refs/remotes/origin/$INSTALL_REF"
+            ;;
+        tag)
+            remote_ref_exists "$repo" "refs/tags/$INSTALL_REF" || {
+                echo "  ERROR: origin has no tag '$INSTALL_REF'" >&2
+                return 1
+            }
+            git -C "$repo" fetch --depth 1 origin "refs/tags/$INSTALL_REF"
+            git -C "$repo" checkout --detach "FETCH_HEAD^{commit}"
+            ;;
+        commit)
+            git -C "$repo" fetch --depth 1 origin "$INSTALL_REF"
+            git -C "$repo" checkout --detach "FETCH_HEAD^{commit}"
+            ;;
+        *)
+            echo "  ERROR: unsupported revision kind '$kind'" >&2
+            return 1
+            ;;
+    esac
+    INSTALL_REF_KIND="$kind"
 }
 
 # Pick the right HIP runtime package name for dnf-based distros. Fedora's
@@ -71,11 +190,11 @@ case "$OS" in
         echo ""
         echo "hipfire has native Windows support. Install options:"
         echo "  1. PowerShell (recommended):"
-        echo "     irm https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/scripts/install.ps1 | iex"
+        echo "     irm https://raw.githubusercontent.com/$GITHUB_REPO/$INSTALL_REF/scripts/install.ps1 | iex"
         echo "  2. WSL2 (alternative):"
         echo "     wsl --install"
         echo "     # Then inside WSL:"
-        echo "     curl -L https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/scripts/install.sh | bash"
+        echo "     curl -L https://raw.githubusercontent.com/$GITHUB_REPO/$INSTALL_REF/scripts/install.sh | bash"
         exit 1
         ;;
     *)
@@ -292,6 +411,15 @@ fi
 echo ""
 if [ "$INSTALL_MODE" = "local" ]; then
     echo "Install mode: local (repo at $REPO_DIR)"
+    if [ "$REF_EXPLICIT" = "1" ]; then
+        current_commit=$(git -C "$REPO_DIR" rev-parse --verify HEAD 2>/dev/null || true)
+        requested_commit=$(git -C "$REPO_DIR" rev-parse --verify "$INSTALL_REF^{commit}" 2>/dev/null || true)
+        if [ -z "$requested_commit" ] || [ "$current_commit" != "$requested_commit" ]; then
+            echo "  ERROR: local installs never switch the developer checkout."
+            echo "  Check out '$INSTALL_REF' first, or use the remote installer with the selector."
+            exit 1
+        fi
+    fi
 else
     echo "Install mode: remote (cloning repository)"
 
@@ -302,17 +430,31 @@ else
             echo "    git clone https://github.com/$GITHUB_REPO.git ~/.hipfire/src"
             exit 1
         fi
-        echo "  Cloning https://github.com/$GITHUB_REPO.git ..."
-        git clone --depth 1 --branch "$GITHUB_BRANCH" \
-            "https://github.com/$GITHUB_REPO.git" "$SRC_DIR" || {
-            echo "  Clone failed. Check your connection or try:"
-            echo "    git clone https://github.com/$GITHUB_REPO.git $SRC_DIR"
+        echo "  Initializing https://github.com/$GITHUB_REPO.git ..."
+        if [ -d "$SRC_DIR" ] && [ -n "$(ls -A "$SRC_DIR" 2>/dev/null)" ]; then
+            echo "  ERROR: $SRC_DIR exists but is not a git checkout; move it aside and retry."
+            exit 1
+        fi
+        mkdir -p "$SRC_DIR"
+        git -C "$SRC_DIR" init --quiet
+        git -C "$SRC_DIR" remote add origin "https://github.com/$GITHUB_REPO.git"
+        checkout_install_ref "$SRC_DIR" || {
+            echo "  Checkout failed. Check the requested ref and your connection."
             exit 1
         }
-        echo "  Cloned ✓"
+        echo "  Checked out $INSTALL_REF_KIND '$INSTALL_REF' ✓"
         SOURCE_UPDATED=1
     else
         echo "  Existing clone found at $SRC_DIR"
+        previous_commit=$(git -C "$SRC_DIR" rev-parse --verify HEAD 2>/dev/null || true)
+        if [ -n "$previous_commit" ]; then
+            stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+            short_commit="${previous_commit:0:12}"
+            backup_ref="refs/hipfire/backups/pre-install-${stamp}-${short_commit}"
+            if git -C "$SRC_DIR" update-ref "$backup_ref" "$previous_commit"; then
+                echo "  Previous source retained at $backup_ref"
+            fi
+        fi
         # Stash any local modifications (Cargo.lock rewritten by cargo build,
         # autocrlf line-ending drift, user edits, etc.) so that the subsequent
         # reset can't abort with "local changes would be overwritten by merge".
@@ -327,19 +469,21 @@ else
                 echo "  WARNING: git stash failed; reset may drop local changes."
             fi
         fi
-        echo "  Updating..."
-        # Fetch + hard-reset is safe now (tree is clean post-stash). Reset
-        # handles both fast-forward and diverged-history cases uniformly.
-        if git -C "$SRC_DIR" fetch origin "$GITHUB_BRANCH" --depth 1 2>/dev/null && \
-           git -C "$SRC_DIR" reset --hard "origin/$GITHUB_BRANCH" 2>/dev/null; then
-            # Source was reset to origin — any prior build artifact is now stale.
+        echo "  Updating to $INSTALL_REF_KIND '$INSTALL_REF'..."
+        if checkout_install_ref "$SRC_DIR"; then
             SOURCE_UPDATED=1
+            echo "  Checked out $INSTALL_REF_KIND '$INSTALL_REF' ✓"
         else
             echo "  Update failed (non-fatal). Using existing checkout."
         fi
     fi
     REPO_DIR="$SRC_DIR"
 fi
+
+RESOLVED_COMMIT=$(git -C "$REPO_DIR" rev-parse --verify HEAD 2>/dev/null || echo "unknown")
+RESOLVED_REF=$(git -C "$REPO_DIR" describe --tags --exact-match HEAD 2>/dev/null || \
+    git -C "$REPO_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "detached")
+echo "Source resolved: $RESOLVED_REF @ $RESOLVED_COMMIT"
 
 # ─── Build / Install binaries ────────────────────────────
 echo ""
@@ -514,12 +658,17 @@ fi
 
 echo ""
 echo "=== hipfire installed ==="
+if [ -x "$BIN_DIR/hipfire" ]; then
+    "$BIN_DIR/hipfire" --version
+    echo "  source: $RESOLVED_REF @ $RESOLVED_COMMIT"
+fi
 echo ""
 echo "Quick start:"
 echo "  source ${SHELL_RC:-~/.bashrc}                    # reload PATH (or restart shell)"
 echo "  hipfire list                                      # see local models"
 echo "  hipfire run <model.hfq> \"Hello\"                  # generate text"
 echo "  hipfire serve                                     # start OpenAI-compatible API"
+echo "  hipfire version                                   # verify binary/source identity"
 echo ""
 echo "Models go in ~/.hipfire/models/ or the repo's models/ directory."
 echo ""

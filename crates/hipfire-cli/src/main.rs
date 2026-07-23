@@ -53,11 +53,15 @@ const MODEL_SUFFIXES: &[&str] = &[
     ".mfp4",
     ".q8",
 ];
+const BUILD_COMMIT: &str = env!("HIPFIRE_BUILD_COMMIT");
+const BUILD_REF: &str = env!("HIPFIRE_BUILD_REF");
+const BUILD_DIRTY: &str = env!("HIPFIRE_BUILD_DIRTY");
+const BUILD_TARGET: &str = env!("HIPFIRE_BUILD_TARGET");
 
 #[derive(Parser, Debug)]
 #[command(
     name = "hipfire",
-    version,
+    version = env!("HIPFIRE_BUILD_VERSION"),
     about = "LLM inference for AMD GPUs",
     long_about = "Native Rust control plane for hipfire. Configuration, registry, model lifecycle, serving, chat, and diagnostics are implemented without a JavaScript runtime."
 )]
@@ -89,8 +93,10 @@ enum Commands {
     Bench(BenchArgs),
     /// Report compiled kernel inventory for the detected architecture.
     Profile(ProfileArgs),
-    /// Update a source installation and rebuild the native control plane.
-    Update,
+    /// Print build, source-checkout, and installed-daemon identity.
+    Version(OutputArgs),
+    /// Update to a branch, tag, or commit and rebuild the native control plane.
+    Update(UpdateArgs),
     /// Quantize a Hugging Face or local model with the Rust quantizer.
     Quantize(QuantizeArgs),
     /// Generate a TriAttention calibration sidecar.
@@ -148,6 +154,57 @@ struct OutputArgs {
     /// Emit machine-readable JSON.
     #[arg(short, long)]
     json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct UpdateArgs {
+    /// Branch, tag, or commit to install. A leading '@' is optional.
+    #[arg(
+        value_name = "REF",
+        conflicts_with_all = ["branch", "tag", "commit"]
+    )]
+    reference: Option<String>,
+    /// Install the tip of a named remote branch.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["tag", "commit"])]
+    branch: Option<String>,
+    /// Install a named git tag in detached/pinned mode.
+    #[arg(long, value_name = "TAG", conflicts_with = "commit")]
+    tag: Option<String>,
+    /// Install an exact git commit in detached/pinned mode.
+    #[arg(long, value_name = "SHA")]
+    commit: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RevisionKind {
+    Auto,
+    Branch,
+    Tag,
+    Commit,
+}
+
+impl RevisionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "ref",
+            Self::Branch => "branch",
+            Self::Tag => "tag",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RevisionSelector {
+    value: String,
+    kind: RevisionKind,
+}
+
+#[derive(Debug)]
+struct ResolvedRevision {
+    selector: RevisionSelector,
+    commit: String,
+    tracking_ref: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -470,7 +527,8 @@ fn run() -> Result<()> {
         Some(Commands::Ps(output)) => ps_command(&paths, output),
         Some(Commands::Bench(args)) => bench_command(&paths, args),
         Some(Commands::Profile(args)) => profile_command(&paths, args),
-        Some(Commands::Update) => update_command(&paths),
+        Some(Commands::Version(output)) => version_command(&paths, output),
+        Some(Commands::Update(args)) => update_command(&paths, args),
         Some(Commands::Quantize(args)) => quantize_command(&paths, args),
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
@@ -4894,39 +4952,177 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
     Ok(())
 }
 
-fn update_command(paths: &Paths) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!("hipfire update is Linux-only; re-run the platform installer on this OS");
-    }
+fn version_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let installed = paths.root.join("src");
-    let repo = if installed.join("Cargo.toml").is_file() {
+    let (source_kind, source) = if installed.join("Cargo.toml").is_file() {
+        ("managed", installed)
+    } else {
+        (
+            "build checkout",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        )
+    };
+    let source = fs::canonicalize(&source).unwrap_or(source);
+    let source_commit = git_output(&source, &["rev-parse", "--verify", "HEAD"]).ok();
+    let source_ref = git_output(&source, &["describe", "--tags", "--exact-match", "HEAD"])
+        .ok()
+        .or_else(|| git_output(&source, &["symbolic-ref", "--short", "HEAD"]).ok());
+    let source_dirty = git_output(&source, &["status", "--porcelain"])
+        .ok()
+        .map(|status| !status.is_empty());
+    let source_matches_build = source_commit
+        .as_deref()
+        .filter(|_| BUILD_COMMIT != "unknown")
+        .map(|commit| commit == BUILD_COMMIT);
+    let daemon = ["daemon", "daemon.exe"]
+        .into_iter()
+        .map(|name| paths.root.join("bin").join(name))
+        .find(|path| path.is_file());
+    let daemon_sha256 = daemon
+        .as_deref()
+        .map(sha256_path)
+        .transpose()
+        .context("failed to hash installed daemon")?;
+    let value = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": {
+            "commit": BUILD_COMMIT,
+            "ref": BUILD_REF,
+            "dirty": BUILD_DIRTY == "true",
+            "target": BUILD_TARGET,
+        },
+        "source": {
+            "kind": source_kind,
+            "path": source,
+            "commit": source_commit,
+            "ref": source_ref,
+            "dirty": source_dirty,
+            "matches_build": source_matches_build,
+        },
+        "daemon": {
+            "path": daemon,
+            "sha256": daemon_sha256,
+        },
+        "config_schema_version": CONFIG_SCHEMA_VERSION,
+    });
+    if output.json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("hipfire {}", env!("CARGO_PKG_VERSION"));
+    println!("  build commit: {BUILD_COMMIT}");
+    println!(
+        "  build ref:    {BUILD_REF}{}",
+        if BUILD_DIRTY == "true" {
+            " (dirty)"
+        } else {
+            ""
+        }
+    );
+    println!("  build target: {BUILD_TARGET}");
+    println!("  source:       {source_kind} {}", source.display());
+    println!(
+        "  source ref:   {}",
+        source_ref.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  source commit: {}",
+        source_commit
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "unknown".into())
+    );
+    println!(
+        "  source state: {}",
+        match source_dirty {
+            Some(true) => "dirty",
+            Some(false) => "clean",
+            None => "unknown",
+        }
+    );
+    println!(
+        "  source/build: {}",
+        match source_matches_build {
+            Some(true) => "match",
+            Some(false) => "MISMATCH",
+            None => "unknown",
+        }
+    );
+    if let (Some(path), Some(digest)) = (daemon, daemon_sha256) {
+        println!("  daemon:       {}", path.display());
+        println!("  daemon sha256: {digest}");
+    } else {
+        println!("  daemon:       not installed");
+    }
+    Ok(())
+}
+
+fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS");
+    }
+    let requested = parse_revision_selector(&args)?;
+    let installed = paths.root.join("src");
+    let managed = installed.join("Cargo.toml").is_file();
+    let repo = if managed {
         installed
     } else {
+        if requested.is_some() {
+            bail!(
+                "revision switching is limited to managed installs under {}; \
+                 run install.sh --ref <ref> once to create one",
+                paths.root.join("src").display()
+            );
+        }
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
     };
     let repo = fs::canonicalize(&repo).unwrap_or(repo);
-    let branch = git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if branch != "master" && branch != "HEAD" {
+    let current_branch = git_output(&repo, &["symbolic-ref", "--short", "HEAD"]).ok();
+    if !managed && current_branch.as_deref() != Some("master") {
         bail!(
-            "current branch is '{branch}', not master; `hipfire update` only updates end-user master installations"
+            "this binary was built from an unmanaged '{}' checkout; \
+             update it with git or install a managed copy",
+            current_branch.as_deref().unwrap_or("detached")
         );
     }
+    let selector = requested
+        .or_else(|| {
+            current_branch.as_ref().map(|branch| RevisionSelector {
+                value: branch.clone(),
+                kind: RevisionKind::Branch,
+            })
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "this installation is pinned at a detached commit; \
+                 choose a target such as `hipfire update @master`"
+            )
+        })?;
+
+    eprintln!(
+        "fetching {} '{}' from origin...",
+        selector.kind.label(),
+        selector.value
+    );
+    let resolved = fetch_revision(&repo, selector)?;
+    let previous = git_output(&repo, &["rev-parse", "--verify", "HEAD"])?;
+    let short = previous.get(..12).unwrap_or(&previous);
+    let backup_ref = format!(
+        "refs/hipfire/backups/pre-update-{}-{short}",
+        unix_timestamp()
+    );
     run_checked(
         Command::new("git")
             .current_dir(&repo)
-            .args(["fetch", "origin", "master"]),
-        "git fetch origin master",
+            .args(["update-ref", &backup_ref, &previous]),
+        "git update-ref backup",
     )?;
-    let ahead = git_output(&repo, &["rev-list", "--count", "origin/master..HEAD"])?
-        .parse::<u64>()
-        .context("git returned an invalid ahead count")?;
-    if ahead > 0 {
-        bail!("local master has {ahead} unpushed commit(s); push or rebase before updating");
-    }
+    eprintln!("previous source retained at {backup_ref}");
+
     let dirty = !git_output(&repo, &["status", "--porcelain"])?.is_empty();
     if dirty {
-        let stamp = unix_timestamp();
-        let message = format!("hipfire-update-{stamp}");
+        let message = format!("hipfire-update-{}", unix_timestamp());
         eprintln!("local modifications detected; stashing as {message}");
         run_checked(
             Command::new("git").current_dir(&repo).args([
@@ -4940,12 +5136,8 @@ fn update_command(paths: &Paths) -> Result<()> {
         )?;
         eprintln!("recover later with: git -C {} stash pop", repo.display());
     }
-    run_checked(
-        Command::new("git")
-            .current_dir(&repo)
-            .args(["reset", "--hard", "origin/master"]),
-        "git reset --hard origin/master",
-    )?;
+    checkout_revision(&repo, &resolved)?;
+
     let installer = repo.join("scripts/install.sh");
     if !installer.is_file() {
         bail!("updated checkout has no {}", installer.display());
@@ -4957,8 +5149,206 @@ fn update_command(paths: &Paths) -> Result<()> {
             .env("HIPFIRE_FORCE_REBUILD", "1"),
         "native installer",
     )?;
-    println!("hipfire updated");
+    println!(
+        "hipfire updated to {} '{}' ({})",
+        resolved.selector.kind.label(),
+        resolved.selector.value,
+        resolved.commit
+    );
+    println!("verify with: hipfire version");
     Ok(())
+}
+
+fn parse_revision_selector(args: &UpdateArgs) -> Result<Option<RevisionSelector>> {
+    let candidates = [
+        args.reference
+            .as_ref()
+            .map(|value| (value.as_str(), RevisionKind::Auto)),
+        args.branch
+            .as_ref()
+            .map(|value| (value.as_str(), RevisionKind::Branch)),
+        args.tag
+            .as_ref()
+            .map(|value| (value.as_str(), RevisionKind::Tag)),
+        args.commit
+            .as_ref()
+            .map(|value| (value.as_str(), RevisionKind::Commit)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if candidates.len() > 1 {
+        bail!("choose only one update ref, --branch, --tag, or --commit");
+    }
+    let Some((raw, mut kind)) = candidates.first().copied() else {
+        return Ok(None);
+    };
+    let mut value = raw.trim().trim_start_matches('@');
+    if let Some(branch) = value.strip_prefix("refs/heads/") {
+        value = branch;
+        kind = RevisionKind::Branch;
+    } else if let Some(tag) = value.strip_prefix("refs/tags/") {
+        value = tag;
+        kind = RevisionKind::Tag;
+    } else if let Some(branch) = value.strip_prefix("origin/") {
+        value = branch;
+        if kind == RevisionKind::Auto {
+            kind = RevisionKind::Branch;
+        }
+    }
+    validate_revision(value, kind)?;
+    Ok(Some(RevisionSelector {
+        value: value.to_owned(),
+        kind,
+    }))
+}
+
+fn validate_revision(value: &str, kind: RevisionKind) -> Result<()> {
+    let invalid = value.is_empty()
+        || value.starts_with(['-', '.', '/'])
+        || value.ends_with(['.', '/'])
+        || value.contains("..")
+        || value.contains("@{")
+        || value.contains("//")
+        || value.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '\\' | ':' | '?' | '*' | '[' | '^' | '~')
+        });
+    if invalid {
+        bail!("unsafe or invalid git revision {value:?}");
+    }
+    if kind == RevisionKind::Commit
+        && (!(7..=40).contains(&value.len())
+            || !value.chars().all(|character| character.is_ascii_hexdigit()))
+    {
+        bail!("--commit requires a 7-40 character hexadecimal git commit");
+    }
+    Ok(())
+}
+
+fn fetch_revision(repo: &Path, mut selector: RevisionSelector) -> Result<ResolvedRevision> {
+    if selector.kind == RevisionKind::Auto {
+        selector.kind = if remote_ref_exists(repo, &format!("refs/heads/{}", selector.value))? {
+            RevisionKind::Branch
+        } else if remote_ref_exists(repo, &format!("refs/tags/{}", selector.value))? {
+            RevisionKind::Tag
+        } else {
+            RevisionKind::Commit
+        };
+    }
+
+    match selector.kind {
+        RevisionKind::Branch => {
+            let remote = format!("refs/heads/{}", selector.value);
+            if !remote_ref_exists(repo, &remote)? {
+                bail!("origin has no branch '{}'", selector.value);
+            }
+            let tracking = format!("refs/remotes/origin/{}", selector.value);
+            let refspec = format!("+{remote}:{tracking}");
+            run_checked(
+                Command::new("git")
+                    .current_dir(repo)
+                    .args(["fetch", "--depth", "1", "origin", &refspec]),
+                "git fetch branch",
+            )?;
+            let commit = git_output(repo, &["rev-parse", "--verify", &tracking])?;
+            Ok(ResolvedRevision {
+                selector,
+                commit,
+                tracking_ref: Some(tracking),
+            })
+        }
+        RevisionKind::Tag => {
+            let remote = format!("refs/tags/{}", selector.value);
+            if !remote_ref_exists(repo, &remote)? {
+                bail!("origin has no tag '{}'", selector.value);
+            }
+            run_checked(
+                Command::new("git")
+                    .current_dir(repo)
+                    .args(["fetch", "--depth", "1", "origin", &remote]),
+                "git fetch tag",
+            )?;
+            let commit = git_output(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+            Ok(ResolvedRevision {
+                selector,
+                commit,
+                tracking_ref: None,
+            })
+        }
+        RevisionKind::Commit => {
+            run_checked(
+                Command::new("git").current_dir(repo).args([
+                    "fetch",
+                    "--depth",
+                    "1",
+                    "origin",
+                    &selector.value,
+                ]),
+                "git fetch commit",
+            )?;
+            let commit = git_output(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+            Ok(ResolvedRevision {
+                selector,
+                commit,
+                tracking_ref: None,
+            })
+        }
+        RevisionKind::Auto => unreachable!("auto revisions are resolved before fetch"),
+    }
+}
+
+fn checkout_revision(repo: &Path, resolved: &ResolvedRevision) -> Result<()> {
+    if let Some(tracking) = &resolved.tracking_ref {
+        run_checked(
+            Command::new("git").current_dir(repo).args([
+                "checkout",
+                "-B",
+                &resolved.selector.value,
+                tracking,
+            ]),
+            "git checkout branch",
+        )
+    } else {
+        run_checked(
+            Command::new("git")
+                .current_dir(repo)
+                .args(["checkout", "--detach", &resolved.commit]),
+            "git checkout pinned revision",
+        )
+    }
+}
+
+fn remote_ref_exists(repo: &Path, reference: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["ls-remote", "--exit-code", "origin", reference])
+        .output()
+        .with_context(|| format!("failed to query origin for {reference}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
+        _ => bail!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn sha256_path(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
@@ -5817,9 +6207,172 @@ mod tests {
         assert!(names.contains("restart"));
         assert!(names.contains("bench"));
         assert!(names.contains("profile"));
+        assert!(names.contains("version"));
         assert!(names.contains("update"));
         assert!(names.contains("quantize"));
         assert!(names.contains("sidecar-gen"));
+    }
+
+    #[test]
+    fn build_version_includes_commit_and_ref_identity() {
+        use clap::error::ErrorKind;
+
+        let error = Cli::try_parse_from(["hipfire", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        let rendered = error.to_string();
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+        assert!(rendered.contains(BUILD_COMMIT.get(..12).unwrap_or(BUILD_COMMIT)));
+        assert!(rendered.contains(BUILD_REF));
+    }
+
+    #[test]
+    fn update_accepts_branch_tag_commit_and_at_shorthand() {
+        let cases = [
+            (
+                UpdateArgs {
+                    reference: Some("@beta".into()),
+                    ..UpdateArgs::default()
+                },
+                RevisionSelector {
+                    value: "beta".into(),
+                    kind: RevisionKind::Auto,
+                },
+            ),
+            (
+                UpdateArgs {
+                    reference: Some("@origin/beta".into()),
+                    ..UpdateArgs::default()
+                },
+                RevisionSelector {
+                    value: "beta".into(),
+                    kind: RevisionKind::Branch,
+                },
+            ),
+            (
+                UpdateArgs {
+                    tag: Some("v0.3.0".into()),
+                    ..UpdateArgs::default()
+                },
+                RevisionSelector {
+                    value: "v0.3.0".into(),
+                    kind: RevisionKind::Tag,
+                },
+            ),
+            (
+                UpdateArgs {
+                    commit: Some("0123456789abcdef".into()),
+                    ..UpdateArgs::default()
+                },
+                RevisionSelector {
+                    value: "0123456789abcdef".into(),
+                    kind: RevisionKind::Commit,
+                },
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(parse_revision_selector(&args).unwrap(), Some(expected));
+        }
+
+        let cli = Cli::try_parse_from(["hipfire", "update", "@beta"]).unwrap();
+        let Some(Commands::Update(args)) = cli.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(args.reference.as_deref(), Some("@beta"));
+    }
+
+    #[test]
+    fn update_rejects_unsafe_or_ambiguous_revisions() {
+        for value in ["../beta", "-beta", "beta^{tree}", "beta branch"] {
+            let args = UpdateArgs {
+                reference: Some(value.into()),
+                ..UpdateArgs::default()
+            };
+            assert!(parse_revision_selector(&args).is_err(), "{value}");
+        }
+        let short_commit = UpdateArgs {
+            commit: Some("123".into()),
+            ..UpdateArgs::default()
+        };
+        assert!(parse_revision_selector(&short_commit).is_err());
+        let ambiguous = UpdateArgs {
+            branch: Some("beta".into()),
+            tag: Some("v0.3.0".into()),
+            ..UpdateArgs::default()
+        };
+        assert!(parse_revision_selector(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn update_fetches_and_checks_out_branch_from_local_origin() {
+        fn git(repo: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {}", args.join(" "));
+        }
+
+        let root = env::temp_dir().join(format!(
+            "hipfire-update-ref-test-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let installed = root.join("installed");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "--bare", origin.to_str().unwrap()]);
+        fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init"]);
+        git(&seed, &["config", "user.name", "hipfire test"]);
+        git(
+            &seed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        fs::write(seed.join("channel"), "master\n").unwrap();
+        git(&seed, &["add", "channel"]);
+        git(&seed, &["commit", "-m", "master"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "master"]);
+        git(&seed, &["checkout", "-b", "beta"]);
+        fs::write(seed.join("channel"), "beta\n").unwrap();
+        git(&seed, &["commit", "-am", "beta"]);
+        git(&seed, &["push", "-u", "origin", "beta"]);
+        git(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "master",
+                origin.to_str().unwrap(),
+                installed.to_str().unwrap(),
+            ],
+        );
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Auto,
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.selector.kind, RevisionKind::Branch);
+        checkout_revision(&installed, &resolved).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("channel")).unwrap(),
+            "beta\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
