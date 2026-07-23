@@ -7,10 +7,13 @@
 
 use crate::gguf::{GgufFile, MetaValue};
 use regex::Regex;
+use rustc_hash::{FxBuildHasher, FxHasher};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
-use std::sync::OnceLock;
+use std::hash::Hasher;
+use std::sync::{Mutex, OnceLock};
+use unicode_categories::UnicodeCategories;
 
 /// GPT-2 / cl100k-style pre-tokenization regex. Same family of pattern
 /// every reference byte-level BPE encoder uses (tiktoken, HF tokenizers,
@@ -26,6 +29,7 @@ use std::sync::OnceLock;
 /// match HF tokenizers' Split-then-ByteLevel pipeline byte-for-byte
 /// (verified against locked niah_4k token md5).
 const GPT2_PRETOK_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+const QWEN35_PRETOK_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 fn gpt2_pretok_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -33,6 +37,220 @@ fn gpt2_pretok_re() -> &'static Regex {
         Regex::new(GPT2_PRETOK_PATTERN)
             .expect("GPT2_PRETOK_PATTERN must compile — pattern is a const")
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PretokenizerKind {
+    Gpt2,
+    Qwen35,
+}
+
+fn hf_pretokenizer_kind(tokenizer_json: &serde_json::Value) -> PretokenizerKind {
+    let pattern = tokenizer_json
+        .pointer("/pre_tokenizer/pretokenizers/0/pattern/Regex")
+        .and_then(|value| value.as_str());
+    match pattern {
+        Some(pattern)
+            if pattern == QWEN35_PRETOK_PATTERN
+                || (pattern.contains(r"[\p{L}\p{M}]+") && pattern.contains(r"|\p{N}|")) =>
+        {
+            PretokenizerKind::Qwen35
+        }
+        _ => PretokenizerKind::Gpt2,
+    }
+}
+
+#[inline]
+fn qwen35_char_at(text: &str, pos: usize) -> Option<(char, usize)> {
+    let ch = text.get(pos..)?.chars().next()?;
+    Some((ch, pos + ch.len_utf8()))
+}
+
+#[inline]
+fn qwen35_is_letter_or_mark(ch: char) -> bool {
+    ch.is_letter() || ch.is_mark()
+}
+
+fn qwen35_scan_letters_and_marks(text: &str, mut pos: usize) -> usize {
+    while let Some((ch, next)) = qwen35_char_at(text, pos) {
+        if !qwen35_is_letter_or_mark(ch) {
+            break;
+        }
+        pos = next;
+    }
+    pos
+}
+
+fn qwen35_scan_other(text: &str, mut pos: usize) -> usize {
+    while let Some((ch, next)) = qwen35_char_at(text, pos) {
+        if ch.is_whitespace() || ch.is_letter() || ch.is_mark() || ch.is_number() {
+            break;
+        }
+        pos = next;
+    }
+    pos
+}
+
+fn qwen35_scan_newlines(text: &str, mut pos: usize) -> usize {
+    while let Some((ch @ ('\r' | '\n'), next)) = qwen35_char_at(text, pos) {
+        let _ = ch;
+        pos = next;
+    }
+    pos
+}
+
+fn qwen35_whitespace_end(text: &str, start: usize) -> usize {
+    let mut pos = start;
+    let mut last_newline_end = None;
+    let mut last_char_start = start;
+    while let Some((ch, next)) = qwen35_char_at(text, pos) {
+        if !ch.is_whitespace() {
+            break;
+        }
+        last_char_start = pos;
+        pos = next;
+        if ch == '\r' || ch == '\n' {
+            last_newline_end = Some(pos);
+        }
+    }
+    if let Some(end) = last_newline_end {
+        end
+    } else if pos == text.len() {
+        pos
+    } else if last_char_start > start {
+        last_char_start
+    } else {
+        pos
+    }
+}
+
+fn qwen35_pretoken_end(text: &str, pos: usize) -> usize {
+    let (first, next) = qwen35_char_at(text, pos).expect("pos is inside text");
+
+    if qwen35_is_letter_or_mark(first) {
+        return qwen35_scan_letters_and_marks(text, next);
+    }
+
+    if first == ' ' {
+        let Some((second, after_second)) = qwen35_char_at(text, next) else {
+            return next;
+        };
+        if qwen35_is_letter_or_mark(second) {
+            return qwen35_scan_letters_and_marks(text, after_second);
+        }
+        if second.is_number() {
+            return next;
+        }
+        if second.is_whitespace() {
+            return qwen35_whitespace_end(text, pos);
+        }
+        return qwen35_scan_newlines(text, qwen35_scan_other(text, after_second));
+    }
+
+    if first.is_number() {
+        return next;
+    }
+
+    if first == '\'' {
+        let tail = text.as_bytes().get(next..).unwrap_or_default();
+        let contraction = match tail {
+            [a, ..] if matches!(a.to_ascii_lowercase(), b's' | b'd' | b'm' | b't') => 1,
+            [a, b, ..]
+                if matches!(
+                    (a.to_ascii_lowercase(), b.to_ascii_lowercase()),
+                    (b'l', b'l') | (b'v', b'e') | (b'r', b'e')
+                ) =>
+            {
+                2
+            }
+            [0xC5, 0xBF, ..] => 2, // U+017F LONG S case-folds to `s`.
+            _ => 0,
+        };
+        if contraction != 0 {
+            return next + contraction;
+        }
+    }
+
+    if first == '\r' || first == '\n' {
+        return qwen35_whitespace_end(text, pos);
+    }
+
+    if first.is_whitespace() {
+        if let Some((second, after_second)) = qwen35_char_at(text, next) {
+            if qwen35_is_letter_or_mark(second) {
+                return qwen35_scan_letters_and_marks(text, after_second);
+            }
+        }
+        return qwen35_whitespace_end(text, pos);
+    }
+
+    if let Some((second, after_second)) = qwen35_char_at(text, next) {
+        if qwen35_is_letter_or_mark(second) {
+            return qwen35_scan_letters_and_marks(text, after_second);
+        }
+    }
+    qwen35_scan_newlines(text, qwen35_scan_other(text, next))
+}
+
+#[inline]
+fn merge_key(left: u32, right: u32) -> u64 {
+    ((left as u64) << 32) | right as u64
+}
+
+type MergeRankMap = HashMap<u64, u32, FxBuildHasher>;
+
+const PRETOKEN_CACHE_SLOTS: usize = 4096;
+const PRETOKEN_CACHE_MAX_BYTES: usize = 128;
+const PRETOKEN_CACHE_MAX_TOKENS: usize = 64;
+
+struct PretokenCacheEntry {
+    hash: u64,
+    bytes: Box<[u8]>,
+    tokens: Box<[u32]>,
+}
+
+#[derive(Default)]
+struct PretokenCache {
+    slots: Vec<Option<PretokenCacheEntry>>,
+}
+
+impl PretokenCache {
+    fn hash(bytes: &[u8]) -> u64 {
+        let mut hasher = FxHasher::default();
+        hasher.write(bytes);
+        hasher.finish()
+    }
+
+    fn append_if_present(&self, bytes: &[u8], out: &mut Vec<u32>) -> bool {
+        if bytes.len() > PRETOKEN_CACHE_MAX_BYTES || self.slots.is_empty() {
+            return false;
+        }
+        let hash = Self::hash(bytes);
+        let slot = (hash as usize) & (PRETOKEN_CACHE_SLOTS - 1);
+        match &self.slots[slot] {
+            Some(entry) if entry.hash == hash && entry.bytes.as_ref() == bytes => {
+                out.extend_from_slice(&entry.tokens);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn insert(&mut self, bytes: &[u8], tokens: &[u32]) {
+        if bytes.len() > PRETOKEN_CACHE_MAX_BYTES || tokens.len() > PRETOKEN_CACHE_MAX_TOKENS {
+            return;
+        }
+        if self.slots.is_empty() {
+            self.slots.resize_with(PRETOKEN_CACHE_SLOTS, || None);
+        }
+        let hash = Self::hash(bytes);
+        let slot = (hash as usize) & (PRETOKEN_CACHE_SLOTS - 1);
+        self.slots[slot] = Some(PretokenCacheEntry {
+            hash,
+            bytes: bytes.into(),
+            tokens: tokens.into(),
+        });
+    }
 }
 
 /// Which side of a merge rule failed validation. Used by `MissingMergeOperand`.
@@ -133,7 +351,7 @@ pub struct Tokenizer {
     /// method (token-id → rank, O(merges) linear scan — different lookup,
     /// different shape). They compiled fine sharing the name but invited
     /// subtle field-vs-method confusion at call sites.
-    merge_pair_rank: HashMap<(u32, u32), u32>,
+    merge_pair_rank: MergeRankMap,
     /// For GPT-2 BPE only: byte `b` → token id of `byte_to_gpt2_char(b).to_string()`.
     /// Construction guarantees every byte 0..=255 has a valid id (else
     /// `from_*` returns `MissingByteSymbol`), so `encode_gpt2_bpe`'s initial
@@ -157,6 +375,10 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
+    /// Model-specific pretokenization semantics.
+    pretokenizer_kind: PretokenizerKind,
+    /// Fixed-size cache for the repeated pretokens in multi-turn prompts.
+    pretoken_cache: Mutex<PretokenCache>,
 }
 
 /// Resolve a list of `(left_string, right_string)` merge pairs into a
@@ -167,10 +389,10 @@ pub struct Tokenizer {
 fn resolve_merges(
     merges_strings: &[(String, String)],
     token_to_id: &HashMap<String, u32>,
-) -> Result<(Vec<u32>, HashMap<(u32, u32), u32>), TokenizerError> {
+) -> Result<(Vec<u32>, MergeRankMap), TokenizerError> {
     let mut merges = Vec::with_capacity(merges_strings.len());
-    let mut merge_pair_rank: HashMap<(u32, u32), u32> =
-        HashMap::with_capacity(merges_strings.len());
+    let mut merge_pair_rank =
+        MergeRankMap::with_capacity_and_hasher(merges_strings.len(), FxBuildHasher::default());
     let mut result_buf = String::new();
     for (rank, (l_str, r_str)) in merges_strings.iter().enumerate() {
         let left = token_to_id.get(l_str.as_str()).copied().ok_or_else(|| {
@@ -209,7 +431,9 @@ fn resolve_merges(
         // it. Pathological vocabs with duplicate merge rules thus behave
         // deterministically (drop the later rule) instead of being
         // overwritten silently.
-        merge_pair_rank.entry((left, right)).or_insert(rank as u32);
+        merge_pair_rank
+            .entry(merge_key(left, right))
+            .or_insert(rank as u32);
     }
     Ok((merges, merge_pair_rank))
 }
@@ -337,12 +561,15 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            pretokenizer_kind: PretokenizerKind::Gpt2,
+            pretoken_cache: Mutex::new(PretokenCache::default()),
         })
     }
 
     /// Load tokenizer from HuggingFace tokenizer.json (embedded in HFQ metadata).
     pub fn from_hf_json(json_str: &str) -> Result<Self, TokenizerError> {
         let tok: serde_json::Value = serde_json::from_str(json_str)?;
+        let pretokenizer_kind = hf_pretokenizer_kind(&tok);
         let model = tok
             .get("model")
             .ok_or(TokenizerError::MetadataMissing { field: "model" })?;
@@ -462,6 +689,8 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            pretokenizer_kind,
+            pretoken_cache: Mutex::new(PretokenCache::default()),
         })
     }
 
@@ -620,6 +849,8 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            pretokenizer_kind: PretokenizerKind::Gpt2,
+            pretoken_cache: Mutex::new(PretokenCache::default()),
         })
     }
 
@@ -872,10 +1103,49 @@ impl Tokenizer {
         // → tokens, so `len/4` is a sane lower bound that avoids early
         // reallocs without wasting memory on short inputs.
         let mut result: Vec<u32> = Vec::with_capacity(text.len() / 4 + 1);
-        for m in gpt2_pretok_re().find_iter(text) {
-            self.encode_gpt2_chunk(m.as_str().as_bytes(), &mut result);
+        let mut cache = self
+            .pretoken_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.pretokenizer_kind {
+            PretokenizerKind::Gpt2 => {
+                for matched in gpt2_pretok_re().find_iter(text) {
+                    self.encode_gpt2_cached_chunk(
+                        &mut cache,
+                        matched.as_str().as_bytes(),
+                        &mut result,
+                    );
+                }
+            }
+            PretokenizerKind::Qwen35 => {
+                let mut pos = 0usize;
+                while pos < text.len() {
+                    let end = qwen35_pretoken_end(text, pos);
+                    debug_assert!(end > pos && text.is_char_boundary(end));
+                    self.encode_gpt2_cached_chunk(
+                        &mut cache,
+                        &text.as_bytes()[pos..end],
+                        &mut result,
+                    );
+                    pos = end;
+                }
+            }
         }
         result
+    }
+
+    fn encode_gpt2_cached_chunk(
+        &self,
+        cache: &mut PretokenCache,
+        chunk: &[u8],
+        out: &mut Vec<u32>,
+    ) {
+        if cache.append_if_present(chunk, out) {
+            return;
+        }
+        let start = out.len();
+        self.encode_gpt2_chunk(chunk, out);
+        cache.insert(chunk, &out[start..]);
     }
 
     /// BPE-encode a single pre-tokenized chunk (byte slice from
@@ -886,6 +1156,8 @@ impl Tokenizer {
     /// prompt — each chunk is typically ≤10 bytes so the per-chunk state
     /// is tiny.
     fn encode_gpt2_chunk(&self, chunk_bytes: &[u8], out: &mut Vec<u32>) {
+        const STACK_CHUNK_BYTES: usize = 32;
+
         // 1. Convert chunk bytes to GPT-2 byte-encoded symbol IDs.
         // Construction guarantees `byte_to_id` covers every byte 0..=255
         // for GPT-2 BPE tokenizers (else `from_*` returned
@@ -894,6 +1166,36 @@ impl Tokenizer {
             .byte_to_id
             .as_ref()
             .expect("encode_gpt2_chunk called on non-GPT2 tokenizer");
+        if chunk_bytes.len() <= STACK_CHUNK_BYTES {
+            let mut syms = [0u32; STACK_CHUNK_BYTES];
+            for (dst, &byte) in syms.iter_mut().zip(chunk_bytes) {
+                *dst = byte_to_id[byte as usize];
+            }
+            let mut len = chunk_bytes.len();
+            while len > 1 {
+                let mut best: Option<(u32, usize)> = None;
+                for left in 0..len - 1 {
+                    let Some(&rank) = self
+                        .merge_pair_rank
+                        .get(&merge_key(syms[left], syms[left + 1]))
+                    else {
+                        continue;
+                    };
+                    if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+                        best = Some((rank, left));
+                    }
+                }
+                let Some((rank, left)) = best else {
+                    break;
+                };
+                syms[left] = self.merges[rank as usize];
+                syms.copy_within(left + 2..len, left + 1);
+                len -= 1;
+            }
+            out.extend_from_slice(&syms[..len]);
+            return;
+        }
+
         let mut syms: Vec<u32> = chunk_bytes
             .iter()
             .map(|&b| byte_to_id[b as usize])
@@ -922,24 +1224,24 @@ impl Tokenizer {
             .map(|i| if i + 1 < n as i32 { i + 1 } else { -1 })
             .collect();
         let mut dead: Vec<bool> = vec![false; n];
-        let mut gen: Vec<u32> = vec![0; n];
+        let mut generation: Vec<u32> = vec![0; n];
 
         // 4. Min-heap of (rank, left_idx, gen_at_push). Reverse for min-heap.
         let mut heap: BinaryHeap<Reverse<(u32, usize, u32)>> = BinaryHeap::with_capacity(n);
         let push_pair = |heap: &mut BinaryHeap<Reverse<(u32, usize, u32)>>,
                          syms: &[u32],
-                         gen: &[u32],
+                         generation: &[u32],
                          l: usize,
                          r: usize| {
-            // O(1) HashMap lookup on a Copy `(u32, u32)` key — no clones.
-            if let Some(&rank) = merge_pair_rank.get(&(syms[l], syms[r])) {
-                heap.push(Reverse((rank, l, gen[l])));
+            // O(1) FxHash lookup on one packed u64 key.
+            if let Some(&rank) = merge_pair_rank.get(&merge_key(syms[l], syms[r])) {
+                heap.push(Reverse((rank, l, generation[l])));
             }
         };
 
         // 5. Seed heap with initial adjacent pairs.
         for i in 0..n - 1 {
-            push_pair(&mut heap, &syms, &gen, i, i + 1);
+            push_pair(&mut heap, &syms, &generation, i, i + 1);
         }
 
         // 6. Main merge loop. Each pop is O(log N); validation is O(1);
@@ -947,7 +1249,7 @@ impl Tokenizer {
         while let Some(Reverse((rank, l, gen_at_push))) = heap.pop() {
             // Validate: slot still alive, generation matches, right neighbor
             // exists. Stale heap entries are dropped here cheaply.
-            if dead[l] || gen[l] != gen_at_push {
+            if dead[l] || generation[l] != gen_at_push {
                 continue;
             }
             let r = next[l];
@@ -961,7 +1263,9 @@ impl Tokenizer {
             // either side bumps `gen[l]` (or kills `r`) and would have failed
             // the check above. Verified in debug builds; release trusts it.
             debug_assert_eq!(
-                merge_pair_rank.get(&(syms[l], syms[r])).copied(),
+                merge_pair_rank
+                    .get(&merge_key(syms[l], syms[r]))
+                    .copied(),
                 Some(rank),
                 "BPE pq invariant: popped rank must match live pair rank",
             );
@@ -975,7 +1279,7 @@ impl Tokenizer {
             // overflow is unreachable. `wrapping_add` would silently un-stale
             // heap entries on overflow — wrong semantics. Debug panics, release
             // aborts: both communicate that wraparound is a bug, not a feature.
-            gen[l] += 1;
+            generation[l] += 1;
 
             // Splice r out of the linked list.
             let nr = next[r];
@@ -991,11 +1295,11 @@ impl Tokenizer {
                 // syms[l]; bump pl's gen so its old heap entries die. (Not
                 // strictly required since we revalidate on pop, but tightens
                 // the invariant.)
-                gen[pl as usize] += 1;
-                push_pair(&mut heap, &syms, &gen, pl as usize, l);
+                generation[pl as usize] += 1;
+                push_pair(&mut heap, &syms, &generation, pl as usize, l);
             }
             if next[l] >= 0 {
-                push_pair(&mut heap, &syms, &gen, l, next[l] as usize);
+                push_pair(&mut heap, &syms, &generation, l, next[l] as usize);
             }
         }
 
@@ -1067,6 +1371,7 @@ impl Tokenizer {
         mix(&self.bos_id.to_le_bytes());
         mix(&self.eos_id.to_le_bytes());
         mix(&self.eot_id.unwrap_or(u32::MAX).to_le_bytes());
+        mix(&[self.pretokenizer_kind as u8]);
         h
     }
 }
@@ -1617,7 +1922,75 @@ mod bpe_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: true,
+            pretokenizer_kind: PretokenizerKind::Gpt2,
+            pretoken_cache: Mutex::new(PretokenCache::default()),
         }
+    }
+
+    #[test]
+    fn qwen35_pretokenizer_isolates_digits_and_keeps_marks() {
+        let input = "abc123e\u{301}";
+        let mut qwen = Vec::new();
+        let mut pos = 0;
+        while pos < input.len() {
+            let end = qwen35_pretoken_end(input, pos);
+            qwen.push(&input[pos..end]);
+            pos = end;
+        }
+        let gpt2: Vec<&str> = gpt2_pretok_re()
+            .find_iter(input)
+            .map(|m| m.as_str())
+            .collect();
+        assert_eq!(qwen, ["abc", "1", "2", "3", "e\u{301}"]);
+        assert_eq!(gpt2, ["abc", "123", "e", "\u{301}"]);
+    }
+
+    #[test]
+    fn qwen35_pretokenizer_matches_indentation_boundaries() {
+        let input = "\n\n    *Recounting*  123";
+        let mut spans = Vec::new();
+        let mut pos = 0;
+        while pos < input.len() {
+            let end = qwen35_pretoken_end(input, pos);
+            spans.push(&input[pos..end]);
+            pos = end;
+        }
+        assert_eq!(
+            spans,
+            ["\n\n", "   ", " *", "Recounting", "*", " ", " ", "1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn detects_qwen35_hf_pattern() {
+        let json = serde_json::json!({
+            "pre_tokenizer": {
+                "pretokenizers": [{
+                    "pattern": {
+                        "Regex": QWEN35_PRETOK_PATTERN
+                    }
+                }]
+            }
+        });
+        assert_eq!(hf_pretokenizer_kind(&json), PretokenizerKind::Qwen35);
+    }
+
+    #[test]
+    fn repeated_pretoken_uses_bounded_cache_without_changing_tokens() {
+        let tok = synth(
+            &["h", "e", "l", "o", "he", "ll", "hell", "hello"],
+            &[("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o")],
+        );
+        let first = tok.encode_gpt2_bpe("hello hello");
+        let second = tok.encode_gpt2_bpe("hello hello");
+        assert_eq!(first, second);
+        assert!(tok
+            .pretoken_cache
+            .lock()
+            .expect("cache lock")
+            .slots
+            .iter()
+            .any(Option::is_some));
     }
 
     #[test]
@@ -1872,7 +2245,12 @@ mod consistency_tests {
         // Merge resolved to ids: A → 0x41, B → 0x42, AB → 256 (first extra).
         // `merges[0]` is the result id; `merge_pair_rank` carries the pair → rank.
         assert_eq!(tok.merges[0], 256);
-        assert_eq!(tok.merge_pair_rank.get(&(0x41, 0x42)).copied(), Some(0));
+        assert_eq!(
+            tok.merge_pair_rank
+                .get(&merge_key(0x41, 0x42))
+                .copied(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1917,7 +2295,7 @@ mod sp_tests {
             vocab,
             token_to_id,
             merges: Vec::new(),
-            merge_pair_rank: HashMap::new(),
+            merge_pair_rank: MergeRankMap::default(),
             byte_to_id: None,
             special_tokens: Vec::new(),
             bos_id: 0,
@@ -1925,6 +2303,8 @@ mod sp_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            pretokenizer_kind: PretokenizerKind::Gpt2,
+            pretoken_cache: Mutex::new(PretokenCache::default()),
         }
     }
 

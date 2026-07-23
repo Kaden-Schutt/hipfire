@@ -88,6 +88,11 @@ smallvec = "1"
 # per-iteration costs but not the algorithmic shape — this regex restores
 # the canonical chunking.
 regex = "1"
+# Fast deterministic hashing for packed BPE merge keys and the bounded
+# serving-time pretoken cache. These keys are tokenizer-internal, trusted
+# values; SipHash's collision resistance only adds latency here.
+rustc-hash = "2"
+unicode_categories = "0.1"
 # Renders the upstream HF chat_template (Jinja) when present in
 # .hfq metadata, so prompt framing matches what the model was
 # trained on. Falls back to the hand-rolled `prompt_frame::ChatFrame`

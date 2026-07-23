@@ -55,6 +55,8 @@ struct Args {
     shard_index: usize,
     shard_count: usize,
     shadow_iterations: Option<usize>,
+    batched_seed: bool,
+    wave_refill: bool,
 }
 
 impl Args {
@@ -88,6 +90,8 @@ impl Args {
             shard_index: 0,
             shard_count: 1,
             shadow_iterations: None,
+            batched_seed: true,
+            wave_refill: false,
         };
         while let Some(flag) = it.next() {
             let value = |it: &mut std::iter::Skip<std::env::Args>, flag: &str| {
@@ -133,10 +137,11 @@ impl Args {
                     args.shard_count = value(&mut it, &flag)?.parse().map_err(|_| flag)?
                 }
                 "--shadow-iterations" => {
-                    args.shadow_iterations =
-                        Some(value(&mut it, &flag)?.parse().map_err(|_| flag)?)
+                    args.shadow_iterations = Some(value(&mut it, &flag)?.parse().map_err(|_| flag)?)
                 }
                 "--raw-prompt" => args.raw_prompt = true,
+                "--sequential-seed" => args.batched_seed = false,
+                "--wave-refill" => args.wave_refill = true,
                 "--help" | "-h" => {
                     return Err(
                         "usage: qwen35_batch_generate MODEL --input IN.jsonl --output OUT.jsonl \
@@ -147,7 +152,8 @@ impl Args {
                          [--repeat-window 128] \
                          [--config CONFIG.toml] [--device PHYSICAL_ID] \
                          [--shadow-iterations N] \
-                         [--shard-index I --shard-count N] [--raw-prompt]"
+                         [--shard-index I --shard-count N] [--raw-prompt] \
+                         [--sequential-seed] [--wave-refill]"
                             .to_string(),
                     )
                 }
@@ -161,7 +167,9 @@ impl Args {
         }
         if !(0.0..=1.0).contains(&args.top_p)
             || args.top_p == 0.0
-            || args.min_p.is_some_and(|value| !(0.0..=1.0).contains(&value))
+            || args
+                .min_p
+                .is_some_and(|value| !(0.0..=1.0).contains(&value))
             || args.repeat_penalty < 1.0
             || args.presence_penalty < 0.0
             || args.frequency_penalty < 0.0
@@ -386,23 +394,59 @@ fn batch_prefix_hashes(
         hash_tensor!(name, tensor);
     }
     for (name, tensor) in [
-        ("moe_router_logits_batch", state.pbs.moe_router_logits_batch.as_ref()),
-        ("moe_shared_scalar_batch", state.pbs.moe_shared_scalar_batch.as_ref()),
-        ("moe_shared_gate_batch", state.pbs.moe_shared_gate_batch.as_ref()),
-        ("moe_shared_up_batch", state.pbs.moe_shared_up_batch.as_ref()),
-        ("moe_shared_rot_batch", state.pbs.moe_shared_rot_batch.as_ref()),
-        ("moe_topk_indices_batch", state.pbs.moe_topk_indices_batch.as_ref()),
-        ("moe_topk_weights_batch", state.pbs.moe_topk_weights_batch.as_ref()),
+        (
+            "moe_router_logits_batch",
+            state.pbs.moe_router_logits_batch.as_ref(),
+        ),
+        (
+            "moe_shared_scalar_batch",
+            state.pbs.moe_shared_scalar_batch.as_ref(),
+        ),
+        (
+            "moe_shared_gate_batch",
+            state.pbs.moe_shared_gate_batch.as_ref(),
+        ),
+        (
+            "moe_shared_up_batch",
+            state.pbs.moe_shared_up_batch.as_ref(),
+        ),
+        (
+            "moe_shared_rot_batch",
+            state.pbs.moe_shared_rot_batch.as_ref(),
+        ),
+        (
+            "moe_topk_indices_batch",
+            state.pbs.moe_topk_indices_batch.as_ref(),
+        ),
+        (
+            "moe_topk_weights_batch",
+            state.pbs.moe_topk_weights_batch.as_ref(),
+        ),
         ("moe_gate_batch", state.pbs.moe_gate_batch.as_ref()),
         ("moe_up_batch", state.pbs.moe_up_batch.as_ref()),
         ("moe_rot_batch", state.pbs.moe_rot_batch.as_ref()),
-        ("moe_down_expanded_batch", state.pbs.moe_down_expanded_batch.as_ref()),
-        ("moe_expert_token_counts", state.pbs.moe_expert_token_counts.as_ref()),
+        (
+            "moe_down_expanded_batch",
+            state.pbs.moe_down_expanded_batch.as_ref(),
+        ),
+        (
+            "moe_expert_token_counts",
+            state.pbs.moe_expert_token_counts.as_ref(),
+        ),
         ("moe_expert_offsets", state.pbs.moe_expert_offsets.as_ref()),
-        ("moe_sorted_slot_index", state.pbs.moe_sorted_slot_index.as_ref()),
+        (
+            "moe_sorted_slot_index",
+            state.pbs.moe_sorted_slot_index.as_ref(),
+        ),
         ("moe_inverse_perm", state.pbs.moe_inverse_perm.as_ref()),
-        ("moe_expert_tile_ids", state.pbs.moe_expert_tile_ids.as_ref()),
-        ("moe_y_gate_up_grouped", state.pbs.moe_y_gate_up_grouped.as_ref()),
+        (
+            "moe_expert_tile_ids",
+            state.pbs.moe_expert_tile_ids.as_ref(),
+        ),
+        (
+            "moe_y_gate_up_grouped",
+            state.pbs.moe_y_gate_up_grouped.as_ref(),
+        ),
         ("moe_y_down_grouped", state.pbs.moe_y_down_grouped.as_ref()),
     ] {
         if let Some(tensor) = tensor {
@@ -441,14 +485,7 @@ fn reset_shadow_state(
             .as_ref()
             .ok_or_else(|| format!("shadow lane {lane} has no seeded job"))?;
         state
-            .prefill_lane(
-                gpu,
-                weights,
-                config,
-                scratch,
-                lane,
-                &job.prompt_tokens,
-            )
+            .prefill_lane(gpu, weights, config, scratch, lane, &job.prompt_tokens)
             .map_err(|error| format!("re-prime shadow lane {lane}: {error}"))?;
     }
     // The conversion caches key on source pointer. Shadow restoration changes
@@ -663,12 +700,7 @@ fn run_batch_shadow_gate(
         let mut direct_tokens = initial_tokens.clone();
         let mut direct_positions = initial_positions.clone();
         if observation != 0 {
-            advance_shadow_tokens(
-                &mut direct_tokens,
-                observation,
-                997,
-                config.vocab_size,
-            );
+            advance_shadow_tokens(&mut direct_tokens, observation, 997, config.vocab_size);
         }
         let direct_started = Instant::now();
         for step in 0..iterations {
@@ -683,12 +715,7 @@ fn run_batch_shadow_gate(
             )
             .map_err(|error| format!("ordinary HIP shadow arm: {error}"))?;
             if step + 1 != iterations {
-                advance_shadow_tokens(
-                    &mut direct_tokens,
-                    observation,
-                    step,
-                    config.vocab_size,
-                );
+                advance_shadow_tokens(&mut direct_tokens, observation, step, config.vocab_size);
                 for position in &mut direct_positions {
                     *position += 1;
                 }
@@ -710,12 +737,7 @@ fn run_batch_shadow_gate(
         let mut recorded_tokens = initial_tokens.clone();
         let mut recorded_positions = initial_positions.clone();
         if observation != 0 {
-            advance_shadow_tokens(
-                &mut recorded_tokens,
-                observation,
-                997,
-                config.vocab_size,
-            );
+            advance_shadow_tokens(&mut recorded_tokens, observation, 997, config.vocab_size);
         }
         let recorded_started = Instant::now();
         for step in 0..iterations {
@@ -731,12 +753,7 @@ fn run_batch_shadow_gate(
             gpu.replay_recorded_hip_prefix(capture.launch_count)
                 .map_err(|error| format!("execute recorded HIP shadow: {error}"))?;
             if step + 1 != iterations {
-                advance_shadow_tokens(
-                    &mut recorded_tokens,
-                    observation,
-                    step,
-                    config.vocab_size,
-                );
+                advance_shadow_tokens(&mut recorded_tokens, observation, step, config.vocab_size);
                 for position in &mut recorded_positions {
                     *position += 1;
                 }
@@ -754,12 +771,7 @@ fn run_batch_shadow_gate(
         let mut replay_tokens = initial_tokens.clone();
         let mut replay_positions = initial_positions.clone();
         if observation != 0 {
-            advance_shadow_tokens(
-                &mut replay_tokens,
-                observation,
-                997,
-                config.vocab_size,
-            );
+            advance_shadow_tokens(&mut replay_tokens, observation, 997, config.vocab_size);
         }
         let replay_started = Instant::now();
         let mut replay_gpu_us = 0.0;
@@ -783,12 +795,7 @@ fn run_batch_shadow_gate(
                     .span_microseconds()
             };
             if step + 1 != iterations {
-                advance_shadow_tokens(
-                    &mut replay_tokens,
-                    observation,
-                    step,
-                    config.vocab_size,
-                );
+                advance_shadow_tokens(&mut replay_tokens, observation, step, config.vocab_size);
                 for position in &mut replay_positions {
                     *position += 1;
                 }
@@ -1268,6 +1275,109 @@ fn seed_lane(
     })
 }
 
+/// Seed a complete fixed-shape batch through the independent decode path.
+///
+/// For equal-length prompts, stepping all lanes by prompt position turns
+/// `batch * prompt_len` serial prefill work into `prompt_len` full-batch
+/// launches. The state transition is the same one used for autoregressive
+/// decode: each lane owns disjoint KV and recurrent-state storage, and logits
+/// after the last prompt position are ready for the first sampled token.
+#[allow(clippy::too_many_arguments)]
+fn seed_equal_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &Qwen35Scratch,
+    state: &mut Qwen35DecodeBatchState,
+    jobs: Vec<Job>,
+    args: &Args,
+) -> Result<Vec<Slot>, String> {
+    let prompt_len = jobs
+        .first()
+        .map(|job| job.prompt_tokens.len())
+        .ok_or_else(|| "cannot seed an empty batch".to_string())?;
+    if prompt_len == 0
+        || jobs.len() != state.max_batch
+        || jobs.iter().any(|job| job.prompt_tokens.len() != prompt_len)
+    {
+        return Err("batched seed requires a full batch of equal-length prompts".to_string());
+    }
+
+    let mut tokens = vec![0u32; jobs.len()];
+    let mut positions = vec![0usize; jobs.len()];
+    for position in 0..prompt_len {
+        for (lane, job) in jobs.iter().enumerate() {
+            tokens[lane] = job.prompt_tokens[position];
+            positions[lane] = position;
+        }
+        qwen35::forward_decode_batch(gpu, weights, config, &tokens, &positions, state, scratch)
+            .map_err(|e| format!("batched seed position {position}: {e}"))?;
+    }
+
+    let repeat_capacity = args.repeat_window.min(state.sample_repeat_capacity);
+    let mut repeat_tokens = vec![0u32; jobs.len() * state.sample_repeat_capacity];
+    let mut repeat_lengths = vec![0u32; jobs.len()];
+    let rng_states: Vec<u32> = jobs
+        .iter()
+        .map(|job| job_seed(args.seed, job.index))
+        .collect();
+    for (lane, job) in jobs.iter().enumerate() {
+        let history = repeat_suffix(&job.prompt_tokens, &job.output_tokens, repeat_capacity);
+        repeat_lengths[lane] = history.len() as u32;
+        let start = lane * state.sample_repeat_capacity;
+        repeat_tokens[start..start + history.len()].copy_from_slice(&history);
+    }
+    let sampled = state
+        .sample_product(
+            gpu,
+            config,
+            jobs.len(),
+            &repeat_tokens,
+            &repeat_lengths,
+            &rng_states,
+            args.temperature,
+            args.top_p,
+            args.top_k,
+            args.min_p,
+            args.repeat_penalty,
+            args.presence_penalty,
+            args.frequency_penalty,
+        )
+        .map_err(|e| format!("sample batched seed: {e}"))?;
+
+    Ok(jobs
+        .into_iter()
+        .zip(sampled)
+        .map(|(job, (next_token, rng_state))| Slot {
+            job: Some(job),
+            next_token,
+            next_pos: prompt_len,
+            rng_state,
+        })
+        .collect())
+}
+
+fn equal_prompt_batch(jobs: &VecDeque<Job>, batch: usize) -> bool {
+    jobs.len() >= batch
+        && jobs
+            .front()
+            .map(|first| {
+                jobs.iter()
+                    .take(batch)
+                    .all(|job| job.prompt_tokens.len() == first.prompt_tokens.len())
+            })
+            .unwrap_or(false)
+}
+
+fn idle_slot(eos: u32, max_seq: usize) -> Slot {
+    Slot {
+        job: None,
+        next_token: eos,
+        next_pos: max_seq.saturating_sub(1),
+        rng_state: 0,
+    }
+}
+
 fn write_completion(
     writer: &mut BufWriter<File>,
     tokenizer: &Tokenizer,
@@ -1347,22 +1457,41 @@ fn main() -> Result<(), String> {
     let im_end = tokenizer.encode("<|im_end|>");
     let im_end = (im_end.len() == 1).then_some(im_end[0]);
     let wall_start = Instant::now();
-    let mut slots = Vec::with_capacity(active_n);
-    for lane in 0..active_n {
-        let job = jobs.pop_front().expect("active_n bounded by jobs");
-        slots.push(seed_lane(
-            &mut gpu, &weights, &config, &scratch, &mut state, lane, job, &args,
-        )?);
-    }
+    let seed_start = Instant::now();
+    let equal_prompt_len = equal_prompt_batch(&jobs, active_n);
+    let use_batched_seed =
+        args.batched_seed && args.shadow_iterations.is_none() && equal_prompt_len;
+    let mut slots = if use_batched_seed {
+        let seed_jobs: Vec<Job> = jobs.drain(..active_n).collect();
+        seed_equal_batch(
+            &mut gpu, &weights, &config, &scratch, &mut state, seed_jobs, &args,
+        )?
+    } else {
+        let mut slots = Vec::with_capacity(active_n);
+        for lane in 0..active_n {
+            let job = jobs.pop_front().expect("active_n bounded by jobs");
+            slots.push(seed_lane(
+                &mut gpu, &weights, &config, &scratch, &mut state, lane, job, &args,
+            )?);
+        }
+        slots
+    };
+    let seed_time = seed_start.elapsed();
+    let wave_refill = args.wave_refill && use_batched_seed;
+    eprintln!(
+        "seed: route={} refill={} lanes={} elapsed={:.3}s",
+        if use_batched_seed {
+            "independent-batch"
+        } else {
+            "sequential"
+        },
+        if wave_refill { "wave" } else { "continuous" },
+        active_n,
+        seed_time.as_secs_f64(),
+    );
     if let Some(iterations) = args.shadow_iterations {
         let report = run_batch_shadow_gate(
-            &mut gpu,
-            &weights,
-            &config,
-            &scratch,
-            &mut state,
-            &slots,
-            iterations,
+            &mut gpu, &weights, &config, &scratch, &mut state, &slots, iterations,
         )?;
         serde_json::to_writer_pretty(&mut writer, &report)
             .map_err(|error| format!("write batch shadow report: {error}"))?;
@@ -1389,6 +1518,8 @@ fn main() -> Result<(), String> {
     let mut generated = 0usize;
     let mut batched_generated = 0usize;
     let mut completed = 0usize;
+    let mut refill_time = Duration::ZERO;
+    let mut output_time = Duration::ZERO;
     loop {
         // Consume the samples produced from the previous logits. If a lane
         // finishes, refill it before the next fixed-shape model launch.
@@ -1407,6 +1538,7 @@ fn main() -> Result<(), String> {
                 }
 
                 let finished = slots[lane].job.take().unwrap();
+                let output_start = Instant::now();
                 write_completion(
                     &mut writer,
                     &tokenizer,
@@ -1414,12 +1546,19 @@ fn main() -> Result<(), String> {
                     if eos_hit { "stop" } else { "length" },
                     &args,
                 )?;
+                output_time += output_start.elapsed();
                 completed += 1;
                 if completed % 32 == 0 {
                     writer.flush().map_err(|e| format!("flush output: {e}"))?;
                     eprintln!("completed={completed} queued={}", jobs.len());
                 }
                 if let Some(replacement) = jobs.pop_front() {
+                    if wave_refill {
+                        jobs.push_front(replacement);
+                        slots[lane] = idle_slot(eos, args.max_seq);
+                        break;
+                    }
+                    let refill_start = Instant::now();
                     slots[lane] = seed_lane(
                         &mut gpu,
                         &weights,
@@ -1430,6 +1569,7 @@ fn main() -> Result<(), String> {
                         replacement,
                         &args,
                     )?;
+                    refill_time += refill_start.elapsed();
                     continue;
                 }
                 // Keep the fixed batch dense while other real lanes finish.
@@ -1442,7 +1582,47 @@ fn main() -> Result<(), String> {
         }
 
         if slots.iter().all(|slot| slot.job.is_none()) {
-            break;
+            if jobs.is_empty() {
+                break;
+            }
+
+            let refill_start = Instant::now();
+            state
+                .reset(&mut gpu)
+                .map_err(|e| format!("reset batch for next wave: {e}"))?;
+            let batched_wave = args.batched_seed && equal_prompt_batch(&jobs, active_n);
+            slots = if batched_wave {
+                let seed_jobs: Vec<Job> = jobs.drain(..active_n).collect();
+                seed_equal_batch(
+                    &mut gpu, &weights, &config, &scratch, &mut state, seed_jobs, &args,
+                )?
+            } else {
+                let mut next_slots = Vec::with_capacity(active_n);
+                for lane in 0..active_n {
+                    if let Some(job) = jobs.pop_front() {
+                        next_slots.push(seed_lane(
+                            &mut gpu, &weights, &config, &scratch, &mut state, lane, job, &args,
+                        )?);
+                    } else {
+                        next_slots.push(idle_slot(eos, args.max_seq));
+                    }
+                }
+                next_slots
+            };
+            let elapsed = refill_start.elapsed();
+            refill_time += elapsed;
+            eprintln!(
+                "wave: route={} lanes={} queued={} elapsed={:.3}s",
+                if batched_wave {
+                    "independent-batch"
+                } else {
+                    "sequential-tail"
+                },
+                slots.iter().filter(|slot| slot.job.is_some()).count(),
+                jobs.len(),
+                elapsed.as_secs_f64(),
+            );
+            continue;
         }
 
         let tokens: Vec<u32> = slots.iter().map(|slot| slot.next_token).collect();
@@ -1510,6 +1690,14 @@ fn main() -> Result<(), String> {
         generated as f64 / wall.as_secs_f64().max(1e-9),
         model_time.as_secs_f64(),
         wall.as_secs_f64(),
+    );
+    eprintln!(
+        "phases: seed={:.3}s refill={:.3}s output={:.3}s unaccounted={:.3}s",
+        seed_time.as_secs_f64(),
+        refill_time.as_secs_f64(),
+        output_time.as_secs_f64(),
+        wall.saturating_sub(seed_time + refill_time + output_time + model_time)
+            .as_secs_f64(),
     );
     eprintln!(
         "redline: request={:?} state={:?} transport={} retained_replays={} first_position={:?} last_position={:?} dispatches={:?} packets={:?} command_dwords={:?}",
