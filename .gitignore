@@ -138,3 +138,7 @@ docs/investigations/*/sources/
 *_results.csv
 *.rocpd
 *.pftrace
+
+# Harvested corpus index — regenerable from autoresearch/corpus/*.jsonl
+# via scripts/harvest_ledgers.py --ingest
+autoresearch/db/ar.db

@@ -13,7 +13,7 @@ outcome rows to the static ISA rows that already exist alongside them.
 | Field | Value |
 |---|---|
 | Date | 2026-07-23 |
-| Status | Design approved; not yet implemented |
+| Status | **Implemented** — `scripts/harvest_ledgers.py`. See "As built" below. |
 | Scope | `autoresearch/` ledgers only. Redline is explicitly excluded. |
 | Boxes surveyed | k9lin (local), hipx, hiptrx |
 
@@ -256,3 +256,76 @@ risk and `mwu_dominance` is the natural filter for statistically-real rows.
 
 The immediate payoff is smaller and certain: the falsification record stops
 living only on two disposable boxes.
+
+---
+
+## As built (2026-07-23)
+
+Implemented in `scripts/harvest_ledgers.py`. Five things diverged from the
+design above; all five were forced by the real data.
+
+**1. `/tmp` is harvested, not just `$HOME`.** hiptrx keeps 23 ledger files /
+531 rows under `/tmp`. Excluding it lost exactly those rows (3,374 + 531 =
+3,905, the independently-measured hiptrx total). Tmp data is the most
+loss-prone on the fleet, which makes it the most important to capture, not the
+least.
+
+**2. Redline paths are walked, not pruned.** The design said exclude redline.
+Blanket-pruning `.redline-work/` dropped ~1.3k *autoresearch* rows, because
+redline worktrees contain full hipfire checkouts whose loop wrote genuine
+ledgers (`~/.redline-work/hipfire-redline-kernel-oracle/autoresearch/ledger/`).
+Only redline's own artifact roots (`redline-results|runs|cert`) are excluded.
+The two corpora stay separate; the path is not the discriminator.
+
+**3. Tables are `corpus_attempts` / `kernel_static` / `provenance`,** not a
+shared `attempts`. The live loop's `attempts` table keys on canonical
+`measurement_hash` with a UNIQUE constraint. 97% of harvested rows have no
+canonical hash, so sharing the table would either drop them or mint look-alike
+hashes. `corpus_key = COALESCE(measurement_hash, fallback_key)` lives in its
+own table instead. `ar.db.ingest()` is deliberately not reused — it globs
+`*.jsonl` in the directory given, which would have slurped `kernels.jsonl` and
+`bod.jsonl` in as bogus attempt rows.
+
+**4. `harvest_ts` is in `manifest.json`, not per row.** Stamping it on every
+row made the corpus non-idempotent: every line diffed on every harvest, which
+defeats git-tracking. Provenance also picks the lexicographically smallest
+`(box, path)` rather than "latest mtime wins" — mtime ties were resolved by
+`os.walk` order, which is not stable across runs. Both were caught by the
+idempotency test, which now passes byte-identically.
+
+**5. Timestamps come in two formats.** k9lin/hipx emit epoch ints; hiptrx emits
+ISO-8601 (`2026-07-09T23:47:48Z`). Both are normalized.
+
+### Result
+
+```
+attempts :   6,263 raw ->  932 unique (5,331 identical collapsed, 30 collisions kept)
+kernels  :     321 raw ->  157 unique
+bod      :      25 snapshots
+archs    : gfx1010, gfx1030, gfx1100, gfx1151, gfx1201   (28 distinct kernels)
+verdicts : DEAD 632 · WIN 107 · NOISE 87 · VOID 25 · INCONCLUSIVE 20 · LOSS 11 · +4
+key conf : weak 698 · canonical 204 · collision 30
+```
+
+The 6,263 raw figure matches the independent pre-implementation count exactly.
+Worst-case duplication was one row present **12 times** across the fleet.
+
+### The finding that matters
+
+**The `(arch, kernel)` join currently has 2 cells.** 57 outcome pairs, 2 static
+pairs, 2 joinable — both gfx1201 `gemv_hfq4g256_moe_*`. The static corpus is
+gfx1201-only and tiny (78 kernel-ledger rows), so the outcome/static join that
+would make this a pre-flight filter is not yet viable.
+
+This is a collection gap, not a modelling gap, and it is cheap to close:
+`kernel_perf_instrument` already emits `kernel_atlas.v0` rows, and there are
+~35,400 `.hsaco` on disk fleet-wide. Running it per arch would populate the
+static side without any new GPU experiments. That is the next step — not a
+classifier, which at 2 joinable cells would be fitting noise.
+
+### Known asymmetry
+
+`attempts.jsonl` keeps all 932 rows including the 30 collision-flagged ones;
+`corpus_attempts` holds 902, since collisions share a `corpus_key` and are
+`INSERT OR IGNORE`d. The JSONL is the source of truth and retains everything;
+the DB is a keyed index. Query the JSONL when collisions matter.
