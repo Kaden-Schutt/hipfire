@@ -584,16 +584,18 @@ impl Gpus {
     ///
     /// Algorithm (N-rank, race-free and bit-exact across ranks):
     ///
-    /// 1. gather ranks `1..N` into rank 0's peer temps;
-    /// 2. rank 0 adds them in ascending global-rank order;
-    /// 3. broadcast rank 0's completed sum to ranks `1..N`.
+    /// 1. reduce partials through a fixed binary tree rooted at rank 0;
+    /// 2. broadcast rank 0's completed sum to ranks `1..N`.
     ///
     /// The prior all-to-all algorithm used `N*(N-1)` copies and adds, and each
     /// rank began the floating-point reduction with its own partial. At N>2
     /// that produced rank-dependent association order and therefore residuals
-    /// that were not bit-exact. The rooted algorithm uses `2*(N-1)` copies and
-    /// `N-1` adds while making rank 0's order authoritative on every device.
-    /// `n==1` is the identity. Requires peer access (caller's
+    /// that were not bit-exact. The rooted tree uses `2*(N-1)` copies and
+    /// `N-1` adds while making one association order authoritative on every
+    /// device and allowing independent tree branches to execute concurrently.
+    /// The symmetric two-rank path remains special-cased because `a+b == b+a`
+    /// bit-for-bit and its two local adds avoid a broadcast on the critical
+    /// path. `n==1` is the identity. Requires peer access (caller's
     /// `enable_peer_all`) for the fast P2P path; without it `boundary_copy`
     /// host-stages (slower but correct). In-place: `buffers[r]` is both input
     /// and output.
@@ -618,38 +620,80 @@ impl Gpus {
         let bytes = count * 4;
         self.ensure_peer_ar_tmp(bytes)?;
 
-        // Phase 1: gather every non-root ORIGINAL partial into rank 0.
-        let mut gather_events = Vec::with_capacity(n - 1);
-        for src in 1..n {
-            gather_events.push(self.boundary_copy(
-                src,
-                0,
-                buffers[src],
-                &self.peer_ar_tmp[0][src - 1],
-                bytes,
-            )?);
-        }
-        for evt in gather_events {
-            self.wait_boundary(evt)?;
-        }
-
-        // Phase 2: rank 0 sums in ascending global-rank order.
-        let root = GpuTensor {
-            buf: unsafe { buffers[0].alias() },
-            shape: vec![count],
-            dtype: DType::F32,
-        };
-        self.devices[0].bind_thread()?;
-        for slot in 0..n - 1 {
-            let src = GpuTensor {
-                buf: unsafe { self.peer_ar_tmp[0][slot].alias() },
-                shape: vec![count],
-                dtype: DType::F32,
-            };
-            self.devices[0].add_inplace_f32(&root, &src)?;
+        if n == 2 {
+            // Preserve the faster symmetric EP2 schedule: both peer copies and
+            // both local adds run concurrently. Two-term addition is commutative
+            // at the IEEE-754 bit level, so both ranks still receive identical
+            // results despite their reversed operand order.
+            let to_root =
+                self.boundary_copy(1, 0, buffers[1], &self.peer_ar_tmp[0][0], bytes)?;
+            let to_peer =
+                self.boundary_copy(0, 1, buffers[0], &self.peer_ar_tmp[1][0], bytes)?;
+            self.wait_boundary(to_root)?;
+            self.wait_boundary(to_peer)?;
+            for rank in 0..2 {
+                let dst = GpuTensor {
+                    buf: unsafe { buffers[rank].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                let src = GpuTensor {
+                    buf: unsafe { self.peer_ar_tmp[rank][0].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[rank].bind_thread()?;
+                self.devices[rank].add_inplace_f32(&dst, &src)?;
+            }
+            return Ok(());
         }
 
-        // Phase 3: broadcast the authoritative root sum. Each destination
+        // Phase 1: fixed binary-tree reduction. Each level uses a distinct
+        // temp slot so a later peer copy cannot overwrite storage still being
+        // consumed by the preceding level's add.
+        let mut stride = 1usize;
+        let mut level = 0usize;
+        while stride < n {
+            let mut transfers = Vec::new();
+            for root in (0..n).step_by(2 * stride) {
+                let partner = root + stride;
+                if partner < n {
+                    transfers.push((
+                        root,
+                        self.boundary_copy(
+                            partner,
+                            root,
+                            buffers[partner],
+                            &self.peer_ar_tmp[root][level],
+                            bytes,
+                        )?,
+                    ));
+                }
+            }
+            let mut roots = Vec::with_capacity(transfers.len());
+            for (root, event) in transfers {
+                self.wait_boundary(event)?;
+                roots.push(root);
+            }
+            for root in roots {
+                let dst = GpuTensor {
+                    buf: unsafe { buffers[root].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                let src = GpuTensor {
+                    buf: unsafe { self.peer_ar_tmp[root][level].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[root].bind_thread()?;
+                self.devices[root].add_inplace_f32(&dst, &src)?;
+            }
+            stride *= 2;
+            level += 1;
+        }
+
+        // Phase 2: broadcast the authoritative root sum. Each destination
         // stream waits on its copy event before it can consume the residual.
         let mut broadcast_events = Vec::with_capacity(n - 1);
         for dst in 1..n {
