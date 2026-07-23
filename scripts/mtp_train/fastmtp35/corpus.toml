@@ -37,7 +37,7 @@ config = "train"
 split = "train"
 license = "CC-BY-4.0"
 category = "code"
-raw_count = 57200
+raw_count = 68600
 bucket_mix = [0.85, 0.12, 0.03]
 
 [[source]]
@@ -77,7 +77,9 @@ config = "kimi,glm-5.1"
 split = "train"
 license = "Apache-2.0"
 category = "agent"
-raw_count = 13200
+# The Kimi and GLM configs share most tasks; 1.8K stays below the measured
+# 1,901-task globally deduplicated capacity.
+raw_count = 1800
 bucket_mix = [0.20, 0.60, 0.20]
 
 [profiles.serve]
