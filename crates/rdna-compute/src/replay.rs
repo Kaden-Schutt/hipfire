@@ -278,7 +278,8 @@ impl Pm4Commands {
 fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
     matches!(
         kernel,
-        "conv1d_silu_split_f32"
+        "convert_f32_to_f16"
+            | "conv1d_silu_split_f32"
             | "conv1d_silu_split_qknorm_b256"
             | "deinterleave_f32"
             | "fused_qk_l2_norm_scale_f32"
@@ -1474,12 +1475,14 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     }
     matches!(
         previous,
-        "repeat_interleave_qk_f32"
+        "convert_f32_to_f16"
+            | "repeat_interleave_qk_f32"
             | "repeat_interleave_qk_f32_batched"
             | "rope_partial_halfsplit_f32"
     ) || matches!(
         current,
-        "repeat_interleave_qk_f32"
+        "convert_f32_to_f16"
+            | "repeat_interleave_qk_f32"
             | "repeat_interleave_qk_f32_batched"
             | "rope_partial_halfsplit_f32"
     )
@@ -2324,7 +2327,9 @@ impl ReplayController {
         for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
             if matches!(
                 launch.kernel.as_str(),
-                "repeat_interleave_qk_f32" | "repeat_interleave_qk_f32_batched"
+                "convert_f32_to_f16"
+                    | "repeat_interleave_qk_f32"
+                    | "repeat_interleave_qk_f32_batched"
             ) {
                 headers[index] = HeaderPolicy::RECORDED_DISPATCH;
                 if index + 1 < headers.len() {
@@ -3110,6 +3115,7 @@ mod tests {
     use super::*;
 
     const A3B_REPLAY_KERNELS: &[&str] = &[
+        "convert_f32_to_f16",
         "fused_rmsnorm_mq_rotate",
         "fused_rmsnorm_mq_rotate_vecsum",
         "fused_rmsnorm_mq_rotate_vecsum_sign_const",
@@ -3432,6 +3438,10 @@ mod tests {
             "fused_qk_l2_norm_scale_f32",
             "repeat_interleave_qk_f32_batched"
         ));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("moe_down_combine_k8_batched", "convert_f32_to_f16"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("convert_f32_to_f16", "gemm_hfq4g256"));
         assert!(!Pm4MidAcquirePolicy::WithoutRepeatInterleave.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "repeat_interleave_qk_f32_batched"
