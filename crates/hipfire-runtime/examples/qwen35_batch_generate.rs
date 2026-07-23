@@ -1203,27 +1203,44 @@ fn load_completed_indices(args: &Args) -> Result<HashSet<usize>, String> {
     if !args.resume || !args.output.exists() {
         return Ok(HashSet::new());
     }
-    let file = File::open(&args.output).map_err(|e| format!("open resume output: {e}"))?;
+    let bytes = std::fs::read(&args.output).map_err(|e| format!("read resume output: {e}"))?;
     let expected = expected_sampling(args);
     let mut completed = HashSet::new();
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|e| {
-            format!(
-                "read resume output {} line {}: {e}",
-                args.output.display(),
-                line_index + 1
-            )
-        })?;
-        if line.trim().is_empty() {
+    let mut offset = 0usize;
+    for (line_index, raw_line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let terminated = raw_line.ends_with(b"\n");
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            offset += raw_line.len();
             continue;
         }
-        let row: Value = serde_json::from_str(&line).map_err(|e| {
-            format!(
-                "parse resume output {} line {}: {e}",
-                args.output.display(),
-                line_index + 1
-            )
-        })?;
+        let row: Value = match serde_json::from_slice(line) {
+            Ok(row) => row,
+            Err(error) if !terminated && offset + raw_line.len() == bytes.len() => {
+                let output = OpenOptions::new()
+                    .write(true)
+                    .open(&args.output)
+                    .map_err(|e| format!("open partial resume output for repair: {e}"))?;
+                output
+                    .set_len(offset as u64)
+                    .and_then(|_| output.sync_all())
+                    .map_err(|e| format!("truncate partial resume output: {e}"))?;
+                eprintln!(
+                    "resume: discarded incomplete final record from {} at byte {} ({error})",
+                    args.output.display(),
+                    offset
+                );
+                break;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "parse resume output {} line {}: {error}",
+                    args.output.display(),
+                    line_index + 1
+                ));
+            }
+        };
         let index = row
             .get("index")
             .and_then(Value::as_u64)
@@ -1258,6 +1275,7 @@ fn load_completed_indices(args: &Args) -> Result<HashSet<usize>, String> {
                 args.output.display()
             ));
         }
+        offset += raw_line.len();
     }
     Ok(completed)
 }

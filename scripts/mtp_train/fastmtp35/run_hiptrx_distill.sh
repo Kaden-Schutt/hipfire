@@ -88,6 +88,18 @@ run_job() {
     local stem="${bucket}-${profile}"
     local input="$ROOT/jobs/$stem.jsonl"
     [[ -s "$input" ]] || { echo "missing input: $input" >&2; return 2; }
+    # Batch 100 is the fresh-run throughput point. Once durable rows exist,
+    # missing indices can break equal-length wave groups and exercise the
+    # sequential lane-99 path that faulted this campaign. Batch 96 is the
+    # already-used stable shape for resumed and medium/long work.
+    if (( batch > 96 )); then
+        for gpu in 0 1 2 3; do
+            if [[ -s "$ROOT/completions/$stem.gpu$gpu.jsonl" ]]; then
+                batch=96
+                break
+            fi
+        done
+    fi
 
     local pids=()
     for gpu in 0 1 2 3; do
