@@ -9,6 +9,8 @@ passed as `HIPFIRE_*` environment variables.
 | [`user.toml`](user.toml) | Users | Generation, memory, prompt, speculation, and serve policy. |
 | [`developer.toml`](developer.toml) | Developers | Hardware selection, kernel policy, graphs, diagnostics, and the experimental escape namespace. |
 | [`redline-pm4.toml`](redline-pm4.toml) | Redline developers | Explicit retained-PM4 transport and diagnostic policy. |
+| [`batched-ar.toml`](batched-ar.toml) | Batch developers | Fixed-slot sampled AR control with speculation and replay disabled. |
+| [`batched-redline-pm4.toml`](batched-redline-pm4.toml) | Batch/Redline developers | Explicit diagnostic admission of the independent fixed-slot PM4 tape. |
 
 Each file is a complete valid profile, but it is intentionally not a dump of
 every default. Missing keys continue to inherit registry or compiled policy.
@@ -50,6 +52,7 @@ concatenation operation; merge the desired keys or use `hipfire config set`.
 | `HIPFIRE_DEVICES=3` | `hardware.devices = "3"`; startup applies `ROCR_VISIBLE_DEVICES=3` and matching `HIP_VISIBLE_DEVICES=0` |
 | `HIPFIRE_REPLAY_BACKEND=redline` | `replay.backend = "redline"` |
 | `HIPFIRE_REPLAY_TRANSPORT=pm4` | `replay.transport = "pm4"` |
+| `HIPFIRE_BATCH_REPLAY_UNSAFE=1` | `diagnostic.replay.independent_batch = true` |
 | `HIPFIRE_REPLAY_PM4_QUEUES=2` | `diagnostic.replay.pm4_queues = "2"` |
 
 Stable keys are typed and documented by `hipfire config schema`. A remaining

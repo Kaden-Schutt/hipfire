@@ -6078,6 +6078,7 @@ impl PrefillBatchScratch {
 pub struct Qwen35DecodeBatchState {
     pub max_batch: usize,
     pub lane_capacity: usize,
+    pub sample_repeat_capacity: usize,
     pub kv_cache: llama::KvCache,
     pub dn_state: DeltaNetState,
     pub pbs: PrefillBatchScratch,
@@ -6085,6 +6086,9 @@ pub struct Qwen35DecodeBatchState {
     pub logits: GpuTensor,
     pub lm_rot: GpuTensor,
     pub sample_out: GpuTensor,
+    pub sample_repeat_tokens: GpuTensor,
+    pub sample_repeat_lengths: GpuTensor,
+    pub sample_rng_states: GpuTensor,
 }
 
 impl Qwen35DecodeBatchState {
@@ -6121,10 +6125,16 @@ impl Qwen35DecodeBatchState {
         let final_hidden = gpu.zeros(&[max_batch * config.dim], DType::F32)?;
         let logits = gpu.zeros(&[max_batch * config.vocab_size], DType::F32)?;
         let lm_rot = gpu.zeros(&[max_batch * config.dim], DType::F32)?;
-        let sample_out = gpu.zeros(&[max_batch + 1], DType::F32)?;
+        let sample_repeat_capacity = 128;
+        let sample_out = gpu.zeros(&[max_batch * 2], DType::F32)?;
+        let sample_repeat_tokens =
+            gpu.zeros(&[max_batch * sample_repeat_capacity], DType::F32)?;
+        let sample_repeat_lengths = gpu.zeros(&[max_batch], DType::F32)?;
+        let sample_rng_states = gpu.zeros(&[max_batch], DType::F32)?;
         Ok(Self {
             max_batch,
             lane_capacity,
+            sample_repeat_capacity,
             kv_cache,
             dn_state,
             pbs,
@@ -6132,6 +6142,9 @@ impl Qwen35DecodeBatchState {
             logits,
             lm_rot,
             sample_out,
+            sample_repeat_tokens,
+            sample_repeat_lengths,
+            sample_rng_states,
         })
     }
 
@@ -6224,6 +6237,74 @@ impl Qwen35DecodeBatchState {
         )
     }
 
+    /// Sample independent rows with the full product sampling surface and
+    /// per-lane RNG state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_product(
+        &self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        batch_size: usize,
+        repeat_tokens: &[u32],
+        repeat_lengths: &[u32],
+        rng_states: &[u32],
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<Vec<(u32, u32)>> {
+        if batch_size == 0
+            || batch_size > self.max_batch
+            || repeat_tokens.len() != batch_size * self.sample_repeat_capacity
+            || repeat_lengths.len() != batch_size
+            || rng_states.len() != batch_size
+        {
+            return Err(HipError::new(
+                0,
+                "product sampler inputs do not match the active batch shape",
+            ));
+        }
+        let repeat_bytes = unsafe {
+            std::slice::from_raw_parts(repeat_tokens.as_ptr() as *const u8, repeat_tokens.len() * 4)
+        };
+        let length_bytes = unsafe {
+            std::slice::from_raw_parts(
+                repeat_lengths.as_ptr() as *const u8,
+                repeat_lengths.len() * 4,
+            )
+        };
+        let rng_bytes = unsafe {
+            std::slice::from_raw_parts(rng_states.as_ptr() as *const u8, rng_states.len() * 4)
+        };
+        gpu.hip
+            .memcpy_htod(&self.sample_repeat_tokens.buf, repeat_bytes)?;
+        gpu.hip
+            .memcpy_htod(&self.sample_repeat_lengths.buf, length_bytes)?;
+        gpu.hip
+            .memcpy_htod(&self.sample_rng_states.buf, rng_bytes)?;
+        let logits = self.logits.sub_offset(0, batch_size * config.vocab_size);
+        gpu.sample_rows_pf_f32(
+            &logits,
+            &self.sample_repeat_tokens,
+            &self.sample_repeat_lengths,
+            &self.sample_rng_states,
+            &self.sample_out,
+            batch_size,
+            config.vocab_size,
+            self.sample_repeat_capacity,
+            temperature,
+            top_p,
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+            top_k,
+            min_p,
+        )
+    }
+
     /// Single-row refill sampler. Continuous batching uses this only when a
     /// completed lane is replaced; steady-state decode samples all rows with
     /// [`Self::sample`] and pays one D2H for the whole batch.
@@ -6260,6 +6341,56 @@ impl Qwen35DecodeBatchState {
         )
     }
 
+    /// Product-semantics refill sample for one lane. Refill is deliberately
+    /// outside the steady-state batched draw, so a single-row sampler here
+    /// does not serialize active lanes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_lane_product(
+        &self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        lane: usize,
+        repeat_tokens: &[u32],
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
+        rng_state: u32,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<(u32, u32)> {
+        if lane >= self.max_batch || repeat_tokens.len() > self.sample_repeat_capacity {
+            return Err(HipError::new(
+                0,
+                "sample lane/history is out of range",
+            ));
+        }
+        let repeat_bytes = unsafe {
+            std::slice::from_raw_parts(repeat_tokens.as_ptr() as *const u8, repeat_tokens.len() * 4)
+        };
+        gpu.hip
+            .memcpy_htod(&self.sample_repeat_tokens.buf, repeat_bytes)?;
+        let logits = self
+            .logits
+            .sub_offset(lane * config.vocab_size, config.vocab_size);
+        gpu.sample_top_p_pf(
+            &logits,
+            &self.sample_out,
+            &self.sample_repeat_tokens,
+            config.vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_tokens.len(),
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+            top_k,
+            min_p,
+        )
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.kv_cache.free_gpu(gpu);
         self.dn_state.free_gpu(gpu);
@@ -6268,6 +6399,9 @@ impl Qwen35DecodeBatchState {
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.lm_rot);
         let _ = gpu.free_tensor(self.sample_out);
+        let _ = gpu.free_tensor(self.sample_repeat_tokens);
+        let _ = gpu.free_tensor(self.sample_repeat_lengths);
+        let _ = gpu.free_tensor(self.sample_rng_states);
     }
 }
 
@@ -6426,8 +6560,7 @@ pub fn forward_decode_batch(
     // Independent batched HIP execution is exact, but immutable replay of
     // this tape has not passed token-parity certification yet. Keep Redline
     // fail-closed unless a developer explicitly opts into the unsafe oracle.
-    let unsafe_batch_replay =
-        std::env::var("HIPFIRE_BATCH_REPLAY_UNSAFE").as_deref() == Ok("1");
+    let unsafe_batch_replay = gpu.flags.independent_batch_replay;
     gpu.replay.set_forward_eligible(unsafe_batch_replay);
     if unsafe_batch_replay {
         // The embedding is produced on a HIP stream while AQL/PM4 owns a
@@ -9363,8 +9496,7 @@ fn forward_batch_chunk_impl(
             positions.iter().copied().max().unwrap_or(0) + 1
         }
     };
-    let unsafe_batch_replay = gpu.replay.is_enabled()
-        && std::env::var("HIPFIRE_BATCH_REPLAY_UNSAFE").as_deref() == Ok("1");
+    let unsafe_batch_replay = gpu.replay.is_enabled() && gpu.flags.independent_batch_replay;
     let max_ctx_len = if batch_semantics.is_independent() && unsafe_batch_replay {
         // The unsafe replay oracle needs a fixed launch shape: positions
         // change every step, but PM4/AQL geometry and LDS may not. Ordinary

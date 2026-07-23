@@ -1,0 +1,30 @@
+# Isolated diagnostic profile for fixed-slot sampled Redline PM4 certification.
+# Keep this separate from normal user configuration until token parity and
+# sampled-output checks admit the route.
+schema_version = 1
+
+[replay]
+backend = "redline"
+transport = "pm4"
+
+[diagnostic.replay]
+independent_batch = true
+manual_capture = false
+pm4_queues = "1"
+pm4_register_policy = "static"
+pm4_wait_policy = "resource"
+pm4_acquire_policy = "required-only"
+pm4_gcr_trim = true
+pm4_dynamic_grid = false
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[memory]
+kv_cache = "q8"
+
+[generation]
+loop_guard_threshold = 0

@@ -37,12 +37,19 @@ struct Args {
     model: PathBuf,
     input: PathBuf,
     output: PathBuf,
+    config: Option<PathBuf>,
+    device: Option<String>,
     batch: usize,
     max_seq: usize,
     max_new: usize,
     temperature: f32,
     top_p: f32,
     top_k: Option<u32>,
+    min_p: Option<f32>,
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    repeat_window: usize,
     seed: u32,
     raw_prompt: bool,
     shard_index: usize,
@@ -62,12 +69,19 @@ impl Args {
             model,
             input: PathBuf::new(),
             output: PathBuf::new(),
+            config: None,
+            device: None,
             batch: 16,
             max_seq: 4096,
             max_new: 512,
             temperature: 1.0,
             top_p: 0.95,
             top_k: Some(20),
+            min_p: None,
+            repeat_penalty: 1.0,
+            presence_penalty: 1.5,
+            frequency_penalty: 0.0,
+            repeat_window: 128,
             seed: 0x1357_9bdf,
             raw_prompt: false,
             shard_index: 0,
@@ -80,6 +94,8 @@ impl Args {
             match flag.as_str() {
                 "--input" => input = Some(PathBuf::from(value(&mut it, &flag)?)),
                 "--output" => output = Some(PathBuf::from(value(&mut it, &flag)?)),
+                "--config" => args.config = Some(PathBuf::from(value(&mut it, &flag)?)),
+                "--device" => args.device = Some(value(&mut it, &flag)?),
                 "--batch" => args.batch = value(&mut it, &flag)?.parse().map_err(|_| flag)?,
                 "--max-seq" => args.max_seq = value(&mut it, &flag)?.parse().map_err(|_| flag)?,
                 "--max-new" => args.max_new = value(&mut it, &flag)?.parse().map_err(|_| flag)?,
@@ -90,6 +106,22 @@ impl Args {
                 "--top-k" => {
                     let k: u32 = value(&mut it, &flag)?.parse().map_err(|_| flag)?;
                     args.top_k = (k > 0).then_some(k);
+                }
+                "--min-p" => {
+                    let p: f32 = value(&mut it, &flag)?.parse().map_err(|_| flag)?;
+                    args.min_p = (p > 0.0).then_some(p);
+                }
+                "--repeat-penalty" => {
+                    args.repeat_penalty = value(&mut it, &flag)?.parse().map_err(|_| flag)?
+                }
+                "--presence-penalty" => {
+                    args.presence_penalty = value(&mut it, &flag)?.parse().map_err(|_| flag)?
+                }
+                "--frequency-penalty" => {
+                    args.frequency_penalty = value(&mut it, &flag)?.parse().map_err(|_| flag)?
+                }
+                "--repeat-window" => {
+                    args.repeat_window = value(&mut it, &flag)?.parse().map_err(|_| flag)?
                 }
                 "--seed" => args.seed = value(&mut it, &flag)?.parse().map_err(|_| flag)?,
                 "--shard-index" => {
@@ -104,6 +136,10 @@ impl Args {
                         "usage: qwen35_batch_generate MODEL --input IN.jsonl --output OUT.jsonl \
                          [--batch 16] [--max-seq 4096] [--max-new 512] \
                          [--temperature 1] [--top-p .95] [--top-k 20] [--seed N] \
+                         [--min-p 0] [--repeat-penalty 1] \
+                         [--presence-penalty 1.5] [--frequency-penalty 0] \
+                         [--repeat-window 128] \
+                         [--config CONFIG.toml] [--device PHYSICAL_ID] \
                          [--shard-index I --shard-count N] [--raw-prompt]"
                             .to_string(),
                     )
@@ -116,11 +152,74 @@ impl Args {
         if args.batch == 0 || args.max_seq < 2 || args.max_new == 0 {
             return Err("batch/max-new must be non-zero and max-seq >= 2".to_string());
         }
+        if !(0.0..=1.0).contains(&args.top_p)
+            || args.top_p == 0.0
+            || args.min_p.is_some_and(|value| !(0.0..=1.0).contains(&value))
+            || args.repeat_penalty < 1.0
+            || args.presence_penalty < 0.0
+            || args.frequency_penalty < 0.0
+            || args.repeat_window == 0
+            || args.repeat_window > 128
+        {
+            return Err(
+                "invalid sampling parameter range (repeat-window must be 1..=128)".to_string(),
+            );
+        }
         if args.shard_count == 0 || args.shard_index >= args.shard_count {
             return Err("shard-count must be non-zero and shard-index < shard-count".to_string());
         }
         Ok(args)
     }
+}
+
+fn install_startup_config(args: &Args) -> Result<(), String> {
+    let (path, global) = if let Some(path) = args.config.as_deref() {
+        (
+            path.to_owned(),
+            hipfire_config::load_toml_layer(path)
+                .map_err(|e| format!("load {}: {e}", path.display()))?,
+        )
+    } else {
+        let loaded = hipfire_config::load_global(&hipfire_config::ConfigPaths::discover())
+            .map_err(|e| format!("load local config: {e}"))?;
+        (loaded.path, loaded.layer)
+    };
+    let mut layers = vec![hipfire_config::NamedLayer {
+        source: hipfire_config::ConfigSource::GlobalUser { path },
+        layer: global,
+    }];
+    let environment =
+        hipfire_config::load_env_layer().map_err(|e| format!("load environment: {e}"))?;
+    if !environment.values.is_empty() {
+        layers.push(hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::LegacyEnv {
+                name: "HIPFIRE_*".into(),
+            },
+            layer: environment,
+        });
+    }
+    if let Some(device) = &args.device {
+        let mut one_shot = hipfire_config::ConfigLayer::default();
+        one_shot
+            .set_cli("hardware.devices", device)
+            .map_err(|e| format!("invalid --device: {e}"))?;
+        layers.push(hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::OneShot {
+                argument: format!("--device {device}"),
+            },
+            layer: one_shot,
+        });
+    }
+    let resolved = hipfire_config::resolve(layers).map_err(|e| format!("resolve config: {e}"))?;
+    let process = hipfire_config::ProcessConfig::from_resolved(&resolved)
+        .map_err(|e| format!("build process config: {e}"))?;
+    hipfire_config::apply_device_visibility(&process)
+        .map_err(|e| format!("apply device visibility: {e}"))?;
+    let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config(&process);
+    hipfire_config::install_process_config(process)
+        .map_err(|_| "process configuration was already initialized".to_string())?;
+    hipfire_runtime::config::init_with(runtime)
+        .map_err(|_| "runtime process configuration was already initialized".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +250,32 @@ struct Slot {
     job: Option<Job>,
     next_token: u32,
     next_pos: usize,
+    rng_state: u32,
+}
+
+fn repeat_suffix(prompt: &[u32], output: &[u32], capacity: usize) -> Vec<u32> {
+    let total = prompt.len() + output.len();
+    let start = total.saturating_sub(capacity);
+    let mut suffix = Vec::with_capacity(total - start);
+    if start < prompt.len() {
+        suffix.extend_from_slice(&prompt[start..]);
+        suffix.extend_from_slice(output);
+    } else {
+        suffix.extend_from_slice(&output[start - prompt.len()..]);
+    }
+    suffix
+}
+
+fn job_seed(seed: u32, index: usize) -> u32 {
+    let mut state = seed ^ (index as u32).wrapping_mul(0x9e37_79b9);
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    if state == 0 {
+        0xa341_316c
+    } else {
+        state
+    }
 }
 
 fn chatml_tokens(tokenizer: &Tokenizer, messages: &[Message]) -> Vec<u32> {
@@ -255,7 +380,6 @@ fn seed_lane(
     lane: usize,
     job: Job,
     args: &Args,
-    rng: &mut u32,
 ) -> Result<Slot, String> {
     state
         .reset_lane(gpu, config, lane)
@@ -264,22 +388,33 @@ fn seed_lane(
         .prefill_lane(gpu, weights, config, scratch, lane, &job.prompt_tokens)
         .map_err(|e| format!("prefill lane {lane}: {e}"))?;
     let next_pos = job.prompt_tokens.len();
-    let (next_token, new_rng) = state
-        .sample_lane(
+    let rng_state = job_seed(args.seed, job.index);
+    let history = repeat_suffix(
+        &job.prompt_tokens,
+        &job.output_tokens,
+        args.repeat_window.min(state.sample_repeat_capacity),
+    );
+    let (next_token, rng_state) = state
+        .sample_lane_product(
             gpu,
             config,
             lane,
+            &history,
             args.temperature,
             args.top_p,
             args.top_k,
-            *rng,
+            args.min_p,
+            rng_state,
+            args.repeat_penalty,
+            args.presence_penalty,
+            args.frequency_penalty,
         )
         .map_err(|e| format!("sample refill lane {lane}: {e}"))?;
-    *rng = new_rng;
     Ok(Slot {
         job: Some(job),
         next_token,
         next_pos,
+        rng_state,
     })
 }
 
@@ -301,6 +436,11 @@ fn write_completion(
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
+            "min_p": args.min_p.unwrap_or(0.0),
+            "repeat_penalty": args.repeat_penalty,
+            "presence_penalty": args.presence_penalty,
+            "frequency_penalty": args.frequency_penalty,
+            "repeat_window": args.repeat_window,
         }
     });
     serde_json::to_writer(&mut *writer, &row).map_err(|e| format!("write output: {e}"))?;
@@ -311,6 +451,7 @@ fn write_completion(
 
 fn main() -> Result<(), String> {
     let args = Args::parse()?;
+    install_startup_config(&args)?;
     let mut hfq = HfqFile::open(Path::new(&args.model)).map_err(|e| format!("open model: {e}"))?;
     let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("read config: {e}"))?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -322,7 +463,7 @@ fn main() -> Result<(), String> {
     }
 
     eprintln!(
-        "batch-generator: jobs={} batch={} shard={}/{} max_seq={} max_new={} temp={} top_p={} top_k={:?}",
+        "batch-generator: jobs={} batch={} shard={}/{} max_seq={} max_new={} temp={} top_p={} top_k={:?} min_p={} repeat={} presence={} frequency={} window={}",
         jobs.len(),
         args.batch,
         args.shard_index,
@@ -332,6 +473,11 @@ fn main() -> Result<(), String> {
         args.temperature,
         args.top_p,
         args.top_k,
+        args.min_p.unwrap_or(0.0),
+        args.repeat_penalty,
+        args.presence_penalty,
+        args.frequency_penalty,
+        args.repeat_window,
     );
     let mut gpu = Gpu::init().map_err(|e| format!("GPU init: {e}"))?;
     let weights = {
@@ -350,14 +496,12 @@ fn main() -> Result<(), String> {
     let eos = config.eos_token;
     let im_end = tokenizer.encode("<|im_end|>");
     let im_end = (im_end.len() == 1).then_some(im_end[0]);
-    let mut rng = args.seed;
-
     let wall_start = Instant::now();
     let mut slots = Vec::with_capacity(active_n);
     for lane in 0..active_n {
         let job = jobs.pop_front().expect("active_n bounded by jobs");
         slots.push(seed_lane(
-            &mut gpu, &weights, &config, &scratch, &mut state, lane, job, &args, &mut rng,
+            &mut gpu, &weights, &config, &scratch, &mut state, lane, job, &args,
         )?);
     }
     let mut model_time = Duration::ZERO;
@@ -404,7 +548,6 @@ fn main() -> Result<(), String> {
                         lane,
                         replacement,
                         &args,
-                        &mut rng,
                     )?;
                     continue;
                 }
@@ -429,23 +572,42 @@ fn main() -> Result<(), String> {
             &mut gpu, &weights, &config, &tokens, &positions, &mut state, &scratch,
         )
         .map_err(|e| format!("batched forward: {e}"))?;
-        let (sampled, new_rng) = state
-            .sample(
+        let repeat_capacity = args.repeat_window.min(state.sample_repeat_capacity);
+        let mut repeat_tokens = vec![0u32; active_n * state.sample_repeat_capacity];
+        let mut repeat_lengths = vec![0u32; active_n];
+        let rng_states: Vec<u32> = slots.iter().map(|slot| slot.rng_state).collect();
+        for (lane, slot) in slots.iter().enumerate() {
+            let Some(job) = &slot.job else {
+                continue;
+            };
+            let history = repeat_suffix(&job.prompt_tokens, &job.output_tokens, repeat_capacity);
+            repeat_lengths[lane] = history.len() as u32;
+            let start = lane * state.sample_repeat_capacity;
+            repeat_tokens[start..start + history.len()].copy_from_slice(&history);
+        }
+        let sampled = state
+            .sample_product(
                 &mut gpu,
                 &config,
                 active_n,
+                &repeat_tokens,
+                &repeat_lengths,
+                &rng_states,
                 args.temperature,
                 args.top_p,
                 args.top_k,
-                rng,
+                args.min_p,
+                args.repeat_penalty,
+                args.presence_penalty,
+                args.frequency_penalty,
             )
             .map_err(|e| format!("batched sample: {e}"))?;
         model_time += t.elapsed();
         batched_generated += real_lanes;
-        rng = new_rng;
         for lane in 0..active_n {
             if slots[lane].job.is_some() {
-                slots[lane].next_token = sampled[lane];
+                slots[lane].next_token = sampled[lane].0;
+                slots[lane].rng_state = sampled[lane].1;
                 slots[lane].next_pos += 1;
             }
         }

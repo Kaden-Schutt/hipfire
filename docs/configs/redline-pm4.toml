@@ -12,6 +12,9 @@ pm4_gfx11_vmem_acquire = "auto"
 
 [diagnostic.replay]
 manual_capture = false
+# Independent fixed-slot batch replay is still a diagnostic route. Enable only
+# for explicit parity/performance certification; ordinary AR leaves it off.
+independent_batch = false
 pm4_min_parallel_width = 2
 pm4_min_parallel_workgroups = 0
 # Omit pm4_max_parallel_phases to leave the phase count unlimited.

@@ -166,6 +166,10 @@ pub struct FeatureFlags {
     pub graph_forward: Option<bool>,
     pub graph_ar: bool,
     pub graph_moe: bool,
+    /// Diagnostic admission for retained replay of independent fixed-slot
+    /// decode batches. This remains off until the batched tape passes the same
+    /// token-parity and output guards as the single-sequence product route.
+    pub independent_batch_replay: bool,
     pub force_blob_path: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
@@ -453,6 +457,7 @@ impl FeatureFlags {
             graph_forward: parse_bool("HIPFIRE_GRAPH"),
             graph_ar: value("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"),
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
+            independent_batch_replay: value("HIPFIRE_BATCH_REPLAY_UNSAFE").as_deref() == Ok("1"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
@@ -667,6 +672,7 @@ impl FeatureFlags {
             graph_forward: None,
             graph_ar: true,
             graph_moe: true,
+            independent_batch_replay: false,
             force_blob_path: false,
             gemm_dump: false,
             deterministic: false,
@@ -725,6 +731,9 @@ mod tests {
         let mut layer = ConfigLayer::default();
         layer.set_cli("kernel.qkvza_split_tail", "true").unwrap();
         layer.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
+        layer
+            .set_cli("diagnostic.replay.independent_batch", "true")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -737,6 +746,7 @@ mod tests {
 
         assert!(flags.qkvza_split_tail);
         assert_eq!(flags.gemv_rows, Some(4));
+        assert!(flags.independent_batch_replay);
         assert!(flags.rdna3_hfq4_qkvza_k2048);
         assert!(flags.rdna3_hfq4_residual_stage_x32);
     }

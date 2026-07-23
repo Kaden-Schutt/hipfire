@@ -1,0 +1,21 @@
+# Isolated control profile for fixed-slot sampled AR batch certification.
+schema_version = 1
+
+[replay]
+backend = "hip"
+transport = "auto"
+
+[diagnostic.replay]
+independent_batch = false
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[memory]
+kv_cache = "q8"
+
+[generation]
+loop_guard_threshold = 0

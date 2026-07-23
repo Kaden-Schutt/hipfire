@@ -111,7 +111,9 @@ Diagnostic booleans all default off: `diagnostic.prompt_token_heat`,
 `diagnostic.prompt_heat_json`, `diagnostic.draft_gemm_dump`,
 `diagnostic.draft_subphase`, `diagnostic.mmq_quantize_only`,
 `diagnostic.blob_force`, `diagnostic.gemm_dump`, and
-`diagnostic.qkv_bias`.
+`diagnostic.qkv_bias`. `diagnostic.replay.independent_batch` additionally
+admits the uncertified independent fixed-slot replay tape for explicit
+parity/performance work; it is never enabled by an architecture default.
 
 Process-wide scalar policy is typed as well:
 

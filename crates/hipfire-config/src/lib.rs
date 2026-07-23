@@ -2250,6 +2250,13 @@ pub static FIELDS: &[ConfigField] = &[
         include_builtin_in_process_config: false,
         help: "Preferred launch backend, subject to immutable admission policy.",
     },
+    diagnostic_bool_field!(
+        "diagnostic.replay.independent_batch",
+        "batch_replay_unsafe",
+        false,
+        "HIPFIRE_BATCH_REPLAY_UNSAFE",
+        "Allow retained replay for independent fixed-slot decode batches; diagnostic-only until token parity is certified."
+    ),
     process_field!(
         "replay.transport",
         "replay_transport",
@@ -4117,7 +4124,13 @@ mod tests {
     #[test]
     fn documented_config_profiles_match_the_schema() {
         let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/configs");
-        for name in ["user.toml", "developer.toml", "redline-pm4.toml"] {
+        for name in [
+            "user.toml",
+            "developer.toml",
+            "redline-pm4.toml",
+            "batched-ar.toml",
+            "batched-redline-pm4.toml",
+        ] {
             let path = docs.join(name);
             load_toml_layer(&path).unwrap_or_else(|error| {
                 panic!("{} is not a valid config profile: {error}", path.display())
