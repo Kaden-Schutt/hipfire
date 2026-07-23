@@ -39,7 +39,7 @@
 
 use crate::tp_shard::ShardConfig;
 use crate::weight_manifest::{placement_devices, ShardPolicy, SourceDType, WeightEntry};
-use hipfire_hardware::{DeviceMesh, DimKind};
+use hipfire_hardware::{DeviceMesh, DimKind, Gpus, WeightAllocationOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 
@@ -322,6 +322,208 @@ fn free_handle(target: &WeightStoreTarget<'_>, device: usize, handle: WeightHand
     if let WeightHandle::Resident(t) = handle {
         if let Some(gpu) = target.device(device) {
             let _ = gpu.hip.free(t.buf);
+        }
+    }
+}
+
+// ── WeightStoreAllocation / free state machine ───────────────────────
+
+/// A GPU weight allocation whose origin is tracked for identity-safe
+/// [`free`](WeightStoreAllocation::free).
+///
+/// Created by the production upload path (Phase 2) — this type is not
+/// publicly constructable; callers receive it from a future
+/// [`WeightStore`] upload API.
+pub struct WeightStoreAllocation {
+    tensor: GpuTensor,
+    origin: WeightAllocationOrigin,
+}
+
+// Manual impl: GpuTensor does not implement Debug.
+impl std::fmt::Debug for WeightStoreAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeightStoreAllocation")
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WeightStoreAllocation {
+    /// Read-only access to the underlying GPU tensor.
+    pub fn tensor(&self) -> &GpuTensor {
+        &self.tensor
+    }
+
+    /// Read-only access to the allocation's origin (mesh epoch, logical
+    /// rank, physical device, pool epoch).
+    pub fn origin(&self) -> &WeightAllocationOrigin {
+        &self.origin
+    }
+
+    /// Consume this allocation and free its GPU buffer, but only after
+    /// validating that the allocation's origin matches the expected
+    /// identity derived from `gpus.weight_origin(rank)`.  On failure the
+    /// original allocation is returned inside [`FailedWeightStoreFree`]
+    /// so the caller can inspect or retry.
+    ///
+    /// **Ownership semantics.** Only validation and [`Gpu::bind_thread`] failures
+    /// prevent submission to the driver — the buffer is never freed on those
+    /// paths.  If the driver (`hipFree`) itself fails, the allocation still
+    /// retains ownership of the GPU buffer
+    /// (via [`hip_bridge::HipRuntime::free_preserving`]) so the caller can
+    /// retry.
+    pub fn free(self, gpus: &Gpus, rank: usize) -> Result<(), FailedWeightStoreFree> {
+        let tensor = self.tensor;
+        let origin = self.origin;
+
+        // Resolve the expected origin before entering the state machine
+        // so failure paths can rebuild the allocation.
+        let expected = match gpus.weight_origin(rank) {
+            Ok(o) => o,
+            Err(e) => {
+                return Err(FailedWeightStoreFree {
+                    error: WeightStoreFreeError::OriginMismatch(format!(
+                        "cannot derive expected origin for rank {rank}: {e:?}"
+                    )),
+                    allocation: WeightStoreAllocation { tensor, origin },
+                });
+            }
+        };
+
+        match try_free(
+            AllocationToken {
+                resource: tensor,
+                origin,
+            },
+            &expected,
+            |tensor: GpuTensor| -> Result<(), (GpuTensor, String)> {
+                let mut opt = Some(tensor);
+                let gpu = match gpus.devices.get(rank) {
+                    Some(g) => g,
+                    None => {
+                        return Err((opt.take().unwrap(), format!("rank {rank} out of range")));
+                    }
+                };
+                // Bind thread before submitting to the driver. A bind error
+                // returns the tensor untouched — no free is attempted.
+                if let Err(e) = gpu.bind_thread() {
+                    return Err((opt.take().unwrap(), format!("bind_thread failed: {e:?}")));
+                }
+                let tensor = opt.take().unwrap();
+                // free_preserving takes ownership of the DeviceBuffer and
+                // returns it on failure so the caller retains the buffer.
+                match gpu.hip.free_preserving(tensor.buf) {
+                    Ok(()) => Ok(()),
+                    Err((returned_buf, e)) => Err((
+                        GpuTensor {
+                            buf: returned_buf,
+                            shape: tensor.shape,
+                            dtype: tensor.dtype,
+                        },
+                        format!("hipFree failed: {e:?}"),
+                    )),
+                }
+            },
+        ) {
+            Ok(()) => Ok(()),
+            Err((token, FreeError::OriginMismatch)) => Err(FailedWeightStoreFree {
+                error: WeightStoreFreeError::OriginMismatch("origin mismatch".into()),
+                allocation: WeightStoreAllocation {
+                    tensor: token.resource,
+                    origin: token.origin,
+                },
+            }),
+            Err((token, FreeError::DriverFailure(msg))) => Err(FailedWeightStoreFree {
+                error: WeightStoreFreeError::DriverError(msg),
+                allocation: WeightStoreAllocation {
+                    tensor: token.resource,
+                    origin: token.origin,
+                },
+            }),
+        }
+    }
+}
+
+/// Errors from [`WeightStoreAllocation::free`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WeightStoreFreeError {
+    /// The allocation's origin did not match the expected identity
+    /// derived from [`Gpus::weight_origin`].
+    OriginMismatch(String),
+    /// A driver operation (`hipFree` or [`Gpu::bind_thread`]) failed.
+    DriverError(String),
+}
+
+impl std::fmt::Display for WeightStoreFreeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeightStoreFreeError::OriginMismatch(d) => {
+                write!(f, "origin validation failed: {d}")
+            }
+            WeightStoreFreeError::DriverError(d) => {
+                write!(f, "driver operation failed: {d}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WeightStoreFreeError {}
+
+/// The original [`WeightStoreAllocation`] returned on a failed
+/// [`free`](WeightStoreAllocation::free) so the caller can inspect or
+/// retry.
+#[derive(Debug)]
+pub struct FailedWeightStoreFree {
+    /// What went wrong.
+    pub error: WeightStoreFreeError,
+    /// The original allocation.  On origin-mismatch and bind-thread
+    /// failures the buffer was never submitted to the driver.  On
+    /// driver failures the buffer was submitted but ownership was
+    /// retained (via [`hip_bridge::HipRuntime::free_preserving`]) so the
+    /// caller can retry.
+    pub allocation: WeightStoreAllocation,
+}
+
+/// Generic ownership/free state machine for origin-gated resource release.
+/// Shared by [`WeightStoreAllocation::free`] and CPU-unit tests.
+#[derive(Debug)]
+struct AllocationToken<R, O> {
+    resource: R,
+    origin: O,
+}
+
+/// Distinguishes a validation mismatch (caller error) from a driver
+/// failure (runtime/HIP error) in the [`try_free`] state machine.
+#[derive(Debug, PartialEq, Eq)]
+enum FreeError {
+    /// The token's origin did not match the expected origin.
+    OriginMismatch,
+    /// The driver reported a failure.
+    DriverFailure(String),
+}
+
+/// Attempt to free `token` through `driver`, but only after verifying
+/// the token's origin matches `expected`.  The driver receives ownership
+/// of the resource (`R`) and must return `Ok(())` on success (consuming
+/// the resource) or `Err((R, String))` on failure (returning the resource
+/// for retry).  Origin mismatches are detected before any driver call;
+/// driver failures and their returned resources are propagated back.
+fn try_free<R, O: PartialEq>(
+    token: AllocationToken<R, O>,
+    expected: &O,
+    driver: impl FnOnce(R) -> Result<(), (R, String)>,
+) -> Result<(), (AllocationToken<R, O>, FreeError)> {
+    if token.origin != *expected {
+        return Err((token, FreeError::OriginMismatch));
+    }
+    match driver(token.resource) {
+        Ok(()) => Ok(()),
+        Err((resource, msg)) => {
+            let token = AllocationToken {
+                resource,
+                origin: token.origin,
+            };
+            Err((token, FreeError::DriverFailure(msg)))
         }
     }
 }
@@ -1150,6 +1352,266 @@ mod tests {
     fn wl(name: &str, layer: usize, policy: ShardPolicy) -> WeightEntry {
         WeightEntry::layer(name, layer, vec![8, 8], DType::F16, policy)
     }
+
+    // ── try_free CPU tests (generic state machine, local types) ──────
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestOrigin {
+        mesh_epoch: u64,
+        logical_rank: usize,
+        physical_device: i32,
+        pool_epoch: u64,
+    }
+
+    #[derive(Debug)]
+    struct TestResource(u64);
+
+    /// Resource that tracks whether it was dropped (consumed) vs retained.
+    struct DropSpy(Arc<AtomicBool>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn allocation_rejects_wrong_mesh_epoch() {
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+        let token = AllocationToken {
+            resource: TestResource(1),
+            origin: TestOrigin {
+                mesh_epoch: 99,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        let calls = Cell::new(0u32);
+        let result = try_free(token, &expected, |r: TestResource| {
+            calls.set(calls.get() + 1);
+            drop(r);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 0, "driver must not be called on mismatch");
+        let (returned, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::OriginMismatch);
+        assert_eq!(returned.origin.mesh_epoch, 99);
+    }
+
+    #[test]
+    fn allocation_rejects_wrong_rank_or_physical_device() {
+        // Logical rank mismatch.
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+        let token = AllocationToken {
+            resource: TestResource(1),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 7,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        let calls = Cell::new(0u32);
+        let result = try_free(token, &expected, |r: TestResource| {
+            calls.set(calls.get() + 1);
+            drop(r);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 0);
+        assert!(result.is_err());
+
+        // Physical device mismatch (independent check).
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 42,
+            pool_epoch: 10,
+        };
+        let token = AllocationToken {
+            resource: TestResource(2),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 99,
+                pool_epoch: 10,
+            },
+        };
+        let calls = Cell::new(0u32);
+        let result = try_free(token, &expected, |r: TestResource| {
+            calls.set(calls.get() + 1);
+            drop(r);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn allocation_rejects_stale_pool_epoch() {
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+        let token = AllocationToken {
+            resource: TestResource(1),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 99,
+            },
+        };
+        let calls = Cell::new(0u32);
+        let result = try_free(token, &expected, |r: TestResource| {
+            calls.set(calls.get() + 1);
+            drop(r);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn successful_free_consumes_allocation_token() {
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+        let token = AllocationToken {
+            resource: TestResource(1),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        let calls = Cell::new(0u32);
+        let result = try_free(token, &expected, |r: TestResource| {
+            calls.set(calls.get() + 1);
+            drop(r);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 1, "driver must be called once on match");
+        assert!(result.is_ok(), "successful free: {result:?}");
+    }
+
+    #[test]
+    fn failed_free_returns_the_original_token() {
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+
+        // First attempt: driver fails and returns the resource.
+        let calls = Cell::new(0u32);
+        let token = AllocationToken {
+            resource: TestResource(42),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        let result = try_free(token, &expected, |r: TestResource| {
+            calls.set(calls.get() + 1);
+            Err((r, "mock failure".into()))
+        });
+        assert_eq!(calls.get(), 1);
+        let (returned_token, free_err) = result.unwrap_err();
+        assert_eq!(free_err, FreeError::DriverFailure("mock failure".into()));
+        assert_eq!(returned_token.resource.0, 42);
+
+        // Retry with the EXACT returned token (not a reconstruction).
+        let calls = Cell::new(0u32);
+        let result2 = try_free(returned_token, &expected, |r: TestResource| {
+            calls.set(calls.get() + 1);
+            drop(r);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 1);
+        assert!(result2.is_ok(), "retry must succeed: {result2:?}");
+    }
+
+    #[test]
+    fn successful_free_drops_resource_exactly_once() {
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+        let dropped = Arc::new(AtomicBool::new(false));
+        let token = AllocationToken {
+            resource: DropSpy(dropped.clone()),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        let result = try_free(token, &expected, |r: DropSpy| {
+            drop(r); // driver consumes
+            Ok(())
+        });
+        assert!(result.is_ok(), "success expected");
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "resource must be dropped on success"
+        );
+    }
+
+    #[test]
+    fn failed_free_retains_resource() {
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+        let dropped = Arc::new(AtomicBool::new(false));
+        let token = AllocationToken {
+            resource: DropSpy(dropped.clone()),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        let result = try_free(token, &expected, |r: DropSpy| {
+            Err((r, "mock driver failure".into()))
+        });
+        assert!(result.is_err(), "failure expected");
+        assert!(
+            !dropped.load(Ordering::Relaxed),
+            "resource must NOT be dropped on driver failure"
+        );
+    }
+
+    // ── pre-existing tests ────────────────────────────────────────────
 
     #[test]
     fn dense_tp_slice_classification() {
