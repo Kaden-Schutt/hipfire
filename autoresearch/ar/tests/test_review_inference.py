@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 import shutil
 import subprocess
@@ -29,7 +30,8 @@ from autoresearch.ar.review.config import (
     load_review_configuration,
 )
 from autoresearch.ar.review.github import GitHubClient
-from autoresearch.ar.review.models import ReviewTarget
+from autoresearch.ar.review.models import ReviewTarget, fixture_descriptor_digest
+from autoresearch.ar.review.validation import MAX_VALIDATION_ROWS
 
 
 TARGET = ReviewTarget("owner/repo", 42, "fork/repo", "head", "main", "base", "merge")
@@ -56,6 +58,19 @@ _CONFIGURATION = None
 _LIVE_CLIENT = None
 _LIVE_RUNNER = None
 X_OID = hashlib.sha1(b"blob 6\0x = 1\n").hexdigest()
+_PROTECTED_VALIDATION_REQUESTS = (
+    ("rdna3-smoke", "run the protected smoke fixture"),
+    ("gfx1151-kernel-validation", "run the protected kernel fixture"),
+    ("dflash-coherence", "run the protected coherence fixture"),
+)
+
+
+def protected_validation_requests(rationale_overrides=None):
+    rationale_overrides = rationale_overrides or {}
+    return [
+        {"profile_id": profile_id, "rationale": rationale_overrides.get(profile_id, rationale)}
+        for profile_id, rationale in _PROTECTED_VALIDATION_REQUESTS
+    ]
 
 
 def protected_configuration(policy=None, capability_policy=None):
@@ -181,7 +196,7 @@ def patch_owned_transport(monkeypatch):
 def Transport(response):
     _OPEN_OPENER.response = response
     _OPEN_OPENER.calls = []
-    transport = BoundedHttpTransport()
+    transport = BoundedHttpTransport(context=multiprocessing.get_context("fork"))
     transport.calls = _OPEN_OPENER.calls
     return transport
 
@@ -190,19 +205,35 @@ def valid_response(**changes):
     content = {
         "verdict": "clean",
         "findings": [],
-        "validation_requests": [{"profile_id": "rdna3-smoke", "rationale": "run the protected smoke fixture"}],
+        "validation_requests": protected_validation_requests(),
         "scope": {
             "model_architectures": ["qwen3.6-27b"],
             "hardware_architectures": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
         },
+        "hardware_validation_triage": {
+            "impacted_model_families": ["qwen3.6-27b"],
+            "impacted_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
+            "coverage_decision": "all-impacted",
+            "rationale": "all model families and hardware architectures are impacted by this change",
+        },
     }
     value = {"choices": [{"index": 0, "message": {"role": "assistant", "content": json.dumps(content)}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}, "cost_usd": 0.01}
-    response_keys = {"verdict", "findings", "validation_requests", "scope"}
+    response_keys = {"verdict", "findings", "validation_requests", "scope", "hardware_validation_triage"}
     if response_keys.intersection(changes):
         content.update({key: changes.pop(key) for key in tuple(changes) if key in response_keys})
         value["choices"][0]["message"]["content"] = json.dumps(content)
     value.update(changes)
     return HttpResponse(200, {"content-type": "application/json"}, json.dumps(value).encode())
+
+
+def test_provider_cannot_omit_a_protected_profile():
+    response = valid_response(validation_requests=protected_validation_requests()[:-1])
+
+    with pytest.raises(
+        ToollessInferenceError,
+        match="^provider validation requests must cover every protected profile$",
+    ):
+        adapter(Transport(response)).review(capsule())
 
 
 def adapter(transport):
@@ -237,8 +268,9 @@ def test_exactly_one_toolless_https_request_and_bound_proposal():
     request_json = json.loads(request.data)
     assert request_json["model"] == "review-model-v1"
     assert request_json["max_output_tokens"] == 128
-    assert request_json["response_format"]["type"] == "json_schema"
+    assert request_json["response_format"]["type"] == "json_object"
     assert "x.py" in request_json["messages"][1]["content"]
+    assert "PROTECTED_REVIEW_MODE=non-exempt\n" in request_json["messages"][1]["content"]
 
 
 @pytest.mark.parametrize("missing", ["validation_requests", "scope"])
@@ -384,7 +416,9 @@ def test_owned_transport_deadline_covers_slow_response_reads(monkeypatch):
 
     monkeypatch.setattr(inference_module, "build_opener", lambda handler: SlowOpener())
     with pytest.raises(ToollessInferenceError, match="deadline|timed out"):
-        BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.005, 8))
+        BoundedHttpTransport(context=multiprocessing.get_context("fork")).send(
+            HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.005, 8)
+        )
 
 
 def test_owned_transport_applies_remaining_deadline_before_near_expiry_read(monkeypatch):
@@ -412,7 +446,9 @@ def test_owned_transport_applies_remaining_deadline_before_near_expiry_read(monk
 
     monkeypatch.setattr(inference_module, "build_opener", lambda handler: NearExpiryOpener())
     with pytest.raises(ToollessInferenceError, match="deadline|timed out"):
-        BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.1, 8))
+        BoundedHttpTransport(context=multiprocessing.get_context("fork")).send(
+            HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.1, 8)
+        )
 
 
 def test_owned_transport_terminates_blocked_connection_setup(monkeypatch):
@@ -423,7 +459,9 @@ def test_owned_transport_terminates_blocked_connection_setup(monkeypatch):
     monkeypatch.setattr(inference_module, "build_opener", lambda handler: BlockingOpener())
     started = time.monotonic()
     with pytest.raises(ToollessInferenceError, match="deadline|timed out"):
-        BoundedHttpTransport().send(HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.05, 8))
+        BoundedHttpTransport(context=multiprocessing.get_context("fork")).send(
+            HttpRequest("POST", "https://provider.example.invalid", {}, b"{}", 0.05, 8)
+        )
     assert time.monotonic() - started < 1
 
 
@@ -523,17 +561,10 @@ def test_provider_request_contains_only_protected_validation_profile_catalogue()
     assert len(catalogue_json.encode("utf-8")) <= 64 * 1024
     assert not any(field in json.dumps(catalogue) for field in ("commands", "paths", "environment", "secret", "policy"))
 
-    schema = request["response_format"]["json_schema"]["schema"]
-    validation_schema = schema["properties"]["validation_requests"]
-    assert "validation_requests" in schema["required"]
-    assert "scope" in schema["required"]
-    assert validation_schema["maxItems"] == 64
-    assert validation_schema["items"]["additionalProperties"] is False
-    assert validation_schema["items"]["required"] == ["profile_id", "rationale"]
-    assert set(validation_schema["items"]["properties"]) == {"profile_id", "rationale"}
+    assert request["response_format"] == {"type": "json_object"}
 
 
-def test_trusted_instruction_requires_authoritative_profile_selection_requests():
+def test_trusted_instruction_requires_authoritative_mode_dependent_scope_and_requests():
     transport = Transport(valid_response())
     adapter(transport).review(capsule())
     instruction = json.loads(transport.calls[0].data)["messages"][0]["content"].lower()
@@ -541,24 +572,36 @@ def test_trusted_instruction_requires_authoritative_profile_selection_requests()
     for semantic in (
         "inspect only the supplied immutable capsule",
         "validation_profile_catalogue_json",
-        "authoritative protected selection data",
-        "select every relevant protected profile",
-        "one validation_requests item per selected profile",
+        "the trusted protected_review_mode marker and validation_profile_catalogue_json catalogue are authoritative",
+        "for protected_review_mode=non-exempt, scope must contain the complete registered model_architectures",
+        "hardware_architectures inventory from the authoritative catalogue",
+        "validation_requests must contain every protected profile exactly once",
+        "for protected_review_mode=exempt, scope must be empty and validation_requests",
+        "must be empty",
+        "each item must contain only profile_id and a concise rationale",
+        "the provider cannot invent profiles or scope",
         "only profile_id and a concise rationale",
         "no invented hardware, fixture, or commands",
-        "empty validation_requests array only when no profile is relevant",
         "required for hardware/model smoke validation",
-        "complete touched model_architectures",
-        "complete touched hardware_architectures",
     ):
         assert semantic in instruction
+
+    assert "touched" not in instruction
+    assert "relevant" not in instruction
+    assert "coverage-based" not in instruction
 
 
 def test_oversized_protected_profile_catalogue_is_rejected_before_request():
     custom_capabilities = json.loads(
         (ROOT / ".github" / "agentic-review" / "capabilities-v1.json").read_text(encoding="utf-8")
     )
-    custom_capabilities["profiles"][0]["model_architecture"] = "x" * (64 * 1024)
+    oversized_model = "x" * (64 * 1024)
+    profile = custom_capabilities["profiles"][0]
+    profile["model_architecture"] = oversized_model
+    fixture = next(item for item in custom_capabilities["fixtures"] if item["fixture_id"] == profile["fixture_id"])
+    fixture["model_architecture"] = oversized_model
+    fixture["fixture_digest"] = fixture_descriptor_digest(fixture)
+    profile["fixture_digest"] = fixture["fixture_digest"]
     configuration = protected_configuration(capability_policy=custom_capabilities)
     review_adapter = configured_adapter(
         configuration, Transport(valid_response()), {"REVIEW_API_KEY": "secret"}
@@ -566,6 +609,19 @@ def test_oversized_protected_profile_catalogue_is_rejected_before_request():
 
     with pytest.raises(ToollessInferenceError, match="catalogue|byte"):
         review_adapter._request_body(capsule())
+
+
+def test_capability_policy_rejects_more_profiles_than_validation_rows():
+    custom_capabilities = json.loads(
+        (ROOT / ".github" / "agentic-review" / "capabilities-v1.json").read_text(encoding="utf-8")
+    )
+    profile = custom_capabilities["profiles"][0]
+    custom_capabilities["profiles"].extend(
+        [{**profile, "id": f"extra-profile-{index}"} for index in range(MAX_VALIDATION_ROWS)]
+    )
+
+    with pytest.raises(ValueError, match=rf"more than {MAX_VALIDATION_ROWS} profiles"):
+        protected_configuration(capability_policy=custom_capabilities)
 
 
 def test_provider_hardware_override_is_rejected():
@@ -582,18 +638,17 @@ def test_validation_request_is_enriched_from_protected_profile_and_capability():
     configuration = protected_configuration()
     profile = next(item for item in configuration.capabilities["profiles"] if item["id"] == "rdna3-smoke")
     capability = next(item for item in configuration.capabilities["capabilities"] if item["id"] == profile["capability_id"])
-    transport = Transport(valid_response(validation_requests=[{
-        "profile_id": "rdna3-smoke",
-        "rationale": "  inspect\n  the smoke result  ",
-    }], scope={
+    transport = Transport(valid_response(validation_requests=protected_validation_requests({
+        "rdna3-smoke": "  inspect\n  the smoke result  ",
+    }), scope={
         "model_architectures": ["qwen3.6-27b"],
         "hardware_architectures": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
     }))
 
     proposal = adapter(transport).review(capsule())
 
-    assert len(proposal.validation_ledger) == 1
-    row = proposal.validation_ledger[0]
+    assert len(proposal.validation_ledger) == 3
+    row = next(row for row in proposal.validation_ledger if row.profile_snapshot["id"] == "rdna3-smoke")
     assert row.rationales == ("inspect the smoke result",)
     assert row.model_architecture == profile["model_architecture"]
     assert row.representative_hardware == profile["representative_hardware"]
@@ -646,40 +701,39 @@ def test_validation_request_profile_ids_must_be_known_and_unique(requests, messa
 
 
 def test_validation_rationale_is_normalized_and_bounded():
-    proposal = adapter(Transport(valid_response(validation_requests=[{
-        "profile_id": "rdna3-smoke",
-        "rationale": "  first\nsecond  ",
-    }]))).review(capsule())
-    assert proposal.validation_ledger[0].rationales == ("first second",)
+    proposal = adapter(Transport(valid_response(validation_requests=protected_validation_requests({
+        "rdna3-smoke": "  first\nsecond  ",
+    })))).review(capsule())
+    row = next(row for row in proposal.validation_ledger if row.profile_snapshot["id"] == "rdna3-smoke")
+    assert row.rationales == ("first second",)
 
     with pytest.raises(ToollessInferenceError, match="rationale|limit"):
-        adapter(Transport(valid_response(validation_requests=[{
-            "profile_id": "rdna3-smoke",
-            "rationale": "x" * 1025,
-        }]))).review(capsule())
+        adapter(Transport(valid_response(validation_requests=protected_validation_requests({
+            "rdna3-smoke": "x" * 1025,
+        })))).review(capsule())
 
-    accepted = adapter(Transport(valid_response(validation_requests=[{
-        "profile_id": "rdna3-smoke",
-        "rationale": "😀" * 256,
-    }]))).review(capsule())
-    assert len(accepted.validation_ledger[0].rationales[0].encode("utf-8")) == 1024
+    accepted = adapter(Transport(valid_response(validation_requests=protected_validation_requests({
+        "rdna3-smoke": "😀" * 256,
+    })))).review(capsule())
+    accepted_row = next(row for row in accepted.validation_ledger if row.profile_snapshot["id"] == "rdna3-smoke")
+    assert len(accepted_row.rationales[0].encode("utf-8")) == 1024
 
     with pytest.raises(ToollessInferenceError, match="rationale|limit"):
-        adapter(Transport(valid_response(validation_requests=[{
-            "profile_id": "rdna3-smoke",
-            "rationale": "😀" * 257,
-        }]))).review(capsule())
+        adapter(Transport(valid_response(validation_requests=protected_validation_requests({
+            "rdna3-smoke": "😀" * 257,
+        })))).review(capsule())
 
 
-def test_empty_validation_requests_are_incomplete_for_non_exempt_changes():
-    proposal = adapter(Transport(valid_response(validation_requests=[]))).review(capsule())
-    assert proposal.verdict == "incomplete"
-    assert proposal.validation_ledger == ()
-    assert proposal.configuration_source_digest is None
+def test_empty_validation_requests_are_rejected_for_non_exempt_changes():
+    with pytest.raises(
+        ToollessInferenceError,
+        match="^provider validation requests must cover every protected profile$",
+    ):
+        adapter(Transport(valid_response(validation_requests=[]))).review(capsule())
 
 
 def test_reverse_ordered_validation_selections_are_serialized_by_request_id():
-    profile_ids = ["dflash-coherence", "rdna3-smoke"]
+    profile_ids = [request["profile_id"] for request in protected_validation_requests()]
     profile_ids.sort(key=lambda profile_id: "vr-" + hashlib.sha256(profile_id.encode()).hexdigest()[:16])
     requests = [{"profile_id": profile_id, "rationale": "check it"} for profile_id in reversed(profile_ids)]
     proposal = adapter(Transport(valid_response(validation_requests=requests))).review(capsule())
@@ -701,18 +755,40 @@ def test_original_verdict_and_finding_consistency_are_validated_before_downgrade
         adapter(Transport(valid_response(**content))).review(capsule())
 
 
+def test_policy_exempt_partial_ledger_is_rejected():
+    custom_capabilities = json.loads(
+        (ROOT / ".github" / "agentic-review" / "capabilities-v1.json").read_text(encoding="utf-8")
+    )
+    custom_capabilities["exemptions"] = [{"id": "test-exempt", "path_globs": ["x.py"]}]
+    configuration = protected_configuration(capability_policy=custom_capabilities)
+
+    with pytest.raises(
+        ToollessInferenceError,
+        match="^provider validation requests are forbidden for exempt capsule$",
+    ):
+        configured_adapter(
+            configuration,
+            Transport(valid_response(
+                validation_requests=protected_validation_requests()[:1],
+                scope={"model_architectures": [], "hardware_architectures": []},
+            )),
+            {"REVIEW_API_KEY": "secret"},
+        ).review(capsule())
+
+
 def test_policy_exempt_empty_ledger_is_clean_and_binds_configuration_digest():
     custom_capabilities = json.loads(
         (ROOT / ".github" / "agentic-review" / "capabilities-v1.json").read_text(encoding="utf-8")
     )
     custom_capabilities["exemptions"] = [{"id": "test-exempt", "path_globs": ["x.py"]}]
     configuration = protected_configuration(capability_policy=custom_capabilities)
+    transport = Transport(valid_response(
+        validation_requests=[],
+        scope={"model_architectures": [], "hardware_architectures": []},
+    ))
     proposal = configured_adapter(
         configuration,
-        Transport(valid_response(
-            validation_requests=[],
-            scope={"model_architectures": [], "hardware_architectures": []},
-        )),
+        transport,
         {"REVIEW_API_KEY": "secret"},
     ).review(capsule())
 
@@ -721,6 +797,8 @@ def test_policy_exempt_empty_ledger_is_clean_and_binds_configuration_digest():
     assert proposal.configuration_source_digest == configuration.source.config_digest
     assert proposal.exemption_ids == ("test-exempt",)
     assert proposal.exemption_paths == ("x.py",)
+    request = json.loads(transport.calls[0].data)
+    assert "PROTECTED_REVIEW_MODE=exempt\n" in request["messages"][1]["content"]
     with pytest.raises(ValueError, match="proposal digest"):
         replace(proposal, configuration_source_digest="sha256:" + "0" * 64)
 
@@ -734,9 +812,10 @@ def test_validation_request_id_collision_is_rejected(monkeypatch):
         return row
 
     monkeypatch.setattr(inference_module, "ValidationLedgerRow", colliding_row)
-    requests = [
-        {"profile_id": "rdna3-smoke", "rationale": "check smoke"},
-        {"profile_id": "dflash-coherence", "rationale": "check coherence"},
-    ]
+    requests = protected_validation_requests({
+        "rdna3-smoke": "check smoke",
+        "gfx1151-kernel-validation": "check kernel",
+        "dflash-coherence": "check coherence",
+    })
     with pytest.raises(ToollessInferenceError, match="collision"):
         adapter(Transport(valid_response(validation_requests=requests))).review(capsule())

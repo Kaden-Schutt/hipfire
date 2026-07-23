@@ -131,6 +131,16 @@ def render_report(proposal: ReviewProposal) -> str:
             lines.append(f"  <pre><code>{message}</code></pre>")
     else:
         lines.extend(("", "No findings."))
+    if proposal.hardware_validation_triage is not None:
+        triage = proposal.hardware_validation_triage
+        lines.extend((
+            "",
+            "### Hardware validation triage",
+            f"- Impacted model families: {_safe_html_text(', '.join(triage.impacted_model_families))}",
+            f"- Impacted hardware: {_safe_html_text(', '.join(triage.impacted_hardware))}",
+            f"- Coverage decision: <code>{_safe_html_text(triage.coverage_decision)}</code>",
+            f"- Rationale: {_safe_html_text(triage.rationale)}",
+        ))
     if proposal.validation_ledger or proposal.exemption_ids:
         lines.extend(("", render_validation_section(
             proposal.validation_ledger, exempt=bool(proposal.exemption_ids), scope=proposal.scope,
@@ -139,7 +149,6 @@ def render_report(proposal: ReviewProposal) -> str:
     if not body or body != body.strip() or len(body.encode("utf-8")) > _MAX_RENDERED_REPORT_BYTES:
         raise PublisherError("rendered report is empty, padded, or exceeds 256 KiB")
     return body
-
 
 class ReviewPublisher:
     """Publish a validated proposal through the fixed GitHub boundary."""
@@ -1066,6 +1075,16 @@ class ReviewPublisher:
             try:
                 render_report(proposal)
                 self._validate_proposal_configuration(proposal, target, capsule)
+                # Apply verify-* labels for impacted hardware so downstream agents
+                # discover validation tasks by label. Skip when triage is absent or
+                # coverage_decision is "none" (no hardware validation needed).
+                if proposal.hardware_validation_triage is not None and proposal.hardware_validation_triage.coverage_decision != "none":
+                    verify_labels = [
+                        "verify-" + arch
+                        for arch in proposal.hardware_validation_triage.impacted_hardware
+                    ]
+                    if verify_labels:
+                        self._client.add_labels(target.repository, target.number, verify_labels)
                 self._preflight_report_comment(proposal, target, attempt_id, capsule)
             except _PreflightRejected:
                 raise

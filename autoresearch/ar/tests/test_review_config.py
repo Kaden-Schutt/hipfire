@@ -172,5 +172,8 @@ def test_fixture_must_match_referenced_capability(field, value, message):
     fixture[field] = value
     from autoresearch.ar.review.models import fixture_descriptor_digest
     fixture["fixture_digest"] = fixture_descriptor_digest(fixture)
+    for profile in policy["profiles"]:
+        if profile["fixture_id"] == fixture["fixture_id"]:
+            profile["fixture_digest"] = fixture["fixture_digest"]
     with pytest.raises(ValueError, match=message):
         validate_capability_policy(policy)

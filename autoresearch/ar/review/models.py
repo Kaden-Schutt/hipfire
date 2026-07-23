@@ -17,6 +17,7 @@ from .canonical import DEFAULT_MAX_BYTES, canonical_digest, canonical_json
 from .validation import (
     MAX_VALIDATION_FIELD_BYTES,
     MAX_VALIDATION_RATIONALE_BYTES,
+    MAX_VALIDATION_ROWS,
     validate_ledger_payload_shape,
     validate_ledger_row_mapping,
 )
@@ -317,6 +318,50 @@ class Finding:
             raise ValueError("severity is not supported")
         _require_text("message", self.message)
 
+@dataclass(frozen=True)
+class HardwareValidationTriage:
+    """Diff-informed triage of model families needing hardware validation."""
+
+    impacted_model_families: tuple[str, ...]
+    impacted_hardware: tuple[str, ...]
+    coverage_decision: str
+    rationale: str
+
+    def __post_init__(self) -> None:
+        _require_string_list("impacted_model_families", self.impacted_model_families, nonempty=False)
+        _require_string_list("impacted_hardware", self.impacted_hardware, nonempty=False)
+        if self.coverage_decision not in {"all-impacted", "representative-only", "none"}:
+            raise ValueError("coverage_decision must be one of: all-impacted, representative-only, none")
+        _require_text("rationale", self.rationale)
+        if tuple(sorted(self.impacted_model_families)) != self.impacted_model_families:
+            raise ValueError("impacted_model_families must be lexicographically ordered")
+        if tuple(sorted(self.impacted_hardware)) != self.impacted_hardware:
+            raise ValueError("impacted_hardware must be lexicographically ordered")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "impacted_model_families": list(self.impacted_model_families),
+            "impacted_hardware": list(self.impacted_hardware),
+            "coverage_decision": self.coverage_decision,
+            "rationale": self.rationale,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "HardwareValidationTriage":
+        if not isinstance(value, Mapping):
+            raise ValueError("hardware_validation_triage must be an object")
+        required = {"impacted_model_families", "impacted_hardware", "coverage_decision", "rationale"}
+        if set(value) != required:
+            raise ValueError("hardware_validation_triage has unexpected or missing keys")
+        model_families = value["impacted_model_families"]
+        hardware = value["impacted_hardware"]
+        if isinstance(model_families, list):
+            model_families = tuple(model_families)
+        if isinstance(hardware, list):
+            hardware = tuple(hardware)
+        return cls(model_families, hardware, value["coverage_decision"], value["rationale"])
+
+
 
 @dataclass(frozen=True)
 class ReviewScope:
@@ -550,14 +595,15 @@ class ReviewProposal:
     expected_file_count: int | None = None
     retrieved_blob_count: int | None = None
     expected_blob_count: int | None = None
-    retrieved_content_count: int | None = None
     expected_content_count: int | None = None
+    retrieved_content_count: int | None = None
     coverage_complete: bool | None = None
     validation_ledger: tuple[ValidationLedgerRow, ...] = ()
     configuration_source_digest: str | None = None
     exemption_ids: tuple[str, ...] = ()
     exemption_paths: tuple[str, ...] = ()
     scope: ReviewScope | None = None
+    hardware_validation_triage: HardwareValidationTriage | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, ReviewTarget):
@@ -577,6 +623,8 @@ class ReviewProposal:
             raise ValueError("findings must be a tuple of Finding values")
         if self.scope is not None and not isinstance(self.scope, ReviewScope):
             raise ValueError("scope must be a ReviewScope")
+        if self.hardware_validation_triage is not None and not isinstance(self.hardware_validation_triage, HardwareValidationTriage):
+            raise ValueError("hardware_validation_triage must be a HardwareValidationTriage")
         if not isinstance(self.validation_ledger, tuple) or any(
             not isinstance(row, ValidationLedgerRow) for row in self.validation_ledger
         ):
@@ -679,6 +727,8 @@ class ReviewProposal:
                 digest_values["exemption_paths"] = self.exemption_paths
         if self.scope is not None:
             digest_values["scope"] = self.scope.to_mapping()
+        if self.hardware_validation_triage is not None:
+            digest_values["hardware_validation_triage"] = self.hardware_validation_triage.to_mapping()
         expected = "sha256:" + canonical_digest(digest_values)
         if self.proposal_digest != expected:
             raise ValueError("proposal digest is not bound to target, capsule, provider, and response")
@@ -982,6 +1032,8 @@ def validate_capability_policy(policy: Mapping[str, Any]) -> None:
     profiles = policy["profiles"]
     if not isinstance(profiles, (list, tuple)) or not profiles:
         raise ValueError("capability policy must contain profiles")
+    if len(profiles) > MAX_VALIDATION_ROWS:
+        raise ValueError(f"capability policy cannot contain more than {MAX_VALIDATION_ROWS} profiles")
     profile_ids: list[str] = []
     profile_capability_ids: list[str] = []
     for profile in profiles:

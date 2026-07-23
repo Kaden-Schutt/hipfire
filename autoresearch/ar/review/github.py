@@ -184,6 +184,7 @@ _LOGIN = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
 _MAX_PAGINATED_PAGES = 16
 _MAX_PAGINATED_ITEMS = 4096
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+_MAX_JSON_DEPTH = 256
 _MAX_STDERR_BYTES = 1 << 20
 _MAX_REQUEST_BYTES = 1 << 20
 _MAX_RENDERED_REPORT_BYTES = 256 * 1024
@@ -460,6 +461,39 @@ def _validate_protocol_payload(payload: Mapping[str, Any], *, report_body: str |
         canonical_digest(payload)
 
 
+def _check_json_depth(text: str, *, start: int = 0) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    started = False
+    for char in text[start:]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+                if depth == 0:
+                    return
+            continue
+        if char == '"':
+            in_string = True
+            started = True
+        elif char in "[{":
+            started = True
+            depth += 1
+            if depth > _MAX_JSON_DEPTH:
+                raise GitHubBoundaryError("gh response JSON depth exceeds the fixed recursion bound")
+        elif char in "]}":
+            if depth:
+                depth -= 1
+                if started and depth == 0:
+                    return
+        elif not started and not char.isspace():
+            return
+
+
 def _decode_output(raw: str | bytes) -> tuple[list[tuple[int, dict[str, str], Any]], bool]:
     if not isinstance(raw, (str, bytes)):
         raise GitHubBoundaryError("gh response has an unsupported output type")
@@ -475,6 +509,7 @@ def _decode_output(raw: str | bytes) -> tuple[list[tuple[int, dict[str, str], An
     if not text.strip():
         raise GitHubBoundaryError("gh returned an empty response")
     if not text.lstrip().startswith("HTTP/"):
+        _check_json_depth(text)
         try:
             return [(200, {}, json.loads(text, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value))))], False
         except (ValueError, json.JSONDecodeError, RecursionError) as exc:
@@ -512,6 +547,7 @@ def _decode_output(raw: str | bytes) -> tuple[list[tuple[int, dict[str, str], An
         if not text[offset:].strip():
             value, consumed = None, len(text) - offset
         else:
+            _check_json_depth(text, start=offset)
             try:
                 value, consumed = decoder.raw_decode(text[offset:])
             except (ValueError, json.JSONDecodeError, RecursionError) as exc:

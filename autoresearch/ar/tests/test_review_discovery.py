@@ -462,8 +462,21 @@ def test_valid_current_clean_completion_is_clean_and_reconciles_label():
 @pytest.mark.parametrize("field", ["head_sha", "base_sha", "merge_base_sha"])
 def test_stale_full_target_requires_review(field):
     client = completed_client()
-    client.target = replace(replace(TARGET, head_repository=REPO), **{field: "new-" + field})
-    client.pull = client._pull(client.target)
+    stale_target = replace(PUBLISH_TARGET, **{field: "new-" + field})
+    client.pull = client._pull(stale_target)
+    source_repository, source_sha = (
+        (PUBLISH_TARGET.head_repository, PUBLISH_TARGET.head_sha)
+        if field == "head_sha" else
+        (PUBLISH_TARGET.repository, PUBLISH_TARGET.merge_base_sha)
+    )
+    replacement_sha = getattr(stale_target, field)
+    replacement_repository = (
+        stale_target.head_repository if field == "head_sha" else stale_target.repository
+    )
+    client.commits[(replacement_repository, replacement_sha)] = {
+        **client.commits[(source_repository, source_sha)],
+        "sha": replacement_sha,
+    }
     summary = discover_pull_requests(
         client, REPO, configuration=app_configuration(), operator_credential=DISCOVERY_BOT
     )

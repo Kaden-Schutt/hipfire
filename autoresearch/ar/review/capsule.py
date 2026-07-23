@@ -242,7 +242,10 @@ def _blob(
             reasons.append(f"{side} blob has opaque or invalid encoding: {path}")
             return None, declared, reasons
         try:
-            raw = base64.b64decode(data["content"].encode("ascii"), validate=True)
+            raw = base64.b64decode(
+                data["content"].encode("ascii").replace(b"\n", b"").replace(b"\r", b""),
+                validate=True,
+            )
         except (UnicodeEncodeError, binascii.Error) as exc:
             reasons.append(f"{side} blob has invalid base64: {path}")
             return None, declared, reasons

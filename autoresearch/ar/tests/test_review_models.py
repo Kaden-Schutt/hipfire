@@ -22,6 +22,7 @@ from autoresearch.ar.review.models import (
     ValidationRequest,
     ProposedValidationObligation,
     capability_contract_digest,
+    fixture_descriptor_digest,
     profile_digest,
     protected_exemption_evidence,
     load_capability_policy,
@@ -129,6 +130,14 @@ def test_capability_policy_rejects_invalid_contract_digests(digest):
         validate_capability_policy(policy)
 
 
+def test_capability_policy_rejects_stale_contract_digest():
+    policy = json.loads((POLICY_DIR / "capabilities-v1.json").read_text())
+    policy["capabilities"][0]["required_checks"] = ["changed-check"]
+
+    with pytest.raises(ValueError, match="^capability contract digest does not match capability$"):
+        validate_capability_policy(policy)
+
+
 @pytest.mark.parametrize(
     "field, value",
     [
@@ -150,12 +159,81 @@ def test_capability_digest_covers_complete_capability(field, value):
     changed_digest = capability_contract_digest(capability)
     assert changed_digest != original_digest
 
-    with pytest.raises(ValueError, match="digest|capability ID|pass_criteria"):
-        validate_capability_policy(mutated)
 
-    capability["contract_digest"] = changed_digest
-    if field not in ("id", "pass_criteria"):
-        validate_capability_policy(mutated)
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("allowed_suite_revisions", ["changed-suite-v1"]),
+        ("artifacts", ["changed-artifact.json"]),
+        ("eligible_hardware", ["changed-hardware"]),
+    ],
+)
+def test_rehashed_capability_rejects_incoherent_dependent_records(field, value):
+    policy = load_capability_policy(POLICY_DIR / "capabilities-v1.json")
+    capability_id = "hipfire/rdna3-smoke@1"
+    capability = next(item for item in policy["capabilities"] if item["id"] == capability_id)
+    capability[field] = value
+    capability["contract_digest"] = capability_contract_digest(capability)
+
+    with pytest.raises(ValueError):
+        validate_capability_policy(policy)
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("id", "hipfire/changed@1", "wrong capability IDs"),
+        ("pass_criteria", {"all_required_checks_pass": False}, "pass_criteria"),
+    ],
+)
+def test_rehashed_capability_rejects_invalid_capability_contract(field, value, message):
+    policy = load_capability_policy(POLICY_DIR / "capabilities-v1.json")
+    capability = policy["capabilities"][0]
+    capability[field] = value
+    capability["contract_digest"] = capability_contract_digest(capability)
+
+    with pytest.raises(ValueError, match=message):
+        validate_capability_policy(policy)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("allowed_suite_revisions", ["changed-suite-v1"]),
+        ("required_checks", ["changed-check"]),
+        ("artifacts", ["changed-artifact.json"]),
+        ("eligible_hardware", ["changed-hardware"]),
+    ],
+)
+def test_rehashed_capability_accepts_coherent_dependent_records(field, value):
+    policy = load_capability_policy(POLICY_DIR / "capabilities-v1.json")
+    capability_id = "hipfire/rdna3-smoke@1"
+    capability = next(item for item in policy["capabilities"] if item["id"] == capability_id)
+    capability[field] = value
+    capability["contract_digest"] = capability_contract_digest(capability)
+
+    profiles = [profile for profile in policy["profiles"] if profile["capability_id"] == capability_id]
+    fixture_ids = {profile["fixture_id"] for profile in profiles}
+    fixtures = [fixture for fixture in policy["fixtures"] if fixture["fixture_id"] in fixture_ids]
+    if field == "allowed_suite_revisions":
+        for fixture in fixtures:
+            fixture["suite_revision"] = value[0]
+    elif field == "artifacts":
+        for fixture in fixtures:
+            fixture["artifact_identity"] = value[0]
+    elif field == "eligible_hardware":
+        for profile in profiles:
+            profile["representative_hardware"] = value[0]
+            profile["covered_hardware"] = value
+
+    if field in ("allowed_suite_revisions", "artifacts"):
+        for fixture in fixtures:
+            fixture["fixture_digest"] = fixture_descriptor_digest(fixture)
+            for profile in policy["profiles"]:
+                if profile["fixture_id"] == fixture["fixture_id"]:
+                    profile["fixture_digest"] = fixture["fixture_digest"]
+
+    validate_capability_policy(policy)
 
 
 def test_capability_digest_uses_documented_canonical_json():
@@ -535,10 +613,11 @@ def test_profile_identifier_128_bytes_is_allowed_but_129_is_rejected():
                                         PROFILE.fixture_id, PROFILE.fixture_digest,
                                         PROFILE.representative_hardware, PROFILE.covered_hardware)
     invalid_row = ValidationLedgerRow(invalid_profile, "sha256:" + "2" * 64, "representative")
-    with pytest.raises(ValueError, match="128|malformed"):
-        ReviewProposal(TARGET, values["capsule_digest"], values["response_digest"], "clean", (),
-                       "adapter", "1", "model", values["response_digest"],
-                       validation_ledger=(invalid_row,), configuration_source_digest=values["configuration_source_digest"])
+    invalid_values = {**values, "validation_ledger": (invalid_row.to_mapping(),)}
+    with pytest.raises(ValueError, match=r"profile_snapshot\.id exceeds its maximum UTF-8 length"):
+        ReviewProposal(TARGET, invalid_values["capsule_digest"], "sha256:" + canonical_digest(invalid_values), "clean", (),
+                       "adapter", "1", "model", invalid_values["response_digest"],
+                       validation_ledger=(invalid_row,), configuration_source_digest=invalid_values["configuration_source_digest"])
 
 
 def test_serialized_ledger_over_64_kib_is_rejected():
@@ -568,10 +647,11 @@ def test_serialized_ledger_over_64_kib_is_rejected():
                    configuration_source_digest=values["configuration_source_digest"])
     over_rows = rows(exact_first_rationale_length + 1)
     assert len(canonical_json(tuple(row.to_mapping() for row in over_rows))) == MAX_VALIDATION_LEDGER_BYTES + 1
+    over_values = {**values, "validation_ledger": tuple(row.to_mapping() for row in over_rows)}
     with pytest.raises(ValueError, match="64 KiB"):
-        ReviewProposal(TARGET, values["capsule_digest"], values["response_digest"], "clean", (),
-                       "adapter", "1", "model", values["response_digest"], validation_ledger=over_rows,
-                       configuration_source_digest=values["configuration_source_digest"])
+        ReviewProposal(TARGET, over_values["capsule_digest"], "sha256:" + canonical_digest(over_values), "clean", (),
+                       "adapter", "1", "model", over_values["response_digest"], validation_ledger=over_rows,
+                       configuration_source_digest=over_values["configuration_source_digest"])
 
 
 def test_validation_profile_and_obligation_are_immutable_and_exact():
@@ -644,9 +724,16 @@ def test_review_proposal_digest_binds_enriched_rows_and_config_source():
 
 def test_review_proposal_rejects_duplicate_and_noncanonical_ledger_order():
     duplicate = ValidationLedgerRow(PROFILE, "sha256:" + "2" * 64, "representative", ())
+    duplicate_values = {
+        "target": TARGET, "target_key": TARGET.target_key(), "capsule_digest": "sha256:" + "a" * 64,
+        "adapter_id": "adapter", "adapter_version": "1", "model": "model",
+        "response_digest": "sha256:" + "c" * 64, "verdict": "clean", "findings": (),
+        "validation_ledger": (duplicate.to_mapping(), duplicate.to_mapping()),
+        "configuration_source_digest": "sha256:" + "d" * 64,
+    }
     with pytest.raises(ValueError, match="unique"):
         ReviewProposal(
-            TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (),
+            TARGET, duplicate_values["capsule_digest"], "sha256:" + canonical_digest(duplicate_values), "clean", (),
             "adapter", "1", "model", "sha256:" + "c" * 64,
             validation_ledger=(duplicate, duplicate), configuration_source_digest="sha256:" + "d" * 64,
         )
@@ -661,9 +748,16 @@ def test_review_proposal_rejects_duplicate_and_noncanonical_ledger_order():
     rows = (first, second)
     if tuple(row.request_id for row in rows) == tuple(sorted(row.request_id for row in rows)):
         rows = (second, first)
-    with pytest.raises(ValueError, match="order"):
+    order_values = {
+        "target": TARGET, "target_key": TARGET.target_key(), "capsule_digest": "sha256:" + "a" * 64,
+        "adapter_id": "adapter", "adapter_version": "1", "model": "model",
+        "response_digest": "sha256:" + "c" * 64, "verdict": "clean", "findings": (),
+        "validation_ledger": tuple(row.to_mapping() for row in rows),
+        "configuration_source_digest": "sha256:" + "d" * 64,
+    }
+    with pytest.raises(ValueError, match=r"validation ledger request IDs must be sorted and unique"):
         ReviewProposal(
-            TARGET, "sha256:" + "a" * 64, "sha256:" + "b" * 64, "clean", (),
+            TARGET, order_values["capsule_digest"], "sha256:" + canonical_digest(order_values), "clean", (),
             "adapter", "1", "model", "sha256:" + "c" * 64,
             validation_ledger=rows, configuration_source_digest="sha256:" + "d" * 64,
         )

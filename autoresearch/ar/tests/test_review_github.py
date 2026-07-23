@@ -494,6 +494,75 @@ def test_api_json_recursion_failure_is_a_bounded_boundary_error(include_http_hea
         GitHubClient(FakeRunner([response]))._request("GET", "/user")
 
 
+@pytest.mark.parametrize("include_http_headers", [False, True])
+def test_api_json_depth_check_ignores_brackets_inside_strings(include_http_headers):
+    payload = json.dumps("[" * 10000 + "]" * 10000)
+    if include_http_headers:
+        payload = "HTTP/2 200\r\nX-OAuth-Scopes: read:user\r\n\r\n" + payload
+    response = subprocess.CompletedProcess(["gh"], 0, payload, "")
+
+    assert GitHubClient(FakeRunner([response]))._request("GET", "/user").data == "[" * 10000 + "]" * 10000
+
+
+def test_api_json_depth_check_ignores_escaped_quotes_and_deep_text_inside_strings():
+    value = 'escaped quote: " ' + "[{" * 10000 + "}]" * 10000
+    payload = json.dumps(value)
+    response = subprocess.CompletedProcess(["gh"], 0, payload, "")
+
+    assert GitHubClient(FakeRunner([response]))._request("GET", "/user").data == value
+
+
+def test_api_json_depth_check_handles_even_and_odd_backslash_parity_before_nested_json():
+    string_fields = json.dumps(
+        {"even": "ends with a backslash\\", "odd": 'contains an escaped " quote'},
+        separators=(",", ":"),
+    )[:-1]
+    nested = '{"value":' * 64 + "0" + "}" * 64
+    payload = string_fields + ',"nested":' + nested + "}"
+    response = subprocess.CompletedProcess(["gh"], 0, payload, "")
+
+    data = GitHubClient(FakeRunner([response]))._request("GET", "/user").data
+
+    assert data["even"] == "ends with a backslash\\"
+    assert data["odd"] == 'contains an escaped " quote'
+    nested_data = data["nested"]
+    for _ in range(63):
+        nested_data = nested_data["value"]
+    assert nested_data["value"] == 0
+
+
+@pytest.mark.parametrize(
+    "opening, closing, expected_type",
+    [("[", "]", list), ('{"value":', "}", dict)],
+)
+@pytest.mark.parametrize("depth, accepted", [(256, True), (257, False)])
+def test_api_json_depth_check_enforces_exact_depth_boundary(opening, closing, expected_type, depth, accepted):
+    payload = opening * depth + "0" + closing * depth
+    response = subprocess.CompletedProcess(["gh"], 0, payload, "")
+
+    if accepted:
+        data = GitHubClient(FakeRunner([response]))._request("GET", "/user").data
+        assert isinstance(data, expected_type)
+    else:
+        with pytest.raises(GitHubBoundaryError, match="JSON|depth|recursion"):
+            GitHubClient(FakeRunner([response]))._request("GET", "/user")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"unterminated":"value}',
+        '{"items":[1,2}',
+        '[{"item":1]}',
+    ],
+)
+def test_api_json_depth_check_rejects_unterminated_strings_and_mismatched_delimiters(payload):
+    response = subprocess.CompletedProcess(["gh"], 0, payload, "")
+
+    with pytest.raises(GitHubBoundaryError):
+        GitHubClient(FakeRunner([response]))._request("GET", "/user")
+
+
 def test_effective_permission_is_normalized():
     response = result({"user": {**user(), "permissions": {"pull": True, "push": False, "admin": False}}})
     permission = GitHubClient(FakeRunner([response])).collaborator_effective_permission(REPO, "review-bot")
