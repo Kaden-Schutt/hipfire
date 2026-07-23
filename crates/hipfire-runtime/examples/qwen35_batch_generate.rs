@@ -455,6 +455,30 @@ fn run_batch_shadow_gate(
         .replay
         .prepared_route_identity()
         .ok_or_else(|| "batch shadow prepare produced no retained identity".to_string())?;
+    let captured_launches = gpu
+        .replay
+        .recorded_launches()
+        .iter()
+        .take(32)
+        .enumerate()
+        .map(|(index, launch)| {
+            json!({
+                "index": index,
+                "kernel": launch.kernel,
+                "grid": launch.grid,
+                "block": launch.block,
+                "kernarg_bytes": launch.kernarg.len(),
+                "first_u64": launch.kernarg
+                    .chunks_exact(8)
+                    .take(8)
+                    .map(|bytes| format!(
+                        "{:016x}",
+                        u64::from_ne_bytes(bytes.try_into().expect("eight-byte kernarg chunk"))
+                    ))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     let mut observations = Vec::with_capacity(2);
     for observation in 0..2 {
@@ -643,6 +667,17 @@ fn run_batch_shadow_gate(
             "unique_kernels": capture.unique_kernel_count,
             "sequence_hash": format!("{:016x}", capture.sequence_hash),
             "abi_contracts": contracts.len(),
+            "batch_buffers": {
+                "x_batch": format!("{:016x}", state.pbs.x_batch.buf.as_ptr() as usize),
+                "x_rot_batch": format!("{:016x}", state.pbs.x_rot_batch.buf.as_ptr() as usize),
+                "x_norm_batch": format!("{:016x}", state.pbs.x_norm_batch.buf.as_ptr() as usize),
+                "positions": format!("{:016x}", state.pbs.positions.buf.as_ptr() as usize),
+                "tokens": format!("{:016x}", state.pbs.tokens.buf.as_ptr() as usize),
+                "final_hidden": format!("{:016x}", state.final_hidden.buf.as_ptr() as usize),
+                "logits": format!("{:016x}", state.logits.buf.as_ptr() as usize),
+                "lm_rot": format!("{:016x}", state.lm_rot.buf.as_ptr() as usize),
+            },
+            "first_launches": captured_launches,
         },
         "retained": {
             "dispatches": identity.dispatch_count,
