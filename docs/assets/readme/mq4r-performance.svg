@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen 3.6 35B-A3B MQ4R decode performance across three AMD GPUs</title>
+  <desc id="desc">Measured ordinary autoregressive decode with Q8 KV: 253.3 tokens per second on gfx1100, 115.1 on gfx1151, and 203.9 on gfx1201.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#100c0c"/><stop offset="1" stop-color="#1b1210"/></linearGradient>
+    <linearGradient id="bar" x1="0" x2="1"><stop stop-color="#ff3b17"/><stop offset="1" stop-color="#ff9f1a"/></linearGradient>
+    <filter id="glow" x="-30%" y="-40%" width="160%" height="180%"><feGaussianBlur stdDeviation="12" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="1600" height="760" rx="32" fill="url(#bg)"/>
+  <path d="M0 128H1600M0 668H1600" stroke="#ffffff" stroke-opacity=".09"/>
+  <text x="90" y="104" fill="#ffb25c" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" letter-spacing="5">MQ4R + REDLINE  /  MEASURED DECODE</text>
+  <text x="90" y="163" fill="#fff7ed" font-family="Arial, Helvetica, sans-serif" font-size="45" font-weight="700">Qwen 3.6 35B-A3B · ordinary AR with Q8 KV</text>
+  <text x="90" y="207" fill="#c8bbb3" font-family="Arial, Helvetica, sans-serif" font-size="25">No MTP, speculative acceptance, reduced-output benchmark, or clock pinning.</text>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="90" y="276" fill="#a89a92" font-size="20" font-weight="700" letter-spacing="2">TG128 AUTOREGRESSIVE DECODE</text>
+    <text x="1510" y="276" fill="#a89a92" font-size="20" font-weight="700" text-anchor="end">TOKENS / SECOND</text>
+    <g stroke="#fff" stroke-opacity=".12"><path d="M470 305V594"/><path d="M730 305V594"/><path d="M990 305V594"/><path d="M1250 305V594"/><path d="M1510 305V594"/></g>
+    <g fill="#a89a92" font-size="18"><text x="470" y="622" text-anchor="middle">0</text><text x="730" y="622" text-anchor="middle">75</text><text x="990" y="622" text-anchor="middle">150</text><text x="1250" y="622" text-anchor="middle">225</text><text x="1510" y="622" text-anchor="middle">300</text></g>
+    <text x="90" y="354" fill="#fff7ed" font-size="31" font-weight="700">Radeon RX 7900 XTX</text><text x="90" y="385" fill="#ffb25c" font-size="21" font-weight="700">gfx1100 · RDNA3</text>
+    <rect x="470" y="327" width="877" height="58" rx="12" fill="url(#bar)" filter="url(#glow)"/><text x="1372" y="369" fill="#fff7ed" font-size="38" font-weight="700">253.3</text>
+    <text x="90" y="461" fill="#fff7ed" font-size="31" font-weight="700">Strix Halo</text><text x="90" y="492" fill="#ffb25c" font-size="21" font-weight="700">gfx1151 · RDNA3.5</text>
+    <rect x="470" y="434" width="399" height="58" rx="12" fill="url(#bar)"/><text x="894" y="476" fill="#fff7ed" font-size="38" font-weight="700">115.1</text>
+    <text x="90" y="568" fill="#fff7ed" font-size="31" font-weight="700">Radeon AI PRO R9700</text><text x="90" y="599" fill="#ffb25c" font-size="21" font-weight="700">gfx1201 · RDNA4</text>
+    <rect x="470" y="541" width="707" height="58" rx="12" fill="url(#bar)"/><text x="1202" y="583" fill="#fff7ed" font-size="38" font-weight="700">203.9</text>
+  </g>
+  <g transform="translate(90 687)" font-family="Arial, Helvetica, sans-serif"><rect width="1420" height="42" rx="21" fill="#fff" fill-opacity=".06"/><text x="28" y="28" fill="#d9ccc5" font-size="19">8-turn average: 191.0 tok/s</text><circle cx="359" cy="21" r="4" fill="#ff6f1d"/><text x="382" y="28" fill="#d9ccc5" font-size="19">92.2 tok/s</text><circle cx="544" cy="21" r="4" fill="#ff6f1d"/><text x="567" y="28" fill="#d9ccc5" font-size="19">169.5 tok/s</text><circle cx="759" cy="21" r="4" fill="#ff6f1d"/><text x="782" y="28" fill="#d9ccc5" font-size="19">All recorded runs clean</text></g>
+</svg>

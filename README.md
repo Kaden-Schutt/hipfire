@@ -1,9 +1,28 @@
-<img width="1774" height="887" alt="image" src="https://github.com/user-attachments/assets/2013c1ae-6011-477c-a8de-5e90751bed74" />
+<p align="center">
+  <img width="1774" height="887" alt="hipfire — local LLM inference for AMD GPUs" src="https://github.com/user-attachments/assets/2013c1ae-6011-477c-a8de-5e90751bed74" />
+</p>
 
-# hipfire
+<h1 align="center">hipfire</h1>
 
-Fast local LLM inference for AMD GPUs. Rust + HIP + Redline. No Python
-in the hot path. Ollama-style UX.
+<p align="center">
+  <strong>Fast local LLM inference for AMD GPUs.</strong><br />
+  Rust + HIP + Redline. No Python in the hot path. Ollama-style UX.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Kaden-Schutt/hipfire/releases"><img alt="Stable release v0.2.1" src="https://img.shields.io/badge/stable-v0.2.1-24292f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Next release v0.3.0 beta" src="https://img.shields.io/badge/next-v0.3.0%20beta-f04b24?style=flat-square" /></a>
+  <a href="docs/MODELS.md"><img alt="54 curated model entries" src="https://img.shields.io/badge/registry-54%20curated%20models-ff8a1f?style=flat-square" /></a>
+  <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
+</p>
+
+<p align="center">
+  <a href="#mq4r--redline">MQ4R + Redline</a> ·
+  <a href="#curated-model-registry">Models</a> ·
+  <a href="#gpu-support">GPU support</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#documentation">Docs</a>
+</p>
 
 ```bash
 hipfire pull qwen3.5:4b
@@ -31,6 +50,18 @@ Discord: <https://discord.gg/F3BaywB8Rs>
 
 ## MQ4R + Redline
 
+<p align="center">
+  <img width="1200" alt="A retained command graph flows into a GPU compute engine" src="docs/assets/readme/retained-engine.png" />
+</p>
+
+<table>
+  <tr>
+    <td width="33%"><strong>MQ4R</strong><br />Performance-oriented Qwen 3.6 35B-A3B quantization.</td>
+    <td width="33%"><strong>Redline</strong><br />Validated, retained dispatch replay for the real kernel graph.</td>
+    <td width="33%"><strong>Fail closed</strong><br />Unsafe or incompatible routes return to ordinary HIP dispatch.</td>
+  </tr>
+</table>
+
 MQ4R is the performance-oriented Qwen 3.6 35B-A3B SKU. It combines
 uniform MQ4 attention and gate-side weights with graded routed experts
 and the fused gate path.
@@ -55,10 +86,18 @@ Optimized routes remain architecture- and workload-specific. Unsupported
 graphs, failed shadow validation, ABI mismatches, queue faults, and model
 changes fail closed to ordinary HIP dispatch.
 
+<p align="center">
+  <img width="1200" alt="Hipfire runtime and Redline validated replay path, with fail-closed ordinary HIP fallback" src="docs/assets/readme/redline-runtime.svg" />
+</p>
+
 ### Qwen 3.6 35B-A3B MQ4R performance
 
 Ordinary autoregressive decode with Q8 KV. No MTP, DFlash, speculative
 acceptance, reduced-output benchmark, or manual clock pinning.
+
+<p align="center">
+  <img width="1200" alt="MQ4R ordinary autoregressive decode performance: gfx1100 253.3 tokens per second, gfx1151 115.1 tokens per second, gfx1201 203.9 tokens per second" src="docs/assets/readme/mq4r-performance.svg" />
+</p>
 
 | GPU | Architecture | TG128 AR | 8-turn average | Final-turn context | Final-turn speed | Health |
 |---|---:|---:|---:|---:|---:|---|
