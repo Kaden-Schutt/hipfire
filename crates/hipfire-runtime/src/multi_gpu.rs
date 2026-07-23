@@ -582,13 +582,21 @@ impl Gpus {
     /// decode's tiny per-token reduce stays on RCCL (already fast). PP never
     /// all-reduces (it uses `boundary_copy` point-to-point).
     ///
-    /// Algorithm (N-rank, race-free): **phase 1** copies every OTHER rank's
-    /// ORIGINAL buffer into a local temp (all reads, no writes); a barrier
-    /// (`wait_boundary`); **phase 2** adds the peer temps into the local buffer.
-    /// All-reads-before-writes ⇒ no cross-device read/write race. `n==1` is the
-    /// identity (no-op). Requires peer access (caller's `enable_peer_all`) for
-    /// the fast P2P path; without it `boundary_copy` host-stages (slower but
-    /// correct). In-place: `buffers[r]` is both input and output.
+    /// Algorithm (N-rank, race-free and bit-exact across ranks):
+    ///
+    /// 1. gather ranks `1..N` into rank 0's peer temps;
+    /// 2. rank 0 adds them in ascending global-rank order;
+    /// 3. broadcast rank 0's completed sum to ranks `1..N`.
+    ///
+    /// The prior all-to-all algorithm used `N*(N-1)` copies and adds, and each
+    /// rank began the floating-point reduction with its own partial. At N>2
+    /// that produced rank-dependent association order and therefore residuals
+    /// that were not bit-exact. The rooted algorithm uses `2*(N-1)` copies and
+    /// `N-1` adds while making rank 0's order authoritative on every device.
+    /// `n==1` is the identity. Requires peer access (caller's
+    /// `enable_peer_all`) for the fast P2P path; without it `boundary_copy`
+    /// host-stages (slower but correct). In-place: `buffers[r]` is both input
+    /// and output.
     pub fn all_reduce_sum_f32_peer(
         &mut self,
         buffers: &[&DeviceBuffer],
@@ -610,42 +618,45 @@ impl Gpus {
         let bytes = count * 4;
         self.ensure_peer_ar_tmp(bytes)?;
 
-        // Phase 1: read every peer's ORIGINAL buffer into a local temp.
-        let mut evts = Vec::with_capacity(n * (n - 1));
-        for r in 0..n {
-            let mut slot = 0usize;
-            for j in 0..n {
-                if j == r {
-                    continue;
-                }
-                let evt =
-                    self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
-                evts.push(evt);
-                slot += 1;
-            }
+        // Phase 1: gather every non-root ORIGINAL partial into rank 0.
+        let mut gather_events = Vec::with_capacity(n - 1);
+        for src in 1..n {
+            gather_events.push(self.boundary_copy(
+                src,
+                0,
+                buffers[src],
+                &self.peer_ar_tmp[0][src - 1],
+                bytes,
+            )?);
         }
-        for evt in evts {
+        for evt in gather_events {
             self.wait_boundary(evt)?;
         }
 
-        // Phase 2: add the peer temps into each rank's buffer.
-        for r in 0..n {
-            let dst = GpuTensor {
-                buf: unsafe { buffers[r].alias() },
+        // Phase 2: rank 0 sums in ascending global-rank order.
+        let root = GpuTensor {
+            buf: unsafe { buffers[0].alias() },
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        self.devices[0].bind_thread()?;
+        for slot in 0..n - 1 {
+            let src = GpuTensor {
+                buf: unsafe { self.peer_ar_tmp[0][slot].alias() },
                 shape: vec![count],
                 dtype: DType::F32,
             };
-            let srcs: Vec<GpuTensor> = (0..n - 1)
-                .map(|slot| GpuTensor {
-                    buf: unsafe { self.peer_ar_tmp[r][slot].alias() },
-                    shape: vec![count],
-                    dtype: DType::F32,
-                })
-                .collect();
-            self.devices[r].bind_thread()?;
-            for src in &srcs {
-                self.devices[r].add_inplace_f32(&dst, src)?;
-            }
+            self.devices[0].add_inplace_f32(&root, &src)?;
+        }
+
+        // Phase 3: broadcast the authoritative root sum. Each destination
+        // stream waits on its copy event before it can consume the residual.
+        let mut broadcast_events = Vec::with_capacity(n - 1);
+        for dst in 1..n {
+            broadcast_events.push(self.boundary_copy(0, dst, buffers[0], buffers[dst], bytes)?);
+        }
+        for evt in broadcast_events {
+            self.wait_boundary(evt)?;
         }
         Ok(())
     }
