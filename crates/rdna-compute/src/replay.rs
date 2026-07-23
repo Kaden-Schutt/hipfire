@@ -2264,28 +2264,33 @@ impl ReplayController {
         }
         let mut headers = vec![HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL; dispatches.len()];
         headers[0] = HeaderPolicy::BATCH_BOUNDARY_FIRST_SERIAL;
-        for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
-            if launch.kernel == "repeat_interleave_qk_f32" {
-                headers[index] = HeaderPolicy::RECORDED_DISPATCH;
-                if index + 1 < headers.len() {
-                    headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+        let independent_batch_shadow =
+            hipfire_config::process_value("HIPFIRE_BATCH_REPLAY_UNSAFE")
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+        if !independent_batch_shadow {
+            for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
+                if launch.kernel == "repeat_interleave_qk_f32" {
+                    headers[index] = HeaderPolicy::RECORDED_DISPATCH;
+                    if index + 1 < headers.len() {
+                        headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+                    }
+                } else if matches!(
+                    launch.kernel.as_str(),
+                    "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
+                ) {
+                    headers[index] = if launch.kernel == "mq_rotate_x" {
+                        HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
+                    } else {
+                        HeaderPolicy::RECORDED_DISPATCH
+                    };
                 }
-            } else if matches!(
-                launch.kernel.as_str(),
-                "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
-            ) {
-                headers[index] = if launch.kernel == "mq_rotate_x" {
-                    HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
-                } else {
-                    HeaderPolicy::RECORDED_DISPATCH
-                };
             }
-        }
-        for index in 1..headers.len() {
-            let previous = self.recorded[index - 1].kernel.as_str();
-            let current = self.recorded[index].kernel.as_str();
-            if independent_sibling(previous, current) {
-                headers[index] = HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT;
+            for index in 1..headers.len() {
+                let previous = self.recorded[index - 1].kernel.as_str();
+                let current = self.recorded[index].kernel.as_str();
+                if independent_sibling(previous, current) {
+                    headers[index] = HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT;
+                }
             }
         }
         let graph = if self.request == ReplayBackendRequest::Auto {
