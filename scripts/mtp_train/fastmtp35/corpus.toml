@@ -65,7 +65,7 @@ split = "train"
 license = "Apache-2.0"
 category = "rag"
 raw_count = 30800
-bucket_mix = [0.10, 0.70, 0.20]
+bucket_mix = [0.00, 0.80, 0.20]
 
 [[source]]
 name = "hermes_agent"
