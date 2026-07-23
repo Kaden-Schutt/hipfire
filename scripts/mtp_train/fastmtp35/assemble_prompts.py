@@ -154,11 +154,22 @@ def strip_final_assistant(messages: list[dict[str, Any]]) -> list[dict[str, str]
     return normalized
 
 
-def adapt_row(name: str, row: dict[str, Any], row_index: int) -> tuple[list[dict[str, str]], str, dict[str, Any]] | None:
+def adapt_row(
+    source: dict[str, Any], row: dict[str, Any], row_index: int
+) -> tuple[list[dict[str, str]], str, dict[str, Any]] | None:
+    name = source["name"]
     attrs: dict[str, Any] = {}
     if name == "ultrachat":
-        messages = strip_final_assistant(row.get("messages") or [])
         source_id = str(row.get("prompt_id") or row_index)
+        multiturn_threshold = round(
+            float(source.get("multiturn_fraction", 1.0)) * (1 << 64)
+        )
+        if hash64(source_id) < multiturn_threshold:
+            messages = strip_final_assistant(row.get("messages") or [])
+            attrs["prompt_shape"] = "multiturn_prefix"
+        else:
+            messages = [{"role": "user", "content": str(row.get("prompt", ""))}]
+            attrs["prompt_shape"] = "single_turn"
     elif name == "openmath":
         messages = [{"role": "user", "content": str(row.get("problem", ""))}]
         source_id = f"{row.get('problem_source', 'unknown')}:{row_index}"
@@ -334,7 +345,7 @@ def main() -> int:
         for row_index, row in enumerate(
             stream_source(source, seed + source_number * 1009, args.shuffle_buffer)
         ):
-            adapted = adapt_row(name, row, row_index)
+            adapted = adapt_row(source, row, row_index)
             if adapted is None:
                 rejected["adapter"] += 1
                 continue

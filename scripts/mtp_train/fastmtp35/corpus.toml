@@ -15,6 +15,9 @@ split = "train_sft"
 license = "MIT"
 category = "general"
 raw_count = 184800
+# Keep a real multi-turn slice while making the 80% short-context quota
+# attainable from UltraChat's otherwise long conversation prefixes.
+multiturn_fraction = 0.10
 bucket_mix = [0.80, 0.18, 0.02]
 
 [[source]]
