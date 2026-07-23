@@ -5232,6 +5232,77 @@ impl Qwen35Scratch {
         })
     }
 
+    /// Clear mutable single-token scratch before a retained-launch shadow arm.
+    ///
+    /// The independent-batch executor still borrows this bundle for a small
+    /// number of shared temporaries. Clearing it alongside the batch-owned
+    /// scratch prevents residue from the preceding oracle arm from becoming
+    /// an accidental replay input.
+    pub fn clear_gpu(&self, gpu: &mut Gpu) -> HipResult<()> {
+        for tensor in [
+            &self.x,
+            &self.tmp,
+            &self.dn_qkv,
+            &self.dn_z,
+            &self.dn_alpha,
+            &self.dn_beta,
+            &self.dn_conv_out,
+            &self.dn_q,
+            &self.dn_k,
+            &self.dn_v,
+            &self.dn_q_raw,
+            &self.dn_k_raw,
+            &self.dn_attn_out,
+            &self.dn_normed,
+            &self.fa_q_full,
+            &self.fa_q,
+            &self.fa_gate,
+            &self.fa_k,
+            &self.fa_v,
+            &self.fa_attn_out,
+            &self.o,
+            &self.gate_ffn,
+            &self.up,
+            &self.ffn_hidden,
+            &self.ffn_out,
+            &self.logits,
+            &self.sample_buf,
+            &self.repeat_buf,
+            &self.x_rot,
+            &self.flash_partials,
+        ] {
+            gpu.hip
+                .memset(&tensor.buf, 0, tensor.buf.size())?;
+        }
+        gpu.hip.memset(&self.pos_buf, 0, self.pos_buf.size())?;
+        for tensor in [
+            self.moe_router_logits.as_ref(),
+            self.moe_scalar_buf.as_ref(),
+            self.moe_x_rot.as_ref(),
+            self.moe_gate_up_buf.as_ref(),
+            self.moe_gate_buf.as_ref(),
+            self.moe_up_buf.as_ref(),
+            self.moe_ffn_hidden.as_ref(),
+            self.moe_ffn_out.as_ref(),
+            self.moe_gate_batch.as_ref(),
+            self.moe_up_batch.as_ref(),
+            self.moe_rot_batch.as_ref(),
+            self.moe_topk_indices.as_ref(),
+            self.moe_topk_weights.as_ref(),
+            self.moe_down_expanded.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            gpu.hip
+                .memset(&tensor.buf, 0, tensor.buf.size())?;
+        }
+        if let Some(pbs) = &self.prefill_batch {
+            pbs.clear_gpu(gpu)?;
+        }
+        Ok(())
+    }
+
     /// Free all GPU tensors. Call before drop to return VRAM.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.x);
@@ -6000,6 +6071,77 @@ impl PrefillBatchScratch {
         })
     }
 
+    /// Clear every mutable batch scratch allocation.
+    ///
+    /// Normal continuous decode overwrites these buffers in dependency order
+    /// and does not need this. Shadow replay does: the HIP oracle and retained
+    /// arm must begin from the same complete mutable surface, not merely equal
+    /// KV and recurrent state.
+    pub fn clear_gpu(&self, gpu: &mut Gpu) -> HipResult<()> {
+        for tensor in [
+            &self.x_batch,
+            &self.x_rot_batch,
+            &self.x_norm_batch,
+            &self.dn_qkv_batch,
+            &self.dn_z_batch,
+            &self.dn_alpha_batch,
+            &self.dn_beta_batch,
+            &self.dn_q_raw_batch,
+            &self.dn_k_raw_batch,
+            &self.dn_v_batch,
+            &self.dn_q_batch,
+            &self.dn_k_batch,
+            &self.dn_attn_out_batch,
+            &self.dn_normed_batch,
+            &self.gate_ffn_batch,
+            &self.up_batch,
+            &self.ffn_hidden_batch,
+            &self.dn_normed_rot_batch,
+            &self.positions,
+            &self.tokens,
+            &self.fa_q_full_batch,
+            &self.fa_q_batch,
+            &self.fa_gate_batch,
+            &self.fa_k_batch,
+            &self.fa_v_batch,
+            &self.fa_attn_out_batch,
+            &self.fa_attn_out_rot_batch,
+        ] {
+            gpu.hip
+                .memset(&tensor.buf, 0, tensor.buf.size())?;
+        }
+        for tensor in [
+            self.moe_router_logits_batch.as_ref(),
+            self.moe_shared_scalar_batch.as_ref(),
+            self.moe_shared_gate_batch.as_ref(),
+            self.moe_shared_up_batch.as_ref(),
+            self.moe_shared_rot_batch.as_ref(),
+            self.moe_topk_indices_batch.as_ref(),
+            self.moe_topk_weights_batch.as_ref(),
+            self.moe_gate_batch.as_ref(),
+            self.moe_up_batch.as_ref(),
+            self.moe_rot_batch.as_ref(),
+            self.moe_down_expanded_batch.as_ref(),
+            self.moe_expert_token_counts.as_ref(),
+            self.moe_expert_offsets.as_ref(),
+            self.moe_sorted_slot_index.as_ref(),
+            self.moe_inverse_perm.as_ref(),
+            self.moe_expert_tile_ids.as_ref(),
+            self.moe_y_gate_up_grouped.as_ref(),
+            self.moe_y_down_grouped.as_ref(),
+            self.dn_s_tape_q8.as_ref(),
+            self.dn_s_tape_scales.as_ref(),
+            self.dn_s_tape_f32.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            gpu.hip
+                .memset(&tensor.buf, 0, tensor.buf.size())?;
+        }
+        Ok(())
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for t in [
             self.x_batch,
@@ -6151,6 +6293,19 @@ impl Qwen35DecodeBatchState {
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
         self.kv_cache.clear_gpu(gpu)?;
         self.dn_state.reset(gpu);
+        self.pbs.clear_gpu(gpu)?;
+        for tensor in [
+            &self.final_hidden,
+            &self.logits,
+            &self.lm_rot,
+            &self.sample_out,
+            &self.sample_repeat_tokens,
+            &self.sample_repeat_lengths,
+            &self.sample_rng_states,
+        ] {
+            gpu.hip
+                .memset(&tensor.buf, 0, tensor.buf.size())?;
+        }
         Ok(())
     }
 
@@ -6477,25 +6632,26 @@ fn lm_head_batched(
     }
 }
 
-/// Advance one token in each independent sequence lane and write
-/// `[batch, vocab]` logits into `state.logits`.
+/// Populate the changing inputs that intentionally stay outside a retained
+/// independent-batch replay: token embeddings and per-lane positions.
 ///
-/// `positions[lane]` is the logical 0-based position of `tokens[lane]` in
-/// that lane.  Callers prefill each prompt into the same state before entering
-/// the fixed-shape decode loop; continuous slot refill is layered above this
-/// primitive rather than hidden inside model execution.
-pub fn forward_decode_batch(
+/// This is also the only supported boundary for batch shadow execution. A
+/// shadow adapter restores the mutable model state, calls this function, then
+/// executes the retained AQL/PM4 launch without re-entering model dispatch.
+pub fn prepare_decode_batch_inputs(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     tokens: &[u32],
     positions: &[usize],
-    state: &mut Qwen35DecodeBatchState,
-    scratch: &Qwen35Scratch,
-) -> HipResult<()> {
+    state: &Qwen35DecodeBatchState,
+) -> HipResult<usize> {
     let n = tokens.len();
     if n == 0 {
-        return Ok(());
+        return Err(HipError::new(
+            0,
+            "independent batch input preparation requires at least one lane",
+        ));
     }
     if n > state.max_batch || positions.len() != n {
         return Err(HipError::new(
@@ -6556,6 +6712,30 @@ pub fn forward_decode_batch(
     };
     gpu.hip
         .memcpy_htod(&state.pbs.positions.buf, position_bytes)?;
+    Ok(positions.iter().copied().max().unwrap_or(0))
+}
+
+/// Advance one token in each independent sequence lane and write
+/// `[batch, vocab]` logits into `state.logits`.
+///
+/// `positions[lane]` is the logical 0-based position of `tokens[lane]` in
+/// that lane.  Callers prefill each prompt into the same state before entering
+/// the fixed-shape decode loop; continuous slot refill is layered above this
+/// primitive rather than hidden inside model execution.
+pub fn forward_decode_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    positions: &[usize],
+    state: &mut Qwen35DecodeBatchState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let position = prepare_decode_batch_inputs(gpu, weights, config, tokens, positions, state)?;
 
     // Independent batched HIP execution is exact, but immutable replay of
     // this tape has not passed token-parity certification yet. Keep Redline
@@ -6569,7 +6749,6 @@ pub fn forward_decode_batch(
         gpu.replay
             .begin_auto_capture_if_armed()
             .map_err(|reason| HipError::new(0, reason))?;
-        let position = positions.iter().copied().max().unwrap_or(0);
         if gpu.replay.should_route_aql() {
             return unsafe { gpu.replay.replay_linear_aql(position) }
                 .map(|_| ())

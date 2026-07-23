@@ -3,12 +3,12 @@
 schema_version = 1
 
 [replay]
-backend = "redline"
+backend = "shadow"
 transport = "aql"
 
 [diagnostic.replay]
 independent_batch = true
-manual_capture = false
+manual_capture = true
 
 [speculation]
 mode = "off"

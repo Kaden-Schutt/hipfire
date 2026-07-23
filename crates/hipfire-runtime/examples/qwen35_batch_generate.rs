@@ -54,6 +54,7 @@ struct Args {
     raw_prompt: bool,
     shard_index: usize,
     shard_count: usize,
+    shadow_iterations: Option<usize>,
 }
 
 impl Args {
@@ -86,6 +87,7 @@ impl Args {
             raw_prompt: false,
             shard_index: 0,
             shard_count: 1,
+            shadow_iterations: None,
         };
         while let Some(flag) = it.next() {
             let value = |it: &mut std::iter::Skip<std::env::Args>, flag: &str| {
@@ -130,6 +132,10 @@ impl Args {
                 "--shard-count" => {
                     args.shard_count = value(&mut it, &flag)?.parse().map_err(|_| flag)?
                 }
+                "--shadow-iterations" => {
+                    args.shadow_iterations =
+                        Some(value(&mut it, &flag)?.parse().map_err(|_| flag)?)
+                }
                 "--raw-prompt" => args.raw_prompt = true,
                 "--help" | "-h" => {
                     return Err(
@@ -140,6 +146,7 @@ impl Args {
                          [--presence-penalty 1.5] [--frequency-penalty 0] \
                          [--repeat-window 128] \
                          [--config CONFIG.toml] [--device PHYSICAL_ID] \
+                         [--shadow-iterations N] \
                          [--shard-index I --shard-count N] [--raw-prompt]"
                             .to_string(),
                     )
@@ -167,6 +174,9 @@ impl Args {
         }
         if args.shard_count == 0 || args.shard_index >= args.shard_count {
             return Err("shard-count must be non-zero and shard-index < shard-count".to_string());
+        }
+        if args.shadow_iterations == Some(0) {
+            return Err("--shadow-iterations must be non-zero".to_string());
         }
         Ok(args)
     }
@@ -251,6 +261,329 @@ struct Slot {
     next_token: u32,
     next_pos: usize,
     rng_state: u32,
+}
+
+#[derive(PartialEq)]
+struct BatchShadowSnapshot {
+    logits: Vec<u8>,
+    kv: Vec<u8>,
+    recurrent: Vec<u8>,
+}
+
+impl BatchShadowSnapshot {
+    fn json(&self) -> Value {
+        json!({
+            "logits_bytes": self.logits.len(),
+            "logits_hash": format!("{:016x}", shadow_hash(&self.logits)),
+            "kv_bytes": self.kv.len(),
+            "kv_hash": format!("{:016x}", shadow_hash(&self.kv)),
+            "recurrent_bytes": self.recurrent.len(),
+            "recurrent_hash": format!("{:016x}", shadow_hash(&self.recurrent)),
+        })
+    }
+}
+
+fn shadow_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn append_shadow_buffer(
+    gpu: &Gpu,
+    output: &mut Vec<u8>,
+    buffer: &hip_bridge::DeviceBuffer,
+) -> Result<(), String> {
+    let start = output.len();
+    output.resize(start + buffer.size(), 0);
+    gpu.hip
+        .memcpy_dtoh(&mut output[start..], buffer)
+        .map_err(|error| error.to_string())
+}
+
+fn batch_shadow_snapshot(
+    gpu: &Gpu,
+    state: &Qwen35DecodeBatchState,
+) -> Result<BatchShadowSnapshot, String> {
+    let mut logits = Vec::new();
+    append_shadow_buffer(gpu, &mut logits, &state.logits.buf)?;
+    let mut kv = Vec::new();
+    for tensor in state
+        .kv_cache
+        .k_gpu
+        .iter()
+        .chain(state.kv_cache.v_gpu.iter())
+        .chain(state.kv_cache.k_scales.iter())
+        .chain(state.kv_cache.v_scales.iter())
+    {
+        append_shadow_buffer(gpu, &mut kv, &tensor.buf)?;
+    }
+    let mut recurrent = Vec::new();
+    for tensor in state
+        .dn_state
+        .s_matrices
+        .iter()
+        .chain(state.dn_state.s_scales.iter())
+        .chain(state.dn_state.conv_states.iter())
+        .chain(state.dn_state.s_ef_residual.iter())
+    {
+        append_shadow_buffer(gpu, &mut recurrent, &tensor.buf)?;
+    }
+    Ok(BatchShadowSnapshot {
+        logits,
+        kv,
+        recurrent,
+    })
+}
+
+fn reset_shadow_state(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &Qwen35Scratch,
+    state: &mut Qwen35DecodeBatchState,
+    slots: &[Slot],
+) -> Result<(), String> {
+    state
+        .reset(gpu)
+        .map_err(|error| format!("reset batch shadow state: {error}"))?;
+    scratch
+        .clear_gpu(gpu)
+        .map_err(|error| format!("reset shared shadow scratch: {error}"))?;
+    for (lane, slot) in slots.iter().enumerate() {
+        let job = slot
+            .job
+            .as_ref()
+            .ok_or_else(|| format!("shadow lane {lane} has no seeded job"))?;
+        state
+            .prefill_lane(
+                gpu,
+                weights,
+                config,
+                scratch,
+                lane,
+                &job.prompt_tokens,
+            )
+            .map_err(|error| format!("re-prime shadow lane {lane}: {error}"))?;
+    }
+    // The conversion caches key on source pointer. Shadow restoration changes
+    // the pointee contents while retaining that pointer, so force the direct
+    // oracle to emit the same conversion launches captured by the tape.
+    gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+    gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| format!("synchronize restored shadow state: {error}"))
+}
+
+fn advance_shadow_tokens(tokens: &mut [u32], observation: usize, step: usize, vocab: usize) {
+    for (lane, token) in tokens.iter_mut().enumerate() {
+        let delta = 17 + observation * 29 + step * 13 + lane * 3;
+        *token = ((*token as usize + delta) % vocab) as u32;
+    }
+}
+
+fn run_batch_shadow_gate(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &Qwen35Scratch,
+    state: &mut Qwen35DecodeBatchState,
+    slots: &[Slot],
+    iterations: usize,
+) -> Result<Value, String> {
+    if gpu.replay.request() != rdna_compute::replay::ReplayBackendRequest::Shadow {
+        return Err(
+            "--shadow-iterations requires replay.backend = \"shadow\" and manual capture"
+                .to_string(),
+        );
+    }
+    let initial_tokens: Vec<u32> = slots.iter().map(|slot| slot.next_token).collect();
+    let initial_positions: Vec<usize> = slots.iter().map(|slot| slot.next_pos).collect();
+
+    // Capture exactly one ordinary HIP batch forward. Shadow mode can prepare
+    // and execute this tape explicitly, but can never change the model route.
+    gpu.replay
+        .begin_capture()
+        .map_err(|reason| format!("begin batch shadow capture: {reason}"))?;
+    gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+    gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
+    qwen35::forward_decode_batch(
+        gpu,
+        weights,
+        config,
+        &initial_tokens,
+        &initial_positions,
+        state,
+        scratch,
+    )
+    .map_err(|error| format!("capture ordinary HIP batch forward: {error}"))?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| format!("synchronize batch capture: {error}"))?;
+    let capture = gpu
+        .replay
+        .finish_capture()
+        .map_err(|reason| format!("finish batch shadow capture: {reason}"))?;
+    let contracts = gpu
+        .replay
+        .probe_aql_contracts(gpu.device_id as usize)
+        .map_err(|reason| format!("probe batch replay ABI: {reason}"))?;
+    if gpu.replay.uses_pm4_transport() {
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, capture.launch_count)
+            .map_err(|reason| format!("prepare batch PM4 shadow: {reason}"))?;
+    } else {
+        gpu.replay
+            .prepare_linear_aql(gpu.device_id as usize)
+            .map_err(|reason| format!("prepare batch AQL shadow: {reason}"))?;
+    }
+    let identity = gpu
+        .replay
+        .prepared_route_identity()
+        .ok_or_else(|| "batch shadow prepare produced no retained identity".to_string())?;
+
+    let mut observations = Vec::with_capacity(2);
+    for observation in 0..2 {
+        let arm_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
+        reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
+        let decode_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+
+        let mut direct_tokens = initial_tokens.clone();
+        let mut direct_positions = initial_positions.clone();
+        if observation != 0 {
+            advance_shadow_tokens(
+                &mut direct_tokens,
+                observation,
+                997,
+                config.vocab_size,
+            );
+        }
+        let direct_started = Instant::now();
+        for step in 0..iterations {
+            qwen35::forward_decode_batch(
+                gpu,
+                weights,
+                config,
+                &direct_tokens,
+                &direct_positions,
+                state,
+                scratch,
+            )
+            .map_err(|error| format!("ordinary HIP shadow arm: {error}"))?;
+            if step + 1 != iterations {
+                advance_shadow_tokens(
+                    &mut direct_tokens,
+                    observation,
+                    step,
+                    config.vocab_size,
+                );
+                for position in &mut direct_positions {
+                    *position += 1;
+                }
+            }
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| format!("synchronize ordinary HIP shadow arm: {error}"))?;
+        let direct_host_us = direct_started.elapsed().as_secs_f64() * 1_000_000.0;
+        let direct = batch_shadow_snapshot(gpu, state)?;
+
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(arm_checkpoint);
+        reset_shadow_state(gpu, weights, config, scratch, state, slots)?;
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(decode_checkpoint);
+        let mut replay_tokens = initial_tokens.clone();
+        let mut replay_positions = initial_positions.clone();
+        if observation != 0 {
+            advance_shadow_tokens(
+                &mut replay_tokens,
+                observation,
+                997,
+                config.vocab_size,
+            );
+        }
+        let replay_started = Instant::now();
+        let mut replay_gpu_us = 0.0;
+        for step in 0..iterations {
+            let position = qwen35::prepare_decode_batch_inputs(
+                gpu,
+                weights,
+                config,
+                &replay_tokens,
+                &replay_positions,
+                state,
+            )
+            .map_err(|error| format!("prepare retained batch inputs: {error}"))?;
+            replay_gpu_us += if gpu.replay.uses_pm4_transport() {
+                unsafe { gpu.replay.replay_pm4(position) }
+                    .map_err(|reason| format!("execute batch PM4 shadow: {reason}"))?
+                    .span_microseconds()
+            } else {
+                unsafe { gpu.replay.replay_linear_aql(position) }
+                    .map_err(|reason| format!("execute batch AQL shadow: {reason}"))?
+                    .span_microseconds()
+            };
+            if step + 1 != iterations {
+                advance_shadow_tokens(
+                    &mut replay_tokens,
+                    observation,
+                    step,
+                    config.vocab_size,
+                );
+                for position in &mut replay_positions {
+                    *position += 1;
+                }
+            }
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| format!("synchronize retained shadow arm: {error}"))?;
+        let replay_host_us = replay_started.elapsed().as_secs_f64() * 1_000_000.0;
+        let replay = batch_shadow_snapshot(gpu, state)?;
+        let logits_equal = direct.logits == replay.logits;
+        let kv_equal = direct.kv == replay.kv;
+        let recurrent_equal = direct.recurrent == replay.recurrent;
+        observations.push(json!({
+            "observation": observation,
+            "iterations": iterations,
+            "bit_exact": logits_equal && kv_equal && recurrent_equal,
+            "logits_equal": logits_equal,
+            "kv_equal": kv_equal,
+            "recurrent_equal": recurrent_equal,
+            "direct_host_us": direct_host_us,
+            "replay_host_us": replay_host_us,
+            "replay_gpu_us": replay_gpu_us,
+            "direct": direct.json(),
+            "replay": replay.json(),
+        }));
+    }
+    let bit_exact = observations
+        .iter()
+        .all(|row| row["bit_exact"].as_bool() == Some(true));
+    Ok(json!({
+        "type": "qwen35_batch_shadow_result",
+        "backend": if gpu.replay.uses_pm4_transport() { "pm4_ib" } else { "aql_packets" },
+        "bit_exact": bit_exact,
+        "batch": slots.len(),
+        "iterations": iterations,
+        "capture": {
+            "dispatches": capture.launch_count,
+            "unique_kernels": capture.unique_kernel_count,
+            "sequence_hash": format!("{:016x}", capture.sequence_hash),
+            "abi_contracts": contracts.len(),
+        },
+        "retained": {
+            "dispatches": identity.dispatch_count,
+            "packets": identity.packet_count,
+            "queue_id": identity.queue_id,
+            "command_dwords": identity.command_dwords,
+        },
+        "observations": observations,
+    }))
 }
 
 fn repeat_suffix(prompt: &[u32], output: &[u32], capacity: usize) -> Vec<u32> {
@@ -503,6 +836,37 @@ fn main() -> Result<(), String> {
         slots.push(seed_lane(
             &mut gpu, &weights, &config, &scratch, &mut state, lane, job, &args,
         )?);
+    }
+    if let Some(iterations) = args.shadow_iterations {
+        let report = run_batch_shadow_gate(
+            &mut gpu,
+            &weights,
+            &config,
+            &scratch,
+            &mut state,
+            &slots,
+            iterations,
+        )?;
+        serde_json::to_writer_pretty(&mut writer, &report)
+            .map_err(|error| format!("write batch shadow report: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("write batch shadow newline: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("flush batch shadow report: {error}"))?;
+        eprintln!(
+            "shadow: backend={} batch={} iterations={} exact={}",
+            report["backend"].as_str().unwrap_or("unknown"),
+            active_n,
+            iterations,
+            report["bit_exact"].as_bool().unwrap_or(false),
+        );
+        return if report["bit_exact"].as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err("batch retained-launch shadow parity failed".to_string())
+        };
     }
     let mut model_time = Duration::ZERO;
     let mut generated = 0usize;

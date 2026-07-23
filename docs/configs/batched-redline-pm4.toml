@@ -4,12 +4,12 @@
 schema_version = 1
 
 [replay]
-backend = "redline"
+backend = "shadow"
 transport = "pm4"
 
 [diagnostic.replay]
 independent_batch = true
-manual_capture = false
+manual_capture = true
 pm4_queues = "1"
 pm4_register_policy = "static"
 pm4_wait_policy = "resource"
