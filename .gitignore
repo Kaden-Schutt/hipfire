@@ -142,3 +142,7 @@ docs/investigations/*/sources/
 # Harvested corpus index — regenerable from autoresearch/corpus/*.jsonl
 # via scripts/harvest_ledgers.py --ingest
 autoresearch/db/ar.db
+
+# Redline capture-corpus index — regenerable from redline/corpus/*.jsonl
+# via scripts/harvest_redline.py --ingest
+redline/db/redline.db
