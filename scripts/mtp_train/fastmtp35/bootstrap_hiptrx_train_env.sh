@@ -13,6 +13,21 @@ sudo apt-get install -y python3-torch-rocm python3-venv
 python3 -m venv --system-site-packages "$VENV"
 "$VENV/bin/pip" install -r scripts/mtp_train/fastmtp35/requirements.txt
 
+HIP_RUNTIME="$(ldconfig -p | awk '$1 == "libamdhip64.so.7" { print $NF; exit }')"
+[[ -n "$HIP_RUNTIME" ]] || {
+    echo "the dynamic loader cannot resolve libamdhip64.so.7" >&2
+    exit 2
+}
+HIP_RUNTIME="$(readlink -f "$HIP_RUNTIME")"
+case "$HIP_RUNTIME" in
+    /opt/rocm/core-*/lib/libamdhip64.so.*) ;;
+    *)
+        echo "loader no longer prefers the known-good /opt ROCm HIP runtime: $HIP_RUNTIME" >&2
+        exit 2
+        ;;
+esac
+echo "preferred HIP runtime: $HIP_RUNTIME"
+
 "$VENV/bin/python" scripts/mtp_train/fastmtp35/validate_rocm_train_env.py \
     --mode devices \
     --expected-devices 4 \
