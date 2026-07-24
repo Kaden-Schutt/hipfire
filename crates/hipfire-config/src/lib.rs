@@ -20,6 +20,38 @@ use thiserror::Error;
 
 pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 
+/// Admission policy for the optional XDNA projection overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum XdnaMode {
+    #[default]
+    Off,
+    Shadow,
+    Auto,
+    Force,
+}
+
+impl XdnaMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "shadow" => Some(Self::Shadow),
+            "auto" => Some(Self::Auto),
+            "force" => Some(Self::Force),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Auto => "auto",
+            Self::Force => "force",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("unknown configuration key '{0}'")]
@@ -1309,6 +1341,16 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB",
         "Allowed free-VRAM spread across a uniform multi-GPU topology."
+    ),
+    process_field!(
+        "accelerator.xdna",
+        "xdna",
+        Hardware,
+        DefaultValue::String("off"),
+        ValueRule::Enum(&["off", "shadow", "auto", "force"]),
+        false,
+        "HIPFIRE_XDNA",
+        "XDNA projection policy: off, compare-only shadow, admitted auto, or fail-closed force."
     ),
     process_field!(
         "generation.loop_guard_threshold",

@@ -10,6 +10,9 @@ deltanet = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hsa-bridge = { path = "../hsa-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 redline-dispatch = { path = "../redline-dispatch" }
+redline-xdna = { path = "../redline-xdna" }
 rayon = "1"
+serde = { version = "1", features = ["derive"] }

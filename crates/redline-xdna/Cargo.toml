@@ -1,0 +1,18 @@
+[package]
+name = "redline-xdna"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Rust-native retained amdxdna command runtime for Hipfire"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+thiserror = "2"
+
+[dev-dependencies]
+hsa-bridge = { path = "../hsa-bridge" }
+hip-bridge = { path = "../hip-bridge" }
+tempfile = "3"

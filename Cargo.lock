@@ -1925,8 +1925,11 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "hsa-bridge",
  "rayon",
  "redline-dispatch",
+ "redline-xdna",
+ "serde",
 ]
 
 [[package]]
@@ -1954,6 +1957,20 @@ version = "0.3.0"
 dependencies = [
  "libloading",
  "proptest",
+]
+
+[[package]]
+name = "redline-xdna"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hsa-bridge",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

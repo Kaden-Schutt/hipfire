@@ -1327,6 +1327,12 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
+                // Invalidate every retained XDNA import before any old model
+                // allocation can be returned to the HIP pool. This is safe
+                // even when a transactional EP load later fails: the still-live
+                // prior model will simply re-register on its next eligible
+                // projection. A poisoned controller remains quarantined.
+                gpu.xdna.begin_model_epoch();
                 // FIX #1 (transactional EP load): the unload of the prior model
                 // is deferred for the EP (tp>1) path until AFTER the new load
                 // succeeds, so a partial EP load failure leaves the prior model
@@ -2743,6 +2749,10 @@ fn main() {
             }
 
             "unload" => {
+                // Release healthy retained imports while their HIP owners are
+                // still live. Poisoned state deliberately stays quarantined
+                // until process exit and is never reanimated by model unload.
+                gpu.xdna.begin_model_epoch();
                 // PFlash drafter goes FIRST: its weights/scratch/KV
                 // tensors are released via Gpu::free_tensor, which only
                 // queues into the GPU pool. The actual hipFree happens
@@ -2835,19 +2845,19 @@ fn main() {
                         (hsaco, hash)
                     })
                     .unwrap_or((0, 0));
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{}}}"#,
-                    gpu.arch,
-                    hip_ver.0,
-                    hip_ver.1,
-                    vram_free / (1024 * 1024),
-                    vram_total / (1024 * 1024),
-                    has_model,
-                    model_arch,
-                    hsaco_count,
-                    hash_count
-                );
+                let response = serde_json::json!({
+                    "type": "diag",
+                    "arch": gpu.arch.as_str(),
+                    "hip_version": format!("{}.{}", hip_ver.0, hip_ver.1),
+                    "vram_free_mb": vram_free / (1024 * 1024),
+                    "vram_total_mb": vram_total / (1024 * 1024),
+                    "model_loaded": has_model,
+                    "model_arch": model_arch,
+                    "kernels": hsaco_count,
+                    "kernel_hashes": hash_count,
+                    "xdna": gpu.xdna.diagnostics(),
+                });
+                let _ = writeln!(stdout, "{response}");
                 let _ = stdout.flush();
             }
 
@@ -15263,9 +15273,7 @@ mod render_tail_think_tests {
 
     #[test]
     fn qwen_jinja_think_tail_primes_reasoning_channel() {
-        assert!(render_tail_opens_think(
-            "<|im_start|>assistant\n<think>\n"
-        ));
+        assert!(render_tail_opens_think("<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]

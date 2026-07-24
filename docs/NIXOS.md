@@ -265,7 +265,9 @@ and TUI honor it for discovery and model lifecycle. With `rocmSupport`,
 trusted network or an authenticated TLS reverse proxy terminates in front of
 the port. Prefer probing on loopback (`127.0.0.1`).
 
-Device policy allows `/dev/kfd`, DRM char devices, and `/dev/accel/accel0`.
+Device policy allows `/dev/kfd`, DRM char devices, and the `char-accel` device
+class. XDNA reprobe may advance the real node from `accel0` to `accel1`, so the
+service does not pin a single minor or create compatibility symlinks.
 
 HTTP contract after start: [SERVE.md](SERVE.md).
 

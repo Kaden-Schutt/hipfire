@@ -412,6 +412,9 @@ pub struct Gpu {
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Optional gfx1151 XDNA projection overlay. Dormant until an eligible
+    /// projection is evaluated, so other architectures pay no device-open cost.
+    pub xdna: crate::xdna::XdnaController,
 
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
     pub mmq_screen: MmqScreenState,
@@ -810,6 +813,7 @@ impl Gpu {
 
         let mmq_screen = flags.mmq_screen;
         let mmq_screen_threshold = flags.mmq_screen_threshold;
+        let xdna = crate::xdna::XdnaController::from_active_config(&arch, id);
 
         Ok(Self {
             hip,
@@ -850,6 +854,7 @@ impl Gpu {
                 sample_partials_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
+            xdna,
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,
@@ -1749,15 +1754,9 @@ impl Gpu {
 
     // ── Tensor allocation ───────────────────────────────────────
 
-    pub fn ensure_gemv_residual_tmp(
-        &mut self,
-        min_elems: usize,
-    ) -> HipResult<&GpuTensor> {
-        self.scratch.ensure_gemv_residual_tmp(
-            &self.hip,
-            self.device_id,
-            min_elems,
-        )
+    pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
+        self.scratch
+            .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
     }
 
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {

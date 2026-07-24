@@ -66,6 +66,7 @@ pub struct RuntimeConfig {
     pub devices: Option<String>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
+    pub xdna_mode: hipfire_config::XdnaMode,
     pub mtp_mode: String,
     pub mtp_k: usize,
 }
@@ -152,8 +153,7 @@ impl RuntimeConfig {
             prompt_cache_capacity: value("HIPFIRE_PROMPT_CACHE_CAP")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(32),
-            prompt_cache_unbounded: value("HIPFIRE_PROMPT_CACHE_UNBOUNDED").as_deref()
-                == Some("1"),
+            prompt_cache_unbounded: value("HIPFIRE_PROMPT_CACHE_UNBOUNDED").as_deref() == Some("1"),
             experimental_budget_alert: value("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT").as_deref()
                 == Some("1"),
             max_total_think_tokens: value("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
@@ -173,6 +173,10 @@ impl RuntimeConfig {
             allow_mixed_arch: value("HIPFIRE_ALLOW_MIXED_ARCH").as_deref() == Some("1"),
             uniform_vram_tolerance_gb: value("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
                 .and_then(|s| s.parse().ok()),
+            xdna_mode: value("HIPFIRE_XDNA")
+                .as_deref()
+                .and_then(hipfire_config::XdnaMode::parse)
+                .unwrap_or_default(),
             mtp_mode: value("HIPFIRE_MTP_MODE").unwrap_or_else(|| "auto".into()),
             mtp_k: value("HIPFIRE_MTP_K")
                 .and_then(|value| value.parse().ok())
@@ -233,6 +237,28 @@ mod tests {
         assert_eq!(config.ngram_loop_threshold, 12);
         assert_eq!(config.devices.as_deref(), Some("0,1"));
         assert!(config.prefill_batched, "sparse arch defaults remain intact");
+    }
+
+    #[test]
+    fn xdna_is_typed_and_off_by_default() {
+        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        let cfg = RuntimeConfig::from_process_config(&process);
+        assert_eq!(cfg.xdna_mode, hipfire_config::XdnaMode::Off);
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("accelerator.xdna", "shadow").unwrap();
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: "config.toml".into(),
+                },
+                layer,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = RuntimeConfig::from_process_config(&process);
+        assert_eq!(cfg.xdna_mode, hipfire_config::XdnaMode::Shadow);
     }
 
     #[test]

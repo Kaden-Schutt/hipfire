@@ -450,7 +450,7 @@ in
             "/dev/kfd rw"
             "char-drm rw"      # /dev/dri/* — glob is silently ineffective
                                # under DevicePolicy=closed on systemd 258.5+
-            "/dev/accel/accel0 rw"  # kernel 6.2+ DRM_ACCEL node
+            "char-accel rw"    # all real DRM_ACCEL minors; reprobe may advance accelN
           ];
         };
       };

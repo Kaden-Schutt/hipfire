@@ -22,6 +22,7 @@ pub use ffi::{HsaKernelDispatchPacket, HsaQueue as HsaQueueRaw};
 
 use ffi::*;
 use std::ffi::{c_void, CString};
+use std::os::fd::{AsRawFd, RawFd};
 use std::ptr;
 use std::sync::Arc;
 
@@ -50,6 +51,48 @@ impl HsaRuntime {
     /// Enumerate agents and return the first CPU agent.
     pub fn find_cpu_agent(self: &Arc<Self>) -> HsaResult<HsaAgent> {
         self.find_agent(HSA_DEVICE_TYPE_CPU, None)
+    }
+
+    /// Export an existing HSA/HIP allocation as a dma-buf.
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr+size` must name a live allocation owned by ROCr for the
+    /// lifetime of the returned export. The allocation must not be freed or
+    /// reallocated while another driver still holds the dma-buf.
+    pub unsafe fn export_dmabuf(
+        self: &Arc<Self>,
+        ptr: *const c_void,
+        size: usize,
+    ) -> HsaResult<ExportedDmaBuf> {
+        if ptr.is_null() || size == 0 {
+            return Err(HsaError::new(1, "portable_export_dmabuf: empty allocation"));
+        }
+        let mut fd = -1;
+        let mut offset = 0;
+        let export = self.lib.fn_amd_portable_export_dmabuf.ok_or_else(|| {
+            HsaError::new(1, "ROCr does not provide hsa_amd_portable_export_dmabuf")
+        })?;
+        if self.lib.fn_amd_portable_close_dmabuf.is_none() {
+            return Err(HsaError::new(
+                1,
+                "ROCr does not provide hsa_amd_portable_close_dmabuf",
+            ));
+        }
+        let status = export(ptr, size, &mut fd, &mut offset);
+        error::check(status, "hsa_amd_portable_export_dmabuf")?;
+        if fd < 0 {
+            return Err(HsaError::new(
+                1,
+                "hsa_amd_portable_export_dmabuf returned an invalid fd",
+            ));
+        }
+        Ok(ExportedDmaBuf {
+            runtime: self.clone(),
+            fd,
+            offset,
+            size,
+        })
     }
 
     fn find_agent(
@@ -116,6 +159,50 @@ impl HsaRuntime {
             runtime: self.clone(),
             handle: ctx.found,
         })
+    }
+}
+
+/// ROCr-owned dma-buf export of an existing GPU allocation.
+///
+/// This object closes the portable export with ROCr, rather than calling
+/// `close(2)` directly, as required by the HSA extension.
+pub struct ExportedDmaBuf {
+    runtime: Arc<HsaRuntime>,
+    fd: RawFd,
+    offset: u64,
+    size: usize,
+}
+
+impl ExportedDmaBuf {
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+}
+
+impl AsRawFd for ExportedDmaBuf {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+impl Drop for ExportedDmaBuf {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            if let Some(close_export) = self.runtime.lib.fn_amd_portable_close_dmabuf {
+                unsafe {
+                    let _ = close_export(self.fd);
+                }
+            }
+            self.fd = -1;
+        }
     }
 }
 

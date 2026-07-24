@@ -23,6 +23,7 @@ pub mod profiler;
 pub mod replay;
 pub mod sampling;
 pub mod scratch;
+pub mod xdna;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{
