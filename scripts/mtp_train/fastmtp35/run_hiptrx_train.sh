@@ -20,9 +20,9 @@ VOCAB_MAP="${VOCAB_MAP:-$ROOT/features/vocab-map.json}"
     echo "official HF checkpoint or deployed stock .mtp is missing" >&2
     exit 2
 }
-[[ -x "$VENV/bin/torchrun" ]] || {
-    echo "ROCm PyTorch venv is missing torchrun: $VENV/bin/torchrun" >&2
-    echo "Install the ROCm-supported PyTorch build before Stage 3." >&2
+"$VENV/bin/python" -c 'import torch.distributed.run' || {
+    echo "ROCm PyTorch venv cannot import torch.distributed.run: $VENV" >&2
+    echo "Bootstrap the ROCm-supported PyTorch environment before Stage 3." >&2
     exit 2
 }
 
@@ -81,7 +81,7 @@ if [[ "${HIPFIRE_FASTMTP_AUTO_RESUME:-1}" != "0" ]]; then
     fi
 fi
 
-"$VENV/bin/torchrun" --standalone --nproc-per-node=4 \
+"$VENV/bin/python" -m torch.distributed.run --standalone --nproc-per-node=4 \
     scripts/mtp_train/fastmtp35/train_head.py \
     --features "$ROOT/features/train" \
     --validation-features "$ROOT/features/validation" \
