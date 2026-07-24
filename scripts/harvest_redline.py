@@ -25,12 +25,17 @@ What it collects, by shape:
   speedup     A/B arm pairs carrying an explicit `speedup`
   inspection  hipcc compiler probes (arch, hipcc_version, output_sha256)
   bench       cert measurement rows (backend, correctness, classification, isa)
+  aql         aql_shadow (PM4-vs-HIP parity verdict: backend, dispatches,
+              command_dwords, bit_exact/logits/kv/recurrent/oracle flags) and
+              aql_contract_probe (per-kernel captured-vs-loader kernarg bytes,
+              alignment, static/dynamic LDS)
 
 Outputs (git-tracked JSONL + regenerable index):
 
   redline/corpus/captures.jsonl       one row per capture (seq_hash keyed)
   redline/corpus/launch_shapes.jsonl  DISTINCT launch shapes + occurrence counts
   redline/corpus/bench.jsonl          bench/cert measurement rows
+  redline/corpus/aql_contracts.jsonl  per-kernel AQL kernarg/LDS ABI contracts
   redline/corpus/manifest.json        harvest metadata (timestamps live here)
   redline/db/redline.db               SQLite index (gitignored, regenerable)
 
@@ -199,6 +204,68 @@ def classify(doc: dict) -> str:
     return "other"
 
 
+_SHADOW_FLAGS = ("bit_exact", "pre_bit_exact", "pre_logits_equal", "pre_kv_equal",
+                 "pre_recurrent_equal", "hip_oracles_equal", "blob_bit_exact",
+                 "logits_equal", "force_blob_path")
+
+
+def parse_aql(doc: dict, path: str, box: str, mtime: int, arch):
+    """→ (shadow summary dict, per-kernel AQL contract rows).
+
+    `aql_shadow` is the PM4-vs-HIP parity verdict and `aql_contract_probe` is
+    the per-kernel ABI check -- the two things CLAUDE.md requires as redline
+    acceptance evidence. An earlier version of this script stored both as a
+    bare bool, discarding the parity flags and every kernarg contract.
+    """
+    sh = doc.get("aql_shadow")
+    summary = {}
+    if isinstance(sh, dict):
+        summary = {
+            "shadow_backend": sh.get("backend"),
+            "shadow_dispatches": sh.get("dispatches"),
+            "shadow_packets": sh.get("packets"),
+            "shadow_command_dwords": sh.get("command_dwords"),
+            "shadow_queue_id": sh.get("queue_id"),
+            "shadow_context_tokens": sh.get("context_tokens"),
+            "shadow_iterations": sh.get("iterations"),
+            "shadow_frame_checkpoint": sh.get("frame_checkpoint"),
+        }
+        for f in _SHADOW_FLAGS:
+            if f in sh:
+                summary["shadow_" + f] = bool(sh[f])
+
+    probe = doc.get("aql_contract_probe")
+    contracts = []
+    if isinstance(probe, dict):
+        for c in probe.get("contracts", []):
+            if not isinstance(c, dict):
+                continue
+            cap_b, ld_b = c.get("captured_kernarg_bytes"), c.get("loader_kernarg_bytes")
+            contracts.append({
+                "arch": arch,
+                "kernel": c.get("kernel"),
+                "captured_kernarg_bytes": cap_b,
+                "loader_kernarg_bytes": ld_b,
+                "loader_kernarg_alignment": c.get("loader_kernarg_alignment"),
+                "static_group_bytes": c.get("static_group_bytes"),
+                "dynamic_group_bytes": c.get("dynamic_group_bytes"),
+                # Derived, not persisted upstream. NOTE: this is a DISCREPANCY
+                # INDICATOR, not a defect count. It fires on 54/66 contracts on
+                # one box alone, and the direction (captured 32 vs loader 288)
+                # says the two fields most likely measure different things --
+                # bytes the packet actually used vs bytes the loader declared or
+                # allocated. Treat a hit as "worth a look", never as a bug, until
+                # the loader-side semantics are confirmed. `captured > loader` is
+                # the genuinely alarming direction and is flagged separately.
+                "kernarg_differs": (cap_b is not None and ld_b is not None
+                                    and cap_b != ld_b),
+                "kernarg_captured_exceeds_loader": (
+                    cap_b is not None and ld_b is not None and cap_b > ld_b),
+                "_prov": {"box": box, "path": path, "mtime": mtime},
+            })
+    return summary, contracts
+
+
 def parse_capture(doc: dict, path: str, box: str, mtime: int):
     """→ (capture rows, launch-shape rows). Launch shapes are deduped by caller."""
     caps, shapes = [], []
@@ -206,6 +273,8 @@ def parse_capture(doc: dict, path: str, box: str, mtime: int):
     arch = _arch_of(path, doc)
     kv = doc.get("kv_mode")
     daemon = doc.get("daemon")
+    _aql_summary, _ = parse_aql(doc, path, box, mtime, arch)
+    contracts = []
     for holder in _walk_captures(doc):
         rc = holder.get("redline_capture") or {}
         if not rc:
@@ -213,6 +282,8 @@ def parse_capture(doc: dict, path: str, box: str, mtime: int):
         seq = rc.get("sequence_hash")
         seq_list = rc.get("sequence") or []
         arch = arch or _arch_from_artifacts(seq_list)
+        if not contracts:
+            _s2, contracts = parse_aql(doc, path, box, mtime, arch)
         caps.append({
             "sequence_hash": seq,
             "arch": arch,
@@ -228,6 +299,7 @@ def parse_capture(doc: dict, path: str, box: str, mtime: int):
             "daemon": daemon,
             "aql_contract_probe": bool(doc.get("aql_contract_probe")),
             "aql_shadow": bool(doc.get("aql_shadow")),
+            **_aql_summary,
             "arm": os.path.splitext(os.path.basename(path))[0],
             "experiment": os.path.basename(os.path.dirname(path)),
             "_prov": {"box": box, "path": path, "mtime": mtime},
@@ -250,7 +322,7 @@ def parse_capture(doc: dict, path: str, box: str, mtime: int):
                 "sequence_hash": seq,
                 "_prov": {"box": box, "path": path, "mtime": mtime},
             })
-    return caps, shapes
+    return caps, shapes, contracts
 
 
 def _scalar(v, limit: int = 400):
@@ -373,7 +445,7 @@ def main() -> int:
     args = ap.parse_args()
 
     harvest_ts = int(time.time())
-    captures, raw_shapes, benches = [], [], []
+    captures, raw_shapes, benches, contracts = [], [], [], []
     kinds, failures, malformed = Counter(), {}, Counter()
 
     for box in args.boxes:
@@ -396,11 +468,13 @@ def main() -> int:
             kind = classify(root) if root else "capture"
             kinds[kind] += 1
             if kind == "capture" or "redline_capture" in e["b"][:100000]:
-                c, s = parse_capture(root or {}, path, box, mtime)
+                c, s, ct = parse_capture(root or {}, path, box, mtime)
+                contracts.extend(ct)
                 if not c and isinstance(doc, list):
                     for sub in doc:
                         if isinstance(sub, dict):
-                            c2, s2 = parse_capture(sub, path, box, mtime)
+                            c2, s2, ct2 = parse_capture(sub, path, box, mtime)
+                            contracts.extend(ct2)
                             c += c2
                             s += s2
                 captures.extend(c)
@@ -439,6 +513,21 @@ def main() -> int:
 
     shapes = dedup_shapes(raw_shapes)
 
+    cseen, contract_rows = {}, []
+    for ct in contracts:
+        k = _sha16(ct["arch"], ct["kernel"], ct["captured_kernarg_bytes"],
+                   ct["loader_kernarg_bytes"], ct["static_group_bytes"],
+                   ct["dynamic_group_bytes"])
+        if k in cseen:
+            cseen[k]["occurrences"] += 1
+            continue
+        ct["contract_key"] = k
+        ct["occurrences"] = 1
+        cseen[k] = ct
+        contract_rows.append(ct)
+    contract_rows.sort(key=lambda r: (r.get("arch") or "", r.get("kernel") or "",
+                                      r["contract_key"]))
+
     bseen, bench = set(), []
     for b in benches:
         k = _sha16(b["kind"], b["backend"], b["bench"], b["arch"], b["arm"],
@@ -466,6 +555,12 @@ def main() -> int:
     print(f"captures      : {len(caps):6d}  ({tot_launch:,} launches)")
     print(f"launch shapes : {len(shapes):6d} distinct (from {len(raw_shapes):,} raw)")
     print(f"bench rows    : {len(bench):6d}")
+    mism = sum(1 for r in contract_rows if r["kernarg_differs"])
+    over = sum(1 for r in contract_rows if r["kernarg_captured_exceeds_loader"])
+    print(f"aql contracts : {len(contract_rows):6d}  ({mism} differ, {over} captured>loader)")
+    shadow = [c for c in caps if c.get("shadow_backend")]
+    bx = sum(1 for c in shadow if c.get("shadow_bit_exact"))
+    print(f"pm4 shadows   : {len(shadow):6d}  ({bx} bit_exact)")
     print(f"kernels       : {len(kern):6d}   .hsaco artifacts: {len(arts)}")
     print(f"sequence hashes:{len(seqs):6d}")
     print(f"archs         : {', '.join(archs)}")
@@ -483,7 +578,8 @@ def main() -> int:
     os.makedirs(args.out, exist_ok=True)
     for name, rows in (("captures.jsonl", caps),
                        ("launch_shapes.jsonl", shapes),
-                       ("bench.jsonl", bench)):
+                       ("bench.jsonl", bench),
+                       ("aql_contracts.jsonl", contract_rows)):
         p = os.path.join(args.out, name)
         with open(p, "w") as fh:
             for r in rows:
@@ -500,6 +596,11 @@ def main() -> int:
         "launch_shapes": len(shapes),
         "raw_launches": len(raw_shapes),
         "bench_rows": len(bench),
+        "aql_contracts": len(contract_rows),
+        "kernarg_differs": mism,
+        "kernarg_captured_exceeds_loader": over,
+        "pm4_shadows": len(shadow),
+        "pm4_shadow_bit_exact": bx,
         "distinct_kernels": len(kern),
         "distinct_artifacts": len(arts),
         "sequence_hashes": len(seqs),
@@ -514,7 +615,7 @@ def main() -> int:
     print(f"wrote {mp}")
 
     if args.ingest:
-        print(f"ingested -> {ingest(caps, shapes, bench)}")
+        print(f"ingested -> {ingest(caps, shapes, bench, contract_rows)}")
     return 1 if failures else 0
 
 
@@ -524,7 +625,16 @@ CREATE TABLE IF NOT EXISTS captures(
   kv_mode TEXT, launches INTEGER, unique_kernels INTEGER, tok_s REAL,
   us_per_token REAL, ms REAL, context_tokens INTEGER, iterations INTEGER,
   aql_contract_probe INTEGER, aql_shadow INTEGER,
-  experiment TEXT, arm TEXT, box TEXT, path TEXT, mtime INTEGER);
+  experiment TEXT, arm TEXT, box TEXT, path TEXT, mtime INTEGER,
+  shadow_backend TEXT, shadow_dispatches INTEGER, shadow_packets INTEGER,
+  shadow_command_dwords INTEGER, shadow_queue_id INTEGER,
+  shadow_context_tokens INTEGER, shadow_iterations INTEGER,
+  shadow_frame_checkpoint INTEGER,
+  shadow_bit_exact INTEGER, shadow_pre_bit_exact INTEGER,
+  shadow_pre_logits_equal INTEGER, shadow_pre_kv_equal INTEGER,
+  shadow_pre_recurrent_equal INTEGER, shadow_hip_oracles_equal INTEGER,
+  shadow_blob_bit_exact INTEGER, shadow_logits_equal INTEGER,
+  shadow_force_blob_path INTEGER);
 CREATE TABLE IF NOT EXISTS launch_shapes(
   shape_key TEXT PRIMARY KEY, arch TEXT, kernel TEXT, artifact TEXT,
   artifact_path TEXT, grid TEXT, block TEXT, shared_mem INTEGER,
@@ -536,27 +646,48 @@ CREATE TABLE IF NOT EXISTS bench(
   status TEXT, speedup REAL, hipcc_version TEXT, output_sha256 TEXT,
   daemon_sha256 TEXT, git_commit TEXT, run_tag TEXT, experiment TEXT, arm TEXT,
   n_measurements INTEGER, box TEXT, path TEXT);
+CREATE TABLE IF NOT EXISTS aql_contracts(
+  contract_key TEXT PRIMARY KEY, arch TEXT, kernel TEXT,
+  captured_kernarg_bytes INTEGER, loader_kernarg_bytes INTEGER,
+  loader_kernarg_alignment INTEGER, static_group_bytes INTEGER,
+  dynamic_group_bytes INTEGER, kernarg_differs INTEGER,
+  kernarg_captured_exceeds_loader INTEGER, occurrences INTEGER);
+CREATE INDEX IF NOT EXISTS ix_aqlc ON aql_contracts(arch, kernel);
 CREATE INDEX IF NOT EXISTS ix_cap   ON captures(arch, experiment, sequence_hash);
 CREATE INDEX IF NOT EXISTS ix_shape ON launch_shapes(arch, kernel);
 CREATE INDEX IF NOT EXISTS ix_bench ON bench(arch, backend, bench);
 """
 
 
-def ingest(caps, shapes, bench) -> str:
+def ingest(caps, shapes, bench, contract_rows) -> str:
     import sqlite3
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     c = sqlite3.connect(DB_PATH)
     c.executescript(SCHEMA)
-    for t in ("captures", "launch_shapes", "bench"):
+    for t in ("captures", "launch_shapes", "bench", "aql_contracts"):
         c.execute(f"DELETE FROM {t}")
+    CAP_COLS = ["capture_key","sequence_hash","arch","model","kv_mode","launches",
+                "unique_kernels","tok_s","us_per_token","ms","context_tokens",
+                "iterations","aql_contract_probe","aql_shadow","experiment","arm",
+                "box","path","mtime","shadow_backend","shadow_dispatches",
+                "shadow_packets","shadow_command_dwords","shadow_queue_id",
+                "shadow_context_tokens","shadow_iterations","shadow_frame_checkpoint",
+                "shadow_bit_exact","shadow_pre_bit_exact","shadow_pre_logits_equal",
+                "shadow_pre_kv_equal","shadow_pre_recurrent_equal",
+                "shadow_hip_oracles_equal","shadow_blob_bit_exact",
+                "shadow_logits_equal","shadow_force_blob_path"]
+    # Named binding, not positional: the shadow_* fields reached the JSONL but not
+    # the DB when this was a fixed 19-slot positional INSERT, and nothing failed.
+    ins = ("INSERT OR IGNORE INTO captures(" + ",".join(CAP_COLS) + ") VALUES(" +
+           ",".join(":" + c for c in CAP_COLS) + ")")
     for r in caps:
         p = r["_prov"]
-        c.execute("INSERT OR IGNORE INTO captures VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (r["capture_key"], r["sequence_hash"], r["arch"], r["model"],
-                   r["kv_mode"], r["launches"], r["unique_kernels"], r["tok_s"],
-                   r["us_per_token"], r["ms"], r["context_tokens"], r["iterations"],
-                   int(bool(r["aql_contract_probe"])), int(bool(r["aql_shadow"])),
-                   r["experiment"], r["arm"], p["box"], p["path"], p["mtime"]))
+        row = {c: r.get(c) for c in CAP_COLS}
+        row.update(box=p["box"], path=p["path"], mtime=p["mtime"])
+        for k, v in row.items():
+            if isinstance(v, bool):
+                row[k] = int(v)
+        c.execute(ins, row)
     for r in shapes:
         c.execute("INSERT OR IGNORE INTO launch_shapes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                   (r["shape_key"], r["arch"], r["kernel"], r["artifact"],
@@ -571,6 +702,14 @@ def ingest(caps, shapes, bench) -> str:
                    r["status"], r["speedup"], r["hipcc_version"], r["output_sha256"],
                    r["daemon_sha256"], r["git_commit"], r["run_tag"], r["experiment"],
                    r["arm"], r.get("n_measurements"), p["box"], p["path"]))
+    for r in contract_rows:
+        c.execute("INSERT OR IGNORE INTO aql_contracts VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (r["contract_key"], r["arch"], r["kernel"],
+                   r["captured_kernarg_bytes"], r["loader_kernarg_bytes"],
+                   r["loader_kernarg_alignment"], r["static_group_bytes"],
+                   r["dynamic_group_bytes"], int(bool(r["kernarg_differs"])),
+                   int(bool(r["kernarg_captured_exceeds_loader"])),
+                   r["occurrences"]))
     c.commit()
     c.close()
     return DB_PATH

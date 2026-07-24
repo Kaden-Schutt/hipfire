@@ -1,4 +1,5 @@
 {
+  "aql_contracts": 391,
   "archs": [
     "gfx1030",
     "gfx1100",
@@ -14,10 +15,14 @@
   "captures": 1718,
   "distinct_artifacts": 247,
   "distinct_kernels": 223,
-  "harvest_iso": "2026-07-24T01:10:55Z",
-  "harvest_ts": 1784855455,
+  "harvest_iso": "2026-07-24T01:24:35Z",
+  "harvest_ts": 1784856275,
+  "kernarg_captured_exceeds_loader": 184,
+  "kernarg_differs": 277,
   "launch_shapes": 515,
   "malformed": {},
+  "pm4_shadow_bit_exact": 1274,
+  "pm4_shadows": 1362,
   "raw_launches": 1080413,
   "sequence_hashes": 277,
   "shapes_seen": {
