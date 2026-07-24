@@ -51,6 +51,36 @@ export HIP_VISIBLE_DEVICES=0,1,2,3
 export ROCR_VISIBLE_DEVICES=0,1,2,3
 export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
 
+TRAIN_ARGS=("$@")
+if [[ "${HIPFIRE_FASTMTP_AUTO_RESUME:-1}" != "0" ]]; then
+    explicit_resume=0
+    for arg in "${TRAIN_ARGS[@]}"; do
+        case "$arg" in
+            --resume-optimizer|--resume-optimizer=*|--resume-weights|--resume-weights=*)
+                explicit_resume=1
+                ;;
+        esac
+    done
+    if (( explicit_resume == 0 )); then
+        shopt -s nullglob
+        optimizer_checkpoints=("$OUTPUT"/step-*.optimizer.pt)
+        shopt -u nullglob
+        if (( ${#optimizer_checkpoints[@]} > 0 )); then
+            latest_optimizer="${optimizer_checkpoints[-1]}"
+            latest_weights="${latest_optimizer%.optimizer.pt}.safetensors"
+            if [[ ! -s "$latest_weights" ]]; then
+                echo "latest optimizer checkpoint has no matching weights: $latest_optimizer" >&2
+                exit 2
+            fi
+            echo "resuming FastMTP training from $latest_weights"
+            TRAIN_ARGS+=(
+                --resume-weights "$latest_weights"
+                --resume-optimizer "$latest_optimizer"
+            )
+        fi
+    fi
+fi
+
 "$VENV/bin/torchrun" --standalone --nproc-per-node=4 \
     scripts/mtp_train/fastmtp35/train_head.py \
     --features "$ROOT/features/train" \
@@ -65,4 +95,4 @@ export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:Tru
     --warmup-ratio 0.05 \
     --checkpoint-every 1000 \
     --eval-every 250 \
-    "$@"
+    "${TRAIN_ARGS[@]}"

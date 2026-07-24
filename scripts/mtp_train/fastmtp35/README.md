@@ -120,6 +120,11 @@ scripts/mtp_train/fastmtp35/run_hiptrx_train.sh \
   ~/.hipfire/datasets/fastmtp-qwen36-a3b-v1
 ```
 
+The launcher resumes from the newest matched
+`step-*.{safetensors,optimizer.pt}` checkpoint pair in the output directory.
+Set `HIPFIRE_FASTMTP_AUTO_RESUME=0` for an intentional fresh start, or pass
+both `--resume-weights` and `--resume-optimizer` to select an explicit pair.
+
 The default effective batch is 64: one 128-token sequence per GPU with 16
 gradient-accumulation steps. Intermediate microsteps use DDP `no_sync`, so the
 800M-parameter head is all-reduced only once per effective batch rather than
