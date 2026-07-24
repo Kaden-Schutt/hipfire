@@ -107,6 +107,28 @@ cargo build --release -p hipfire-tui
 
 Other packaging: [NIXOS.md](NIXOS.md), [CONTAINER.md](CONTAINER.md).
 
+## Uninstall a managed Linux install
+
+The default uninstall removes the installed binaries, kernels, clean managed
+source checkout, runtime PID/log files, and the PATH entry created by the
+installer. It preserves downloaded models and settings under `~/.hipfire`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh | bash
+```
+
+Preview without changing anything:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh \
+  | bash -s -- --dry-run
+```
+
+Use `--purge` only when models, configuration, and every other file under
+`~/.hipfire` should also be deleted. The script asks for an explicit
+confirmation; automation can add `--yes`. It does not remove ROCm, Rust, or
+other shared system dependencies.
+
 ## Verify
 
 ```bash

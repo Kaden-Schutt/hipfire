@@ -25,6 +25,7 @@ fi
 python3 scripts/test_redline_product_bench.py
 python3 scripts/test_golden_redline.py
 python3 scripts/test_install_revision.py
+python3 scripts/test_uninstall.py
 
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py
