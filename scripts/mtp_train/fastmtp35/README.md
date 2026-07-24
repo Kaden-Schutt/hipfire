@@ -97,7 +97,10 @@ uses one physical-GPU lock per R9700 and writes partition state beneath
 `features/{train,validation}`. Each GPU is supervised independently: a failed
 ROCr process resumes from its last atomic shard without stopping healthy
 partitions. `FEATURE_RETRY_LIMIT` (default `8`) and
-`FEATURE_RETRY_BACKOFF_SECS` (default `10`) bound that recovery loop.
+`FEATURE_RETRY_BACKOFF_SECS` (default `10`) bound that recovery loop. A
+progress watchdog also terminates ROCr children that fault without exiting;
+`FEATURE_STALL_TIMEOUT_SECS` (default `240`), `FEATURE_STALL_POLL_SECS`
+(default `15`), and `FEATURE_TERM_GRACE_SECS` (default `10`) control it.
 
 ## Stage 3: head-only K=3 training on four R9700s
 

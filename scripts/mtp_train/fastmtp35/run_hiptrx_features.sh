@@ -12,6 +12,9 @@ WINDOWS_PER_RECORD="${WINDOWS_PER_RECORD:-2}"
 ROWS_PER_SHARD="${ROWS_PER_SHARD:-262144}"
 FEATURE_RETRY_LIMIT="${FEATURE_RETRY_LIMIT:-8}"
 FEATURE_RETRY_BACKOFF_SECS="${FEATURE_RETRY_BACKOFF_SECS:-10}"
+FEATURE_STALL_TIMEOUT_SECS="${FEATURE_STALL_TIMEOUT_SECS:-240}"
+FEATURE_STALL_POLL_SECS="${FEATURE_STALL_POLL_SECS:-15}"
+FEATURE_TERM_GRACE_SECS="${FEATURE_TERM_GRACE_SECS:-10}"
 
 resolve_hipcc_dir() {
     local hipcc_path=""
@@ -46,8 +49,12 @@ resolve_hipcc_dir() {
     echo "clean manifest or deployed MQ4R trunk is missing" >&2
     exit 2
 }
-[[ "$FEATURE_RETRY_LIMIT" =~ ^[0-9]+$ && "$FEATURE_RETRY_BACKOFF_SECS" =~ ^[0-9]+$ ]] || {
-    echo "feature retry limit and backoff must be unsigned integers" >&2
+[[ "$FEATURE_RETRY_LIMIT" =~ ^[0-9]+$ \
+    && "$FEATURE_RETRY_BACKOFF_SECS" =~ ^[0-9]+$ \
+    && "$FEATURE_STALL_TIMEOUT_SECS" =~ ^[1-9][0-9]*$ \
+    && "$FEATURE_STALL_POLL_SECS" =~ ^[1-9][0-9]*$ \
+    && "$FEATURE_TERM_GRACE_SECS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "feature retry/watchdog settings must be unsigned integers (timeouts nonzero)" >&2
     exit 2
 }
 
@@ -61,6 +68,67 @@ cargo build --release -p hipfire-arch-qwen35 --example qwen35_mtp_features
 TRUNK_SHA256="${TRUNK_SHA256:-$(sha256sum "$MODEL" | awk '{print $1}')}"
 SOURCE_SHA256="${SOURCE_SHA256:-$(sha256sum "$ROOT/clean/manifest.json" | awk '{print $1}')}"
 PRODUCER_COMMIT="${PRODUCER_COMMIT:-$(git rev-parse HEAD)}"
+
+run_attempt() {
+    local split="$1"
+    local target_rows="$2"
+    local gpu="$3"
+    local stdout="$4"
+    local stderr="$5"
+    local child
+    local last_size
+    local last_progress
+    local now
+    local size
+    local deadline
+
+    HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES="$gpu" \
+        "$BIN" \
+        --input "$ROOT/clean/$split.jsonl" \
+        --output "$FEATURE_ROOT/$split" \
+        --model "$MODEL" \
+        --split "$split" \
+        --partition-index "$gpu" \
+        --partition-count 4 \
+        --max-seq 4096 \
+        --recursive-steps 3 \
+        --window-rows "$WINDOW_ROWS" \
+        --windows-per-record "$WINDOWS_PER_RECORD" \
+        --rows-per-shard "$ROWS_PER_SHARD" \
+        --target-rows "$target_rows" \
+        --trunk-sha256 "$TRUNK_SHA256" \
+        --source-manifest-sha256 "$SOURCE_SHA256" \
+        --producer-git-commit "$PRODUCER_COMMIT" \
+        >>"$stdout" 2>>"$stderr" &
+    child=$!
+    last_size="$(stat -c %s "$stderr")"
+    last_progress="$(date +%s)"
+
+    while kill -0 "$child" 2>/dev/null; do
+        sleep "$FEATURE_STALL_POLL_SECS"
+        size="$(stat -c %s "$stderr")"
+        now="$(date +%s)"
+        if (( size != last_size )); then
+            last_size="$size"
+            last_progress="$now"
+        elif (( now - last_progress >= FEATURE_STALL_TIMEOUT_SECS )); then
+            printf '[mtp-features-supervisor] partition=%s gpu=%s stalled_for=%ss pid=%s terminating=%s\n' \
+                "$split" "$gpu" "$((now - last_progress))" "$child" \
+                "$(date --iso-8601=seconds)" >>"$stderr"
+            kill -TERM "$child" 2>/dev/null || true
+            deadline=$((now + FEATURE_TERM_GRACE_SECS))
+            while kill -0 "$child" 2>/dev/null && (( $(date +%s) < deadline )); do
+                sleep 1
+            done
+            if kill -0 "$child" 2>/dev/null; then
+                kill -KILL "$child" 2>/dev/null || true
+            fi
+            wait "$child" 2>/dev/null || true
+            return 124
+        fi
+    done
+    wait "$child"
+}
 
 run_partition() {
     local split="$1"
@@ -78,24 +146,7 @@ run_partition() {
         printf '[mtp-features-supervisor] partition=%s gpu=%s attempt=%s/%s started=%s\n' \
             "$split" "$gpu" "$attempt" "$((FEATURE_RETRY_LIMIT + 1))" \
             "$(date --iso-8601=seconds)" >>"$stderr"
-        if HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES="$gpu" \
-            "$BIN" \
-            --input "$ROOT/clean/$split.jsonl" \
-            --output "$FEATURE_ROOT/$split" \
-            --model "$MODEL" \
-            --split "$split" \
-            --partition-index "$gpu" \
-            --partition-count 4 \
-            --max-seq 4096 \
-            --recursive-steps 3 \
-            --window-rows "$WINDOW_ROWS" \
-            --windows-per-record "$WINDOWS_PER_RECORD" \
-            --rows-per-shard "$ROWS_PER_SHARD" \
-            --target-rows "$target_rows" \
-            --trunk-sha256 "$TRUNK_SHA256" \
-            --source-manifest-sha256 "$SOURCE_SHA256" \
-            --producer-git-commit "$PRODUCER_COMMIT" \
-            >>"$stdout" 2>>"$stderr"
+        if run_attempt "$split" "$target_rows" "$gpu" "$stdout" "$stderr"
         then
             printf '[mtp-features-supervisor] partition=%s gpu=%s completed=%s\n' \
                 "$split" "$gpu" "$(date --iso-8601=seconds)" >>"$stderr"

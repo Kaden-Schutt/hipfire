@@ -11359,7 +11359,12 @@ fn forward_batch_chunk_impl(
                     v_cache: &kv_cache.v_gpu[layer_idx],
                     k_scales: None,
                     v_scales: None,
-                    pos_buf: &s.pos_buf,
+                    // A batched prefill whose final chunk has one row still
+                    // resolves the single-token attention keys. Those kernels
+                    // read `pos_buf`, not `positions`; point them at the first
+                    // uploaded batch position instead of the decode scratch
+                    // slot, which is not populated by this path.
+                    pos_buf: &pbs.positions.buf,
                     pos: start_pos,
                     positions: Some(&pbs.positions),
                     n_heads: config.n_heads,
@@ -12936,7 +12941,10 @@ fn forward_batch_chunk_impl(
                     v_cache: &kv_cache.v_gpu[layer_idx],
                     k_scales: None,
                     v_scales: None,
-                    pos_buf: &s.pos_buf,
+                    // See the sibling FullAttn arm above: a 1-row tail of an
+                    // otherwise batched prefill must read its uploaded batch
+                    // position, not the unrelated decode position scratch.
+                    pos_buf: &pbs.positions.buf,
                     pos: start_pos,
                     positions: Some(&pbs.positions),
                     n_heads: config.n_heads,
