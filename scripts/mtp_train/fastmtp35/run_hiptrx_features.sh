@@ -10,6 +10,8 @@ TARGET_ROWS_PER_GPU="${TARGET_ROWS_PER_GPU:-25000000}"
 WINDOW_ROWS="${WINDOW_ROWS:-128}"
 WINDOWS_PER_RECORD="${WINDOWS_PER_RECORD:-2}"
 ROWS_PER_SHARD="${ROWS_PER_SHARD:-262144}"
+FEATURE_RETRY_LIMIT="${FEATURE_RETRY_LIMIT:-8}"
+FEATURE_RETRY_BACKOFF_SECS="${FEATURE_RETRY_BACKOFF_SECS:-10}"
 
 resolve_hipcc_dir() {
     local hipcc_path=""
@@ -44,6 +46,10 @@ resolve_hipcc_dir() {
     echo "clean manifest or deployed MQ4R trunk is missing" >&2
     exit 2
 }
+[[ "$FEATURE_RETRY_LIMIT" =~ ^[0-9]+$ && "$FEATURE_RETRY_BACKOFF_SECS" =~ ^[0-9]+$ ]] || {
+    echo "feature retry limit and backoff must be unsigned integers" >&2
+    exit 2
+}
 
 HIPCC_DIR="$(resolve_hipcc_dir)"
 export PATH="$HIPCC_DIR:$PATH"
@@ -55,6 +61,58 @@ cargo build --release -p hipfire-arch-qwen35 --example qwen35_mtp_features
 TRUNK_SHA256="${TRUNK_SHA256:-$(sha256sum "$MODEL" | awk '{print $1}')}"
 SOURCE_SHA256="${SOURCE_SHA256:-$(sha256sum "$ROOT/clean/manifest.json" | awk '{print $1}')}"
 PRODUCER_COMMIT="${PRODUCER_COMMIT:-$(git rev-parse HEAD)}"
+
+run_partition() {
+    local split="$1"
+    local target_rows="$2"
+    local gpu="$3"
+    local stdout="$ROOT/logs/features-${split}.gpu${gpu}.stdout"
+    local stderr="$ROOT/logs/features-${split}.gpu${gpu}.stderr"
+    local attempt=0
+    local rc=0
+
+    : >"$stdout"
+    : >"$stderr"
+    while :; do
+        attempt=$((attempt + 1))
+        printf '[mtp-features-supervisor] partition=%s gpu=%s attempt=%s/%s started=%s\n' \
+            "$split" "$gpu" "$attempt" "$((FEATURE_RETRY_LIMIT + 1))" \
+            "$(date --iso-8601=seconds)" >>"$stderr"
+        if HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES="$gpu" \
+            "$BIN" \
+            --input "$ROOT/clean/$split.jsonl" \
+            --output "$FEATURE_ROOT/$split" \
+            --model "$MODEL" \
+            --split "$split" \
+            --partition-index "$gpu" \
+            --partition-count 4 \
+            --max-seq 4096 \
+            --recursive-steps 3 \
+            --window-rows "$WINDOW_ROWS" \
+            --windows-per-record "$WINDOWS_PER_RECORD" \
+            --rows-per-shard "$ROWS_PER_SHARD" \
+            --target-rows "$target_rows" \
+            --trunk-sha256 "$TRUNK_SHA256" \
+            --source-manifest-sha256 "$SOURCE_SHA256" \
+            --producer-git-commit "$PRODUCER_COMMIT" \
+            >>"$stdout" 2>>"$stderr"
+        then
+            printf '[mtp-features-supervisor] partition=%s gpu=%s completed=%s\n' \
+                "$split" "$gpu" "$(date --iso-8601=seconds)" >>"$stderr"
+            return 0
+        else
+            rc=$?
+        fi
+        if (( attempt > FEATURE_RETRY_LIMIT )); then
+            printf '[mtp-features-supervisor] partition=%s gpu=%s exhausted_retries=%s rc=%s\n' \
+                "$split" "$gpu" "$FEATURE_RETRY_LIMIT" "$rc" >>"$stderr"
+            return "$rc"
+        fi
+        printf '[mtp-features-supervisor] partition=%s gpu=%s retrying_after_rc=%s backoff=%ss\n' \
+            "$split" "$gpu" "$rc" "$FEATURE_RETRY_BACKOFF_SECS" >>"$stderr"
+        sleep "$FEATURE_RETRY_BACKOFF_SECS"
+    done
+}
 
 run_split() {
     local split="$1"
@@ -69,25 +127,7 @@ run_split() {
             # ROCr selects the physical GPU. HIP sees the filtered device as
             # logical device zero; giving both layers the physical index
             # double-filters GPUs 1+ and leaves no visible device.
-            HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES="$gpu" \
-                "$BIN" \
-                --input "$ROOT/clean/$split.jsonl" \
-                --output "$FEATURE_ROOT/$split" \
-                --model "$MODEL" \
-                --split "$split" \
-                --partition-index "$gpu" \
-                --partition-count 4 \
-                --max-seq 4096 \
-                --recursive-steps 3 \
-                --window-rows "$WINDOW_ROWS" \
-                --windows-per-record "$WINDOWS_PER_RECORD" \
-                --rows-per-shard "$ROWS_PER_SHARD" \
-                --target-rows "$target_rows" \
-                --trunk-sha256 "$TRUNK_SHA256" \
-                --source-manifest-sha256 "$SOURCE_SHA256" \
-                --producer-git-commit "$PRODUCER_COMMIT" \
-                >"$ROOT/logs/features-${split}.gpu${gpu}.stdout" \
-                2>"$ROOT/logs/features-${split}.gpu${gpu}.stderr"
+            run_partition "$split" "$target_rows" "$gpu"
         ) &
         pids+=("$!")
     done

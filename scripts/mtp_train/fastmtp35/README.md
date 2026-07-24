@@ -94,7 +94,10 @@ scripts/mtp_train/fastmtp35/run_hiptrx_features.sh \
 
 Do not launch this concurrently with the Stage 1 teacher service. The runner
 uses one physical-GPU lock per R9700 and writes partition state beneath
-`features/{train,validation}`.
+`features/{train,validation}`. Each GPU is supervised independently: a failed
+ROCr process resumes from its last atomic shard without stopping healthy
+partitions. `FEATURE_RETRY_LIMIT` (default `8`) and
+`FEATURE_RETRY_BACKOFF_SECS` (default `10`) bound that recovery loop.
 
 ## Stage 3: head-only K=3 training on four R9700s
 
