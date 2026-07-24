@@ -63,27 +63,4 @@ HIPFIRE_REPLAY_MANUAL_CAPTURE=1 HIPFIRE_REPLAY_BACKEND=shadow \
     --out "$OUT/redline-shadow.json" \
     --log "$OUT/redline-shadow.log"
 
-python3 - "$OUT" <<'PY'
-import json
-import pathlib
-import statistics
-import sys
-
-root = pathlib.Path(sys.argv[1])
-summary = {}
-for label in ("ar", "stock-mtp", "candidate-mtp"):
-    rows = json.loads((root / f"{label}.json").read_text())
-    rates = [row["decode_tok_s"] for row in rows if isinstance(row.get("decode_tok_s"), (int, float))]
-    taus = [row["tau"] for row in rows if isinstance(row.get("tau"), (int, float))]
-    summary[label] = {
-        "turns": len(rows),
-        "median_decode_tok_s": statistics.median(rates) if rates else None,
-        "mean_decode_tok_s": statistics.mean(rates) if rates else None,
-        "mean_tau": statistics.mean(taus) if taus else None,
-        "runaway": sum(bool(row.get("runaway")) for row in rows),
-        "empty": sum(bool(row.get("empty")) for row in rows),
-        "attractor": sum(bool(row.get("attractor")) for row in rows),
-    }
-(root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-print(json.dumps(summary, indent=2))
-PY
+python3 scripts/mtp_train/fastmtp35/evaluate_certification.py "$OUT"
