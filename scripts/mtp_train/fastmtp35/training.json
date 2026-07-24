@@ -19,13 +19,13 @@
     "state_quant": "q8"
   },
   "epochs": 3,
-  "global_batch_size": 64,
-  "micro_batch_size_per_gpu": 1,
+  "global_batch_size": 512,
+  "micro_batch_size_per_gpu": 128,
   "data_parallel_gpus": 4,
   "precision": "bf16",
   "optimizer": {
     "name": "AdamW",
-    "learning_rate": 5e-5,
+    "learning_rate": 2e-4,
     "beta1": 0.9,
     "beta2": 0.95
   },

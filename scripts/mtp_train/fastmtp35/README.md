@@ -131,10 +131,11 @@ The launcher resumes from the newest matched
 Set `HIPFIRE_FASTMTP_AUTO_RESUME=0` for an intentional fresh start, or pass
 both `--resume-weights` and `--resume-optimizer` to select an explicit pair.
 
-The default effective batch is 64: one 128-token sequence per GPU with 16
-gradient-accumulation steps. Intermediate microsteps use DDP `no_sync`, so the
-800M-parameter head is all-reduced only once per effective batch rather than
-16 times. Losses are recursive K=3 CE with normalized
+The hiptrx default uses the verified 32 GB R9700 capacity point: 128
+sequences per GPU, an effective global batch of 512, and one DDP all-reduce
+per optimizer step. The `2e-4` learning rate is a conservative 4x scale from
+the original batch-64 run, with validation every 250 steps and resumable
+checkpoints every 500. Losses are recursive K=3 CE with normalized
 weights `[0.5102, 0.3061, 0.1837]`. Full-vocab targets outside the deployed
 16K draft vocabulary are explicitly excluded and reported as coverage; they
 are not silently aliased. DDP caps all ranks to the smallest feature

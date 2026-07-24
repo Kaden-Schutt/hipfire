@@ -91,10 +91,10 @@ fi
     --vocab-map "$VOCAB_MAP" \
     --output "$OUTPUT" \
     --epochs 3 \
-    --micro-batch-size 1 \
-    --global-batch-size 64 \
-    --learning-rate 5e-5 \
+    --micro-batch-size 128 \
+    --global-batch-size 512 \
+    --learning-rate 2e-4 \
     --warmup-ratio 0.05 \
-    --checkpoint-every 1000 \
+    --checkpoint-every 500 \
     --eval-every 250 \
     "${TRAIN_ARGS[@]}"
