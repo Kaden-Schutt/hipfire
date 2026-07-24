@@ -13,24 +13,13 @@ sudo apt-get install -y python3-torch-rocm python3-venv
 python3 -m venv --system-site-packages "$VENV"
 "$VENV/bin/pip" install -r scripts/mtp_train/fastmtp35/requirements.txt
 
-"$VENV/bin/python" - <<'PY'
-import torch
-
-assert torch.version.hip, "installed torch is not a ROCm build"
-assert torch.cuda.is_available(), "ROCm torch cannot see a GPU"
-count = torch.cuda.device_count()
-assert count == 4, f"expected four R9700s, found {count}"
-arches = []
-for index in range(count):
-    props = torch.cuda.get_device_properties(index)
-    arches.append(getattr(props, "gcnArchName", "unknown"))
-assert all(str(arch).startswith("gfx1201") for arch in arches), arches
-print(
-    {
-        "torch": torch.__version__,
-        "hip": torch.version.hip,
-        "devices": [torch.cuda.get_device_name(index) for index in range(count)],
-        "arches": arches,
-    }
-)
-PY
+"$VENV/bin/python" scripts/mtp_train/fastmtp35/validate_rocm_train_env.py \
+    --mode devices \
+    --expected-devices 4 \
+    --arch-prefix gfx1201
+"$VENV/bin/python" -m torch.distributed.run \
+    --standalone \
+    --nproc-per-node=4 \
+    scripts/mtp_train/fastmtp35/validate_rocm_train_env.py \
+    --mode distributed \
+    --expected-devices 4
