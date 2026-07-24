@@ -312,7 +312,10 @@ def train_microbatch(
         keep = valid_rows & (target >= 0)
         if not keep.any():
             raise RuntimeError("microbatch has no targets inside compressed vocabulary")
-        losses.append(F.cross_entropy(logits[keep].float(), target[keep]))
+        # ROCm cross_entropy applies its FP32 opmath internally for BF16 input.
+        # Avoid materializing a second FP32 logits tensor: at larger batches it
+        # costs multiple GiB per rank without a meaningful gradient benefit.
+        losses.append(F.cross_entropy(logits[keep], target[keep]))
         coverage.append(float(keep.sum()) / float(valid_rows.sum()))
         with torch.no_grad():
             current_tokens = vocab_map[logits.argmax(-1)]
