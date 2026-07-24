@@ -11,6 +11,27 @@ WINDOW_ROWS="${WINDOW_ROWS:-128}"
 WINDOWS_PER_RECORD="${WINDOWS_PER_RECORD:-2}"
 ROWS_PER_SHARD="${ROWS_PER_SHARD:-262144}"
 
+resolve_hipcc_dir() {
+    local hipcc_path=""
+    local candidate
+    if hipcc_path="$(command -v hipcc 2>/dev/null)" && [[ -x "$hipcc_path" ]]; then
+        dirname "$hipcc_path"
+        return
+    fi
+    if [[ -x /opt/rocm/bin/hipcc ]]; then
+        dirname /opt/rocm/bin/hipcc
+        return
+    fi
+    while IFS= read -r candidate; do
+        [[ -x "$candidate" ]] && hipcc_path="$candidate"
+    done < <(compgen -G '/opt/rocm/core-*/bin/hipcc' | sort -V)
+    [[ -n "$hipcc_path" ]] || {
+        echo "hipcc is required for feature extraction but was not found" >&2
+        return 1
+    }
+    dirname "$hipcc_path"
+}
+
 [[ -s "$ROOT/clean/train.jsonl" ]] || {
     echo "missing finalized train split: $ROOT/clean/train.jsonl" >&2
     exit 2
@@ -23,6 +44,10 @@ ROWS_PER_SHARD="${ROWS_PER_SHARD:-262144}"
     echo "clean manifest or deployed MQ4R trunk is missing" >&2
     exit 2
 }
+
+HIPCC_DIR="$(resolve_hipcc_dir)"
+export PATH="$HIPCC_DIR:$PATH"
+hipcc --version >/dev/null
 
 mkdir -p "$FEATURE_ROOT/train" "$FEATURE_ROOT/validation" "$ROOT/logs" "$LOCK_ROOT"
 cargo build --release -p hipfire-arch-qwen35 --example qwen35_mtp_features
@@ -41,7 +66,10 @@ run_split() {
             source scripts/gpu-lock.sh
             gpu_acquire "fastmtp-features-${split}-gpu${gpu}"
             trap gpu_release EXIT
-            HIP_VISIBLE_DEVICES="$gpu" ROCR_VISIBLE_DEVICES="$gpu" \
+            # ROCr selects the physical GPU. HIP sees the filtered device as
+            # logical device zero; giving both layers the physical index
+            # double-filters GPUs 1+ and leaves no visible device.
+            HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES="$gpu" \
                 "$BIN" \
                 --input "$ROOT/clean/$split.jsonl" \
                 --output "$FEATURE_ROOT/$split" \
