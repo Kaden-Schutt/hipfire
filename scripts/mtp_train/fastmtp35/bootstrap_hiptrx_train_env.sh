@@ -2,6 +2,9 @@
 set -euo pipefail
 
 VENV="${VENV:-$PWD/.venv-rocm}"
+# The host may have a user-site CPU-only torch that otherwise precedes the
+# distro ROCm build even inside a --system-site-packages venv.
+export PYTHONNOUSERSITE=1
 
 if systemctl --user is-active --quiet hipfire-fastmtp-teacher.service; then
     echo "Stage 1 teacher service is still active; refusing to alter the ROCm training environment." >&2

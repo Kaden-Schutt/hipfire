@@ -11,6 +11,8 @@ OUTPUT="${OUTPUT:-$HOME/.hipfire/training/fastmtp-qwen36-a3b-v1}"
 VENV="${VENV:-$PWD/.venv-rocm}"
 LOCK_ROOT="${XDG_RUNTIME_DIR:-$HOME/.cache/hipfire}/hipfire-locks"
 VOCAB_MAP="${VOCAB_MAP:-$ROOT/features/vocab-map.json}"
+# Never allow a host user-site CPU-only torch to shadow the distro ROCm build.
+export PYTHONNOUSERSITE=1
 
 [[ -d "$ROOT/features/train" && -d "$ROOT/features/validation" ]] || {
     echo "Stage 2 features are missing under $ROOT/features" >&2
