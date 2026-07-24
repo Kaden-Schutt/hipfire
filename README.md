@@ -242,6 +242,16 @@ the installed binary, managed source checkout, and daemon. Managed Linux
 installs can switch revisions with `hipfire update @beta`,
 `hipfire update --tag v0.2.1`, or `hipfire update --commit <sha>`.
 
+To uninstall a managed Linux install while keeping downloaded models and
+settings:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh | bash
+```
+
+Add `--dry-run` to preview it. `--purge` also deletes all data under
+`~/.hipfire` and requires explicit confirmation.
+
 For Windows, source builds, and verifying the install:
 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
