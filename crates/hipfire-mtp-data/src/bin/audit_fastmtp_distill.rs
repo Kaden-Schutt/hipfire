@@ -88,6 +88,63 @@ struct CompletionRow {
     sampling: Value,
 }
 
+fn numeric_equal(left: &Value, right: &Value) -> bool {
+    match (left.as_f64(), right.as_f64()) {
+        (Some(left), Some(right)) => (left - right).abs() <= f64::EPSILON,
+        _ => left == right,
+    }
+}
+
+fn validate_sampling(expected: &Value, actual: &Value) -> Result<(), String> {
+    let expected = expected
+        .as_object()
+        .ok_or_else(|| "job sampling is not an object".to_string())?;
+    let actual = actual
+        .as_object()
+        .ok_or_else(|| "completion sampling is not an object".to_string())?;
+    for (key, expected_value) in expected {
+        if key == "fraction" {
+            continue;
+        }
+        let actual_value = actual
+            .get(key)
+            .ok_or_else(|| format!("completion sampling is missing {key}"))?;
+        let matches = if key == "top_k" {
+            let normalized = |value: &Value| {
+                if value.is_null() {
+                    Some(0)
+                } else {
+                    value.as_u64()
+                }
+            };
+            normalized(expected_value) == normalized(actual_value)
+        } else {
+            numeric_equal(expected_value, actual_value)
+        };
+        if !matches {
+            return Err(format!(
+                "completion sampling {key}={actual_value} differs from job {expected_value}"
+            ));
+        }
+    }
+    for (key, expected_value) in [
+        ("min_p", json!(0.0)),
+        ("repeat_penalty", json!(1.0)),
+        ("frequency_penalty", json!(0.0)),
+        ("repeat_window", json!(128)),
+    ] {
+        let actual_value = actual
+            .get(key)
+            .ok_or_else(|| format!("completion sampling is missing {key}"))?;
+        if !numeric_equal(&expected_value, actual_value) {
+            return Err(format!(
+                "completion sampling {key}={actual_value} differs from campaign {expected_value}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut reader = BufReader::new(
         File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?,
@@ -326,12 +383,9 @@ fn audit(args: &Args) -> Result<Value, String> {
                             completion_path.display()
                         ));
                     }
-                    if row.sampling != job.sampling {
-                        return Err(format!(
-                            "{} line {line} sampling differs from job manifest",
-                            completion_path.display()
-                        ));
-                    }
+                    validate_sampling(&job.sampling, &row.sampling).map_err(|error| {
+                        format!("{} line {line}: {error}", completion_path.display())
+                    })?;
                     if row.completion_tokens.is_empty() {
                         return Err(format!(
                             "{} line {line} has no completion tokens",
@@ -460,6 +514,7 @@ mod tests {
             "temperature": 1.0,
             "top_p": 0.95,
             "top_k": 20,
+            "fraction": 1.0,
         });
         let manifest = json!({
             "schema_version": 1,
@@ -484,7 +539,16 @@ mod tests {
                 "id": format!("row-{gpu}"),
                 "completion_tokens": [10, 11],
                 "finish_reason": "stop",
-                "sampling": sampling,
+                "sampling": {
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "min_p": 0.0,
+                    "repeat_penalty": 1.0,
+                    "presence_penalty": 1.5,
+                    "frequency_penalty": 0.0,
+                    "repeat_window": 128,
+                },
             });
             fs::write(
                 root.join("completions")
@@ -521,5 +585,27 @@ mod tests {
         let error = audit(&args).unwrap_err();
         assert!(error.contains("belongs to GPU"), "{error}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sampling_treats_zero_and_null_top_k_as_disabled() {
+        let expected = json!({
+            "fraction": 0.1,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "presence_penalty": 0.0,
+        });
+        let actual = json!({
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": null,
+            "min_p": 0.0,
+            "repeat_penalty": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "repeat_window": 128,
+        });
+        validate_sampling(&expected, &actual).unwrap();
     }
 }
