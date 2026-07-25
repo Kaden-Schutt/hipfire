@@ -12,8 +12,8 @@ Architecture (from inspecting Qwen3.5-0.8B safetensors):
 
 Forward:
   inputs: trunk_hidden_t (frozen trunk's last hidden at position t),
-          prev_token_emb (embedding of token t-1)
-  emb_n   = pre_fc_norm_embedding(prev_token_emb)
+          next_token_emb (embedding of token t+1)
+  emb_n   = pre_fc_norm_embedding(next_token_emb)
   hid_n   = pre_fc_norm_hidden(trunk_hidden_t)
   x       = fc(concat([emb_n, hid_n], dim=-1))   # [B, T, 2H] -> [B, T, H]
   x       = layers[0](x, position_embeddings=...)   # decoder layer
@@ -90,18 +90,17 @@ class Qwen35MtpBlock(nn.Module):
 
     def forward(
         self,
-        prev_token_emb,
+        next_token_emb,
         trunk_hidden,
         position_ids=None,
         attention_mask=None,
     ):
         """
-        prev_token_emb: [B, T, H] — embeddings of input tokens shifted by -1
-                        (or whatever convention the caller uses; we just
-                        concat them with trunk_hidden).
-        trunk_hidden:   [B, T, H] — frozen trunk's last hidden state at
-                        the same positions as prev_token_emb.
-        position_ids:   [B, T] — position indices (defaults to arange)
+        next_token_emb: [B, T, H] — embeddings one position ahead of the
+                        frozen trunk hidden sequence. For trunk h[t], this is
+                        embed(x[t+1]); the output predicts x[t+2].
+        trunk_hidden:   [B, T, H] — frozen trunk hidden states h[t].
+        position_ids:   [B, T] — positions of next_token_emb (t+1).
 
         Returns: hidden output of MTP block, [B, T, H]. Caller computes
                  logits = F.linear(hidden, lm_head_weight) with tied embed.
@@ -110,7 +109,7 @@ class Qwen35MtpBlock(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(T, device=trunk_hidden.device).unsqueeze(0).expand(B, -1)
 
-        emb_n = self.pre_fc_norm_embedding(prev_token_emb)
+        emb_n = self.pre_fc_norm_embedding(next_token_emb)
         hid_n = self.pre_fc_norm_hidden(trunk_hidden)
         x = torch.cat([emb_n, hid_n], dim=-1)  # [B, T, 2H]
         x = self.fc(x)                          # [B, T, H]
@@ -212,15 +211,14 @@ def smoke_test():
         trunk_logits = trunk_out.logits               # [1, T, V]
         trunk_argmax = trunk_logits.argmax(-1)        # [1, T]
 
-        # Per hipfire mtp_spec.rs runtime trace (agent #2):
-        #   Input to MTP block: embed(last_committed_token) + prev_hidden
-        # In training: at position t, "last_committed" = ids[t], "prev_hidden" = trunk_hidden[t].
-        # MTP then predicts the NEXT token (ground truth = ids[t+1]).
-        # So NO shift on the embedding side.
-        prev_emb = embed(ids)  # [1, T, H] — embed of token AT position t
-
-        # Try BOTH conventions and report
-        mtp_hidden = mtp(prev_emb, trunk_hidden)   # [1, T, H]
+        # Serving contract: h[t] produced x[t+1], which is then embedded and
+        # passed to MTP at position t+1 to predict x[t+2].
+        mtp_trunk_hidden = trunk_hidden[:, :-1]
+        next_emb = embed(ids[:, 1:])
+        position_ids = torch.arange(
+            1, ids.shape[1], device=ids.device
+        ).unsqueeze(0)
+        mtp_hidden = mtp(next_emb, mtp_trunk_hidden, position_ids=position_ids)
         mtp_logits = F.linear(mtp_hidden, embed.weight)    # tied lm_head
         mtp_argmax = mtp_logits.argmax(-1)                 # [1, T]
 
@@ -230,22 +228,18 @@ def smoke_test():
     print("\n   Trunk argmax (predicts next token at each position):")
     print(f"     positions 0..10:  {trunk_argmax[0,:11].tolist()}")
     print(f"     decoded: {tok.decode(trunk_argmax[0,:11].tolist())!r}")
-    print("\n   MTP argmax (predicts ??? from hidden + prev_emb):")
+    print("\n   MTP argmax (predicts token after the shifted input):")
     print(f"     positions 0..10:  {mtp_argmax[0,:11].tolist()}")
     print(f"     decoded: {tok.decode(mtp_argmax[0,:11].tolist())!r}")
 
-    # If MTP is meant to predict t+1 from hidden_t + emb_{t-1}, then
-    # MTP[t-1] should predict ids[t] (same as trunk[t-1] does).
-    # Agreement: count where mtp_argmax[t] == trunk_argmax[t]
-    agree = (mtp_argmax == trunk_argmax).float().mean().item()
+    # MTP[h[t], x[t+1]] and trunk h[t+1] both predict x[t+2].
+    agree = (mtp_argmax == trunk_argmax[:, 1:]).float().mean().item()
     print(f"\n   MTP/trunk argmax agreement: {100*agree:.1f}%")
-    # Also: does MTP predict the actual next-token in the sequence?
-    # ids[t+1] should = mtp_argmax[t]? Position t MTP sees emb_{t-1} + hidden_t,
-    # so it should predict ids[t+1] (the token AFTER position t)
-    if ids.shape[1] > 1:
-        labels = ids[0, 1:]
+    # Also compare both predictors against the actual token at t+2.
+    if ids.shape[1] > 2:
+        labels = ids[0, 2:]
         mtp_pred = mtp_argmax[0, :-1]
-        trunk_pred = trunk_argmax[0, :-1]
+        trunk_pred = trunk_argmax[0, 1:-1]
         mtp_acc = (mtp_pred == labels).float().mean().item()
         trunk_acc = (trunk_pred == labels).float().mean().item()
         print(f"   Next-token accuracy vs actual prompt tokens:")

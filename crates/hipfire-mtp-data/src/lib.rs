@@ -69,10 +69,13 @@ impl FeatureHeader {
 
 /// One independent MTP attention sequence.
 ///
-/// `tokens` contains `hidden_rows + recursive_steps` entries. Hidden row `i`
-/// corresponds to committed `tokens[i]`; recursive target `k` is
-/// `tokens[i + k + 1]`. The head's private attention cache starts empty at
-/// `absolute_start`, matching a cropped deployment trajectory.
+/// `tokens` contains `hidden_rows + recursive_steps` entries. Serving-aligned
+/// training pairs hidden row `i` (`h[t]`) with `tokens[i + 1]` (`x[t+1]`) and
+/// predicts `tokens[i + k + 2]` at recursive depth `k`. Consequently schema 1
+/// exposes `hidden_rows - 1` usable rows; the final hidden row is retained for
+/// backward-compatible decoding of already-produced feature shards. The
+/// head's private attention cache starts empty at `absolute_start + 1`,
+/// matching a cropped deployment trajectory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureRecord {
     pub id: String,

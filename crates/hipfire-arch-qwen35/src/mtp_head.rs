@@ -1203,13 +1203,12 @@ fn weight_tensor_from_raw(
 /// `scratch.logits` for position `pos + 1`. Caller does sampling.
 ///
 /// - `next_token`: the most-recently committed token id at position `pos`.
-///   Embedded via the trunk's `weights.token_embd` and used as the
-///   prediction-target signal.
-/// - `prev_hidden`: the trunk's post-final-norm hidden state at position
-///   `pos` (or any other contextually-equivalent activation that's
-///   distillation-aligned with the MTP block's training input).
-/// - `pos`: current position (the slot the MTP block writes its K/V into,
-///   then attends to all positions 0..=pos).
+///   Embedded via the trunk's `weights.token_embd`.
+/// - `prev_hidden`: the hidden state whose trunk logits produced
+///   `next_token`, normally from position `pos - 1`; recursively this is the
+///   preceding MTP output.
+/// - `pos`: the position of `next_token` (the slot the MTP block writes its
+///   K/V into, then attends to all positions 0..=pos).
 /// - `lm_head_weights`: the trunk's `weights.output`. The MTP file
 ///   intentionally does NOT pack a separate LM head — Qwen3.5/3.6 share
 ///   the trunk's lm_head with the MTP head ("shared_lm_head_with_trunk":

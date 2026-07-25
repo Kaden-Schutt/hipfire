@@ -36,6 +36,9 @@ from mtp_module import Qwen35MtpBlock, load_mtp_from_safetensors
 MAGIC = b"HFMTPF01"
 MAX_HEADER_BYTES = 16 * 1024 * 1024
 MAX_RECORD_BYTES = 2 * 1024 * 1024 * 1024
+RUNTIME_SHIFTED_ALIGNMENT = "runtime-shifted-v1"
+LEGACY_SAME_POSITION_ALIGNMENT = "legacy-same-position-v0"
+ALIGNMENTS = (RUNTIME_SHIFTED_ALIGNMENT, LEGACY_SAME_POSITION_ALIGNMENT)
 
 
 @dataclass
@@ -153,19 +156,39 @@ def causal_mask(lengths: torch.Tensor, width: int, dtype: torch.dtype) -> torch.
     return mask.masked_fill(~allowed, torch.finfo(dtype).min)
 
 
-def collate(records: list[FeatureRecord], dim: int, k: int) -> dict[str, torch.Tensor]:
-    width = max(record.hidden_rows for record in records)
+def collate(
+    records: list[FeatureRecord],
+    dim: int,
+    k: int,
+    alignment: str = RUNTIME_SHIFTED_ALIGNMENT,
+) -> dict[str, torch.Tensor]:
+    if alignment not in ALIGNMENTS:
+        raise ValueError(f"unsupported MTP alignment {alignment!r}")
+    # Transformers' MTP contract shifts input tokens one position ahead of
+    # the trunk hidden sequence. For trunk h[t], the head consumes token
+    # x[t+1] at position t+1 and predicts x[t+2]. HFMTPF01 predates that
+    # clarification and stores N hidden rows plus N+K tokens, so the corrected
+    # view uses the first N-1 hidden rows and all N+K tokens. No expensive
+    # feature regeneration is needed; only the final hidden row is unused.
+    shifted = alignment == RUNTIME_SHIFTED_ALIGNMENT
+    effective_lengths = [
+        record.hidden_rows - 1 if shifted else record.hidden_rows for record in records
+    ]
+    if any(length <= 0 for length in effective_lengths):
+        raise ValueError("MTP feature record is too short for the requested alignment")
+    width = max(effective_lengths)
     batch = len(records)
     hidden = torch.zeros((batch, width, dim), dtype=torch.bfloat16)
-    tokens = torch.zeros((batch, width + k), dtype=torch.long)
-    lengths = torch.tensor([record.hidden_rows for record in records], dtype=torch.long)
+    token_tail = k + 1 if shifted else k
+    tokens = torch.zeros((batch, width + token_tail), dtype=torch.long)
+    lengths = torch.tensor(effective_lengths, dtype=torch.long)
     positions = torch.zeros((batch, width), dtype=torch.long)
-    for row, record in enumerate(records):
-        n = record.hidden_rows
-        hidden[row, :n].copy_(record.hidden)
-        tokens[row, : n + k].copy_(record.tokens)
+    for row, (record, n) in enumerate(zip(records, effective_lengths, strict=True)):
+        hidden[row, :n].copy_(record.hidden[:n])
+        tokens[row, : n + token_tail].copy_(record.tokens[: n + token_tail])
+        position_start = record.absolute_start + (1 if shifted else 0)
         positions[row, :n] = torch.arange(
-            record.absolute_start, record.absolute_start + n, dtype=torch.long
+            position_start, position_start + n, dtype=torch.long
         )
     return {"hidden": hidden, "tokens": tokens, "lengths": lengths, "positions": positions}
 
@@ -285,8 +308,9 @@ def train_microbatch(
     device: torch.device,
     dim: int,
     k: int,
+    alignment: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[float]]:
-    batch = collate(records, dim, k)
+    batch = collate(records, dim, k, alignment)
     hidden = batch["hidden"].to(device, non_blocking=True)
     tokens = batch["tokens"].to(device, non_blocking=True)
     lengths = batch["lengths"].to(device, non_blocking=True)
@@ -294,7 +318,9 @@ def train_microbatch(
     width = hidden.shape[1]
     mask = causal_mask(lengths, width, hidden.dtype)
     current_hidden = hidden
-    current_tokens = tokens[:, :width]
+    token_offset = 1 if alignment == RUNTIME_SHIFTED_ALIGNMENT else 0
+    target_offset = token_offset + 1
+    current_tokens = tokens[:, token_offset : token_offset + width]
     valid_rows = torch.arange(width, device=device)[None, :] < lengths[:, None]
     losses = []
     coverage = []
@@ -307,7 +333,7 @@ def train_microbatch(
             attention_mask=mask,
         )
         logits = F.linear(current_hidden, lm_weight)
-        target_full = tokens[:, depth + 1 : depth + 1 + width]
+        target_full = tokens[:, target_offset + depth : target_offset + depth + width]
         target = inverse_vocab[target_full]
         keep = valid_rows & (target >= 0)
         if not keep.any():
@@ -338,6 +364,7 @@ def evaluate(
     dim: int,
     k: int,
     max_batches: int,
+    alignment: str,
 ) -> list[dict[str, float]]:
     model.eval()
     totals = [
@@ -346,7 +373,7 @@ def evaluate(
     for batch_index, records in enumerate(
         batches(shard_paths, rank, world, seed, 0, micro_batch, max_batches)
     ):
-        batch = collate(records, dim, k)
+        batch = collate(records, dim, k, alignment)
         hidden = batch["hidden"].cuda(non_blocking=True)
         tokens = batch["tokens"].cuda(non_blocking=True)
         lengths = batch["lengths"].cuda(non_blocking=True)
@@ -354,7 +381,9 @@ def evaluate(
         width = hidden.shape[1]
         mask = causal_mask(lengths, width, hidden.dtype)
         current_hidden = hidden
-        current_tokens = tokens[:, :width]
+        token_offset = 1 if alignment == RUNTIME_SHIFTED_ALIGNMENT else 0
+        target_offset = token_offset + 1
+        current_tokens = tokens[:, token_offset : token_offset + width]
         valid_rows = torch.arange(width, device=hidden.device)[None, :] < lengths[:, None]
         for depth in range(k):
             current_emb = F.embedding(current_tokens, embed_weight)
@@ -365,7 +394,7 @@ def evaluate(
                 attention_mask=mask,
             )
             logits = F.linear(current_hidden, lm_weight)
-            target_full = tokens[:, depth + 1 : depth + 1 + width]
+            target_full = tokens[:, target_offset + depth : target_offset + depth + width]
             target = inverse_vocab[target_full]
             keep = valid_rows & (target >= 0)
             if keep.any():
@@ -428,6 +457,12 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--resume-optimizer", type=Path)
     parser.add_argument("--resume-weights", type=Path)
+    parser.add_argument(
+        "--alignment",
+        choices=ALIGNMENTS,
+        default=RUNTIME_SHIFTED_ALIGNMENT,
+        help="token/hidden contract; runtime-shifted-v1 matches Transformers and Hipfire serving",
+    )
     args = parser.parse_args()
 
     rank = int(os.environ.get("RANK", "0"))
@@ -629,6 +664,7 @@ def main() -> None:
                     device,
                     dim,
                     k,
+                    args.alignment,
                 )
                 (loss / accumulation).backward()
             micro_step += 1
@@ -672,6 +708,7 @@ def main() -> None:
                     dim,
                     k,
                     args.eval_batches,
+                    args.alignment,
                 )
                 if rank == 0:
                     print(json.dumps({"event": "validation", "step": step, "metrics": metrics}), flush=True)
@@ -696,6 +733,7 @@ def main() -> None:
         dim,
         k,
         args.eval_batches,
+        args.alignment,
     )
     save_checkpoint(args.output, mtp, optimizer, scheduler, step, args.epochs, rank, final=True)
     if rank == 0:
@@ -712,6 +750,7 @@ def main() -> None:
             "epochs": args.epochs,
             "steps": step,
             "loss_weights": weights.cpu().tolist(),
+            "alignment": args.alignment,
             "validation": metrics,
             "output": "final.safetensors",
         }
