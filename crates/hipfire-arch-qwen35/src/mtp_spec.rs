@@ -37,6 +37,7 @@ use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
@@ -176,8 +177,25 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     // WMMA when the arch/shape supports it, otherwise it falls back to scalar.
     // Prompt-sweep parity is clean; opt out with HIPFIRE_MTP_Q8_VERIFY_WMMA=0.
     mtp_q8_verify_wmma_enabled_from_env_value(
-        hipfire_config::developer_var("HIPFIRE_MTP_Q8_VERIFY_WMMA").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MTP_Q8_VERIFY_WMMA")
+            .ok()
+            .as_deref(),
     )
+}
+
+fn mtp_verify_graph_enabled_from_env() -> bool {
+    // Default on: unlike the proposal graph, a verifier graph coalesces the
+    // dominant full-trunk phase. The captured forward reads changing tokens
+    // and positions from `trunk_pbs`, exactly like DFlash's validated
+    // per-batch verifier graph. Opt out for parity/performance diagnosis with
+    // HIPFIRE_MTP_VERIFY_GRAPH=0.
+    match hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_GRAPH") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        Err(_) => true,
+    }
 }
 
 /// Default draft-confidence cutoff (adaptive-K) per arch. p_min=0.6 truncates
@@ -234,7 +252,9 @@ fn mtp_proposal_graph_policy_from_env_value(value: Option<&str>) -> MtpProposalG
 
 fn mtp_proposal_graph_policy_from_env() -> MtpProposalGraphPolicy {
     mtp_proposal_graph_policy_from_env_value(
-        hipfire_config::developer_var("HIPFIRE_MTP_PROPOSAL_GRAPH").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MTP_PROPOSAL_GRAPH")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -564,6 +584,13 @@ pub struct MtpSpecState {
     mtp_proposal_graph_warmed: bool,
     mtp_proposal_graph_disabled: bool,
 
+    /// Captured trunk-verifier graphs keyed by the live verify batch size.
+    /// These belong to MTP state—not `Gpu::graphs.verify`, which is DFlash's
+    /// cache—because every node bakes MTP-owned PBS/tape/hidden pointers.
+    mtp_verify_graphs: HashMap<usize, (Graph, GraphExec, Vec<Vec<u8>>)>,
+    mtp_verify_graph_warmed: HashSet<usize>,
+    mtp_verify_graph_disabled: bool,
+
     /// Optional FastMTP-style compressed batched-logits output, shape
     /// `[max_n * compressed_vocab_size]`. Populated by
     /// [`spec_step_mtp_compressed`] when the head ships a sidecar.
@@ -756,6 +783,9 @@ impl MtpSpecState {
             mtp_proposal_graph_seq_cap: 0,
             mtp_proposal_graph_warmed: false,
             mtp_proposal_graph_disabled: false,
+            mtp_verify_graphs: HashMap::new(),
+            mtp_verify_graph_warmed: HashSet::new(),
+            mtp_verify_graph_disabled: false,
             mtp_lm_logits_compressed: None,
             mtp_topk_idx,
             mtp_topk_logp,
@@ -1015,6 +1045,10 @@ impl MtpSpecState {
             let _ = gpu.hip.graph_destroy(graph);
         }
         drop(self.mtp_proposal_graph_blobs);
+        for (_, (graph, exec, _blobs)) in self.mtp_verify_graphs {
+            let _ = gpu.hip.graph_exec_destroy(exec);
+            let _ = gpu.hip.graph_destroy(graph);
+        }
         if let Some(lc) = self.mtp_lm_logits_compressed {
             let _ = gpu.free_tensor(lc);
         }
@@ -1259,6 +1293,152 @@ fn abort_mtp_proposal_graph_capture(gpu: &mut Gpu) {
         gpu.graphs.capture_mode = false;
     }
     gpu.graphs.capture_blobs.clear();
+}
+
+fn run_mtp_trunk_verify(
+    gpu: &mut Gpu,
+    trunk_weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut qwen35::DeltaNetState,
+    scratch: &qwen35::Qwen35Scratch,
+    state: &mut MtpSpecState,
+    verify_tokens: &[u32],
+    cur_pos: usize,
+    tape_captured: bool,
+) -> HipResult<()> {
+    let n = verify_tokens.len();
+    let graph_ok = mtp_verify_graph_enabled_from_env()
+        && !state.mtp_verify_graph_disabled
+        && tape_captured
+        && n <= state.trunk_pbs.max_batch
+        && matches!(
+            trunk_weights.embd_format,
+            llama::EmbeddingFormat::HFQ4G256 | llama::EmbeddingFormat::Q8_0
+        );
+
+    if !graph_ok {
+        let verify_tape = tape_captured.then_some(&mut state.trunk_gdn_tape);
+        return qwen35::forward_prefill_batch_with_pbs_opts(
+            gpu,
+            trunk_weights,
+            config,
+            verify_tokens,
+            cur_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            Some(&state.verify_hidden),
+            verify_tape,
+            None,
+            Some(&state.trunk_pbs),
+            None,
+            None,
+            false,
+        );
+    }
+
+    qwen35::upload_prefill_batch_inputs(gpu, &state.trunk_pbs, verify_tokens, cur_pos)?;
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
+    if let Some((_graph, exec, _blobs)) = state.mtp_verify_graphs.get(&n) {
+        return gpu
+            .hip
+            .graph_launch(exec, gpu.active_stream.as_ref().unwrap());
+    }
+
+    if state.mtp_verify_graph_warmed.insert(n) {
+        let result = qwen35::forward_prefill_batch_single_chunk_captured_opts(
+            gpu,
+            trunk_weights,
+            config,
+            verify_tokens,
+            cur_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            &state.trunk_pbs,
+            None,
+            Some(&state.verify_hidden),
+            Some(&mut state.trunk_gdn_tape),
+            None,
+            false,
+        );
+        if result.is_ok() {
+            eprintln!("[mtp-verify-graph] warmup complete for B={n}");
+        }
+        return result;
+    }
+
+    gpu.graphs.capture_blobs.clear();
+    gpu.graphs.capture_mode = true;
+    // A spec verifier mutates recurrent/KV state through a different launch
+    // topology. Never let a previously captured plain-AR graph span it.
+    gpu.graphs.ar_forward_replay_enabled = false;
+    gpu.graphs.ar_forward_kernel_dirty = true;
+    let stream = gpu.active_stream.as_ref().unwrap();
+    if let Err(error) = gpu.hip.stream_begin_capture(stream, 0) {
+        gpu.graphs.capture_mode = false;
+        state.mtp_verify_graph_disabled = true;
+        return Err(error);
+    }
+
+    let captured = qwen35::forward_prefill_batch_single_chunk_captured_opts(
+        gpu,
+        trunk_weights,
+        config,
+        verify_tokens,
+        cur_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        &state.trunk_pbs,
+        None,
+        Some(&state.verify_hidden),
+        Some(&mut state.trunk_gdn_tape),
+        None,
+        false,
+    );
+    if let Err(error) = captured {
+        abort_mtp_proposal_graph_capture(gpu);
+        state.mtp_verify_graph_disabled = true;
+        return Err(error);
+    }
+
+    gpu.graphs.capture_mode = false;
+    let graph = match gpu
+        .hip
+        .stream_end_capture(gpu.active_stream.as_ref().unwrap())
+    {
+        Ok(graph) => graph,
+        Err(error) => {
+            gpu.graphs.capture_blobs.clear();
+            state.mtp_verify_graph_disabled = true;
+            return Err(error);
+        }
+    };
+    let exec = match gpu.hip.graph_instantiate(&graph) {
+        Ok(exec) => exec,
+        Err(error) => {
+            let _ = gpu.hip.graph_destroy(graph);
+            gpu.graphs.capture_blobs.clear();
+            state.mtp_verify_graph_disabled = true;
+            return Err(error);
+        }
+    };
+    let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
+    state.mtp_verify_graphs.insert(n, (graph, exec, blobs));
+    let (_graph, exec, _blobs) = state.mtp_verify_graphs.get(&n).unwrap();
+    gpu.hip
+        .graph_launch(exec, gpu.active_stream.as_ref().unwrap())?;
+    eprintln!(
+        "[mtp-verify-graph] captured B={n} (cache size={})",
+        state.mtp_verify_graphs.len()
+    );
+    Ok(())
 }
 
 fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) {
@@ -1881,7 +2061,10 @@ pub fn spec_step_mtp(
     // HIPFIRE_MTP_TAPE_REPLAY=0 forces the original full-replay path (A/B gate).
     let use_tape_replay = tape_captured
         && advance >= 2
-        && hipfire_config::developer_var("HIPFIRE_MTP_TAPE_REPLAY").ok().as_deref() != Some("0");
+        && hipfire_config::developer_var("HIPFIRE_MTP_TAPE_REPLAY")
+            .ok()
+            .as_deref()
+            != Some("0");
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
     if use_tape_replay {
         // Batched verify populated the tape this cycle — cheap GDN-only replay.
@@ -3316,29 +3499,17 @@ pub fn spec_step_mtp_compressed_serial(
         gpu.arch.as_str(),
         /* moe_router_logits_present — dense trunk: arm never matched */ true,
     );
-    let verify_tape: Option<&mut GdnTape> = if tape_captured {
-        Some(&mut state.trunk_gdn_tape)
-    } else {
-        None
-    };
-
-    qwen35::forward_prefill_batch_with_pbs_opts(
+    run_mtp_trunk_verify(
         gpu,
         trunk_weights,
         &target.config,
-        &verify_tokens,
-        cur_pos,
         &mut target.kv_cache,
         &mut target.dn_state,
         &target.scratch,
-        None,
-        Some(&state.verify_hidden),
-        verify_tape,
-        None,
-        Some(&state.trunk_pbs),
-        None,  // mask_override
-        None,  // max_layer
-        false, // MTP computes all verify logits from verify_hidden below
+        state,
+        &verify_tokens,
+        cur_pos,
+        tape_captured,
     )?;
     if phase_on {
         gpu.hip.device_synchronize()?;
