@@ -161,8 +161,13 @@ scripts/mtp_train/fastmtp35/package_head.sh \
   ~/.hipfire/training/fastmtp-qwen36-a3b-v1/qwen3.6-35b-a3b.fastmtp.mtp
 ```
 
-The packer emits the candidate and SHA256 provenance without modifying the
-stock sidecar.
+The packer defaults to the runtime-compatible `mixed` contract: shared MTP
+matrices remain Q8 while the routed-MoE experts and compressed draft LM head
+use MQ4G256. Full-Q8 routed experts are rejected because the serving runtime
+cannot execute that representation. Set `MTP_QUANT=mq4` only for a comparison
+artifact. The packer emits SHA256 and key-value provenance, including the
+training checkpoint, manifest, vocabulary map, HF snapshot, quantization
+contract, and producer commit, without modifying the stock sidecar.
 
 ## Stage 5: sampled product and Redline certification
 
