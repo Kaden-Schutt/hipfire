@@ -159,11 +159,15 @@ stock sidecar.
 
 ## Stage 5: sampled product and Redline certification
 
-Certification uses isolated symlink fixtures, so the stock model directory is
-never overwritten. It runs the same eight-turn sampled multi-turn session at
-the registry defaults with `thinking=med`, `max_tokens=4096`, and Q8 KV for:
-plain AR, stock MTP, and trained MTP. It then runs the retained-PM4 trunk
-shadow/parity diagnostic for 15 consecutive positions.
+Certification uses isolated same-filesystem hard-link fixtures, so the stock
+model directory is never overwritten and no trunk bytes are copied. Hard links
+are required because serve canonicalizes model paths before sibling-sidecar
+discovery; symlink fixtures would silently resolve back to the global stock
+`.mtp`. The script verifies the sidecar path after every MTP arm. It runs the
+same eight-turn sampled multi-turn session at the registry defaults with
+`thinking=med`, `max_tokens=4096`, and Q8 KV for plain AR, stock MTP, and
+trained MTP. It then runs the retained-PM4 trunk shadow/parity diagnostic for
+15 consecutive positions.
 
 ```bash
 scripts/mtp_train/fastmtp35/certify_head.sh \

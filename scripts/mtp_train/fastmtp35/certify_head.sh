@@ -32,10 +32,26 @@ export HIPFIRE_GPU_LOCKFILE="$LOCK_ROOT/gpu-${GPU}.lock"
 source scripts/gpu-lock.sh
 gpu_acquire "fastmtp-certify-gpu${GPU}"
 trap gpu_release EXIT
-ln -sfn "$TRUNK" "$OUT/stock/model.mq4r"
-ln -sfn "$STOCK_MTP" "$OUT/stock/model.mtp"
-ln -sfn "$TRUNK" "$OUT/candidate/model.mq4r"
-ln -sfn "$CANDIDATE" "$OUT/candidate/model.mtp"
+
+# Do not symlink the trunk fixture. The serve control plane canonicalizes model
+# paths before sidecar discovery; a symlink therefore resolves back into the
+# global model directory and silently loads its stock `.mtp` for BOTH arms.
+# Same-filesystem hard links preserve the exact trunk bytes while keeping the
+# fixture path canonical, so sibling `model.mtp` selection is unambiguous and
+# costs no data copy.
+link_fixture() {
+    local source="$1"
+    local destination="$2"
+    rm -f "$destination"
+    if ! ln "$source" "$destination"; then
+        echo "cannot hard-link certification fixture (source/output must share a filesystem): $source -> $destination" >&2
+        exit 2
+    fi
+}
+link_fixture "$TRUNK" "$OUT/stock/model.mq4r"
+link_fixture "$STOCK_MTP" "$OUT/stock/model.mtp"
+link_fixture "$TRUNK" "$OUT/candidate/model.mq4r"
+link_fixture "$CANDIDATE" "$OUT/candidate/model.mtp"
 
 run_serve() {
     local label="$1"
@@ -57,6 +73,14 @@ run_serve() {
         --home "$OUT/home-$label" \
         --serve-log "$OUT/$label.serve.log" \
         --out "$OUT/$label.json"
+    if [[ "$mtp" == "on" ]]; then
+        local expected_sidecar="${model%.*}.mtp"
+        if ! grep -Fq "MTP head loaded (sidecar $expected_sidecar)" "$OUT/$label.serve.log"; then
+            echo "$label did not load its fixture sidecar: $expected_sidecar" >&2
+            grep -F "MTP head loaded (sidecar " "$OUT/$label.serve.log" >&2 || true
+            exit 2
+        fi
+    fi
 }
 
 # Same eight sampled multi-turn requests, with AR as the quality/perf floor.
