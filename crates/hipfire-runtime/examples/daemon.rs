@@ -597,7 +597,11 @@ fn strip_think_for_fingerprint(s: &str) -> String {
                 let bytes = out.as_bytes();
                 while tail < bytes.len() {
                     let c = bytes[tail];
-                    if c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' {
+                    // Match ThinkChannelRouter exactly: after </think> the
+                    // OpenAI surface strips only the framing CR/LF. Leading
+                    // spaces/tabs belong to the visible answer and must remain
+                    // in the cache fingerprint.
+                    if c == b'\n' || c == b'\r' {
                         tail += 1;
                     } else {
                         break;
@@ -619,7 +623,8 @@ fn strip_think_for_fingerprint(s: &str) -> String {
         let bytes = out.as_bytes();
         while tail < bytes.len() {
             let c = bytes[tail];
-            if c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' {
+            // Keep this byte-identical to ThinkChannelRouter::emit.
+            if c == b'\n' || c == b'\r' {
                 tail += 1;
             } else {
                 break;
@@ -6556,10 +6561,13 @@ fn generate_qwen35_mtp(
                     });
                     if trace_cache {
                         eprintln!(
-                            "[qwen-cache mtp-jinja lookup] fp={:#018x} primer={} hit={}",
+                            "[qwen-cache mtp-jinja lookup] fp={:#018x} content.len={}/normalized.len={} primer={} hit={} preview={:?}",
                             fp,
+                            msg.content.len(),
+                            normalized.len(),
                             primer.len(),
                             hit.is_some(),
+                            normalized.chars().take(60).collect::<String>(),
                         );
                     }
                     hit
@@ -7312,6 +7320,16 @@ fn generate_qwen35_mtp(
     if !cached_seq.is_empty() {
         let emit_text = normalize_asst_turn_for_fingerprint(&decoded_full);
         let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[qwen-cache mtp-store] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
+                fp,
+                cached_seq.len(),
+                emit_text.len(),
+                emit_tool_calls.len(),
+                emit_text.chars().take(60).collect::<String>(),
+            );
+        }
         m.asst_turn_cache.insert(fp, cached_seq);
     }
 
@@ -15731,6 +15749,17 @@ mod render_tail_think_tests {
         assert_eq!(
             asst_turn_fingerprint(&normalized, &[]),
             asst_turn_fingerprint("visible answer", &[])
+        );
+    }
+
+    #[test]
+    fn assistant_cache_fingerprint_preserves_visible_indentation() {
+        let raw = "hidden reasoning</think>\n\n   - visible item<|im_end|>";
+        let normalized = normalize_asst_turn_for_fingerprint(raw);
+        assert_eq!(normalized, "   - visible item");
+        assert_eq!(
+            asst_turn_fingerprint(&normalized, &[]),
+            asst_turn_fingerprint("   - visible item", &[])
         );
     }
 
