@@ -10,18 +10,22 @@
 // vectors.  After this kernel the host only downloads 16 bytes.
 //
 // ── Inputs ────────────────────────────────────────────────────────────────
-//   tgt_probs[b * vocab]     — target model probabilities (post-softmax,
+//   tgt_probs[(b+1)*vocab]   — target model probabilities (post-softmax,
 //                              NOT truncated; this kernel applies topp in-kernel
-//                              using tau_t / z_t).
-//   dft_probs[b * vocab]     — draft model probabilities (post-softmax, same
-//                              convention).  b here is the DRAFT batch (number
-//                              of drafted positions, NOT including the target-
-//                              only bonus position at the end).
+//                              using tau_t / z_t). The last row is the target-
+//                              only bonus distribution.
+//   dft_probs[b*draft_vocab] — draft model probabilities (post-softmax, same
+//                              convention). `draft_vocab` may be smaller than
+//                              the target vocabulary.
+//   draft_vocab_inverse[vocab] — optional full-token -> draft-column map.
+//                              Values < 0 mean the compressed draft assigns zero
+//                              mass to that full-vocab token. Pass null when the
+//                              draft and target vocabularies are identical.
 //   draft_tokens[b]          — i32 drafted token ids.
 //   draft_p_at_token[b]      — f32 effective prob of the drafted token under
 //                              the draft distribution (AFTER topp truncation),
 //                              i.e. p_d used in the acceptance ratio.
-//   tau_t[b], z_t[b]         — target topp parameters per position.
+//   tau_t[b+1], z_t[b+1]     — target topp parameters per position.
 //                              tau_t[i] == 0 means no truncation for position i.
 //   tau_d[b], z_d[b]         — draft topp parameters per position.
 //   b                        — number of speculated positions (0-indexed; the
@@ -29,6 +33,7 @@
 //                              all b positions are accepted; requires the target
 //                              forward to produce b+1 rows, last row = bonus row).
 //   vocab                    — vocabulary size.
+//   draft_vocab              — row width of dft_probs.
 //   rng_seed                 — u32 base seed (LCG convention, same as SWOR walk).
 //   cactus_delta             — CACTUS boost parameter δ ≥ 0 (0.0 = plain RS).
 //
@@ -76,6 +81,23 @@ __device__ __forceinline__ float eff_prob(float p, float tau, float inv_z) {
     return (p >= tau) ? (p * inv_z) : 0.0f;
 }
 
+// Read draft probability for a full-vocabulary token. With no inverse map the
+// draft is already full-width. With a compressed draft, missing full tokens
+// have exactly zero draft mass — the same semantics as scattering the compact
+// row into a zero-filled full-vocab host vector.
+__device__ __forceinline__ float draft_eff_prob(
+    const float* drow,
+    int full_token,
+    const int* draft_vocab_inverse,
+    int draft_vocab,
+    float tau,
+    float inv_z) {
+    const int draft_token =
+        draft_vocab_inverse != nullptr ? draft_vocab_inverse[full_token] : full_token;
+    if (draft_token < 0 || draft_token >= draft_vocab) return 0.0f;
+    return eff_prob(drow[draft_token], tau, inv_z);
+}
+
 // CACTUS h-distribution value at column j on rejection. `pt_j` is the effective
 // (topp-truncated) target prob at column j; `t` is the drafted token. When
 // use_cx is false this is a no-op (h == raw effective target). Mirrors the host
@@ -88,16 +110,18 @@ __device__ __forceinline__ float casp_h_val(
 }
 
 extern "C" __global__ void chain_accept_spec_f32(
-    const float* __restrict__ tgt_probs,         // [b * vocab]
-    const float* __restrict__ dft_probs,         // [b * vocab]
+    const float* __restrict__ tgt_probs,         // [(b+1) * vocab]
+    const float* __restrict__ dft_probs,         // [b * draft_vocab]
+    const int*   __restrict__ draft_vocab_inverse, // optional [vocab]
     const int*   __restrict__ draft_tokens,      // [b] i32
     const float* __restrict__ draft_p_at_token,  // [b] f32
-    const float* __restrict__ tau_t,             // [b] target topp tau
-    const float* __restrict__ z_t,               // [b] target topp Z
+    const float* __restrict__ tau_t,             // [b+1] target topp tau
+    const float* __restrict__ z_t,               // [b+1] target topp Z
     const float* __restrict__ tau_d,             // [b] draft topp tau
     const float* __restrict__ z_d,               // [b] draft topp Z
     int   b,         // number of speculated positions
     int   vocab,
+    int   draft_vocab,
     unsigned int rng_seed,
     float cactus_delta,
     int*  __restrict__ out   // [4]: accept_len, bonus_token, rejected_at, new_rng
@@ -183,7 +207,7 @@ extern "C" __global__ void chain_accept_spec_f32(
             // residual[j] = max(h[j] - p_deff[j], 0), where h is the CACTUS
             // h-distribution (== raw effective target when cactus_delta == 0).
             // p_deff uses tau_d[i] / z_d[i].
-            const float* drow = dft_probs + (size_t)i * vocab;
+            const float* drow = dft_probs + (size_t)i * draft_vocab;
             const float  tau_di = tau_d[i];
             const float  inv_zd = 1.0f / fmaxf(z_d[i], 1e-30f);
 
@@ -205,7 +229,8 @@ extern "C" __global__ void chain_accept_spec_f32(
             for (int j = tid; j < vocab; j += nth) {
                 float pt = casp_h_val(j, draft_tok, eff_prob(trow[j], tau_ti, inv_zt),
                                       use_cx, cx_onehot, gamma_star, cx_scale);
-                float pd = eff_prob(drow[j], tau_di, inv_zd);
+                float pd = draft_eff_prob(
+                    drow, j, draft_vocab_inverse, draft_vocab, tau_di, inv_zd);
                 float diff = pt - pd;
                 if (diff > 0.0f) local_sum += diff;
             }
@@ -243,7 +268,8 @@ extern "C" __global__ void chain_accept_spec_f32(
                     for (int j = 0; j < vocab; ++j) {
                         float pt = casp_h_val(j, draft_tok, eff_prob(trow[j], tau_ti, inv_zt),
                                               use_cx, cx_onehot, gamma_star, cx_scale);
-                        float pd = eff_prob(drow[j], tau_di, inv_zd);
+                        float pd = draft_eff_prob(
+                            drow, j, draft_vocab_inverse, draft_vocab, tau_di, inv_zd);
                         float diff = pt - pd;
                         if (diff > 0.0f) {
                             acc += diff;

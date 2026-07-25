@@ -1380,11 +1380,12 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn batched_categorical_sample_f32(
         &mut self,
-        probs: &GpuTensor,      // [batch * vocab] f32 — softmax output
-        tau_cut: &GpuTensor,    // [batch] f32 — top-p threshold per row
-        z: &GpuTensor,          // [batch] f32 — kept mass per row
-        out_tokens: &GpuTensor, // [batch] i32 — sampled token ids
-        out_probs: &GpuTensor,  // [batch] f32 — prob at sampled token
+        probs: &GpuTensor,                 // [batch * vocab] f32 — softmax output
+        tau_cut: &GpuTensor,               // [batch] f32 — top-p threshold per row
+        z: &GpuTensor,                     // [batch] f32 — kept mass per row
+        out_tokens: &GpuTensor,            // [batch] i32 — sampled token ids
+        out_probs: &GpuTensor,             // [batch] f32 — prob at sampled token
+        out_top_probs: Option<&GpuTensor>, // optional [batch] f32 — raw row maxima
         vocab: usize,
         batch: usize,
         seed: u32,
@@ -1403,6 +1404,7 @@ impl Gpu {
         let mut sd = seed;
         let ot = out_tokens.buf.as_ptr();
         let op = out_probs.buf.as_ptr();
+        let otp = out_top_probs.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
 
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
@@ -1412,6 +1414,7 @@ impl Gpu {
             &mut sd as *mut _ as *mut c_void,
             &ot as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
+            &otp as *const _ as *mut c_void,
         ];
 
         // One block per row; 256 threads per block.
@@ -1430,6 +1433,7 @@ impl Gpu {
                 b.push_u32(sd);
                 b.push_ptr(ot);
                 b.push_ptr(op);
+                b.push_ptr(otp);
                 b
             },
         )
@@ -1445,7 +1449,7 @@ impl Gpu {
     /// target probs for the drafted positions; row `b` is used for the bonus
     /// draw when all b positions are accepted.
     ///
-    /// `dft_probs` must have `b * vocab` elements (draft side only).
+    /// `dft_probs` must have `b * draft_vocab` elements (draft side only).
     ///
     /// Returns the 16-byte output buffer contents as `[accept_len, bonus_token,
     /// rejected_at, new_rng_state]` (all i32/u32 words).  The caller reads the
@@ -1455,17 +1459,19 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn chain_accept_spec_f32(
         &mut self,
-        tgt_probs: &GpuTensor,        // [(b+1) * vocab] f32
-        dft_probs: &GpuTensor,        // [b * vocab] f32
-        draft_tokens: &GpuTensor,     // [b] i32
-        draft_p_at_token: &GpuTensor, // [b] f32
-        tau_t: &GpuTensor,            // [(b+1)] f32 — target topp tau per row
-        z_t: &GpuTensor,              // [(b+1)] f32 — target topp Z per row
-        tau_d: &GpuTensor,            // [b] f32 — draft topp tau per row
-        z_d: &GpuTensor,              // [b] f32 — draft topp Z per row
-        out: &GpuTensor,              // [4] i32 output buffer
+        tgt_probs: &GpuTensor,                   // [(b+1) * vocab] f32
+        dft_probs: &GpuTensor,                   // [b * draft_vocab] f32
+        draft_vocab_inverse: Option<&GpuTensor>, // optional [vocab] i32 full→draft
+        draft_tokens: &GpuTensor,                // [b] i32 full-vocab token ids
+        draft_p_at_token: &GpuTensor,            // [b] f32
+        tau_t: &GpuTensor,                       // [(b+1)] f32 — target topp tau per row
+        z_t: &GpuTensor,                         // [(b+1)] f32 — target topp Z per row
+        tau_d: &GpuTensor,                       // [b] f32 — draft topp tau per row
+        z_d: &GpuTensor,                         // [b] f32 — draft topp Z per row
+        out: &GpuTensor,                         // [4] i32 output buffer
         b: usize,
         vocab: usize,
+        draft_vocab: usize,
         rng_seed: u32,
         cactus_delta: f32,
     ) -> HipResult<()> {
@@ -1478,6 +1484,7 @@ impl Gpu {
 
         let tgt_p = tgt_probs.buf.as_ptr();
         let dft_p = dft_probs.buf.as_ptr();
+        let dinv = draft_vocab_inverse.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
         let dtok = draft_tokens.buf.as_ptr();
         let dpat = draft_p_at_token.buf.as_ptr();
         let tt = tau_t.buf.as_ptr();
@@ -1487,12 +1494,14 @@ impl Gpu {
         let outp = out.buf.as_ptr();
         let bv = b as i32;
         let vs = vocab as i32;
+        let dvs = draft_vocab as i32;
         let mut sd = rng_seed;
         let mut cd = cactus_delta;
 
         let mut params: Vec<*mut c_void> = vec![
             &tgt_p as *const _ as *mut c_void,
             &dft_p as *const _ as *mut c_void,
+            &dinv as *const _ as *mut c_void,
             &dtok as *const _ as *mut c_void,
             &dpat as *const _ as *mut c_void,
             &tt as *const _ as *mut c_void,
@@ -1501,6 +1510,7 @@ impl Gpu {
             &zd as *const _ as *mut c_void,
             &bv as *const _ as *mut c_void,
             &vs as *const _ as *mut c_void,
+            &dvs as *const _ as *mut c_void,
             &mut sd as *mut _ as *mut c_void,
             &mut cd as *mut _ as *mut c_void,
             &outp as *const _ as *mut c_void,
@@ -1517,6 +1527,7 @@ impl Gpu {
                 let mut bl = hip_bridge::KernargBlob::new();
                 bl.push_ptr(tgt_p);
                 bl.push_ptr(dft_p);
+                bl.push_ptr(dinv);
                 bl.push_ptr(dtok);
                 bl.push_ptr(dpat);
                 bl.push_ptr(tt);
@@ -1525,6 +1536,7 @@ impl Gpu {
                 bl.push_ptr(zd);
                 bl.push_i32(bv);
                 bl.push_i32(vs);
+                bl.push_i32(dvs);
                 bl.push_u32(sd);
                 bl.push_f32(cd);
                 bl.push_ptr(outp);

@@ -255,10 +255,14 @@ pub struct Qwen35MtpHeadWeights {
     // - `lm_head_draft_vocab_map_gpu`: same map on-device for the greedy
     //   MTP token-chain path, where draft idx -> full token must happen
     //   without a per-step D2H sync.
+    // - `lm_head_draft_vocab_inverse_gpu`: full-token -> draft-column map for
+    //   exact on-device residual sampling. Missing full-vocab entries are -1,
+    //   meaning the compressed draft assigns them zero probability.
     // - `compressed_vocab_size`: K. Cached for fast access in forward.
     pub lm_head_draft: Option<WeightTensor>,
     pub lm_head_draft_vocab_map: Option<Vec<u32>>,
     pub lm_head_draft_vocab_map_gpu: Option<GpuTensor>,
+    pub lm_head_draft_vocab_inverse_gpu: Option<GpuTensor>,
     pub compressed_vocab_size: Option<usize>,
 }
 
@@ -301,6 +305,9 @@ impl Qwen35MtpHeadWeights {
         }
         if let Some(vmap) = self.lm_head_draft_vocab_map_gpu {
             let _ = gpu.free_tensor(vmap);
+        }
+        if let Some(inverse) = self.lm_head_draft_vocab_inverse_gpu {
+            let _ = gpu.free_tensor(inverse);
         }
     }
 }
@@ -817,6 +824,34 @@ pub fn load_mtp_head(path: &Path, gpu: &mut Gpu, max_seq: usize) -> HipResult<Qw
     load_mtp_head_at_offset(path, gpu, max_seq, 0)
 }
 
+/// Build the inverse of the compressed draft vocabulary map.
+///
+/// The residual sampler walks the target's full vocabulary. An entry of `-1`
+/// means the compressed draft has no corresponding column and therefore
+/// assigns that token zero probability. Duplicate or out-of-range entries make
+/// the draft distribution ambiguous, so reject a malformed sidecar at load.
+fn build_draft_vocab_inverse(vmap: &[u32], vocab: usize) -> Vec<i32> {
+    assert!(
+        vmap.len() <= i32::MAX as usize,
+        "compressed vocab has {} entries, exceeding i32 indexing",
+        vmap.len()
+    );
+    let mut inverse = vec![-1_i32; vocab];
+    for (draft_idx, &full_token) in vmap.iter().enumerate() {
+        let full_token = full_token as usize;
+        assert!(
+            full_token < vocab,
+            "compressed vocab_map[{draft_idx}]={full_token} exceeds trunk vocab {vocab}"
+        );
+        assert_eq!(
+            inverse[full_token], -1,
+            "compressed vocab_map maps full token {full_token} more than once"
+        );
+        inverse[full_token] = draft_idx as i32;
+    }
+    inverse
+}
+
 /// Like [`load_mtp_head`] but opens the HFQM container at `base_offset`
 /// inside `path`. Pass `0` for a standalone `.mtp` file; for a bundled
 /// `.mq4-mtp` file pass the offset returned by [`detect_bundled_mtp_offset`].
@@ -900,6 +935,7 @@ pub fn load_mtp_head_at_offset(
         lm_head_draft,
         lm_head_draft_vocab_map,
         lm_head_draft_vocab_map_gpu,
+        lm_head_draft_vocab_inverse_gpu,
         compressed_vocab_size,
     ) = if has_compressed {
         let cvs = meta
@@ -928,10 +964,20 @@ pub fn load_mtp_head_at_offset(
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        let inverse = build_draft_vocab_inverse(&vmap, config.vocab_size);
+        let inverse_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(inverse.as_ptr() as *const u8, inverse.len() * 4) };
         let vmap_gpu = gpu.upload_raw(&vmap_bytes, &[vmap_bytes.len()])?;
-        (Some(lm_d), Some(vmap), Some(vmap_gpu), Some(cvs))
+        let inverse_gpu = gpu.upload_raw(inverse_bytes, &[inverse_bytes.len()])?;
+        (
+            Some(lm_d),
+            Some(vmap),
+            Some(vmap_gpu),
+            Some(inverse_gpu),
+            Some(cvs),
+        )
     } else {
-        (None, None, None, None)
+        (None, None, None, None, None)
     };
 
     let weights = Qwen35MtpHeadWeights {
@@ -951,6 +997,7 @@ pub fn load_mtp_head_at_offset(
         lm_head_draft,
         lm_head_draft_vocab_map,
         lm_head_draft_vocab_map_gpu,
+        lm_head_draft_vocab_inverse_gpu,
         compressed_vocab_size,
     };
 
@@ -2480,4 +2527,29 @@ pub fn mtp_head_forward_block_batched(
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_draft_vocab_inverse;
+
+    #[test]
+    fn draft_vocab_inverse_marks_unmapped_tokens() {
+        assert_eq!(
+            build_draft_vocab_inverse(&[4, 1, 6], 8),
+            vec![-1, 1, -1, -1, 0, -1, 2, -1]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "more than once")]
+    fn draft_vocab_inverse_rejects_duplicates() {
+        let _ = build_draft_vocab_inverse(&[2, 2], 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds trunk vocab")]
+    fn draft_vocab_inverse_rejects_out_of_range_tokens() {
+        let _ = build_draft_vocab_inverse(&[4], 4);
+    }
 }

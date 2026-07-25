@@ -178,13 +178,14 @@ fn gpu_categorical_sample_one(
     tau: f32,
     z: f32,
     seed: u32,
-) -> (u32, f32) {
+) -> (u32, f32, f32) {
     assert_eq!(probs.len(), VOCAB);
     let d_probs = gpu.upload_f32(probs, &[VOCAB]).unwrap();
     let d_tau = gpu.upload_f32(&[tau], &[1]).unwrap();
     let d_z = gpu.upload_f32(&[z], &[1]).unwrap();
     let d_out_tok = gpu.zeros(&[1], rdna_compute::DType::F32).unwrap(); // i32 as raw bytes
     let d_out_prob = gpu.zeros(&[1], rdna_compute::DType::F32).unwrap();
+    let d_out_top_prob = gpu.zeros(&[1], rdna_compute::DType::F32).unwrap();
 
     gpu.batched_categorical_sample_f32(
         &d_probs,
@@ -192,6 +193,7 @@ fn gpu_categorical_sample_one(
         &d_z,
         &d_out_tok,
         &d_out_prob,
+        Some(&d_out_top_prob),
         VOCAB,
         1,
         seed,
@@ -200,15 +202,17 @@ fn gpu_categorical_sample_one(
 
     let tok_raw = gpu.download_f32(&d_out_tok).unwrap();
     let prob_raw = gpu.download_f32(&d_out_prob).unwrap();
+    let top_prob_raw = gpu.download_f32(&d_out_top_prob).unwrap();
 
     gpu.free_tensor(d_probs).unwrap();
     gpu.free_tensor(d_tau).unwrap();
     gpu.free_tensor(d_z).unwrap();
     gpu.free_tensor(d_out_tok).unwrap();
     gpu.free_tensor(d_out_prob).unwrap();
+    gpu.free_tensor(d_out_top_prob).unwrap();
 
     let tok = f32::to_bits(tok_raw[0]) as u32;
-    (tok, prob_raw[0])
+    (tok, prob_raw[0], top_prob_raw[0])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -244,6 +248,7 @@ fn gpu_chain_accept(
     gpu.chain_accept_spec_f32(
         &d_tgt,
         &d_dft,
+        None,
         &d_dtok,
         &d_dpat,
         &d_tt,
@@ -252,6 +257,7 @@ fn gpu_chain_accept(
         &d_zd,
         &d_out,
         b,
+        VOCAB,
         VOCAB,
         seed,
         cactus_delta,
@@ -262,6 +268,87 @@ fn gpu_chain_accept(
 
     gpu.free_tensor(d_tgt).unwrap();
     gpu.free_tensor(d_dft).unwrap();
+    gpu.free_tensor(d_dtok).unwrap();
+    gpu.free_tensor(d_dpat).unwrap();
+    gpu.free_tensor(d_tt).unwrap();
+    gpu.free_tensor(d_zt).unwrap();
+    gpu.free_tensor(d_td).unwrap();
+    gpu.free_tensor(d_zd).unwrap();
+    gpu.free_tensor(d_out).unwrap();
+
+    [
+        f32::to_bits(raw[0]) as i32,
+        f32::to_bits(raw[1]) as i32,
+        f32::to_bits(raw[2]) as i32,
+        f32::to_bits(raw[3]) as i32,
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gpu_chain_accept_compressed(
+    gpu: &mut rdna_compute::Gpu,
+    tgt_probs_flat: &[f32], // (b+1) * VOCAB
+    dft_probs_flat: &[f32], // b * draft_vocab
+    draft_vocab_map: &[usize],
+    draft_tokens: &[i32],
+    draft_p_at_tok: &[f32],
+    b: usize,
+    seed: u32,
+) -> [i32; 4] {
+    let draft_vocab = draft_vocab_map.len();
+    let mut inverse = vec![-1_i32; VOCAB];
+    for (draft_idx, &full_token) in draft_vocab_map.iter().enumerate() {
+        inverse[full_token] = draft_idx as i32;
+    }
+
+    let d_tgt = gpu.upload_f32(tgt_probs_flat, &[(b + 1) * VOCAB]).unwrap();
+    let d_dft = gpu
+        .upload_f32(dft_probs_flat, &[b * draft_vocab])
+        .unwrap();
+    let d_inverse = gpu
+        .upload_raw(
+            unsafe {
+                std::slice::from_raw_parts(inverse.as_ptr() as *const u8, inverse.len() * 4)
+            },
+            &[inverse.len() * 4],
+        )
+        .unwrap();
+    let d_dtok = gpu
+        .upload_raw(
+            unsafe { std::slice::from_raw_parts(draft_tokens.as_ptr() as *const u8, b * 4) },
+            &[b],
+        )
+        .unwrap();
+    let d_dpat = gpu.upload_f32(draft_p_at_tok, &[b]).unwrap();
+    let d_tt = gpu.upload_f32(&vec![0.0; b + 1], &[b + 1]).unwrap();
+    let d_zt = gpu.upload_f32(&vec![1.0; b + 1], &[b + 1]).unwrap();
+    let d_td = gpu.upload_f32(&vec![0.0; b], &[b]).unwrap();
+    let d_zd = gpu.upload_f32(&vec![1.0; b], &[b]).unwrap();
+    let d_out = gpu.zeros(&[4], rdna_compute::DType::F32).unwrap();
+
+    gpu.chain_accept_spec_f32(
+        &d_tgt,
+        &d_dft,
+        Some(&d_inverse),
+        &d_dtok,
+        &d_dpat,
+        &d_tt,
+        &d_zt,
+        &d_td,
+        &d_zd,
+        &d_out,
+        b,
+        VOCAB,
+        draft_vocab,
+        seed,
+        0.0,
+    )
+    .unwrap();
+
+    let raw = gpu.download_f32(&d_out).unwrap();
+    gpu.free_tensor(d_tgt).unwrap();
+    gpu.free_tensor(d_dft).unwrap();
+    gpu.free_tensor(d_inverse).unwrap();
     gpu.free_tensor(d_dtok).unwrap();
     gpu.free_tensor(d_dpat).unwrap();
     gpu.free_tensor(d_tt).unwrap();
@@ -400,9 +487,17 @@ fn main() {
             // Run 50 GPU samples; all must select the argmax.
             for smp in 0..50u32 {
                 let seed = 0xABCD_0000u32.wrapping_add(smp);
-                let (tok, _) = gpu_categorical_sample_one(&mut gpu, &probs, 0.0, 1.0, seed);
+                let (tok, _, top_prob) =
+                    gpu_categorical_sample_one(&mut gpu, &probs, 0.0, 1.0, seed);
                 if tok != expected {
                     println!("  FAIL trial={trial} sample={smp}: expected={expected} got={tok}");
+                    ok = false;
+                }
+                if (top_prob - probs[peak]).abs() > 1e-6 {
+                    println!(
+                        "  FAIL trial={trial} sample={smp}: top_prob={} expected={}",
+                        top_prob, probs[peak]
+                    );
                     ok = false;
                 }
             }
@@ -504,7 +599,7 @@ fn main() {
             let mut hist_gpu = vec![0u32; VOCAB];
             for s_idx in 0..N_SAMPLES {
                 let seed = 0x1234_5600u32.wrapping_add(s_idx as u32);
-                let (tok, _) =
+                let (tok, _, _) =
                     gpu_categorical_sample_one(&mut gpu, &case.probs, case.tau, case.z, seed);
                 if (tok as usize) < VOCAB {
                     hist_gpu[tok as usize] += 1;
@@ -536,7 +631,8 @@ fn main() {
             let base_seed = 0x1234_5600u32.wrapping_add(s_idx as u32);
             let gpu_seed = base_seed;
             let sim_seed = gpu_seed_for_row(base_seed, 0); // row=0 for single-row calls
-            let (gpu_tok, _) = gpu_categorical_sample_one(&mut gpu, &probs, 0.0, 1.0, gpu_seed);
+            let (gpu_tok, _, _) =
+                gpu_categorical_sample_one(&mut gpu, &probs, 0.0, 1.0, gpu_seed);
             let sim_tok = host_simulate_gpu_categorical(&probs, 0.0, 1.0, sim_seed);
             if gpu_tok != sim_tok {
                 mismatches += 1;
@@ -889,6 +985,96 @@ fn main() {
         println!("  host distribution: {:?}", &hist_host);
         println!("  gpu  distribution: {:?}", &hist_gpu);
         if tv >= 0.02 {
+            all_pass = false;
+        }
+    }
+
+    // ── Check 5: compressed-vocab inverse-map equivalence ────────────────
+    // A compact draft row plus full→draft inverse map must be exactly
+    // equivalent to scattering that row into a zero-filled full-vocab vector.
+    println!("\n[5] Compressed-vocab inverse-map equivalence");
+    {
+        let b = 2usize;
+        let map = vec![10usize, 50, 100, 500];
+        let compact_rows = vec![
+            vec![0.10f32, 0.60, 0.20, 0.10],
+            vec![0.40f32, 0.10, 0.40, 0.10],
+        ];
+        let compact_flat: Vec<f32> =
+            compact_rows.iter().flat_map(|row| row.iter().copied()).collect();
+        let full_rows: Vec<Vec<f32>> = compact_rows
+            .iter()
+            .map(|compact| {
+                let mut full = vec![0.0f32; VOCAB];
+                for (draft_idx, &full_token) in map.iter().enumerate() {
+                    full[full_token] = compact[draft_idx];
+                }
+                full
+            })
+            .collect();
+        let full_flat: Vec<f32> =
+            full_rows.iter().flat_map(|row| row.iter().copied()).collect();
+        let draft_tokens = vec![50_i32, 100_i32];
+        let draft_p_at_tok = vec![0.60f32, 0.40f32];
+
+        let mut target_rows = Vec::with_capacity(b + 1);
+        let mut row0 = vec![0.0f32; VOCAB];
+        row0[50] = 0.30;
+        row0[10] = 0.30;
+        row0[200] = 0.40;
+        target_rows.push(row0);
+        let mut row1 = vec![0.0f32; VOCAB];
+        row1[100] = 0.20;
+        row1[10] = 0.30;
+        row1[300] = 0.50;
+        target_rows.push(row1);
+        let mut bonus = vec![0.0f32; VOCAB];
+        bonus[500] = 0.30;
+        bonus[700] = 0.70;
+        target_rows.push(bonus);
+        let target_flat: Vec<f32> = target_rows
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect();
+
+        let mut mismatches = 0usize;
+        for i in 0..512u32 {
+            let seed = 0xBEEF_0000u32.wrapping_add(i);
+            let full = gpu_chain_accept(
+                &mut gpu,
+                &target_flat,
+                &full_flat,
+                &draft_tokens,
+                &draft_p_at_tok,
+                &[0.0, 0.0, 0.0],
+                &[1.0, 1.0, 1.0],
+                &[0.0, 0.0],
+                &[1.0, 1.0],
+                b,
+                seed,
+                0.0,
+            );
+            let compact = gpu_chain_accept_compressed(
+                &mut gpu,
+                &target_flat,
+                &compact_flat,
+                &map,
+                &draft_tokens,
+                &draft_p_at_tok,
+                b,
+                seed,
+            );
+            if full != compact {
+                mismatches += 1;
+                if mismatches <= 5 {
+                    println!("  seed={seed:#010x}: full={full:?} compact={compact:?}");
+                }
+            }
+        }
+        if mismatches == 0 {
+            println!("  PASS: 512/512 compact results match zero-scattered full vocab");
+        } else {
+            println!("  FAIL: {mismatches}/512 compact results differ");
             all_pass = false;
         }
     }

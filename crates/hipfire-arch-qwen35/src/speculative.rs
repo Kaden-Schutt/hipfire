@@ -3256,6 +3256,7 @@ pub fn spec_step_dflash(
                     &z_dev,
                     &tok_dev,
                     &pat_dev,
+                    None,
                     vocab,
                     batch,
                     seed_u32,
@@ -3555,6 +3556,7 @@ pub fn spec_step_dflash(
             gpu.chain_accept_spec_f32(
                 &tgt_probs_dev,
                 dft_probs_dev,
+                None,
                 dft_tok_dev,
                 dft_pat_dev,
                 &tau_t_dev,
@@ -3563,6 +3565,7 @@ pub fn spec_step_dflash(
                 z_d_dev,
                 &out_dev,
                 draft_b,
+                vocab,
                 vocab,
                 rng_seed,
                 cactus_delta,
