@@ -638,6 +638,10 @@ pub struct MoeFfnWeights {
     /// Owned device buffer (no aliasing) — freed as a buffer in free_moe_ffn.
     pub expert_dtype_tags: Option<GpuTensor>,
 
+    /// EP-shard zero gate-up target for non-owned expert slots. The pointer
+    /// tables reference this buffer, so it is owned alongside the tables.
+    pub expert_gate_up_dummy: Option<GpuTensor>,
+
     /// Layer index. Stable identity used to key
     /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.
     pub layer_idx: u16,
@@ -916,6 +920,9 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     }
     // Owned device buffer (built from per-expert gpu_dtype). Free it.
     if let Some(t) = ffn.expert_dtype_tags {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = ffn.expert_gate_up_dummy {
         let _ = gpu.free_tensor(t);
     }
     for e in ffn.experts {
@@ -2335,6 +2342,7 @@ fn paro_load_moe_ffn(
         expert_down_awq_ptrs: None,
         // Paged/paro layers are uniform-dtype — no per-expert mixed table.
         expert_dtype_tags: None,
+        expert_gate_up_dummy: None,
         layer_idx,
         expert_shape: None,
         paro_shared: Some(shared),
@@ -3890,18 +3898,24 @@ pub(crate) fn load_moe_ffn(
     // in-bounds) — exactly what `shard_moe_experts` builds post-load.
     let mut gu_ptrs = vec![0u64; n_exp];
     let mut dn_ptrs = vec![0u64; n_exp];
+    let dummy_slot = if ep_shard.is_some() && experts.len() < n_exp {
+        Some(
+            gpu.zeros(&[experts[0].gate_up.buf.buf.size() / 4], DType::F32)
+                .map_err(|e| HipError::new(0, &format!("qwen35: zero EP gate-up dummy: {e:?}")))?,
+        )
+    } else {
+        None
+    };
     if ep_shard.is_some() {
         assert!(
             !experts.is_empty(),
             "EP shard: rank owns no experts in layer {layer_idx}"
         );
         // Shared zeroed gate_up dummy (same byte size as a real expert gate_up).
-        // LEAKED so the ptr stays valid for the model's lifetime (matches
-        // shard_moe_experts v1).
-        let gu_buf_bytes = experts[0].gate_up.buf.buf.size();
-        let zero_gu = gpu.zeros(&[gu_buf_bytes / 4], DType::F32)?;
-        let dummy_gu = zero_gu.buf.as_ptr() as u64;
-        std::mem::forget(zero_gu);
+        let dummy_gu = dummy_slot
+            .as_ref()
+            .map(|tensor| tensor.buf.as_ptr() as u64)
+            .unwrap_or_else(|| experts[0].gate_up.buf.buf.as_ptr() as u64);
         let dummy_dn = experts[0].down.buf.buf.as_ptr() as u64;
         let mut li = 0usize;
         for slot in 0..n_exp {
@@ -3927,6 +3941,7 @@ pub(crate) fn load_moe_ffn(
     let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
+    let dummy_gate_up_slot = dummy_slot;
 
     // Route A MoE-AWQ: when every expert carries a down.awq_scale sidecar
     // (auto-loaded by load_weight_tensor for MQ4G256, which supports_awq_sidecar),
@@ -3962,9 +3977,9 @@ pub(crate) fn load_moe_ffn(
             .map(|e| e.down.awq_scale.as_ref().unwrap().buf.as_ptr() as u64)
             .collect();
         let aw_bytes: Vec<u8> = aw_ptrs.iter().flat_map(|q| q.to_ne_bytes()).collect();
-        let t = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-        gpu.hip.memcpy_htod(&t.buf, &aw_bytes)?;
-        Some(t)
+        let slot = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+        gpu.hip.memcpy_htod(&slot.buf, &aw_bytes)?;
+        Some(slot)
     } else {
         if awq_present != 0 {
             eprintln!(
@@ -4057,9 +4072,9 @@ pub(crate) fn load_moe_ffn(
                     _ => 2u8, // default: treat unknown tiers as MQ4
                 })
                 .collect();
-            let t = gpu.alloc_tensor(&[n_exp], DType::Raw)?;
-            gpu.hip.memcpy_htod(&t.buf, &tags)?;
-            Some(t)
+            let slot = gpu.alloc_tensor(&[n_exp], DType::Raw)?;
+            gpu.hip.memcpy_htod(&slot.buf, &tags)?;
+            Some(slot)
         } else {
             None
         }
@@ -4067,6 +4082,7 @@ pub(crate) fn load_moe_ffn(
         None
     };
 
+    let dummy_gate_up = dummy_gate_up_slot;
     Ok(MoeFfnWeights {
         router,
         experts,
@@ -4076,6 +4092,7 @@ pub(crate) fn load_moe_ffn(
         expert_down_ptrs,
         expert_down_awq_ptrs,
         expert_dtype_tags,
+        expert_gate_up_dummy: dummy_gate_up,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -13113,8 +13130,8 @@ fn moe_ffn_dispatch_ep(
 /// through `moe_down_combine` WITHOUT any masking kernel. (The non-owned down
 /// ptr is irrelevant — its input rot is already 0 — so it reuses
 /// `experts[0].down`.) Router / shared expert / attention stay full (replicated
-/// in EP v1). The zero buffer is leaked for v1 (lives until teardown) to avoid
-/// threading a lifetime field through `Qwen35Weights`.
+/// in EP v1). The zero buffer is owned by the per-layer FFN and freed during
+/// teardown.
 pub fn shard_moe_experts(
     gpu: &mut Gpu,
     ffn: &mut MoeFfnWeights,
@@ -13153,13 +13170,12 @@ pub fn shard_moe_experts(
     );
 
     // Shared zeroed gate_up buffer for non-owned slots (same byte size as a real
-    // expert's gate_up). LEAKED (mem::forget) so the ptr stays valid for the
-    // model's lifetime without a Qwen35Weights field — v1 TODO: own it properly.
+    // expert's gate_up). Keep it in the per-layer owner because the pointer table
+    // below bakes its address.
     let gu_bytes = compacted[0].gate_up.buf.buf.size();
-    let zero_gu = gpu.zeros(&[gu_bytes / 4], DType::F32)?;
-    let dummy_gu = zero_gu.buf.as_ptr() as u64;
+    let dummy_slot = gpu.zeros(&[gu_bytes / 4], DType::F32)?;
+    let dummy_gu = dummy_slot.buf.as_ptr() as u64;
     let dummy_dn = compacted[0].down.buf.buf.as_ptr() as u64; // rot=0 ⇒ output 0 regardless
-    std::mem::forget(zero_gu);
 
     // Rebuild the [2·n_exp] u64 pointer tables (8 B/ptr = 2 F32 slots).
     let mut gu = vec![0u64; n_exp];
@@ -13203,6 +13219,7 @@ pub fn shard_moe_experts(
         gpu.hip.memcpy_htod(&awq_tbl.buf, &aw_b)?;
     }
 
+    ffn.expert_gate_up_dummy = Some(dummy_slot);
     ffn.experts = compacted;
     Ok(())
 }

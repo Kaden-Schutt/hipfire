@@ -733,20 +733,19 @@ impl MiniMaxWeights {
             // (base + local*stride); non-owned e → a shared ZEROED gate_up buffer
             // (→ 0 output ⇒ 0 contribution; down ptr is irrelevant since its rot
             // input is 0, so it reuses the compact down base).
-            // Owned (not forgotten): held in `dummy_gate_up` on the layer below
-            // so the staging guard reclaims it if a later layer fails to load,
-            // and `free_gpu` reclaims it on a successful EP unload. GpuTensor has
-            // no Drop, so leaving it on the stack here would leak its buffer; we
-            // must thread it into the layer struct.
-            let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
-                let z = gpu
+            // Owned in `dummy_gate_up` on the layer below so `free_gpu` reclaims
+            // it on a successful EP unload. GpuTensor has no Drop, so leaving it
+            // on the stack here would leak its buffer; we must thread it into
+            // the layer struct.
+            let dummy_slot = if shard.is_some() && n_owned < n_exp {
+                let slot = gpu
                     .zeros(&[gu_packed_stride / 4], DType::F32)
                     .map_err(|e| format!("minimax L{l}: zero gate_up dummy: {e:?}"))?;
-                Some(z)
+                Some(slot)
             } else {
                 None
             };
-            let dummy_gu = dummy_gate_up
+            let dummy_gu = dummy_slot
                 .as_ref()
                 .map(|z| z.buf.as_ptr() as u64)
                 .unwrap_or(gu_base);
@@ -782,6 +781,7 @@ impl MiniMaxWeights {
             gpu.hip
                 .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
                 .map_err(|e| format!("minimax: htod dn_ptrs: {e:?}"))?;
+            let dummy_gate_up = dummy_slot;
 
             layers.push(MiniMaxLayerWeights {
                 attn_norm,

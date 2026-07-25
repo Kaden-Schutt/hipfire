@@ -221,6 +221,11 @@ impl DeepseekV4 {
             }
         }
         let src = |slot: usize| -> usize { keep.map(|k| k[slot] as usize).unwrap_or(slot) };
+        let w2_blob_slot;
+        let w2_ptr_slot;
+        let gate_up_blob_slot;
+        let gate_up_ptr_slot;
+        let mut dummy_slot = None;
         // EP shard: precompute owned set + compact-slot mapping. `shard = None`
         // ⇒ every expert owned, `local_of_global[e] == e`, n_owned == n_exp →
         // identical layout to the unsharded path.
@@ -295,11 +300,11 @@ impl DeepseekV4 {
             }
             let mut blob_shape = vec![n_owned];
             blob_shape.extend_from_slice(&shape0);
-            let blob_tensor = gpu
+            let blob_slot = gpu
                 .upload_raw(&blob, &blob_shape)
                 .map_err(|e| format!("deepseek4: upload blob {prefix}.w2: {e:?}"))?;
             drop(blob);
-            let base_ptr = blob_tensor.buf.as_ptr() as u64;
+            let base_ptr = blob_slot.buf.as_ptr() as u64;
             // Owned e → compact slot; non-owned e → base (rotate input 0 ⇒
             // output 0 regardless of which down weights are read).
             let ptrs: Vec<u64> = (0..n_exp)
@@ -312,14 +317,14 @@ impl DeepseekV4 {
                 })
                 .collect();
             let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-            let ptr_tensor = gpu
+            let ptr_slot = gpu
                 .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
                 .map_err(|e| format!("deepseek4: alloc ptr table {prefix}.w2: {e:?}"))?;
             gpu.hip
-                .memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
+                .memcpy_htod(&ptr_slot.buf, &ptr_bytes)
                 .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
-            layer.expert_w2_blob = Some(blob_tensor);
-            layer.expert_w2_ptrs = Some(ptr_tensor);
+            w2_blob_slot = blob_slot;
+            w2_ptr_slot = ptr_slot;
             layer.expert_w2_stride = packed_stride;
         }
         // gate_up (combined w1 ‖ w3): per-expert pread, pack ONLY owned, single
@@ -405,29 +410,26 @@ impl DeepseekV4 {
                     }
                 }
             }
-            let combined_tensor = gpu
+            let combined_slot = gpu
                 .upload_raw(&combined, &[n_owned, packed_combined])
                 .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
             drop(combined);
-            let base_ptr = combined_tensor.buf.as_ptr() as u64;
+            let base_ptr = combined_slot.buf.as_ptr() as u64;
             // Non-owned gate_up ptr → a shared zeroed dummy (only when actually
             // sharding with some experts non-owned); else the compact base.
             // Owned (not mem::forget-leaked): the zeroed buffer is threaded into
-            // `layer.expert_gate_up_dummy` so the staging guard reclaims it if a
-            // later layer/global fails to load, and `free_gpu` reclaims it on a
+            // `layer.expert_gate_up_dummy` so `free_gpu` reclaims it on a
             // successful EP unload. GpuTensor has no Drop, so leaving it on the
             // stack here would leak its buffer. Must outlive the device pointer
             // table built just below that bakes its address. Mirrors the
             // minimax `dummy_gate_up` fix.
-            let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
+            if shard.is_some() && n_owned < n_exp {
                 let z = gpu
                     .zeros(&[combined_stride / 4], rdna_compute::DType::F32)
                     .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?;
-                Some(z)
-            } else {
-                None
-            };
-            let dummy_gu = dummy_gate_up
+                dummy_slot = Some(z);
+            }
+            let dummy_gu = dummy_slot
                 .as_ref()
                 .map(|z| z.buf.as_ptr() as u64)
                 .unwrap_or(base_ptr);
@@ -441,19 +443,26 @@ impl DeepseekV4 {
                 })
                 .collect();
             let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-            let ptr_tensor = gpu
+            let ptr_slot = gpu
                 .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
                 .map_err(|e| format!("deepseek4: alloc gate_up ptr table {prefix}: {e:?}"))?;
             gpu.hip
-                .memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
+                .memcpy_htod(&ptr_slot.buf, &ptr_bytes)
                 .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
-            layer.expert_gate_up_blob = Some(combined_tensor);
-            layer.expert_gate_up_ptrs = Some(ptr_tensor);
+            gate_up_blob_slot = combined_slot;
+            gate_up_ptr_slot = ptr_slot;
             layer.expert_gate_up_stride = packed_combined;
-            // Store the owning handle (None on single-GPU / fully-owned shards).
-            // Its device pointer is already baked into `ptr_tensor` above.
-            layer.expert_gate_up_dummy = dummy_gate_up;
         }
+        let gate_up_ptrs = gate_up_ptr_slot;
+        let dummy = dummy_slot;
+        let gate_up_blob = gate_up_blob_slot;
+        let w2_ptrs = w2_ptr_slot;
+        let w2_blob = w2_blob_slot;
+        layer.expert_w2_blob = Some(w2_blob);
+        layer.expert_w2_ptrs = Some(w2_ptrs);
+        layer.expert_gate_up_blob = Some(gate_up_blob);
+        layer.expert_gate_up_ptrs = Some(gate_up_ptrs);
+        layer.expert_gate_up_dummy = dummy;
         Ok(())
     }
 

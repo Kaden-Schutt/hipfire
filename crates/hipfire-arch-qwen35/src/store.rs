@@ -1272,6 +1272,7 @@ fn typed_moe_ffn(
         expert_down_ptrs: down_ptrs,
         expert_down_awq_ptrs: down_awq_ptrs,
         expert_dtype_tags: dtype_tags,
+        expert_gate_up_dummy: None,
         layer_idx: layer as u16,
         expert_shape: None,
         paro_shared: None,
