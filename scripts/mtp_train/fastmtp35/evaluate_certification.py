@@ -161,10 +161,14 @@ def evaluate(root: Path, expected_turns: int = 8) -> dict[str, Any]:
         if len(numeric(rows_by_label[label], "tau")) != expected_turns:
             failures.append(f"{label}: missing finite tau measurements")
 
+    for label in LABELS:
+        for flag in QUALITY_FLAGS:
+            if summary[label][flag]:
+                failures.append(
+                    f"{label}: {summary[label][flag]} {flag} turn(s)"
+                )
+
     candidate = summary["candidate-mtp"]
-    for flag in QUALITY_FLAGS:
-        if candidate[flag]:
-            failures.append(f"candidate-mtp: {candidate[flag]} {flag} turn(s)")
     if candidate["recall_total"] <= 0:
         failures.append("candidate-mtp: session emitted no scored recall checks")
     elif candidate["recall_hits"] != candidate["recall_total"]:

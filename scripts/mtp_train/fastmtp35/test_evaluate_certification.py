@@ -93,6 +93,16 @@ class CertificationTest(unittest.TestCase):
         self.assertFalse(summary["promotion_pass"])
         self.assertTrue(any("recall" in item for item in summary["failures"]))
 
+    def test_incoherent_baseline_fails(self):
+        temp, root = self.fixture()
+        self.addCleanup(temp.cleanup)
+        stock = json.loads((root / "stock-mtp.json").read_text())
+        stock[3]["runaway"] = True
+        (root / "stock-mtp.json").write_text(json.dumps(stock))
+        summary = evaluate(root)
+        self.assertFalse(summary["promotion_pass"])
+        self.assertIn("stock-mtp: 1 runaway turn(s)", summary["failures"])
+
 
 if __name__ == "__main__":
     unittest.main()
