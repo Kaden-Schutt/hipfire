@@ -304,6 +304,21 @@ fn mtp_gpu_lcg_advance_once(seed: u32) -> u32 {
         .wrapping_add(1_013_904_223)
 }
 
+/// Fold an arbitrary 64-bit request seed into the GPU sampler's 32-bit state.
+///
+/// The sampling kernels force the low bit (`seed | 1`) before their first LCG
+/// step. A plain low/high XOR therefore aliases every adjacent even/odd request
+/// pair (for example seeds 2 and 3), producing identical MTP transcripts.
+/// SplitMix64 avalanches nearby request seeds before the unavoidable 32-bit
+/// fold, making those aliases vanishingly rare while remaining deterministic.
+fn mtp_gpu_seed(seed: u64) -> u32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z as u32) ^ ((z >> 32) as u32)
+}
+
 /// Sample one token from a row of logits with temp/top_k/top_p/min_p.
 /// Returns `(token_id, p_sampled)` where `p_sampled` is the normalized
 /// probability of the chosen token under the truncated distribution.
@@ -799,9 +814,9 @@ impl MtpSpecState {
             self.penalty_history.drain(..discard);
         }
         self.rng = MtpRng::new(seed);
-        // GPU rng uses u32; mix the lower + upper halves so different seeds
-        // produce different on-device streams.
-        self.gpu_rng_state = ((seed >> 32) as u32) ^ (seed as u32) | 1;
+        // GPU rng uses u32 and the kernels force its low bit. Avalanche the
+        // request seed first so adjacent even/odd seeds do not alias.
+        self.gpu_rng_state = mtp_gpu_seed(seed);
     }
 
     /// Replace the penalty history for a new generation request. Product AR
@@ -3644,6 +3659,12 @@ mod tests {
         assert_eq!(cfg.presence_penalty, 0.0);
         assert_eq!(cfg.frequency_penalty, 0.0);
         assert!(!cfg.has_penalties());
+    }
+
+    #[test]
+    fn gpu_request_seed_does_not_alias_adjacent_even_odd_values() {
+        assert_ne!(mtp_gpu_seed(2) | 1, mtp_gpu_seed(3) | 1);
+        assert_ne!(mtp_gpu_seed(42) | 1, mtp_gpu_seed(43) | 1);
     }
 
     #[test]
