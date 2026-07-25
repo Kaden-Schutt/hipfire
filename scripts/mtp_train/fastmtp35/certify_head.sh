@@ -56,9 +56,15 @@ trap gpu_release EXIT
 link_fixture() {
     local source="$1"
     local destination="$2"
+    local pinned_source
+    pinned_source="$(realpath "$source")"
+    [[ -f "$pinned_source" && -s "$pinned_source" ]] || {
+        echo "certification fixture does not resolve to a non-empty regular file: $source" >&2
+        exit 2
+    }
     rm -f "$destination"
-    if ! ln "$source" "$destination"; then
-        echo "cannot hard-link certification fixture (source/output must share a filesystem): $source -> $destination" >&2
+    if ! ln "$pinned_source" "$destination"; then
+        echo "cannot hard-link certification fixture (source/output must share a filesystem): $pinned_source -> $destination" >&2
         exit 2
     fi
 }
