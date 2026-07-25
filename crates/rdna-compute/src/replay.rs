@@ -2010,6 +2010,20 @@ impl ReplayController {
         controller
     }
 
+    /// Construct an explicitly-owned retained-PM4 controller.
+    ///
+    /// Model subsystems with a different immutable launch topology (for
+    /// example an MTP batched verifier) must not reuse the plain-AR
+    /// controller: preparing their tape would replace the already-certified
+    /// AR tape. This constructor preserves all configured PM4 queue, wait,
+    /// acquire, and register policies while forcing only the transport and
+    /// adoption mode required by that subsystem-owned tape.
+    pub fn new_retained_pm4_armed() -> Self {
+        let mut controller = Self::new_armed(ReplayBackendRequest::Auto);
+        controller.transport = ReplayTransport::Pm4Ib;
+        controller
+    }
+
     /// Apply the daemon's model-scoped replay default after a successful load.
     ///
     /// An explicit backend selection always wins. Otherwise every successful
@@ -3960,6 +3974,15 @@ mod tests {
         controller.record_hip_launch("k", None, [1; 3], [32, 1, 1], 0, &[]);
         assert!(controller.recorded_launches().is_empty());
         assert!(!controller.should_route_aql());
+    }
+
+    #[test]
+    fn subsystem_controller_is_armed_for_retained_pm4() {
+        let controller = ReplayController::new_retained_pm4_armed();
+        assert_eq!(controller.request(), ReplayBackendRequest::Auto);
+        assert_eq!(controller.state(), ReplayState::Armed);
+        assert_eq!(controller.transport_name(), "pm4");
+        assert!(controller.recorded_launches().is_empty());
     }
 
     #[test]

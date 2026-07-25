@@ -9996,6 +9996,12 @@ fn forward_batch_chunk_impl(
         }
     };
     let unsafe_batch_replay = gpu.replay.is_enabled() && gpu.flags.independent_batch_replay;
+    // A subsystem-owned Redline capture (notably the MTP verifier) records
+    // this same batched body without entering HIP graph capture. Its retained
+    // tape has the identical fixed-shape requirement: changing positions live
+    // in `pbs.positions`, while scalar route/geometry decisions must be baked
+    // for the physical capacity rather than the capture cycle's prefix.
+    let retained_batch_capture = gpu.replay.is_recording();
     let max_ctx_len = if batch_semantics.is_independent() && unsafe_batch_replay {
         // The unsafe replay oracle needs a fixed launch shape: positions
         // change every step, but PM4/AQL geometry and LDS may not. Ordinary
@@ -10005,7 +10011,7 @@ fn forward_batch_chunk_impl(
             BatchSemantics::Independent { lane_capacity, .. } => lane_capacity,
             BatchSemantics::Sequential => unreachable!(),
         }
-    } else if gpu.graphs.capture_mode {
+    } else if gpu.graphs.capture_mode || retained_batch_capture {
         kv_cache.physical_cap
     } else {
         logical_max_ctx
@@ -11345,7 +11351,7 @@ fn forward_batch_chunk_impl(
                 let plan = KvTierPlan::derive(KvTierInputs {
                     pos: start_pos,
                     flash_mode: s.flash_mode as usize,
-                    capture_mode: gpu.graphs.capture_mode,
+                    capture_mode: gpu.graphs.capture_mode || retained_batch_capture,
                     batch_size: n,
                     is_tree,
                     ..kv_cache.tier_inputs()
@@ -12927,7 +12933,7 @@ fn forward_batch_chunk_impl(
                 let plan = KvTierPlan::derive(KvTierInputs {
                     pos: start_pos,
                     flash_mode: s.flash_mode as usize,
-                    capture_mode: gpu.graphs.capture_mode,
+                    capture_mode: gpu.graphs.capture_mode || retained_batch_capture,
                     batch_size: n,
                     is_tree,
                     ..kv_cache.tier_inputs()

@@ -36,6 +36,7 @@ use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
+use rdna_compute::replay::{ReplayBackendRequest, ReplayController};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -195,6 +196,25 @@ fn mtp_verify_graph_enabled_from_env() -> bool {
             v == "1" || v == "true" || v == "on" || v == "yes"
         }
         Err(_) => false,
+    }
+}
+
+fn mtp_verify_pm4_enabled(gpu: &Gpu) -> bool {
+    // An explicit knob is useful for direct-HIP A/Bs and bring-up. Otherwise
+    // follow the model's certified retained-PM4 route on gfx12. The dedicated
+    // MTP controller owns a separate tape, so this does not replace the
+    // already-prepared plain-AR controller.
+    match hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_PM4") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on" || v == "yes"
+        }
+        Err(_) => {
+            gpu.arch.starts_with("gfx12")
+                && gpu.replay.is_enabled()
+                && gpu.replay.request() == ReplayBackendRequest::Auto
+                && gpu.replay.uses_pm4_transport()
+        }
     }
 }
 
@@ -591,6 +611,13 @@ pub struct MtpSpecState {
     mtp_verify_graph_warmed: HashSet<usize>,
     mtp_verify_graph_disabled: bool,
 
+    /// MTP-owned retained-PM4 verifier tapes keyed by live verify batch size.
+    /// The plain-AR tape remains in `Gpu::replay`; only capture temporarily
+    /// swaps one of these controllers into the central launch recorder.
+    mtp_verify_pm4: HashMap<usize, ReplayController>,
+    mtp_verify_pm4_warmed: HashSet<usize>,
+    mtp_verify_pm4_disabled: bool,
+
     /// Optional FastMTP-style compressed batched-logits output, shape
     /// `[max_n * compressed_vocab_size]`. Populated by
     /// [`spec_step_mtp_compressed`] when the head ships a sidecar.
@@ -786,6 +813,9 @@ impl MtpSpecState {
             mtp_verify_graphs: HashMap::new(),
             mtp_verify_graph_warmed: HashSet::new(),
             mtp_verify_graph_disabled: false,
+            mtp_verify_pm4: HashMap::new(),
+            mtp_verify_pm4_warmed: HashSet::new(),
+            mtp_verify_pm4_disabled: false,
             mtp_lm_logits_compressed: None,
             mtp_topk_idx,
             mtp_topk_logp,
@@ -1025,6 +1055,9 @@ impl MtpSpecState {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        // Drop retained queues/kernargs before releasing any model or
+        // MTP-owned allocation whose address is baked into those kernargs.
+        drop(self.mtp_verify_pm4);
         let _ = gpu.free_tensor(self.prev_hidden);
         let _ = gpu.free_tensor(self.verify_hidden);
         let _ = gpu.free_tensor(self.verify_logits);
@@ -1308,6 +1341,116 @@ fn run_mtp_trunk_verify(
     tape_captured: bool,
 ) -> HipResult<()> {
     let n = verify_tokens.len();
+    let retained_pm4_ok = mtp_verify_pm4_enabled(gpu)
+        && !state.mtp_verify_pm4_disabled
+        && tape_captured
+        && n <= state.trunk_pbs.max_batch
+        && matches!(
+            trunk_weights.embd_format,
+            llama::EmbeddingFormat::HFQ4G256 | llama::EmbeddingFormat::Q8_0
+        );
+
+    if retained_pm4_ok {
+        // Tokens and positions are the only changing verifier inputs. These
+        // blocking uploads also close the preceding HIP producer before the
+        // dedicated HSA queue acquires and consumes MTP/trunk state.
+        qwen35::upload_prefill_batch_inputs(gpu, &state.trunk_pbs, verify_tokens, cur_pos)?;
+
+        if let Some(controller) = state.mtp_verify_pm4.get_mut(&n) {
+            let replay = unsafe { controller.replay_pm4(cur_pos + n) };
+            return match replay {
+                Ok(_) => Ok(()),
+                Err(reason) => {
+                    controller.poison(format!(
+                        "retained MTP verifier PM4 replay failed for B={n}: {reason}"
+                    ));
+                    state.mtp_verify_pm4_disabled = true;
+                    Err(hip_bridge::HipError::new(0, &reason))
+                }
+            };
+        }
+
+        if state.mtp_verify_pm4_warmed.insert(n) {
+            let result = qwen35::forward_prefill_batch_single_chunk_captured_opts(
+                gpu,
+                trunk_weights,
+                config,
+                verify_tokens,
+                cur_pos,
+                kv_cache,
+                dn_state,
+                scratch,
+                &state.trunk_pbs,
+                None,
+                Some(&state.verify_hidden),
+                Some(&mut state.trunk_gdn_tape),
+                None,
+                false,
+            );
+            if result.is_ok() {
+                eprintln!("[mtp-redline] PM4 warmup complete for B={n}");
+            }
+            return result;
+        }
+
+        let mut controller = ReplayController::new_retained_pm4_armed();
+        controller
+            .begin_capture()
+            .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+
+        // Every launch wrapper records through `Gpu::replay`. Swap only for
+        // this immutable verifier body, then restore the prepared plain-AR
+        // controller before any lm-head/accept/rollback work is submitted.
+        std::mem::swap(&mut gpu.replay, &mut controller);
+        let captured = qwen35::forward_prefill_batch_single_chunk_captured_opts(
+            gpu,
+            trunk_weights,
+            config,
+            verify_tokens,
+            cur_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            &state.trunk_pbs,
+            None,
+            Some(&state.verify_hidden),
+            Some(&mut state.trunk_gdn_tape),
+            None,
+            false,
+        );
+        std::mem::swap(&mut gpu.replay, &mut controller);
+        if let Err(error) = captured {
+            state.mtp_verify_pm4_disabled = true;
+            return Err(error);
+        }
+
+        // PM4 lowering reads the recorded HSACO metadata while the just-run
+        // HIP verifier may still be completing on its stream.
+        gpu.hip.device_synchronize()?;
+        let capture = controller
+            .finish_capture()
+            .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+        match controller.prepare_pm4_prefix(gpu.device_id as usize, capture.launch_count) {
+            Ok((dispatches, command_dwords, queue_id)) => {
+                eprintln!(
+                    "[mtp-redline] retained PM4 ready B={n} dispatches={dispatches} \
+                     kernels={} command_dwords={command_dwords} queue={queue_id} hash={:016x}",
+                    capture.unique_kernel_count, capture.sequence_hash,
+                );
+                state.mtp_verify_pm4.insert(n, controller);
+            }
+            Err(reason) => {
+                state.mtp_verify_pm4_disabled = true;
+                eprintln!(
+                    "[mtp-redline] PM4 prepare failed for B={n}; keeping HIP verifier: {reason}"
+                );
+            }
+        }
+        // The captured HIP traversal produced this cycle's verifier outputs;
+        // the retained tape begins executing on the next cycle.
+        return Ok(());
+    }
+
     let graph_ok = mtp_verify_graph_enabled_from_env()
         && !state.mtp_verify_graph_disabled
         && tape_captured
