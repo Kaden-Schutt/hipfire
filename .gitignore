@@ -127,6 +127,7 @@ docs/investigations/*/sources/
 .scratch/
 .opencode/
 /.build/
+.slim/deepwork/
 
 # rocprofv3 / rocpd profiler dumps. The rocpd_info_process table snapshots the
 # FULL process environment, so any exported secret (an OPENROUTER_API_KEY leaked

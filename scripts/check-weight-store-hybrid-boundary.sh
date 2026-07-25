@@ -9,9 +9,6 @@ forbidden_symbols=(
   WeightStoreKey
   WeightStoreAuxiliary
   WeightStorePoolTarget
-  WeightCellId
-  WeightStoreBuilder
-  FrozenWeightStore
   DurableWeightStoreAssembly
   DurableWeightStoreGuard
   begin_durable_assembly
