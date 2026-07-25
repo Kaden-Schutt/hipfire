@@ -57,6 +57,23 @@ echo "[rocprof-wrap] output dir: ${OUTPUT_DIR}" >&2
 echo "[rocprof-wrap] stats CSV:  ${STATS_CSV}" >&2
 echo "[rocprof-wrap] command:    $*" >&2
 
+ROCPROFV3="${HIPFIRE_ROCPROFV3:-}"
+if [[ -z "$ROCPROFV3" ]]; then
+    ROCPROFV3="$(command -v rocprofv3 2>/dev/null || true)"
+fi
+if [[ -z "$ROCPROFV3" ]]; then
+    for candidate in /opt/rocm/core-*/bin/rocprofv3 /opt/rocm/bin/rocprofv3; do
+        if [[ -x "$candidate" ]]; then
+            ROCPROFV3="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -z "$ROCPROFV3" ]]; then
+    echo "rocprof-wrap: rocprofv3 not found; set HIPFIRE_ROCPROFV3" >&2
+    exit 127
+fi
+
 # Run under rocprofv3.
 # --kernel-trace   : record per-dispatch kernel execution times
 # --stats          : aggregate per-kernel totals into _kernel_stats.csv
@@ -64,7 +81,7 @@ echo "[rocprof-wrap] command:    $*" >&2
 # --output-format  : CSV output format (newer rocprofv3 dropped the `-f csv` short form)
 # -d <dir>         : output directory
 # -o <prefix>      : output filename prefix
-exec rocprofv3 \
+exec "$ROCPROFV3" \
     --kernel-trace \
     --stats \
     -S \
