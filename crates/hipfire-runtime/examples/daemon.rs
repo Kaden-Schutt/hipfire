@@ -716,6 +716,20 @@ fn render_tail_opens_think(rendered: &str) -> bool {
     rendered.trim_end().ends_with("<think>")
 }
 
+/// Physical sequence capacity required by native MTP.
+///
+/// `max_tokens` is the total committed-token budget, not a number of
+/// speculative cycles. Only one verifier block (`max_n + 1` slots) is live
+/// beyond the committed cursor at a time; rollback discards the rejected tail
+/// before the next cycle. Multiplying the whole output budget by `max_n + 1`
+/// incorrectly rejects ordinary long-context requests.
+fn mtp_required_capacity(prompt_len: usize, max_tokens: usize, max_n: usize) -> usize {
+    prompt_len
+        .saturating_add(max_tokens)
+        .saturating_add(max_n.saturating_add(1))
+        .saturating_add(16)
+}
+
 fn emit_gen_start(stdout: &mut std::io::Stdout, id: &str, started_in_think: bool) {
     let envelope = serde_json::json!({
         "type": "gen_start",
@@ -6354,6 +6368,10 @@ fn generate_qwen35_mtp(
     // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -6395,7 +6413,13 @@ fn generate_qwen35_mtp(
             frame.render()
         };
         match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                // The template owns the generation primer. Tell the serve
+                // channel router whether its rendered tail opened `<think>`;
+                // otherwise MTP reasoning is mislabeled as visible content.
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
@@ -6505,23 +6529,20 @@ fn generate_qwen35_mtp(
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
 
-    // Capacity guard: worst case per cycle writes max_n+1 verify slots before
-    // the rollback truncates. seq budget must hold prompt + max*(max_n+1).
+    // Capacity guard: only one max_n+1 verifier block exists beyond the
+    // committed cursor at once. Rejected slots are rolled back each cycle.
     let max_seq_total = m.physical_cap;
-    if prompt_tokens
-        .len()
-        .saturating_add(max_tokens.saturating_mul(max_n + 1))
-        .saturating_add(16)
-        > max_seq_total
-    {
+    let required_capacity = mtp_required_capacity(prompt_tokens.len(), max_tokens, max_n);
+    if required_capacity > max_seq_total {
         emit_error_with_id(
             stdout,
             id,
             format!(
-                "prompt ({}) + max ({}) × (max_n+1) ({}) exceeds context capacity {} — reload with a larger max_seq",
+                "prompt ({}) + max ({}) + speculative slack ({}) + guard (16) requires capacity {}, exceeds context capacity {} — reload with a larger max_seq",
                 prompt_tokens.len(),
                 max_tokens,
                 max_n + 1,
+                required_capacity,
                 max_seq_total
             ),
         );
@@ -6675,6 +6696,7 @@ fn generate_qwen35_mtp(
     let mut think_closed = false;
 
     // Emit the seed token first (TTFT = prefill).
+    emit_gen_start(stdout, id, started_in_think);
     streamed_tokens.push(seed_token);
     emit_committed_event(
         stdout,
@@ -6777,10 +6799,7 @@ fn generate_qwen35_mtp(
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(
-                        assistant_prefix,
-                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                    ),
+                    started_in_think,
                 );
                 if in_think && !prev_in_think {
                     think_count = 0;
@@ -15258,7 +15277,8 @@ mod tool_call_parser_tests {
 #[cfg(test)]
 mod render_tail_think_tests {
     use super::{
-        asst_turn_fingerprint, normalize_asst_turn_for_fingerprint, render_tail_opens_think,
+        asst_turn_fingerprint, mtp_required_capacity, normalize_asst_turn_for_fingerprint,
+        render_tail_opens_think,
     };
 
     #[test]
@@ -15288,5 +15308,16 @@ mod render_tail_think_tests {
             asst_turn_fingerprint(&normalized, &[]),
             asst_turn_fingerprint("visible answer", &[])
         );
+    }
+
+    #[test]
+    fn mtp_capacity_reserves_one_speculative_block_not_one_per_token() {
+        assert_eq!(mtp_required_capacity(19_373, 4_096, 3), 23_489);
+        assert!(mtp_required_capacity(19_373, 4_096, 3) <= 32_768);
+    }
+
+    #[test]
+    fn mtp_capacity_saturates_on_untrusted_sizes() {
+        assert_eq!(mtp_required_capacity(usize::MAX, 1, 3), usize::MAX);
     }
 }
