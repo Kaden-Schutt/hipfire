@@ -48,9 +48,13 @@ use std::time::Instant;
 #[derive(Copy, Clone, Debug)]
 pub struct MtpSamplingConfig {
     pub temp: f32,
-    pub top_k: usize, // 0 = disabled (no top-K cutoff)
-    pub top_p: f32,   // 1.0 = disabled (no nucleus cutoff)
-    pub min_p: f32,   // 0.0 = disabled (no min-prob cutoff)
+    pub top_k: usize,        // 0 = disabled (no top-K cutoff)
+    pub top_p: f32,          // 1.0 = disabled (no nucleus cutoff)
+    pub min_p: f32,          // 0.0 = disabled (no min-prob cutoff)
+    pub repeat_penalty: f32, // 1.0 = disabled
+    pub repeat_window: usize,
+    pub presence_penalty: f32,  // 0.0 = disabled
+    pub frequency_penalty: f32, // 0.0 = disabled
 }
 
 impl Default for MtpSamplingConfig {
@@ -60,6 +64,10 @@ impl Default for MtpSamplingConfig {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -68,6 +76,52 @@ impl MtpSamplingConfig {
     pub fn is_greedy(&self) -> bool {
         self.temp <= 0.0
     }
+
+    fn has_penalties(&self) -> bool {
+        self.repeat_window > 0
+            && (self.repeat_penalty > 1.0
+                || self.presence_penalty > 0.0
+                || self.frequency_penalty > 0.0)
+    }
+}
+
+/// Build the exact chronological suffix consumed by the product penalty
+/// kernel. `hypothetical` contains already-proposed tokens for the distribution
+/// currently being evaluated. When `draft_inverse` is present, full-vocab IDs
+/// are mapped to compressed draft columns and missing entries become
+/// `u32::MAX`, which the kernel deliberately skips without shortening the
+/// recency window.
+fn mtp_penalty_window(
+    committed: &[u32],
+    hypothetical: &[u32],
+    requested_window: usize,
+    buffer_capacity: usize,
+    draft_inverse: Option<&[i32]>,
+) -> Vec<u32> {
+    let keep = requested_window
+        .min(buffer_capacity)
+        .min(committed.len().saturating_add(hypothetical.len()));
+    if keep == 0 {
+        return Vec::new();
+    }
+    let skip = committed
+        .len()
+        .saturating_add(hypothetical.len())
+        .saturating_sub(keep);
+    committed
+        .iter()
+        .chain(hypothetical)
+        .skip(skip)
+        .map(|&token| match draft_inverse {
+            Some(inverse) => inverse
+                .get(token as usize)
+                .copied()
+                .filter(|&column| column >= 0)
+                .map(|column| column as u32)
+                .unwrap_or(u32::MAX),
+            None => token,
+        })
+        .collect()
 }
 
 fn mtp_device_token_chain_enabled_from_env() -> bool {
@@ -551,6 +605,16 @@ pub struct MtpSpecState {
     /// RNG state for sampling. Seeded via [`Self::set_sampling`].
     /// Single global stream across all spec-decode positions in a generation.
     pub rng: MtpRng,
+
+    /// Chronological generated-token suffix used by repeat, presence, and
+    /// frequency penalties. Matching AR, prompt/history tokens are outside the
+    /// penalty scope; each newly committed speculative block extends it.
+    penalty_history: Vec<u32>,
+
+    /// Host mirror of full-token → compressed-draft-column. Missing entries
+    /// are `-1`. This lets the draft distribution receive exactly the same
+    /// history semantics as the full-vocab verifier without a GPU gather.
+    draft_vocab_inverse: Option<Vec<i32>>,
 }
 
 impl MtpSpecState {
@@ -640,6 +704,15 @@ impl MtpSpecState {
         let mtp_sample_tau_t = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
         let mtp_sample_z_t = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
         let mtp_chain_accept_result = gpu.alloc_tensor(&[4], DType::F32)?;
+        let draft_vocab_inverse = head.weights.lm_head_draft_vocab_map.as_ref().map(|map| {
+            let mut inverse = vec![-1_i32; vocab];
+            for (column, &token) in map.iter().enumerate() {
+                if (token as usize) < vocab {
+                    inverse[token as usize] = column as i32;
+                }
+            }
+            inverse
+        });
 
         Ok(Self {
             prev_hidden,
@@ -684,10 +757,13 @@ impl MtpSpecState {
             p_min: default_mtp_p_min(gpu.arch.as_str()),
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
+            penalty_history: Vec::new(),
+            draft_vocab_inverse,
         })
     }
 
-    /// Configure sampling (temp/top_p/top_k/min_p) and reseed the per-state RNG.
+    /// Configure sampling (distribution cutoffs + repetition controls) and
+    /// reseed the per-state RNG.
     /// `cfg.temp == 0.0` keeps the legacy greedy path. `cfg.temp > 0` enables
     /// residual-acceptance sampling per the Unsloth/llama.cpp MTP recipe.
     /// Reseeds BOTH the host RNG (used for the residual accept rule) and the
@@ -708,11 +784,118 @@ impl MtpSpecState {
             "set_sampling: min_p must be in [0,1], got {}",
             cfg.min_p
         );
+        assert!(
+            cfg.repeat_penalty >= 1.0,
+            "set_sampling: repeat_penalty must be >= 1.0, got {}",
+            cfg.repeat_penalty
+        );
+        assert!(
+            cfg.presence_penalty >= 0.0 && cfg.frequency_penalty >= 0.0,
+            "set_sampling: additive penalties must be >= 0.0"
+        );
         self.sampling = cfg;
+        if self.penalty_history.len() > cfg.repeat_window {
+            let discard = self.penalty_history.len() - cfg.repeat_window;
+            self.penalty_history.drain(..discard);
+        }
         self.rng = MtpRng::new(seed);
         // GPU rng uses u32; mix the lower + upper halves so different seeds
         // produce different on-device streams.
         self.gpu_rng_state = ((seed >> 32) as u32) ^ (seed as u32) | 1;
+    }
+
+    /// Replace the penalty history for a new generation request. Product AR
+    /// passes an empty slice so prompt/history tokens are never penalized.
+    pub fn set_penalty_history(&mut self, tokens: &[u32]) {
+        self.penalty_history.clear();
+        let keep = self.sampling.repeat_window.min(tokens.len());
+        self.penalty_history
+            .extend_from_slice(&tokens[tokens.len() - keep..]);
+    }
+
+    /// Extend penalty history with tokens that were genuinely committed.
+    pub fn append_penalty_history(&mut self, tokens: &[u32]) {
+        let keep = self.sampling.repeat_window;
+        if keep == 0 {
+            self.penalty_history.clear();
+            return;
+        }
+        self.penalty_history.extend_from_slice(tokens);
+        if self.penalty_history.len() > keep {
+            let discard = self.penalty_history.len() - keep;
+            self.penalty_history.drain(..discard);
+        }
+    }
+
+    /// Apply product penalty semantics to a full-vocabulary target row.
+    pub fn apply_target_sampling_penalties(
+        &self,
+        gpu: &mut Gpu,
+        logits: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        hypothetical: &[u32],
+    ) -> HipResult<()> {
+        self.apply_sampling_penalties(gpu, logits, repeat_buf, vocab_size, hypothetical, None)
+    }
+
+    fn apply_draft_sampling_penalties(
+        &self,
+        gpu: &mut Gpu,
+        logits: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        draft_vocab_size: usize,
+        hypothetical: &[u32],
+        compressed: bool,
+    ) -> HipResult<()> {
+        self.apply_sampling_penalties(
+            gpu,
+            logits,
+            repeat_buf,
+            draft_vocab_size,
+            hypothetical,
+            compressed.then_some(
+                self.draft_vocab_inverse
+                    .as_deref()
+                    .expect("compressed sampled MTP requires a host inverse vocabulary map"),
+            ),
+        )
+    }
+
+    fn apply_sampling_penalties(
+        &self,
+        gpu: &mut Gpu,
+        logits: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        logits_vocab_size: usize,
+        hypothetical: &[u32],
+        draft_inverse: Option<&[i32]>,
+    ) -> HipResult<()> {
+        if !self.sampling.has_penalties() {
+            return Ok(());
+        }
+        let window = mtp_penalty_window(
+            &self.penalty_history,
+            hypothetical,
+            self.sampling.repeat_window,
+            repeat_buf.numel(),
+            draft_inverse,
+        );
+        if window.is_empty() {
+            return Ok(());
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(window.as_ptr() as *const u8, window.len() * 4) };
+        gpu.hip.memcpy_htod(&repeat_buf.buf, bytes)?;
+        gpu.apply_sampling_penalties_f32(
+            logits,
+            repeat_buf,
+            logits_vocab_size,
+            window.len(),
+            self.sampling.repeat_penalty,
+            self.sampling.presence_penalty,
+            self.sampling.frequency_penalty,
+        )
     }
 
     /// Set the draft-confidence threshold for compressed-serial K-chain
@@ -791,6 +974,7 @@ impl MtpSpecState {
         destroy_mtp_proposal_graph(gpu, self);
         self.mtp_proposal_graph_warmed = false;
         self.mtp_proposal_graph_seq_cap = 0;
+        self.penalty_history.clear();
         self.mtp_kv.reset(gpu)?;
         Ok(())
     }
@@ -2848,6 +3032,17 @@ pub fn spec_step_mtp_compressed_serial(
 
             let draft_idx: usize;
             if use_sampling {
+                // The drafter must see the same repetition controls as AR and
+                // the verifier. Candidate tokens from earlier positions in this
+                // speculative chain are hypothetical history for step k.
+                state.apply_draft_sampling_penalties(
+                    gpu,
+                    logits_for_argmax,
+                    &target.scratch.repeat_buf,
+                    argmax_vocab,
+                    &candidates,
+                    !use_full_vocab,
+                )?;
                 let top_prob = if use_gpu_compressed_sampling {
                     // Keep the compact raw probabilities + tau/Z on device. The
                     // sampler emits only the compressed token index and raw row
@@ -3222,6 +3417,23 @@ pub fn spec_step_mtp_compressed_serial(
         }
     }
 
+    if use_sampling {
+        // Row `pos` predicts after `last_committed` plus candidates[..pos].
+        // Adjust every target distribution before residual acceptance; applying
+        // penalties only to the drafter or only to the chosen bonus would no
+        // longer preserve the AR sampling distribution.
+        for pos in 0..n_verify {
+            let row = state.verify_logits.sub_offset(pos * vocab, vocab);
+            state.apply_target_sampling_penalties(
+                gpu,
+                &row,
+                &target.scratch.repeat_buf,
+                vocab,
+                &candidates[..pos.min(candidates.len())],
+            )?;
+        }
+    }
+
     let mut accept_count = 0usize;
     // Assigned exactly once in each arm below (sampled accept returns it; the
     // legacy arm copies it out of the accept result), so no dead initializer.
@@ -3423,6 +3635,37 @@ pub fn spec_step_mtp_compressed_serial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_defaults_leave_penalties_disabled() {
+        let cfg = MtpSamplingConfig::default();
+        assert_eq!(cfg.repeat_penalty, 1.0);
+        assert_eq!(cfg.repeat_window, 0);
+        assert_eq!(cfg.presence_penalty, 0.0);
+        assert_eq!(cfg.frequency_penalty, 0.0);
+        assert!(!cfg.has_penalties());
+    }
+
+    #[test]
+    fn penalty_window_is_chronological_and_includes_hypothetical_prefix() {
+        assert_eq!(
+            mtp_penalty_window(&[1, 2, 3, 4], &[5, 6], 4, 8, None),
+            vec![3, 4, 5, 6]
+        );
+        assert_eq!(
+            mtp_penalty_window(&[1, 2, 3, 4], &[5, 6], 8, 3, None),
+            vec![4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn compressed_penalty_window_preserves_recency_with_missing_sentinel() {
+        let inverse = [-1, 7, -1, 2, -1, 0];
+        assert_eq!(
+            mtp_penalty_window(&[1, 2, 3], &[5], 4, 4, Some(&inverse)),
+            vec![7, u32::MAX, 2, 0]
+        );
+    }
 
     #[test]
     fn trunk_spine_verify_tokens_are_seed_plus_candidates() {

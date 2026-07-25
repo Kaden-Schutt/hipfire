@@ -6389,6 +6389,10 @@ fn generate_qwen35_mtp(
     // applied to BOTH draft + target nuclei → lossless == AR-at-(min_p,top_k,top_p).
     // 0.0 = disabled. Ignored on the greedy path.
     min_p: f32,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
 ) {
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -6852,6 +6856,10 @@ fn generate_qwen35_mtp(
                 top_k: top_k.map(|k| k as usize).unwrap_or(0),
                 top_p: top_p_eff,
                 min_p,
+                repeat_penalty: repeat_penalty.max(1.0),
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
             },
             42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
         );
@@ -6859,6 +6867,10 @@ fn generate_qwen35_mtp(
         state.set_p_min(p_min); // greedy MTP confidence cutoff
         state.set_sampling(mtp_spec::MtpSamplingConfig::default(), 42);
     }
+    // Match mature AR exactly: penalties see only tokens generated during this
+    // request, never the prompt or prior chat history. Prefix-cache retention
+    // therefore does not leak the preceding turn's penalty scope.
+    state.set_penalty_history(&[]);
 
     let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new
 
@@ -6892,12 +6904,61 @@ fn generate_qwen35_mtp(
     let _ = gpu.hip.device_synchronize();
     let prefill_ms = t0.elapsed().as_millis();
 
-    // Seed token = trunk argmax at the last prefill position. prefill left
-    // target.scratch.logits holding the post-prompt logits.
-    let seed_logits = match gpu.download_f32(&target.scratch.logits) {
-        Ok(v) => v,
+    // Prefill leaves the post-prompt trunk logits resident. Greedy keeps the
+    // historical argmax seed; sampled MTP must draw this first token from the
+    // same penalized registry distribution as AR (it is not speculative yet).
+    let seed_token_result = if temp > 1e-6 {
+        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
+        state
+            .apply_target_sampling_penalties(
+                gpu,
+                &target.scratch.logits,
+                &target.scratch.repeat_buf,
+                target.config.vocab_size,
+                &[],
+            )
+            .and_then(|_| {
+                // Penalties were applied by the shared standalone prepass.
+                // Disable them inside the sampler to avoid a second mutation.
+                gpu.sample_top_p_pf(
+                    &target.scratch.logits,
+                    &target.scratch.sample_buf,
+                    &target.scratch.repeat_buf,
+                    target.config.vocab_size,
+                    temp,
+                    top_p_eff,
+                    state.gpu_rng_state,
+                    0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    top_k,
+                    Some(min_p),
+                )
+            })
+            .map(|(token, new_rng)| {
+                state.gpu_rng_state = new_rng;
+                token
+            })
+    } else {
+        gpu.download_f32(&target.scratch.logits).map(|seed_logits| {
+            seed_logits
+                .iter()
+                .enumerate()
+                .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                    if v > bv {
+                        (i as u32, v)
+                    } else {
+                        (best, bv)
+                    }
+                })
+                .0
+        })
+    };
+    let seed_token = match seed_token_result {
+        Ok(token) => token,
         Err(e) => {
-            emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
+            emit_error_with_id(stdout, id, format!("select MTP seed token: {e:?}"));
             state.free_gpu(gpu);
             m.seq_pos = 0;
             m.conversation_tokens.clear();
@@ -6912,17 +6973,7 @@ fn generate_qwen35_mtp(
             return;
         }
     };
-    let seed_token = seed_logits
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
-        })
-        .0;
+    state.append_penalty_history(&[seed_token]);
 
     // ── Decode loop ─────────────────────────────────────────────────────
     let t_prefill = Instant::now();
@@ -7003,6 +7054,7 @@ fn generate_qwen35_mtp(
         };
         cycles += 1;
         accepted_total += result.accept_count;
+        state.append_penalty_history(&result.committed);
 
         let mut hit_eos = false;
         let streamed_before = streamed_tokens.len();
@@ -7148,6 +7200,7 @@ fn generate_qwen35_mtp(
                     break;
                 }
                 cur_pos += advance_toks.len();
+                state.append_penalty_history(&close_ids);
                 if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                     let represented =
                         mtp_represented_len(prompt_tokens.len(), streamed_tokens.len());
@@ -8932,9 +8985,9 @@ fn generate(
     // un-truncated / sample_top_p(trunk) posture). Gating:
     //   * greedy (temp <= 1e-6) → ALWAYS routes to MTP (default, unchanged), or
     //   * sampled (temp > 0) → routes to MTP only when `HIPFIRE_MTP_SAMPLED=1`.
-    //     temp + top_p + top_k + min_p are all plumbed through and honored on the
-    //     sampled MTP path (top_k+top_p lossless on both nuclei; min_p applied via
-    //     the mtp_spec cutoff), so no sampling knob forces a fall-through here.
+    //     temp + top_p + top_k + min_p + repetition controls are all plumbed
+    //     through and honored on both sampled MTP distributions, so no sampling
+    //     knob forces a fall-through here.
     // With HIPFIRE_MTP_SAMPLED unset, a temp>0 MTP-opted-in request still falls
     // through to DFlash (lossless sampled-spec) or AR exactly as before.
     let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
@@ -8970,14 +9023,14 @@ fn generate(
             top_p, // nucleus cutoff: honored on the sampled MTP path
             top_k, // top-k cutoff: honored on the sampled MTP path (both nuclei)
             min_p.unwrap_or(0.0), // min_p floor: honored on the sampled MTP nuclei
-        );
-        // Silence unused-variable warnings for AR-only / DFlash-only knobs the
-        // MTP serve path does not consume.
-        let _ = (
             repeat_penalty,
             repeat_window,
             presence_penalty,
             frequency_penalty,
+        );
+        // Silence unused-variable warnings for AR-only / DFlash-only knobs the
+        // MTP serve path does not consume.
+        let _ = (
             budget_alert_at_tok,
             budget_alert_text,
             pflash_state,

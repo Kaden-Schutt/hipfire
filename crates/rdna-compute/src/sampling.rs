@@ -39,6 +39,73 @@ fn sample_fast_stable_enabled() -> bool {
 }
 
 impl Gpu {
+    /// Apply the product sampler's repeat/presence/frequency penalties to one
+    /// resident F32 logits row, in place.
+    ///
+    /// This is the same prepass used by [`Self::sample_top_p_pf`], exposed
+    /// separately for speculative decoders that must adjust both draft and
+    /// target distributions before residual acceptance. `repeat_tokens` must
+    /// contain `repeat_window` chronological token IDs (oldest first).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_sampling_penalties_f32(
+        &mut self,
+        logits: &GpuTensor,
+        repeat_tokens: &GpuTensor,
+        vocab_size: usize,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<()> {
+        let any_penalty = repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
+        if !any_penalty || repeat_window == 0 {
+            return Ok(());
+        }
+        if logits.numel() < vocab_size || repeat_tokens.numel() < repeat_window {
+            return Err(HipError::new(
+                0,
+                "apply_sampling_penalties_f32 buffers do not cover the requested shape",
+            ));
+        }
+
+        self.bind_thread()?;
+        const MODULE: &str = "sample_penalty_prepass";
+        const FUNCTION: &str = "sample_apply_repeat_penalty";
+        if !self.functions.contains_key(FUNCTION) {
+            let src =
+                kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20");
+            self.ensure_kernel(MODULE, &src, FUNCTION)?;
+        }
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut repeat_ptr = repeat_tokens.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut rw = repeat_window as i32;
+        let mut rp = repeat_penalty;
+        let mut pp = presence_penalty;
+        let mut fp = frequency_penalty;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut c_void,
+            &mut repeat_ptr as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut rw as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut fp as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(FUNCTION, [1, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(logits_ptr);
+            blob.push_ptr(repeat_ptr);
+            blob.push_i32(vs);
+            blob.push_i32(rw);
+            blob.push_f32(rp);
+            blob.push_f32(pp);
+            blob.push_f32(fp);
+            blob
+        })
+    }
+
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
         &mut self,
