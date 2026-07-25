@@ -632,6 +632,24 @@ fn strip_think_for_fingerprint(s: &str) -> String {
         }
         out.replace_range(0..tail, "");
     }
+    // Once the prompt-primed reasoning span has closed, the model can emit
+    // another orphan closer without reopening `<think>`. ThinkChannelRouter
+    // strips every such control marker while preserving the visible text that
+    // precedes it, so mirror that behavior for the cache fingerprint.
+    while let Some(close_idx) = out.find("</think>") {
+        let after_close = close_idx + "</think>".len();
+        let mut tail = after_close;
+        let bytes = out.as_bytes();
+        while tail < bytes.len() {
+            let c = bytes[tail];
+            if c == b'\n' || c == b'\r' {
+                tail += 1;
+            } else {
+                break;
+            }
+        }
+        out.replace_range(close_idx..tail, "");
+    }
     // (4): strip the literal `<|im_end|>` substring (CLI relay strips
     // it from every chunk before forwarding as content).
     while let Some(idx) = out.find("<|im_end|>") {
@@ -15760,6 +15778,17 @@ mod render_tail_think_tests {
         assert_eq!(
             asst_turn_fingerprint(&normalized, &[]),
             asst_turn_fingerprint("   - visible item", &[])
+        );
+    }
+
+    #[test]
+    fn assistant_cache_fingerprint_strips_repeated_orphan_closers() {
+        let raw = "hidden reasoning</think>\n\nvisible answer</think>\n\n<|im_end|>";
+        let normalized = normalize_asst_turn_for_fingerprint(raw);
+        assert_eq!(normalized, "visible answer");
+        assert_eq!(
+            asst_turn_fingerprint(&normalized, &[]),
+            asst_turn_fingerprint("visible answer", &[])
         );
     }
 
