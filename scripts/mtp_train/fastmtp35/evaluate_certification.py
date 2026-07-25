@@ -29,6 +29,7 @@ EXPECTED_CONTRACT = {
     "max_tokens": 4096,
     "kv_mode": "q8",
     "mtp_k": 3,
+    "seed": 42,
     "redline_shadow_iterations": 15,
 }
 

@@ -7,13 +7,24 @@ VOCAB_MAP="${3:-$HOME/.hipfire/datasets/fastmtp-qwen36-a3b-v1/features/vocab-map
 HF_MODEL="${HF_MODEL:-$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B}"
 STOCK_MTP="${STOCK_MTP:-$HOME/.hipfire/models/qwen3.6-35b-a3b.mtp}"
 MTP_QUANT="${MTP_QUANT:-mixed}"
-OVERRIDE="$TRAINING_DIR/final.safetensors"
+OVERRIDE="${HIPFIRE_FASTMTP_CHECKPOINT:-$TRAINING_DIR/final.safetensors}"
 ALLOW_PARTIAL="${HIPFIRE_FASTMTP_ALLOW_PARTIAL:-0}"
 
 [[ -s "$OVERRIDE" && -s "$TRAINING_DIR/training-manifest.json" ]] || {
-    echo "final checkpoint or training manifest missing under $TRAINING_DIR" >&2
+    echo "selected checkpoint or training manifest is missing: $OVERRIDE" >&2
     exit 2
 }
+case "$(basename "$OVERRIDE")" in
+    final.safetensors|step-[0-9]*.safetensors) ;;
+    *)
+        echo "selected checkpoint must be final.safetensors or step-N.safetensors: $OVERRIDE" >&2
+        exit 2
+        ;;
+esac
+if [[ "$(realpath -m "$(dirname "$OVERRIDE")")" != "$(realpath -m "$TRAINING_DIR")" ]]; then
+    echo "selected checkpoint must be inside the training directory: $OVERRIDE" >&2
+    exit 2
+fi
 [[ -s "$VOCAB_MAP" ]] || {
     echo "compressed-vocabulary map is missing: $VOCAB_MAP" >&2
     exit 2

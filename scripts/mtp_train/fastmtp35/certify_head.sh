@@ -8,6 +8,7 @@ STOCK_MTP="${STOCK_MTP:-$HOME/.hipfire/models/qwen3.6-35b-a3b.mtp}"
 SESSION="${SESSION:-$HOME/mv/session_coding.json}"
 TAG="${TAG:-qwen3.6:35b-a3b-mq4r}"
 GPU="${GPU:-0}"
+SEED=42
 LOCK_ROOT="${XDG_RUNTIME_DIR:-$HOME/.cache/hipfire}/hipfire-locks"
 
 if ! command -v hipcc >/dev/null 2>&1; then
@@ -66,6 +67,7 @@ link_fixture "$STOCK_MTP" "$OUT/stock/model.mtp"
 link_fixture "$TRUNK" "$OUT/candidate/model.mq4r"
 link_fixture "$CANDIDATE" "$OUT/candidate/model.mtp"
 
+export SEED
 python3 - "$TRUNK" "$STOCK_MTP" "$CANDIDATE" "$SESSION" \
     "$OUT/certification-manifest.json" "$(git rev-parse HEAD)" <<'PY'
 import hashlib
@@ -102,6 +104,7 @@ manifest = {
         "max_tokens": 4096,
         "kv_mode": "q8",
         "mtp_k": 3,
+        "seed": int(os.environ["SEED"]),
         "redline_shadow_iterations": 15,
     },
 }
@@ -120,10 +123,12 @@ run_serve() {
         --tag "$TAG" \
         --kv q8 \
         --mtp "$mtp" \
+        --mtp-k 3 \
         --thinking med \
         --max-tokens 4096 \
         --max-seq 32768 \
         --sampling registry \
+        --seed "$SEED" \
         --mode session \
         --session "$SESSION" \
         --port 11520 \

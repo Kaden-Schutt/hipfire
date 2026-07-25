@@ -171,7 +171,9 @@ contract, and producer commit, without modifying the stock sidecar. It fails
 closed unless `steps == planned_steps == stop_step`, the four-rank Q8 feature
 contract matches, and the vocabulary-map hash is exact. Pilot packaging
 requires the explicit research-only
-`HIPFIRE_FASTMTP_ALLOW_PARTIAL=1` override.
+`HIPFIRE_FASTMTP_ALLOW_PARTIAL=1` override. After a complete run,
+`HIPFIRE_FASTMTP_CHECKPOINT=/path/to/step-N.safetensors` can package a retained
+validation checkpoint for product A/B without weakening the full-run gate.
 
 ## Stage 5: sampled product and Redline certification
 
@@ -182,8 +184,10 @@ discovery; symlink fixtures would silently resolve back to the global stock
 `.mtp`. The script verifies the sidecar path after every MTP arm. It runs the
 same eight-turn sampled multi-turn session at the registry defaults with
 `thinking=med`, `max_tokens=4096`, and Q8 KV for plain AR, stock MTP, and
-trained MTP. It then runs the retained-PM4 trunk shadow/parity diagnostic for
-15 consecutive positions.
+trained MTP. All three arms use the same recorded seed (42 by default) so the
+comparison is repeatable without changing the registry distribution. It then
+runs the retained-PM4 trunk shadow/parity diagnostic for 15 consecutive
+positions.
 
 ```bash
 scripts/mtp_train/fastmtp35/certify_head.sh \
