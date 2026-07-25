@@ -167,7 +167,11 @@ use MQ4G256. Full-Q8 routed experts are rejected because the serving runtime
 cannot execute that representation. Set `MTP_QUANT=mq4` only for a comparison
 artifact. The packer emits SHA256 and key-value provenance, including the
 training checkpoint, manifest, vocabulary map, HF snapshot, quantization
-contract, and producer commit, without modifying the stock sidecar.
+contract, and producer commit, without modifying the stock sidecar. It fails
+closed unless `steps == planned_steps == stop_step`, the four-rank Q8 feature
+contract matches, and the vocabulary-map hash is exact. Pilot packaging
+requires the explicit research-only
+`HIPFIRE_FASTMTP_ALLOW_PARTIAL=1` override.
 
 ## Stage 5: sampled product and Redline certification
 
@@ -188,8 +192,11 @@ scripts/mtp_train/fastmtp35/certify_head.sh \
 
 Promotion requires coherent outputs with no new empty/runaway/attractor
 failures, trained-MTP throughput above AR and stock MTP, higher useful tau,
-and a passing Redline shadow report. Offline CE or top-1 agreement alone is
-not a promotion result.
+strict MTP prefix reuse on all seven continuation turns, complete scored
+session recall, and a passing Redline shadow report. Certification rebuilds
+the CLI and daemon from the clean current commit and records hashes for the
+trunk, both sidecars, session, and source revision. Offline CE or top-1
+agreement alone is not a promotion result.
 
 ## Reuse for DeepSeek and MiniMax
 

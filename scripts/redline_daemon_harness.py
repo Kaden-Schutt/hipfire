@@ -191,6 +191,7 @@ def main():
                     "max_seq": args.max_seq,
                     "kv_mode": args.kv_mode,
                     "dflash_mode": "off",
+                    "mtp_mode": "off",
                 },
             }
         )

@@ -405,7 +405,12 @@ def run(cfg, args):
             recall = ""
             if t.get("expect"):
                 hit = sum(1 for e in t["expect"] if e.lower() in r["assistant_content"].lower())
+                r["recall_hits"] = hit
+                r["recall_total"] = len(t["expect"])
                 recall = f" recall={hit}/{len(t['expect'])}"
+            else:
+                r["recall_hits"] = 0
+                r["recall_total"] = 0
             rows.append(r); persist_rows(args.out, rows)
             print(turn_line(i+1, r, recall), flush=True)
     g = rows

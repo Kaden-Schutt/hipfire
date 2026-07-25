@@ -26,6 +26,19 @@ command -v hipcc >/dev/null 2>&1 || {
 for path in "$CANDIDATE" "$TRUNK" "$STOCK_MTP" "$SESSION"; do
     [[ -s "$path" ]] || { echo "missing certification input: $path" >&2; exit 2; }
 done
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+    echo "refusing to certify from a checkout with tracked modifications" >&2
+    git status --short >&2
+    exit 2
+fi
+
+# Certification must execute the source commit recorded below, never whatever
+# release binaries happened to be left in target/ by a prior experiment.
+cargo build --release -p hipfire-cli
+cargo build --release -p hipfire-runtime --example daemon
+export HIPFIRE_CLI_BIN="$PWD/target/release/hipfire"
+export HIPFIRE_DAEMON_BIN="$PWD/target/release/examples/daemon"
+
 mkdir -p "$OUT/stock" "$OUT/candidate"
 mkdir -p "$LOCK_ROOT"
 export HIPFIRE_GPU_LOCKFILE="$LOCK_ROOT/gpu-${GPU}.lock"
@@ -52,6 +65,50 @@ link_fixture "$TRUNK" "$OUT/stock/model.mq4r"
 link_fixture "$STOCK_MTP" "$OUT/stock/model.mtp"
 link_fixture "$TRUNK" "$OUT/candidate/model.mq4r"
 link_fixture "$CANDIDATE" "$OUT/candidate/model.mtp"
+
+python3 - "$TRUNK" "$STOCK_MTP" "$CANDIDATE" "$SESSION" \
+    "$OUT/certification-manifest.json" "$(git rev-parse HEAD)" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+trunk, stock, candidate, session, output = map(Path, sys.argv[1:6])
+commit = sys.argv[6]
+
+def describe(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": str(path.resolve()),
+        "bytes": path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+manifest = {
+    "schema_version": 1,
+    "producer_git_commit": commit,
+    "trunk": describe(trunk),
+    "stock_mtp": describe(stock),
+    "candidate_mtp": describe(candidate),
+    "session": describe(session),
+    "contract": {
+        "turns": 8,
+        "sampling": "registry",
+        "thinking": "med",
+        "max_tokens": 4096,
+        "kv_mode": "q8",
+        "mtp_k": 3,
+        "redline_shadow_iterations": 15,
+    },
+}
+partial = output.with_suffix(".json.partial")
+partial.write_text(json.dumps(manifest, indent=2) + "\n")
+os.replace(partial, output)
+PY
 
 run_serve() {
     local label="$1"
@@ -93,6 +150,7 @@ HIP_VISIBLE_DEVICES="$GPU" ROCR_VISIBLE_DEVICES="$GPU" \
 HIPFIRE_REPLAY_MANUAL_CAPTURE=1 HIPFIRE_REPLAY_BACKEND=shadow \
     python3 scripts/redline_daemon_harness.py \
     --model "$OUT/candidate/model.mq4r" \
+    --daemon "$HIPFIRE_DAEMON_BIN" \
     --skip-prefill \
     --pm4 \
     --kv-mode q8 \

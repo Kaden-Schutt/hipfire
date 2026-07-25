@@ -8,6 +8,7 @@ HF_MODEL="${HF_MODEL:-$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B
 STOCK_MTP="${STOCK_MTP:-$HOME/.hipfire/models/qwen3.6-35b-a3b.mtp}"
 MTP_QUANT="${MTP_QUANT:-mixed}"
 OVERRIDE="$TRAINING_DIR/final.safetensors"
+ALLOW_PARTIAL="${HIPFIRE_FASTMTP_ALLOW_PARTIAL:-0}"
 
 [[ -s "$OVERRIDE" && -s "$TRAINING_DIR/training-manifest.json" ]] || {
     echo "final checkpoint or training manifest missing under $TRAINING_DIR" >&2
@@ -17,6 +18,72 @@ OVERRIDE="$TRAINING_DIR/final.safetensors"
     echo "compressed-vocabulary map is missing: $VOCAB_MAP" >&2
     exit 2
 }
+python3 - "$TRAINING_DIR/training-manifest.json" "$VOCAB_MAP" "$ALLOW_PARTIAL" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+vocab_map = Path(sys.argv[2])
+allow_partial = sys.argv[3] == "1"
+manifest = json.loads(manifest_path.read_text())
+
+required = {
+    "steps",
+    "planned_steps",
+    "stop_step",
+    "output",
+    "world_size",
+    "alignment",
+    "recurrence_input",
+    "feature_header",
+    "vocab_map_sha256",
+}
+missing = sorted(required - manifest.keys())
+if missing:
+    raise SystemExit(f"training manifest is missing required fields: {missing}")
+
+if manifest["output"] != "final.safetensors":
+    raise SystemExit(
+        f"training manifest output is {manifest['output']!r}, expected 'final.safetensors'"
+    )
+if not allow_partial and not (
+    manifest["steps"] == manifest["planned_steps"] == manifest["stop_step"]
+):
+    raise SystemExit(
+        "refusing to package a partial FastMTP run: "
+        f"steps={manifest['steps']} planned_steps={manifest['planned_steps']} "
+        f"stop_step={manifest['stop_step']}; set "
+        "HIPFIRE_FASTMTP_ALLOW_PARTIAL=1 only for an explicit research artifact"
+    )
+if manifest["world_size"] != 4:
+    raise SystemExit(
+        f"production hiptrx manifest has world_size={manifest['world_size']}, expected 4"
+    )
+if manifest["alignment"] != "runtime-shifted-v1":
+    raise SystemExit(
+        f"unexpected training alignment: {manifest['alignment']!r}"
+    )
+if manifest["recurrence_input"] != "teacher-forced-v1":
+    raise SystemExit(
+        f"unexpected recurrence input: {manifest['recurrence_input']!r}"
+    )
+
+feature = manifest["feature_header"]
+for key, expected in (("kv_mode", "q8"), ("state_quant", "q8")):
+    if feature.get(key) != expected:
+        raise SystemExit(
+            f"feature manifest {key}={feature.get(key)!r}, expected {expected!r}"
+        )
+
+actual_vocab_hash = hashlib.sha256(vocab_map.read_bytes()).hexdigest()
+if manifest["vocab_map_sha256"] != actual_vocab_hash:
+    raise SystemExit(
+        "vocabulary map hash does not match the training manifest: "
+        f"{actual_vocab_hash} != {manifest['vocab_map_sha256']}"
+    )
+PY
 case "$MTP_QUANT" in
     mixed|mq4) ;;
     q8)
