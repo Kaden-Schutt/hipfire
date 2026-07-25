@@ -1,0 +1,23 @@
+# Structural guard: make `cargo fmt` fail loudly instead of reformatting the
+# whole workspace.
+#
+# WHY: the repo carries historical rustfmt debt, so CI only checks CHANGED
+# files (scripts/ci-rustfmt-changed.sh). A bare `cargo fmt` rewrites every file
+# in the workspace, burying the real change under a 200+ file diff. This alias
+# shadows the external `cargo-fmt` subcommand so the mistake is impossible
+# rather than merely discouraged — it covers humans, IDEs, and non-Claude
+# agents, none of which read CLAUDE.md.
+#
+# `cargo fmt` now exits 101 with:
+#   error: no such command: `use-scripts-fmt-changed-sh-instead-of-cargo-fmt`
+# Other cargo subcommands (build / check / test / clippy / metadata) are
+# unaffected — only the shadowed `fmt` name is intercepted.
+#
+# Escape hatch for a deliberate, reviewed sweep: call the binary directly,
+# `cargo-fmt --all`, or `rustfmt` on an explicit file list.
+#
+# CAVEAT: cargo warns that alias-shadowing "will become a hard error in the
+# future" (rust-lang/cargo#10049). If a future toolchain rejects this, delete
+# this file — scripts/check-fmt-bomb.sh (pre-commit) still backstops the case.
+[alias]
+fmt = ["use-scripts-fmt-changed-sh-instead-of-cargo-fmt"]
