@@ -1,145 +1,270 @@
-> **Historical document.** This file preserves dated implementation and validation evidence. Current status and remaining work are tracked only in [device-mesh-refactor-tracker.md](device-mesh-refactor-tracker.md).
+> **Current handover — 2026-07-23.** This is a self-contained handover for a
+> new session. The authoritative task status remains
+> [device-mesh-refactor-tracker.md](device-mesh-refactor-tracker.md); this file
+> records the current working-tree stopping point and the next implementation
+> boundary.
 
-> **Current synchronization (2026-07-16):** COR-003 is complete. The
-> implementation work described by the later lifecycle migration passed its
-> CPU, DFlash coherence, and real multi-turn serving gates:
-> Terminal stop/finalization, sealed Qwen speculative turns, architecture
-> discard/reset paths, and native Qwen/DeepSeek/DSpark MTP in-flight
-> cancellation are implemented with production-owned lifecycle tests. The
-> full CPU `nix develop --command cargo test --workspace --locked` suite passed
-> (GPU tests ignored as applicable); `nix develop --command
-> ./scripts/coherence-gate-dflash.sh` passed with no hard or soft warnings
-> (report `/tmp/coherence-dflash-20260716-110721.md`); `nix develop --command
-> ./scripts/serve-multiturn-gate.sh` passed (report
-> `/tmp/serve-multiturn-20260716-110919.md`); and `git diff --check` passed.
-> Native Qwen MTP cancellation is done, while transactional target loading is
-> still deferred to `SPEC-003`. Remaining architecture migrations and separate
-> physical PP/TP/EP hardware tasks remain open. This handover remains
-> historical; use the tracker and its terminal lifecycle migration matrix for
-> current work.
+# Device-mesh / STEP-002 handover
 
-# Device-mesh — HANDOVER for the next session
+## Current goal
 
-> ⚠️ **PIVOT (2026-07-06) — the executor plan changed. Read the plan's `## PIVOT` section BEFORE
-> setting a goal.** The master merge made `execute_steps` (63 call sites) the dense spine and reverted
-> our qwen2→`run_layer_program_mesh` wiring. The new ONE executor is **`execute_steps(mesh, gpus)`** on
-> the `Step` IR — NOT `run_layer_program` on `SuperOp`. The loader/placement half (below, "What's DONE")
-> is all still valid and done; the *executor* half re-sequences to phases **P-A…P-E**. **Suggested next
-> goal:** `/goal device-mesh P-A: big-bang execute_steps(&mut Gpu → mesh, gpus) signature flip, byte-identical`.
-> Full reconciliation + keep/rework/orphan in the plan `## PIVOT` and the git-tracked note
-> `.agent-memory/notes/device-mesh-pivot-execute-steps-spine.md` (`scripts/mem.sh recall execute_steps mesh pivot`).
+Complete **STEP-002 — Adopt Step/Manifest for MoE** for the all-family MoE
+surface: DeepSeek4, MiniMax, and Qwen35 contracts must use the shared
+manifest/mesh/dispatch vocabulary for routed-expert ownership, routing,
+zero/dummy handling, and collectives.
 
-**Set a *single-phase* goal** (not the whole roadmap — that's a multi-week, one-PR-per-phase effort by
-design; a session-scoped `/goal` on all phases loops forever).
+STEP-002 remains `ready`, not complete. The direct-builder fulfillment
+prerequisite (Tasks 2–4) and its evidence documentation (Task 5) have
+passed applicable Oracle gates. DeepSeek4 and MiniMax retain their accepted
+Single behavior and named structural EP regressions. Full physical EP closure
+remains HW-001/HW-002. Vertical architecture cutovers and GPU end-to-end
+upload/freeze/rollback evidence remain outstanding. Qwen35 production EP
+remains a planned, refused-before-allocation capability owned by AXIS-002
+and HW-011; it is not made production-ready by STEP-002.
 
-## Where things are
-- **Branch:** `feature/device-mesh` (worktree `.claude/worktrees/feature+device-mesh`),
-  off `feature/parallel-expansion` (which carries `HIPFIRE_EMULATE_GPUS` — the single-card
-  multi-rank harness that P-B/P-C/5a validation depends on). Tree clean,
-  workspace builds with 0 errors, all no-GPU tests green (0 failures).
-- **Plan:** `docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md`
-  — the **`## PIVOT` section is authoritative** (the older "IMPLEMENTATION STATUS" + §1 + phase table
-  are marked SUPERSEDED inline but kept for the mesh-tree / manifest / safety design record).
-- **Commit map:** `.agent-progress/device-mesh-status.md`.
+## Working-tree snapshot
 
-## What's DONE (pure layer + 2 GPU-validated integrations)
-- `hipfire-hardware` leaf crate: `Gpus`+collectives (extracted from `multi_gpu`, config→`DeviceResolveOpts`), `DeviceMesh` (`mesh.rs`), `CollectiveHint`. Coherence-gate validated.
-- EP executor relocated to `hipfire-dispatch` (`ep.rs`), now mesh-driven (`ep_decode_parity` tp=1 anchor PASS on qwen3.6-35b-a3b).
-- `hipfire_runtime::config::resolve_mesh`, `hipfire_runtime::weight_manifest::*`:
-  `ShardPolicy`/`WeightEntry`/`StateEntry`, `collective_for_policy`, `layer_collectives`,
-  `placement_devices`, `validate_manifest`, **`plan_manifest` → `ManifestPlan`** (the full
-  deterministic compile). `Architecture::{weight_manifest,state_manifest}` implemented for
-  llama, qwen2, minimax, toy.
+The session started from a dirty worktree. `git status --short` currently shows
+changes in:
 
-## DONE (last 2 sessions): `fulfill_manifest` whole-tensor + ExpertSharded (Phase 2 GPU exec)
-`crates/hipfire-runtime/src/weight_store.rs` — `fulfill_manifest(weights, mesh, n_layers, gpus,
-source) -> Result<WeightStore, FulfillError>`. GPU-validated on gfx1151 (`fulfill_manifest_probe`:
-single-1×1 + emulated PP-2 + emulated EP-2; placement + `memcpy_dtoh` byte-oracle; the oracle
-caught a real missing-`layer`-in-key bug + a rollback smoke). Implemented: whole-tensor upload
-(single/PP/Replicate/Pin/Tied→Alias) + **`ExpertSharded`** (each rank = compact blob of its owned
-experts, generic expert-outermost gather via `expert_compact_blob` + `ShardConfig`) + **§6
-transactional guard** (mid-load failure → `free_all` the partial uploads, return `Err`; no VRAM
-leak). **Dense-TP slice returns `Err`** (Phase 5). `source(entry)->bytes` closure keeps arch
-on-disk HFQ naming out of the engine. Additive
-— forward untouched (Tier-1; store-read is Phase 3). NOTE: the EP path produces the placed *bytes*;
-the per-expert pointer-table + zeroed-dummy the deepseek4 kernel indexes through
-(`crates/hipfire-arch-deepseek4/src/arch.rs:163-333`) is forward-consumption, wired in Phase 3.
+- `.agent-progress/device-mesh-refactor-tracker.md`;
+- `crates/hipfire-runtime/src/{weight_manifest.rs,weight_store.rs,arch.rs}`;
+- `crates/hipfire-loader/src/model_parallel.rs`;
+- `crates/hipfire-dispatch/src/families/moe.rs`;
+- `crates/hipfire-arch-deepseek4/src/arch.rs`;
+- `crates/hipfire-arch-minimax/src/minimax.rs`;
+- `crates/hipfire-arch-qwen35/src/{store.rs,qwen35.rs,paro_moe.rs}`; and
+- untracked `scripts/check_moe_residency_boundary.sh` and
+  `scripts/check-weight-store-hybrid-boundary.sh`.
 
-**Also DONE (arch manifests):** qwen35 `state_manifest` (hybrid Kv+Recurrent+Conv by `layer_types`)
-and **deepseek4 `weight_manifest` + `state_manifest`** (MLA replicated, routed experts
-`ExpertSharded`, `num_hash_layers` gate-bias split; compressor/indexer/HC/MTP scoped out — all
-`Replicate`/file-shaped; 2 unit tests). Phase-2 arch coverage now: llama, qwen2, minimax, toy
-(weight+state); qwen35 (state only); deepseek4 (weight+state). Only **qwen35 `weight_manifest`**
-(DeltaNet fused projections + MoE variants) is left in Phase-2 arch coverage.
+Do not reset, clean, or reformat this worktree. The changes above predate this
+documentation update and are not to be committed by the next session without
+the appropriate implementation review.
 
-**Also DONE (Phase 3 START): store-backed REAL llama load.** `source(entry)` now returns
-`(bytes, DType)` (real quant type → forward-ready store tensor, not `Raw`). `examples/llama_store_load.rs`
-loads `qwen3-0.6b-llama.mq4`'s quantized projections via generic `fulfill_manifest` + a llama
-HFQ-backed source and byte+dtype-matches bespoke `Llama::load_weights` — **196 tensors/28 layers,
-identical (MQ4G256), GPU-validated**. Loader name map: HF names `model.layers.{i}.self_attn.q_proj.weight`
-via `hfq::load_weights_hfq` (NOT the GGUF `blk.*` path); quant projections upload raw/verbatim (match),
-norms/embed/tied-lm_head do F16→F32 host dequant (scoped out).
+## Completed / approved work
 
-**Also DONE (Phase 3, WHOLE-MODEL, bit-exact): store→forward.** llama `weight_manifest` gained
-q_norm/k_norm; a universal `source` (quant_type 1→F16→F32, 2→F32, else raw+real dtype) covers the
-whole model; `llama_store_load` fulfills the FULL manifest, assembles a complete `LlamaWeights` from
-the store, and the forward is **logit-IDENTICAL to bespoke (max |Δ|=0, 311 tensors, gfx1151)** — a
-drop-in bit-exact replacement for the bespoke llama loader on a single GPU.
+### Tracker contract
 
-**Also DONE (Phase 3, PP-2 PLACEMENT): mesh-driven pipeline load.** llama `output_norm`→`Pin(Output)`;
-`llama_store_pp` fulfills the WHOLE manifest on a PP-2 emulated mesh, asserts mesh-correct banding
-(311 tensors 155/156; embed→0, output_norm+lm_head→1, layers by `stage_for_layer`), and the gathered
-forward is **logit-IDENTICAL to bespoke (max |Δ|=0, gfx1151)**. The load half of PP is validated.
+The STEP-002 tracker row now makes acceptance explicit: permanent WeightStore
+ownership for routed-expert placements and derived resources; private
+read-only typed projections; origin-enforcing rank-branded allocation tokens;
+and rejection of raw-pointer `WeightStoreView` values. It also records the
+Qwen refusal invariant and preserves the canonical Single-vs-emulated-EP2 gate.
+The tracker remains the status authority; its STEP-002 `Evidence` is still
+`Pending`.
 
-**Also DONE (Phase 1c: PP-2 banded EXECUTION).** Refactored llama's forward: `forward_scratch_band(
-gpu, w, cfg, layer_range, pos, kv, scratch)` (range-parameterized layer loop) + `forward_scratch_head`
-(final norm + lm_head); `forward_scratch_compute` = band(0..n)+head (bit-exact). `llama_store_pp` runs
-a REAL banded PP forward — stage0 embed+band(0..14)/dev0 → `boundary_copy` → stage1 band(14..28)+head
-/dev1 — **logit-IDENTICAL to bespoke (max |Δ|=0)**. Full pipeline-parallel LOAD + EXECUTE, mesh-driven.
+### Manifest contracts
 
-## The NEXT unit — the executor half now sequences P-A → P-E (plan `## PIVOT`)
+The generic manifest layer is present in
+`crates/hipfire-runtime/src/weight_manifest.rs`:
 
-**START HERE — P-A (mechanical, byte-identical):** big-bang flip
-`execute_steps(gpu: &mut Gpu, …)` → `execute_steps(mesh: &DeviceMesh, gpus: &mut Gpus, …)`
-(`crates/hipfire-dispatch/src/pipeline/steps.rs:600`) across **all 63 call sites** + the forward
-drivers that hold `&mut Gpu` (`dense_forward` `arch_spec.rs:131`, qwen35 `forward_from_x_gpu`,
-cohere2moe `decode_step_body`, `prefill_forward` at `crates/hipfire-runtime/src/llama.rs:1498`). Every caller passes `DeviceMesh::single()`.
-Internally degenerate to `gpus.devices[0]`, **never call `ensure_rank_streams`** (the memset sync→async
-trap). Validate: per-arch committed-token md5 A/B == pre-flip (`HIPFIRE_FORWARD_LOWERED`-style) +
-`coherence-gate.sh`. This threads the mesh to the chokepoint with zero behavior change — the safe
-foundation everything else builds on. Then: **P-B** TP-in-execute_steps (per-`Step` `ShardPolicy` shard +
-`Tp` all-reduce), **P-C** PP-at-driver (generalize `forward_scratch_band`+`boundary_copy` into
-`dense_forward`), **P-D** `Step::Moe` + EP fold (retire `run_layer_program_mesh`/`ep.rs`), **P-E**
-`Step::Recurrent`/`Conv` + DeltaNet head-shard.
+- `ShardPolicy`, including `ExpertSharded` and `ExpertTensorSharded`;
+- `WeightEntry` / `StateEntry` and placement validation;
+- `collective_for_policy`, `layer_collectives`, and `placement_devices`;
+- deterministic `plan_manifest` / `ManifestPlan`; and
+- validation of expert shape, shard policy, placement, and collective
+  contracts.
 
-**Still-valid parallel/later units (loader half, unblocked, do anytime):**
-- **qwen35 `weight_manifest`** — finishes Phase-2 arch coverage; pure-CPU DeltaNet loader study
-  (`qwen35.rs:2876-2945`, per-`LayerType` weight sets: LinearAttention fused
-  `in_proj_qkv`/`in_proj_z`/`in_proj_a`/`in_proj_b` + `A_log`/`dt_bias`/`conv1d`/`norm` vs FullAttention
-  gated QKV; dense-vs-MoE variants). Feeds P-E.
-- **real 2-GPU HW validation** — run `llama_store_pp` on hiptrx (4× gfx1201) / hipx (gfx1151+gfx1010)
-  with distinct devices (emulation aliases device 0); confirms `boundary_copy` peer path. Validates P-C.
-- **`ModelParallel`/`ArchDispatch` daemon hoist (serve-reach)** — sits *above* the executor, carries
-  forward unchanged from the old Phase 3. The god-struct refactor (`EpArch`/`LoadedModel`/`load_model_pp`
-  guard `daemon.rs:4843`) → `ModelParallel{gpus, mesh, weights: WeightStore, state}` + `Box<dyn ArchDispatch>`.
-  Only needed once an axis is serve-reachable (after P-C/P-D land a real forward).
+`crates/hipfire-runtime/src/weight_store.rs` fulfills whole tensors and
+expert-compact placement through the existing generic path, with projection
+metadata for static, compact-expert, column, and row placements. This is
+manifest/placement foundation work, not the selected frozen-store ownership
+implementation.
 
-## GOTCHAS (bit me this session)
-- **GPU lock goes stale** (`/tmp/hipfire-gpu.lock`, noclobber variant). Verify dead (dead pid
-  + no `/proc/*/fd` holder + idle `rocm-smi`) then `rm -f` — happened twice this session.
-- **NEVER `cargo fmt`**; per-file `rustfmt --edition 2021 --config skip_children=true <file>`.
-  NEVER rustfmt the fmt-debt files: `daemon.rs`, `qwen35.rs`, `deepseek4/minimax forward.rs`.
-- **Multi-invocation bash caches builds** — the first `cargo build` in a block compiles, the
-  rest show 0.02s. Capture output in one invocation to read real compile/error counts.
-- **deepseek4 EP is slow to cold-JIT** (35B MoE) — use `ep_decode_parity` (fast tp=1 anchor)
-  or a small model, not the full daemon EP, for quick byte-identity checks.
-- Base is `feature/parallel-expansion`, so the mesh branch's diff-vs-master includes the
-  emulation feature until that lands; rebase once it merges.
+### Dispatch contracts
 
-## Engineering decisions recorded (don't re-litigate)
-- ~~The literal single-GPU+EP one-signature merge was NOT done~~ **— SUPERSEDED by the 2026-07-06 pivot.**
-  The one-executor merge IS the plan again, but onto `execute_steps(mesh, gpus)` (the 63-site `Step` spine),
-  NOT `run_layer_program`/`SuperOp`. bjoern locked: grand-unify all arches+axes into `Step`, big-bang flip.
-- `CollectiveHint` is DERIVED from `ShardPolicy` (single source of truth), not hand-written. **(Still holds —
-  now emitted per-`Step` in `execute_steps`, keyed by the manifest policy.)**
-- Mesh is named-axis-primary; the `Dimension` tree is the raggedness (mixed-arch) extension. **(Unchanged.)**
+`crates/hipfire-dispatch/src/families/moe.rs` now centralizes the MoE dispatch
+vocabulary and resolution boundary: `MoeDtypes`, `MoeResolution`, typed MoE
+parameter records, prefill resolution, and `MoeFamily` routing. The loader's
+`MoEExecutionPolicy` in
+`crates/hipfire-loader/src/model_parallel.rs` validates that the effective
+named mesh axis matches Single, TP, or EP and rejects competing TP×EP axes.
+
+These are dispatch contracts and policy seams. They do not prove permanent
+resident ownership or Qwen production admission.
+
+### Failed ExpertShard ownership removal
+
+The unfinished `ExpertShardResourceKind`, `ExpertShardResource`,
+`ExpertShardResident`, `ExpertShardAssembly`, `ExpertShardTarget`, and
+`ExpertShardSlot` layer has been removed from tracked Rust sources. The
+pointer-table/dummy lifetime fixes in the current DS4, MiniMax, and Qwen diffs
+avoid the former `mem::forget` leak path by threading the dummy allocation into
+the per-layer owner.
+
+This removal is an approved **reset boundary**, not proof that the new hybrid
+store exists. The old ownership model must not be reconstructed.
+
+## Rejected ownership approaches
+
+1. **Architecture-owned `ExpertShardResident` / resource assembly.** Rejected
+   because it split ownership between generic placement and architecture
+   structs, made partial-rank rollback ambiguous, and invited leaks/double
+   frees when pointer tables and dummy buffers outlived their source records.
+2. **`WeightStoreAuxiliary` plus `WeightStoreView`.** Rejected because it added
+   a second ownership vocabulary, allowed raw-pointer descriptors to outlive
+   their actual owner, and made typed extraction/freeing look valid without a
+   lifetime or origin proof. `WeightStoreView` is explicitly non-accepting,
+   even when it is described as “non-owning.”
+3. **Raw `take`/replacement from a mutable store.** Rejected for the final
+   architecture because it turns cell identity into temporal mutation and
+   lets architecture assembly silently become an owner.
+4. **Launch leases in this slice.** Deferred. Do not add a lease abstraction
+   while resetting residency ownership; kernel launch lifetime/argument leases
+   require a separate contract and are not needed to establish the store
+   ownership invariant.
+
+## Selected hybrid architecture
+
+The authoritative design is
+`docs/superpowers/plans/2026-07-22-weight-store-moe-residency-recovery.md`:
+
+- `WeightStoreAllocation` is a non-forgeable, non-cloneable, rank-branded
+  free authority containing origin mesh epoch, logical rank, physical device,
+  and pool epoch. A fallible free consumes the token on success and returns
+  the original token with the error on failure.
+- `WeightStoreBuilder` owns all staged allocations until freeze.
+  `FrozenWeightStore` owns one immutable cell arena keyed by opaque
+  `WeightCellId` values. Original routed placements, pointer tables, dummy
+  buffers, dtype/layout metadata, and shared sidecars are store cells; there
+  is no auxiliary owner.
+- Alias resolution happens at freeze. After freeze there is no cell `take`,
+  replacement, mutable lookup, or transfer of ownership.
+- Qwen35, DeepSeek4, and MiniMax keep private typed read-only projections of
+  IDs and aliases. A forward borrows bindings from the frozen owner; the
+  projection cannot extract tensors, clone raw views, or free typed weights.
+- The loader owns the builder during construction and publishes exactly one
+  frozen store into `LoadedModel.weight_store` or `EpState`. Unload consumes
+  that same owner. Architecture teardown frees only architecture-owned scratch
+  and state.
+- **Launch leases are deferred.** The selected architecture uses borrowed
+  bindings for this migration and does not claim a launch-lease solution.
+
+## Mandatory Qwen35 acceptance invariant
+
+The canonical gate is preserved exactly in intent and must remain in the next
+session's acceptance evidence:
+
+- use the pinned canonical Qwen35-MoE 35B fixture;
+- record model SHA-256, prompt MD5, binary digest, exact command, and topology;
+- the emulated EP harness uses **Single as the sole baseline**; EP=1 is its
+  alias and is not a second required run;
+- prefill parity is exact final-prefill logits plus the first token emitted
+  after prefill;
+- decode parity is exact generated token IDs, with reset and multi-turn
+  behavior; and
+- report the first logit divergence if tokens differ.
+
+The explicit negative invariant is equally mandatory: throughout STEP-002,
+Qwen35Moe EP remains `Planned`/refused before allocation. No emulated test may
+construct `EpArch::Qwen35`; no daemon Qwen EP admission may be added; and
+**AXIS-002 is the sole Qwen admission owner**. HW-011 owns physical closure
+only after AXIS-002 admits the cell.
+
+## Updated stopping point — direct-builder prerequisite complete
+
+This handover was originally written after the unsafe-foundation reset, when
+`WeightStoreAllocation`, `WeightCellId`, `WeightStoreBuilder`, and
+`FrozenWeightStore` did not yet exist. Tasks 2–4 of the direct-builder
+fulfillment plan have since been implemented and passed applicable Oracle gates.
+The current tree now contains:
+
+- `WeightStoreAllocation` with live-origin-gated free and retry ownership
+  (Task 2).
+- `WeightStoreBuilder` with `for_target` full-binding capture,
+  `stage_bytes`/`stage_alias` keyed placement, and private adoption surface
+  (Task 3, after full-binding remediation).
+- `fulfill_manifest_builder` with transactional rollback, retry-owning freeze,
+  global-device/local-shard rank separation, whole-arena structural validation,
+  and panic-free shard helpers (Task 4, after rank/slicing/arena/no-panic
+  remediations).
+
+Legacy `WeightStore`, `WeightHandle`, `WeightStoreAssembly`, and
+`fulfill_manifest*` remain untouched for unmigrated callers. Pre-existing
+architecture-file worktree changes (Qwen/DS4/MiniMax/depth) are unrelated and
+were not modified by Tasks 2–4.
+
+Both boundary scripts pass:
+
+```text
+MOE residency boundary check passed: no forbidden ownership symbols in tracked Rust sources under crates/.
+weight_store hybrid foundation boundary: passed
+```
+
+CPU evidence: `cargo test -p hipfire-runtime weight_store --lib` 102 passed /
+9 GPU ignored; `cargo test -p hipfire-runtime weight_manifest --lib` 40 passed;
+`cargo test -p hipfire-hardware --lib` 20 CPU passed / 10 GPU ignored (GPU
+tests executed separately as allocation-domain identity evidence, NOT
+direct-builder GPU proof). GPU upload/freeze/rollback fixtures are explicitly
+ignored — unavailable/unexecuted direct-path evidence.
+
+## Next work — architecture vertical cutovers and GPU evidence
+
+The direct builder fulfillment prerequisite is complete. Outstanding work on the
+roadmap:
+
+1. **Architecture vertical cutovers** (Qwen, DeepSeek4, MiniMax) — each
+   architecture's private typed projection, frozen-store publication, and unload.
+   Qwen EP admission remains **refused** (AXIS-002 owner). No architecture code
+   has been changed by Tasks 2–4.
+2. **GPU end-to-end evidence** — single and emulated mesh upload/freeze/rollback
+   tests remain `#[ignore]`d because compatible AMD hardware/fixtures are not
+   verified for these scenarios. They are unavailable evidence, not passes.
+
+Do not claim STEP-002 completed, Qwen EP admission, or production GPU
+validation. Do not begin adding another view, auxiliary ledger, or launch
+lease.
+
+## Verification already passed
+
+- `bash scripts/check_moe_residency_boundary.sh` passed.
+- `bash scripts/check-weight-store-hybrid-boundary.sh` passed.
+- The tracker records STEP-001 manifest/Step parity, Qwen35 coherence, and
+  serve-multiturn evidence as complete; those are prior evidence, not STEP-002
+  completion.
+- The tracker records the existing manifest, dispatch, model-parallel, and
+  failed-ownership-reset work as the current foundation; STEP-002 evidence
+  remains pending.
+
+Before handing off implementation, run `git diff --check` and inspect only the
+intended source changes. Do not commit from this handover session.
+
+## Active risks
+
+- The current mutable store can still be mistaken for the selected immutable
+  store; keep the Phase 0 boundary script active until every old API is gone.
+- `GpuTensor` has no ordinary freeing `Drop`; any temporary or derived
+  allocation not registered under the eventual token owner can leak on a
+  later-rank failure.
+- Pointer tables bake physical addresses. Borrowed binding construction must
+  prove the cell/store lifetime and must not recreate raw cloneable views.
+- DS4/MiniMax EP has physical RCCL gates HW-001/HW-002; emulation is not
+  production hardware evidence.
+- Qwen's canonical 35B fixture and all required digests are acceptance
+  blockers. Missing evidence is a failed/incomplete gate, not an invitation to
+  substitute a smaller model.
+- Existing dirty changes include dispatch/manifest and dummy-buffer work. Keep
+  the hybrid ownership migration separate and review the full diff before any
+  integration.
+
+## Files to read first
+
+1. `.agent-progress/device-mesh-refactor-tracker.md` — authoritative status,
+   especially STEP-002 at lines 412–420 and AXIS-002 at lines 482–490.
+2. `docs/superpowers/plans/2026-07-22-weight-store-moe-residency-recovery.md` —
+   selected hybrid phases, exact paths, TDD tasks, and old-task supersession.
+3. `crates/hipfire-runtime/src/weight_store.rs` — current mutable store and
+   the exact Phase-0-to-Phase-1 seam.
+4. `crates/hipfire-runtime/src/weight_manifest.rs` — placement and collective
+   contracts.
+5. `crates/hipfire-dispatch/src/families/moe.rs` — centralized MoE dispatch
+   contracts.
+6. `crates/hipfire-loader/src/model_parallel.rs` — named-axis MoE execution
+   policy and refusal checks.
+7. `crates/hipfire-arch-qwen35/src/{store.rs,qwen35.rs,paro_moe.rs}` — raw
+   projection/ownership surfaces to migrate only after the frozen store.
+8. `crates/hipfire-arch-deepseek4/src/arch.rs` and
+   `crates/hipfire-arch-minimax/src/minimax.rs` — routed placement consumers.
+9. `scripts/check_moe_residency_boundary.sh` and
+   `scripts/check-weight-store-hybrid-boundary.sh` — reset and hybrid boundary
+   checks.
