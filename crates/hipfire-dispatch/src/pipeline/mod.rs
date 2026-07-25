@@ -2005,6 +2005,20 @@ pub fn run_moe_prefill(
     }
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
+    // Grouped WMMA pads every live expert to MOE_GROUPED_BLOCK_M rows. That is
+    // excellent for prompt-sized batches but wasteful for speculative verify:
+    // Qwen A3B K=3 supplies only four rows (32 routed slots spread over many
+    // experts), so most 16-row tiles are padding. Keep an opt-in threshold
+    // while the indexed small-B route is parity/perf screened on each arch.
+    // A value of 0 preserves the historical grouped selection.
+    static GROUPED_MIN_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let grouped_min_batch = *GROUPED_MIN_BATCH.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_MOE_GROUPED_MIN_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    let use_path2 = res.use_path2 && p.batch_size >= grouped_min_batch;
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
     if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
@@ -2017,7 +2031,7 @@ pub fn run_moe_prefill(
             p.dtypes.shared_expert_down,
             p.dtypes.routed_gate_up,
             p.dtypes.routed_down,
-            res.use_path2,
+            use_path2,
             force_mq4_grouped_fp16,
             ctx.flags.moe_grouped_i8,
         );
@@ -2038,7 +2052,7 @@ pub fn run_moe_prefill(
 
     // ── Path 2 scatter pipeline ───────────────────────────────────────
     let mut path2_m_total: usize = 0;
-    if res.use_path2 {
+    if use_path2 {
         let m_total_max = p.m_total_max;
         hip!(gpu.moe_scatter_fused_k8(
             p.topk_indices,
@@ -2058,7 +2072,7 @@ pub fn run_moe_prefill(
     }
 
     // ── Gate_up ────────────────────────────────────────────────────────
-    if res.use_path2 {
+    if use_path2 {
         // Path 2: grouped-WMMA-GEMM. Paro gate_up Givens preamble in-line
         // (above the helper — D3).
         if res.paro_mode {
@@ -2305,7 +2319,7 @@ pub fn run_moe_prefill(
     }
 
     // ── Down projection ───────────────────────────────────────────────
-    if res.use_path2 {
+    if use_path2 {
         // Path 2: grouped-WMMA-GEMM + non-atomic combine via inverse_perm.
         dispatch_grouped_gemm(
             gpu,
