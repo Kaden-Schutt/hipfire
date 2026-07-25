@@ -93,7 +93,7 @@ fi
     --epochs 3 \
     --micro-batch-size 128 \
     --global-batch-size 512 \
-    --learning-rate 2e-4 \
+    --learning-rate 5e-5 \
     --warmup-ratio 0.05 \
     --checkpoint-every 500 \
     --eval-every 250 \

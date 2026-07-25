@@ -80,6 +80,11 @@ Each portable `HFMTPF01` record contains:
 - three trailing token ids for the recursive K=3 targets;
 - source ordinal and model/dataset/commit provenance.
 
+Serving-aligned training pairs `h[t]` with the shifted token `x[t+1]` and
+predicts `x[t+2]`. Schema 1 therefore exposes `N-1` usable rows from each
+already-produced record; its final hidden row is ignored, preserving the
+100M-row artifact without regeneration.
+
 Two 128-row windows cover the beginning and tail of each trajectory. The
 default 100M-row budget is about 410 GB at hidden size 2048. Output shards are
 atomic, XXH3-checksummed (native-speed in both Rust and Python), independently
@@ -133,13 +138,15 @@ both `--resume-weights` and `--resume-optimizer` to select an explicit pair.
 
 The hiptrx default uses the verified 32 GB R9700 capacity point: 128
 sequences per GPU, an effective global batch of 512, and one DDP all-reduce
-per optimizer step. The `2e-4` learning rate is a conservative 4x scale from
-the original batch-64 run, with validation every 250 steps and resumable
-checkpoints every 500. Losses are recursive K=3 CE with normalized
-weights `[0.5102, 0.3061, 0.1837]`. Full-vocab targets outside the deployed
-16K draft vocabulary are explicitly excluded and reported as coverage; they
-are not silently aliased. DDP caps all ranks to the smallest feature
-partition, preventing an uneven final shard from hanging collectives.
+per optimizer step. The peak learning rate is `5e-5`, matching the published
+FastMTP recipe, with validation every 250 steps and resumable checkpoints
+every 500. Training recursively reuses the shared head while teacher-forcing
+the shifted ground-truth token at every depth; self-rollout is reserved for
+diagnostic evaluation and product certification. Losses are K=3 CE with
+normalized weights `[0.5102, 0.3061, 0.1837]`. Full-vocab targets outside the
+deployed 16K draft vocabulary are explicitly excluded and reported as
+coverage; they are not silently aliased. DDP caps all ranks to the smallest
+feature partition, preventing an uneven final shard from hanging collectives.
 
 ## Stage 4: package a deployable sidecar
 

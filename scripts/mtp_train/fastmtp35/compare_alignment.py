@@ -13,6 +13,7 @@ from transformers import AutoConfig
 from mtp_module import Qwen35MtpBlock, load_mtp_from_safetensors
 from train_head import (
     ALIGNMENTS,
+    RECURRENCE_INPUTS,
     FeatureShard,
     evaluate,
     find_tensor,
@@ -92,34 +93,37 @@ def main() -> None:
             load_checkpoint_weights(model, checkpoint)
         model = model.to(device=device, dtype=torch.bfloat16)
         for alignment in ALIGNMENTS:
-            metrics = evaluate(
-                model,
-                embed_weight,
-                lm_weight,
-                vocab_map,
-                inverse_vocab,
-                shards,
-                0,
-                1,
-                args.seed,
-                args.micro_batch_size,
-                dim,
-                k,
-                args.eval_batches,
-                alignment,
-            )
-            print(
-                json.dumps(
-                    {
-                        "event": "alignment-eval",
-                        "weights": label,
-                        "checkpoint": str(checkpoint) if checkpoint else "official",
-                        "alignment": alignment,
-                        "metrics": metrics,
-                    }
-                ),
-                flush=True,
-            )
+            for recurrence_input in RECURRENCE_INPUTS:
+                metrics = evaluate(
+                    model,
+                    embed_weight,
+                    lm_weight,
+                    vocab_map,
+                    inverse_vocab,
+                    shards,
+                    0,
+                    1,
+                    args.seed,
+                    args.micro_batch_size,
+                    dim,
+                    k,
+                    args.eval_batches,
+                    alignment,
+                    recurrence_input,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "alignment-eval",
+                            "weights": label,
+                            "checkpoint": str(checkpoint) if checkpoint else "official",
+                            "alignment": alignment,
+                            "recurrence_input": recurrence_input,
+                            "metrics": metrics,
+                        }
+                    ),
+                    flush=True,
+                )
         del model
         torch.cuda.empty_cache()
 

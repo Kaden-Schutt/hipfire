@@ -39,6 +39,9 @@ MAX_RECORD_BYTES = 2 * 1024 * 1024 * 1024
 RUNTIME_SHIFTED_ALIGNMENT = "runtime-shifted-v1"
 LEGACY_SAME_POSITION_ALIGNMENT = "legacy-same-position-v0"
 ALIGNMENTS = (RUNTIME_SHIFTED_ALIGNMENT, LEGACY_SAME_POSITION_ALIGNMENT)
+TEACHER_FORCED_RECURRENCE = "teacher-forced-v1"
+SELF_ROLLOUT_RECURRENCE = "self-rollout-v0"
+RECURRENCE_INPUTS = (TEACHER_FORCED_RECURRENCE, SELF_ROLLOUT_RECURRENCE)
 
 
 @dataclass
@@ -309,6 +312,7 @@ def train_microbatch(
     dim: int,
     k: int,
     alignment: str,
+    recurrence_input: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[float]]:
     batch = collate(records, dim, k, alignment)
     hidden = batch["hidden"].to(device, non_blocking=True)
@@ -325,6 +329,12 @@ def train_microbatch(
     losses = []
     coverage = []
     for depth in range(k):
+        if recurrence_input == TEACHER_FORCED_RECURRENCE:
+            current_tokens = tokens[
+                :, token_offset + depth : token_offset + depth + width
+            ]
+        elif recurrence_input != SELF_ROLLOUT_RECURRENCE:
+            raise ValueError(f"unsupported recurrence input {recurrence_input!r}")
         current_emb = F.embedding(current_tokens, embed_weight)
         current_hidden = model(
             current_emb,
@@ -343,8 +353,9 @@ def train_microbatch(
         # costs multiple GiB per rank without a meaningful gradient benefit.
         losses.append(F.cross_entropy(logits[keep], target[keep]))
         coverage.append(float(keep.sum()) / float(valid_rows.sum()))
-        with torch.no_grad():
-            current_tokens = vocab_map[logits.argmax(-1)]
+        if recurrence_input == SELF_ROLLOUT_RECURRENCE:
+            with torch.no_grad():
+                current_tokens = vocab_map[logits.argmax(-1)]
     loss = sum(loss_weights[index] * losses[index] for index in range(k))
     return loss, losses, coverage
 
@@ -365,6 +376,7 @@ def evaluate(
     k: int,
     max_batches: int,
     alignment: str,
+    recurrence_input: str,
 ) -> list[dict[str, float]]:
     model.eval()
     totals = [
@@ -386,6 +398,12 @@ def evaluate(
         current_tokens = tokens[:, token_offset : token_offset + width]
         valid_rows = torch.arange(width, device=hidden.device)[None, :] < lengths[:, None]
         for depth in range(k):
+            if recurrence_input == TEACHER_FORCED_RECURRENCE:
+                current_tokens = tokens[
+                    :, token_offset + depth : token_offset + depth + width
+                ]
+            elif recurrence_input != SELF_ROLLOUT_RECURRENCE:
+                raise ValueError(f"unsupported recurrence input {recurrence_input!r}")
             current_emb = F.embedding(current_tokens, embed_weight)
             current_hidden = model(
                 current_emb,
@@ -397,15 +415,15 @@ def evaluate(
             target_full = tokens[:, target_offset + depth : target_offset + depth + width]
             target = inverse_vocab[target_full]
             keep = valid_rows & (target >= 0)
+            prediction = logits.argmax(-1)
             if keep.any():
                 loss = F.cross_entropy(logits[keep].float(), target[keep], reduction="sum")
-                prediction = logits.argmax(-1)
                 totals[depth]["loss"] += float(loss)
                 totals[depth]["correct"] += float((prediction[keep] == target[keep]).sum())
                 totals[depth]["covered"] += float(keep.sum())
             totals[depth]["tokens"] += float(valid_rows.sum())
-            prediction = logits.argmax(-1)
-            current_tokens = vocab_map[prediction]
+            if recurrence_input == SELF_ROLLOUT_RECURRENCE:
+                current_tokens = vocab_map[prediction]
     packed = torch.tensor(
         [
             value
@@ -462,6 +480,12 @@ def main() -> None:
         choices=ALIGNMENTS,
         default=RUNTIME_SHIFTED_ALIGNMENT,
         help="token/hidden contract; runtime-shifted-v1 matches Transformers and Hipfire serving",
+    )
+    parser.add_argument(
+        "--recurrence-input",
+        choices=RECURRENCE_INPUTS,
+        default=TEACHER_FORCED_RECURRENCE,
+        help="recursive-token source; teacher-forced-v1 matches FastMTP training",
     )
     args = parser.parse_args()
 
@@ -665,6 +689,7 @@ def main() -> None:
                     dim,
                     k,
                     args.alignment,
+                    args.recurrence_input,
                 )
                 (loss / accumulation).backward()
             micro_step += 1
@@ -709,6 +734,7 @@ def main() -> None:
                     k,
                     args.eval_batches,
                     args.alignment,
+                    args.recurrence_input,
                 )
                 if rank == 0:
                     print(json.dumps({"event": "validation", "step": step, "metrics": metrics}), flush=True)
@@ -734,6 +760,7 @@ def main() -> None:
         k,
         args.eval_batches,
         args.alignment,
+        args.recurrence_input,
     )
     save_checkpoint(args.output, mtp, optimizer, scheduler, step, args.epochs, rank, final=True)
     if rank == 0:
@@ -751,6 +778,7 @@ def main() -> None:
             "steps": step,
             "loss_weights": weights.cpu().tolist(),
             "alignment": args.alignment,
+            "recurrence_input": args.recurrence_input,
             "validation": metrics,
             "output": "final.safetensors",
         }

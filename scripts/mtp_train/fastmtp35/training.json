@@ -25,7 +25,7 @@
   "precision": "bf16",
   "optimizer": {
     "name": "AdamW",
-    "learning_rate": 2e-4,
+    "learning_rate": 5e-5,
     "beta1": 0.9,
     "beta2": 0.95
   },
@@ -39,6 +39,8 @@
     "recursive_steps": 3,
     "loss_decay_beta": 0.6,
     "normalized_loss_weights": [0.5102040816, 0.3061224490, 0.1836734694],
+    "alignment": "runtime-shifted-v1",
+    "recurrence_input": "teacher-forced-v1",
     "mask_targets_outside_compressed_vocab": true
   },
   "certification": {
