@@ -90,7 +90,14 @@ struct CompletionRow {
 
 fn numeric_equal(left: &Value, right: &Value) -> bool {
     match (left.as_f64(), right.as_f64()) {
-        (Some(left), Some(right)) => (left - right).abs() <= f64::EPSILON,
+        // Sampling values enter the daemon as f32 and are then serialized
+        // through serde_json as widened f64 decimals. Compare their exact f32
+        // representations so a round-trip such as
+        // 0.6 -> 0.6000000238418579 is accepted without admitting a distinct
+        // sampler value.
+        (Some(left), Some(right)) => {
+            left == right || (left as f32).to_bits() == (right as f32).to_bits()
+        }
         _ => left == right,
     }
 }
@@ -607,5 +614,11 @@ mod tests {
             "repeat_window": 128,
         });
         validate_sampling(&expected, &actual).unwrap();
+    }
+
+    #[test]
+    fn sampling_accepts_exact_f32_json_round_trip_only() {
+        assert!(numeric_equal(&json!(0.6), &json!(0.6000000238418579)));
+        assert!(!numeric_equal(&json!(0.6), &json!(0.60001)));
     }
 }
