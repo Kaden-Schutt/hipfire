@@ -10,6 +10,19 @@ TAG="${TAG:-qwen3.6:35b-a3b-mq4r}"
 GPU="${GPU:-0}"
 LOCK_ROOT="${XDG_RUNTIME_DIR:-$HOME/.cache/hipfire}/hipfire-locks"
 
+if ! command -v hipcc >/dev/null 2>&1; then
+    for rocm_bin in /opt/rocm/bin /opt/rocm/core-*/bin; do
+        if [[ -x "$rocm_bin/hipcc" ]]; then
+            export PATH="$rocm_bin:$PATH"
+            break
+        fi
+    done
+fi
+command -v hipcc >/dev/null 2>&1 || {
+    echo "hipcc was not found in PATH or an installed ROCm bin directory" >&2
+    exit 2
+}
+
 for path in "$CANDIDATE" "$TRUNK" "$STOCK_MTP" "$SESSION"; do
     [[ -s "$path" ]] || { echo "missing certification input: $path" >&2; exit 2; }
 done

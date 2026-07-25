@@ -294,6 +294,7 @@ def send(cfg, messages):
     req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
+    event_count = 0
     for raw in urllib.request.urlopen(req, timeout=1800):
         line = raw.decode("utf-8", "ignore").strip()
         if not line.startswith("data:"): continue
@@ -301,6 +302,7 @@ def send(cfg, messages):
         if p == "[DONE]": break
         try: ck = json.loads(p)
         except Exception: continue
+        event_count += 1
         if ck.get("usage"): usage = ck["usage"]
         if ck.get("timings"): timings = ck["timings"]
         ch = (ck.get("choices") or [{}])[0]
@@ -314,6 +316,11 @@ def send(cfg, messages):
             ans.append(d["content"])
         if d.get("tool_calls"): tools.append(json.dumps(d["tool_calls"]))
     wall = time.time() - t0
+    if event_count == 0 or (not usage and finish is None and not think and not ans and not tools):
+        raise RuntimeError(
+            "serve returned no usable completion events; the daemon may have exited "
+            "after the health check (inspect --serve-log)"
+        )
     dtoks = usage.get("completion_tokens", 0)
     decode_ts = timings.get("decode_tok_s")
     decode_est = False
