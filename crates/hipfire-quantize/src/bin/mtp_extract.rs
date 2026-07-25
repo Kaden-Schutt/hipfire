@@ -4,7 +4,7 @@
 //!
 //! Usage:
 //!     mtp_extract --hf-dir <safetensors_dir> --output <out.mtp>
-//!                 [--quant {mq4,q8}] [--verbose]
+//!                 [--quant {mq4,q8,mixed}] [--verbose]
 //!
 //! Empirical: every released dense Qwen3.5 (0.8B / 2B / 4B / 9B / 27B)
 //! and Qwen3.6-27B exposes the SAME 15 MTP-block tensors in safetensors.
@@ -16,8 +16,9 @@
 //! Output container:
 //!   * arch_id = 21 (QWEN35_MTP_HEAD)
 //!   * 15 tensors with hipfire-canonical names (see naming map below)
-//!   * Norms (`*norm`) stay F32; weights default to MQ4 (or Q8 with
-//!     `--quant q8` for the conservative first-integration path).
+//!   * Norms (`*norm`) stay F32; weights default to MQ4. `--quant q8` packs
+//!     every matrix as Q8, while `--quant mixed` keeps routed MoE + compressed
+//!     LM-head matrices in runtime-specialized MQ4 and packs the rest as Q8.
 //!   * Embedding + LM head are intentionally NOT packed — the MTP head
 //!     reuses the trunk's `embed_tokens` and `lm_head`. Metadata flags
 //!     `shared_embed_with_trunk` + `shared_lm_head_with_trunk` make
@@ -404,6 +405,10 @@ fn find_tensor<'a>(
 enum QuantChoice {
     Mq4,
     Q8,
+    /// Keep runtime-specialized routed MoE weights and the compressed LM head
+    /// in MQ4, but use Q8 for the shared MTP block weights. This is the
+    /// highest-fidelity format the current MoE runtime can execute.
+    Mixed,
 }
 
 impl QuantChoice {
@@ -411,6 +416,7 @@ impl QuantChoice {
         match s {
             "mq4" | "MQ4" | "mq4g256" => Some(Self::Mq4),
             "q8" | "Q8" | "q8f16" => Some(Self::Q8),
+            "mixed" | "q8-moe-mq4" => Some(Self::Mixed),
             _ => None,
         }
     }
@@ -418,6 +424,7 @@ impl QuantChoice {
         match self {
             Self::Mq4 => "MQ4G256",
             Self::Q8 => "Q8_F16",
+            Self::Mixed => "Q8_F16 + routed-MoE MQ4G256",
         }
     }
 }
@@ -477,6 +484,10 @@ fn quantize_mtp_tensor(
             (QuantType::Q8F16, 32, q, "Q8_F16")
         }
         QuantChoice::Q8 => {
+            let q = quantize_q8f16(f32_data);
+            (QuantType::Q8F16, 32, q, "Q8_F16")
+        }
+        QuantChoice::Mixed => {
             let q = quantize_q8f16(f32_data);
             (QuantType::Q8F16, 32, q, "Q8_F16")
         }
@@ -560,7 +571,7 @@ fn parse_args() -> Args {
             "--quant" => {
                 let s = &argv[i + 1];
                 quant = QuantChoice::parse(s).unwrap_or_else(|| {
-                    eprintln!("unknown --quant value '{s}' (valid: mq4, q8)");
+                    eprintln!("unknown --quant value '{s}' (valid: mq4, q8, mixed)");
                     std::process::exit(1);
                 });
                 i += 2;
@@ -580,7 +591,7 @@ fn parse_args() -> Args {
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: mtp_extract --hf-dir <safetensors_dir> --output <out.mtp> \
-                     [--quant mq4|q8] [--mtp-override <trained.safetensors>] \
+                     [--quant mq4|q8|mixed] [--mtp-override <trained.safetensors>] \
                      [--vocab-sidecar <sidecar.json>] [--verbose]"
                 );
                 std::process::exit(0);
@@ -986,6 +997,11 @@ fn main() {
         let gate_up_elems = 2 * moe_intermediate_size * n_embd;
         let down_elems = n_embd * moe_intermediate_size;
         total_in_bytes += gate_up_raw.len() + down_raw.len();
+        let routed_expert_quant = if matches!(args.quant, QuantChoice::Mixed) {
+            QuantChoice::Mq4
+        } else {
+            args.quant
+        };
         for expert_idx in 0..num_experts {
             let f32_data = to_f32_range(
                 gate_up_raw,
@@ -1000,7 +1016,7 @@ fn main() {
                 &f32_data,
                 false,
                 true,
-                args.quant,
+                routed_expert_quant,
                 false,
                 &signs1,
                 &signs2,
@@ -1036,7 +1052,7 @@ fn main() {
                 &f32_data,
                 false,
                 true,
-                args.quant,
+                routed_expert_quant,
                 false,
                 &signs1,
                 &signs2,
@@ -1184,7 +1200,7 @@ fn main() {
         // Quantize compressed lm_head as MQ4G256 (h_dim=5120 is 256-aligned
         // for all Qwen3.5/3.6 dense models). If --quant q8, fall back.
         let (lm_quant_type, lm_group_size, lm_bytes, lm_label) = match args.quant {
-            QuantChoice::Mq4 if h_dim % 256 == 0 => {
+            QuantChoice::Mq4 | QuantChoice::Mixed if h_dim % 256 == 0 => {
                 let q = quantize_mq4g256(&lm_compressed_f32, &signs1, &signs2);
                 (QuantType::MQ4G256, 256u32, q, "MQ4G256")
             }
