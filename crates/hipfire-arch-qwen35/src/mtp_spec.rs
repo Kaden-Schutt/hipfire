@@ -2712,6 +2712,21 @@ pub fn spec_step_mtp_compressed_serial(
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
+    // HIPFIRE_MTP_PHASES=1: synchronize at each major cycle boundary and emit
+    // actual GPU-complete wall time. This is intentionally expensive and must
+    // remain diagnostic-only; without the env flag it adds only timestamps.
+    static MTP_PHASES_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let phase_on = *MTP_PHASES_ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_MTP_PHASES")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_cycle_start = Instant::now();
+
     let overlap_trunk_snap = mtp_snapshot_overlap_enabled_from_env()
         && state.trunk_snap_stream.is_some()
         && state.trunk_snap_start_event.is_some();
@@ -3265,6 +3280,10 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         candidates.len()
     };
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_proposal_end = Instant::now();
 
     // ── 2. Trunk verify ───────────────────────────────────────────────────
     let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
@@ -3321,6 +3340,10 @@ pub fn spec_step_mtp_compressed_serial(
         None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
     )?;
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_trunk_end = Instant::now();
 
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
@@ -3431,6 +3454,10 @@ pub fn spec_step_mtp_compressed_serial(
             }
         }
     }
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_lmhead_end = Instant::now();
 
     if use_sampling {
         // Row `pos` predicts after `last_committed` plus candidates[..pos].
@@ -3448,6 +3475,10 @@ pub fn spec_step_mtp_compressed_serial(
             )?;
         }
     }
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_penalty_end = Instant::now();
 
     let mut accept_count = 0usize;
     // Assigned exactly once in each arm below (sampled accept returns it; the
@@ -3560,6 +3591,10 @@ pub fn spec_step_mtp_compressed_serial(
     // tok/s tau=2.74; offset ±1 collapses to 17-45 tok/s. Default is sharp.
     let prev_hidden_row = advance - 1;
     state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_accept_end = Instant::now();
 
     // ── 3. KV / DN rollback (or skip on full accept) ──────────────────────
     //
@@ -3634,6 +3669,27 @@ pub fn spec_step_mtp_compressed_serial(
                 )?;
             }
         }
+    }
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+        let t_cycle_end = Instant::now();
+        eprintln!(
+            "[mtp-phase] K={} drafts={} accept={} advance={} full={} \
+             proposal={}us trunk={}us lmhead={}us penalties={}us \
+             accept={}us rollback={}us total={}us",
+            max_n,
+            drafts_generated,
+            accept_count,
+            advance,
+            replay_skipped,
+            t_proposal_end.duration_since(t_cycle_start).as_micros(),
+            t_trunk_end.duration_since(t_proposal_end).as_micros(),
+            t_lmhead_end.duration_since(t_trunk_end).as_micros(),
+            t_penalty_end.duration_since(t_lmhead_end).as_micros(),
+            t_accept_end.duration_since(t_penalty_end).as_micros(),
+            t_cycle_end.duration_since(t_accept_end).as_micros(),
+            t_cycle_end.duration_since(t_cycle_start).as_micros(),
+        );
     }
 
     Ok(MtpSpecResult {
