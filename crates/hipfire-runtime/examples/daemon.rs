@@ -735,11 +735,19 @@ fn mtp_required_capacity(prompt_len: usize, max_tokens: usize, max_n: usize) -> 
 /// Equality is not reusable here: native MTP needs at least the previously
 /// deferred final token in the suffix so it can advance the trunk exactly once.
 fn mtp_strict_extension_len(prior: &[u32], rendered: &[u32]) -> Option<usize> {
-    if prior.is_empty() || rendered.len() <= prior.len() || !rendered.starts_with(prior) {
+    let lcp = mtp_common_prefix_len(prior, rendered);
+    if prior.is_empty() || rendered.len() <= prior.len() || lcp != prior.len() {
         None
     } else {
         Some(prior.len())
     }
+}
+
+fn mtp_common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter()
+        .zip(b)
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 /// Number of tokens represented by native-MTP's retained target state.
@@ -6500,7 +6508,11 @@ fn generate_qwen35_mtp(
         && !m.conversation_tokens.is_empty()
         && m.seq_pos == m.conversation_tokens.len()
         && m.eviction.is_none();
-    if cache_candidate {
+    // Canonicalize history even after a cold/reset turn. Replaying verbatim
+    // hidden reasoning is what makes the newly cold-prefilled state eligible
+    // for a strict extension on the following turn; conditioning this render
+    // on an already-valid state would make one reset poison every later LCP.
+    if mtp_prefix_cache_on && messages_history.is_some() {
         let history = messages_history.unwrap();
         let trace_cache = std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
         let canonical = if try_jinja {
@@ -6592,13 +6604,14 @@ fn generate_qwen35_mtp(
     let cached_tokens = extension_len.unwrap_or(0);
     let prefill_start = cached_tokens;
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        let lcp = mtp_common_prefix_len(&m.conversation_tokens, &prompt_tokens);
         eprintln!(
             "[qwen-cache mtp] candidate={} hit={} prior_len={} rendered_len={} lcp={} seq_pos={}",
             cache_candidate,
             cache_hit,
             prior_len,
             prompt_tokens.len(),
-            cached_tokens,
+            lcp,
             m.seq_pos,
         );
     }
@@ -7058,6 +7071,20 @@ fn generate_qwen35_mtp(
             None => break, // defensive: spec_step always commits ≥ 1
         };
         cur_pos += result.advance;
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            let represented = mtp_represented_len(prompt_tokens.len(), streamed_tokens.len());
+            if represented != cur_pos {
+                eprintln!(
+                    "[qwen-cache mtp cycle] mismatch represented={} cur_pos={} advance={} committed={} streamed_delta={} hit_eos={}",
+                    represented,
+                    cur_pos,
+                    result.advance,
+                    result.committed.len(),
+                    streamed_tokens.len().saturating_sub(streamed_before),
+                    result.hit_eos || hit_eos,
+                );
+            }
+        }
         if result.hit_eos || hit_eos {
             break;
         }
@@ -7115,6 +7142,18 @@ fn generate_qwen35_mtp(
                     break;
                 }
                 cur_pos += advance_toks.len();
+                if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                    let represented =
+                        mtp_represented_len(prompt_tokens.len(), streamed_tokens.len());
+                    eprintln!(
+                        "[qwen-cache mtp force-close] close_ids={} advance_toks={} represented={} cur_pos={} generated={}",
+                        close_ids.len(),
+                        advance_toks.len(),
+                        represented,
+                        cur_pos,
+                        generated,
+                    );
+                }
                 last_committed = *close_ids.last().unwrap();
                 think_closed = true;
                 prev_in_think = false;
@@ -15602,8 +15641,9 @@ mod tool_call_parser_tests {
 #[cfg(test)]
 mod render_tail_think_tests {
     use super::{
-        asst_turn_fingerprint, mtp_represented_len, mtp_required_capacity,
-        mtp_strict_extension_len, normalize_asst_turn_for_fingerprint, render_tail_opens_think,
+        asst_turn_fingerprint, mtp_common_prefix_len, mtp_represented_len,
+        mtp_required_capacity, mtp_strict_extension_len, normalize_asst_turn_for_fingerprint,
+        render_tail_opens_think,
     };
 
     #[test]
@@ -15648,6 +15688,8 @@ mod render_tail_think_tests {
 
     #[test]
     fn mtp_cache_accepts_only_a_strict_forward_extension() {
+        assert_eq!(mtp_common_prefix_len(&[1, 2], &[1, 2, 3]), 2);
+        assert_eq!(mtp_common_prefix_len(&[1, 2], &[1, 9, 3]), 1);
         assert_eq!(mtp_strict_extension_len(&[1, 2], &[1, 2, 3]), Some(2));
         assert_eq!(mtp_strict_extension_len(&[1, 2], &[1, 2]), None);
         assert_eq!(mtp_strict_extension_len(&[1, 2], &[1, 9, 3]), None);
