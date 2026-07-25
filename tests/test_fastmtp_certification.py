@@ -8,20 +8,24 @@ from pathlib import Path
 FAST_MTP = Path(__file__).parents[1] / "scripts" / "mtp_train" / "fastmtp35"
 sys.path.insert(0, str(FAST_MTP))
 
-from evaluate_certification import evaluate  # noqa: E402
+from evaluate_certification import EXPECTED_CONTRACT, evaluate  # noqa: E402
 
 
 def rows(rate: float, tau: float | None) -> list[dict]:
     return [
         {
+            "ctx": 1000 + turn * 100,
+            "cached": 0 if turn == 0 else 900 + turn * 100,
             "decode_tok_s": rate,
             "decode_estimated": False,
             "tau": tau,
             "runaway": False,
             "empty": False,
             "attractor": False,
+            "recall_hits": 3 if turn >= 6 else 0,
+            "recall_total": 3 if turn >= 6 else 0,
         }
-        for _ in range(8)
+        for turn in range(8)
     ]
 
 
@@ -46,6 +50,24 @@ class FastMtpCertificationTest(unittest.TestCase):
             (root / f"{label}.json").write_text(json.dumps(body))
         (root / "redline-shadow.json").write_text(
             json.dumps({"pass": redline_pass})
+        )
+        artifact = {
+            "path": "/fixture",
+            "bytes": 1,
+            "sha256": "a" * 64,
+        }
+        (root / "certification-manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "producer_git_commit": "f" * 40,
+                    "trunk": artifact,
+                    "stock_mtp": {**artifact, "sha256": "b" * 64},
+                    "candidate_mtp": {**artifact, "sha256": "c" * 64},
+                    "session": {**artifact, "sha256": "d" * 64},
+                    "contract": EXPECTED_CONTRACT,
+                }
+            )
         )
 
     def test_accepts_candidate_that_clears_every_gate(self) -> None:
