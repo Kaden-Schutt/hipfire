@@ -299,6 +299,7 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
             | "mq_rotate_x"
             | "repeat_interleave_qk_f32"
             | "rmsnorm_f32"
+            | "rmsnorm_f32_warp_reduce"
             | "sigmoid_mul_f32"
     )
 }
@@ -501,6 +502,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]);
     }
     match kernel {
+        "add_inplace_f32" => Some(vec![write(0), read(8)]),
         "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -516,6 +518,95 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(40),
         ]),
         "rmsnorm_reduce_gfx1100" => Some(vec![read(0), write(8)]),
+        "compressor_add_ape_f32_buf" => Some(vec![write(0), read(8), read(16)]),
+        "compressor_overlap_concat_f32" => Some(vec![read(0), write(8)]),
+        "compressor_softmax_pool_f32_buf" => Some(vec![read(0), read(8), write(16), read(24)]),
+        "deepseek4_attn_swa_buf" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            read(40),
+        ]),
+        "deepseek4_attn_swa_topk_f32_buf"
+        | "deepseek4_attn_swa_topk_ilp4_f32_buf"
+        | "deepseek4_attn_swa_topk_scoregrid_f32_buf"
+        | "deepseek4_attn_swa_topk_warp_f32_buf" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            write(48),
+            read(56),
+            read(64),
+        ]),
+        "deepseek4_fused_silu_mul_clamp_mq_rotate" => {
+            Some(vec![read(0), read(8), read(16), read(24), write(32)])
+        }
+        "deepseek4_moe_topk_bias_aware_f32" => Some(vec![read(0), read(8), write(16), write(24)]),
+        "deepseek4_silu_mul_clamp_f32" => Some(vec![read(0), read(8), write(16)]),
+        "embedding_q8_buf_broadcast" => Some(vec![read(0), write(8), read(16)]),
+        "deepseek4_topk_kv_gather_f32_buf" => {
+            Some(vec![read(0), read(8), write(16), read(24), read(32)])
+        }
+        "deepseek4_topk_kv_gather_identity_f32_buf" => Some(vec![read(0), write(8), read(16)]),
+        "fused_rmsnorm_mq_rotate_plain" | "fused_rmsnorm_mq_rotate_plain_nox" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+        ]),
+        "gemv_mfp4g32_e8_soa_grouped_gfx1151" | "gemv_mfp4g32_e8_soa_u4" => {
+            Some(vec![read(0), read(8), write(16)])
+        }
+        "gemv_mq2g256_lloyd_moe_down_expanded_k4" => {
+            Some(vec![read(0), read(8), read(16), write(24)])
+        }
+        "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
+        | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed"
+        | "gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed"
+        | "gemv_mq2g256_lloyd_moe_down_residual_scaled_rowtile2_indexed" => {
+            Some(vec![read(0), read(8), read(16), read(24), write(32)])
+        }
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"
+        | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_wavecb" => {
+            Some(vec![read(0), read(8), read(16), write(24), write(32)])
+        }
+        "hash_router_normalize_f32_buf" => {
+            Some(vec![read(0), read(8), read(16), write(24), write(32)])
+        }
+        "hc_apply_alpha" => Some(vec![write(0), read(8), read(16)]),
+        "hc_finalize_control" => Some(vec![write(0), read(8), read(16)]),
+        "hc_finalize_input_map" => Some(vec![write(0), read(8), read(16), read(24), write(32)]),
+        "hc_compute_control" | "hc_compute_control_vec4" | "hc_head_compute_pre" => {
+            Some(vec![read(0), read(8), read(16), write(24)])
+        }
+        "hc_compute_control_vec4_finalize" => {
+            Some(vec![read(0), read(8), read(16), write(24), read(32)])
+        }
+        "hc_input_map_4stream" => Some(vec![read(0), read(8), write(16)]),
+        "hc_mix_4stream" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
+        "hc_pre_post_sigmoid_scale_f32" | "hc_sinkhorn_4x4" => Some(vec![write(0)]),
+        "indexer_relu_score_f32_buf" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
+        "indexer_top_k_buf" | "indexer_top_k_buf_parallel" => {
+            Some(vec![read(0), write(8), read(16), read(24)])
+        }
+        "rmsnorm_f32_at_slot_buf" => Some(vec![write(0), read(8), read(16)]),
+        "rope_tail_interleaved_f32"
+        | "rope_tail_yarn_interleaved_f32"
+        | "rope_tail_yarn_interleaved_wide_f32" => Some(vec![write(0), write(8), read(16)]),
+        "rope_tail_yarn_interleaved_at_slot_buf_f32" => Some(vec![write(0), read(8), read(16)]),
+        "sqrt_softplus_f32" => Some(vec![write(0)]),
+        "state_overlap_shift_f32_buf" => Some(vec![write(0), read(8)]),
+        "state_ring_write_f32_buf" | "swa_ring_write_f32_buf" => {
+            Some(vec![read(0), write(8), read(16)])
+        }
+        "zero_f32" => Some(vec![write(0)]),
         "rotate_with_rms_gfx1100" => Some(vec![
             read(0),
             read(8),
@@ -652,7 +743,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(48),
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
-        "rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
+        "rmsnorm_f32" | "rmsnorm_f32_warp_reduce" => Some(vec![read(0), read(8), write(16)]),
         "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
@@ -684,6 +775,87 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if matches!(
+        kernel,
+        "hc_pre_post_sigmoid_scale_f32" | "hc_sinkhorn_4x4" | "sqrt_softplus_f32" | "zero_f32"
+    ) {
+        return Some(16);
+    }
+    if matches!(
+        kernel,
+        "compressor_add_ape_f32_buf"
+            | "compressor_overlap_concat_f32"
+            | "deepseek4_silu_mul_clamp_f32"
+            | "embedding_q8_buf_broadcast"
+            | "deepseek4_topk_kv_gather_identity_f32_buf"
+            | "gemv_mfp4g32_e8_soa_u4"
+            | "hc_apply_alpha"
+            | "rmsnorm_f32_at_slot_buf"
+            | "state_overlap_shift_f32_buf"
+            | "state_ring_write_f32_buf"
+            | "add_inplace_f32"
+    ) {
+        return Some(32);
+    }
+    if matches!(
+        kernel,
+        "compressor_softmax_pool_f32_buf"
+            | "deepseek4_fused_silu_mul_clamp_mq_rotate"
+            | "deepseek4_moe_topk_bias_aware_f32"
+            | "gemv_mfp4g32_e8_soa_grouped_gfx1151"
+            | "gemv_mq2g256_lloyd_moe_down_expanded_k4"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_rowtile2_indexed"
+            | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_wavecb"
+            | "hc_compute_control"
+            | "hc_compute_control_vec4"
+            | "hc_finalize_control"
+            | "indexer_relu_score_f32_buf"
+            | "indexer_top_k_buf"
+            | "indexer_top_k_buf_parallel"
+            | "rope_tail_interleaved_f32"
+            | "swa_ring_write_f32_buf"
+    ) {
+        return Some(48);
+    }
+    if kernel == "hc_finalize_input_map" {
+        return Some(56);
+    }
+    if kernel == "hc_compute_control_vec4_finalize" {
+        return Some(64);
+    }
+    if kernel == "gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed" {
+        return Some(56);
+    }
+    if matches!(
+        kernel,
+        "deepseek4_attn_swa_buf"
+            | "deepseek4_topk_kv_gather_f32_buf"
+            | "fused_rmsnorm_mq_rotate_plain"
+            | "fused_rmsnorm_mq_rotate_plain_nox"
+            | "hash_router_normalize_f32_buf"
+            | "hc_head_compute_pre"
+            | "rope_tail_yarn_interleaved_at_slot_buf_f32"
+    ) {
+        return Some(64);
+    }
+    if matches!(
+        kernel,
+        "rope_tail_yarn_interleaved_f32" | "rope_tail_yarn_interleaved_wide_f32"
+    ) {
+        return Some(80);
+    }
+    if matches!(
+        kernel,
+        "deepseek4_attn_swa_topk_f32_buf"
+            | "deepseek4_attn_swa_topk_ilp4_f32_buf"
+            | "deepseek4_attn_swa_topk_scoregrid_f32_buf"
+            | "deepseek4_attn_swa_topk_warp_f32_buf"
+    ) {
+        return Some(96);
+    }
     if matches!(
         kernel,
         "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
@@ -782,7 +954,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "moe_down_combine_k8_batched_vec4"
         | "moe_topk_renorm_k8"
         | "rmsnorm_f32"
+        | "rmsnorm_f32_warp_reduce"
         | "rmsnorm_reduce_gfx1100"
+        | "hc_input_map_4stream"
         | "sigmoid_mul_f32" => Some(32),
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
@@ -804,6 +978,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        | "hc_mix_4stream"
         | "kv_cache_write_asym_k_fwht3"
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
@@ -941,6 +1116,10 @@ impl ResourceFrontier {
 struct Pm4PhasePlan {
     indices: Vec<usize>,
     parallel: bool,
+    /// For a parallel phase containing two dependent branch chains, indices
+    /// before this position belong to lane 0 and indices at/after it belong
+    /// to lane 1. `None` retains the ordinary round-robin antichain layout.
+    lane_split: Option<usize>,
 }
 
 fn launches_are_independent(left: &RecordedHipLaunch, right: &RecordedHipLaunch) -> bool {
@@ -996,10 +1175,149 @@ fn pm4_phase_plan(
         if !parallel && phases.last().is_some_and(|phase| !phase.parallel) {
             phases.last_mut().unwrap().indices.extend(indices);
         } else {
-            phases.push(Pm4PhasePlan { parallel, indices });
+            phases.push(Pm4PhasePlan {
+                parallel,
+                indices,
+                lane_split: None,
+            });
         }
     }
     phases
+}
+
+fn launch_workgroups(launch: &RecordedHipLaunch) -> u64 {
+    launch.grid.iter().fold(1_u64, |product, axis| {
+        product.saturating_mul(u64::from(*axis))
+    })
+}
+
+fn launch_ranges_are_independent(
+    recorded: &[RecordedHipLaunch],
+    left: std::ops::Range<usize>,
+    right: std::ops::Range<usize>,
+) -> bool {
+    left.clone().all(|left_index| {
+        right.clone().all(|right_index| {
+            launches_are_independent(&recorded[left_index], &recorded[right_index])
+        })
+    })
+}
+
+/// Recover the two branch chains intentionally serialized by DeepSeek4's
+/// retained-FFN capture route:
+///
+///   zero(routed) ; shared-E8 chain ; routed-MQ2 chain ; add(shared, routed)
+///
+/// The resource contracts prove every launch in the shared chain independent
+/// of every launch in the routed chain. The zero is moved onto the routed lane
+/// so the shared lane can start immediately. Both dependent chains retain their
+/// original internal order, and the following serial phase begins with `add`.
+fn pm4_ds4_ffn_branch_plan(recorded: &[RecordedHipLaunch]) -> Result<Vec<Pm4PhasePlan>, String> {
+    let mut phases = Vec::<Pm4PhasePlan>::new();
+    let mut cursor = 0_usize;
+    let mut branches = 0_usize;
+
+    while let Some(zero) = recorded[cursor..]
+        .iter()
+        .position(|launch| launch.kernel == "zero_f32")
+        .map(|offset| cursor + offset)
+    {
+        let add = recorded[zero + 1..]
+            .iter()
+            .position(|launch| launch.kernel == "add_inplace_f32")
+            .map(|offset| zero + 1 + offset)
+            .ok_or_else(|| {
+                format!(
+                    "DeepSeek4 FFN branch capture has zero_f32 at {zero} without a following add"
+                )
+            })?;
+        if recorded[zero + 1..add]
+            .iter()
+            .any(|launch| launch.kernel == "zero_f32")
+        {
+            return Err(format!(
+                "DeepSeek4 FFN branch capture has nested zero_f32 before add at {add}"
+            ));
+        }
+
+        let shared_start = zero + 1;
+        let mut best = None::<(usize, u64)>;
+        for split in shared_start + 1..add {
+            let shared = &recorded[shared_start..split];
+            let routed = &recorded[split..add];
+            let looks_like_shared = shared
+                .iter()
+                .any(|launch| launch.kernel == "gemv_mfp4g32_e8_soa_u4");
+            let looks_like_routed = routed
+                .iter()
+                .any(|launch| launch.kernel == "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed");
+            if !looks_like_shared
+                || !looks_like_routed
+                || !launch_ranges_are_independent(recorded, shared_start..split, split..add)
+                || !launch_ranges_are_independent(recorded, zero..zero + 1, shared_start..split)
+            {
+                continue;
+            }
+            let shared_work = shared.iter().map(launch_workgroups).sum::<u64>();
+            let routed_work = recorded[zero..zero + 1]
+                .iter()
+                .chain(routed.iter())
+                .map(launch_workgroups)
+                .sum::<u64>();
+            let balance = shared_work.min(routed_work);
+            if best.is_none_or(|(_, best_balance)| balance > best_balance) {
+                best = Some((split, balance));
+            }
+        }
+        let (split, _) = best.ok_or_else(|| {
+            format!(
+                "DeepSeek4 FFN branch capture at zero_f32 index {zero} has no resource-independent shared/routed split before add index {add}"
+            )
+        })?;
+
+        if cursor < zero {
+            phases.push(Pm4PhasePlan {
+                indices: (cursor..zero).collect(),
+                parallel: false,
+                lane_split: None,
+            });
+        }
+
+        let shared_len = split - shared_start;
+        let mut branch_indices = (shared_start..split).collect::<Vec<_>>();
+        branch_indices.push(zero);
+        branch_indices.extend(split..add);
+        phases.push(Pm4PhasePlan {
+            indices: branch_indices,
+            parallel: true,
+            lane_split: Some(shared_len),
+        });
+        branches += 1;
+        cursor = add;
+    }
+
+    if cursor < recorded.len() {
+        phases.push(Pm4PhasePlan {
+            indices: (cursor..recorded.len()).collect(),
+            parallel: false,
+            lane_split: None,
+        });
+    }
+    if branches == 0 {
+        return Err(
+            "DeepSeek4 FFN branch-chain planning requested but tape contains no zero/add markers"
+                .to_owned(),
+        );
+    }
+    eprintln!(
+        "[redline] DeepSeek4 FFN branch-chain plan recovered {branches} shared/routed phases"
+    );
+    Ok(phases)
+}
+
+fn pm4_ds4_ffn_branch_chains_from_config() -> bool {
+    hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DS4_FFN_BRANCH_CHAINS")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
 }
 
 fn pm4_min_parallel_width_from_config() -> usize {
@@ -2278,6 +2596,23 @@ impl ReplayController {
                 headers[index] = HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT;
             }
         }
+        // HC ping-pong publishes the next residual allocation from
+        // `hc_mix_4stream`, then `hc_input_map_4stream` consumes it after the
+        // following block's control kernels. Queue-order barriers serialize
+        // execution but do not by themselves establish gfx1151 cache
+        // visibility, so place the narrow same-agent release/acquire pair at
+        // the actual producer/consumer boundary.
+        for (index, launch) in self.recorded.iter().take(prefix).enumerate() {
+            match launch.kernel.as_str() {
+                "hc_mix_4stream" => {
+                    headers[index] = HeaderPolicy::BATCH_INTERNAL_RELEASE_AGENT;
+                }
+                "hc_input_map_4stream" => {
+                    headers[index] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_AGENT;
+                }
+                _ => {}
+            }
+        }
         let graph = if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,
@@ -2510,13 +2845,22 @@ impl ReplayController {
             let min_parallel_workgroups = pm4_min_parallel_workgroups_from_config();
             let max_parallel_phases = pm4_max_parallel_phases_from_config();
             let native_phase_sync = pm4_native_phase_sync_from_config();
-            let plans = pm4_phase_plan(
-                &self.recorded[..prefix],
-                min_parallel_width,
-                min_parallel_workgroups,
-                max_parallel_phases,
-            );
+            let ds4_ffn_branch_chains = pm4_ds4_ffn_branch_chains_from_config();
+            let plans = if ds4_ffn_branch_chains {
+                pm4_ds4_ffn_branch_plan(&self.recorded[..prefix])?
+            } else {
+                pm4_phase_plan(
+                    &self.recorded[..prefix],
+                    min_parallel_width,
+                    min_parallel_workgroups,
+                    max_parallel_phases,
+                )
+            };
             let parallel_phases = plans.iter().filter(|phase| phase.parallel).count();
+            let branch_chain_phases = plans
+                .iter()
+                .filter(|phase| phase.lane_split.is_some())
+                .count();
             let max_width = plans
                 .iter()
                 .map(|phase| phase.indices.len())
@@ -2533,8 +2877,12 @@ impl ReplayController {
 
             for phase in &plans {
                 let lane_count = if phase.parallel {
-                    self.pm4_queue_policy
-                        .resolve(device.name(), phase.indices.len())
+                    if phase.lane_split.is_some() {
+                        self.pm4_queue_policy.resolve(device.name(), 2)
+                    } else {
+                        self.pm4_queue_policy
+                            .resolve(device.name(), phase.indices.len())
+                    }
                 } else {
                     1
                 };
@@ -2552,15 +2900,60 @@ impl ReplayController {
                             commands
                         })
                         .collect::<Vec<_>>();
-                    for (position, index) in phase.indices.iter().copied().enumerate() {
-                        lanes[position % lane_count]
-                            .dispatch(
+                    let lane_indices = if let Some(split) = phase.lane_split {
+                        if lane_count != 2 || split == 0 || split >= phase.indices.len() {
+                            return Err(format!(
+                                "invalid DeepSeek4 FFN branch phase: lanes={lane_count} split={split} launches={}",
+                                phase.indices.len()
+                            ));
+                        }
+                        vec![
+                            phase.indices[..split].to_vec(),
+                            phase.indices[split..].to_vec(),
+                        ]
+                    } else {
+                        let mut lane_indices = vec![Vec::<usize>::new(); lane_count];
+                        for (position, index) in phase.indices.iter().copied().enumerate() {
+                            lane_indices[position % lane_count].push(index);
+                        }
+                        lane_indices
+                    };
+                    for (lane, indices) in lanes.iter_mut().zip(&lane_indices) {
+                        let mut resource_frontier = ResourceFrontier::default();
+                        for (position, index) in indices.iter().copied().enumerate() {
+                            if position != 0 && phase.lane_split.is_some() {
+                                let previous_index = indices[position - 1];
+                                let previous_launch = &self.recorded[previous_index];
+                                let current_launch = &self.recorded[index];
+                                let previous = previous_launch.kernel.as_str();
+                                let current = current_launch.kernel.as_str();
+                                let resources_independent =
+                                    resource_frontier.independent(current_launch);
+                                if !resources_independent {
+                                    lane.wait_compute_idle();
+                                }
+                                resource_frontier.advance(current_launch, resources_independent);
+                                if (!resources_independent && lane.requires_dependency_acquire())
+                                    || self
+                                        .pm4_mid_acquire_policy
+                                        .acquire_between(previous, current)
+                                {
+                                    lane.acquire_inter_node(
+                                        gfx12_gcr_trim,
+                                        gfx11_vmem_acquire && radiowave_vmem_only_consumer(current),
+                                    );
+                                }
+                            } else {
+                                resource_frontier.advance(&self.recorded[index], false);
+                            }
+                            lane.dispatch(
                                 &kernels[index],
                                 geometries[index],
                                 self.recorded[index].shared_mem,
                                 kernargs[index].address(),
                             )
                             .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
+                        }
                     }
                     for commands in &mut lanes {
                         commands.wait_compute_idle();
@@ -2639,11 +3032,12 @@ impl ReplayController {
             )?;
             debug_assert_eq!(graph.queue_count(), max_queue_count);
             eprintln!(
-                "[redline] PM4 phase plan architecture={} queues={} phases={} parallel_phases={} parallel_launches={} max_width={} min_parallel_width={} min_parallel_workgroups={} max_parallel_phases={} sync={}",
+                "[redline] PM4 phase plan architecture={} queues={} phases={} parallel_phases={} branch_chain_phases={} parallel_launches={} max_width={} min_parallel_width={} min_parallel_workgroups={} max_parallel_phases={} sync={}",
                 device.name(),
                 graph.queue_count(),
                 graph.phase_count(),
                 parallel_phases,
+                branch_chain_phases,
                 parallel_launches,
                 max_width,
                 min_parallel_width,
@@ -3106,6 +3500,41 @@ mod tests {
         "gemv_hfq4g256_multirow_r8",
     ];
 
+    const DS4_MQ2R_REPLAY_KERNELS: &[&str] = &[
+        "compressor_add_ape_f32_buf",
+        "compressor_overlap_concat_f32",
+        "compressor_softmax_pool_f32_buf",
+        "deepseek4_attn_swa_buf",
+        "deepseek4_attn_swa_topk_scoregrid_f32_buf",
+        "deepseek4_fused_silu_mul_clamp_mq_rotate",
+        "deepseek4_moe_topk_bias_aware_f32",
+        "deepseek4_silu_mul_clamp_f32",
+        "deepseek4_topk_kv_gather_f32_buf",
+        "deepseek4_topk_kv_gather_identity_f32_buf",
+        "fused_rmsnorm_mq_rotate_plain_nox",
+        "gemv_mfp4g32_e8_soa_grouped_gfx1151",
+        "gemv_mfp4g32_e8_soa_u4",
+        "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed",
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+        "hash_router_normalize_f32_buf",
+        "hc_compute_control_vec4_finalize",
+        "hc_head_compute_pre",
+        "hc_input_map_4stream",
+        "hc_mix_4stream",
+        "indexer_relu_score_f32_buf",
+        "indexer_top_k_buf_parallel",
+        "mq_rotate_x",
+        "rmsnorm_f32",
+        "rmsnorm_f32_at_slot_buf",
+        "rope_tail_interleaved_f32",
+        "rope_tail_yarn_interleaved_at_slot_buf_f32",
+        "rope_tail_yarn_interleaved_wide_f32",
+        "sqrt_softplus_f32",
+        "state_overlap_shift_f32_buf",
+        "state_ring_write_f32_buf",
+        "swa_ring_write_f32_buf",
+    ];
+
     fn passing(speedup: f64) -> ShadowValidation {
         ShadowValidation {
             bit_exact: true,
@@ -3136,6 +3565,29 @@ mod tests {
         ));
         assert!(!radiowave_vmem_only_consumer("fused_qkvza_hfq4g256"));
         assert!(!radiowave_vmem_only_consumer("unknown_kernel"));
+    }
+
+    #[test]
+    fn ds4_mq2r_tape_has_complete_resource_contracts() {
+        assert_eq!(DS4_MQ2R_REPLAY_KERNELS.len(), 32);
+        for kernel in DS4_MQ2R_REPLAY_KERNELS {
+            assert!(
+                expected_kernarg_bytes(kernel).is_some(),
+                "{kernel} has no kernarg contract"
+            );
+            assert!(
+                pointer_effects(kernel).is_some(),
+                "{kernel} has no pointer-effect contract"
+            );
+        }
+        assert_eq!(
+            pointer_effects("hc_mix_4stream").map(|effects| effects[4].mode),
+            Some(RecordedAccessMode::Write)
+        );
+        assert_eq!(
+            pointer_effects("hc_input_map_4stream").map(|effects| effects[1].mode),
+            Some(RecordedAccessMode::Read)
+        );
     }
 
     #[test]
@@ -3717,10 +4169,12 @@ mod tests {
                 Pm4PhasePlan {
                     indices: vec![0, 1],
                     parallel: true,
+                    lane_split: None,
                 },
                 Pm4PhasePlan {
                     indices: vec![2, 3, 4],
                     parallel: false,
+                    lane_split: None,
                 },
             ]
         );
@@ -3734,10 +4188,12 @@ mod tests {
                 Pm4PhasePlan {
                     indices: vec![0, 1],
                     parallel: true,
+                    lane_split: None,
                 },
                 Pm4PhasePlan {
                     indices: vec![2, 3],
                     parallel: false,
+                    lane_split: None,
                 },
             ]
         );
@@ -3765,6 +4221,7 @@ mod tests {
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: true,
+                lane_split: None,
             }]
         );
         assert_eq!(
@@ -3786,6 +4243,7 @@ mod tests {
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
+                lane_split: None,
             }]
         );
         assert_eq!(
@@ -3793,6 +4251,7 @@ mod tests {
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
+                lane_split: None,
             }]
         );
         assert_eq!(
@@ -3800,7 +4259,67 @@ mod tests {
             vec![Pm4PhasePlan {
                 indices: vec![0, 1],
                 parallel: false,
+                lane_split: None,
             }]
+        );
+    }
+
+    #[test]
+    fn pm4_ds4_ffn_branch_planner_recovers_dependent_chains() {
+        let launch = |kernel: &str, accesses: &[(u64, RecordedAccessMode)]| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: Some(
+                accesses
+                    .iter()
+                    .map(|(base, mode)| RecordedResourceAccess {
+                        allocation_base: *base,
+                        allocation_bytes: 0x100,
+                        access_base: *base,
+                        mode: *mode,
+                    })
+                    .collect(),
+            ),
+        };
+        use RecordedAccessMode::{Read, Write};
+        let recorded = vec![
+            launch("prepare", &[(0x1000, Write)]),
+            launch("zero_f32", &[(0x5000, Write)]),
+            launch("gemv_mfp4g32_e8_soa_u4", &[(0x1000, Read), (0x2000, Write)]),
+            launch("shared_down", &[(0x2000, Read), (0x4000, Write)]),
+            launch(
+                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+                &[(0x1000, Read), (0x3000, Write)],
+            ),
+            launch("routed_down", &[(0x3000, Read), (0x5000, Write)]),
+            launch("add_inplace_f32", &[(0x4000, Write), (0x5000, Read)]),
+            launch("tail", &[(0x4000, Read)]),
+        ];
+
+        assert_eq!(
+            pm4_ds4_ffn_branch_plan(&recorded).unwrap(),
+            vec![
+                Pm4PhasePlan {
+                    indices: vec![0],
+                    parallel: false,
+                    lane_split: None,
+                },
+                Pm4PhasePlan {
+                    indices: vec![2, 3, 1, 4, 5],
+                    parallel: true,
+                    lane_split: Some(2),
+                },
+                Pm4PhasePlan {
+                    indices: vec![6, 7],
+                    parallel: false,
+                    lane_split: None,
+                },
+            ]
         );
     }
 

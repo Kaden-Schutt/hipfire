@@ -1249,7 +1249,11 @@ fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
         m,
         k
     );
-    assert!(k % 256 == 0, "HFP4G32 v1 requires K%256==0 (gemv_hfp4g32 kernel constraint; v2 will lift to K%32==0), got K={}", k);
+    assert!(
+        k % 256 == 0,
+        "HFP4G32 v1 requires K%256==0 (gemv_hfp4g32 kernel constraint; v2 will lift to K%32==0), got K={}",
+        k
+    );
     let row_bytes = 16 + 17 * (k / 32);
     let mut out = Vec::with_capacity(m * row_bytes);
     for r in 0..m {
@@ -1570,6 +1574,110 @@ fn quantize_mfp4g32_e8_row(row: &[f32]) -> Vec<u8> {
     out
 }
 
+/// E8 row encoder with a post-encode least-squares row-scale correction.
+///
+/// The ordinary encoder chooses row/block scales from maxima so no lattice
+/// coordinate clips. Once the E8 codewords and block scales are fixed, the
+/// remaining row-scale scalar has a closed-form MSE optimum:
+/// `alpha = dot(w, q) / dot(q, q)`. Folding alpha into the existing f16 row
+/// scale changes neither the wire format nor the gfx1151 decoder. This variant
+/// is kept as an explicit overlay tier until full-corpus quality decides
+/// whether it should repair the MQ2R router/head buckets.
+fn quantize_mfp4g32_e8_row_lsq(row: &[f32]) -> Vec<u8> {
+    let mut out = quantize_mfp4g32_e8_row(row);
+    let row_scale = f16_to_f32(u16::from_le_bytes([out[0], out[1]]));
+    if !(row_scale > 0.0) {
+        return out;
+    }
+
+    let n_blocks = row.len() / 32;
+    let mut dot_wq = 0.0f64;
+    let mut dot_qq = 0.0f64;
+    for b in 0..n_blocks {
+        let payload_off = 16 + b * 17;
+        let block_scale = e4m3_scale_decode(out[payload_off]);
+        let scale = row_scale * block_scale;
+        for g in 0..4 {
+            let off = payload_off + 1 + g * 4;
+            let idx = u32::from_le_bytes([out[off], out[off + 1], out[off + 2], out[off + 3]]);
+            let decoded = e8::dequantize8(idx, e8::QUANT_STEP);
+            for i in 0..8 {
+                let q = scale * decoded[i];
+                let w = row[b * 32 + g * 8 + i];
+                dot_wq += (w as f64) * (q as f64);
+                dot_qq += (q as f64) * (q as f64);
+            }
+        }
+    }
+    if dot_qq > 0.0 {
+        let alpha = (dot_wq / dot_qq) as f32;
+        if alpha.is_finite() && alpha > 0.0 {
+            let corrected = f32_to_f16(row_scale * alpha);
+            let corrected_scale = f16_to_f32(corrected);
+            let beta = (corrected_scale / row_scale) as f64;
+            // Compare the representable f16 candidate against the original
+            // scale. The dot(w,w) term cancels:
+            //   ΔSSE = -2(β-1)dot(w,q) + (β²-1)dot(q,q).
+            // This guards against f16 rounding moving the closed-form optimum
+            // to the wrong side of the original scale.
+            let delta_sse = -2.0 * (beta - 1.0) * dot_wq + (beta * beta - 1.0) * dot_qq;
+            if corrected_scale > 0.0 && delta_sse <= 0.0 {
+                out[0..2].copy_from_slice(&corrected.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// E8 row-scale correction weighted by a diagonal activation Hessian.
+///
+/// `importance[i] = Σ_t x[t,i]²` in the same FWHT-rotated domain as `row`.
+/// For fixed codewords/block scales, this minimizes the diagonal-Hessian
+/// approximation to output error while preserving the E8 wire format.
+fn quantize_mfp4g32_e8_row_awls(row: &[f32], importance: &[f64]) -> Vec<u8> {
+    assert_eq!(row.len(), importance.len());
+    let mut out = quantize_mfp4g32_e8_row(row);
+    let row_scale = f16_to_f32(u16::from_le_bytes([out[0], out[1]]));
+    if !(row_scale > 0.0) {
+        return out;
+    }
+
+    let n_blocks = row.len() / 32;
+    let mut dot_wq = 0.0f64;
+    let mut dot_qq = 0.0f64;
+    for b in 0..n_blocks {
+        let payload_off = 16 + b * 17;
+        let block_scale = e4m3_scale_decode(out[payload_off]);
+        let scale = row_scale * block_scale;
+        for g in 0..4 {
+            let off = payload_off + 1 + g * 4;
+            let idx = u32::from_le_bytes([out[off], out[off + 1], out[off + 2], out[off + 3]]);
+            let decoded = e8::dequantize8(idx, e8::QUANT_STEP);
+            for i in 0..8 {
+                let column = b * 32 + g * 8 + i;
+                let h = importance[column];
+                let q = scale * decoded[i];
+                let w = row[column];
+                dot_wq += h * (w as f64) * (q as f64);
+                dot_qq += h * (q as f64) * (q as f64);
+            }
+        }
+    }
+    if dot_qq > 0.0 {
+        let alpha = (dot_wq / dot_qq) as f32;
+        if alpha.is_finite() && alpha > 0.0 {
+            let corrected = f32_to_f16(row_scale * alpha);
+            let corrected_scale = f16_to_f32(corrected);
+            let beta = (corrected_scale / row_scale) as f64;
+            let delta_error = -2.0 * (beta - 1.0) * dot_wq + (beta * beta - 1.0) * dot_qq;
+            if corrected_scale > 0.0 && delta_error <= 0.0 {
+                out[0..2].copy_from_slice(&corrected.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
 /// Generic mfpN-E8 row encoder (n=2 or n=3). Same outer container as mfp4-E8
 /// (16 B row header + (K/32) blocks) but each block is 1 + 4*n bytes:
 ///   - 1 B: E4M3 block scale
@@ -1791,7 +1899,7 @@ fn hessian_key(tensor_name: &str) -> String {
 /// Read per-256-block Hessians for one tensor from `<dir>/<key>.hblk`.
 /// File layout: [u32 magic][u32 n_blocks][u32 k][f32 ... n_blocks*256*256].
 /// Returns empty Vec if the file is missing (-> caller falls back to RTN).
-fn load_hessian_blocks(dir: &Path, tensor_name: &str) -> Vec<e8_gptq::HBlock> {
+pub(crate) fn load_hessian_blocks(dir: &Path, tensor_name: &str) -> Vec<e8_gptq::HBlock> {
     let path = dir.join(format!("{}.hblk", hessian_key(tensor_name)));
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -1806,6 +1914,16 @@ fn load_hessian_blocks(dir: &Path, tensor_name: &str) -> Vec<e8_gptq::HBlock> {
         return Vec::new();
     }
     let n_blocks = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let stored_k = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    if stored_k != n_blocks * 256 {
+        eprintln!(
+            "warning: {} Hessian K={} disagrees with {} blocks; ignoring",
+            path.display(),
+            stored_k,
+            n_blocks
+        );
+        return Vec::new();
+    }
     let want = 12 + n_blocks * 256 * 256 * 4;
     if bytes.len() < want {
         eprintln!(
@@ -1838,7 +1956,7 @@ static GPTQ_E8_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 /// GPTQ-E8 wrapper that wires the production helpers into the e8_gptq module.
 /// `h_blocks` empty -> RTN fallback (byte-identical to quantize_mfp4g32_e8_2d).
-fn quantize_mfp4g32_e8_gptq_2d(
+pub(crate) fn quantize_mfp4g32_e8_gptq_2d(
     f32_data: &[f32],
     m: usize,
     k: usize,
@@ -1985,6 +2103,32 @@ fn aos_to_soa_row(aos: &[u8], n_blocks: usize) -> Vec<u8> {
     out
 }
 
+/// GPTQ-on-E8 with the qt=35 structure-of-arrays wire layout.
+///
+/// LDLQ changes only the E8 codewords. The scale/header and AoS-to-SoA
+/// permutation remain identical to the ordinary qt=35 encoder.
+fn quantize_mfp4g32_e8_soa_gptq_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    h_blocks: &[e8_gptq::HBlock],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+
+    let aos = quantize_mfp4g32_e8_gptq_2d(f32_data, m, k, signs1, signs2, h_blocks);
+    let n_blocks = k / 32;
+    let aos_row_bytes = 16 + n_blocks * 17;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
+    let mut out = vec![0u8; m * soa_row_bytes];
+    out.par_chunks_mut(soa_row_bytes)
+        .zip(aos.par_chunks(aos_row_bytes))
+        .for_each(|(dst, src)| dst.copy_from_slice(&aos_to_soa_row(src, n_blocks)));
+    out
+}
+
 /// mfp4-E8 SoA quantizer: same E8 encoding as quantize_mfp4g32_e8_2d, then permuted to SoA.
 fn quantize_mfp4g32_e8_soa_2d(
     f32_data: &[f32],
@@ -1993,22 +2137,134 @@ fn quantize_mfp4g32_e8_soa_2d(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
+    use rayon::prelude::*;
+
     assert_eq!(f32_data.len(), m * k);
     assert!(k % 256 == 0, "mfp4-E8-SoA requires k%256==0, got k={}", k);
     let n_blocks = k / 32;
     let scale_padded = ((n_blocks + 15) >> 4) << 4;
     let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
-    let mut out = Vec::with_capacity(m * soa_row_bytes);
-    let mut row_buf = vec![0.0f32; k];
-    for r in 0..m {
-        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
-        for seg in 0..(k / 256) {
-            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
-        }
-        let aos_row = quantize_mfp4g32_e8_row(&row_buf);
-        out.extend_from_slice(&aos_to_soa_row(&aos_row, n_blocks));
-    }
+    let mut out = vec![0u8; m * soa_row_bytes];
+    out.par_chunks_mut(soa_row_bytes)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            let mut row_buf = f32_data[r * k..(r + 1) * k].to_vec();
+            for seg in 0..(k / 256) {
+                cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+            }
+            let aos_row = quantize_mfp4g32_e8_row(&row_buf);
+            let soa_row = aos_to_soa_row(&aos_row, n_blocks);
+            dst.copy_from_slice(&soa_row);
+        });
     out
+}
+
+/// SoA E8 with the explicit least-squares row-scale repair above.
+fn quantize_mfp4g32_e8_soa_lsq_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+
+    assert_eq!(f32_data.len(), m * k);
+    assert!(
+        k % 256 == 0,
+        "mfp4-E8-SoA-LSQ requires k%256==0, got k={}",
+        k
+    );
+    let n_blocks = k / 32;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
+    let mut out = vec![0u8; m * soa_row_bytes];
+    out.par_chunks_mut(soa_row_bytes)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            let mut row_buf = f32_data[r * k..(r + 1) * k].to_vec();
+            for seg in 0..(k / 256) {
+                cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+            }
+            let aos_row = quantize_mfp4g32_e8_row_lsq(&row_buf);
+            let soa_row = aos_to_soa_row(&aos_row, n_blocks);
+            dst.copy_from_slice(&soa_row);
+        });
+    out
+}
+
+/// SoA E8 with activation-weighted least-squares row scales.
+fn quantize_mfp4g32_e8_soa_awls_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    importance: &[f64],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+
+    assert_eq!(f32_data.len(), m * k);
+    assert_eq!(importance.len(), k);
+    assert!(
+        k % 256 == 0,
+        "mfp4-E8-SoA-AWLS requires k%256==0, got k={}",
+        k
+    );
+    let n_blocks = k / 32;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
+    let mut out = vec![0u8; m * soa_row_bytes];
+    out.par_chunks_mut(soa_row_bytes)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            let mut row_buf = f32_data[r * k..(r + 1) * k].to_vec();
+            for seg in 0..(k / 256) {
+                cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+            }
+            let aos_row = quantize_mfp4g32_e8_row_awls(&row_buf, importance);
+            let soa_row = aos_to_soa_row(&aos_row, n_blocks);
+            dst.copy_from_slice(&soa_row);
+        });
+    out
+}
+
+/// Load and sum one or more `DS4HIM01` diagonal head-imatrix files.
+///
+/// Multiple paths are separated by `:` in `HIPFIRE_E8_IMATRIX`; raw sums are
+/// additive, so corpora with different row counts receive proportional weight.
+fn load_ds4_head_importance(k: usize) -> Result<Vec<f64>, String> {
+    let spec = std::env::var("HIPFIRE_E8_IMATRIX")
+        .map_err(|_| "mfp4e8soa-awls requires HIPFIRE_E8_IMATRIX".to_string())?;
+    let mut total = vec![0.0f64; k];
+    let mut files = 0usize;
+    for path in spec.split(':').filter(|path| !path.is_empty()) {
+        let bytes = std::fs::read(path).map_err(|e| format!("read E8 imatrix {path}: {e}"))?;
+        let expected = 16 + k * 8;
+        if bytes.len() != expected || &bytes[..8] != b"DS4HIM01" {
+            return Err(format!(
+                "E8 imatrix {path}: invalid format/size {} (expected {expected})",
+                bytes.len()
+            ));
+        }
+        let hidden = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let rows = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        if hidden != k || rows == 0 {
+            return Err(format!(
+                "E8 imatrix {path}: hidden={hidden} rows={rows}, expected hidden={k} and rows>0"
+            ));
+        }
+        for (column, value) in total.iter_mut().enumerate() {
+            let offset = 16 + column * 8;
+            *value += f64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        }
+        files += 1;
+    }
+    if files == 0 || total.iter().all(|value| *value == 0.0) {
+        return Err("E8 imatrix set is empty or all-zero".to_string());
+    }
+    eprintln!("loaded {files} E8 head-imatrix file(s), hidden={k}");
+    Ok(total)
 }
 
 /// CPU reference dequant for mfp4-E8 SoA. Returns row-major f32 [m*k] in ROTATED domain.
@@ -2525,9 +2781,17 @@ mod hfp4_tests {
             for i in 0..32 {
                 let idx = b * 32 + i;
                 let err = (recovered[idx] - row[idx]).abs();
-                assert!(err <= bound,
-                        "block {} elem {} err {} exceeds bound {} (block_e={}, row_scale_a={}, block_scale={})",
-                        b, i, err, bound, block_e, row_scale_a, block_scale);
+                assert!(
+                    err <= bound,
+                    "block {} elem {} err {} exceeds bound {} (block_e={}, row_scale_a={}, block_scale={})",
+                    b,
+                    i,
+                    err,
+                    bound,
+                    block_e,
+                    row_scale_a,
+                    block_scale
+                );
             }
         }
     }
@@ -3416,13 +3680,7 @@ fn quantize_mq2g256_lloyd_gptq(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0.0);
-    quantize_mq2g256_lloyd_gptq_with_damping(
-        f32_data,
-        col_weights,
-        signs1,
-        signs2,
-        damping,
-    )
+    quantize_mq2g256_lloyd_gptq_with_damping(f32_data, col_weights, signs1, signs2, damping)
 }
 
 fn quantize_mq2g256_lloyd_gptq_with_damping(
@@ -5389,7 +5647,10 @@ fn awq_eligible(name: &str) -> bool {
     // are excluded — produces an F1-equivalent quant for comparison
     // bench against the same binary's F2 quant. Default (env unset):
     // the full F2 whitelist applies.
-    let f1_only = hipfire_config::developer_var("HIPFIRE_AWQ_F1_ONLY").ok().as_deref() == Some("1");
+    let f1_only = hipfire_config::developer_var("HIPFIRE_AWQ_F1_ONLY")
+        .ok()
+        .as_deref()
+        == Some("1");
     let f1_match =
     // Full-attention input projections (HF naming + fused variants).
     name.ends_with("q_proj.weight")
@@ -5736,7 +5997,9 @@ fn run_gguf_pipeline(
     let arch_id: u32 = arch_id_override.unwrap_or(auto_arch_id);
     guard_qwen3_arch_override(auto_arch_id, arch_id, force_arch_id);
     if arch_id != auto_arch_id {
-        eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
+        eprintln!(
+            "Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})"
+        );
     } else {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
@@ -6219,6 +6482,139 @@ fn run_gguf_pipeline(
     Ok(())
 }
 
+fn dequantize_hfq_q8f16(data: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
+    let n_blocks = n_elements.div_ceil(32);
+    let expected = n_blocks * 34;
+    if data.len() != expected {
+        return Err(format!(
+            "Q8F16 byte size {} != {expected} for {n_elements} elements",
+            data.len()
+        ));
+    }
+    let mut out = vec![0.0f32; n_elements];
+    for b in 0..n_blocks {
+        let off = b * 34;
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let start = b * 32;
+        let end = (start + 32).min(n_elements);
+        for i in start..end {
+            out[i] = (data[off + 2 + i - start] as i8) as f32 * scale;
+        }
+    }
+    Ok(out)
+}
+
+/// Build a pure-shadow overlay that moves DeepSeek V4's dense, per-token Q8
+/// projections to MFP4-E8-SoA. Routed experts, router, embeddings, and lm_head
+/// remain byte-for-byte in the base model.
+fn build_deepseek4_dense_e8soa_overlay(input: &Path, output: &Path) -> Result<(), String> {
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(input)
+        .map_err(|e| format!("open source HFQ {}: {e}", input.display()))?;
+    if hfq.arch_id != 9 {
+        return Err(format!(
+            "deepseek4 dense E8 overlay requires arch_id=9, got {}",
+            hfq.arch_id
+        ));
+    }
+    let metadata_json = hfq.metadata_json.clone();
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_json)
+        .map_err(|e| format!("source HFQ metadata JSON: {e}"))?;
+    let n_layers = metadata
+        .pointer("/config/num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "source HFQ metadata missing config.num_hidden_layers".to_string())?
+        as usize;
+    hfq.drop_mmap();
+
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    let suffixes = [
+        "attn.wq_a.weight",
+        "attn.wq_b.weight",
+        "attn.wkv.weight",
+        "attn.wo_a.weight",
+        "attn.wo_b.weight",
+        "ffn.shared_experts.w1.weight",
+        "ffn.shared_experts.w2.weight",
+        "ffn.shared_experts.w3.weight",
+    ];
+
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create output dir {}: {e}", parent.display()))?;
+    }
+    let spill_dir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut spill = TensorSpill::new(spill_dir).map_err(|e| format!("create tensor spill: {e}"))?;
+    let mut tensors = Vec::with_capacity(n_layers * suffixes.len());
+    let mut source_bytes = 0u64;
+    let mut overlay_bytes = 0u64;
+
+    for layer in 0..n_layers {
+        for suffix in suffixes {
+            let name = format!("layers.{layer}.{suffix}");
+            let (info, bytes) = hfq
+                .tensor_data_vec(&name)
+                .ok_or_else(|| format!("source HFQ missing dense projection '{name}'"))?;
+            if info.quant_type != QuantType::Q8F16 as u8 {
+                return Err(format!(
+                    "{name}: expected Q8F16 qt=3 source, got qt={}",
+                    info.quant_type
+                ));
+            }
+            if info.shape.len() != 2 {
+                return Err(format!(
+                    "{name}: expected rank-2 shape, got {:?}",
+                    info.shape
+                ));
+            }
+            let m = info.shape[0] as usize;
+            let k = info.shape[1] as usize;
+            if k % 256 != 0 {
+                return Err(format!("{name}: E8-SoA requires K%256==0, got K={k}"));
+            }
+            let f32_data =
+                dequantize_hfq_q8f16(&bytes, m * k).map_err(|e| format!("{name}: {e}"))?;
+            let packed = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
+            source_bytes += bytes.len() as u64;
+            overlay_bytes += packed.len() as u64;
+            eprintln!(
+                "E8-SoA {name}: [{m}, {k}] {:.2} MiB -> {:.2} MiB",
+                bytes.len() as f64 / 1_048_576.0,
+                packed.len() as f64 / 1_048_576.0
+            );
+            tensors.push(HfqTensor {
+                name,
+                quant_type: QuantType::MFP4G32E8SOA,
+                shape: info.shape.clone(),
+                group_size: 32,
+                data: packed,
+                spilled_len: 0,
+            });
+            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024);
+        }
+    }
+
+    write_hfq(
+        output,
+        hfq.arch_id,
+        &metadata_json,
+        &tensors,
+        Some(&mut spill),
+    )
+    .map_err(|e| format!("write overlay {}: {e}", output.display()))?;
+    eprintln!(
+        "deepseek4 dense E8-SoA overlay: {} tensors, {:.2} GiB Q8 -> {:.2} GiB E8 ({:.1}% of source)",
+        tensors.len(),
+        source_bytes as f64 / 1_073_741_824.0,
+        overlay_bytes as f64 / 1_073_741_824.0,
+        overlay_bytes as f64 * 100.0 / source_bytes as f64,
+    );
+    Ok(())
+}
+
 fn main() {
     let args = QuantizeArgs::parse();
 
@@ -6234,11 +6630,26 @@ fn main() {
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global();
-    eprintln!("Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})");
+    eprintln!(
+        "Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})"
+    );
 
     let input_dir = args.input.as_str();
     let output_path = args.output.as_str();
     let format = args.format.as_str();
+
+    if matches!(
+        format,
+        "deepseek4-dense-mfp4e8soa-overlay" | "ds4-dense-e8soa-overlay"
+    ) {
+        if let Err(e) =
+            build_deepseek4_dense_e8soa_overlay(Path::new(input_dir), Path::new(output_path))
+        {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return;
+    }
 
     // ── qwen3-dspark-q8: Qwen3DSparkModel drafter sidecar emission ──────────
     // Produces a `<stem>-dspark.<ext>` HFQ carrying the 5-layer dense drafter
@@ -6672,7 +7083,10 @@ fn main() {
     // exclusive with the AWQ / Lloyd-tier expert paths (graded is the first
     // arm in the rayon dispatch). Compose with --format mq4 --no-kmap so the
     // DENSE attn/shared weights stay MQ4 and only the 3D experts are graded.
-    let use_moe_graded = hipfire_config::developer_var("HIPFIRE_MOE_GRADED").ok().as_deref() == Some("1");
+    let use_moe_graded = hipfire_config::developer_var("HIPFIRE_MOE_GRADED")
+        .ok()
+        .as_deref()
+        == Some("1");
     let moe_hot_frac: f64 = hipfire_config::developer_var("HIPFIRE_MOE_HOT_FRAC")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -6732,9 +7146,10 @@ fn main() {
                 "MFP2E8" | "MFP2G32E8" => QuantType::MFP2G32E8,
                 other => {
                     eprintln!(
-                            "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/E8/MFP3E8/MFP2E8)",
-                            lineno + 1, other
-                        );
+                        "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/E8/MFP3E8/MFP2E8)",
+                        lineno + 1,
+                        other
+                    );
                     std::process::exit(2);
                 }
             };
@@ -6801,7 +7216,10 @@ fn main() {
         || format == "mq4-mq3lloyd-routed"
         || format == "mq4-mq3lloyd-exp";
     let allow_mq3_lloyd_for_mixed = args.allow_mq3_lloyd
-        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD").ok().as_deref() == Some("1");
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD")
+            .ok()
+            .as_deref()
+            == Some("1");
     if use_mq4_mq3lloyd_kmap && !allow_mq3_lloyd_for_mixed {
         eprintln!(
             "note: --format mq4-mq3lloyd-kmap requires --allow-mq3-lloyd or\n\
@@ -6878,7 +7296,10 @@ fn main() {
         || format == "all-mq2-gptq";
     if use_mq4_mq2lloyd_gptq_all
         && imatrix_path.is_none()
-        && hipfire_config::developer_var("HIPFIRE_ALLOW_UNIT_IMATRIX").ok().as_deref() != Some("1")
+        && hipfire_config::developer_var("HIPFIRE_ALLOW_UNIT_IMATRIX")
+            .ok()
+            .as_deref()
+            != Some("1")
     {
         eprintln!("error: --format mq4-mq2lloyd-gptq-all requires --imatrix <PATH>");
         eprintln!(
@@ -7014,13 +7435,19 @@ fn main() {
     // mfp{2,3,4}e8-gptq is set.
     let hessian_dir = args.hessian_dir.clone();
     if use_gptq_e8 && hessian_dir.is_none() {
-        eprintln!("warning: --format mfp4e8-gptq without --hessian-dir; every tensor falls back to RTN E8 (== plain mfp4e8). Pass --hessian-dir <dir> to enable GPTQ.");
+        eprintln!(
+            "warning: --format mfp4e8-gptq without --hessian-dir; every tensor falls back to RTN E8 (== plain mfp4e8). Pass --hessian-dir <dir> to enable GPTQ."
+        );
     }
     if use_gptq_mfp3e8 && hessian_dir.is_none() {
-        eprintln!("warning: --format mfp3e8-gptq without --hessian-dir; every tensor falls back to RTN mfp3-E8. Pass --hessian-dir <dir> to enable GPTQ.");
+        eprintln!(
+            "warning: --format mfp3e8-gptq without --hessian-dir; every tensor falls back to RTN mfp3-E8. Pass --hessian-dir <dir> to enable GPTQ."
+        );
     }
     if use_gptq_mfp2e8 && hessian_dir.is_none() {
-        eprintln!("warning: --format mfp2e8-gptq without --hessian-dir; every tensor falls back to RTN mfp2-E8. Pass --hessian-dir <dir> to enable GPTQ.");
+        eprintln!(
+            "warning: --format mfp2e8-gptq without --hessian-dir; every tensor falls back to RTN mfp2-E8. Pass --hessian-dir <dir> to enable GPTQ."
+        );
     }
     if let Some(hd) = &hessian_dir {
         if !hd.exists() {
@@ -7080,7 +7507,9 @@ fn main() {
     let awq_alpha = args.awq_alpha.unwrap_or(0.55);
     if awq_enabled {
         if IMATRIX.get().is_none() {
-            eprintln!("error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)");
+            eprintln!(
+                "error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)"
+            );
             std::process::exit(1);
         }
         if !(0.0..=1.0).contains(&awq_alpha) {
@@ -7091,7 +7520,9 @@ fn main() {
         AWQ_ALPHA
             .set(awq_alpha)
             .expect("AWQ_ALPHA set twice — should not happen");
-        eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)");
+        eprintln!(
+            "AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)"
+        );
     }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
@@ -7120,8 +7551,11 @@ fn main() {
     // model size validated locally (0.8B / 4B / 9B Qwen 3.5 → multilingual
     // mojibake on all 4 coherence-gate prompts). Refuse by default until
     // Path D Lloyd-Max non-uniform codebooks land (PRD §5.2).
-    let allow_mq2 =
-        args.allow_mq2 || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ2").ok().as_deref() == Some("1");
+    let allow_mq2 = args.allow_mq2
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ2")
+            .ok()
+            .as_deref()
+            == Some("1");
     if use_mq2g256 && !allow_mq2 {
         eprintln!(
             "error: --format mq2 is reserved — empirical quality verdict is collapse on every model\n\
@@ -7141,7 +7575,10 @@ fn main() {
     // vs 9B MQ4 ppl=10. Research-only: same opt-in gate so users don't
     // accidentally ship a 2-bpw model that won't produce coherent output.
     let allow_mq3_lloyd = args.allow_mq3_lloyd
-        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD").ok().as_deref() == Some("1");
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD")
+            .ok()
+            .as_deref()
+            == Some("1");
     if use_mq3g256_lloyd && !allow_mq3_lloyd {
         eprintln!(
             "note: --format mq3-lloyd is research — Lloyd-Max 8-entry codebook +\n\
@@ -7156,7 +7593,10 @@ fn main() {
         std::process::exit(1);
     }
     let allow_mq2_lloyd = args.allow_mq2_lloyd
-        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ2_LLOYD")
+            .ok()
+            .as_deref()
+            == Some("1");
     if (use_mq2g256_lloyd
         || use_mq4_mq2lloydexp
         || use_mq4_mq2lloyd_native
@@ -7191,7 +7631,10 @@ fn main() {
     // Quality not yet validated — same opt-in gate as MQ3-Lloyd until ppl
     // numbers land.
     let allow_mq4_lloyd = args.allow_mq4_lloyd
-        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ4_LLOYD").ok().as_deref() == Some("1");
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ4_LLOYD")
+            .ok()
+            .as_deref()
+            == Some("1");
     if use_mq4g256_lloyd && !allow_mq4_lloyd {
         eprintln!(
             "note: --format mq4-lloyd is research — Lloyd-Max 16-entry codebook +\n\
@@ -7325,7 +7768,9 @@ fn main() {
     let arch_id = args.arch_id.unwrap_or(auto_arch_id);
     guard_qwen3_arch_override(auto_arch_id, arch_id, args.force_arch_id);
     if arch_id != auto_arch_id {
-        eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
+        eprintln!(
+            "Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})"
+        );
     } else {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
@@ -7360,16 +7805,24 @@ fn main() {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
     }
     if is_deepseek4 {
-        eprintln!("  DeepSeek V4 detected — per-expert tensors ship pre-split; quantizing each as 2D weight.");
+        eprintln!(
+            "  DeepSeek V4 detected — per-expert tensors ship pre-split; quantizing each as 2D weight."
+        );
     }
     if is_lfm2moe {
-        eprintln!("  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed/norms) → Q8.");
+        eprintln!(
+            "  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed/norms) → Q8."
+        );
     }
     if is_minimax {
-        eprintln!("  MiniMax-M2 detected — per-expert tensors ship pre-split; quantizing each as HFQ4G256 2D weight.");
+        eprintln!(
+            "  MiniMax-M2 detected — per-expert tensors ship pre-split; quantizing each as HFQ4G256 2D weight."
+        );
     }
     if is_cohere2moe {
-        eprintln!("  Cohere2-MoE detected — experts → --format ({{f16|q8|mq6|mq4}}); attn/dense → Q8 (F16 in oracle); router/embed → Q8; norms → F16.");
+        eprintln!(
+            "  Cohere2-MoE detected — experts → --format ({{f16|q8|mq6|mq4}}); attn/dense → Q8 (F16 in oracle); router/embed → Q8; norms → F16."
+        );
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -7802,7 +8255,11 @@ fn main() {
     // HIPFIRE_NO_SPILL=1 disables the disk spill entirely (hold all tensors in
     // RAM, write output directly). Needed for huge f32 oracles where spill+output
     // would be ~2x the output size on disk — but RAM is ample.
-    let mut spill = if hipfire_config::developer_var("HIPFIRE_NO_SPILL").ok().as_deref() == Some("1") {
+    let mut spill = if hipfire_config::developer_var("HIPFIRE_NO_SPILL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         None
     } else {
         TensorSpill::new(spill_dir).ok()
@@ -8635,7 +9092,11 @@ fn main() {
                             if scale.len() == k {
                                 awq_pre_scale_weights(&mut f32_data, m, k, scale);
                             } else {
-                                eprintln!("  minimax AWQ L{layer_n}: scale len {} != k {} ({name}); skipped", scale.len(), k);
+                                eprintln!(
+                                    "  minimax AWQ L{layer_n}: scale len {} != k {} ({name}); skipped",
+                                    scale.len(),
+                                    k
+                                );
                             }
                             if mm_awq_emitted.insert(layer_n) {
                                 let p = name.split(".block_sparse_moe.").next().unwrap();
@@ -8665,12 +9126,12 @@ fn main() {
                 // Expert format by --format: mq2-lloyd (MQ2G256Lloyd, hipx sub-4-bit
                 // target — has deepseek4 indexed-MoE kernels), mq3-lloyd / mq6 (oracle
                 // check / HIPFIRE_MINIMAX_EXPERT_*), else mq4 (MQ4G256, default + validated).
-                let mm_mq6 =
-                    use_mq6g256 || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ6").is_some();
-                let mm_mq2l =
-                    use_mq2g256_lloyd || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ2L").is_some();
-                let mm_mq3l =
-                    use_mq3g256_lloyd || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ3L").is_some();
+                let mm_mq6 = use_mq6g256
+                    || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ6").is_some();
+                let mm_mq2l = use_mq2g256_lloyd
+                    || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ2L").is_some();
+                let mm_mq3l = use_mq3g256_lloyd
+                    || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ3L").is_some();
                 // Per-layer mixed-precision promotion. HIPFIRE_MINIMAX_PROMOTE_MQ4 /
                 // _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are
                 // forced UP to MQ4 / MQ6 regardless of the base --format. The forward
@@ -8963,22 +9424,32 @@ fn main() {
             // experts-level "+P" / kmap-experts recipe, minus the gfx12-only dense
             // attn promotion). HIPFIRE_MOE_DOWN_MQ6=1 promotes only down. `down_mq6`
             // means "promote THIS expert tensor to MQ6" (gate_up or down).
-            let experts_mq6_all =
-                hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ6").ok().as_deref() == Some("1");
+            let experts_mq6_all = hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ6")
+                .ok()
+                .as_deref()
+                == Some("1");
             let down_mq6 = supports_g256
                 && (experts_mq6_all
-                    || (hipfire_config::developer_var("HIPFIRE_MOE_DOWN_MQ6").ok().as_deref() == Some("1")
+                    || (hipfire_config::developer_var("HIPFIRE_MOE_DOWN_MQ6")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
                         && base_name == "down_proj"));
             // HIPFIRE_MOE_EXPERTS_MQ5=1 promotes BOTH gate_up + down to MQ5; the
             // experts-level 5-bit recipe (5.25 bpw, between MQ4 and MQ6).
             // HIPFIRE_MOE_DOWN_MQ5=1 promotes ONLY the expert down_proj to MQ5
             // (gate_up stays MQ4). Kept OUT of `expert_mq5` so `expert_awq_active`
             // still fires; the AWQ branch switches its output format to MQ5.
-            let experts_mq5_all =
-                hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ5").ok().as_deref() == Some("1");
+            let experts_mq5_all = hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ5")
+                .ok()
+                .as_deref()
+                == Some("1");
             let down_mq5 = supports_g256
                 && (experts_mq5_all
-                    || (hipfire_config::developer_var("HIPFIRE_MOE_DOWN_MQ5").ok().as_deref() == Some("1")
+                    || (hipfire_config::developer_var("HIPFIRE_MOE_DOWN_MQ5")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
                         && base_name == "down_proj"));
             // mq4-mq2lloydexp round-trip probe: ALWAYS hits routed experts
             // (overrides any kmap promotion). The intent is to inject MQ2
@@ -9088,13 +9559,17 @@ fn main() {
             // HIPFIRE_AWQ_EXPERTS=down restricts expert AWQ to down_proj (the
             // sensitive residual-write projection + the free runtime kernel);
             // unset/=all does both gate_up and down (default).
-            let awq_down_only =
-                hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS").ok().as_deref() == Some("down");
+            let awq_down_only = hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS")
+                .ok()
+                .as_deref()
+                == Some("down");
             // HIPFIRE_AWQ_EXPERTS=none keeps DENSE AWQ (attn/lm_head) but emits
             // NO per-expert AWQ — the clean baseline for isolating the expert
             // contribution against an HIPFIRE_AWQ_EXPERTS=down treatment.
-            let awq_experts_none =
-                hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS").ok().as_deref() == Some("none");
+            let awq_experts_none = hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS")
+                .ok()
+                .as_deref()
+                == Some("none");
             let expert_awq_active = AWQ_ALPHA.get().is_some()
                 && !awq_experts_none
                 && imatrix_gguf.is_some()
@@ -9560,8 +10035,11 @@ fn main() {
                 "HFQ4G128"
             };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
-            eprintln!("  {label:>8}: {parent_owned}{{0..{n_out_experts}}}.{base_owned}.weight {:?} (×{n_out_experts} experts of {n_experts} || {:.1} KB/expert, parallel)",
-                inner_shape, bytes_per as f64 / 1024.0);
+            eprintln!(
+                "  {label:>8}: {parent_owned}{{0..{n_out_experts}}}.{base_owned}.weight {:?} (×{n_out_experts} experts of {n_experts} || {:.1} KB/expert, parallel)",
+                inner_shape,
+                bytes_per as f64 / 1024.0
+            );
             hfq_tensors.append(&mut new_tensors);
             // Drop source pages and spill quantized data after each expert batch.
             st_files[*file_idx].drop_tensor_pages(name);
@@ -10553,12 +11031,15 @@ fn main() {
                                 };
                             let data: &[f32] = awq_scaled.as_deref().unwrap_or(&f32_data);
                             // HIPFIRE_LLOYD_K3=1 → ternary "MQ1.58" (3-level codebook, reuses kernel).
-                            let q =
-                                if hipfire_config::developer_var("HIPFIRE_LLOYD_K3").ok().as_deref() == Some("1") {
-                                    quantize_mq2g256_lloyd_k3(data, &signs1, &signs2)
-                                } else {
-                                    quantize_mq2g256_lloyd(data, &signs1, &signs2)
-                                };
+                            let q = if hipfire_config::developer_var("HIPFIRE_LLOYD_K3")
+                                .ok()
+                                .as_deref()
+                                == Some("1")
+                            {
+                                quantize_mq2g256_lloyd_k3(data, &signs1, &signs2)
+                            } else {
+                                quantize_mq2g256_lloyd(data, &signs1, &signs2)
+                            };
                             (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
                         } else {
                             // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
@@ -10983,7 +11464,9 @@ fn main() {
                 100.0 * fired as f64 / (fired + fb) as f64
             );
             if fired == 0 {
-                eprintln!("  WARNING: 0 GPTQ tensors fired with --hessian-dir set — likely a KEY-MISMATCH (.hblk filenames != hessian_key), NOT a flat result.");
+                eprintln!(
+                    "  WARNING: 0 GPTQ tensors fired with --hessian-dir set — likely a KEY-MISMATCH (.hblk filenames != hessian_key), NOT a flat result."
+                );
             }
         }
     }
@@ -11151,9 +11634,8 @@ mod gptq_damping_probe {
         eprintln!("  Lloyd                  MSE = {:.6e}", lloyd_mse);
 
         for damping in [0.0_f32, 0.1, 0.3, 0.5, 0.8, 1.0] {
-            let gptq_bytes = quantize_mq2g256_lloyd_gptq_with_damping(
-                weights, &unit, &signs1, &signs2, damping,
-            );
+            let gptq_bytes =
+                quantize_mq2g256_lloyd_gptq_with_damping(weights, &unit, &signs1, &signs2, damping);
             let gptq_recon = dequantize_mq2g256_lloyd_to_f32(&gptq_bytes, n, &signs1, &signs2);
             let gptq_mse = mse(weights, &gptq_recon);
             let delta = ((gptq_mse - lloyd_mse) / lloyd_mse) * 100.0;
@@ -12271,8 +12753,8 @@ mod gptq_damping_probe {
             "{:35} {:>14} {:>14} {:>10}",
             "distribution", "fwht MSE", "no-fwht MSE", "fwht win %"
         );
-        for (label, gen) in cases {
-            let w = gen();
+        for (label, generate) in cases {
+            let w = generate();
             let n = w.len();
             let fwht_bytes = quantize_mq2g256_lloyd(&w, &signs1, &signs2);
             let fwht_recon = dequantize_mq2g256_lloyd_to_f32(&fwht_bytes, n, &signs1, &signs2);
@@ -13417,5 +13899,73 @@ mod tests {
             kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
             QuantLevel::Base
         );
+    }
+
+    #[test]
+    fn e8_soa_lsq_row_scale_does_not_increase_weight_mse() {
+        let m = 2usize;
+        let k = 256usize;
+        let source: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.173).sin() * 1.7) + ((i % 11) as f32 - 5.0) * 0.031)
+            .collect();
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let regular = quantize_mfp4g32_e8_soa_2d(&source, m, k, &s1, &s2);
+        let repaired = quantize_mfp4g32_e8_soa_lsq_2d(&source, m, k, &s1, &s2);
+        let q_regular = dequant_mfp4g32_e8_soa(&regular, m, k);
+        let q_repaired = dequant_mfp4g32_e8_soa(&repaired, m, k);
+
+        let mut rotated = source.clone();
+        for row in rotated.chunks_mut(k) {
+            cpu_fwht_256(row, &s1, &s2);
+        }
+        let mse = |q: &[f32]| {
+            rotated
+                .iter()
+                .zip(q)
+                .map(|(a, b)| {
+                    let d = a - b;
+                    d * d
+                })
+                .sum::<f32>()
+                / rotated.len() as f32
+        };
+        assert!(mse(&q_repaired) <= mse(&q_regular));
+    }
+
+    #[test]
+    fn e8_soa_awls_row_scale_does_not_increase_weighted_mse() {
+        let m = 2usize;
+        let k = 256usize;
+        let source: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.119).cos() * 1.3) + ((i % 17) as f32 - 8.0) * 0.023)
+            .collect();
+        let importance: Vec<f64> = (0..k)
+            .map(|i| 0.05 + ((i * 37 % 101) as f64 / 17.0))
+            .collect();
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let regular = quantize_mfp4g32_e8_soa_2d(&source, m, k, &s1, &s2);
+        let repaired = quantize_mfp4g32_e8_soa_awls_2d(&source, m, k, &s1, &s2, &importance);
+        let q_regular = dequant_mfp4g32_e8_soa(&regular, m, k);
+        let q_repaired = dequant_mfp4g32_e8_soa(&repaired, m, k);
+
+        let mut rotated = source.clone();
+        for row in rotated.chunks_mut(k) {
+            cpu_fwht_256(row, &s1, &s2);
+        }
+        let weighted_mse = |q: &[f32]| {
+            rotated
+                .iter()
+                .zip(q)
+                .enumerate()
+                .map(|(i, (a, b))| {
+                    let d = (*a - *b) as f64;
+                    importance[i % k] * d * d
+                })
+                .sum::<f64>()
+                / (m * k) as f64
+        };
+        assert!(weighted_mse(&q_repaired) <= weighted_mse(&q_regular));
     }
 }

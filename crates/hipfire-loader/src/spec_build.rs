@@ -13,10 +13,10 @@
 //! time without the daemon learning which ran.
 
 use crate::ModelState;
-use hipfire_arch_qwen35::Qwen35Bundle;
-use hipfire_arch_qwen35::dflash_spec::{DflashState, build_dflash_speculator};
+use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, DflashState};
 use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
 use hipfire_arch_qwen35::speculative::ModelSlot;
+use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use std::path::Path;

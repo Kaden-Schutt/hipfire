@@ -15,9 +15,9 @@
 // skip the O(N^2) selection sort entirely. Parallelised across the
 // whole block.
 //
-// Slow path: when n_compressed > max_k (positions > 8K with DeepSeek V4
-// defaults), single-thread selection sort still runs. Worth porting
-// to a parallel top-K when long-context perf matters.
+// Slow path: when n_compressed > max_k, thread 0 runs the portable
+// reference selection sort. gfx1151 MQ2R uses a separately named
+// block-parallel replacement so other architectures keep this baseline.
 //
 // Body math is byte-equivalent to indexer_top_k on the fast path
 // (same SET of selected indices, just different ORDER — downstream

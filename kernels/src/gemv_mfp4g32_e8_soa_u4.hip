@@ -52,7 +52,6 @@ extern "C" __global__ void gemv_mfp4g32_e8_soa_u4(
 
     const char* scale_base = hdr + 16;
     const char* cw_base    = hdr + 16 + scale_padded;
-
     const int block_in_group = tid >> 2;
     const int cw_slot        = tid & 3;
 

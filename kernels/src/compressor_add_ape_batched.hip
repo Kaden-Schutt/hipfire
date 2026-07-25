@@ -33,3 +33,23 @@ __global__ void compressor_add_ape_batched_f32(
     score_batch[(long long)b * proj_dim + d] +=
         ape[(long long)row * proj_dim + d];
 }
+
+// Single-position capture/replay twin. The ring slot is staged in a device
+// buffer before every forward, so neither the APE row nor its pointer is baked
+// into an immutable HIP-graph/Redline tape. For overlap compressors the ring
+// slot is in [ratio, 2*ratio); modulo recovers the APE row.
+extern "C" __launch_bounds__(256, 4)
+__global__ void compressor_add_ape_f32_buf(
+    float*       __restrict__ score,
+    const float* __restrict__ ape,
+    const int*   __restrict__ ring_slot_buf,
+    int proj_dim,
+    int ratio
+) {
+    const int slot = ring_slot_buf[0];
+    if (slot < 0) return;
+    const int d = blockIdx.x * 256 + threadIdx.x;
+    if (d >= proj_dim) return;
+    const int row = slot % ratio;
+    score[d] += ape[(long long)row * proj_dim + d];
+}

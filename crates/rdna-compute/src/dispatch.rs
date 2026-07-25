@@ -399,6 +399,11 @@ pub struct MmqScreenState {
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
+    /// Versioned gfx1151 decode route for the DeepSeek V4 MQ2R tensor recipe.
+    /// This is deliberately route state, not model identity: the same `.mq2r`
+    /// artifact remains loadable on other architectures through their portable
+    /// dispatch. The DeepSeek loader resets it on every model load.
+    pub deepseek4_mq2r_route_v1: bool,
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
@@ -527,11 +532,7 @@ impl BlockHessianAcc {
                 n += 1;
             }
         }
-        if n == 0 {
-            0.0
-        } else {
-            s / n as f64
-        }
+        if n == 0 { 0.0 } else { s / n as f64 }
     }
 }
 
@@ -814,6 +815,7 @@ impl Gpu {
         Ok(Self {
             hip,
             arch,
+            deepseek4_mq2r_route_v1: false,
             flags,
             arch_caps,
             device_id: id,
@@ -1749,15 +1751,9 @@ impl Gpu {
 
     // ── Tensor allocation ───────────────────────────────────────
 
-    pub fn ensure_gemv_residual_tmp(
-        &mut self,
-        min_elems: usize,
-    ) -> HipResult<&GpuTensor> {
-        self.scratch.ensure_gemv_residual_tmp(
-            &self.hip,
-            self.device_id,
-            min_elems,
-        )
+    pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
+        self.scratch
+            .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
     }
 
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
@@ -2707,9 +2703,9 @@ impl Drop for Gpu {
 
 #[cfg(test)]
 mod tests {
-    use super::gen_fwht_signs;
     use super::DType;
     use super::HessianCapture;
+    use super::gen_fwht_signs;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {

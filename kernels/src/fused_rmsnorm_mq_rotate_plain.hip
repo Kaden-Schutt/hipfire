@@ -150,3 +150,146 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_plain(
         x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
     }
 }
+
+// gfx1151 decode variant adapted from the autoresearch-winning
+// `rms_no_xshared_warpreduce_sum2` family. The ordinary dual-output kernel
+// caches all K inputs in LDS and performs an eight-barrier block reduction.
+// This version uses eight LDS scalars for a wave-first reduction, reloads x
+// once the norm is known, and writes x_plain immediately before FWHT.
+__launch_bounds__(256, 1)
+extern "C" __global__ void fused_rmsnorm_mq_rotate_plain_nox(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    float* __restrict__ x_rot,
+    float* __restrict__ x_plain,
+    int K,
+    float eps
+) {
+    extern __shared__ float reduce[];
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
+    const long long batch_off = (long long)blockIdx.x * K;
+    const float* x_b = x + batch_off;
+    float* x_rot_b = x_rot + batch_off;
+    float* x_plain_b = x_plain + batch_off;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    int i = tid;
+    for (; i + blockDim.x < K; i += blockDim.x * 2) {
+        const float v0 = x_b[i];
+        const float v1 = x_b[i + blockDim.x];
+        sum0 += v0 * v0;
+        sum1 += v1 * v1;
+    }
+    if (i < K) {
+        const float v = x_b[i];
+        sum0 += v * v;
+    }
+    float local_sum = sum0 + sum1;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down(local_sum, offset);
+    }
+    if (lane_id == 0) reduce[warp_id] = local_sum;
+    __syncthreads();
+
+    float block_sum = tid < num_warps ? reduce[tid] : 0.0f;
+    if (warp_id == 0) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            block_sum += __shfl_down(block_sum, offset);
+        }
+        if (tid == 0) {
+            reduce[0] = rsqrtf(block_sum / (float)K + eps);
+        }
+    }
+    __syncthreads();
+    const float rms = reduce[0];
+
+    const int groups_total = K / 256;
+    const int groups_per_warp =
+        (groups_total + num_warps - 1) / num_warps;
+    const int warp_group_start = warp_id * groups_per_warp;
+    const int d0 = lane_id * 8;
+
+    const float4 s10 = *reinterpret_cast<const float4*>(signs1 + d0);
+    const float4 s11 = *reinterpret_cast<const float4*>(signs1 + d0 + 4);
+    const float4 s20 = *reinterpret_cast<const float4*>(signs2 + d0);
+    const float4 s21 = *reinterpret_cast<const float4*>(signs2 + d0 + 4);
+
+    for (int gi = 0; gi < groups_per_warp; ++gi) {
+        const int group = warp_group_start + gi;
+        if (group >= groups_total) break;
+        const int base = group * 256 + d0;
+
+        const float4 x0 = *reinterpret_cast<const float4*>(x_b + base);
+        const float4 x1 = *reinterpret_cast<const float4*>(x_b + base + 4);
+        const float4 w0 = *reinterpret_cast<const float4*>(weight + base);
+        const float4 w1 = *reinterpret_cast<const float4*>(weight + base + 4);
+
+        float v0 = x0.x * w0.x * rms;
+        float v1 = x0.y * w0.y * rms;
+        float v2 = x0.z * w0.z * rms;
+        float v3 = x0.w * w0.w * rms;
+        float v4 = x1.x * w1.x * rms;
+        float v5 = x1.y * w1.y * rms;
+        float v6 = x1.z * w1.z * rms;
+        float v7 = x1.w * w1.w * rms;
+
+        *reinterpret_cast<float4*>(x_plain_b + base) =
+            make_float4(v0, v1, v2, v3);
+        *reinterpret_cast<float4*>(x_plain_b + base + 4) =
+            make_float4(v4, v5, v6, v7);
+
+        v0 *= s10.x; v1 *= s10.y; v2 *= s10.z; v3 *= s10.w;
+        v4 *= s11.x; v5 *= s11.y; v6 *= s11.z; v7 *= s11.w;
+
+        float t;
+        t = v0; v0 = v0 + v1; v1 = t - v1;
+        t = v2; v2 = v2 + v3; v3 = t - v3;
+        t = v4; v4 = v4 + v5; v5 = t - v5;
+        t = v6; v6 = v6 + v7; v7 = t - v7;
+
+        t = v0; v0 = v0 + v2; v2 = t - v2;
+        t = v1; v1 = v1 + v3; v3 = t - v3;
+        t = v4; v4 = v4 + v6; v6 = t - v6;
+        t = v5; v5 = v5 + v7; v7 = t - v7;
+
+        t = v0; v0 = v0 + v4; v4 = t - v4;
+        t = v1; v1 = v1 + v5; v5 = t - v5;
+        t = v2; v2 = v2 + v6; v6 = t - v6;
+        t = v3; v3 = v3 + v7; v7 = t - v7;
+
+        #define HBFLY(v, pat, str) do { \
+            float _p = __int_as_float(__builtin_amdgcn_ds_swizzle( \
+                __float_as_int(v), (pat))); \
+            if (lane_id & (str)) { (v) = _p - (v); } \
+            else { (v) = (v) + _p; } \
+        } while (0)
+        #define HBFLY8(pat, str) \
+            HBFLY(v0,pat,str); HBFLY(v1,pat,str); \
+            HBFLY(v2,pat,str); HBFLY(v3,pat,str); \
+            HBFLY(v4,pat,str); HBFLY(v5,pat,str); \
+            HBFLY(v6,pat,str); HBFLY(v7,pat,str)
+
+        HBFLY8(0x041F, 1);
+        HBFLY8(0x081F, 2);
+        HBFLY8(0x101F, 4);
+        HBFLY8(0x201F, 8);
+        HBFLY8(0x401F, 16);
+        #undef HBFLY8
+        #undef HBFLY
+
+        const float scale = 0.0625f;
+        *reinterpret_cast<float4*>(x_rot_b + base) = make_float4(
+            v0 * scale * s20.x, v1 * scale * s20.y,
+            v2 * scale * s20.z, v3 * scale * s20.w);
+        *reinterpret_cast<float4*>(x_rot_b + base + 4) = make_float4(
+            v4 * scale * s21.x, v5 * scale * s21.y,
+            v6 * scale * s21.z, v7 * scale * s21.w);
+    }
+}

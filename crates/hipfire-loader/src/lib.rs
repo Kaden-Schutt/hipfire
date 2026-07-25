@@ -738,7 +738,8 @@ fn finish_qwen35_load(
                 match hipfire_runtime::hfq::HfqFile::open(&p) {
                     Ok(mut sidecar) => {
                         sidecar.drop_mmap();
-                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu) {
+                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu)
+                        {
                             Ok(Some((dspark_weights, assets))) => {
                                 let block = dspark_weights.cfg.block_size;
                                 // Reduced-vocab drafters (ORNITH) ship a compressed
@@ -753,12 +754,13 @@ fn finish_qwen35_load(
                                 let mut lm_head = assets.weights.output.buf.shallow_clone();
                                 lm_head.dtype = rdna_compute::DType::F16;
                                 lm_head.shape = vec![vocab];
-                                let conf_threshold =
-                                    hipfire_config::developer_var("HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD")
-                                        .ok()
-                                        .and_then(|s| s.parse().ok())
-                                        .or(ctx.spec.dspark_conf_threshold)
-                                        .unwrap_or(0.1f32);
+                                let conf_threshold = hipfire_config::developer_var(
+                                    "HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD",
+                                )
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .or(ctx.spec.dspark_conf_threshold)
+                                .unwrap_or(0.1f32);
                                 eprintln!(
                                     "  qwen35 DSpark enabled (block={}, target_layers={:?}, draft_vocab={}, conf={:.2})",
                                     block,
@@ -784,7 +786,9 @@ fn finish_qwen35_load(
                                         ))
                                     }
                                     Err(e) => {
-                                        eprintln!("  qwen35: DSpark body build failed: {e} — AR/other");
+                                        eprintln!(
+                                            "  qwen35: DSpark body build failed: {e} — AR/other"
+                                        );
                                         None
                                     }
                                 }
@@ -852,7 +856,10 @@ fn finish_qwen35_load(
         && dspark_speculator.is_none()
         && eviction.is_none()
         && matches!(arch_id, 5 | 6)
-        && hipfire_config::developer_var("HIPFIRE_QWEN35_MTP").ok().as_deref() == Some("1")
+        && hipfire_config::developer_var("HIPFIRE_QWEN35_MTP")
+            .ok()
+            .as_deref()
+            == Some("1")
         && ctx.path.ends_with(".mq4-mtp")
     {
         match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(

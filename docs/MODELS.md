@@ -120,6 +120,7 @@ Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLA
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
 | `deepseek-v4-flash` | `deepseek-v4-flash.mq2lloyd` | 82 | 96 | arch_id=9; registry lists MTP + DSpark sidecars; entry carries a `sampling` block (temp=1.0 / top_p=1.0) that is **inert metadata** today — not applied by the CLI resolver |
+| `deepseek-v4-flash:mq2r` | `deepseek-v4-flash.mq2r` | 82 | 96 | local campaign SKU; MQ2-Lloyd routed experts + MFP4-E8 dense route; dedicated `.mq2r` MTP/DSpark sidecars; never aliases the MQ2-Lloyd artifact |
 | `minimax-m2.7` | `MiniMax-M2.7.mq2` | 79.2 | 96 | arch_id=10 Mixtral-style MoE |
 | `north-mini-code` | `north-mini-code.mq4.hfq` | 16 | 24 | Cohere2-MoE arch_id=12; registry `sampling` block is **inert metadata** today |
 | `vibethinker:3b` | `vibethinker-3b.mq4.hfq` | 1.82 | 3.5 | Qwen2 MQ4 |
@@ -156,6 +157,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwopus` | `qwopus:9b` |
 | `qwopus:{4b,9b,27b}-{mq4,hf4}` | matching primary `qwopus:{4b,9b,27b}` tag |
 | `deepseek4` / `deepseek-v4` | `deepseek-v4-flash` |
+| `deepseek4:mq2r` / `deepseek-v4:mq2r` | `deepseek-v4-flash:mq2r` |
 | `vibethinker` | `vibethinker:3b` |
 | `qwen3.5:*-mq4` / `*-hf4` / several `*-hf6` | same-size primary or mq6 tag (see registry) |
 | `qwen3.5:9b:draft` etc. | matching `*-draft` tags |
@@ -235,7 +237,7 @@ Dequant path support is format-specific (common Q4_0 / Q8_0 / Q4_K / Q6_K / F16 
   optional sibling drafts / .triattn*.bin sidecars
 ```
 
-Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table.
+Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table.
 
 ---
 

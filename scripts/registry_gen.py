@@ -58,6 +58,7 @@ SIZE_TOLERANCE = 0.25
 KNOWN_QUANTS = {
     "mq2lloyd",
     "mq2",
+    "mq2r",
     "mq3",
     "mq3p",
     "mq4",
@@ -349,8 +350,16 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
         repo = entry.get("repo", "")
         if not repo:
-            # Local-only entry (pull short-circuits). Nothing to probe.
-            new_entry.update({"sha256": None, "size_bytes": None})
+            # Local-only entry (pull short-circuits). A campaign artifact may
+            # still carry a curated content identity even though there is no
+            # Hugging Face tree to probe. Preserve it verbatim and validate it
+            # below through the generated registry parser.
+            new_entry.update(
+                {
+                    "sha256": entry.get("sha256"),
+                    "size_bytes": entry.get("size_bytes"),
+                }
+            )
         elif repo in trees:
             tree = trees[repo]
             item = tree.get(entry["file"])

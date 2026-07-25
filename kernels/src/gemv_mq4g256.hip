@@ -59,9 +59,10 @@ extern "C" __global__ void gemv_mq4g256(
 // Called ONCE before the GEMV, not per-row.
 // 32 threads per group, 8 elements per thread, ds_swizzle butterfly.
 //
-// Grid: [groups_total, batch, 1]. For decode the caller passes batch=1 and
-// blockIdx.y is always 0 (byte-identical to the pre-batching version).
-// For prefill, batch=N; each block processes one group × one batch row.
+// Grid: [groups_total * batch, 1, 1]. The flattened 1-D geometry avoids a
+// backend-specific implicit multi-dimensional dispatch dependency: HIP module
+// launch, public-HSA AQL, and retained PM4 all derive batch/group from the same
+// hardware blockIdx.x value.
 // x_in / x_out are laid out as [batch × K] row-major.
 extern "C" __launch_bounds__(32, 16)
 __global__ void mq_rotate_x(
@@ -71,12 +72,13 @@ __global__ void mq_rotate_x(
     const float* __restrict__ signs2,
     int K
 ) {
-    const int group = blockIdx.x;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
-    if (group >= groups_total) return;
+    const int linear_group = blockIdx.x;
+    const int batch = linear_group / groups_total;
+    const int group = linear_group - batch * groups_total;
 
-    const long long batch_off = (long long)blockIdx.y * K;
+    const long long batch_off = (long long)batch * K;
     const float* x_in_b  = x_in  + batch_off;
           float* x_out_b = x_out + batch_off;
 

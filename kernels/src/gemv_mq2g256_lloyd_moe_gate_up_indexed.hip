@@ -141,3 +141,123 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed(
         }
     }
 }
+
+// gfx1151 experiment: keep each K4 codebook in wave registers instead of
+// materializing it in LDS and issuing one dependent ds_read per decoded
+// weight.  Four shuffles broadcast a group's centroids, then branchless
+// register selects decode its eight weights.  This halves cross-lane/LDS
+// operations (4 broadcasts vs 8 indexed LDS reads per group) while preserving
+// the K4 accumulator structure and output reduction order.
+__device__ __forceinline__ float mq2_wavecb_select(
+    unsigned int packed,
+    int shift,
+    float c0,
+    float c1,
+    float c2,
+    float c3
+) {
+    unsigned int idx = (packed >> shift) & 3u;
+    return (idx & 2u) ? ((idx & 1u) ? c3 : c2)
+                      : ((idx & 1u) ? c1 : c0);
+}
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_wavecb(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int* __restrict__ topk_indices,
+    const float* __restrict__ x_rot,
+    float* __restrict__ y_gate,
+    float* __restrict__ y_up,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int krank = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int expert_id = topk_indices[krank];
+    const char* __restrict__ A =
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 72;
+    const char* row_ptr = A + (long long)row * row_bytes;
+    const int boff = tid * 2;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+    #define DOG2_WAVECB(pk, lane_base, b, a) do {                         \
+        float c0 = __shfl(cb_lane, (lane_base) + 0);                      \
+        float c1 = __shfl(cb_lane, (lane_base) + 1);                      \
+        float c2 = __shfl(cb_lane, (lane_base) + 2);                      \
+        float c3 = __shfl(cb_lane, (lane_base) + 3);                      \
+        (a) += mq2_wavecb_select((pk),  0, c0, c1, c2, c3) * x_rot[(b)]     \
+             + mq2_wavecb_select((pk),  2, c0, c1, c2, c3) * x_rot[(b)+1]  \
+             + mq2_wavecb_select((pk),  4, c0, c1, c2, c3) * x_rot[(b)+2]  \
+             + mq2_wavecb_select((pk),  6, c0, c1, c2, c3) * x_rot[(b)+3]  \
+             + mq2_wavecb_select((pk),  8, c0, c1, c2, c3) * x_rot[(b)+4]  \
+             + mq2_wavecb_select((pk), 10, c0, c1, c2, c3) * x_rot[(b)+5]  \
+             + mq2_wavecb_select((pk), 12, c0, c1, c2, c3) * x_rot[(b)+6]  \
+             + mq2_wavecb_select((pk), 14, c0, c1, c2, c3) * x_rot[(b)+7]; \
+    } while (0)
+
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + g * 72;
+        const char* gp1 = gp0 + 72;
+        const char* gp2 = gp1 + 72;
+        const char* gp3 = gp2 + 72;
+
+        float cb_lane = 0.0f;
+        if (tid < 16) {
+            const __half* cb_h =
+                reinterpret_cast<const __half*>(
+                    gp0 + (long long)(tid >> 2) * 72);
+            cb_lane = __half2float(cb_h[tid & 3]);
+        }
+
+        const unsigned short pk0 =
+            *reinterpret_cast<const unsigned short*>(gp0 + 8 + boff);
+        const unsigned short pk1 =
+            *reinterpret_cast<const unsigned short*>(gp1 + 8 + boff);
+        const unsigned short pk2 =
+            *reinterpret_cast<const unsigned short*>(gp2 + 8 + boff);
+        const unsigned short pk3 =
+            *reinterpret_cast<const unsigned short*>(gp3 + 8 + boff);
+        const int base = g * 256 + tid * 8;
+
+        DOG2_WAVECB(pk0,  0, base,       acc0);
+        DOG2_WAVECB(pk1,  4, base + 256, acc1);
+        DOG2_WAVECB(pk2,  8, base + 512, acc2);
+        DOG2_WAVECB(pk3, 12, base + 768, acc3);
+    }
+
+    for (int t = 0; t < tail; t++) {
+        const int g = (quads << 2) + t;
+        const char* gp = row_ptr + g * 72;
+        float cb_lane = 0.0f;
+        if (tid < 4) {
+            cb_lane = __half2float(
+                reinterpret_cast<const __half*>(gp)[tid]);
+        }
+        const unsigned short pk =
+            *reinterpret_cast<const unsigned short*>(gp + 8 + boff);
+        const int base = g * 256 + tid * 8;
+        DOG2_WAVECB(pk, 0, base, acc0);
+    }
+    #undef DOG2_WAVECB
+
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) {
+        const int mi = M >> 1;
+        if (row < mi) {
+            y_gate[krank * mi + row] = acc;
+        } else {
+            y_up[krank * mi + (row - mi)] = acc;
+        }
+    }
+}

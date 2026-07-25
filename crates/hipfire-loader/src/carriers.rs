@@ -682,11 +682,12 @@ impl Carrier for LlamaCarrier {
             // conf_threshold ladder: env > CLI arg > 0.1
             // Default 0.1 (sweep-tuned): 0.5 over-truncates (1.46/7 proposed);
             // 0.1 proposes ~6.94/7, +16.6% prose tok/s / +7.1% code tok/s.
-            let conf_threshold = hipfire_config::developer_var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or(ctx.spec.dspark_conf_threshold)
-                .unwrap_or(0.1f32);
+            let conf_threshold =
+                hipfire_config::developer_var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .or(ctx.spec.dspark_conf_threshold)
+                    .unwrap_or(0.1f32);
 
             eprintln!(
                 "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
@@ -1006,9 +1007,7 @@ impl Carrier for Deepseek4Carrier {
             let max_n: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .or_else(|| {
-                    Some(hipfire_runtime::config::get().mtp_k)
-                })
+                .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
                 .unwrap_or(2);
             let ctx_capacity = config.max_position_embeddings;
             eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");

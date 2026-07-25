@@ -180,7 +180,10 @@ fn main() -> Result<(), String> {
     // accept rates (~50% K=2, ~53% K=3) spec decode is slower than plain
     // decode_step_with_graph. Kept available for experiments and for when
     // accept rates improve via better MTP plumbing.
-    let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE").ok().as_deref() == Some("1");
+    let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
+        .ok()
+        .as_deref()
+        == Some("1");
     let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -188,7 +191,12 @@ fn main() -> Result<(), String> {
 
     eprintln!("Loading DeepSeek V4 from {path}...");
     let mut hfq = HfqFile::open(std::path::Path::new(&path)).map_err(|e| format!("open: {e:?}"))?;
-    let cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    // The checkpoint metadata may advertise DSpark availability, but this
+    // executable's explicit AR mode must not upload the three-stage sidecar.
+    // Besides wasting VRAM, doing so makes every fresh-process AR comparison
+    // pay the sidecar load even though no speculative step can execute.
+    cfg.load_dspark = spec_mode;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found in HFQ metadata: {e:?}"))?;
 

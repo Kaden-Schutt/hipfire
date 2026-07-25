@@ -123,6 +123,7 @@ impl DsparkBody for Deepseek4DsparkBody {
             markov_w1: weights.markov_w1.as_ref().map(|t| t.shallow_clone()),
             markov_w2: weights.markov_w2.as_ref().map(|t| t.shallow_clone()),
             confidence_proj: weights.confidence_proj.as_ref().map(|t| t.shallow_clone()),
+            draft_head: None,
         };
 
         forward::dspark_run_body_and_hc_gate(

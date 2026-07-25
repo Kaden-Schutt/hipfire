@@ -798,7 +798,7 @@ impl ScratchState {
             capture_mode,
             force_blob_path,
             "mq_rotate_x",
-            [n_groups, batch_size as u32, 1],
+            [n_groups * batch_size as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,

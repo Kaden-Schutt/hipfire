@@ -116,6 +116,13 @@ pub struct DeepseekV4Config {
     /// directly-driven daemon (no CLI selector). Not (de)serialized.
     #[serde(skip)]
     pub load_dspark: bool,
+
+    /// Exact DeepSeek V4 MQ2R SKU selector. This is derived from the `.mq2r`
+    /// artifact suffix (or frozen recipe metadata) and is never inferred from
+    /// the presence of an E8 tensor alone, so MQ2-Lloyd keeps its established
+    /// runtime defaults. Not serialized as part of the upstream config.
+    #[serde(skip)]
+    pub mq2r: bool,
 }
 
 /// Raw upstream JSON shape — only the fields we read. Used to drive
@@ -190,6 +197,15 @@ impl DeepseekV4Config {
             .ok_or_else(|| "deepseek4: metadata_json missing `config` wrapper".to_string())?;
         let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone())
             .map_err(|e| format!("deepseek4: parsing inner config failed: {e}"))?;
+        let mq2r = hfq
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
+            || wrapper
+                .get("hipfire_quant_recipe")
+                .and_then(|value| value.as_str())
+                .is_some_and(|recipe| recipe == "deepseek4-mq2r-e8-p3-v1");
         let mut config = DeepseekV4Config {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
@@ -232,6 +248,7 @@ impl DeepseekV4Config {
             num_hash_layers: raw.num_hash_layers,
             reap_keep: None,
             load_dspark: true,
+            mq2r,
         };
         // Optional REAP plan: emulate a pruned expert pool (e.g. 162B
         // 256→144) by partial-loading this full quant. Read BEFORE the
@@ -245,8 +262,19 @@ impl DeepseekV4Config {
             config.num_hidden_layers,
             config.n_routed_experts,
         )? {
-            config.n_routed_experts = plan.kept_per_layer();
-            config.reap_keep = Some(std::sync::Arc::new(plan));
+            // An overlay-only plan has no expert keep-map. HfqFile already
+            // attached its overlay by this point, so do not route that plan
+            // through the pruning path: doing so would make hash layers look
+            // for remapped tid2eid sidecars and disable MTP unnecessarily.
+            if plan.keep.is_some() {
+                config.n_routed_experts = plan.kept_per_layer();
+                config.reap_keep = Some(std::sync::Arc::new(plan));
+            } else {
+                eprintln!(
+                    "deepseek4: REAP overlay-only plan ACTIVE — no expert pruning; dir {}",
+                    plan.dir.display()
+                );
+            }
         }
         Ok(config)
     }
@@ -314,7 +342,9 @@ impl DsparkConfig {
 ///
 /// The DSpark-specific globals (`main_proj`/`main_norm` from stage 0,
 /// `markov_w1`/`markov_w2`/`confidence_proj` from the last stage) live
-/// directly on this struct.
+/// directly on this struct. A target-recipe-specific sidecar may additionally
+/// carry `draft_head.weight`; it is used only for draft logits and never
+/// replaces the trunk's verification/output head.
 pub struct DsparkWeights {
     pub cfg: DsparkConfig,
     pub stages: Vec<DeepseekV4LayerWeights>,
@@ -323,6 +353,7 @@ pub struct DsparkWeights {
     pub markov_w1: Option<rdna_compute::GpuTensor>,
     pub markov_w2: Option<rdna_compute::GpuTensor>,
     pub confidence_proj: Option<rdna_compute::GpuTensor>,
+    pub draft_head: Option<rdna_compute::GpuTensor>,
 }
 
 impl DsparkWeights {
@@ -340,6 +371,7 @@ impl DsparkWeights {
         free_opt(gpu, &mut self.markov_w1);
         free_opt(gpu, &mut self.markov_w2);
         free_opt(gpu, &mut self.confidence_proj);
+        free_opt(gpu, &mut self.draft_head);
         for stage in self.stages.drain(..) {
             stage.free_gpu(gpu);
         }
@@ -395,6 +427,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Con
         num_hash_layers: raw.num_hash_layers,
         reap_keep: None,
         load_dspark: true,
+        mq2r: false,
     })
 }
 
@@ -993,6 +1026,14 @@ pub struct DeepseekV4State {
     /// `None` until `decode_step` allocates on first call.
     pub residual_streams: Option<rdna_compute::GpuTensor>,
 
+    /// Alternate `[hc_mult, hidden]` output for the decode HC mixers.
+    ///
+    /// The attention and FFN mixers each swap this with `residual_streams`,
+    /// eliminating two device copies per layer. There are exactly two swaps
+    /// per layer, so the externally visible buffer identity is restored at
+    /// every decode boundary (important for graph and retained replay).
+    pub residual_streams_next: Option<rdna_compute::GpuTensor>,
+
     /// Single-row embedding scratch `[hidden]` for the current decode
     /// step's token lookup. F32 to match residual_streams convention.
     pub embed_scratch: Option<rdna_compute::GpuTensor>,
@@ -1108,8 +1149,8 @@ pub struct DeepseekV4State {
     /// Layout (all i32 stored as F32 bits):
     ///   [0] swa_slot          = pos % sliding_window
     ///   [1] n_valid_swa       = min(pos + 1, sliding_window)
-    ///   [2] n_compressed_4    = (pos + 1) / 4    (ratio=4 layers)
-    ///   [3] n_compressed_128  = (pos + 1) / 128  (ratio=128 layers)
+    ///   [2] n_compressed_4    = min((pos + 1) / 4, max_compressed)
+    ///   [3] n_compressed_128  = min((pos + 1) / 128, max_compressed)
     ///   [4] k_active_4        = min(index_topk, n_compressed_4)
     ///   [5] k_active_128      = min(topk_window, n_compressed_128)
     ///   [6] ring_slot_4       = ring write slot for ratio=4 state
@@ -1140,6 +1181,19 @@ pub struct DeepseekV4State {
     /// `transform_out`. Currently = shared expert output (real),
     /// routed experts pending.
     pub ffn_out: Option<rdna_compute::GpuTensor>,
+
+    /// Routed-only FFN partial used by the gfx1151 dual-stream decode path.
+    /// The main stream writes this while the side stream evaluates the shared
+    /// expert into `ffn_out`; after the streams join, the partial is added to
+    /// `ffn_out` before the HC mix.
+    pub ffn_routed_overlap: Option<rdna_compute::GpuTensor>,
+    /// Persistent side-stream resources for shared-vs-routed MoE overlap.
+    /// Constructed before AR graph capture and explicitly destroyed by
+    /// `free_gpu`; leaving them in the per-session state avoids global stream
+    /// ownership and keeps the optimization model/session scoped.
+    pub ffn_overlap_stream: Option<hip_bridge::Stream>,
+    pub ffn_overlap_fork_event: Option<hip_bridge::Event>,
+    pub ffn_overlap_join_event: Option<hip_bridge::Event>,
 
     /// FFN normalised input `[hidden]` F32. RMSNorm(stream0, ffn_norm)
     /// then FWHT-rotated for the shared-expert MQ4 GEMVs.
@@ -1332,6 +1386,7 @@ impl DeepseekV4State {
             _indexer: indexer,
             _attention: attention,
             residual_streams: None, // allocated on first `decode_step` (needs Gpu).
+            residual_streams_next: None,
             embed_scratch: None,
             tmp: None,
             tmp_plain: None,
@@ -1353,6 +1408,10 @@ impl DeepseekV4State {
             attn_state_host: None,
             attn_out: None,
             ffn_out: None,
+            ffn_routed_overlap: None,
+            ffn_overlap_stream: None,
+            ffn_overlap_fork_event: None,
+            ffn_overlap_join_event: None,
             ffn_x_rot: None,
             ffn_x_plain: None,
             ffn_gate: None,
@@ -1528,6 +1587,18 @@ impl DeepseekV4State {
                 let _ = gpu.free_tensor(t);
             }
         }
+        if let Some(stream) = self.ffn_overlap_stream.as_ref() {
+            let _ = gpu.hip.stream_synchronize(stream);
+        }
+        if let Some(event) = self.ffn_overlap_fork_event.take() {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(event) = self.ffn_overlap_join_event.take() {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(stream) = self.ffn_overlap_stream.take() {
+            let _ = gpu.hip.stream_destroy(stream);
+        }
         // Per-layer indexer + main-attention caches.
         for mut l in self._indexer.drain(..) {
             free_opt(gpu, &mut l.main_kv_cache);
@@ -1555,6 +1626,7 @@ impl DeepseekV4State {
         }
         // Top-level scratch.
         free_opt(gpu, &mut self.residual_streams);
+        free_opt(gpu, &mut self.residual_streams_next);
         free_opt(gpu, &mut self.embed_scratch);
         free_opt(gpu, &mut self.tmp);
         free_opt(gpu, &mut self.tmp_plain);
@@ -1572,6 +1644,7 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.attn_state_buf);
         free_opt(gpu, &mut self.attn_out);
         free_opt(gpu, &mut self.ffn_out);
+        free_opt(gpu, &mut self.ffn_routed_overlap);
         free_opt(gpu, &mut self.ffn_x_rot);
         free_opt(gpu, &mut self.ffn_x_plain);
         free_opt(gpu, &mut self.ffn_gate);
@@ -1692,8 +1765,7 @@ mod tests {
     /// model card adds or renames fields.
     #[test]
     fn parses_real_deepseek4_config_json() {
-        let real_config_path =
-            "/home/nick/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/\
+        let real_config_path = "/home/nick/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/\
              snapshots/6976c7ff1b30a1b2cb7805021b8ba4684041f136/config.json";
         let raw_json = match std::fs::read_to_string(real_config_path) {
             Ok(s) => s,

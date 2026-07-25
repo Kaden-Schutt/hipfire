@@ -61,9 +61,7 @@ pub fn q8_flash_tile_size(
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
         })
-        .unwrap_or_else(|| {
-            q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq)
-        })
+        .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq))
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -86,7 +84,9 @@ fn replay_stable_tile_count(
 fn is_wmma_fa_enabled() -> bool {
     use std::sync::OnceLock;
     static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| hipfire_config::developer_var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1"))
+    *GATE.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1")
+    })
 }
 
 /// Minimum chunk size to engage the WMMA-FA route.
@@ -2048,13 +2048,7 @@ impl Gpu {
         output_gate: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let tile_size = q8_flash_tile_size(
-            &self.arch,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            max_seq,
-        );
+        let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;
@@ -2073,7 +2067,8 @@ impl Gpu {
 
         // ── Tile kernel ──
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
-            && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref() == Ok("1");
+            && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
+                == Ok("1");
         let (tile_module, tile_src) = if gfx1151_tile_dpp {
             (
                 "attention_flash_q8_0_tile_dpp_gfx1151",
@@ -2207,11 +2202,7 @@ impl Gpu {
                 )?;
             } else {
                 const KERNEL: &str = "attention_flash_q8_0_reduce";
-                self.ensure_kernel(
-                    KERNEL,
-                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-                    KERNEL,
-                )?;
+                self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, KERNEL)?;
                 let mut params: Vec<*mut c_void> = vec![
                     &p_ptr as *const _ as *mut c_void,
                     &o_ptr as *const _ as *mut c_void,
@@ -8073,6 +8064,52 @@ impl Gpu {
             )
         }
     }
+    pub fn compressor_add_ape_f32_buf(
+        &mut self,
+        score: &GpuTensor,
+        ape: &GpuTensor,
+        ring_slot_buf: &GpuTensor,
+        proj_dim: i32,
+        ratio: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_add_ape_buf",
+            kernels::COMPRESSOR_ADD_APE_BATCHED_SRC,
+            "compressor_add_ape_f32_buf",
+        )?;
+        let sp = score.buf.as_ptr();
+        let ap = ape.buf.as_ptr();
+        let rp = ring_slot_buf.buf.as_ptr();
+        let mut pd = proj_dim;
+        let mut rr = ratio;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &mut pd as *mut _ as *mut c_void,
+            &mut rr as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((proj_dim as u32) + block - 1) / block;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(sp);
+            b.push_ptr(ap);
+            b.push_ptr(rp);
+            b.push_i32(pd);
+            b.push_i32(rr);
+            b
+        };
+        self.launch_maybe_blob(
+            "compressor_add_ape_f32_buf",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
     pub fn compressor_overlap_concat_f32(
         &mut self,
         src: &GpuTensor, // [2*ratio, 2*head_dim] F32
@@ -8086,7 +8123,6 @@ impl Gpu {
             kernels::COMPRESSOR_OVERLAP_CONCAT_SRC,
             "compressor_overlap_concat_f32",
         )?;
-        let func = &self.functions["compressor_overlap_concat_f32"];
         let sp = src.buf.as_ptr();
         let dp = dst.buf.as_ptr();
         let mut rv = ratio;
@@ -8097,16 +8133,21 @@ impl Gpu {
             &mut rv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [(2 * ratio) as u32, 1, 1],
-                [head_dim as u32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "compressor_overlap_concat_f32",
+            [(2 * ratio) as u32, 1, 1],
+            [head_dim as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(dp);
+                b.push_i32(rv);
+                b.push_i32(hd);
+                b
+            },
+        )
     }
     pub fn compressor_ring_write_batched_f32(
         &mut self,
@@ -8261,7 +8302,6 @@ impl Gpu {
             kernels::HC_APPLY_ALPHA_SRC,
             "hc_apply_alpha",
         )?;
-        let func = &self.functions["hc_apply_alpha"];
         let cp = c.buf.as_ptr();
         let ap = alpha.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8270,16 +8310,20 @@ impl Gpu {
             &ap as *const _ as *mut c_void,
             &bp as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [24, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "hc_apply_alpha",
+            [1, 1, 1],
+            [24, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(ap);
+                b.push_ptr(bp);
+                b
+            },
+        )
     }
     pub fn hc_apply_alpha_batched(
         &mut self,
@@ -8326,12 +8370,18 @@ impl Gpu {
         x_dim: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "hc_compute_control",
-            kernels::HC_COMPUTE_CONTROL_SRC,
-            "hc_compute_control",
-        )?;
-        let func = &self.functions["hc_compute_control"];
+        let vec4 = self.arch == "gfx1151"
+            && (self.deepseek4_mq2r_route_v1
+                || hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_HC_CONTROL_VEC4")
+                    .ok()
+                    .as_deref()
+                    == Some("1"));
+        let (logical_name, symbol) = if vec4 {
+            ("hc_compute_control_vec4", "hc_compute_control_vec4")
+        } else {
+            ("hc_compute_control", "hc_compute_control")
+        };
+        self.ensure_kernel(logical_name, kernels::HC_COMPUTE_CONTROL_SRC, symbol)?;
         let xp = x_flat.buf.as_ptr();
         let wp = w_fn.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8346,16 +8396,89 @@ impl Gpu {
             &mut nc as *mut _ as *mut c_void,
             &mut xd as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_ctrl as u32, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            logical_name,
+            [n_ctrl as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(bp);
+                b.push_ptr(cp);
+                b.push_i32(nc);
+                b.push_i32(xd);
+                b
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_compute_control_vec4_finalize(
+        &mut self,
+        x_flat: &GpuTensor,
+        w_fn: &GpuTensor,
+        base: &GpuTensor,
+        c_out: &GpuTensor,
+        alpha: &GpuTensor,
+        n_ctrl: i32,
+        x_dim: i32,
+        hc_eps: f32,
+        post_scale: f32,
+        sinkhorn_iters: i32,
+        rsqrt_once: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let logical_name = "hc_compute_control_vec4_finalize";
+        self.ensure_kernel(logical_name, kernels::HC_COMPUTE_CONTROL_SRC, logical_name)?;
+        let xp = x_flat.buf.as_ptr();
+        let wp = w_fn.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let cp = c_out.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let mut nc = n_ctrl;
+        let mut xd = x_dim;
+        let mut eps = hc_eps;
+        let mut ps = post_scale;
+        let mut iters = sinkhorn_iters;
+        let mut once = i32::from(rsqrt_once);
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut iters as *mut _ as *mut c_void,
+            &mut once as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            logical_name,
+            [n_ctrl as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(bp);
+                b.push_ptr(cp);
+                b.push_ptr(ap);
+                b.push_i32(nc);
+                b.push_i32(xd);
+                b.push_f32(eps);
+                b.push_f32(ps);
+                b.push_i32(iters);
+                b.push_i32(once);
+                b
+            },
+        )
     }
     pub fn hc_compute_control_batched(
         &mut self,
@@ -8419,7 +8542,6 @@ impl Gpu {
             kernels::HC_HEAD_COMPUTE_PRE_SRC,
             "hc_head_compute_pre",
         )?;
-        let func = &self.functions["hc_head_compute_pre"];
         let xp = x_flat.buf.as_ptr();
         let wp = w_fn.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8440,16 +8562,26 @@ impl Gpu {
             &mut ne as *mut _ as *mut c_void,
             &mut he as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [hc_mult as u32, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "hc_head_compute_pre",
+            [hc_mult as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(bp);
+                b.push_ptr(pp);
+                b.push_i32(hm);
+                b.push_i32(xd);
+                b.push_f32(sv);
+                b.push_f32(ne);
+                b.push_f32(he);
+                b
+            },
+        )
     }
     pub fn hc_input_map_4stream(
         &mut self,
@@ -8464,7 +8596,6 @@ impl Gpu {
             kernels::HC_INPUT_MAP_SRC,
             "hc_input_map_4stream",
         )?;
-        let func = &self.functions["hc_input_map_4stream"];
         let ap = a_vec.buf.as_ptr();
         let sp = streams.buf.as_ptr();
         let op = x_out.buf.as_ptr();
@@ -8475,16 +8606,21 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &mut h as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [((hidden + 255) / 256) as u32, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "hc_input_map_4stream",
+            [((hidden + 255) / 256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(sp);
+                b.push_ptr(op);
+                b.push_i32(h);
+                b
+            },
+        )
     }
     pub fn hc_input_map_4stream_batched(
         &mut self,
@@ -8539,7 +8675,6 @@ impl Gpu {
             kernels::HC_MIX_4STREAM_SRC,
             "hc_mix_4stream",
         )?;
-        let func = &self.functions["hc_mix_4stream"];
         let xi = x_in.buf.as_ptr();
         let am = a_matrix.buf.as_ptr();
         let sc = scale.buf.as_ptr();
@@ -8554,16 +8689,23 @@ impl Gpu {
             &xo as *const _ as *mut c_void,
             &mut h as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [((hidden + 255) / 256) as u32, 4, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "hc_mix_4stream",
+            [((hidden + 255) / 256) as u32, 4, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xi);
+                b.push_ptr(am);
+                b.push_ptr(sc);
+                b.push_ptr(to);
+                b.push_ptr(xo);
+                b.push_i32(h);
+                b
+            },
+        )
     }
     pub fn hc_mix_4stream_batched(
         &mut self,
@@ -8645,6 +8787,115 @@ impl Gpu {
             blob_builder,
         )
     }
+
+    pub fn hc_finalize_control(
+        &mut self,
+        c: &GpuTensor,
+        alpha: &GpuTensor,
+        base: &GpuTensor,
+        hc_eps: f32,
+        post_scale: f32,
+        sinkhorn_iters: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_finalize_control",
+            kernels::HC_FINALIZE_CONTROL_SRC,
+            "hc_finalize_control",
+        )?;
+        let cp = c.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let mut eps = hc_eps;
+        let mut ps = post_scale;
+        let mut iters = sinkhorn_iters;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut iters as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "hc_finalize_control",
+            [1, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(ap);
+                b.push_ptr(bp);
+                b.push_f32(eps);
+                b.push_f32(ps);
+                b.push_i32(iters);
+                b
+            },
+        )
+    }
+
+    pub fn hc_finalize_input_map(
+        &mut self,
+        c: &GpuTensor,
+        alpha: &GpuTensor,
+        base: &GpuTensor,
+        streams: &GpuTensor,
+        x_out: &GpuTensor,
+        hidden: i32,
+        hc_eps: f32,
+        post_scale: f32,
+        sinkhorn_iters: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_finalize_input_map",
+            kernels::HC_FINALIZE_INPUT_MAP_SRC,
+            "hc_finalize_input_map",
+        )?;
+        let cp = c.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let sp = streams.buf.as_ptr();
+        let op = x_out.buf.as_ptr();
+        let mut hidden_value = hidden;
+        let mut eps = hc_eps;
+        let mut post = post_scale;
+        let mut iterations = sinkhorn_iters;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut hidden_value as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut post as *mut _ as *mut c_void,
+            &mut iterations as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "hc_finalize_input_map",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(cp);
+                blob.push_ptr(ap);
+                blob.push_ptr(bp);
+                blob.push_ptr(sp);
+                blob.push_ptr(op);
+                blob.push_i32(hidden_value);
+                blob.push_f32(eps);
+                blob.push_f32(post);
+                blob.push_i32(iterations);
+                blob
+            },
+        )
+    }
+
     pub fn hc_sinkhorn_4x4(&mut self, matrix: &GpuTensor, eps: f32, iters: i32) -> HipResult<()> {
         self.bind_thread()?;
         assert_eq!(matrix.numel(), 16, "hc_sinkhorn_4x4 expects a 4x4 matrix");
@@ -8653,7 +8904,6 @@ impl Gpu {
             kernels::HC_SINKHORN_4X4_SRC,
             "hc_sinkhorn_4x4",
         )?;
-        let func = &self.functions["hc_sinkhorn_4x4"];
         let m_ptr = matrix.buf.as_ptr();
         let mut eps_v = eps;
         let mut iters_v = iters;
@@ -8662,16 +8912,20 @@ impl Gpu {
             &mut eps_v as *mut _ as *mut c_void,
             &mut iters_v as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [32, 1, 1], // single-warp variant: 16 active lanes for the 4x4 matrix
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "hc_sinkhorn_4x4",
+            [1, 1, 1],
+            [32, 1, 1], // single-warp variant: 16 active lanes for the 4x4 matrix
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(m_ptr);
+                b.push_f32(eps_v);
+                b.push_i32(iters_v);
+                b
+            },
+        )
     }
     pub fn hc_sinkhorn_4x4_batched(
         &mut self,
@@ -9144,11 +9398,33 @@ impl Gpu {
         max_k: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "indexer_top_k_buf",
-            kernels::INDEXER_TOP_K_BUF_SRC,
-            "indexer_top_k_buf",
-        )?;
+        static FORCE_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_serial = *FORCE_SERIAL.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_SERIAL")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        let parallel =
+            self.arch == "gfx1151" && self.deepseek4_mq2r_route_v1 && !force_serial;
+        let (logical_name, source, symbol, block, smem) = if parallel {
+            (
+                "indexer_top_k_buf_parallel",
+                kernels::INDEXER_TOP_K_BUF_PARALLEL_GFX1151_SRC,
+                "indexer_top_k_buf_parallel",
+                [256, 1, 1],
+                0,
+            )
+        } else {
+            (
+                "indexer_top_k_buf",
+                kernels::INDEXER_TOP_K_BUF_SRC,
+                "indexer_top_k_buf",
+                [128, 1, 1],
+                max_n_compressed as u32,
+            )
+        };
+        self.ensure_kernel(logical_name, source, symbol)?;
         let sp = scores.buf.as_ptr();
         let ti = top_indices.buf.as_ptr();
         let nbp = n_compressed_buf.buf.as_ptr();
@@ -9163,7 +9439,6 @@ impl Gpu {
             &mut h as *mut _ as *mut c_void,
             &mut mk as *mut _ as *mut c_void,
         ];
-        let smem = max_n_compressed as u32;
         let blob_builder = || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(sp);
@@ -9174,15 +9449,10 @@ impl Gpu {
             b.push_i32(mk);
             b
         };
-        // Block sized to parallelise the fast-path identity write of
-        // up to max_k indices across threads (each thread writes
-        // multiple slots via stride). The slow-path selection-sort
-        // still serialises on thread 0 only — the extra threads
-        // early-return in that branch.
         self.launch_maybe_blob(
-            "indexer_top_k_buf",
+            symbol,
             [n_idx_heads as u32, 1, 1],
-            [128, 1, 1],
+            block,
             smem,
             &mut params,
             blob_builder,
@@ -9205,7 +9475,6 @@ impl Gpu {
             kernels::ROPE_TAIL_INTERLEAVED_SRC,
             "rope_tail_interleaved_f32",
         )?;
-        let func = &self.functions["rope_tail_interleaved_f32"];
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
         let pp = pos_buf.buf.as_ptr();
@@ -9225,16 +9494,25 @@ impl Gpu {
             &mut fb as *mut _ as *mut c_void,
         ];
         let half = (n_rot / 2) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [(half + 31) / 32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "rope_tail_interleaved_f32",
+            [(half + 31) / 32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(pp);
+                b.push_i32(nq);
+                b.push_i32(nk);
+                b.push_i32(hd);
+                b.push_i32(nr);
+                b.push_f32(fb);
+                b
+            },
+        )
     }
     pub fn rope_tail_interleaved_batched(
         &mut self,
@@ -9305,12 +9583,34 @@ impl Gpu {
         inverse: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        static WIDE_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wide = self.arch == "gfx1151"
+            && n_rot <= 128
+            && (self.deepseek4_mq2r_route_v1
+                || *WIDE_GFX1151.get_or_init(|| {
+                    hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROPE_WIDE")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                }));
+        let (logical_name, symbol, block) = if wide {
+            (
+                "rope_tail_yarn_interleaved_wide",
+                "rope_tail_yarn_interleaved_wide_f32",
+                [256, 1, 1],
+            )
+        } else {
+            (
+                "rope_tail_yarn_interleaved",
+                "rope_tail_yarn_interleaved_f32",
+                [32, 1, 1],
+            )
+        };
         self.ensure_kernel(
-            "rope_tail_yarn_interleaved",
+            logical_name,
             kernels::ROPE_TAIL_YARN_INTERLEAVED_SRC,
-            "rope_tail_yarn_interleaved_f32",
+            symbol,
         )?;
-        let func = &self.functions["rope_tail_yarn_interleaved_f32"];
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
         let pp = pos_buf.buf.as_ptr();
@@ -9341,17 +9641,24 @@ impl Gpu {
             &mut ch as *mut _ as *mut c_void,
             &mut inv as *mut _ as *mut c_void,
         ];
-        let half = (n_rot / 2) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [(half + 31) / 32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(symbol, [1, 1, 1], block, 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp);
+            b.push_ptr(kp);
+            b.push_ptr(pp);
+            b.push_i32(nq);
+            b.push_i32(nk);
+            b.push_i32(hd);
+            b.push_i32(nr);
+            b.push_f32(fb);
+            b.push_f32(fs);
+            b.push_f32(ef);
+            b.push_f32(af);
+            b.push_f32(cl);
+            b.push_f32(ch);
+            b.push_i32(inv);
+            b
+        })
     }
     pub fn rope_tail_yarn_interleaved_at_slot_buf(
         &mut self,
@@ -10349,11 +10656,60 @@ impl Gpu {
         topk_window: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "deepseek4_attn_swa_topk_f32_buf",
-            kernels::V4F_ATTN_SWA_TOPK_BUF_SRC,
-            "deepseek4_attn_swa_topk_f32_buf",
-        )?;
+        static WARP_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static ILP4_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SCOREGRID_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let scoregrid = self.arch == "gfx1151"
+            && head_dim == 512
+            && (self.deepseek4_mq2r_route_v1
+                || *SCOREGRID_GFX1151.get_or_init(|| {
+                    hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                }));
+        let ilp4 = self.arch == "gfx1151"
+            && head_dim == 512
+            && *ILP4_GFX1151.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_ILP4")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            });
+        let warp = self.arch == "gfx1151"
+            && head_dim == 512
+            && *WARP_GFX1151.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_WARP")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            });
+        let (logical_name, symbol, block) = if scoregrid {
+            (
+                "deepseek4_attn_swa_topk_scoregrid_f32_buf",
+                "deepseek4_attn_swa_topk_scoregrid_f32_buf",
+                [512, 1, 1],
+            )
+        } else if ilp4 {
+            (
+                "deepseek4_attn_swa_topk_ilp4_f32_buf",
+                "deepseek4_attn_swa_topk_ilp4_f32_buf",
+                [512, 1, 1],
+            )
+        } else if warp {
+            (
+                "deepseek4_attn_swa_topk_warp_f32_buf",
+                "deepseek4_attn_swa_topk_warp_f32_buf",
+                [256, 1, 1],
+            )
+        } else {
+            (
+                "deepseek4_attn_swa_topk_f32_buf",
+                "deepseek4_attn_swa_topk_f32_buf",
+                [head_dim as u32, 1, 1],
+            )
+        };
+        self.ensure_kernel(logical_name, kernels::V4F_ATTN_SWA_TOPK_BUF_SRC, symbol)?;
         let qp = q.buf.as_ptr();
         let kp = swa_k.buf.as_ptr();
         let vp = swa_v.buf.as_ptr();
@@ -10400,9 +10756,9 @@ impl Gpu {
             b
         };
         self.launch_maybe_blob(
-            "deepseek4_attn_swa_topk_f32_buf",
+            symbol,
             [n_heads as u32, 1, 1],
-            [head_dim as u32, 1, 1],
+            block,
             0,
             &mut params,
             blob_builder,
@@ -10416,34 +10772,22 @@ mod tests {
 
     #[test]
     fn q8_flash_gfx12_small_dense_shape_uses_tile16_only() {
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1201", 8, 2, 256, 2_048),
-            16
-        );
+        assert_eq!(q8_flash_default_tile_size("gfx1201", 8, 2, 256, 2_048), 16);
         assert_eq!(
             q8_flash_default_tile_size("gfx1201", 16, 2, 256, 2_048),
             128
         );
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1201", 8, 2, 128, 2_048),
-            128
-        );
+        assert_eq!(q8_flash_default_tile_size("gfx1201", 8, 2, 128, 2_048), 128);
     }
 
     #[test]
     fn gfx1151_tile32_default_is_exact_shape_and_arch_only() {
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048),
-            32
-        );
+        assert_eq!(q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048), 32);
         assert_eq!(
             q8_flash_default_tile_size("gfx1151", 16, 2, 256, 8_192),
             128
         );
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192),
-            32
-        );
+        assert_eq!(q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192), 32);
         assert_eq!(
             q8_flash_default_tile_size("gfx1200", 16, 2, 256, 2_048),
             128

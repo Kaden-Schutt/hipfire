@@ -11,7 +11,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 pub(crate) mod steps;
-pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
+pub use steps::{FusedPattern, GemvInput, Step, execute_steps};
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
@@ -461,8 +461,9 @@ pub fn run_moe_decode(
         && p.smi == 512
         && p.shared_down_w.dtype == DType::MQ4G256
         && p.shared_down_w.awq_scale.is_none()
-        && *ROUTER_SHARED_FUSE
-            .get_or_init(|| hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1"));
+        && *ROUTER_SHARED_FUSE.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1")
+        });
     let wave64_router = (ctx.arch.is_gfx1201()
         && hipfire_config::developer_var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
         || (ctx.arch.is_gfx1100()
@@ -1300,7 +1301,9 @@ pub fn run_moe_decode_bias_aware(
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
     //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
     //    atomicAdd-fused path (nondeterministic; bench only).
-    let deterministic = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    let deterministic = !gpu.deepseek4_mq2r_route_v1
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref()
+            != Ok("0");
     if deterministic {
         hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
             p.expert_down_ptrs,
@@ -1390,6 +1393,16 @@ fn use_gfx1151_i8_moe(arch: &str) -> bool {
     arch == "gfx1151"
 }
 
+fn use_gfx1151_i8_moe_perm() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MQ2_PERM")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
 /// Dispatch one MQ2-Lloyd grouped GEMM. All seven variants share the signature
 /// `(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows)`, so
 /// this is called identically for gate_up (m=2*im, k=hidden, x_row_div=k_top,
@@ -1411,6 +1424,18 @@ fn dispatch_grouped_lloyd(
 ) -> Result<(), DispatchError> {
     use GroupedLloydVariant as V;
     let r = match variant {
+        V::I8 if use_gfx1151_i8_moe_perm() => gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_perm_gfx1151(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
         V::I8 => gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
             ptrs,
             tile_ids,
@@ -1590,17 +1615,20 @@ pub fn run_moe_prefill_bias_aware(
         && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     // Shared research levers (read once; default 4w on gfx11+).
-    let lloyd_4w_base = match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
-        Ok("0") => Some(false),
-        Ok("1") => Some(true),
-        _ => None,
-    };
+    let lloyd_4w_base =
+        match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            _ => None,
+        };
     let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
     let n32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
     let cnd = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
     let eightw = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
-    let mmqload_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
-    let nosync_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+    let mmqload_env =
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+    let nosync_env =
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
     // i8 MMQ path (gfx1151 only): 2-bit Lloyd → int8 codebook LUT + i8 WMMA.
     let i8_moe = use_gfx1151_i8_moe(&gpu.arch);
 
@@ -1654,9 +1682,10 @@ pub fn run_moe_prefill_bias_aware(
         )?;
 
         // Unscatter + SwiGLU·clamp.
-        let use_fused_unscatter_silu = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
-            .map(|s| s != "0")
-            .unwrap_or(false);
+        let use_fused_unscatter_silu =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
+                .map(|s| s != "0")
+                .unwrap_or(false);
         if use_fused_unscatter_silu {
             hip!(gpu.moe_unscatter_silu_clamp_k8(
                 p.y_gate_up_grouped,
@@ -1756,8 +1785,9 @@ pub fn run_moe_prefill_bias_aware(
 
         // Down: deterministic expanded+combine (default; bit-reproducible for
         // spec-decode) vs non-deterministic atomic-accumulate.
-        let deterministic =
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+        let deterministic = !gpu.deepseek4_mq2r_route_v1
+            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref()
+                != Ok("0");
         if deterministic {
             hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
                 p.expert_down_ptrs,
@@ -2004,7 +2034,11 @@ pub fn run_moe_prefill(
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
-    if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[moe-prefill] arch={} shared=({:?},{:?},{:?},{:?}) routed=({:?},{:?}) \
              path2={} force_mq4_fp16={} grouped_i8={:?}",
@@ -2197,7 +2231,7 @@ pub fn run_moe_prefill(
                         variant: "prefill-gate-up-path1-dtype",
                         arch: "",
                         quant: "other",
-                    })
+                    });
                 }
             };
             gate_up_result?;
@@ -2295,7 +2329,7 @@ pub fn run_moe_prefill(
                     variant: "prefill-silu-rotate-dtype",
                     arch: "",
                     quant: "other",
-                })
+                });
             }
         }
     }
@@ -2353,7 +2387,7 @@ pub fn run_moe_prefill(
                     variant: "prefill-down-path0-dtype",
                     arch: "",
                     quant: "other",
-                })
+                });
             }
         };
         down_result?;
@@ -2418,7 +2452,7 @@ pub fn run_moe_prefill(
                     variant: "prefill-down-path1-dtype",
                     arch: "",
                     quant: "other",
-                })
+                });
             }
         };
         down_result?;

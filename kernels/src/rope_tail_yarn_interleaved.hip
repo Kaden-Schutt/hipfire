@@ -97,3 +97,83 @@ extern "C" __global__ void rope_tail_yarn_interleaved_f32(
         k[base + d_odd]  = x0 * sin_a + x1 * cos_a;
     }
 }
+
+// gfx1151 decode variant. The scalar-wave kernel above assigns one lane to
+// each rotary pair and makes that lane walk every attention head. DeepSeek4
+// has 64 Q heads, so only 32 lanes perform 64 serial updates apiece. This
+// version computes the 32 sin/cos pairs once into LDS, then spreads the
+// (head,pair) updates across a full 256-thread workgroup.
+__launch_bounds__(256, 4)
+extern "C" __global__ void rope_tail_yarn_interleaved_wide_f32(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const int* __restrict__ pos_buf,
+    int n_heads_q,
+    int n_heads_k,
+    int head_dim,
+    int n_rot,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float corr_low,
+    float corr_high,
+    int inverse
+) {
+    __shared__ float cos_cache[64];
+    __shared__ float sin_cache[64];
+
+    const int tid = threadIdx.x;
+    const int half = n_rot / 2;
+    if (tid < half) {
+        const int pos = *pos_buf;
+        const int idx_pair = tid * 2;
+        const float freq =
+            1.0f / powf(freq_base, (float)idx_pair / (float)n_rot);
+        const float theta_extrap = (float)pos * freq;
+        const float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+
+        if (ext_factor != 0.0f) {
+            const float y =
+                ((float)tid - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+            const float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+            const float ramp_mix = ramp * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix)
+                  + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+
+        const float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
+        cos_cache[tid] = cosf(theta) * mscale;
+        sin_cache[tid] = sin_sign * sinf(theta) * mscale;
+    }
+    __syncthreads();
+
+    const int tail_off = head_dim - n_rot;
+    const int total_heads = n_heads_q + n_heads_k;
+    const int total_pairs = total_heads * half;
+    for (int linear = tid; linear < total_pairs; linear += blockDim.x) {
+        const int head = linear / half;
+        const int pair = linear - head * half;
+        float* base;
+        int local_head;
+        if (head < n_heads_q) {
+            base = q;
+            local_head = head;
+        } else {
+            base = k;
+            local_head = head - n_heads_q;
+        }
+        const int d_even = tail_off + pair * 2;
+        const int d_odd = d_even + 1;
+        const int offset = local_head * head_dim;
+        const float x0 = base[offset + d_even];
+        const float x1 = base[offset + d_odd];
+        const float cos_a = cos_cache[pair];
+        const float sin_a = sin_cache[pair];
+        base[offset + d_even] = x0 * cos_a - x1 * sin_a;
+        base[offset + d_odd] = x0 * sin_a + x1 * cos_a;
+    }
+}

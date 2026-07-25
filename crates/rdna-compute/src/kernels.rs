@@ -1131,6 +1131,28 @@ pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
 /// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
 pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1151.hip");
+/// gfx1151 grouped E8-SoA GEMV for DeepSeek4's eight O-LoRA blocks.
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx1151.hip");
+pub const GEMM_MFP4G32_E8_SOA_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx1151.hip");
+pub const GEMM_MFP4G32_E8_SOA_WMMA_B2_GFX1151_SRC: &str = concat!(
+    "#define E8_PREFILL_BATCH_TILES 2\n",
+    "#define E8_PREFILL_KERNEL_NAME gemm_mfp4g32_e8_soa_wmma_b2_gfx1151\n",
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx1151.hip")
+);
+pub const GEMM_MFP4G32_E8_SOA_WMMA_B4_GFX1151_SRC: &str = concat!(
+    "#define E8_PREFILL_BATCH_TILES 4\n",
+    "#define E8_PREFILL_KERNEL_NAME gemm_mfp4g32_e8_soa_wmma_b4_gfx1151\n",
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx1151.hip")
+);
+pub const GEMM_MFP4G32_E8_SOA_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_grouped_wmma.gfx1151.hip");
+pub const GEMM_MFP4G32_E8_SOA_GROUPED_WMMA_B2_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_PREFILL_BATCH_TILES 2\n",
+    "#define E8_GROUPED_PREFILL_KERNEL_NAME gemm_mfp4g32_e8_soa_grouped_wmma_b2_gfx1151\n",
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_grouped_wmma.gfx1151.hip")
+);
 /// SoA E8 GEMV 4-way / 8-way unroll variants — bench experiments for the gfx1100
 /// cache-roofline MLP sweep (more codewords in flight per wave).
 pub const GEMV_MFP4G32_E8_SOA_U4_SRC: &str =
@@ -1895,85 +1917,78 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
 /// Exact gfx1151 temporal-buffer candidate for the K=512 routed down stream.
 /// The kernel ABI, four-row mapping, reduction tree, and launch geometry stay
 /// unchanged; only weight addressing is lowered differently.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_BUFFER_GFX1151_SRC: &str =
-    concat!(
-        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
-        "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151\n",
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
 /// gfx1151 hybrid routed-down candidate. Preserve wave-uniform scale and
 /// zero-point headers on scalar/global loads while lowering only the
 /// lane-divergent packed weights to temporal buffer VMEM.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_HYBRID_BUFFER_GFX1151_SRC: &str =
-    concat!(
-        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
-        "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
-        "#define HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER 1\n",
-        "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151\n",
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER 1\n",
+    "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_hybrid_buffer_gfx1151\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
 /// gfx1151 one-row routed-down schedule with temporal buffer VMEM for routing
 /// tables, expert pointers, and weights.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW1_BUFFER_GFX1151_SRC: &str =
-    concat!(
-        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
-        "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!(
-            "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer.gfx1151.hip"
-        )
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW1_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!(
+        "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer.gfx1151.hip"
+    )
+);
 /// gfx1151 two-row routed-down schedule: temporal VMEM with an occupancy/MLP
 /// point between the row1 and row4 implementations.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW2_BUFFER_GFX1151_SRC: &str =
-    concat!(
-        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
-        "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!(
-            "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer.gfx1151.hip"
-        )
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW2_BUFFER_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!(
+        "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer.gfx1151.hip"
+    )
+);
 /// Same two-row gfx1151 kernel with an explicit weight-VMEM clause before the
 /// dependent dequant/FMA phase.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW2_CLUSTERED_GFX1151_SRC: &str =
-    concat!(
-        "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
-        "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        "#define HIPFIRE_MOE_DOWN_ROW2_CLUSTERED 1\n",
-        "#define HIPFIRE_MOE_DOWN_ROW2_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_clustered_gfx1151\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!(
-            "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer.gfx1151.hip"
-        )
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW2_CLUSTERED_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_MOE_DOWN_ROW2_CLUSTERED 1\n",
+    "#define HIPFIRE_MOE_DOWN_ROW2_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_clustered_gfx1151\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!(
+        "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer.gfx1151.hip"
+    )
+);
 
 /// gfx1151 K=512 eight-row schedule. One wave amortizes each activation load
 /// across eight output rows, targeting the APU's bandwidth ceiling without
 /// changing the routed-down ABI or any other architecture's code object.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW8_GFX1151_SRC: &str =
-    include_str!(
-        "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8.gfx1151.hip"
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ROW8_GFX1151_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8.gfx1151.hip"
+);
 
 /// Radiowave gfx1100 cache-policy probe for the atomic-free MoE down stream.
 /// Keep this replay-visible and opt-in until exact-shadow and product-level
 /// certification establish whether SLC helps this access pattern.
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC: &str =
-    concat!(
-        "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
-        "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc\n",
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
 
 /// gfx1100 expert-wave-preserving down+combine experiment. Every workgroup
 /// still computes one expert rank; the last arriving rank for each four-row
@@ -3853,9 +3868,8 @@ pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str =
 /// gfx1100-only Qwen attention reduce/gate/MQ epilogue. Kept in a separate
 /// translation unit so its dormant body cannot perturb portable/gfx12 reducer
 /// codegen.
-pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC: &str = include_str!(
-    "../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip"
-);
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip");
 pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151\n",
     include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
@@ -4846,6 +4860,11 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
 /// layout + trailing x_src_rows).
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip");
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_PERM_GFX1151_SRC: &str = concat!(
+    "#define MQ2_GROUPED_MMQ_PERM_DECODE 1\n",
+    "#define MQ2_GROUPED_MMQ_KERNEL_NAME gemm_mq2g256_lloyd_moe_grouped_mmq_perm_gfx1151\n",
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip")
+);
 /// Exact-gfx1030 sdot4 MMQ probe for MQ2-Lloyd grouped GEMM. Production MoE
 /// dispatch does not reference this source.
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1030_SRC: &str =
@@ -4892,6 +4911,8 @@ pub const INDEXER_COMPRESSED_K_SCORE_SRC: &str =
 pub const INDEXER_TOP_K_SRC: &str = include_str!("../../../kernels/src/indexer_top_k.hip");
 
 pub const INDEXER_TOP_K_BUF_SRC: &str = include_str!("../../../kernels/src/indexer_top_k_buf.hip");
+pub const INDEXER_TOP_K_BUF_PARALLEL_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_buf_parallel.gfx1151.hip");
 
 pub const INDEXER_KV_GATHER_SRC: &str = include_str!("../../../kernels/src/indexer_kv_gather.hip");
 
@@ -4906,6 +4927,13 @@ pub const HC_MIX_4STREAM_SRC: &str = include_str!("../../../kernels/src/hc_mix_4
 pub const HC_INPUT_MAP_SRC: &str = include_str!("../../../kernels/src/hc_input_map.hip");
 
 pub const HC_APPLY_ALPHA_SRC: &str = include_str!("../../../kernels/src/hc_apply_alpha.hip");
+
+pub const HC_FINALIZE_CONTROL_SRC: &str =
+    include_str!("../../../kernels/src/hc_finalize_control.hip");
+pub const HC_FINALIZE_INPUT_MAP_SRC: &str =
+    include_str!("../../../kernels/src/hc_finalize_input_map.hip");
+
+pub const ZERO_F32_SRC: &str = include_str!("../../../kernels/src/zero_f32.hip");
 
 pub const SQRT_SOFTPLUS_F32_SRC: &str = include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
 
@@ -5329,22 +5357,19 @@ mod dispatch_tests {
     #[test]
     fn qwen2_bias_symbols_are_isolated_from_existing_qkv_modules() {
         assert!(!FUSED_QKV_HFQ4G256_SRC.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
-        assert!(FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC
-            .contains("fused_qkv_hfq4g256_qwen2_bias"));
+        assert!(FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC.contains("fused_qkv_hfq4g256_qwen2_bias"));
         assert!(FUSED_QKV_Q4K_QWEN2_BIAS_SRC.contains("fused_qkv_q4k_qwen2_bias"));
         assert!(FUSED_QKV_Q8_0_QWEN2_BIAS_SRC.contains("fused_qkv_q8_0_qwen2_bias"));
 
         for arch in ["gfx1030", "gfx1100", "gfx1151", "gfx1201"] {
             let caps = make_caps(arch);
             let (_, old_mq4) = fused_qkv_mq4g256_lloyd_for_arch(&caps, false);
-            let (mq4_src, bias_mq4) =
-                fused_qkv_mq4g256_lloyd_qwen2_bias_for_arch(&caps, false);
+            let (mq4_src, bias_mq4) = fused_qkv_mq4g256_lloyd_qwen2_bias_for_arch(&caps, false);
             assert_ne!(old_mq4, bias_mq4);
             assert!(mq4_src.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
 
             let (_, old_mq3) = fused_qkv_mq3g256_lloyd_for_arch(&caps, false);
-            let (mq3_src, bias_mq3) =
-                fused_qkv_mq3g256_lloyd_qwen2_bias_for_arch(&caps, false);
+            let (mq3_src, bias_mq3) = fused_qkv_mq3g256_lloyd_qwen2_bias_for_arch(&caps, false);
             assert_ne!(old_mq3, bias_mq3);
             assert!(mq3_src.contains("#define HIPFIRE_QKV_WITH_BIAS 1"));
         }
