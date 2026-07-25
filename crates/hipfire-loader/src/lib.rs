@@ -304,11 +304,15 @@ pub struct LoadedModel {
     pub mtp_weights_present: bool,
     // Qwen3.5/3.6 native MTP (NextN) head (arch_id=21). Loaded once at model
     // load when a bundled `.mq4-mtp` trailer OR a separate `.mtp` sidecar is
-    // present alongside the trunk. Persistent for the life of the model;
-    // `generate_qwen35_mtp` allocates a fresh per-request `MtpSpecState`
-    // against it (so the recurrent MTP-KV never bleeds across requests). None
-    // for every other arch and for qwen35 trunks without an MTP head.
+    // present alongside the trunk. Persistent for the life of the model.
+    // None for every other arch and for qwen35 trunks without an MTP head.
     pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    // Position-aligned native-MTP scratch and private KV. Retained across a
+    // pure message-history extension so `generate_qwen35_mtp` can prefill only
+    // the uncached suffix; reset on divergence or an explicit conversation
+    // reset. Keeping it beside the head also makes unload free ownership
+    // explicit instead of leaking the private KV/graph allocations.
+    pub qwen35_mtp_state: Option<hipfire_arch_qwen35::mtp_spec::MtpSpecState>,
     // dots.ocr state
     pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
     pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
@@ -379,6 +383,7 @@ impl LoadedModel {
             mtp_k: 3,
             mtp_weights_present: false,
             qwen35_mtp_head: None,
+            qwen35_mtp_state: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
             vision_config: None,
@@ -1735,6 +1740,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
         // empty) is still drained below for defense-in-depth.
         spec.free(gpu);
+    }
+    if let Some(state) = m.qwen35_mtp_state {
+        state.free_gpu(gpu);
     }
     if let Some(head) = m.qwen35_mtp_head {
         head.free_gpu(gpu);
