@@ -53,7 +53,12 @@ extern "C" __global__ void sample_apply_repeat_penalty(
     float window_len = (float)repeat_window;
     for (int i = tid; i < repeat_window; i += nthreads) {
         unsigned int tok = repeat_tokens[i];
-        if ((int)tok >= vocab_size) continue;
+        // Compressed-vocabulary speculative decoders encode a generated token
+        // that is absent from the draft vocabulary as UINT_MAX. Do the range
+        // comparison in the token's unsigned domain: casting UINT_MAX to int
+        // produces -1, which used to pass the upper-bound check and index
+        // logits[UINT_MAX].
+        if (vocab_size <= 0 || tok >= (unsigned int)vocab_size) continue;
         bool has_later = false;
         int count = 1;
         for (int j = 0; j < repeat_window; j++) {

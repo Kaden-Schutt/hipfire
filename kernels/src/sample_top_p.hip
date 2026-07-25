@@ -65,7 +65,7 @@ extern "C" __global__ void sample_top_p(
         float window_len = (float)repeat_window;
         for (int i = tid; i < repeat_window; i += nthreads) {
             unsigned int tok = repeat_tokens[i];
-            if ((int)tok >= vocab_size) continue;
+            if (vocab_size <= 0 || tok >= (unsigned int)vocab_size) continue;
             bool has_later = false;
             int count = 1;
             for (int j = 0; j < repeat_window; j++) {
