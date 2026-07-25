@@ -198,7 +198,21 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                     ));
                 }
             }
-            ShardPolicy::ExpertTensorSharded { inner, .. } => {
+            ShardPolicy::ExpertTensorSharded { n_experts, inner } => {
+                if e.logical_shape.len() != 3 || e.logical_shape.iter().any(|&dim| dim == 0) {
+                    return Err(format!(
+                        "{}: ExpertTensorSharded logical_shape {:?} must be 3D with no zero dimensions",
+                        ctx(),
+                        e.logical_shape
+                    ));
+                }
+                if e.logical_shape.first().copied() != Some(*n_experts) {
+                    return Err(format!(
+                        "{}: ExpertTensorSharded logical_shape {:?} first dimension must equal n_experts={n_experts}",
+                        ctx(),
+                        e.logical_shape
+                    ));
+                }
                 // Expert intermediate dim must be divisible by Tp and the
                 // resulting slice must be a multiple of 256 (the quant group
                 // size for MQ2G256/MQ3G256 experts).
@@ -207,9 +221,20 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                 // Gate/up (ColumnShard): sharded dim is axis-1 (2*inter).
                 // Down (RowShard): sharded dim is axis-2 (inter).
                 let (axis, kind_name) = match inner.as_ref() {
-                    ShardPolicy::ColumnShard { .. } => (1, "ColumnShard (2*inter)"),
-                    ShardPolicy::RowShard { .. } => (2, "RowShard (inter)"),
-                    _ => (1, "inner"),
+                    ShardPolicy::ColumnShard { axis: 1 } => (1, "ColumnShard (2*inter)"),
+                    ShardPolicy::RowShard { axis: 2 } => (2, "RowShard (inter)"),
+                    ShardPolicy::ColumnShard { axis } | ShardPolicy::RowShard { axis } => {
+                        return Err(format!(
+                            "{}: ExpertTensorSharded inner shard axis {axis} is incompatible with the [n_experts, projection, hidden] layout",
+                            ctx()
+                        ));
+                    }
+                    inner => {
+                        return Err(format!(
+                            "{}: ExpertTensorSharded inner policy {inner:?} is incompatible with the [n_experts, projection, hidden] layout",
+                            ctx()
+                        ));
+                    }
                 };
                 let d = e.logical_shape.get(axis).copied().unwrap_or(0);
                 if tp > 1 && !(d % tp == 0 && (d / tp) % 256 == 0) {
@@ -475,6 +500,686 @@ impl StateEntry {
     }
 }
 
+/// How an architecture distributes one logical expert group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpertParallelism {
+    /// One rank owns and executes the complete expert group.
+    Single,
+    /// Every rank owns a compact slot for each expert's tensor-parallel slice.
+    TensorParallel,
+    /// Experts are assigned to ranks and executed on their owning rank.
+    ExpertParallel,
+}
+
+/// The source representation of the expert tensors in the model artifact.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ExpertSourceLayout {
+    /// Packed fused gate-up plus down projection.
+    PackedFused {
+        gate_up: String,
+        down: String,
+        sidecars: Vec<String>,
+    },
+    /// Packed separate gate, up, and down projections.
+    PackedSeparate {
+        gate: String,
+        up: String,
+        down: String,
+        sidecars: Vec<String>,
+    },
+    /// One fused gate-up and down source per expert.
+    PerExpertFused {
+        gate_up: Vec<String>,
+        down: Vec<String>,
+        sidecars: Vec<String>,
+    },
+    /// Separate gate, up, and down source per expert.
+    PerExpertSeparate {
+        gate: Vec<String>,
+        up: Vec<String>,
+        down: Vec<String>,
+        sidecars: Vec<String>,
+    },
+}
+
+/// CPU-side resource constraints needed to admit an expert group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExpertResourceRequirements {
+    /// Resident bytes required by one expert (before any runtime paging).
+    pub bytes_per_expert: usize,
+    /// Required byte alignment of an expert's compact local slot.
+    pub alignment: usize,
+}
+
+/// The only collectives admitted by an expert-group plan. The variant encodes
+/// both post-combine ordering and the policy-derived collective axis.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpertPostCombineAllReduce {
+    TensorParallel,
+    ExpertParallel,
+}
+
+impl ExpertPostCombineAllReduce {
+    pub const fn axis(self) -> DimKind {
+        match self {
+            Self::TensorParallel => DimKind::Tp,
+            Self::ExpertParallel => DimKind::Ep,
+        }
+    }
+}
+
+fn post_combine_for_parallelism(
+    parallelism: ExpertParallelism,
+) -> Option<ExpertPostCombineAllReduce> {
+    match parallelism {
+        ExpertParallelism::Single => None,
+        ExpertParallelism::TensorParallel => Some(ExpertPostCombineAllReduce::TensorParallel),
+        ExpertParallelism::ExpertParallel => Some(ExpertPostCombineAllReduce::ExpertParallel),
+    }
+}
+
+/// Architecture-declared description of one logical expert group.
+///
+/// The strings are stable manifest references: `router` names the router
+/// weight/plan consumed by the existing router machinery and `execution` names
+/// the arch execution plan. Keeping these references symbolic avoids coupling
+/// this CPU-only manifest to feature-gated GPU or pager types.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpertGroupSpec {
+    /// Stable architecture identity for this logical MoE block.
+    pub group: String,
+    /// Manifest scope: `Some(layer)` for a layer-local group, `None` for a
+    /// model-level group.
+    pub layer: Option<usize>,
+    pub n_experts: usize,
+    pub parallelism: ExpertParallelism,
+    pub assignment: ExpertAssign,
+    pub source_layout: ExpertSourceLayout,
+    pub resources: ExpertResourceRequirements,
+    pub router: String,
+    pub execution: String,
+}
+
+/// One resolved global expert id and its compact local slot on the owning
+/// rank. `owner` is relative to the expert group, not a global device id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExpertPlacement {
+    pub global_id: usize,
+    pub owner: usize,
+    pub local_slot: usize,
+}
+
+/// The resolved expert-group plan consumed by later fulfillment/execution
+/// layers. It deliberately contains no GPU handles.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpertGroupPlan {
+    pub group: String,
+    pub layer: Option<usize>,
+    pub n_experts: usize,
+    pub parallelism: ExpertParallelism,
+    pub assignment: ExpertAssign,
+    pub experts: Vec<ExpertPlacement>,
+    pub source_layout: ExpertSourceLayout,
+    pub resources: ExpertResourceRequirements,
+    pub router: String,
+    pub execution: String,
+    pub collective: Option<ExpertPostCombineAllReduce>,
+}
+
+fn expert_context(spec: &ExpertGroupSpec) -> String {
+    format!("expert group '{}' layer {:?}", spec.group, spec.layer)
+}
+
+fn validate_expert_group_shape(spec: &ExpertGroupSpec, group_size: usize) -> Result<(), String> {
+    let context = expert_context(spec);
+    if group_size == 0 {
+        return Err(format!("{context}: group_size=0 is invalid"));
+    }
+    if spec.n_experts == 0 {
+        return Err(format!("{context}: n_experts=0 is invalid"));
+    }
+
+    match spec.parallelism {
+        ExpertParallelism::Single => {
+            if group_size != 1 {
+                return Err(format!(
+                    "{context}: Single requires group_size=1, got {group_size}"
+                ));
+            }
+        }
+        ExpertParallelism::TensorParallel | ExpertParallelism::ExpertParallel => {
+            if spec.parallelism == ExpertParallelism::ExpertParallel
+                && spec.n_experts % group_size != 0
+            {
+                return Err(format!(
+                    "{context}: n_experts={} must divide evenly across group_size={group_size}",
+                    spec.n_experts
+                ));
+            }
+        }
+    }
+    if spec.resources.bytes_per_expert == 0 {
+        return Err(format!("{context}: bytes_per_expert=0 is invalid"));
+    }
+    if spec.resources.alignment == 0 || !spec.resources.alignment.is_power_of_two() {
+        return Err(format!(
+            "{context}: alignment={} is invalid",
+            spec.resources.alignment
+        ));
+    }
+    if spec.group.is_empty() {
+        return Err(format!("{context}: group reference '' is invalid"));
+    }
+    if spec.execution.is_empty() {
+        return Err(format!("{context}: execution reference '' is invalid"));
+    }
+    Ok(())
+}
+
+/// Validate one expert group without checking manifest references.
+pub fn validate_expert_group_spec(spec: &ExpertGroupSpec, group_size: usize) -> Result<(), String> {
+    validate_expert_group_shape(spec, group_size)
+}
+
+fn validate_manifest_reference<'a>(
+    spec: &ExpertGroupSpec,
+    manifest: &'a [WeightEntry],
+    label: &str,
+    name: &str,
+) -> Result<&'a WeightEntry, String> {
+    let context = expert_context(spec);
+    if name.is_empty() {
+        return Err(format!("{context}: {label} reference '' is invalid"));
+    }
+    let mut found = None;
+    for entry in manifest
+        .iter()
+        .filter(|entry| entry.name == name && entry.layer == spec.layer)
+    {
+        if found.is_some() {
+            return Err(format!(
+                "{context}: {label} reference '{name}' is ambiguous in manifest scope"
+            ));
+        }
+        found = Some(entry);
+    }
+    found
+        .ok_or_else(|| format!("{context}: {label} reference '{name}' not found in manifest scope"))
+}
+
+fn validate_source_policy(
+    spec: &ExpertGroupSpec,
+    entry: &WeightEntry,
+    label: &str,
+    role: ProjectionRole,
+) -> Result<(), String> {
+    let context = expert_context(spec);
+    match spec.parallelism {
+        ExpertParallelism::Single => {
+            if !matches!(
+                entry.policy,
+                ShardPolicy::Replicate | ShardPolicy::Pin(_) | ShardPolicy::Tied { .. }
+            ) {
+                return Err(format!(
+                    "{context}: {label} reference '{}' has incompatible policy {:?} for Single",
+                    entry.name, entry.policy
+                ));
+            }
+        }
+        ExpertParallelism::TensorParallel => match &entry.policy {
+            ShardPolicy::ExpertTensorSharded { n_experts, inner } => {
+                if *n_experts != spec.n_experts {
+                    return Err(format!(
+                        "{context}: {label} reference '{}' embeds n_experts={} but spec requires {}",
+                        entry.name, n_experts, spec.n_experts
+                    ));
+                }
+                let expected = match role {
+                    ProjectionRole::GateUp => ShardPolicy::ColumnShard { axis: 1 },
+                    ProjectionRole::Down => ShardPolicy::RowShard { axis: 2 },
+                };
+                if inner.as_ref() != &expected {
+                    return Err(format!(
+                        "{context}: {label} reference '{}' has inner policy {:?}, expected {:?}",
+                        entry.name, inner, expected
+                    ));
+                }
+            }
+            policy => {
+                return Err(format!(
+                    "{context}: {label} reference '{}' has incompatible policy {:?} for TensorParallel",
+                    entry.name, policy
+                ));
+            }
+        },
+        ExpertParallelism::ExpertParallel => match &entry.policy {
+            ShardPolicy::ExpertSharded { n_experts, assign } => {
+                if *n_experts != spec.n_experts {
+                    return Err(format!(
+                        "{context}: {label} reference '{}' embeds n_experts={} but spec requires {}",
+                        entry.name, n_experts, spec.n_experts
+                    ));
+                }
+                if *assign != spec.assignment {
+                    return Err(format!(
+                        "{context}: {label} reference '{}' has assignment {:?}, expected {:?}",
+                        entry.name, assign, spec.assignment
+                    ));
+                }
+            }
+            policy => {
+                return Err(format!(
+                    "{context}: {label} reference '{}' has incompatible policy {:?} for ExpertParallel",
+                    entry.name, policy
+                ));
+            }
+        },
+    }
+    Ok(())
+}
+
+fn validate_unique_per_expert_sources(
+    spec: &ExpertGroupSpec,
+    groups: &[(&str, &[String])],
+) -> Result<(), String> {
+    let mut names = std::collections::HashSet::new();
+    for (label, refs) in groups {
+        for (idx, name) in refs.iter().enumerate() {
+            if !names.insert(name.as_str()) {
+                return Err(format!(
+                    "{}: duplicate per-expert source '{}' at {label}[{idx}]",
+                    expert_context(spec),
+                    name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionRole {
+    GateUp,
+    Down,
+}
+
+fn validate_per_expert_projection(
+    spec: &ExpertGroupSpec,
+    manifest: &[WeightEntry],
+    label: &str,
+    names: &[String],
+    role: ProjectionRole,
+) -> Result<(), String> {
+    let context = expert_context(spec);
+    if names.len() != spec.n_experts {
+        return Err(format!(
+            "{context}: {label} source count={} does not match n_experts={}",
+            names.len(),
+            spec.n_experts
+        ));
+    }
+    let mut shape: Option<&[usize]> = None;
+    for (idx, name) in names.iter().enumerate() {
+        let entry = validate_manifest_reference(spec, manifest, &format!("{label}[{idx}]"), name)?;
+        validate_source_policy(spec, entry, &format!("{label}[{idx}]"), role)?;
+        if entry.logical_shape.len() < 2 {
+            return Err(format!(
+                "{context}: {label}[{idx}] reference '{}' has incompatible logical_shape {:?}",
+                entry.name, entry.logical_shape
+            ));
+        }
+        if let Some(expected) = shape {
+            if expected != entry.logical_shape.as_slice() {
+                return Err(format!(
+                    "{context}: {label}[{idx}] reference '{}' logical_shape {:?} differs from {:?}",
+                    entry.name, entry.logical_shape, expected
+                ));
+            }
+        } else {
+            shape = Some(entry.logical_shape.as_slice());
+        }
+    }
+    Ok(())
+}
+
+fn validate_packed_projection(
+    spec: &ExpertGroupSpec,
+    manifest: &[WeightEntry],
+    label: &str,
+    name: &str,
+    role: ProjectionRole,
+) -> Result<(), String> {
+    let entry = validate_manifest_reference(spec, manifest, label, name)?;
+    if entry.logical_shape.len() != 3 || entry.logical_shape.iter().any(|&dim| dim == 0) {
+        return Err(format!(
+            "{}: {label} reference '{}' logical_shape {:?} must be 3D with no zero dimensions",
+            expert_context(spec),
+            entry.name,
+            entry.logical_shape
+        ));
+    }
+    if entry.logical_shape.first().copied() != Some(spec.n_experts) {
+        return Err(format!(
+            "{}: {label} reference '{}' logical_shape {:?} is incompatible with n_experts={}",
+            expert_context(spec),
+            entry.name,
+            entry.logical_shape,
+            spec.n_experts
+        ));
+    }
+    validate_source_policy(spec, entry, label, role)?;
+    Ok(())
+}
+
+fn validate_sidecar_policy(
+    spec: &ExpertGroupSpec,
+    entry: &WeightEntry,
+    label: &str,
+) -> Result<(), String> {
+    let context = expert_context(spec);
+    match spec.parallelism {
+        ExpertParallelism::Single => {
+            if !matches!(
+                entry.policy,
+                ShardPolicy::Replicate | ShardPolicy::Pin(_) | ShardPolicy::Tied { .. }
+            ) {
+                return Err(format!(
+                    "{context}: {label} reference '{}' has incompatible sidecar policy {:?}",
+                    entry.name, entry.policy
+                ));
+            }
+        }
+        ExpertParallelism::TensorParallel => {
+            if !matches!(entry.policy, ShardPolicy::Replicate) {
+                return Err(format!(
+                    "{context}: {label} reference '{}' has incompatible sidecar policy {:?}",
+                    entry.name, entry.policy
+                ));
+            }
+        }
+        ExpertParallelism::ExpertParallel => match &entry.policy {
+            ShardPolicy::Replicate => {}
+            ShardPolicy::ExpertSharded { n_experts, assign }
+                if *n_experts == spec.n_experts && *assign == spec.assignment => {}
+            policy => {
+                return Err(format!(
+                    "{context}: {label} reference '{}' has incompatible sidecar policy {:?}",
+                    entry.name, policy
+                ));
+            }
+        },
+    }
+    Ok(())
+}
+
+fn validate_sidecars(
+    spec: &ExpertGroupSpec,
+    manifest: &[WeightEntry],
+    sidecars: &[String],
+) -> Result<(), String> {
+    for (idx, name) in sidecars.iter().enumerate() {
+        let label = format!("sidecar[{idx}]");
+        let entry = validate_manifest_reference(spec, manifest, &label, name)?;
+        validate_sidecar_policy(spec, entry, &label)?;
+        if entry.logical_shape.first().copied() != Some(spec.n_experts) {
+            return Err(format!(
+                "{}: {label} reference '{}' logical_shape {:?} is incompatible with n_experts={}",
+                expert_context(spec),
+                entry.name,
+                entry.logical_shape,
+                spec.n_experts
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_expert_group_references(
+    spec: &ExpertGroupSpec,
+    manifest: &[WeightEntry],
+) -> Result<(), String> {
+    let router = validate_manifest_reference(spec, manifest, "router", &spec.router)?;
+    if !matches!(router.logical_shape.len(), 1 | 2) {
+        return Err(format!(
+            "{}: router reference '{}' has logical_shape {:?}; router rank must be 1 or 2",
+            expert_context(spec),
+            router.name,
+            router.logical_shape
+        ));
+    }
+    if router.logical_shape.last().copied() != Some(spec.n_experts) {
+        return Err(format!(
+            "{}: router reference '{}' has logical_shape {:?}; last dimension must equal n_experts={}",
+            expert_context(spec), router.name, router.logical_shape, spec.n_experts
+        ));
+    }
+    if !matches!(
+        router.policy,
+        ShardPolicy::Replicate | ShardPolicy::Pin(_) | ShardPolicy::Tied { .. }
+    ) {
+        return Err(format!(
+            "{}: router reference '{}' has incompatible policy {:?}",
+            expert_context(spec),
+            router.name,
+            router.policy
+        ));
+    }
+    let per_expert = matches!(
+        spec.source_layout,
+        ExpertSourceLayout::PerExpertFused { .. } | ExpertSourceLayout::PerExpertSeparate { .. }
+    );
+    if per_expert && spec.parallelism != ExpertParallelism::Single {
+        return Err(format!(
+            "{}: PerExpert source layout is unsupported for {:?}; global expert source placement is defined only for Single",
+            expert_context(spec), spec.parallelism
+        ));
+    }
+    match &spec.source_layout {
+        ExpertSourceLayout::PackedFused {
+            gate_up,
+            down,
+            sidecars,
+        } => {
+            validate_packed_projection(
+                spec,
+                manifest,
+                "source gate_up",
+                gate_up,
+                ProjectionRole::GateUp,
+            )?;
+            validate_packed_projection(spec, manifest, "source down", down, ProjectionRole::Down)?;
+            validate_sidecars(spec, manifest, sidecars)?;
+        }
+        ExpertSourceLayout::PackedSeparate {
+            gate,
+            up,
+            down,
+            sidecars,
+        } => {
+            validate_packed_projection(
+                spec,
+                manifest,
+                "source gate",
+                gate,
+                ProjectionRole::GateUp,
+            )?;
+            validate_packed_projection(spec, manifest, "source up", up, ProjectionRole::GateUp)?;
+            validate_packed_projection(spec, manifest, "source down", down, ProjectionRole::Down)?;
+            validate_sidecars(spec, manifest, sidecars)?;
+        }
+        ExpertSourceLayout::PerExpertFused {
+            gate_up,
+            down,
+            sidecars,
+        } => {
+            validate_unique_per_expert_sources(
+                spec,
+                &[("source gate_up", gate_up), ("source down", down)],
+            )?;
+            validate_per_expert_projection(
+                spec,
+                manifest,
+                "source gate_up",
+                gate_up,
+                ProjectionRole::GateUp,
+            )?;
+            validate_per_expert_projection(
+                spec,
+                manifest,
+                "source down",
+                down,
+                ProjectionRole::Down,
+            )?;
+            validate_sidecars(spec, manifest, sidecars)?;
+        }
+        ExpertSourceLayout::PerExpertSeparate {
+            gate,
+            up,
+            down,
+            sidecars,
+        } => {
+            validate_unique_per_expert_sources(
+                spec,
+                &[
+                    ("source gate", gate),
+                    ("source up", up),
+                    ("source down", down),
+                ],
+            )?;
+            validate_per_expert_projection(
+                spec,
+                manifest,
+                "source gate",
+                gate,
+                ProjectionRole::GateUp,
+            )?;
+            validate_per_expert_projection(
+                spec,
+                manifest,
+                "source up",
+                up,
+                ProjectionRole::GateUp,
+            )?;
+            validate_per_expert_projection(
+                spec,
+                manifest,
+                "source down",
+                down,
+                ProjectionRole::Down,
+            )?;
+            validate_sidecars(spec, manifest, sidecars)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate all architecture-declared expert groups against the weight
+/// manifest, including stable group/layer identity and manifest scope.
+pub fn validate_expert_group_specs(
+    specs: &[ExpertGroupSpec],
+    manifest: &[WeightEntry],
+    group_size: usize,
+) -> Result<(), String> {
+    let mut manifest_names = std::collections::HashSet::new();
+    for entry in manifest {
+        if !manifest_names.insert((&entry.name, entry.layer)) {
+            return Err(format!(
+                "duplicate manifest (name, layer) ('{}', {:?})",
+                entry.name, entry.layer
+            ));
+        }
+    }
+    let mut identities = std::collections::HashSet::new();
+    for spec in specs {
+        validate_expert_group_shape(spec, group_size)?;
+        let context = expert_context(spec);
+        if !identities.insert((&spec.group, spec.layer)) {
+            return Err(format!("{context}: duplicate group/layer identity"));
+        }
+        validate_expert_group_references(spec, manifest)?;
+    }
+    Ok(())
+}
+
+/// Resolve an architecture-declared expert group for a group of `group_size`
+/// ranks. Local slots are compact independently for each owner.
+pub fn resolve_expert_group_plan(
+    spec: &ExpertGroupSpec,
+    manifest: &[WeightEntry],
+    group_size: usize,
+) -> Result<ExpertGroupPlan, String> {
+    validate_expert_group_specs(std::slice::from_ref(spec), manifest, group_size)?;
+    resolve_expert_group_plan_unchecked(spec, group_size)
+}
+
+/// Resolve multiple groups after validating their identities and manifest
+/// references as one batch.
+pub fn resolve_expert_group_plans(
+    specs: &[ExpertGroupSpec],
+    manifest: &[WeightEntry],
+    group_size: usize,
+) -> Result<Vec<ExpertGroupPlan>, String> {
+    validate_expert_group_specs(specs, manifest, group_size)?;
+    specs
+        .iter()
+        .map(|spec| resolve_expert_group_plan_unchecked(spec, group_size))
+        .collect()
+}
+
+fn resolve_expert_group_plan_unchecked(
+    spec: &ExpertGroupSpec,
+    group_size: usize,
+) -> Result<ExpertGroupPlan, String> {
+    let mut next_slot = vec![0usize; group_size];
+    let mut experts = Vec::with_capacity(spec.n_experts);
+    for global_id in 0..spec.n_experts {
+        match spec.parallelism {
+            ExpertParallelism::Single => experts.push(ExpertPlacement {
+                global_id,
+                owner: 0,
+                local_slot: global_id,
+            }),
+            ExpertParallelism::TensorParallel => {
+                for owner in 0..group_size {
+                    let local_slot = next_slot[owner];
+                    next_slot[owner] += 1;
+                    experts.push(ExpertPlacement {
+                        global_id,
+                        owner,
+                        local_slot,
+                    });
+                }
+            }
+            ExpertParallelism::ExpertParallel => {
+                let owner = match spec.assignment {
+                    ExpertAssign::Contiguous => global_id / (spec.n_experts / group_size),
+                    ExpertAssign::Stride => global_id % group_size,
+                };
+                let local_slot = next_slot[owner];
+                next_slot[owner] += 1;
+                experts.push(ExpertPlacement {
+                    global_id,
+                    owner,
+                    local_slot,
+                });
+            }
+        }
+    }
+    Ok(ExpertGroupPlan {
+        group: spec.group.clone(),
+        layer: spec.layer,
+        n_experts: spec.n_experts,
+        parallelism: spec.parallelism,
+        assignment: spec.assignment,
+        experts,
+        source_layout: spec.source_layout.clone(),
+        resources: spec.resources,
+        router: spec.router.clone(),
+        execution: spec.execution.clone(),
+        collective: post_combine_for_parallelism(spec.parallelism),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +1325,38 @@ mod tests {
             ),
         ];
         assert!(validate_manifest(&tied_ok, &tp2).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_expert_tensor_shape_expert_count_mismatch() {
+        let manifest = vec![WeightEntry::layer(
+            "experts",
+            0,
+            vec![3, 512, 8],
+            DType::F16,
+            ShardPolicy::ExpertTensorSharded {
+                n_experts: 4,
+                inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
+            },
+        )];
+        let err = validate_manifest(&manifest, &DeviceMesh::rect(&[(DimKind::Tp, 2)])).unwrap_err();
+        assert!(err.contains("experts[layer Some(0)]"));
+        assert!(err.contains("n_experts=4"));
+    }
+
+    #[test]
+    fn validate_manifest_accepts_matching_expert_tensor_shape_expert_count() {
+        let manifest = vec![WeightEntry::layer(
+            "experts",
+            0,
+            vec![4, 512, 8],
+            DType::F16,
+            ShardPolicy::ExpertTensorSharded {
+                n_experts: 4,
+                inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
+            },
+        )];
+        assert!(validate_manifest(&manifest, &DeviceMesh::rect(&[(DimKind::Tp, 2)])).is_ok());
     }
 
     #[test]
@@ -828,5 +1565,809 @@ mod tests {
             },
         );
         assert_eq!(placement_devices(&exp, &ep, 4), vec![0, 1]);
+    }
+
+    fn expert_manifest(
+        layer: Option<usize>,
+        n_experts: usize,
+        parallelism: ExpertParallelism,
+    ) -> Vec<WeightEntry> {
+        let gate_up_policy = match parallelism {
+            ExpertParallelism::Single => ShardPolicy::Replicate,
+            ExpertParallelism::TensorParallel => ShardPolicy::ExpertTensorSharded {
+                n_experts,
+                inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
+            },
+            ExpertParallelism::ExpertParallel => ShardPolicy::ExpertSharded {
+                n_experts,
+                assign: ExpertAssign::Stride,
+            },
+        };
+        let down_policy = match parallelism {
+            ExpertParallelism::Single => ShardPolicy::Replicate,
+            ExpertParallelism::TensorParallel => ShardPolicy::ExpertTensorSharded {
+                n_experts,
+                inner: Box::new(ShardPolicy::RowShard { axis: 2 }),
+            },
+            ExpertParallelism::ExpertParallel => ShardPolicy::ExpertSharded {
+                n_experts,
+                assign: ExpertAssign::Stride,
+            },
+        };
+        vec![
+            WeightEntry {
+                name: "mlp.gate".into(),
+                layer,
+                logical_shape: vec![4, n_experts],
+                dtype: DType::F16,
+                dtype_constraint: DTypeConstraint::any_source(),
+                placement: PlacementHint::Policy,
+                policy: ShardPolicy::Replicate,
+            },
+            WeightEntry {
+                name: "experts.gate_up".into(),
+                layer,
+                logical_shape: vec![n_experts, 4, 4],
+                dtype: DType::F16,
+                dtype_constraint: DTypeConstraint::any_source(),
+                placement: PlacementHint::Policy,
+                policy: gate_up_policy,
+            },
+            WeightEntry {
+                name: "experts.down".into(),
+                layer,
+                logical_shape: vec![n_experts, 4, 4],
+                dtype: DType::F16,
+                dtype_constraint: DTypeConstraint::any_source(),
+                placement: PlacementHint::Policy,
+                policy: down_policy,
+            },
+        ]
+    }
+
+    fn expert_spec(parallelism: ExpertParallelism) -> ExpertGroupSpec {
+        ExpertGroupSpec {
+            group: "block-0".into(),
+            layer: Some(0),
+            n_experts: 4,
+            parallelism,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PackedFused {
+                gate_up: "experts.gate_up".into(),
+                down: "experts.down".into(),
+                sidecars: Vec::new(),
+            },
+            resources: ExpertResourceRequirements {
+                bytes_per_expert: 1024,
+                alignment: 256,
+            },
+            router: "mlp.gate".into(),
+            execution: "moe.feed_forward".into(),
+        }
+    }
+
+    #[test]
+    fn expert_group_single_has_zero_collectives() {
+        let spec = expert_spec(ExpertParallelism::Single);
+        let plan = resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 4, ExpertParallelism::Single),
+            1,
+        )
+        .unwrap();
+
+        assert!(plan.collective.is_none());
+        assert_eq!(plan.group, "block-0");
+        assert_eq!(plan.layer, Some(0));
+        assert!(plan.experts.iter().all(|expert| expert.owner == 0));
+        assert_eq!(plan.experts[3].local_slot, 3);
+    }
+
+    #[test]
+    fn expert_group_tp_has_one_post_combine_collective() {
+        let spec = expert_spec(ExpertParallelism::TensorParallel);
+        let plan = resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.collective,
+            Some(ExpertPostCombineAllReduce::TensorParallel)
+        );
+    }
+
+    #[test]
+    fn expert_group_ep_has_one_post_combine_collective() {
+        let spec = expert_spec(ExpertParallelism::ExpertParallel);
+        let plan = resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.collective,
+            Some(ExpertPostCombineAllReduce::ExpertParallel)
+        );
+        assert_eq!(plan.experts[0].owner, 0);
+        assert_eq!(plan.experts[1].owner, 1);
+        assert_eq!(plan.experts[2].local_slot, 1);
+    }
+
+    #[test]
+    fn expert_group_collective_authority_is_group_level() {
+        let spec = expert_spec(ExpertParallelism::ExpertParallel);
+        let plan = resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel),
+            2,
+        )
+        .unwrap();
+        assert_eq!(plan.collective.unwrap().axis(), DimKind::Ep);
+    }
+
+    #[test]
+    fn expert_group_tp_maps_each_expert_to_all_ranks_without_divisibility() {
+        let mut spec = expert_spec(ExpertParallelism::TensorParallel);
+        spec.n_experts = 3;
+
+        let plan = resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 3, ExpertParallelism::TensorParallel),
+            2,
+        )
+        .unwrap();
+        assert_eq!(plan.experts.len(), 6);
+        for global_id in 0..3 {
+            let owners_and_slots: Vec<_> = plan
+                .experts
+                .iter()
+                .filter(|expert| expert.global_id == global_id)
+                .map(|expert| (expert.owner, expert.local_slot))
+                .collect();
+            assert_eq!(owners_and_slots, vec![(0, global_id), (1, global_id)]);
+        }
+    }
+
+    #[test]
+    fn expert_group_identity_and_references_are_validated() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel);
+        let spec = expert_spec(ExpertParallelism::ExpertParallel);
+        let duplicate = spec.clone();
+
+        let err = validate_expert_group_specs(&[spec, duplicate], &manifest, 2).unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("layer Some(0)"));
+    }
+
+    #[test]
+    fn expert_group_rejects_zero_experts_and_zero_group_size() {
+        let mut spec = expert_spec(ExpertParallelism::Single);
+        spec.n_experts = 0;
+        assert!(resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 1, ExpertParallelism::Single),
+            1
+        )
+        .is_err());
+
+        spec.n_experts = 1;
+        assert!(resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 1, ExpertParallelism::Single),
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn expert_group_rejects_multi_rank_single() {
+        let spec = expert_spec(ExpertParallelism::Single);
+        assert!(resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 4, ExpertParallelism::Single),
+            2
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn expert_group_rejects_invalid_resource_metadata() {
+        let mut spec = expert_spec(ExpertParallelism::Single);
+        spec.resources.bytes_per_expert = 0;
+        let err = resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 4, ExpertParallelism::Single),
+            1,
+        )
+        .unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("bytes_per_expert=0"));
+
+        spec.resources.bytes_per_expert = 1;
+        spec.resources.alignment = 3;
+        let err = resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 4, ExpertParallelism::Single),
+            1,
+        )
+        .unwrap_err();
+        assert!(err.contains("alignment=3"));
+    }
+
+    #[test]
+    fn expert_group_tp_non_divisible_placement_is_valid() {
+        let mut spec = expert_spec(ExpertParallelism::TensorParallel);
+        spec.n_experts = 3;
+        let plan = resolve_expert_group_plan(
+            &spec,
+            &expert_manifest(Some(0), 3, ExpertParallelism::TensorParallel),
+            2,
+        )
+        .unwrap();
+        assert_eq!(plan.experts.len(), 6);
+    }
+
+    #[test]
+    fn expert_group_reference_errors_name_group_and_bad_value() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        let mut spec = expert_spec(ExpertParallelism::Single);
+        spec.router = "missing.router".into();
+
+        let err = validate_expert_group_specs(&[spec.clone()], &manifest, 1).unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("missing.router"));
+
+        spec.router = "mlp.gate".into();
+        spec.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "missing.source".into(),
+            down: "experts.down".into(),
+            sidecars: Vec::new(),
+        };
+        let err = validate_expert_group_specs(&[spec], &manifest, 1).unwrap_err();
+        assert!(err.contains("missing.source"));
+
+        let mut sidecar = expert_spec(ExpertParallelism::Single);
+        sidecar.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: vec![String::new()],
+        };
+        let err = validate_expert_group_specs(&[sidecar], &manifest, 1).unwrap_err();
+        assert!(err.contains("sidecar[0]"));
+    }
+
+    #[test]
+    fn expert_group_preserves_fused_separate_and_sidecar_references() {
+        let mut manifest = expert_manifest(Some(0), 3, ExpertParallelism::Single);
+        manifest.push(WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![3, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        ));
+        let mut spec = expert_spec(ExpertParallelism::Single);
+        spec.n_experts = 3;
+        spec.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        let fused = resolve_expert_group_plan(&spec, &manifest, 1).unwrap();
+        assert_eq!(fused.source_layout, spec.source_layout);
+
+        for name in ["experts.gate", "experts.up"] {
+            manifest.push(WeightEntry::layer(
+                name,
+                0,
+                vec![3, 4, 4],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+        }
+        let mut packed_separate = spec.clone();
+        packed_separate.source_layout = ExpertSourceLayout::PackedSeparate {
+            gate: "experts.gate".into(),
+            up: "experts.up".into(),
+            down: "experts.down".into(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        let packed_separate_plan =
+            resolve_expert_group_plan(&packed_separate, &manifest, 1).unwrap();
+        assert_eq!(
+            packed_separate_plan.source_layout,
+            packed_separate.source_layout
+        );
+
+        let names = ["experts.gate", "experts.up", "experts.down"];
+        for prefix in names {
+            for expert in 0..3 {
+                manifest.push(WeightEntry::layer(
+                    format!("{prefix}.{expert}"),
+                    0,
+                    vec![4, 4],
+                    DType::F16,
+                    ShardPolicy::Replicate,
+                ));
+            }
+        }
+        let mut separate = spec;
+        separate.source_layout = ExpertSourceLayout::PerExpertSeparate {
+            gate: (0..3).map(|e| format!("experts.gate.{e}")).collect(),
+            up: (0..3).map(|e| format!("experts.up.{e}")).collect(),
+            down: (0..3).map(|e| format!("experts.down.{e}")).collect(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        let per_expert = resolve_expert_group_plan(&separate, &manifest, 1).unwrap();
+        assert_eq!(per_expert.source_layout, separate.source_layout);
+
+        for expert in 0..3 {
+            manifest.push(WeightEntry::layer(
+                format!("experts.gate_up.{expert}"),
+                0,
+                vec![4, 4],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+        }
+        let mut fused_per_expert = separate;
+        fused_per_expert.source_layout = ExpertSourceLayout::PerExpertFused {
+            gate_up: (0..3).map(|e| format!("experts.gate_up.{e}")).collect(),
+            down: (0..3).map(|e| format!("experts.down.{e}")).collect(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        let fused_per_expert_plan =
+            resolve_expert_group_plan(&fused_per_expert, &manifest, 1).unwrap();
+        assert_eq!(
+            fused_per_expert_plan.source_layout,
+            fused_per_expert.source_layout
+        );
+    }
+
+    #[test]
+    fn expert_group_rejects_wrong_source_shape_and_policy() {
+        let mut malformed = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        malformed
+            .iter_mut()
+            .find(|entry| entry.name == "experts.gate_up")
+            .unwrap()
+            .logical_shape = vec![3, 4, 4];
+        let spec = expert_spec(ExpertParallelism::Single);
+        let err = validate_expert_group_specs(&[spec], &malformed, 1).unwrap_err();
+        assert!(err.contains("experts.gate_up"));
+        assert!(err.contains("logical_shape"));
+
+        let mut wrong_policy = expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel);
+        wrong_policy
+            .iter_mut()
+            .find(|entry| entry.name == "experts.down")
+            .unwrap()
+            .policy = ShardPolicy::Replicate;
+        let err = validate_expert_group_specs(
+            &[expert_spec(ExpertParallelism::TensorParallel)],
+            &wrong_policy,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("experts.down"));
+        assert!(err.contains("incompatible policy"));
+    }
+
+    #[test]
+    fn expert_group_rejects_empty_references_and_wrong_scope() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        let mut empty = expert_spec(ExpertParallelism::Single);
+        empty.router.clear();
+        let err = validate_expert_group_specs(&[empty], &manifest, 1).unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("reference ''"));
+
+        let mut wrong_scope = expert_spec(ExpertParallelism::Single);
+        wrong_scope.layer = Some(1);
+        let err = validate_expert_group_specs(&[wrong_scope], &manifest, 1).unwrap_err();
+        assert!(err.contains("layer Some(1)"));
+        assert!(err.contains("mlp.gate"));
+    }
+
+    #[test]
+    fn expert_group_collective_is_derived_from_parallelism() {
+        for (parallelism, expected) in [
+            (ExpertParallelism::Single, None),
+            (
+                ExpertParallelism::TensorParallel,
+                Some(ExpertPostCombineAllReduce::TensorParallel),
+            ),
+            (
+                ExpertParallelism::ExpertParallel,
+                Some(ExpertPostCombineAllReduce::ExpertParallel),
+            ),
+        ] {
+            let spec = expert_spec(parallelism);
+            let plan = resolve_expert_group_plan(
+                &spec,
+                &expert_manifest(Some(0), 4, parallelism),
+                if parallelism == ExpertParallelism::Single {
+                    1
+                } else {
+                    2
+                },
+            )
+            .unwrap();
+            assert_eq!(plan.collective, expected);
+        }
+    }
+
+    #[test]
+    fn expert_group_rejects_mismatched_embedded_expert_policy_metadata() {
+        let mut ep = expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel);
+        if let ShardPolicy::ExpertSharded { n_experts, .. } = &mut ep[1].policy {
+            *n_experts = 3;
+        }
+        let err =
+            validate_expert_group_specs(&[expert_spec(ExpertParallelism::ExpertParallel)], &ep, 2)
+                .unwrap_err();
+        assert!(err.contains("experts.gate_up"));
+        assert!(err.contains("n_experts"));
+
+        let mut assignment = expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel);
+        if let ShardPolicy::ExpertSharded { assign, .. } = &mut assignment[1].policy {
+            *assign = ExpertAssign::Contiguous;
+        }
+        let err = validate_expert_group_specs(
+            &[expert_spec(ExpertParallelism::ExpertParallel)],
+            &assignment,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("assignment"));
+        assert!(err.contains("Contiguous"));
+
+        let mut tp = expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel);
+        if let ShardPolicy::ExpertTensorSharded { inner, .. } = &mut tp[1].policy {
+            *inner = Box::new(ShardPolicy::Replicate);
+        }
+        let err =
+            validate_expert_group_specs(&[expert_spec(ExpertParallelism::TensorParallel)], &tp, 2)
+                .unwrap_err();
+        assert!(err.contains("experts.gate_up"));
+        assert!(err.contains("inner"));
+    }
+
+    #[test]
+    fn expert_group_router_accepts_one_or_two_dimensions_and_rejects_wrong_last_dim() {
+        let mut one_d = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        one_d[0].logical_shape = vec![4];
+        assert!(
+            validate_expert_group_specs(&[expert_spec(ExpertParallelism::Single)], &one_d, 1)
+                .is_ok()
+        );
+
+        let two_d = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        assert!(
+            validate_expert_group_specs(&[expert_spec(ExpertParallelism::Single)], &two_d, 1)
+                .is_ok()
+        );
+
+        let mut wrong = two_d;
+        wrong[0].logical_shape = vec![4, 5];
+        let err = validate_expert_group_specs(&[expert_spec(ExpertParallelism::Single)], &wrong, 1)
+            .unwrap_err();
+        assert!(err.contains("router"));
+        assert!(err.contains("logical_shape"));
+        assert!(err.contains("n_experts=4"));
+    }
+
+    #[test]
+    fn expert_group_rejects_per_expert_layouts_for_tp_and_ep() {
+        let mut spec = expert_spec(ExpertParallelism::TensorParallel);
+        spec.source_layout = ExpertSourceLayout::PerExpertFused {
+            gate_up: (0..4).map(|e| format!("experts.gate_up.{e}")).collect(),
+            down: (0..4).map(|e| format!("experts.down.{e}")).collect(),
+            sidecars: Vec::new(),
+        };
+        let err = validate_expert_group_specs(
+            &[spec.clone()],
+            &expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel),
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("PerExpert"));
+
+        spec.parallelism = ExpertParallelism::ExpertParallel;
+        let err = validate_expert_group_specs(
+            &[spec],
+            &expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel),
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("PerExpert"));
+    }
+
+    #[test]
+    fn expert_group_rejects_duplicate_manifest_and_per_expert_sources() {
+        let mut manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        manifest.push(manifest[1].clone());
+        let err =
+            validate_expert_group_specs(&[expert_spec(ExpertParallelism::Single)], &manifest, 1)
+                .unwrap_err();
+        assert!(err.contains("duplicate manifest"));
+        assert!(err.contains("experts.gate_up"));
+
+        let mut per = expert_spec(ExpertParallelism::Single);
+        per.source_layout = ExpertSourceLayout::PerExpertFused {
+            gate_up: vec![
+                "experts.gate_up.0".into(),
+                "experts.gate_up.0".into(),
+                "experts.gate_up.2".into(),
+                "experts.gate_up.3".into(),
+            ],
+            down: (0..4).map(|e| format!("experts.down.{e}")).collect(),
+            sidecars: Vec::new(),
+        };
+        let mut per_manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        for name in [
+            "experts.gate_up.0",
+            "experts.gate_up.2",
+            "experts.gate_up.3",
+            "experts.down.0",
+            "experts.down.1",
+            "experts.down.2",
+            "experts.down.3",
+        ] {
+            per_manifest.push(WeightEntry::layer(
+                name,
+                0,
+                vec![4, 4],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+        }
+        let err = validate_expert_group_specs(&[per], &per_manifest, 1).unwrap_err();
+        assert!(err.contains("duplicate per-expert source"));
+        assert!(err.contains("experts.gate_up.0"));
+    }
+
+    #[test]
+    fn expert_group_accepts_same_manifest_name_at_different_layers() {
+        let mut manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        manifest.extend(expert_manifest(Some(1), 4, ExpertParallelism::Single));
+        let mut spec = expert_spec(ExpertParallelism::Single);
+        spec.layer = Some(1);
+        assert!(validate_expert_group_specs(&[spec], &manifest, 1).is_ok());
+    }
+
+    #[test]
+    fn expert_group_rejects_swapped_or_wrong_tp_projection_axes() {
+        let mut gate_axis = expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel);
+        if let ShardPolicy::ExpertTensorSharded { inner, .. } = &mut gate_axis[1].policy {
+            *inner = Box::new(ShardPolicy::ColumnShard { axis: 0 });
+        }
+        let err = validate_expert_group_specs(
+            &[expert_spec(ExpertParallelism::TensorParallel)],
+            &gate_axis,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("source gate_up"));
+        assert!(err.contains("axis: 1"));
+
+        let mut swapped_gate_down = expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel);
+        if let ShardPolicy::ExpertTensorSharded { inner, .. } = &mut swapped_gate_down[1].policy {
+            *inner = Box::new(ShardPolicy::RowShard { axis: 2 });
+        }
+        let err = validate_expert_group_specs(
+            &[expert_spec(ExpertParallelism::TensorParallel)],
+            &swapped_gate_down,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("source gate_up"));
+        assert!(err.contains("ColumnShard"));
+
+        let mut down_axis = expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel);
+        if let ShardPolicy::ExpertTensorSharded { inner, .. } = &mut down_axis[2].policy {
+            *inner = Box::new(ShardPolicy::ColumnShard { axis: 1 });
+        }
+        let err = validate_expert_group_specs(
+            &[expert_spec(ExpertParallelism::TensorParallel)],
+            &down_axis,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("source down"));
+        assert!(err.contains("RowShard"));
+    }
+
+    #[test]
+    fn expert_group_sidecar_policies_are_separate_from_projection_policies() {
+        let mut tp_replicated = expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel);
+        tp_replicated.push(WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        ));
+        let mut tp_spec = expert_spec(ExpertParallelism::TensorParallel);
+        tp_spec.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        assert!(validate_expert_group_specs(&[tp_spec.clone()], &tp_replicated, 2).is_ok());
+
+        let mut ep_expert = expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel);
+        ep_expert.push(WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        let mut ep_spec = expert_spec(ExpertParallelism::ExpertParallel);
+        ep_spec.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        assert!(validate_expert_group_specs(&[ep_spec], &ep_expert, 2).is_ok());
+
+        let mut tp_expert = expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel);
+        tp_expert.push(WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::ExpertTensorSharded {
+                n_experts: 4,
+                inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
+            },
+        ));
+        let err = validate_expert_group_specs(&[tp_spec], &tp_expert, 2).unwrap_err();
+        assert!(err.contains("sidecar[0]"));
+        assert!(err.contains("ExpertTensorSharded"));
+    }
+
+    #[test]
+    fn expert_group_tp_sidecar_rejects_pin_but_accepts_replicate() {
+        let spec = expert_spec(ExpertParallelism::TensorParallel);
+        let pin = WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Pin(PinTarget::Embed),
+        );
+        assert!(validate_sidecar_policy(&spec, &pin, "sidecar[0]").is_err());
+
+        let replicate = WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        );
+        assert!(validate_sidecar_policy(&spec, &replicate, "sidecar[0]").is_ok());
+    }
+
+    #[test]
+    fn expert_group_tp_sidecar_rejects_tied_but_accepts_replicate() {
+        let spec = expert_spec(ExpertParallelism::TensorParallel);
+        let tied = WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "source".into(),
+            },
+        );
+        assert!(validate_sidecar_policy(&spec, &tied, "sidecar[0]").is_err());
+
+        let replicate = WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        );
+        assert!(validate_sidecar_policy(&spec, &replicate, "sidecar[0]").is_ok());
+    }
+
+    #[test]
+    fn expert_group_ep_sidecar_rejects_pin_but_accepts_replicate() {
+        let spec = expert_spec(ExpertParallelism::ExpertParallel);
+        let pin = WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Pin(PinTarget::Output),
+        );
+        assert!(validate_sidecar_policy(&spec, &pin, "sidecar[0]").is_err());
+
+        let replicate = WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        );
+        assert!(validate_sidecar_policy(&spec, &replicate, "sidecar[0]").is_ok());
+    }
+
+    #[test]
+    fn expert_group_ep_sidecar_rejects_tied_but_accepts_replicate() {
+        let spec = expert_spec(ExpertParallelism::ExpertParallel);
+        let tied = WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "source".into(),
+            },
+        );
+        assert!(validate_sidecar_policy(&spec, &tied, "sidecar[0]").is_err());
+
+        let replicate = WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        );
+        assert!(validate_sidecar_policy(&spec, &replicate, "sidecar[0]").is_ok());
+    }
+
+    #[test]
+    fn expert_group_rejects_non_three_dimensional_or_zero_dim_packed_sources() {
+        for shape in [vec![4], vec![4, 4], vec![4, 4, 4, 4], vec![4, 0, 4]] {
+            let mut manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+            manifest[1].logical_shape = shape;
+            let err = validate_expert_group_specs(
+                &[expert_spec(ExpertParallelism::Single)],
+                &manifest,
+                1,
+            )
+            .unwrap_err();
+            assert!(err.contains("experts.gate_up"));
+            assert!(err.contains("3D") || err.contains("zero"));
+        }
+
+        let tp = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        for shape in [vec![4, 512], vec![4, 512, 8, 1], vec![4, 0, 8]] {
+            let manifest = vec![WeightEntry::layer(
+                "experts",
+                0,
+                shape,
+                DType::F16,
+                ShardPolicy::ExpertTensorSharded {
+                    n_experts: 4,
+                    inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
+                },
+            )];
+            assert!(validate_manifest(&manifest, &tp).is_err());
+        }
+
+        let invalid_inner = vec![WeightEntry::layer(
+            "experts",
+            0,
+            vec![4, 512, 8],
+            DType::F16,
+            ShardPolicy::ExpertTensorSharded {
+                n_experts: 4,
+                inner: Box::new(ShardPolicy::Replicate),
+            },
+        )];
+        assert!(validate_manifest(&invalid_inner, &tp).is_err());
     }
 }

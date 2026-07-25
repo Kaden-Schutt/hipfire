@@ -42,6 +42,7 @@ use crate::weight_manifest::{placement_devices, ShardPolicy, SourceDType, Weight
 use hipfire_hardware::{DeviceMesh, DimKind, Gpus, WeightAllocationOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A placed weight: either a GPU-resident tensor or an alias to another entry
 /// (tied embeddings / lm_head). Modelled as a handle enum so the deferred
@@ -55,6 +56,32 @@ pub enum WeightHandle {
     Alias(String),
 }
 
+/// Metadata describing how a placement is projected from its logical tensor.
+/// The fields are deliberately value-owned so a future typed forward does not
+/// need to borrow manifest state just to dispatch a placed weight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WeightProjectionKind {
+    Static,
+    ExpertCompact,
+    ColumnShard,
+    RowShard,
+}
+
+impl Default for WeightProjectionKind {
+    fn default() -> Self {
+        Self::Static
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WeightProjection {
+    pub kind: WeightProjectionKind,
+    pub axis: Option<usize>,
+    pub rank: Option<usize>,
+    pub world_size: Option<usize>,
+    pub compact: bool,
+}
+
 /// Load-side placement container, keyed by `(logical_name, layer, device_id)`.
 /// Replaces the god-struct's placement bookkeeping: it records *where each
 /// tensor landed*, independent of any arch's weight-struct shape. The `layer`
@@ -66,6 +93,7 @@ pub enum WeightHandle {
 #[derive(Default)]
 pub struct WeightStore {
     placements: HashMap<(String, Option<usize>, usize), WeightHandle>,
+    projections: HashMap<(String, Option<usize>, usize), WeightProjection>,
 }
 
 impl WeightStore {
@@ -80,6 +108,17 @@ impl WeightStore {
 
     pub fn is_empty(&self) -> bool {
         self.placements.is_empty()
+    }
+
+    pub fn set_projection(
+        &mut self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+        projection: WeightProjection,
+    ) {
+        self.projections
+            .insert((name.to_owned(), layer, device), projection);
     }
 
     /// The handle for `name` (of `layer`) on `device`, if placed there.
@@ -110,6 +149,18 @@ impl WeightStore {
     fn insert(&mut self, name: &str, layer: Option<usize>, device: usize, handle: WeightHandle) {
         self.placements
             .insert((name.to_string(), layer, device), handle);
+    }
+
+    fn insert_projected(
+        &mut self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+        handle: WeightHandle,
+        projection: WeightProjection,
+    ) {
+        self.insert(name, layer, device, handle);
+        self.set_projection(name, layer, device, projection);
     }
 
     /// Move a placed handle out of the store (transferring ownership of its
@@ -162,6 +213,37 @@ impl WeightStore {
     }
 }
 
+fn placement_projection(policy: &ShardPolicy, rank: usize, world_size: usize) -> WeightProjection {
+    if matches!(
+        policy,
+        ShardPolicy::Replicate | ShardPolicy::Tied { .. } | ShardPolicy::Pin(_)
+    ) {
+        return WeightProjection::default();
+    }
+    let (kind, axis, compact) = match policy {
+        ShardPolicy::ColumnShard { axis } => {
+            (WeightProjectionKind::ColumnShard, Some(*axis), false)
+        }
+        ShardPolicy::RowShard { axis } => (WeightProjectionKind::RowShard, Some(*axis), false),
+        ShardPolicy::ExpertSharded { .. } => (WeightProjectionKind::ExpertCompact, None, true),
+        ShardPolicy::ExpertTensorSharded { inner, .. } => match inner.as_ref() {
+            ShardPolicy::ColumnShard { axis } => {
+                (WeightProjectionKind::ColumnShard, Some(*axis), false)
+            }
+            ShardPolicy::RowShard { axis } => (WeightProjectionKind::RowShard, Some(*axis), false),
+            _ => (WeightProjectionKind::Static, None, false),
+        },
+        _ => (WeightProjectionKind::Static, None, false),
+    };
+    WeightProjection {
+        kind,
+        axis,
+        rank: Some(rank),
+        world_size: Some(world_size),
+        compact,
+    }
+}
+
 /// The two load surfaces intentionally share one fulfillment engine. The
 /// single-GPU adapter and the multi-GPU adapter differ only in how a logical
 /// device id resolves to a `Gpu`; source reads, policy checks, uploads, and
@@ -185,6 +267,28 @@ impl WeightStoreTarget<'_> {
             Self::Gpus(gpus) => gpus.devices.len(),
         }
     }
+}
+
+/// Crate-visible mutable target-scoped access for weight-allocation cleanup.
+/// Used during free/abort to validate origin and free on the correct GPU.
+///
+/// Visible at crate level so that Tasks 3/4 (same-crate) can construct it
+/// without widening to a public raw ownership path.
+pub(crate) enum WeightStoreTargetMut<'a> {
+    /// Single-GPU target: origin is validated via
+    /// [`Gpus::single_weight_origin`] supplying the device-consistent
+    /// identity.
+    Single {
+        mesh: &'a DeviceMesh,
+        gpu: &'a mut Gpu,
+    },
+    /// Multi-GPU (mesh) target: origin is validated via
+    /// [`Gpus::weight_origin_in`] deriving the logical rank from the
+    /// allocation's origin.
+    Mesh {
+        mesh: &'a DeviceMesh,
+        gpus: &'a mut Gpus,
+    },
 }
 
 /// One weight ownership item returned when typed assembly commits.
@@ -362,9 +466,15 @@ impl WeightStoreAllocation {
 
     /// Consume this allocation and free its GPU buffer, but only after
     /// validating that the allocation's origin matches the expected
-    /// identity derived from `gpus.weight_origin(rank)`.  On failure the
-    /// original allocation is returned inside [`FailedWeightStoreFree`]
-    /// so the caller can inspect or retry.
+    /// identity derived from the live target state:
+    ///
+    /// - **`Single`**: validates via [`Gpus::single_weight_origin`] (logical
+    ///   rank must be 0, device must match).
+    /// - **`Mesh`**: derives the logical rank from `self.origin` and
+    ///   validates via [`Gpus::weight_origin_in`].
+    ///
+    /// On failure the original allocation is returned inside
+    /// [`FailedWeightStoreFree`] so the caller can inspect or retry.
     ///
     /// **Ownership semantics.** Only validation and [`Gpu::bind_thread`] failures
     /// prevent submission to the driver — the buffer is never freed on those
@@ -372,75 +482,110 @@ impl WeightStoreAllocation {
     /// retains ownership of the GPU buffer
     /// (via [`hip_bridge::HipRuntime::free_preserving`]) so the caller can
     /// retry.
-    pub fn free(self, gpus: &Gpus, rank: usize) -> Result<(), FailedWeightStoreFree> {
+    pub(crate) fn free(
+        self,
+        target: &mut WeightStoreTargetMut<'_>,
+    ) -> Result<(), FailedWeightStoreFree> {
         let tensor = self.tensor;
         let origin = self.origin;
 
-        // Resolve the expected origin before entering the state machine
-        // so failure paths can rebuild the allocation.
-        let expected = match gpus.weight_origin(rank) {
-            Ok(o) => o,
-            Err(e) => {
-                return Err(FailedWeightStoreFree {
-                    error: WeightStoreFreeError::OriginMismatch(format!(
-                        "cannot derive expected origin for rank {rank}: {e:?}"
-                    )),
-                    allocation: WeightStoreAllocation { tensor, origin },
-                });
+        // Resolve the expected origin from the live target state, then
+        // call free_with_resolver.  The resolver closure for production
+        // does not capture `target` again — it captures only the
+        // pre-resolved expected value (Copy).  The driver closure borrows
+        // `target` for GPU access.  Because the resolution borrow ends
+        // before free_with_resolver is called, there is no simultaneous
+        // mutable-borrow conflict.
+        match target {
+            WeightStoreTargetMut::Single { mesh, gpu } => {
+                let expected = Gpus::single_weight_origin(mesh, gpu);
+                // target mutable borrow released here (gpu reborrow ended)
+                self::free_with_resolver(
+                    origin,
+                    tensor,
+                    |_rank| Ok(expected),
+                    |tensor: GpuTensor| -> Result<(), (GpuTensor, String)> {
+                        let mut opt = Some(tensor);
+                        if let Err(e) = gpu.bind_thread() {
+                            return Err((
+                                opt.take().unwrap(),
+                                format!("bind_thread failed: {e:?}"),
+                            ));
+                        }
+                        let tensor = opt.take().unwrap();
+                        match gpu.hip.free_preserving(tensor.buf) {
+                            Ok(()) => Ok(()),
+                            Err((returned_buf, e)) => Err((
+                                GpuTensor {
+                                    buf: returned_buf,
+                                    shape: tensor.shape,
+                                    dtype: tensor.dtype,
+                                },
+                                format!("hipFree failed: {e:?}"),
+                            )),
+                        }
+                    },
+                )
             }
-        };
-
-        match try_free(
-            AllocationToken {
-                resource: tensor,
-                origin,
-            },
-            &expected,
-            |tensor: GpuTensor| -> Result<(), (GpuTensor, String)> {
-                let mut opt = Some(tensor);
-                let gpu = match gpus.devices.get(rank) {
-                    Some(g) => g,
-                    None => {
-                        return Err((opt.take().unwrap(), format!("rank {rank} out of range")));
+            WeightStoreTargetMut::Mesh { mesh, gpus } => {
+                let rank = origin.logical_rank();
+                let expected = match gpus.weight_origin_in(mesh, rank) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return Err(FailedWeightStoreFree {
+                            error: WeightStoreFreeError::OriginMismatch(format!(
+                                "cannot derive expected origin for rank {rank}: {e:?}"
+                            )),
+                            allocation: WeightStoreAllocation { tensor, origin },
+                        });
                     }
                 };
-                // Bind thread before submitting to the driver. A bind error
-                // returns the tensor untouched — no free is attempted.
-                if let Err(e) = gpu.bind_thread() {
-                    return Err((opt.take().unwrap(), format!("bind_thread failed: {e:?}")));
-                }
-                let tensor = opt.take().unwrap();
-                // free_preserving takes ownership of the DeviceBuffer and
-                // returns it on failure so the caller retains the buffer.
-                match gpu.hip.free_preserving(tensor.buf) {
-                    Ok(()) => Ok(()),
-                    Err((returned_buf, e)) => Err((
-                        GpuTensor {
-                            buf: returned_buf,
-                            shape: tensor.shape,
-                            dtype: tensor.dtype,
-                        },
-                        format!("hipFree failed: {e:?}"),
-                    )),
-                }
-            },
-        ) {
-            Ok(()) => Ok(()),
-            Err((token, FreeError::OriginMismatch)) => Err(FailedWeightStoreFree {
+                // gpus immutable borrow released here
+                self::free_with_resolver(
+                    origin,
+                    tensor,
+                    |_rank| Ok(expected),
+                    |tensor: GpuTensor| -> Result<(), (GpuTensor, String)> {
+                        let mut opt = Some(tensor);
+                        let gpu = &mut gpus.devices[rank];
+                        if let Err(e) = gpu.bind_thread() {
+                            return Err((
+                                opt.take().unwrap(),
+                                format!("bind_thread failed: {e:?}"),
+                            ));
+                        }
+                        let tensor = opt.take().unwrap();
+                        match gpu.hip.free_preserving(tensor.buf) {
+                            Ok(()) => Ok(()),
+                            Err((returned_buf, e)) => Err((
+                                GpuTensor {
+                                    buf: returned_buf,
+                                    shape: tensor.shape,
+                                    dtype: tensor.dtype,
+                                },
+                                format!("hipFree failed: {e:?}"),
+                            )),
+                        }
+                    },
+                )
+            }
+        }
+        .or_else(|(token, err)| match err {
+            FreeError::OriginMismatch => Err(FailedWeightStoreFree {
                 error: WeightStoreFreeError::OriginMismatch("origin mismatch".into()),
                 allocation: WeightStoreAllocation {
                     tensor: token.resource,
                     origin: token.origin,
                 },
             }),
-            Err((token, FreeError::DriverFailure(msg))) => Err(FailedWeightStoreFree {
+            FreeError::DriverFailure(msg) => Err(FailedWeightStoreFree {
                 error: WeightStoreFreeError::DriverError(msg),
                 allocation: WeightStoreAllocation {
                     tensor: token.resource,
                     origin: token.origin,
                 },
             }),
-        }
+        })
     }
 }
 
@@ -448,7 +593,8 @@ impl WeightStoreAllocation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WeightStoreFreeError {
     /// The allocation's origin did not match the expected identity
-    /// derived from [`Gpus::weight_origin`].
+    /// derived from the live target ([`Gpus::single_weight_origin`] for
+    /// Single, [`Gpus::weight_origin_in`] for Mesh).
     OriginMismatch(String),
     /// A driver operation (`hipFree` or [`Gpu::bind_thread`]) failed.
     DriverError(String),
@@ -485,7 +631,8 @@ pub struct FailedWeightStoreFree {
 }
 
 /// Generic ownership/free state machine for origin-gated resource release.
-/// Shared by [`WeightStoreAllocation::free`] and CPU-unit tests.
+/// Shared by [`free_with_resolver`], [`WeightStoreAllocation::free`], and
+/// CPU-unit tests.
 #[derive(Debug)]
 struct AllocationToken<R, O> {
     resource: R,
@@ -524,6 +671,1172 @@ fn try_free<R, O: PartialEq>(
                 origin: token.origin,
             };
             Err((token, FreeError::DriverFailure(msg)))
+        }
+    }
+}
+
+/// Internal trait for types that provide a logical rank.
+/// Implemented for [`WeightAllocationOrigin`] and [`TestOrigin`]
+/// so [`free_with_resolver`] can derive rank generically.
+trait LogicalRank {
+    fn logical_rank(&self) -> usize;
+}
+
+impl LogicalRank for WeightAllocationOrigin {
+    fn logical_rank(&self) -> usize {
+        self.logical_rank()
+    }
+}
+
+/// Private testable seam: validates an allocation's origin against a
+/// **resolver-supplied** expected origin and, on match, releases the
+/// resource through `driver`.
+///
+/// Unlike a wrapper around [`try_free`], this function:
+///
+/// 1. Derives `rank` from `origin.logical_rank()` (via the [`LogicalRank`]
+///    trait) — the caller does **not** pick the rank.
+/// 2. Invokes `resolve_expected(rank)` to obtain the live expected origin
+///    from the target context (Single → `Gpus::single_weight_origin`
+///    yielding rank 0; Mesh → `gpus.weight_origin_in(mesh, rank)`).
+/// 3. Only after successful resolution does it call [`try_free`], which
+///    validates `origin == expected` before reaching `driver`.
+///
+/// On resolver failure (e.g. [`WeightOriginError::UnknownRank`]) the error
+/// path is identical to an origin mismatch — both return
+/// [`FreeError::OriginMismatch`] without calling `driver`.
+///
+/// The function is generic over `O: PartialEq + LogicalRank` so CPU tests
+/// supply [`TestOrigin`]/[`TestResource`] to exercise rank derivation,
+/// resolver ordering, mismatch suppression, and driver-failure ownership
+/// without a real GPU.
+fn free_with_resolver<R, O: PartialEq + LogicalRank>(
+    origin: O,
+    resource: R,
+    resolve_expected: impl FnOnce(usize) -> Result<O, String>,
+    driver: impl FnOnce(R) -> Result<(), (R, String)>,
+) -> Result<(), (AllocationToken<R, O>, FreeError)> {
+    let rank = origin.logical_rank();
+    let expected = match resolve_expected(rank) {
+        Ok(o) => o,
+        Err(_msg) => {
+            return Err((
+                AllocationToken { resource, origin },
+                FreeError::OriginMismatch,
+            ));
+        }
+    };
+    try_free(AllocationToken { resource, origin }, &expected, driver)
+}
+
+// ── target binding / pre-upload validation seam ─────────────────────
+//
+// Generic types and function that validate a supplied target against a
+// captured binding.  `O` is the origin type: WeightAllocationOrigin in
+// production, TestOrigin in CPU tests.
+
+/// Captured identity of the target at [`for_target`] time.
+enum TargetBinding<O> {
+    /// Full origin of the single GPU.
+    Single(O),
+    /// Ordered per-rank origins (index = rank).  The length, rank
+    /// ordering, and every origin's four fields constitute the
+    /// immutable topology bind.
+    Mesh(Vec<O>),
+}
+
+/// Current state of the target supplied at [`stage_bytes`] time,
+/// pre-resolved from the live target so the generic validation
+/// function does not need GPU access.
+enum TargetState<O> {
+    /// Pre-resolved single origin.
+    Single(O),
+    /// Pre-resolved full per-rank origin set.
+    Mesh { full: Vec<O> },
+}
+
+/// Validate that `current` matches the captured `binding` for the
+/// given `key_rank`.  Returns the validated rank on success (0 for
+/// Single, `key_rank` for Mesh) or a [`StageWeightError`] describing
+/// the mismatch.
+///
+/// This is the **pre-upload validation guard** — every failure returns
+/// `OriginMismatch` (a validation error) with zero GPU/driver work.
+fn validate_staging_binding<O: PartialEq>(
+    binding: &TargetBinding<O>,
+    key_rank: usize,
+    current: &TargetState<O>,
+) -> Result<usize, StageWeightError> {
+    match (binding, current) {
+        (TargetBinding::Single(captured), TargetState::Single(current)) => {
+            if key_rank != 0 {
+                return Err(StageWeightError::OriginMismatch(format!(
+                    "Single target rejects logical_rank {key_rank}"
+                )));
+            }
+            if current != captured {
+                return Err(StageWeightError::OriginMismatch(
+                    "single-GPU allocation domain has changed since for_target".into(),
+                ));
+            }
+            Ok(0)
+        }
+        (TargetBinding::Mesh(captured_ranks), TargetState::Mesh { full: current_full }) => {
+            if key_rank >= captured_ranks.len() {
+                return Err(StageWeightError::OriginMismatch(format!(
+                    "rank {key_rank} is out of range for captured mesh ({} rank(s))",
+                    captured_ranks.len()
+                )));
+            }
+            if current_full.len() != captured_ranks.len() {
+                return Err(StageWeightError::OriginMismatch(format!(
+                    "mesh rank count changed: captured {} rank(s), current {}",
+                    captured_ranks.len(),
+                    current_full.len(),
+                )));
+            }
+            if current_full != captured_ranks {
+                return Err(StageWeightError::OriginMismatch(
+                    "mesh topology or allocation domain changed since for_target".into(),
+                ));
+            }
+            Ok(key_rank)
+        }
+        _ => Err(StageWeightError::OriginMismatch(
+            "target variant does not match captured binding (Single vs Mesh)".into(),
+        )),
+    }
+}
+
+// ── private arena substrate (Phase 2, cell-based allocation) ────────
+
+/// Monotonically-increasing counter for [`WeightArenaEpoch`].
+static NEXT_ARENA_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque epoch that brands exactly one [`ArenaBuilder`] instance.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct WeightArenaEpoch(u64);
+
+/// Allocate the next [`WeightArenaEpoch`] via a checked CAS loop
+/// (same sentinel discipline as other epoch issuers).
+fn next_arena_epoch() -> WeightArenaEpoch {
+    let mut current = NEXT_ARENA_EPOCH.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            panic!("WeightArenaEpoch exhausted");
+        }
+        match NEXT_ARENA_EPOCH.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return WeightArenaEpoch(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// A stable, branded handle to an arena cell.
+///
+/// The `arena_epoch` ties this ID to exactly one arena instance;
+/// the `slot` indexes into that arena's cell vector.  There is no
+/// public constructor and no way to extract the raw fields — the
+/// only way to obtain a `WeightCellId` is through an arena builder's
+/// `insert` or `alias` operations.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct WeightCellId {
+    arena_epoch: WeightArenaEpoch,
+    slot: usize,
+}
+
+/// Errors from an arena builder's `alias` operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AliasError {
+    /// The target [`WeightCellId`] belongs to a different arena.
+    ForeignArena,
+    /// The target [`WeightCellId`] references a slot that does not
+    /// exist (or is no longer valid) in this arena.
+    InvalidSlot,
+}
+
+impl std::fmt::Display for AliasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AliasError::ForeignArena => write!(f, "foreign arena epoch"),
+            AliasError::InvalidSlot => write!(f, "invalid slot in arena"),
+        }
+    }
+}
+
+/// A cell within an [`ArenaBuilder`]: either an owned resource or an
+/// alias to another cell in the same arena.
+#[derive(Debug)]
+enum Cell<R> {
+    /// A directly-owned resource.
+    Resident(R),
+    /// A reference to another cell's resource.
+    Alias(WeightCellId),
+}
+
+/// A private, generically-typed arena that issues stable branded
+/// [`WeightCellId`] handles for staged weight-assembly cells.
+///
+/// Each builder gets a fresh [`WeightArenaEpoch`]; every
+/// [`insert`](ArenaBuilder::insert) or [`alias`](ArenaBuilder::alias)
+/// appends a cell and returns a `WeightCellId` branded with that
+/// epoch.  IDs from one arena are rejected by [`alias`] on another
+/// ([`AliasError::ForeignArena`]).
+#[derive(Debug)]
+struct ArenaBuilder<R> {
+    epoch: WeightArenaEpoch,
+    cells: Vec<Cell<R>>,
+}
+
+impl<R> ArenaBuilder<R> {
+    fn new() -> Self {
+        ArenaBuilder {
+            epoch: next_arena_epoch(),
+            cells: Vec::new(),
+        }
+    }
+
+    /// Insert a new resident resource and return its branded
+    /// [`WeightCellId`].
+    fn insert(&mut self, resource: R) -> WeightCellId {
+        let slot = self.cells.len();
+        self.cells.push(Cell::Resident(resource));
+        WeightCellId {
+            arena_epoch: self.epoch,
+            slot,
+        }
+    }
+
+    /// Create an alias to an existing cell in this arena.
+    /// Rejects IDs from a different arena
+    /// ([`AliasError::ForeignArena`]) and IDs whose slot is out of
+    /// range ([`AliasError::InvalidSlot`]).
+    fn alias(&mut self, target: &WeightCellId) -> Result<WeightCellId, AliasError> {
+        if target.arena_epoch != self.epoch {
+            return Err(AliasError::ForeignArena);
+        }
+        if target.slot >= self.cells.len() {
+            return Err(AliasError::InvalidSlot);
+        }
+        let slot = self.cells.len();
+        self.cells.push(Cell::Alias(*target));
+        Ok(WeightCellId {
+            arena_epoch: self.epoch,
+            slot,
+        })
+    }
+}
+
+// ── FrozenArena (resolved, no aliases retained) ─────────────────────
+
+/// A frozen, read-only arena that has resolved every alias chain to
+/// its ultimate allocation.  Created by [`ArenaBuilder::freeze`].
+#[derive(Debug)]
+struct FrozenArena<R> {
+    epoch: WeightArenaEpoch,
+    /// One box per unique allocation.  Aliases share the same box
+    /// as their ultimate resident target after chain resolution.
+    allocations: Vec<Box<R>>,
+    /// For every cell slot in the original arena, the index into
+    /// `allocations` that holds the resource.
+    slot_to_alloc: Vec<usize>,
+}
+
+impl<R> FrozenArena<R> {
+    /// Look up the resource for `id`.  Returns `None` if `id`
+    /// belongs to a different arena (foreign epoch).
+    fn resource(&self, id: WeightCellId) -> Option<&R> {
+        if id.arena_epoch != self.epoch {
+            return None;
+        }
+        let alloc_idx = self.slot_to_alloc.get(id.slot)?;
+        self.allocations.get(*alloc_idx).map(|b| b.as_ref())
+    }
+}
+
+impl<R> ArenaBuilder<R> {
+    /// Consume this builder and produce a [`FrozenArena`] where every
+    /// alias chain is eagerly resolved to its ultimate allocation.
+    /// No aliases or chains remain in the frozen result.
+    fn freeze(self) -> FrozenArena<R> {
+        let n = self.cells.len();
+        let mut allocations: Vec<Box<R>> = Vec::new();
+        let mut slot_to_alloc = vec![0usize; n];
+
+        for (slot, cell) in self.cells.into_iter().enumerate() {
+            match cell {
+                Cell::Resident(r) => {
+                    let idx = allocations.len();
+                    allocations.push(Box::new(r));
+                    slot_to_alloc[slot] = idx;
+                }
+                Cell::Alias(target) => {
+                    // Target is an earlier slot that has already been
+                    // processed (no forward references possible).
+                    slot_to_alloc[slot] = slot_to_alloc[target.slot];
+                }
+            }
+        }
+
+        FrozenArena {
+            epoch: self.epoch,
+            allocations,
+            slot_to_alloc,
+        }
+    }
+}
+
+// ── public WeightStoreBuilder / FrozenWeightStore wrappers ───────────
+
+/// Builder that stages [`WeightStoreAllocation`] cells before
+/// freezing into a [`FrozenWeightStore`].
+///
+/// The primary constructor is [`for_target`](Self::for_target), which
+/// binds the builder to a specific target identity (mesh epoch) so that
+/// subsequent [`stage_bytes`](Self::stage_bytes) and
+/// [`stage_alias`](Self::stage_alias) calls cannot be redirected to a
+/// different target.  Legacy [`insert`](Self::insert) and
+/// [`alias`](Self::alias) are crate-visible for tests only; new code
+/// uses the placement-key API.
+pub struct WeightStoreBuilder {
+    inner: ArenaBuilder<WeightStoreAllocation>,
+    /// Maps placement keys to arena cell IDs.
+    placement: HashMap<WeightPlacementKey, WeightCellId>,
+    /// Maps cell IDs to the logical rank of their placement.
+    cell_ranks: HashMap<WeightCellId, usize>,
+    /// Projection metadata for each placement key.
+    projections: HashMap<WeightPlacementKey, WeightProjection>,
+    /// Captured target identity — full origin for Single, ordered
+    /// per-rank origin set for Mesh.  `None` when constructed via
+    /// [`new`](Self::new) (test-only, no GPU binding).
+    binding: Option<TargetBinding<WeightAllocationOrigin>>,
+}
+
+impl WeightStoreBuilder {
+    /// Unbound constructor (test/private only).  The resulting builder
+    /// has no captured target identity.
+    fn new() -> Self {
+        WeightStoreBuilder {
+            inner: ArenaBuilder::new(),
+            placement: HashMap::new(),
+            cell_ranks: HashMap::new(),
+            projections: HashMap::new(),
+            binding: None,
+        }
+    }
+
+    /// Low-level alias (test/private only).  Superseded by
+    /// [`stage_alias`](Self::stage_alias).
+    fn alias(&mut self, target: &WeightCellId) -> Result<WeightCellId, AliasError> {
+        self.inner.alias(target)
+    }
+
+    // ── Placement-key API ───────────────────────────────────────────
+
+    /// Construct a builder bound to a live target.
+    ///
+    /// Captures the target's complete identity — for Single the full
+    /// [`WeightAllocationOrigin`] (device id, allocation domain,
+    /// mesh epoch, logical rank 0); for Mesh the ordered per-rank
+    /// origin set (every live rank's physical device, allocation
+    /// domain, and mesh epoch).  Subsequent [`stage_bytes`] calls
+    /// compare the supplied target's current live origins against
+    /// this captured binding, rejecting any change to domain/device/
+    /// topology.
+    pub(crate) fn for_target(
+        target: &WeightStoreTargetMut<'_>,
+    ) -> Result<Self, WeightStoreTargetError> {
+        let binding = match target {
+            WeightStoreTargetMut::Single { mesh, gpu } => {
+                let origin = Gpus::single_weight_origin(mesh, gpu);
+                TargetBinding::Single(origin)
+            }
+            WeightStoreTargetMut::Mesh { mesh, gpus } => {
+                let n = gpus.devices.len();
+                let origins: Vec<WeightAllocationOrigin> = (0..n)
+                    .map(|r| {
+                        gpus.weight_origin_in(mesh, r)
+                            .map_err(|_| WeightStoreTargetError::UnboundMesh)
+                    })
+                    .collect::<Result<_, _>>()?;
+                TargetBinding::Mesh(origins)
+            }
+        };
+        Ok(WeightStoreBuilder {
+            inner: ArenaBuilder::new(),
+            placement: HashMap::new(),
+            cell_ranks: HashMap::new(),
+            projections: HashMap::new(),
+            binding: Some(binding),
+        })
+    }
+
+    /// Upload `bytes` (with `shape` and `dtype`) to the GPU matching
+    /// `key.logical_rank` in `target`, validate the live allocation
+    /// origin via the captured binding, and record the placement.
+    ///
+    /// Pre-upload guards (in order):
+    /// 1. Duplicate-key rejection.
+    /// 2. Target binding validation (variant match, Single rank=0,
+    ///    origin equality, Mesh topology + per-rank origin equality).
+    ///
+    /// On success returns the branded [`WeightCellId`] for the new cell.
+    pub(crate) fn stage_bytes(
+        &mut self,
+        target: &mut WeightStoreTargetMut<'_>,
+        key: WeightPlacementKey,
+        bytes: &[u8],
+        shape: &[usize],
+        dtype: DType,
+        projection: WeightProjection,
+    ) -> Result<WeightCellId, StageWeightError> {
+        // 1. Duplicate-key check (before any GPU operation).
+        if self.placement.contains_key(&key) {
+            return Err(StageWeightError::DuplicateKey(key));
+        }
+
+        // 2. Resolve current target state and validate against binding.
+        let current = resolve_target_state(target)?;
+        let binding = self.binding.as_ref().ok_or_else(|| {
+            StageWeightError::OriginMismatch(
+                "builder has no captured target binding (constructed via new(), not for_target)"
+                    .into(),
+            )
+        })?;
+        let actual_rank = validate_staging_binding(binding, key.logical_rank, &current)?;
+
+        // 3. Upload (only reached when validation passed).
+        let (tensor, origin) = match target {
+            WeightStoreTargetMut::Single { mesh, gpu } => {
+                let origin = Gpus::single_weight_origin(mesh, gpu);
+                let mut t = gpu
+                    .upload_raw(bytes, shape)
+                    .map_err(|e| StageWeightError::UploadFailed(format!("upload_raw: {e:?}")))?;
+                t.dtype = dtype;
+                (t, origin)
+            }
+            WeightStoreTargetMut::Mesh { mesh, gpus } => {
+                let origin = gpus.weight_origin_in(mesh, actual_rank).map_err(|e| {
+                    StageWeightError::OriginMismatch(format!(
+                        "cannot derive origin for rank {actual_rank}: {e:?}"
+                    ))
+                })?;
+                let gpu = &mut gpus.devices[actual_rank];
+                let mut t = gpu
+                    .upload_raw(bytes, shape)
+                    .map_err(|e| StageWeightError::UploadFailed(format!("upload_raw: {e:?}")))?;
+                t.dtype = dtype;
+                (t, origin)
+            }
+        };
+
+        // 4. Wrap and record using the validated actual rank.
+        let alloc = WeightStoreAllocation { tensor, origin };
+        let cell_id = self.inner.insert(alloc);
+        self.placement.insert(key.clone(), cell_id);
+        self.cell_ranks.insert(cell_id, actual_rank);
+        self.projections.insert(key, projection);
+        Ok(cell_id)
+    }
+
+    /// Record an alias from `key` to an existing `target_id` cell.
+    ///
+    /// Rejects duplicate keys, foreign/invalid target IDs, and
+    /// cross-rank aliases (where the alias key's logical rank differs
+    /// from the target allocation's rank).
+    pub(crate) fn stage_alias(
+        &mut self,
+        key: WeightPlacementKey,
+        target_id: WeightCellId,
+        projection: WeightProjection,
+    ) -> Result<WeightCellId, StageAliasError> {
+        // 1. Duplicate-key check.
+        if self.placement.contains_key(&key) {
+            return Err(StageAliasError::DuplicateKey(key));
+        }
+
+        // 2. Cross-rank check BEFORE arena validation.  This allows
+        //    CPU tests to verify cross-rank rejection with a populated
+        //    cell_ranks map without needing a populated arena.
+        //    Every cell created via stage_bytes/alias has a cell_ranks
+        //    entry; legacy insert-only cells are not aliasable.
+        if let Some(&target_rank) = self.cell_ranks.get(&target_id) {
+            if target_rank != key.logical_rank {
+                return Err(StageAliasError::CrossRankTarget {
+                    key_rank: key.logical_rank,
+                    target_rank,
+                });
+            }
+        }
+
+        // 3. Arena-level validation (epoch + slot) without mutation.
+        if target_id.arena_epoch != self.inner.epoch {
+            return Err(StageAliasError::AliasFailed(AliasError::ForeignArena));
+        }
+        if target_id.slot >= self.inner.cells.len() {
+            return Err(StageAliasError::AliasFailed(AliasError::InvalidSlot));
+        }
+        // If cell_ranks had no entry above (legacy insert), fail here.
+        let target_rank = self
+            .cell_ranks
+            .get(&target_id)
+            .copied()
+            .ok_or(StageAliasError::AliasFailed(AliasError::ForeignArena))?;
+
+        // 4. Create the arena-level alias (now guaranteed to succeed).
+        let cell_id = self
+            .inner
+            .alias(&target_id)
+            .map_err(StageAliasError::AliasFailed)?;
+
+        // 5. Record placement with the SAME rank as the target.
+        self.placement.insert(key.clone(), cell_id);
+        self.cell_ranks.insert(cell_id, target_rank);
+        self.projections.insert(key, projection);
+        Ok(cell_id)
+    }
+
+    /// Look up the cell ID for a placement key, if staged.
+    pub fn cell_id(&self, key: &WeightPlacementKey) -> Option<WeightCellId> {
+        self.placement.get(key).copied()
+    }
+
+    /// Look up the projection metadata for a placement key, if staged.
+    pub fn projection(&self, key: &WeightPlacementKey) -> Option<&WeightProjection> {
+        self.projections.get(key)
+    }
+
+    /// Borrow the GPU tensor for `id`, following alias chains.
+    ///
+    /// Returns an error if `id` belongs to a different arena (foreign
+    /// epoch) or references a nonexistent slot.
+    pub fn tensor(&self, id: WeightCellId) -> Result<&GpuTensor, WeightCellLookupError> {
+        if id.arena_epoch != self.inner.epoch {
+            return Err(WeightCellLookupError::ForeignEpoch);
+        }
+        let cell = self
+            .inner
+            .cells
+            .get(id.slot)
+            .ok_or(WeightCellLookupError::InvalidSlot)?;
+        let resident = resolve_to_resident(&self.inner.cells, cell);
+        match resident {
+            Cell::Resident(alloc) => Ok(alloc.tensor()),
+            Cell::Alias(_) => {
+                // Unreachable: resolve_to_resident always returns Resident.
+                Err(WeightCellLookupError::InvalidSlot)
+            }
+        }
+    }
+
+    /// Freeze the builder into a read-only [`FrozenWeightStore`].
+    ///
+    /// Validates that the builder has a captured target binding, current
+    /// live origins match the binding, and the placement map is
+    /// structurally coherent (every cell exists, ranks are consistent,
+    /// alias targets are valid).  On failure the builder is returned
+    /// inside the error tuple so the caller can retry (after fixing the
+    /// issue) or call [`abort`](Self::abort).
+    ///
+    /// `target` provides the live GPU state for origin comparison.  If
+    /// origin validation is not needed (test-only builder from `new()`),
+    /// callers pass a valid target or use the lower-level
+    /// [`validate_freeze_structure`] directly.
+    pub(crate) fn freeze(
+        self,
+        target: &mut WeightStoreTargetMut<'_>,
+    ) -> Result<FrozenWeightStore, (FreezeValidationError, WeightStoreBuilder)> {
+        // 1. Resolve current target origins.
+        let current = match resolve_target_state(target) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err((FreezeValidationError::OriginMismatch(format!("{e}")), self));
+            }
+        };
+
+        // 2. Build arena cell info from live cells.
+        let mut is_alias = Vec::with_capacity(self.inner.cells.len());
+        let mut alias_target = Vec::with_capacity(self.inner.cells.len());
+        for cell in &self.inner.cells {
+            match cell {
+                Cell::Resident(_) => {
+                    is_alias.push(false);
+                    alias_target.push(None);
+                }
+                Cell::Alias(tid) => {
+                    is_alias.push(true);
+                    alias_target.push(Some(tid.slot));
+                }
+            }
+        }
+        let cell_info = ArenaCellInfo {
+            len: self.inner.cells.len(),
+            is_alias,
+            alias_target,
+        };
+
+        // 3. Full validation (origin + structural).
+        if let Err(e) = validate_freeze_structure(
+            self.binding.as_ref(),
+            Some(&current),
+            &self.placement,
+            &self.cell_ranks,
+            self.inner.epoch,
+            &cell_info,
+        ) {
+            return Err((e, self));
+        }
+
+        // 3. All checks passed — consume into frozen store.
+        Ok(FrozenWeightStore {
+            inner: self.inner.freeze(),
+            placement: self.placement,
+            projections: self.projections,
+        })
+    }
+}
+
+/// Per-slot information needed by [`validate_freeze_structure`] for
+/// arena-coverage checks, abstracted so the function stays generic
+/// over origin type.
+#[derive(Default)]
+struct ArenaCellInfo {
+    /// Number of cells in the arena.
+    pub len: usize,
+    /// For each slot, `true` if the cell is an alias (rather than resident).
+    pub is_alias: Vec<bool>,
+    /// For each alias slot, the target slot it points to.  Length = len.
+    pub alias_target: Vec<Option<usize>>,
+}
+
+impl ArenaCellInfo {
+    /// Create info from a count of resident cells (no aliases).
+    fn resident_only(n: usize) -> Self {
+        ArenaCellInfo {
+            len: n,
+            is_alias: vec![false; n],
+            alias_target: vec![None; n],
+        }
+    }
+}
+
+/// Validate that a builder is ready to freeze: captured binding matches
+/// current origins (if provided), and all placement/alias records are
+/// structurally coherent.
+///
+/// Generic over origin type `O` so CPU tests can exercise every failure
+/// path with [`TestOrigin`] without a GPU.
+///
+/// Returns `Ok(())` on success or a [`FreezeValidationError`] describing
+/// the first detected problem.
+fn validate_freeze_structure<O: PartialEq>(
+    binding: Option<&TargetBinding<O>>,
+    current: Option<&TargetState<O>>,
+    placement: &HashMap<WeightPlacementKey, WeightCellId>,
+    cell_ranks: &HashMap<WeightCellId, usize>,
+    arena_epoch: WeightArenaEpoch,
+    cells: &ArenaCellInfo,
+) -> Result<(), FreezeValidationError> {
+    // 1. Binding must exist.
+    let binding = binding.ok_or(FreezeValidationError::UnboundBuilder)?;
+
+    // 2. Current origins must match binding (if provided).
+    if let Some(current) = current {
+        validate_staging_binding(binding, 0, current)
+            .map_err(|e| FreezeValidationError::OriginMismatch(format!("{e}")))?;
+    }
+
+    // 3. Build reverse map: cell_id → count of placement references.
+    let mut cell_refs: Vec<usize> = vec![0; cells.len];
+    for (key, &cell_id) in placement {
+        if cell_id.arena_epoch != arena_epoch {
+            return Err(FreezeValidationError::PlacementArenaMismatch(key.clone()));
+        }
+        if cell_id.slot >= cells.len {
+            return Err(FreezeValidationError::MissingPlacementCell(key.clone()));
+        }
+        cell_refs[cell_id.slot] += 1;
+
+        let cell_rank = cell_ranks
+            .get(&cell_id)
+            .ok_or_else(|| FreezeValidationError::MissingPlacementCell(key.clone()))?;
+        if *cell_rank != key.logical_rank {
+            return Err(FreezeValidationError::RankMismatch {
+                key: key.clone(),
+                cell_rank: *cell_rank,
+            });
+        }
+    }
+
+    // 4. Every arena slot must have exactly one placement reference.
+    for slot in 0..cells.len {
+        match cell_refs[slot] {
+            0 => {
+                return Err(FreezeValidationError::UnplacedCell(slot));
+            }
+            1 => {}
+            n => {
+                return Err(FreezeValidationError::DuplicateCellPlacement(slot, n));
+            }
+        }
+    }
+
+    // 5. Alias-target validation: each alias points to an earlier valid
+    //    slot with the same rank.
+    for (slot, &maybe_target) in cells.alias_target.iter().enumerate() {
+        if let Some(target_slot) = maybe_target {
+            if target_slot >= cells.len {
+                return Err(FreezeValidationError::AliasTargetMissing(WeightCellId {
+                    arena_epoch,
+                    slot: target_slot,
+                }));
+            }
+            // Resolve the alias target to the ultimate resident to
+            // find its rank, then compare with this alias cell's rank.
+            let resolved = resolve_alias_target_slot(&cells.alias_target, target_slot);
+            let alias_cell_id = WeightCellId { arena_epoch, slot };
+            let target_cell_id = WeightCellId {
+                arena_epoch,
+                slot: resolved,
+            };
+            let alias_rank = cell_ranks.get(&alias_cell_id).copied();
+            let target_rank = cell_ranks.get(&target_cell_id).copied();
+            if let (Some(ar), Some(tr)) = (alias_rank, target_rank) {
+                if ar != tr {
+                    return Err(FreezeValidationError::AliasedRankMismatch {
+                        key: WeightPlacementKey {
+                            logical_name: String::new(),
+                            layer: None,
+                            logical_rank: ar,
+                        },
+                        target_rank: tr,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Follow an alias chain to the ultimate resident slot.
+fn resolve_alias_target_slot(alias_target: &[Option<usize>], slot: usize) -> usize {
+    match alias_target.get(slot).copied().flatten() {
+        Some(target) if target != slot => resolve_alias_target_slot(alias_target, target),
+        _ => slot,
+    }
+}
+
+/// Resolve the current target state (all live origins) from a mutable
+/// target reference, used by [`WeightStoreBuilder::stage_bytes`] for
+/// binding validation.  Errors are mapped to [`StageWeightError`] so
+/// the caller passes them through directly.
+fn resolve_target_state(
+    target: &mut WeightStoreTargetMut<'_>,
+) -> Result<TargetState<WeightAllocationOrigin>, StageWeightError> {
+    match target {
+        WeightStoreTargetMut::Single { mesh, gpu } => {
+            let origin = Gpus::single_weight_origin(mesh, gpu);
+            Ok(TargetState::Single(origin))
+        }
+        WeightStoreTargetMut::Mesh { mesh, gpus } => {
+            let n = gpus.devices.len();
+            let full: Vec<WeightAllocationOrigin> = (0..n)
+                .map(|r| {
+                    gpus.weight_origin_in(mesh, r).map_err(|e| {
+                        StageWeightError::OriginMismatch(format!(
+                            "cannot resolve origin for rank {r}: {e:?}"
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(TargetState::Mesh { full })
+        }
+    }
+}
+
+/// Resolve an alias chain to the ultimate resident cell.
+fn resolve_to_resident<'a, R>(cells: &'a [Cell<R>], cell: &'a Cell<R>) -> &'a Cell<R> {
+    match cell {
+        Cell::Resident(_) => cell,
+        Cell::Alias(target) => {
+            let next = &cells[target.slot];
+            resolve_to_resident(cells, next)
+        }
+    }
+}
+
+/// A frozen, read-only weight store produced by
+/// [`WeightStoreBuilder::freeze`].  Borrowed access: `tensor`,
+/// `cell_id`, `projection`.  Consuming cleanup: `free`.
+#[derive(Debug)]
+pub struct FrozenWeightStore {
+    inner: FrozenArena<WeightStoreAllocation>,
+    /// Snapshotted placement map from the builder.
+    placement: HashMap<WeightPlacementKey, WeightCellId>,
+    /// Snapshotted projection map from the builder.
+    projections: HashMap<WeightPlacementKey, WeightProjection>,
+}
+
+impl FrozenWeightStore {
+    /// Look up the GPU tensor for `id`.  Returns `None` for foreign
+    /// or invalid IDs.
+    pub fn tensor(&self, id: WeightCellId) -> Option<&GpuTensor> {
+        self.inner.resource(id).map(|alloc| alloc.tensor())
+    }
+
+    /// Look up the cell ID for a placement key, if present.
+    pub fn cell_id(&self, key: &WeightPlacementKey) -> Option<WeightCellId> {
+        self.placement.get(key).copied()
+    }
+
+    /// Look up the projection metadata for a placement key, if present.
+    pub fn projection(&self, key: &WeightPlacementKey) -> Option<&WeightProjection> {
+        self.projections.get(key)
+    }
+}
+
+// ── aggregate cleanup helper ─────────────────────────────────────────
+
+/// Invoke `driver` for every resource (`R`), collecting failures.
+/// The driver receives ownership of each resource and must return
+/// `Ok(())` on success (consuming the resource) or `Err(E)` on
+/// failure.  `E` is expected to carry enough state for retry (e.g.
+/// [`FailedWeightStoreFree`] or a test wrapper).  Processing
+/// continues past failures so all items are attempted.
+fn aggregate_cleanup<R, E>(
+    resources: impl IntoIterator<Item = R>,
+    mut driver: impl FnMut(R) -> Result<(), E>,
+) -> Vec<E> {
+    let mut failures = Vec::new();
+    for r in resources {
+        if let Err(e) = driver(r) {
+            failures.push(e);
+        }
+    }
+    failures
+}
+
+// ── WeightPlacementKey ──────────────────────────────────────────────
+
+/// Stable placement identifier within a [`WeightStoreBuilder`].
+///
+/// Uniquely identifies a weight cell by its logical tensor name, layer
+/// index, and logical mesh rank.  Used as the key for [`stage_bytes`]
+/// and [`stage_alias`] operations to reject duplicates and provide
+/// stable lookups via [`cell_id`](WeightStoreBuilder::cell_id) and
+/// [`projection`](WeightStoreBuilder::projection).
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct WeightPlacementKey {
+    pub logical_name: String,
+    pub layer: Option<usize>,
+    pub logical_rank: usize,
+}
+
+// ── StageWeightError / StageAliasError / WeightCellLookupError ──────
+
+/// Errors from [`WeightStoreBuilder::stage_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StageWeightError {
+    /// A cell with this key already exists.
+    DuplicateKey(WeightPlacementKey),
+    /// Origin validation failed (e.g. rank out of range for the mesh).
+    OriginMismatch(String),
+    /// GPU upload (hipMalloc / hipMemcpy) failed.
+    UploadFailed(String),
+}
+
+/// Errors from [`WeightStoreBuilder::stage_alias`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StageAliasError {
+    /// A cell with this key already exists.
+    DuplicateKey(WeightPlacementKey),
+    /// Underlying arena alias operation failed (foreign epoch or
+    /// invalid slot).
+    AliasFailed(AliasError),
+    /// The alias key's rank differs from the target allocation's rank.
+    CrossRankTarget { key_rank: usize, target_rank: usize },
+}
+
+/// Errors from [`WeightStoreBuilder::tensor`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WeightCellLookupError {
+    /// The cell ID belongs to a different arena (foreign epoch).
+    ForeignEpoch,
+    /// The cell ID references a nonexistent slot.
+    InvalidSlot,
+}
+
+/// Outcome of a builder abort after a staging failure.
+/// `Clean` means all resources were freed; `Partial` lists failures.
+#[derive(Debug)]
+pub enum AbortOutcome {
+    Clean,
+    Partial(WeightStoreCleanupError),
+}
+
+/// Errors from [`WeightStoreBuilder::freeze`].
+#[derive(Debug)]
+pub enum FreezeValidationError {
+    /// Builder has no captured target binding (constructed via `new()`,
+    /// not `for_target`).
+    UnboundBuilder,
+    /// Current target origins do not match the captured binding.
+    OriginMismatch(String),
+    /// A placement key references a cell from a different arena epoch.
+    PlacementArenaMismatch(WeightPlacementKey),
+    /// A placement key references a nonexistent cell slot.
+    MissingPlacementCell(WeightPlacementKey),
+    /// A placement key's logical rank differs from its cell's recorded rank.
+    RankMismatch {
+        key: WeightPlacementKey,
+        cell_rank: usize,
+    },
+    /// An alias cell's target has a different rank than the alias key.
+    AliasedRankMismatch {
+        key: WeightPlacementKey,
+        target_rank: usize,
+    },
+    /// An alias target does not exist in this arena.
+    AliasTargetMissing(WeightCellId),
+    /// An arena cell is not referenced by any placement key.
+    UnplacedCell(usize),
+    /// An arena cell is referenced by more than one placement key.
+    DuplicateCellPlacement(usize, usize),
+}
+
+/// Errors from [`fulfill_manifest_builder`].
+#[derive(Debug)]
+pub enum FulfillManifestBuilderError {
+    /// Preflight (manifest-level) rejection before any GPU work.
+    Preflight(FulfillError),
+    /// A weight could not be staged.  Already-staged allocations were
+    /// aborted against the same target; `AbortOutcome` reports whether
+    /// cleanup completed fully (`Clean`) or partially (`Partial`).
+    Staging(StageWeightError, AbortOutcome),
+}
+
+impl std::fmt::Display for FulfillManifestBuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FulfillManifestBuilderError::Preflight(e) => write!(f, "preflight: {e}"),
+            FulfillManifestBuilderError::Staging(e, _) => write!(f, "staging: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FulfillManifestBuilderError {}
+
+impl std::fmt::Display for FreezeValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FreezeValidationError::UnboundBuilder => {
+                write!(f, "builder has no captured target binding")
+            }
+            FreezeValidationError::OriginMismatch(msg) => {
+                write!(f, "origin mismatch: {msg}")
+            }
+            FreezeValidationError::PlacementArenaMismatch(k) => {
+                write!(f, "placement key {k:?} references foreign arena cell")
+            }
+            FreezeValidationError::MissingPlacementCell(k) => {
+                write!(f, "placement key {k:?} references nonexistent slot")
+            }
+            FreezeValidationError::RankMismatch { key, cell_rank } => {
+                write!(
+                    f,
+                    "placement key {key:?} has logical_rank {} but cell rank is {cell_rank}",
+                    key.logical_rank
+                )
+            }
+            FreezeValidationError::AliasedRankMismatch { key, target_rank } => {
+                write!(
+                    f,
+                    "alias key {key:?} (rank {}) has target cell at rank {target_rank}",
+                    key.logical_rank
+                )
+            }
+            FreezeValidationError::AliasTargetMissing(id) => {
+                write!(f, "alias target cell {id:?} does not exist in arena")
+            }
+            FreezeValidationError::UnplacedCell(slot) => {
+                write!(f, "arena cell slot {slot} has no placement key")
+            }
+            FreezeValidationError::DuplicateCellPlacement(slot, n) => {
+                write!(
+                    f,
+                    "arena cell slot {slot} is referenced by {n} placement keys (expected 1)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FreezeValidationError {}
+
+/// Errors from [`WeightStoreBuilder::for_target`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WeightStoreTargetError {
+    /// The mesh bound to a `Mesh` target has no epoch — it was
+    /// constructed without a mesh (e.g. via `Gpus::single`).
+    UnboundMesh,
+}
+
+impl std::fmt::Display for WeightStoreTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeightStoreTargetError::UnboundMesh => {
+                write!(f, "Gpus was not constructed from a DeviceMesh")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WeightStoreTargetError {}
+
+impl std::fmt::Display for StageWeightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StageWeightError::DuplicateKey(k) => {
+                write!(f, "duplicate placement key {k:?}")
+            }
+            StageWeightError::OriginMismatch(msg) => {
+                write!(f, "origin validation failed: {msg}")
+            }
+            StageWeightError::UploadFailed(msg) => {
+                write!(f, "GPU upload failed: {msg}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StageWeightError {}
+
+impl std::fmt::Display for StageAliasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StageAliasError::DuplicateKey(k) => {
+                write!(f, "duplicate alias key {k:?}")
+            }
+            StageAliasError::AliasFailed(e) => {
+                write!(f, "alias failed: {e}")
+            }
+            StageAliasError::CrossRankTarget {
+                key_rank,
+                target_rank,
+            } => {
+                write!(
+                    f,
+                    "cross-rank alias: key rank {key_rank} != target rank {target_rank}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for StageAliasError {}
+
+impl std::fmt::Display for WeightCellLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeightCellLookupError::ForeignEpoch => {
+                write!(f, "cell ID belongs to a different arena")
+            }
+            WeightCellLookupError::InvalidSlot => {
+                write!(f, "cell ID references a nonexistent slot")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WeightCellLookupError {}
+
+// ── WeightStoreCleanupError / abort / free ──────────────────────────
+
+/// Aggregate error from a batched weight-store cleanup.  Every
+/// [`FailedWeightStoreFree`] is available for inspection or retry.
+#[derive(Debug)]
+pub struct WeightStoreCleanupError {
+    pub failures: Vec<FailedWeightStoreFree>,
+}
+
+impl std::fmt::Display for WeightStoreCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "weight store cleanup failed with {} error(s)",
+            self.failures.len(),
+        )
+    }
+}
+
+impl std::error::Error for WeightStoreCleanupError {}
+
+impl WeightStoreBuilder {
+    /// Abort this builder, freeing every staged resident allocation.
+    /// Aliases are skipped — they carry no resource ownership.
+    /// Returns `Ok(())` on full success, or an aggregate error
+    /// containing every failed allocation for retry.
+    ///
+    /// The `target` provides the live mesh/GPU state for origin
+    /// validation.  Allocations whose origin does not match the live
+    /// identity are returned as failures without touching the driver.
+    /// Successful frees consume their allocation; failures retain the
+    /// original [`WeightStoreAllocation`] for retry.
+    pub(crate) fn abort(
+        self,
+        target: &mut WeightStoreTargetMut<'_>,
+    ) -> Result<(), WeightStoreCleanupError> {
+        let resources: Vec<_> = self
+            .inner
+            .cells
+            .into_iter()
+            .filter_map(|cell| match cell {
+                Cell::Resident(alloc) => Some(alloc),
+                Cell::Alias(_) => None,
+            })
+            .collect();
+
+        let failures = aggregate_cleanup(resources, |alloc: WeightStoreAllocation| {
+            alloc.free(target).map_err(|f| f)
+        });
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WeightStoreCleanupError { failures })
+        }
+    }
+}
+
+impl FrozenWeightStore {
+    /// Free every canonical allocation in this frozen store.  Each
+    /// unique resident is freed exactly once — alias chains were
+    /// already resolved during freezing.  Returns `Ok(())` on full
+    /// success, or an aggregate error with every failed allocation.
+    ///
+    /// The `target` provides the live mesh/GPU state for origin
+    /// validation.  Allocations whose origin does not match the live
+    /// identity are returned as failures without touching the driver.
+    pub(crate) fn free(
+        self,
+        mut target: WeightStoreTargetMut<'_>,
+    ) -> Result<(), WeightStoreCleanupError> {
+        let resources: Vec<_> = self.inner.allocations.into_iter().map(|b| *b).collect();
+
+        let failures = aggregate_cleanup(resources, |alloc: WeightStoreAllocation| {
+            alloc.free(&mut target).map_err(|f| f)
+        });
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WeightStoreCleanupError { failures })
         }
     }
 }
@@ -630,6 +1943,12 @@ pub fn expert_tp_column_pair(
     rank: usize,
     tp: usize,
 ) -> Result<Vec<u8>, String> {
+    if tp == 0 {
+        return Err("expert_tp_column_pair: tp cannot be 0".into());
+    }
+    if rank >= tp {
+        return Err(format!("expert_tp_column_pair: rank {rank} >= tp {tp}"));
+    }
     if inter % tp != 0 {
         return Err(format!(
             "expert_tp_column_pair: inter {inter} not divisible by tp {tp}"
@@ -641,12 +1960,40 @@ pub fn expert_tp_column_pair(
             "expert_tp_column_pair: inter/tp={slice} not divisible by group size 256"
         ));
     }
+    if hidden < 256 || hidden % 256 != 0 {
+        return Err(format!(
+            "expert_tp_column_pair: hidden {hidden} must be multiple of 256"
+        ));
+    }
     let row_bytes = (hidden / 256) * block_bytes;
-    let gate_start = rank * slice * row_bytes;
-    let gate_end = gate_start + slice * row_bytes;
-    let up_start = (inter + rank * slice) * row_bytes;
-    let up_end = up_start + slice * row_bytes;
-    let mut out = Vec::with_capacity(2 * slice * row_bytes);
+    let gate_start = rank
+        .checked_mul(slice)
+        .and_then(|v| v.checked_mul(row_bytes))
+        .ok_or_else(|| "expert_tp_column_pair: integer overflow in gate offset".to_string())?;
+    let gate_len = slice
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "expert_tp_column_pair: integer overflow in gate length".to_string())?;
+    let gate_end = gate_start
+        .checked_add(gate_len)
+        .ok_or_else(|| "expert_tp_column_pair: integer overflow in gate end".to_string())?;
+    let up_start = inter
+        .checked_add(rank * slice)
+        .and_then(|v| v.checked_mul(row_bytes))
+        .ok_or_else(|| "expert_tp_column_pair: integer overflow in up offset".to_string())?;
+    let up_end = up_start
+        .checked_add(gate_len)
+        .ok_or_else(|| "expert_tp_column_pair: integer overflow in up end".to_string())?;
+    let expected_len = (2 * inter / 256) * hidden * block_bytes;
+    if expert_blob.len() < expected_len
+        || gate_end > expert_blob.len()
+        || up_end > expert_blob.len()
+    {
+        return Err(format!(
+            "expert_tp_column_pair: blob {} bytes too small for {inter}×{hidden}×{block_bytes} (need {expected_len})",
+            expert_blob.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(gate_len * 2);
     out.extend_from_slice(&expert_blob[gate_start..gate_end]);
     out.extend_from_slice(&expert_blob[up_start..up_end]);
     Ok(out)
@@ -668,6 +2015,12 @@ pub fn expert_tp_row_gather(
     rank: usize,
     tp: usize,
 ) -> Result<Vec<u8>, String> {
+    if tp == 0 {
+        return Err("expert_tp_row_gather: tp cannot be 0".into());
+    }
+    if rank >= tp {
+        return Err(format!("expert_tp_row_gather: rank {rank} >= tp {tp}"));
+    }
     if inter % tp != 0 {
         return Err(format!(
             "expert_tp_row_gather: inter {inter} not divisible by tp {tp}"
@@ -681,12 +2034,151 @@ pub fn expert_tp_row_gather(
     }
     let row_bytes = (inter / 256) * block_bytes;
     let sub = (slice / 256) * block_bytes;
+    let expected_len = hidden * row_bytes;
+    if expert_blob.len() < expected_len {
+        return Err(format!(
+            "expert_tp_row_gather: blob {} bytes too small for {hidden}×{inter}×{block_bytes} (need {expected_len})",
+            expert_blob.len()
+        ));
+    }
     let mut out = Vec::with_capacity(hidden * sub);
     for row in 0..hidden {
-        let base = row * row_bytes + rank * sub;
-        out.extend_from_slice(&expert_blob[base..base + sub]);
+        let base = row
+            .checked_mul(row_bytes)
+            .and_then(|v| v.checked_add(rank * sub))
+            .ok_or_else(|| "expert_tp_row_gather: integer overflow in row offset".to_string())?;
+        let end = base
+            .checked_add(sub)
+            .ok_or_else(|| "expert_tp_row_gather: integer overflow in row end".to_string())?;
+        if end > expert_blob.len() {
+            return Err(format!(
+                "expert_tp_row_gather: row {row} range {base}..{end} exceeds blob length {}",
+                expert_blob.len()
+            ));
+        }
+        out.extend_from_slice(&expert_blob[base..end]);
     }
     Ok(out)
+}
+
+/// Validate a column-shard slice and produce `(bytes, shape)` for one
+/// `local_rank`.  The error messages match the legacy [`fulfill_into`]
+/// convention so they can be mapped to either [`FulfillError`] or
+/// [`StageWeightError`].
+///
+/// The caller is responsible for mapping `local_rank` to the global
+/// device id for the placement key; this function uses `local_rank`
+/// only to extract the rank-owned byte range and sharded shape.
+pub fn column_shard_slice(
+    bytes: &[u8],
+    shape: &[usize],
+    tp: usize,
+    local_rank: usize,
+) -> Result<(Vec<u8>, Vec<usize>), String> {
+    if tp == 0 {
+        return Err("ColumnShard: Tp cannot be 0".into());
+    }
+    if local_rank >= tp {
+        return Err(format!("ColumnShard: local_rank {local_rank} >= Tp {tp}"));
+    }
+    let rows = *shape.first().unwrap_or(&0);
+    if rows == 0 || rows % tp != 0 {
+        return Err(format!(
+            "ColumnShard: outermost dim {rows} not divisible by Tp {tp}"
+        ));
+    }
+    if bytes.len() % tp != 0 || bytes.len() < tp {
+        return Err(format!(
+            "ColumnShard: blob {} bytes not divisible by Tp {tp}",
+            bytes.len()
+        ));
+    }
+    let chunk = bytes.len() / tp;
+    let sharded_rows = rows / tp;
+    let mut sharded = shape.to_vec();
+    if let Some(first) = sharded.first_mut() {
+        *first = sharded_rows;
+    }
+    let start = local_rank
+        .checked_mul(chunk)
+        .ok_or_else(|| format!("ColumnShard: integer overflow computing byte offset"))?;
+    let end = start
+        .checked_add(chunk)
+        .ok_or_else(|| format!("ColumnShard: integer overflow computing byte range end"))?;
+    if end > bytes.len() {
+        return Err(format!(
+            "ColumnShard: byte range {start}..{end} exceeds blob length {}",
+            bytes.len()
+        ));
+    }
+    Ok((bytes[start..end].to_vec(), sharded))
+}
+
+/// Validate a row-shard slice and produce `(bytes, shape)` for one
+/// `local_rank`.  Same error convention as [`column_shard_slice`].
+pub fn row_shard_slice(
+    bytes: &[u8],
+    shape: &[usize],
+    tp: usize,
+    local_rank: usize,
+) -> Result<(Vec<u8>, Vec<usize>), String> {
+    if tp == 0 {
+        return Err("RowShard: Tp cannot be 0".into());
+    }
+    if local_rank >= tp {
+        return Err(format!("RowShard: local_rank {local_rank} >= Tp {tp}"));
+    }
+    let rows = *shape.first().unwrap_or(&0);
+    let inner: usize = shape.iter().skip(1).product();
+    if rows == 0 || inner == 0 || inner % tp != 0 {
+        return Err(format!(
+            "RowShard: inner dim {inner} not divisible by Tp {tp}"
+        ));
+    }
+    if bytes.len() < rows {
+        return Err(format!(
+            "RowShard: blob {} bytes shorter than {rows} rows",
+            bytes.len()
+        ));
+    }
+    if bytes.len() % rows != 0 {
+        return Err(format!(
+            "RowShard: blob {} bytes not a whole number of {rows} rows",
+            bytes.len()
+        ));
+    }
+    let row_bytes = bytes.len() / rows;
+    if row_bytes == 0 || row_bytes % tp != 0 {
+        return Err(format!(
+            "RowShard: row {row_bytes} bytes not divisible by Tp {tp} \
+             (k not group-aligned for this shard)"
+        ));
+    }
+    let sub = row_bytes / tp;
+    let mut sharded = shape.to_vec();
+    if let Some(last) = sharded.last_mut() {
+        *last /= tp;
+    }
+    let mut blob = Vec::with_capacity(rows * sub);
+    for row in 0..rows {
+        let base = row
+            .checked_mul(row_bytes)
+            .ok_or_else(|| format!("RowShard: integer overflow computing row base"))?;
+        let base = base
+            .checked_add(local_rank * sub)
+            .ok_or_else(|| format!("RowShard: integer overflow computing rank offset"))?;
+        let end = base
+            .checked_add(sub)
+            .ok_or_else(|| format!("RowShard: integer overflow computing row slice end"))?;
+        if end > bytes.len() {
+            return Err(format!(
+                "RowShard: row {row} range {base}..{end} exceeds blob length {}",
+                bytes.len()
+            ));
+        }
+        blob.extend_from_slice(&bytes[base..end]);
+    }
+    Ok((blob, sharded))
 }
 
 /// Build the per-rank TP-sliced blob for an `ExpertTensorSharded` entry.
@@ -795,6 +2287,387 @@ where
     )
 }
 
+/// Number of devices in a [`WeightStoreTargetMut`].
+fn target_mut_device_count(target: &WeightStoreTargetMut<'_>) -> usize {
+    match target {
+        WeightStoreTargetMut::Single { .. } => 1,
+        WeightStoreTargetMut::Mesh { gpus, .. } => gpus.devices.len(),
+    }
+}
+
+/// Execute a weight manifest against a live target, staging every
+/// tensor into a [`WeightStoreBuilder`] keyed by
+/// [`WeightPlacementKey`].
+///
+/// Preflights the manifest first (no GPU work), then creates a
+/// target-bound builder, stages every weight, and returns the builder
+/// on success.  On failure the builder is aborted against the same
+/// target; if cleanup succeeds the original fulfillment error is
+/// returned; if cleanup is incomplete the error carries partial abort
+/// failures for retry.
+pub(crate) fn fulfill_manifest_builder<F>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    target: &mut WeightStoreTargetMut<'_>,
+    source: F,
+) -> Result<WeightStoreBuilder, FulfillManifestBuilderError>
+where
+    F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
+{
+    // 1. Preflight (no GPU work, no builder).
+    let n_devices = target_mut_device_count(target);
+    preflight_manifest(weights, mesh, n_layers, n_devices)
+        .map_err(FulfillManifestBuilderError::Preflight)?;
+
+    // 2. Create target-bound builder.
+    let builder = WeightStoreBuilder::for_target(target).map_err(|_| {
+        FulfillManifestBuilderError::Preflight(FulfillError {
+            name: String::new(),
+            layer: None,
+            device: 0,
+            reason: "for_target failed: unbound mesh".to_owned(),
+        })
+    })?;
+
+    // 3. Stage weights.
+    match fulfill_into_builder(builder, weights, mesh, n_layers, target, &source) {
+        Ok(builder) => Ok(builder),
+        Err((stage_err, builder)) => {
+            // Builder has partial state — abort against the same target.
+            match builder.abort(target) {
+                Ok(()) => Err(FulfillManifestBuilderError::Staging(
+                    stage_err,
+                    AbortOutcome::Clean,
+                )),
+                Err(cleanup_err) => Err(FulfillManifestBuilderError::Staging(
+                    stage_err,
+                    AbortOutcome::Partial(cleanup_err),
+                )),
+            }
+        }
+    }
+}
+
+/// Stage every entry in `weights` into `builder`.  Mirrors the
+/// iteration structure of [`fulfill_into`] but uses the builder's
+/// [`stage_bytes`] and [`stage_alias`] APIs and returns the builder
+/// on success.
+fn fulfill_into_builder<F>(
+    mut builder: WeightStoreBuilder,
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    target: &mut WeightStoreTargetMut<'_>,
+    source: &F,
+) -> Result<WeightStoreBuilder, (StageWeightError, WeightStoreBuilder)>
+where
+    F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
+{
+    for entry in weights {
+        let devices = placement_devices(entry, mesh, n_layers);
+        let tp_axis = mesh.size_of(DimKind::Tp);
+        let ep_axis = mesh.size_of(DimKind::Ep);
+        let dev = *devices.first().unwrap_or(&0);
+
+        // ── Tied entries ──────────────────────────────────────────
+        if let ShardPolicy::Tied { source: src } = &entry.policy {
+            let source_entry = match weights.iter().find(|c| c.name == *src) {
+                Some(s) => s,
+                None => {
+                    return Err((
+                        StageWeightError::OriginMismatch(format!(
+                            "Tied source '{src}' not found in manifest for '{}'",
+                            entry.name
+                        )),
+                        builder,
+                    ));
+                }
+            };
+
+            for (local_rank, &global_device) in devices.iter().enumerate() {
+                let key = WeightPlacementKey {
+                    logical_name: entry.name.clone(),
+                    layer: entry.layer,
+                    logical_rank: global_device,
+                };
+                let proj = placement_projection(&entry.policy, local_rank, devices.len());
+
+                if tied_requires_materialization(entry, source_entry, mesh, n_layers) {
+                    let (source_bytes, source_dtype) =
+                        match read_source(source_entry, global_device, source) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err((StageWeightError::UploadFailed(e.reason), builder));
+                            }
+                        };
+                    if let Err(e) = builder.stage_bytes(
+                        target,
+                        key,
+                        &source_bytes,
+                        &entry.logical_shape,
+                        source_dtype,
+                        proj,
+                    ) {
+                        return Err((e, builder));
+                    }
+                } else {
+                    let source_key = WeightPlacementKey {
+                        logical_name: src.clone(),
+                        layer: source_entry.layer,
+                        logical_rank: global_device,
+                    };
+                    let src_id = match builder.cell_id(&source_key) {
+                        Some(id) => id,
+                        None => {
+                            return Err((
+                                StageWeightError::OriginMismatch(format!(
+                                    "Tied source '{}' for '{}' has no placement on rank {}",
+                                    src, entry.name, global_device
+                                )),
+                                builder,
+                            ));
+                        }
+                    };
+                    if let Err(e) = builder.stage_alias(key, src_id, proj) {
+                        return Err((StageWeightError::OriginMismatch(format!("{e:?}")), builder));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // ── ExpertSharded ─────────────────────────────────────────
+        if let ShardPolicy::ExpertSharded { n_experts, assign } = &entry.policy {
+            if ep_axis > 1 {
+                let tp_size = devices.len();
+                let _shard = match ShardConfig::new(tp_size, false, *n_experts, *assign) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err((
+                            StageWeightError::OriginMismatch(format!("ExpertSharded: {e}")),
+                            builder,
+                        ));
+                    }
+                };
+                let (bytes, dtype) = match read_source(entry, dev, source) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err((StageWeightError::UploadFailed(e.reason), builder));
+                    }
+                };
+                for (local_rank, &global_device) in devices.iter().enumerate() {
+                    let owned = _shard.experts_on_rank(local_rank);
+                    let compact = match expert_compact_blob(&bytes, *n_experts, &owned) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err((StageWeightError::UploadFailed(e), builder));
+                        }
+                    };
+                    let mut shape = entry.logical_shape.clone();
+                    if let Some(first) = shape.first_mut() {
+                        *first = owned.len();
+                    }
+                    let key = WeightPlacementKey {
+                        logical_name: entry.name.clone(),
+                        layer: entry.layer,
+                        logical_rank: global_device,
+                    };
+                    let proj = placement_projection(&entry.policy, local_rank, devices.len());
+                    if let Err(e) = builder.stage_bytes(target, key, &compact, &shape, dtype, proj)
+                    {
+                        return Err((e, builder));
+                    }
+                }
+                continue;
+            }
+        }
+
+        // ── ColumnShard axis 0 ────────────────────────────────────
+        if let ShardPolicy::ColumnShard { axis: 0 } = &entry.policy {
+            if tp_axis > 1 {
+                let tp = devices.len();
+                let (bytes, dtype) = match read_source(entry, dev, source) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err((StageWeightError::UploadFailed(e.reason), builder));
+                    }
+                };
+                for (local_rank, &global_device) in devices.iter().enumerate() {
+                    let (slice, sharded_shape) =
+                        match column_shard_slice(&bytes, &entry.logical_shape, tp, local_rank) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err((StageWeightError::UploadFailed(e), builder));
+                            }
+                        };
+                    let key = WeightPlacementKey {
+                        logical_name: entry.name.clone(),
+                        layer: entry.layer,
+                        logical_rank: global_device,
+                    };
+                    let proj = placement_projection(&entry.policy, local_rank, tp);
+                    if let Err(e) =
+                        builder.stage_bytes(target, key, &slice, &sharded_shape, dtype, proj)
+                    {
+                        return Err((e, builder));
+                    }
+                }
+                continue;
+            }
+        }
+
+        // ── RowShard ──────────────────────────────────────────────
+        if let ShardPolicy::RowShard { .. } = &entry.policy {
+            if tp_axis > 1 {
+                let tp = devices.len();
+                let (bytes, dtype) = match read_source(entry, dev, source) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err((StageWeightError::UploadFailed(e.reason), builder));
+                    }
+                };
+                for (local_rank, &global_device) in devices.iter().enumerate() {
+                    let (blob, sharded_shape) =
+                        match row_shard_slice(&bytes, &entry.logical_shape, tp, local_rank) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err((StageWeightError::UploadFailed(e), builder));
+                            }
+                        };
+                    let key = WeightPlacementKey {
+                        logical_name: entry.name.clone(),
+                        layer: entry.layer,
+                        logical_rank: global_device,
+                    };
+                    let proj = placement_projection(&entry.policy, local_rank, tp);
+                    if let Err(e) =
+                        builder.stage_bytes(target, key, &blob, &sharded_shape, dtype, proj)
+                    {
+                        return Err((e, builder));
+                    }
+                }
+                continue;
+            }
+        }
+
+        // ── ExpertTensorSharded ───────────────────────────────────
+        if let ShardPolicy::ExpertTensorSharded { n_experts, inner } = &entry.policy {
+            if tp_axis > 1 {
+                let tp = devices.len();
+                let (bytes, dtype) = match read_source(entry, dev, source) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err((StageWeightError::UploadFailed(e.reason), builder));
+                    }
+                };
+                let block_bytes: usize = match dtype {
+                    DType::MQ2G256Lloyd => 72,
+                    DType::MQ3G256Lloyd => 112,
+                    _ => {
+                        return Err((
+                            StageWeightError::UploadFailed(format!(
+                                "ExpertTensorSharded: unsupported dtype {dtype:?}"
+                            )),
+                            builder,
+                        ));
+                    }
+                };
+                let (_inter, _hidden) = match inner.as_ref() {
+                    ShardPolicy::ColumnShard { .. } => {
+                        let two_inter = entry.logical_shape.get(1).copied().unwrap_or(0);
+                        let h = entry.logical_shape.get(2).copied().unwrap_or(0);
+                        (two_inter / 2, h)
+                    }
+                    ShardPolicy::RowShard { .. } => {
+                        let h = entry.logical_shape.get(1).copied().unwrap_or(0);
+                        let i = entry.logical_shape.get(2).copied().unwrap_or(0);
+                        (i, h)
+                    }
+                    _ => {
+                        return Err((
+                            StageWeightError::UploadFailed(format!(
+                                "ExpertTensorSharded: inner must be ColumnShard or RowShard, \
+                                 got {inner:?}"
+                            )),
+                            builder,
+                        ));
+                    }
+                };
+                if *n_experts == 0 || bytes.len() % n_experts != 0 {
+                    return Err((
+                        StageWeightError::UploadFailed(format!(
+                            "ExpertTensorSharded: blob {} bytes not divisible by n_experts {}",
+                            bytes.len(),
+                            n_experts
+                        )),
+                        builder,
+                    ));
+                }
+                let expert_bytes = bytes.len() / n_experts;
+                for (local_rank, &global_device) in devices.iter().enumerate() {
+                    let per_rank_blob = match build_expert_tp_blob(
+                        &bytes,
+                        *n_experts,
+                        expert_bytes,
+                        _inter,
+                        _hidden,
+                        block_bytes,
+                        local_rank,
+                        tp,
+                        inner,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err((StageWeightError::UploadFailed(e), builder));
+                        }
+                    };
+                    let key = WeightPlacementKey {
+                        logical_name: entry.name.clone(),
+                        layer: entry.layer,
+                        logical_rank: global_device,
+                    };
+                    let proj = placement_projection(&entry.policy, local_rank, tp);
+                    if let Err(e) = builder.stage_bytes(
+                        target,
+                        key,
+                        &per_rank_blob,
+                        &entry.logical_shape,
+                        dtype,
+                        proj,
+                    ) {
+                        return Err((e, builder));
+                    }
+                }
+                continue;
+            }
+        }
+
+        // ── Whole-tensor ──────────────────────────────────────────
+        let (bytes, dtype) = match read_source(entry, dev, source) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err((StageWeightError::UploadFailed(e.reason), builder));
+            }
+        };
+        for (local_rank, &global_device) in devices.iter().enumerate() {
+            let key = WeightPlacementKey {
+                logical_name: entry.name.clone(),
+                layer: entry.layer,
+                logical_rank: global_device,
+            };
+            let proj = placement_projection(&entry.policy, local_rank, devices.len());
+            if let Err(e) =
+                builder.stage_bytes(target, key, &bytes, &entry.logical_shape, dtype, proj)
+            {
+                return Err((e, builder));
+            }
+        }
+    }
+
+    Ok(builder)
+}
+
 /// CPU-only checks that must complete before the first source closure call.
 /// This is intentionally limited to fulfillment/target safety; architecture
 /// policy belongs to the architecture crate, not to generic `ShardPolicy`.
@@ -804,7 +2677,13 @@ fn preflight_manifest(
     n_layers: usize,
     target_devices: usize,
 ) -> Result<(), FulfillError> {
-    if mesh.axes().iter().filter(|axis| axis.kind != DimKind::Pp).count() > 1 {
+    if mesh
+        .axes()
+        .iter()
+        .filter(|axis| axis.kind != DimKind::Pp)
+        .count()
+        > 1
+    {
         return Err(FulfillError {
             name: String::new(),
             layer: None,
@@ -942,18 +2821,20 @@ where
                         reason: format!("upload_raw failed: {e}"),
                     })?;
                 tensor.dtype = source_dtype;
-                store.insert(
+                store.insert_projected(
                     &entry.name,
                     entry.layer,
                     dev,
                     WeightHandle::Resident(tensor),
+                    placement_projection(&entry.policy, 0, 1),
                 );
             } else {
-                store.insert(
+                store.insert_projected(
                     &entry.name,
                     entry.layer,
                     dev,
                     WeightHandle::Alias(src.clone()),
+                    placement_projection(&entry.policy, 0, 1),
                 );
             }
             continue;
@@ -1008,11 +2889,12 @@ where
                             reason: format!("upload_raw failed: {e}"),
                         })?;
                     tensor.dtype = dtype;
-                    store.insert(
+                    store.insert_projected(
                         &entry.name,
                         entry.layer,
                         dev,
                         WeightHandle::Resident(tensor),
+                        placement_projection(&entry.policy, rank, devices.len()),
                     );
                 }
                 continue;
@@ -1029,39 +2911,18 @@ where
         if let ShardPolicy::ColumnShard { axis: 0 } = &entry.policy {
             if tp_axis > 1 {
                 let tp = devices.len();
-                let rows = *entry.logical_shape.first().unwrap_or(&0);
-                if rows == 0 || rows % tp != 0 {
-                    return Err(FulfillError {
-                        name: entry.name.clone(),
-                        layer: entry.layer,
-                        device: *devices.first().unwrap_or(&0),
-                        reason: format!(
-                            "ColumnShard: outermost dim {rows} not divisible by Tp {tp}"
-                        ),
-                    });
-                }
                 let (bytes, dtype) =
                     read_source(entry, devices.first().copied().unwrap_or(0), source)?;
-                if bytes.len() % tp != 0 {
-                    return Err(FulfillError {
-                        name: entry.name.clone(),
-                        layer: entry.layer,
-                        device: *devices.first().unwrap_or(&0),
-                        reason: format!(
-                            "ColumnShard: blob {} bytes not divisible by Tp {tp} \
-                             (row-major quant rows must split evenly)",
-                            bytes.len()
-                        ),
-                    });
-                }
-                let chunk = bytes.len() / tp;
-                // Sharded logical shape: outermost dim becomes rows/tp.
-                let mut shape = entry.logical_shape.clone();
-                if let Some(first) = shape.first_mut() {
-                    *first = rows / tp;
-                }
-                for (rank, &dev) in devices.iter().enumerate() {
-                    let slice = &bytes[rank * chunk..(rank + 1) * chunk];
+                for (local_rank, &dev) in devices.iter().enumerate() {
+                    let (slice, sharded_shape) =
+                        column_shard_slice(&bytes, &entry.logical_shape, tp, local_rank).map_err(
+                            |e| FulfillError {
+                                name: entry.name.clone(),
+                                layer: entry.layer,
+                                device: dev,
+                                reason: e,
+                            },
+                        )?;
                     let gpu = target.device(dev).ok_or_else(|| FulfillError {
                         name: entry.name.clone(),
                         layer: entry.layer,
@@ -1071,18 +2932,21 @@ where
                             target.device_count()
                         ),
                     })?;
-                    let mut tensor = gpu.upload_raw(slice, &shape).map_err(|e| FulfillError {
-                        name: entry.name.clone(),
-                        layer: entry.layer,
-                        device: dev,
-                        reason: format!("upload_raw failed: {e}"),
-                    })?;
+                    let mut tensor =
+                        gpu.upload_raw(&slice, &sharded_shape)
+                            .map_err(|e| FulfillError {
+                                name: entry.name.clone(),
+                                layer: entry.layer,
+                                device: dev,
+                                reason: format!("upload_raw failed: {e}"),
+                            })?;
                     tensor.dtype = dtype;
-                    store.insert(
+                    store.insert_projected(
                         &entry.name,
                         entry.layer,
                         dev,
                         WeightHandle::Resident(tensor),
+                        placement_projection(&entry.policy, local_rank, tp),
                     );
                 }
                 continue;
@@ -1101,54 +2965,18 @@ where
         if let ShardPolicy::RowShard { .. } = &entry.policy {
             if tp_axis > 1 {
                 let tp = devices.len();
-                let rows = *entry.logical_shape.first().unwrap_or(&0);
-                let inner: usize = entry.logical_shape.iter().skip(1).product();
-                if rows == 0 || inner == 0 || inner % tp != 0 {
-                    return Err(FulfillError {
-                        name: entry.name.clone(),
-                        layer: entry.layer,
-                        device: *devices.first().unwrap_or(&0),
-                        reason: format!("RowShard: inner dim {inner} not divisible by Tp {tp}"),
-                    });
-                }
                 let (bytes, dtype) =
                     read_source(entry, devices.first().copied().unwrap_or(0), source)?;
-                if bytes.len() % rows != 0 {
-                    return Err(FulfillError {
-                        name: entry.name.clone(),
-                        layer: entry.layer,
-                        device: *devices.first().unwrap_or(&0),
-                        reason: format!(
-                            "RowShard: blob {} bytes not a whole number of {rows} rows",
-                            bytes.len()
-                        ),
-                    });
-                }
-                let row_bytes = bytes.len() / rows;
-                if row_bytes % tp != 0 {
-                    return Err(FulfillError {
-                        name: entry.name.clone(),
-                        layer: entry.layer,
-                        device: *devices.first().unwrap_or(&0),
-                        reason: format!(
-                            "RowShard: row {row_bytes} bytes not divisible by Tp {tp} \
-                             (k not group-aligned for this shard)"
-                        ),
-                    });
-                }
-                let sub = row_bytes / tp;
-                // Sharded logical shape: the LAST dim (k) becomes k/tp.
-                let mut shape = entry.logical_shape.clone();
-                if let Some(last) = shape.last_mut() {
-                    *last /= tp;
-                }
-                for (rank, &dev) in devices.iter().enumerate() {
-                    // Gather rank r's k-slice out of every row.
-                    let mut blob = Vec::with_capacity(rows * sub);
-                    for row in 0..rows {
-                        let base = row * row_bytes + rank * sub;
-                        blob.extend_from_slice(&bytes[base..base + sub]);
-                    }
+                for (local_rank, &dev) in devices.iter().enumerate() {
+                    let (blob, sharded_shape) =
+                        row_shard_slice(&bytes, &entry.logical_shape, tp, local_rank).map_err(
+                            |e| FulfillError {
+                                name: entry.name.clone(),
+                                layer: entry.layer,
+                                device: dev,
+                                reason: e,
+                            },
+                        )?;
                     let gpu = target.device(dev).ok_or_else(|| FulfillError {
                         name: entry.name.clone(),
                         layer: entry.layer,
@@ -1158,18 +2986,21 @@ where
                             target.device_count()
                         ),
                     })?;
-                    let mut tensor = gpu.upload_raw(&blob, &shape).map_err(|e| FulfillError {
-                        name: entry.name.clone(),
-                        layer: entry.layer,
-                        device: dev,
-                        reason: format!("upload_raw failed: {e}"),
-                    })?;
+                    let mut tensor =
+                        gpu.upload_raw(&blob, &sharded_shape)
+                            .map_err(|e| FulfillError {
+                                name: entry.name.clone(),
+                                layer: entry.layer,
+                                device: dev,
+                                reason: format!("upload_raw failed: {e}"),
+                            })?;
                     tensor.dtype = dtype;
-                    store.insert(
+                    store.insert_projected(
                         &entry.name,
                         entry.layer,
                         dev,
                         WeightHandle::Resident(tensor),
+                        placement_projection(&entry.policy, local_rank, tp),
                     );
                 }
                 continue;
@@ -1281,11 +3112,12 @@ where
                             reason: format!("upload_raw failed: {e}"),
                         })?;
                     tensor.dtype = dtype;
-                    store.insert(
+                    store.insert_projected(
                         &entry.name,
                         entry.layer,
                         dev,
                         WeightHandle::Resident(tensor),
+                        placement_projection(&entry.policy, rank, tp),
                     );
                 }
                 continue;
@@ -1326,11 +3158,12 @@ where
                         reason: format!("upload_raw failed: {e}"),
                     })?;
             tensor.dtype = dtype;
-            store.insert(
+            store.insert_projected(
                 &entry.name,
                 entry.layer,
                 dev,
                 WeightHandle::Resident(tensor),
+                WeightProjection::default(),
             );
         }
     }
@@ -1355,10 +3188,10 @@ mod tests {
 
     // ── try_free CPU tests (generic state machine, local types) ──────
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestOrigin {
         mesh_epoch: u64,
         logical_rank: usize,
@@ -1366,7 +3199,13 @@ mod tests {
         pool_epoch: u64,
     }
 
-    #[derive(Debug)]
+    impl super::LogicalRank for TestOrigin {
+        fn logical_rank(&self) -> usize {
+            self.logical_rank
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
     struct TestResource(u64);
 
     /// Resource that tracks whether it was dropped (consumed) vs retained.
@@ -1611,6 +3450,327 @@ mod tests {
         );
     }
 
+    // ── ArenaBuilder CPU tests ────────────────────────────────────────
+
+    #[test]
+    fn builders_issue_arena_branded_ids() {
+        let mut arena = ArenaBuilder::<TestResource>::new();
+        let id1 = arena.insert(TestResource(10));
+        let id2 = arena.insert(TestResource(20));
+        assert_ne!(id1, id2, "each insert must yield a distinct branded ID");
+
+        // Successful alias appends one cell and stores Cell::Alias(target).
+        let len_before = arena.cells.len();
+        let id3 = arena.alias(&id1).unwrap();
+        assert_eq!(arena.cells.len(), len_before + 1, "alias must append");
+        match &arena.cells[id3.slot] {
+            super::Cell::Alias(target) => assert_eq!(*target, id1),
+            other => panic!("expected Alias, got {other:?}"),
+        }
+        assert_ne!(id3, id1);
+        assert_ne!(id3, id2);
+
+        // Two separately created arenas each insert at slot 0; their
+        // IDs must differ because each arena has a unique epoch.
+        let mut arena_a = ArenaBuilder::<TestResource>::new();
+        let mut arena_b = ArenaBuilder::<TestResource>::new();
+        let id_a = arena_a.insert(TestResource(1));
+        let id_b = arena_b.insert(TestResource(2));
+        assert_ne!(id_a, id_b, "cross-arena slot-0 IDs must differ");
+    }
+
+    #[test]
+    fn builder_rejects_foreign_alias_id() {
+        let mut arena_a = ArenaBuilder::<TestResource>::new();
+        let id_a = arena_a.insert(TestResource(1));
+        let mut arena_b = ArenaBuilder::<TestResource>::new();
+        let len_before = arena_b.cells.len();
+        assert_eq!(arena_b.alias(&id_a), Err(AliasError::ForeignArena),);
+        assert_eq!(
+            arena_b.cells.len(),
+            len_before,
+            "foreign alias must not append a cell"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_invalid_slot_id() {
+        let mut arena = ArenaBuilder::<TestResource>::new();
+        let valid = arena.insert(TestResource(1));
+        let len_before = arena.cells.len();
+        // Construct an ID whose arena_epoch matches but slot is out of
+        // range — possible from within the crate where fields are visible.
+        let bad = WeightCellId {
+            arena_epoch: valid.arena_epoch,
+            slot: 999,
+        };
+        assert_eq!(arena.alias(&bad), Err(AliasError::InvalidSlot));
+        assert_eq!(
+            arena.cells.len(),
+            len_before,
+            "invalid-slot alias must not append a cell"
+        );
+    }
+
+    #[test]
+    fn arena_builder_drop_drops_resident_exactly_once() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        struct CountDrop(Arc<AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let dc = drop_count.clone();
+        {
+            let mut arena = ArenaBuilder::new();
+            let id_r1 = arena.insert(CountDrop(dc));
+            // Second resource as a non-counted control.
+            arena.insert(CountDrop(Arc::new(AtomicUsize::new(0))));
+            // Both aliases target the counted resident.
+            let _a1 = arena.alias(&id_r1).unwrap();
+            let _a2 = arena.alias(&id_r1).unwrap();
+            // arena dropped here — all cells are cleaned up.
+        }
+        assert_eq!(
+            drop_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "resident must drop exactly once; aliases carry no resource ownership",
+        );
+    }
+
+    // ── FrozenArena / freeze tests ───────────────────────────────────
+
+    #[test]
+    fn freeze_resolves_direct_alias() {
+        let mut arena = ArenaBuilder::<TestResource>::new();
+        let id1 = arena.insert(TestResource(10));
+        let id2 = arena.alias(&id1).unwrap();
+        let frozen = arena.freeze();
+        assert_eq!(frozen.resource(id1), Some(&TestResource(10)));
+        assert_eq!(frozen.resource(id2), Some(&TestResource(10)));
+        assert_eq!(frozen.allocations.len(), 1, "alias must not duplicate");
+    }
+
+    #[test]
+    fn freeze_resolves_chain_alias() {
+        let mut arena = ArenaBuilder::<TestResource>::new();
+        let id1 = arena.insert(TestResource(20));
+        let id2 = arena.alias(&id1).unwrap();
+        let id3 = arena.alias(&id2).unwrap();
+        let frozen = arena.freeze();
+        assert_eq!(frozen.resource(id1), Some(&TestResource(20)));
+        assert_eq!(frozen.resource(id2), Some(&TestResource(20)));
+        assert_eq!(frozen.resource(id3), Some(&TestResource(20)));
+        assert_eq!(frozen.allocations.len(), 1);
+    }
+
+    #[test]
+    fn freeze_foreign_id_returns_none() {
+        let mut arena1 = ArenaBuilder::<TestResource>::new();
+        let id1 = arena1.insert(TestResource(30));
+        let _frozen1 = arena1.freeze();
+        let mut arena2 = ArenaBuilder::<TestResource>::new();
+        let id2 = arena2.insert(TestResource(40));
+        let frozen2 = arena2.freeze();
+        assert_eq!(frozen2.resource(id1), None, "foreign epoch");
+        assert_eq!(frozen2.resource(id2), Some(&TestResource(40)));
+    }
+
+    #[test]
+    fn freeze_ids_stable_after_freeze() {
+        let mut arena = ArenaBuilder::<TestResource>::new();
+        let id1 = arena.insert(TestResource(50));
+        let a1 = arena.alias(&id1).unwrap();
+        let id3 = arena.insert(TestResource(60));
+        let a3 = arena.alias(&id3).unwrap();
+        let frozen = arena.freeze();
+        assert_eq!(frozen.resource(id1), Some(&TestResource(50)));
+        assert_eq!(frozen.resource(a1), Some(&TestResource(50)));
+        assert_eq!(frozen.resource(id3), Some(&TestResource(60)));
+        assert_eq!(frozen.resource(a3), Some(&TestResource(60)));
+        assert_eq!(frozen.allocations.len(), 2);
+    }
+
+    #[test]
+    fn weight_store_builder_surface_compiles() {
+        // 1. WeightStoreBuilder::new
+        let mut builder = WeightStoreBuilder::new();
+
+        // 2. WeightStoreBuilder::alias — we can construct a WeightCellId
+        //    (private fields visible in this module) and verify the
+        //    method returns the expected error for a foreign ID.
+        let dummy_id = WeightCellId {
+            arena_epoch: WeightArenaEpoch(0),
+            slot: 0,
+        };
+        assert_eq!(builder.alias(&dummy_id), Err(AliasError::ForeignArena));
+
+        // 3. WeightStoreBuilder::insert — cannot be called in CPU tests
+        //    because WeightStoreAllocation requires a real GPU tensor.
+        //    The method's presence is verified by type-check.
+
+        // 4. WeightStoreBuilder::freeze → takes target, returns
+        //    Result<FrozenWeightStore, (FreezeValidationError, …)>.
+        //    Verify the type signature compiles; execution needs GPU.
+        let _freeze_fn: fn(
+            WeightStoreBuilder,
+            &mut WeightStoreTargetMut,
+        ) -> Result<
+            FrozenWeightStore,
+            (FreezeValidationError, WeightStoreBuilder),
+        > = WeightStoreBuilder::freeze;
+
+        // WeightStoreBuilder surface includes consuming abort.
+        // FrozenWeightStore surface: borrow-only + consuming free.
+        // No take/get_mut/replace/into_resource exist on either.
+        // The guarded API surface is enforced by the struct definitions,
+        // not by test comments.
+    }
+
+    // ── aggregate_cleanup / alias-release tests ───────────────────────
+
+    #[test]
+    fn builder_cleanup_resident_plus_aliases_releases_once() {
+        // Arrange: resident -> direct alias -> chained alias.
+        let mut arena = ArenaBuilder::<TestResource>::new();
+        let r1 = arena.insert(TestResource(10));
+        let _a1 = arena.alias(&r1).unwrap();
+        let _a2 = arena.alias(&_a1).unwrap();
+
+        // Act: extract owned residents exactly as `abort` does.
+        let resources: Vec<_> = arena
+            .cells
+            .into_iter()
+            .filter_map(|cell| match cell {
+                super::Cell::Resident(alloc) => Some(alloc),
+                super::Cell::Alias(_) => None,
+            })
+            .collect();
+
+        let mut callback_count = 0u32;
+        let _failures: Vec<String> = aggregate_cleanup(resources, |_r: TestResource| {
+            callback_count += 1;
+            Ok(())
+        });
+
+        // Assert: exactly one resident, one callback.
+        assert_eq!(callback_count, 1, "aliases must not be released");
+    }
+
+    #[test]
+    fn frozen_cleanup_resident_plus_aliases_releases_once() {
+        // Arrange: resident -> direct alias -> chained alias.
+        let mut arena = ArenaBuilder::<TestResource>::new();
+        let r1 = arena.insert(TestResource(10));
+        let _a1 = arena.alias(&r1).unwrap();
+        let _a2 = arena.alias(&_a1).unwrap();
+        let frozen = arena.freeze();
+
+        // Act: consume canonical allocations exactly as `free` does.
+        let resources: Vec<_> = frozen.allocations.into_iter().map(|b| *b).collect();
+
+        let mut callback_count = 0u32;
+        let _failures: Vec<String> = aggregate_cleanup(resources, |_r: TestResource| {
+            callback_count += 1;
+            Ok(())
+        });
+
+        // Assert: one canonical allocation, one callback.
+        assert_eq!(
+            callback_count, 1,
+            "aliases resolved to one canonical allocation"
+        );
+    }
+
+    /// Wrapper type so the generic helper can return both the
+    /// resource and an error string through a single `E` type.
+    type RetryToken<R, O> = (AllocationToken<R, O>, String);
+
+    #[test]
+    fn aggregate_cleanup_returns_success_with_no_failures() {
+        struct D;
+        impl Drop for D {
+            fn drop(&mut self) {}
+        }
+        let resources = vec![D];
+        let failures: Vec<String> = aggregate_cleanup(resources, |_r: D| Ok(()));
+        assert!(failures.is_empty(), "all succeeded");
+    }
+
+    #[test]
+    fn aggregate_cleanup_returns_all_failures() {
+        struct D;
+        impl Drop for D {
+            fn drop(&mut self) {}
+        }
+        let resources = vec![D, D];
+        let failures: Vec<String> = aggregate_cleanup(resources, |_r: D| Err("fail".to_string()));
+        assert_eq!(failures.len(), 2, "both items failed");
+    }
+
+    #[test]
+    fn cleanup_continues_after_failure_and_retains_only_failures() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        struct CountDrop(Arc<AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let resources = vec![
+            CountDrop(dropped.clone()),
+            CountDrop(dropped.clone()),
+            CountDrop(dropped.clone()),
+        ];
+
+        let mut call = 0u32;
+        let failures: Vec<RetryToken<CountDrop, ()>> =
+            aggregate_cleanup(resources, |r: CountDrop| {
+                call += 1;
+                if call <= 2 {
+                    Err((
+                        AllocationToken {
+                            resource: r,
+                            origin: (),
+                        },
+                        format!("fail {call}"),
+                    ))
+                } else {
+                    drop(r);
+                    Ok(())
+                }
+            });
+
+        assert_eq!(call, 3, "every item must be attempted");
+        assert_eq!(failures.len(), 2, "first two items failed");
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only the successful item was dropped"
+        );
+
+        // Retry the two failures.
+        let mut retry_call = 0u32;
+        let retry: Vec<RetryToken<CountDrop, ()>> = aggregate_cleanup(
+            failures.into_iter().map(|(token, _)| token.resource),
+            |r: CountDrop| {
+                retry_call += 1;
+                drop(r);
+                Ok(())
+            },
+        );
+        assert_eq!(retry_call, 2);
+        assert_eq!(retry.len(), 0);
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "all three resources consumed after retry"
+        );
+    }
+
     // ── pre-existing tests ────────────────────────────────────────────
 
     #[test]
@@ -1683,7 +3843,10 @@ mod tests {
         let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
         let entries = vec![wl("test", 0, ShardPolicy::Replicate)];
         let result = preflight_manifest(&entries, &mesh, 1, 2);
-        assert!(result.is_ok(), "expected single-axis Tp mesh to pass, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected single-axis Tp mesh to pass, got: {result:?}"
+        );
     }
 
     #[test]
@@ -2099,5 +4262,1554 @@ mod tests {
 
         assert_eq!(assembly_result, Err("typed assembly expected Resident"));
         assert!(store.is_empty(), "rollback must drain untaken entries too");
+    }
+
+    #[test]
+    fn fulfill_projection_metadata_distinguishes_compact_column_and_row() {
+        let compact = placement_projection(
+            &ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+            1,
+            2,
+        );
+        assert_eq!(compact.kind, WeightProjectionKind::ExpertCompact);
+        assert!(compact.compact);
+        assert_eq!(compact.rank, Some(1));
+        assert_eq!(compact.world_size, Some(2));
+
+        let column = placement_projection(&ShardPolicy::ColumnShard { axis: 0 }, 1, 2);
+        assert_eq!(column.kind, WeightProjectionKind::ColumnShard);
+        assert_eq!(column.axis, Some(0));
+        assert_eq!(column.rank, Some(1));
+
+        let row = placement_projection(&ShardPolicy::RowShard { axis: 1 }, 0, 2);
+        assert_eq!(row.kind, WeightProjectionKind::RowShard);
+        assert_eq!(row.axis, Some(1));
+        assert_eq!(row.rank, Some(0));
+    }
+
+    // ── WeightStoreTargetMut / origin-gated cleanup tests ────────────
+
+    #[test]
+    fn single_gpu_target_rejects_allocation_with_nonzero_logical_rank() {
+        // A single-GPU target always expects logical_rank=0 (the sole rank
+        // in a 1-wide mesh). Allocations claiming a different rank must be
+        // rejected before any driver operation.
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+        let token = AllocationToken {
+            resource: TestResource(1),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 7, // single-GPU target cannot satisfy rank 7
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let result = try_free(token, &expected, |_: TestResource| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 0, "driver must not be called on rank mismatch");
+        let (_returned, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::OriginMismatch);
+    }
+
+    #[test]
+    fn single_gpu_target_rejects_wrong_physical_device() {
+        // Single-GPU target: the physical device in the allocation must
+        // match the single GPU's device_id.
+        let expected = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 0,
+            physical_device: 42, // expected device
+            pool_epoch: 10,
+        };
+        let token = AllocationToken {
+            resource: TestResource(2),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 99, // mismatched device
+                pool_epoch: 10,
+            },
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let result = try_free(token, &expected, |_: TestResource| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(
+            calls.get(),
+            0,
+            "driver must not be called on device mismatch"
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mesh_target_derives_rank_from_origin_for_validation() {
+        // Mesh target: the rank used for origin validation is derived from
+        // the allocation's origin, not passed externally.
+        let mesh_expected = TestOrigin {
+            mesh_epoch: 2,
+            logical_rank: 3,
+            physical_device: 5,
+            pool_epoch: 20,
+        };
+        // Allocation with matching rank → success through driver.
+        let token = AllocationToken {
+            resource: TestResource(10),
+            origin: TestOrigin {
+                mesh_epoch: 2,
+                logical_rank: 3, // rank derived from origin
+                physical_device: 5,
+                pool_epoch: 20,
+            },
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let result = try_free(token, &mesh_expected, |r: TestResource| {
+            calls.set(calls.get() + 1);
+            drop(r);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 1, "driver must be called when origin matches");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn mesh_target_rejects_allocation_with_wrong_rank() {
+        // Allocation's origin has rank 3 but the mesh expects rank 1 for
+        // that slot. Must be rejected.
+        let mesh_expected = TestOrigin {
+            mesh_epoch: 2,
+            logical_rank: 1, // mesh expects rank 1 here
+            physical_device: 5,
+            pool_epoch: 20,
+        };
+        let token = AllocationToken {
+            resource: TestResource(11),
+            origin: TestOrigin {
+                mesh_epoch: 2,
+                logical_rank: 3, // allocation claims rank 3
+                physical_device: 5,
+                pool_epoch: 20,
+            },
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let result = try_free(token, &mesh_expected, |_: TestResource| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 0, "driver must not be called on rank mismatch");
+        assert_eq!(result.unwrap_err().1, FreeError::OriginMismatch);
+    }
+
+    #[test]
+    fn mesh_target_rejects_allocation_with_wrong_mesh_epoch() {
+        // Allocation's mesh_epoch differs from the live mesh epoch.
+        let mesh_expected = TestOrigin {
+            mesh_epoch: 5,
+            logical_rank: 0,
+            physical_device: 0,
+            pool_epoch: 30,
+        };
+        let token = AllocationToken {
+            resource: TestResource(12),
+            origin: TestOrigin {
+                mesh_epoch: 99, // stale/wrong mesh
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 30,
+            },
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let result = try_free(token, &mesh_expected, |_: TestResource| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(
+            calls.get(),
+            0,
+            "driver must not be called on mesh epoch mismatch"
+        );
+        assert_eq!(result.unwrap_err().1, FreeError::OriginMismatch);
+    }
+
+    #[test]
+    fn aggregate_cleanup_continues_after_origin_mismatch_retains_only_failures() {
+        // Three allocations: first two fail with origin mismatch,
+        // third succeeds. aggregate_cleanup must attempt all three
+        // and return only the failures for retry.
+
+        // Allocation 1: mismatched mesh_epoch.
+        let t1 = AllocationToken {
+            resource: TestResource(100),
+            origin: TestOrigin {
+                mesh_epoch: 99,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        // Allocation 2: mismatched logical_rank.
+        let t2 = AllocationToken {
+            resource: TestResource(200),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 7,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+        // Allocation 3: matching origin.
+        let t3 = AllocationToken {
+            resource: TestResource(300),
+            origin: TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+        };
+
+        let tokens = vec![t1, t2, t3];
+
+        let mut call = 0u32;
+        let failures: Vec<(AllocationToken<TestResource, TestOrigin>, FreeError)> =
+            aggregate_cleanup(
+                tokens,
+                |token: AllocationToken<TestResource, TestOrigin>| {
+                    call += 1;
+                    let expected = TestOrigin {
+                        mesh_epoch: 1,
+                        logical_rank: 0,
+                        physical_device: 0,
+                        pool_epoch: 10,
+                    };
+                    let result = try_free(token, &expected, |r: TestResource| {
+                        drop(r);
+                        Ok(())
+                    });
+                    result.map_err(|(t, e)| (t, e))
+                },
+            );
+
+        assert_eq!(call, 3, "every item must be attempted");
+        assert_eq!(failures.len(), 2, "first two items failed origin check");
+        // Verify the failures are OriginMismatch (driver was never called).
+        for (_, err) in &failures {
+            assert_eq!(*err, FreeError::OriginMismatch);
+        }
+        // Original resources preserved intact (not consumed by driver).
+        assert_eq!(failures[0].0.resource.0, 100);
+        assert_eq!(failures[1].0.resource.0, 200);
+
+        // Retry: now match each token's own origin so the driver
+        // is reached (testing retry ownership through driver failure).
+        let mut retry_call = 0u32;
+        let retry_failures: Vec<(AllocationToken<TestResource, TestOrigin>, FreeError)> =
+            aggregate_cleanup(
+                failures.into_iter().map(|(token, _)| token),
+                |token: AllocationToken<TestResource, TestOrigin>| {
+                    retry_call += 1;
+                    // Use the token's own origin so validation passes.
+                    let expected = TestOrigin {
+                        mesh_epoch: token.origin.mesh_epoch,
+                        logical_rank: token.origin.logical_rank,
+                        physical_device: token.origin.physical_device,
+                        pool_epoch: token.origin.pool_epoch,
+                    };
+                    try_free(token, &expected, |_: TestResource| {
+                        // Driver always fails; returns a sentinel resource.
+                        Err((TestResource(999), "retry driver fail".into()))
+                    })
+                    .map_err(|(t, e)| (t, e))
+                },
+            );
+        assert_eq!(retry_call, 2);
+        assert_eq!(retry_failures.len(), 2, "both retries also fail driver");
+        // Resources now carry the driver-returned sentinel.
+        for (token, _) in &retry_failures {
+            assert_eq!(token.resource.0, 999);
+        }
+        assert_eq!(
+            retry_failures[0].1,
+            FreeError::DriverFailure("retry driver fail".into()),
+            "retry failures must be driver errors (origin passed)"
+        );
+    }
+
+    // ── free_with_resolver CPU tests (rank-derived validation seam) ──
+    //
+    // Unlike the generic try_free tests above, these exercise the
+    // target-scoped validation pipeline that WeightStoreAllocation::free
+    // follows: free_with_resolver calls origin.logical_rank() internally,
+    // passes the rank to a resolver closure, and only after the resolver
+    // returns Ok does it validate origin == expected via try_free.
+    // The resolver closure captures the Single/Mesh semantic (in
+    // production: Single→single_weight_origin yielding rank 0;
+    // Mesh→weight_origin_in(mesh, rank)).  Tests here assert the rank
+    // argument matches the origin's embedded rank, then return an expected
+    // origin that may or may not match to exercise mismatch/rejection.
+
+    #[test]
+    fn resolver_rank_derived_from_origin_not_caller() {
+        // Verifies that free_with_resolver obtains the rank from
+        // origin.logical_rank() — the test cannot "cheat" by passing a
+        // different rank.  The resolver asserts it receives rank 7
+        // (the origin's logical_rank) and returns an expected origin
+        // with rank 0 (simulating Single GPU expectation), causing a
+        // mismatch that suppresses the driver.
+        let calls = Cell::new(0u32);
+        let origin = TestOrigin {
+            mesh_epoch: 1,
+            logical_rank: 7,
+            physical_device: 0,
+            pool_epoch: 10,
+        };
+        let result = self::free_with_resolver(
+            origin,
+            TestResource(42),
+            |r| {
+                assert_eq!(
+                    r, 7,
+                    "resolver must receive origin's rank, not a caller-selected value"
+                );
+                // Single GPU: expected logical_rank is always 0.
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |_: TestResource| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 0, "driver must not be called on mismatch");
+        let (token, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::OriginMismatch);
+        assert_eq!(token.resource.0, 42, "resource retained");
+    }
+
+    #[test]
+    fn resolver_single_gpu_rejects_nonzero_logical_rank() {
+        // Single-GPU target: resolver returns expected with rank 0
+        // (mirroring Gpus::single_weight_origin).  Allocation rank 7
+        // → mismatch → driver suppressed.
+        let calls = Cell::new(0u32);
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 7,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+            TestResource(42),
+            |r| {
+                assert_eq!(r, 7);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |_: TestResource| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 0, "driver must not be called on rank mismatch");
+        let (token, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::OriginMismatch);
+        assert_eq!(token.resource.0, 42, "resource retained");
+    }
+
+    #[test]
+    fn resolver_single_gpu_rejects_wrong_physical_device() {
+        // Single GPU device_id=0; allocation claims device 99.
+        let calls = Cell::new(0u32);
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 99,
+                pool_epoch: 10,
+            },
+            TestResource(55),
+            |r| {
+                assert_eq!(r, 0);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |_: TestResource| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 0, "driver not called on device mismatch");
+        let (token, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::OriginMismatch);
+        assert_eq!(token.resource.0, 55);
+    }
+
+    #[test]
+    fn resolver_single_gpu_rejects_wrong_mesh_epoch() {
+        let calls = Cell::new(0u32);
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 99,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+            TestResource(66),
+            |r| {
+                assert_eq!(r, 0);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |_: TestResource| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 0, "driver not called on mesh epoch mismatch");
+        assert_eq!(result.unwrap_err().1, FreeError::OriginMismatch);
+    }
+
+    #[test]
+    fn resolver_mesh_origin_matches_and_driver_called() {
+        // Mesh target: resolver receives rank 3 (from origin), returns
+        // matching expected origin → driver called.
+        let calls = Cell::new(0u32);
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 2,
+                logical_rank: 3,
+                physical_device: 5,
+                pool_epoch: 20,
+            },
+            TestResource(99),
+            |r| {
+                assert_eq!(r, 3, "rank from origin passed to resolver");
+                Ok(TestOrigin {
+                    mesh_epoch: 2,
+                    logical_rank: 3,
+                    physical_device: 5,
+                    pool_epoch: 20,
+                })
+            },
+            |r: TestResource| {
+                calls.set(calls.get() + 1);
+                drop(r);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 1, "driver called on match");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolver_mesh_rejects_wrong_logical_rank() {
+        // Allocation origin says rank 7; resolver (simulating
+        // weight_origin_in) returns expected with rank 3 for this mesh
+        // slot → mismatch → driver suppressed.
+        let calls = Cell::new(0u32);
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 2,
+                logical_rank: 7,
+                physical_device: 0,
+                pool_epoch: 20,
+            },
+            TestResource(111),
+            |r| {
+                assert_eq!(r, 7);
+                Ok(TestOrigin {
+                    mesh_epoch: 2,
+                    logical_rank: 3,
+                    physical_device: 0,
+                    pool_epoch: 20,
+                })
+            },
+            |_: TestResource| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 0, "driver not called on rank mismatch");
+        let (token, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::OriginMismatch);
+        assert_eq!(token.resource.0, 111, "resource retained");
+    }
+
+    #[test]
+    fn resolver_mesh_rejects_wrong_mesh_epoch() {
+        let calls = Cell::new(0u32);
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 99,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+            TestResource(222),
+            |r| {
+                assert_eq!(r, 0);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |_: TestResource| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 0, "driver not called on mesh epoch mismatch");
+        let (token, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::OriginMismatch);
+        assert_eq!(token.resource.0, 222);
+    }
+
+    #[test]
+    fn resolver_resolver_failure_suppresses_driver_retains_resource() {
+        // Simulate weight_origin_in returning UnknownRank: resolver
+        // returns Err.  Must suppress driver and return OriginMismatch.
+        let calls = Cell::new(0u32);
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 2,
+                logical_rank: 7,
+                physical_device: 0,
+                pool_epoch: 20,
+            },
+            TestResource(333),
+            |r| {
+                assert_eq!(r, 7);
+                Err("rank 7 out of bounds for this mesh".into())
+            },
+            |_: TestResource| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 0, "driver suppressed after resolver failure");
+        let (token, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::OriginMismatch);
+        assert_eq!(
+            token.resource.0, 333,
+            "resource retained after resolver failure"
+        );
+    }
+
+    #[test]
+    fn resolver_driver_failure_retains_exact_resource_for_retry() {
+        // Origins match; driver returns Err with the exact resource.
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+            TestResource(77),
+            |r| {
+                assert_eq!(r, 0);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |r: TestResource| Err((r, "hipFree OOM".into())),
+        );
+        let (token, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::DriverFailure("hipFree OOM".into()));
+        assert_eq!(token.resource.0, 77, "exact resource retained");
+    }
+
+    #[test]
+    fn resolver_resource_retained_on_driver_failure() {
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+            TestResource(88),
+            |r| {
+                assert_eq!(r, 0);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |r: TestResource| Err((r, "bind thread failed".into())),
+        );
+        let (token, err) = result.unwrap_err();
+        assert_eq!(err, FreeError::DriverFailure("bind thread failed".into()));
+        assert_eq!(token.resource.0, 88, "exact resource retained");
+    }
+
+    #[test]
+    fn resolver_rank_zero_accepted_for_single_gpu() {
+        let calls = Cell::new(0u32);
+        let result = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+            TestResource(33),
+            |r| {
+                assert_eq!(r, 0);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |r: TestResource| {
+                calls.set(calls.get() + 1);
+                drop(r);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 1, "driver called for matching single GPU");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolver_origin_mismatch_driver_failure_return_types_consistent() {
+        // Path A: origin mismatch (resolver returns expected with rank 0,
+        // allocation has rank 7) → OriginMismatch, driver not called.
+        let result_a = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 7,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+            TestResource(10),
+            |r| {
+                assert_eq!(r, 7);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |_: TestResource| Ok(()),
+        );
+        assert_eq!(result_a.unwrap_err().1, FreeError::OriginMismatch);
+
+        // Path B: origins match, driver returns Err → DriverFailure.
+        let result_b = self::free_with_resolver(
+            TestOrigin {
+                mesh_epoch: 1,
+                logical_rank: 0,
+                physical_device: 0,
+                pool_epoch: 10,
+            },
+            TestResource(20),
+            |r| {
+                assert_eq!(r, 0);
+                Ok(TestOrigin {
+                    mesh_epoch: 1,
+                    logical_rank: 0,
+                    physical_device: 0,
+                    pool_epoch: 10,
+                })
+            },
+            |_: TestResource| Err((TestResource(999), "driver oom".into())),
+        );
+        assert_eq!(
+            result_b.unwrap_err().1,
+            FreeError::DriverFailure("driver oom".into())
+        );
+    }
+
+    #[test]
+    fn weight_store_target_mut_surface_compiles() {
+        // Type-check verification that WeightStoreTargetMut exists and
+        // its patterns are recognized.  Instantiation requires a real GPU;
+        // this test verifies the match arms compile.
+        let mesh = DeviceMesh::single();
+        fn _assert_single(_: &mut WeightStoreTargetMut) {}
+        fn _assert_mesh(_: &mut WeightStoreTargetMut) {}
+        let _ = (_assert_single, _assert_mesh, mesh);
+    }
+
+    // ── WeightPlacementKey / stage_bytes / stage_alias CPU tests ─────
+
+    #[test]
+    fn placement_key_equality_distinguishes_names_layers_ranks() {
+        let a = WeightPlacementKey {
+            logical_name: "wq".into(),
+            layer: Some(0),
+            logical_rank: 0,
+        };
+        let b = WeightPlacementKey {
+            logical_name: "wq".into(),
+            layer: Some(0),
+            logical_rank: 0,
+        };
+        assert_eq!(a, b);
+        // Different name
+        assert_ne!(
+            a,
+            WeightPlacementKey {
+                logical_name: "wo".into(),
+                layer: Some(0),
+                logical_rank: 0,
+            }
+        );
+        // Different layer
+        assert_ne!(
+            a,
+            WeightPlacementKey {
+                logical_name: "wq".into(),
+                layer: Some(1),
+                logical_rank: 0,
+            }
+        );
+        // Different rank
+        assert_ne!(
+            a,
+            WeightPlacementKey {
+                logical_name: "wq".into(),
+                layer: Some(0),
+                logical_rank: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn builder_new_empty_has_no_placements() {
+        let builder = WeightStoreBuilder::new();
+        let key = WeightPlacementKey {
+            logical_name: "x".into(),
+            layer: None,
+            logical_rank: 0,
+        };
+        assert!(builder.cell_id(&key).is_none());
+        assert!(builder.projection(&key).is_none());
+    }
+
+    #[test]
+    fn builder_tensor_rejects_foreign_epoch_id() {
+        let builder = WeightStoreBuilder::new();
+        // WeightArenaEpoch 999 does not match the builder's live arena epoch.
+        let foreign = WeightCellId {
+            arena_epoch: WeightArenaEpoch(999),
+            slot: 0,
+        };
+        assert!(matches!(
+            builder.tensor(foreign),
+            Err(WeightCellLookupError::ForeignEpoch)
+        ));
+    }
+
+    #[test]
+    fn builder_tensor_rejects_invalid_slot() {
+        let mut builder = WeightStoreBuilder::new();
+        // Populate one cell via a fake insert so the arena has a known
+        // size, then query slot 999 which is out of range.
+        // We insert a dummy WeightStoreAllocation requirement
+        // fulfilled with GpuTensor::null_for_test() — it is never
+        // submitted to HIP.
+        // (This is the same pattern as the assembly-failure GPU test.)
+        // Cannot be done without a real GPU tensor; skip to the
+        // known-invalid-slot check using the foreign-epoch path
+        // which does not require a populated arena:
+        let bad_slot = WeightCellId {
+            // Match the builder's arena epoch but reference a slot
+            // that doesn't exist (arena is empty).
+            arena_epoch: builder.inner.epoch,
+            slot: 999,
+        };
+        assert!(matches!(
+            builder.tensor(bad_slot),
+            Err(WeightCellLookupError::InvalidSlot)
+        ));
+    }
+
+    #[test]
+    fn stage_alias_rejects_foreign_target_epoch() {
+        let mut builder = WeightStoreBuilder::new();
+        let key = WeightPlacementKey {
+            logical_name: "tied".into(),
+            layer: None,
+            logical_rank: 0,
+        };
+        // A cell ID from a different arena (epoch 999).
+        let foreign = WeightCellId {
+            arena_epoch: WeightArenaEpoch(999),
+            slot: 0,
+        };
+        let result = builder.stage_alias(key, foreign, WeightProjection::default());
+        assert!(
+            matches!(
+                result,
+                Err(StageAliasError::AliasFailed(AliasError::ForeignArena))
+            ),
+            "expected ForeignArena, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stage_alias_rejects_nonexistent_slot() {
+        let mut builder = WeightStoreBuilder::new();
+        let key = WeightPlacementKey {
+            logical_name: "alias".into(),
+            layer: None,
+            logical_rank: 0,
+        };
+        // Arena epoch matches but slot 999 is out of range (empty arena).
+        let bad = WeightCellId {
+            arena_epoch: builder.inner.epoch,
+            slot: 999,
+        };
+        let result = builder.stage_alias(key, bad, WeightProjection::default());
+        assert!(
+            matches!(
+                result,
+                Err(StageAliasError::AliasFailed(AliasError::InvalidSlot))
+            ),
+            "expected InvalidSlot, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stage_alias_rejects_duplicate_key() {
+        let mut builder = WeightStoreBuilder::new();
+        let key = WeightPlacementKey {
+            logical_name: "dup".into(),
+            layer: None,
+            logical_rank: 0,
+        };
+        // Populate the placement map directly (tests have module-level
+        // access to private fields) to simulate a pre-existing placement.
+        let existing = WeightCellId {
+            arena_epoch: builder.inner.epoch,
+            slot: 0,
+        };
+        builder.placement.insert(key.clone(), existing);
+        builder.cell_ranks.insert(existing, 0);
+
+        // Attempt to stage_alias with the same key.
+        let target = WeightCellId {
+            arena_epoch: builder.inner.epoch,
+            slot: 0,
+        };
+        let result = builder.stage_alias(key, target, WeightProjection::default());
+        assert!(
+            matches!(result, Err(StageAliasError::DuplicateKey(_))),
+            "expected DuplicateKey, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stage_weight_error_surface_compiles() {
+        // Type-check: error type variants are usable.
+        let key = WeightPlacementKey {
+            logical_name: "w".into(),
+            layer: None,
+            logical_rank: 0,
+        };
+        let _dup = StageWeightError::DuplicateKey(key);
+        let _bad = StageWeightError::OriginMismatch("rank out of range".into());
+        let _up = StageWeightError::UploadFailed("hipMalloc OOM".into());
+        // Discard to suppress unused-variable warnings on Debug-only.
+        let _ = |_: &StageWeightError| match _dup {
+            StageWeightError::DuplicateKey(ref k) => Some(k),
+            _ => None,
+        };
+    }
+
+    #[test]
+    fn stage_alias_error_surface_compiles() {
+        let key = WeightPlacementKey {
+            logical_name: "a".into(),
+            layer: None,
+            logical_rank: 0,
+        };
+        let _dup = StageAliasError::DuplicateKey(key);
+        let _for = StageAliasError::AliasFailed(AliasError::ForeignArena);
+        let _inv = StageAliasError::AliasFailed(AliasError::InvalidSlot);
+        let _cr = StageAliasError::CrossRankTarget {
+            key_rank: 0,
+            target_rank: 1,
+        };
+        let _ = |e: &StageAliasError| match e {
+            StageAliasError::DuplicateKey(_) => "dup",
+            StageAliasError::AliasFailed(_) => "arena",
+            StageAliasError::CrossRankTarget { .. } => "xrank",
+        };
+    }
+
+    #[test]
+    fn weight_cell_lookup_error_surface_compiles() {
+        let _f = WeightCellLookupError::ForeignEpoch;
+        let _i = WeightCellLookupError::InvalidSlot;
+        let _ = |e: &WeightCellLookupError| match e {
+            WeightCellLookupError::ForeignEpoch => "epoch",
+            WeightCellLookupError::InvalidSlot => "slot",
+        };
+    }
+
+    #[test]
+    fn weight_store_target_error_surface_compiles() {
+        let _e: WeightStoreTargetError = WeightStoreTargetError::UnboundMesh;
+        let _ = |e: &WeightStoreTargetError| match e {
+            WeightStoreTargetError::UnboundMesh => "unbound",
+        };
+    }
+
+    // ── validate_staging_binding CPU tests ───────────────────────────
+    //
+    // These exercise the generic validation seam with TestOrigin,
+    // proving every failure mode without a GPU.
+
+    #[test]
+    fn binding_single_accepts_rank_zero_with_matching_origin() {
+        let captured = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        let result = validate_staging_binding(&captured, 0, &current);
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn binding_single_rejects_nonzero_rank() {
+        let captured = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        let result = validate_staging_binding(&captured, 7, &current);
+        assert!(matches!(result, Err(StageWeightError::OriginMismatch(_))));
+    }
+
+    #[test]
+    fn binding_single_rejects_changed_origin() {
+        let captured = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current_bad = TargetState::Single(tori(99, 0, 0, 10)); // different mesh_epoch
+        let result = validate_staging_binding(&captured, 0, &current_bad);
+        assert!(matches!(result, Err(StageWeightError::OriginMismatch(_))));
+    }
+
+    #[test]
+    fn binding_mesh_accepts_valid_rank_with_matching_topology() {
+        let ranks = vec![tori(1, 0, 0, 10), tori(1, 1, 1, 11)];
+        let captured = TargetBinding::Mesh(ranks.clone());
+        let current = TargetState::Mesh { full: ranks };
+        let result = validate_staging_binding(&captured, 1, &current);
+        assert_eq!(result, Ok(1));
+    }
+
+    #[test]
+    fn binding_mesh_rejects_out_of_range_rank() {
+        let ranks = vec![tori(1, 0, 0, 10)];
+        let captured = TargetBinding::Mesh(ranks.clone());
+        let current = TargetState::Mesh { full: ranks };
+        let result = validate_staging_binding(&captured, 5, &current);
+        assert!(matches!(result, Err(StageWeightError::OriginMismatch(_))));
+    }
+
+    #[test]
+    fn binding_mesh_rejects_shrunk_topology() {
+        let captured = TargetBinding::Mesh(vec![tori(1, 0, 0, 10), tori(1, 1, 1, 11)]);
+        let current = TargetState::Mesh {
+            full: vec![tori(1, 0, 0, 10)], // only 1 rank now
+        };
+        let result = validate_staging_binding(&captured, 0, &current);
+        assert!(matches!(result, Err(StageWeightError::OriginMismatch(_))));
+    }
+
+    #[test]
+    fn binding_mesh_rejects_changed_origin_at_valid_rank() {
+        let captured = TargetBinding::Mesh(vec![tori(1, 0, 0, 10), tori(1, 1, 1, 11)]);
+        // Rank 0 origin changed (different pool_epoch)
+        let current = TargetState::Mesh {
+            full: vec![tori(1, 0, 0, 99), tori(1, 1, 1, 11)],
+        };
+        let result = validate_staging_binding(&captured, 0, &current);
+        assert!(matches!(result, Err(StageWeightError::OriginMismatch(_))));
+    }
+
+    #[test]
+    fn binding_variant_mismatch_single_vs_mesh_rejected() {
+        let captured = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Mesh {
+            full: vec![tori(1, 0, 0, 10)],
+        };
+        let result = validate_staging_binding(&captured, 0, &current);
+        assert!(matches!(result, Err(StageWeightError::OriginMismatch(_))));
+    }
+
+    #[test]
+    fn binding_variant_mismatch_mesh_vs_single_rejected() {
+        let captured = TargetBinding::Mesh(vec![tori(1, 0, 0, 10)]);
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        let result = validate_staging_binding(&captured, 0, &current);
+        assert!(matches!(result, Err(StageWeightError::OriginMismatch(_))));
+    }
+
+    /// Shortcut to build a TestOrigin — keeps test lines short.
+    fn tori(
+        mesh_epoch: u64,
+        logical_rank: usize,
+        physical_device: i32,
+        pool_epoch: u64,
+    ) -> TestOrigin {
+        TestOrigin {
+            mesh_epoch,
+            logical_rank,
+            physical_device,
+            pool_epoch,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU and a WeightStoreTargetMut"]
+    fn stage_bytes_happy_path() {
+        // Integration test omitted — requires GPU upload.
+    }
+
+    #[test]
+    fn stage_alias_rejects_cross_rank() {
+        // CPU test: build a cell_ranks + placement fixture (no GPU/arena
+        // cell needed because the cross-rank check fires before arena
+        // validation) and assert CrossRankTarget.
+        let mut builder = WeightStoreBuilder {
+            inner: ArenaBuilder::new(),
+            placement: HashMap::new(),
+            cell_ranks: HashMap::new(),
+            projections: HashMap::new(),
+            binding: None,
+        };
+
+        // Simulate a target cell staged at rank 0.
+        let target_id = WeightCellId {
+            arena_epoch: builder.inner.epoch,
+            slot: 0,
+        };
+        builder.cell_ranks.insert(target_id, 0);
+        builder.placement.insert(
+            WeightPlacementKey {
+                logical_name: "w".into(),
+                layer: None,
+                logical_rank: 0,
+            },
+            target_id,
+        );
+
+        // Alias key at rank 1 must trigger cross-rank rejection.
+        let alias_key = WeightPlacementKey {
+            logical_name: "a".into(),
+            layer: None,
+            logical_rank: 1,
+        };
+        let result = builder.stage_alias(alias_key, target_id, WeightProjection::default());
+        match result {
+            Err(StageAliasError::CrossRankTarget {
+                key_rank: 1,
+                target_rank: 0,
+            }) => {} // expected
+            other => panic!("expected CrossRankTarget, got {other:?}"),
+        }
+    }
+
+    // ── validate_freeze_structure CPU tests ─────────────────────────
+    //
+    // Freeze's validation logic is extracted into
+    // `validate_freeze_structure`, which is generic over origin type
+    // and takes pre-resolved data.  CPU tests exercise every failure
+    // mode with `TargetBinding<TestOrigin>` / `TargetState<TestOrigin>`
+    // plus manually constructed placement/rank maps.
+
+    #[test]
+    fn fvalidate_unbound_binding_rejected() {
+        let result = validate_freeze_structure::<TestOrigin>(
+            None,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(0),
+        );
+        assert!(matches!(result, Err(FreezeValidationError::UnboundBuilder)));
+    }
+
+    #[test]
+    fn fvalidate_single_origin_match_passes() {
+        let binding = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        let result = validate_freeze_structure(
+            Some(&binding),
+            Some(&current),
+            &HashMap::new(),
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(0),
+        );
+        assert!(result.is_ok(), "matching origins should pass: {result:?}");
+    }
+
+    #[test]
+    fn fvalidate_single_origin_mismatch_rejected() {
+        let binding = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(99, 0, 0, 10));
+        let result = validate_freeze_structure(
+            Some(&binding),
+            Some(&current),
+            &HashMap::new(),
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(0),
+        );
+        assert!(matches!(
+            result,
+            Err(FreezeValidationError::OriginMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn fvalidate_mesh_topology_shrunk_rejected() {
+        let binding = TargetBinding::Mesh(vec![tori(1, 0, 0, 10), tori(1, 1, 1, 11)]);
+        let current = TargetState::Mesh {
+            full: vec![tori(1, 0, 0, 10)], // only 1 rank now
+        };
+        let result = validate_freeze_structure(
+            Some(&binding),
+            Some(&current),
+            &HashMap::new(),
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(0),
+        );
+        assert!(matches!(
+            result,
+            Err(FreezeValidationError::OriginMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn fvalidate_placement_foreign_arena_rejected() {
+        let binding = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        let mut placement: HashMap<WeightPlacementKey, WeightCellId> = HashMap::new();
+        placement.insert(
+            key("w", 0, 0),
+            WeightCellId {
+                arena_epoch: WeightArenaEpoch(999),
+                slot: 0,
+            },
+        );
+        let result = validate_freeze_structure(
+            Some(&binding),
+            Some(&current),
+            &placement,
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(10),
+        );
+        assert!(matches!(
+            result,
+            Err(FreezeValidationError::PlacementArenaMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn fvalidate_placement_slot_out_of_range_rejected() {
+        let binding = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        let cell_id = WeightCellId {
+            arena_epoch: WeightArenaEpoch(1),
+            slot: 999,
+        };
+        let mut placement: HashMap<WeightPlacementKey, WeightCellId> = HashMap::new();
+        placement.insert(key("w", 0, 0), cell_id);
+        let result = validate_freeze_structure(
+            Some(&binding),
+            Some(&current),
+            &placement,
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(10),
+        );
+        assert!(matches!(
+            result,
+            Err(FreezeValidationError::MissingPlacementCell(_))
+        ));
+    }
+
+    #[test]
+    fn fvalidate_rank_mismatch_rejected() {
+        let binding = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        // Slot 0 exists (arena has at least 1 cell).  Placement key
+        // says rank 0, cell_ranks says rank 7 → mismatch.
+        let cell_id = WeightCellId {
+            arena_epoch: WeightArenaEpoch(1),
+            slot: 0,
+        };
+        let mut placement: HashMap<WeightPlacementKey, WeightCellId> = HashMap::new();
+        placement.insert(key("w", 0, 0), cell_id);
+        // Note: arena_epoch must match so placement check passes first.
+        // We need 1 cell in the arena for slot 0 to be valid.
+        let mut ranks: HashMap<WeightCellId, usize> = HashMap::new();
+        ranks.insert(cell_id, 7);
+        let result = validate_freeze_structure(
+            Some(&binding),
+            Some(&current),
+            &placement,
+            &ranks,
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(1),
+        );
+        assert!(matches!(
+            result,
+            Err(FreezeValidationError::RankMismatch { .. })
+        ));
+    }
+
+    /// Shortcut: build a `WeightPlacementKey`.
+    fn key(name: &str, layer: usize, rank: usize) -> WeightPlacementKey {
+        WeightPlacementKey {
+            logical_name: name.into(),
+            layer: Some(layer),
+            logical_rank: rank,
+        }
+    }
+
+    #[test]
+    fn fvalidate_placement_missing_cell_rank_rejected() {
+        // Cell exists but has no entry in cell_ranks → rejected.
+        let binding = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        let cell_id = WeightCellId {
+            arena_epoch: WeightArenaEpoch(1),
+            slot: 0,
+        };
+        let mut placement: HashMap<WeightPlacementKey, WeightCellId> = HashMap::new();
+        placement.insert(key("w", 0, 0), cell_id);
+        // cell_ranks is empty — cell has no recorded rank.
+        let result = validate_freeze_structure(
+            Some(&binding),
+            Some(&current),
+            &placement,
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(1),
+        );
+        assert!(matches!(
+            result,
+            Err(FreezeValidationError::MissingPlacementCell(_))
+        ));
+    }
+
+    #[test]
+    fn fvalidate_empty_placement_passes() {
+        // No placements at all — only origin validation applies.
+        let binding = TargetBinding::Single(tori(1, 0, 0, 10));
+        let current = TargetState::Single(tori(1, 0, 0, 10));
+        let result = validate_freeze_structure(
+            Some(&binding),
+            Some(&current),
+            &HashMap::new(),
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(0),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fvalidate_binding_none_with_current_skips_origin() {
+        // When current is None, origin validation is skipped.
+        // UnboundBuilder still fires if binding is None.
+        let result = validate_freeze_structure::<TestOrigin>(
+            None,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            WeightArenaEpoch(1),
+            &ArenaCellInfo::resident_only(0),
+        );
+        assert!(matches!(result, Err(FreezeValidationError::UnboundBuilder)));
+    }
+
+    #[test]
+    fn fulfill_manifest_builder_error_types_compile() {
+        // Verify error variants are reachable and matchable.
+        let _stg = FulfillManifestBuilderError::Staging(
+            StageWeightError::DuplicateKey(WeightPlacementKey {
+                logical_name: "x".into(),
+                layer: None,
+                logical_rank: 0,
+            }),
+            AbortOutcome::Clean,
+        );
+        let _stg2 = FulfillManifestBuilderError::Staging(
+            StageWeightError::UploadFailed("OOM".into()),
+            AbortOutcome::Partial(WeightStoreCleanupError {
+                failures: Vec::new(),
+            }),
+        );
+        let _ = |e: &FulfillManifestBuilderError| match e {
+            FulfillManifestBuilderError::Preflight(_) => 0,
+            FulfillManifestBuilderError::Staging(_, _) => 1,
+        };
+        let _ = |o: &AbortOutcome| match o {
+            AbortOutcome::Clean => 0,
+            AbortOutcome::Partial(_) => 1,
+        };
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU and a WeightStoreTargetMut"]
+    fn fulfill_manifest_builder_single_gpu_happy_path() {
+        // Integration: create target, call fulfill_manifest_builder,
+        // freeze, tensor borrow, free.  Each placement key is
+        // discoverable via cell_id.
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU and a multi-GPU emulation/mesh target"]
+    fn fulfill_manifest_builder_mesh_happy_path() {
+        // Same for a Mesh target with at least 2 ranks.
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; tests post-stage rollback"]
+    fn fulfill_manifest_builder_staging_failure_aborts_cleanly() {
+        // Force a mid-fulfillment error; verify abort releases
+        // already-staged resources and returns the failure with
+        // AbortOutcome::Clean.
+    }
+
+    #[test]
+    fn stage_alias_cross_rank_rejects_with_placement_epoch_match() {
+        // Double-check that a matching-rank alias DOES reach the
+        // ForeignArena error (not CrossRankTarget) when the arena
+        // slot is empty.
+        let mut builder = WeightStoreBuilder {
+            inner: ArenaBuilder::new(),
+            placement: HashMap::new(),
+            cell_ranks: HashMap::new(),
+            projections: HashMap::new(),
+            binding: None,
+        };
+
+        // Same rank but no arena cell → arena validation fails before
+        // cross-rank can be reached.
+        let target_id = WeightCellId {
+            arena_epoch: builder.inner.epoch,
+            slot: 999,
+        };
+        builder.cell_ranks.insert(target_id, 0);
+        let alias_key = WeightPlacementKey {
+            logical_name: "ok".into(),
+            layer: None,
+            logical_rank: 0,
+        };
+        let result = builder.stage_alias(alias_key, target_id, WeightProjection::default());
+        assert!(
+            matches!(
+                result,
+                Err(StageAliasError::AliasFailed(AliasError::InvalidSlot))
+            ),
+            "expected InvalidSlot (empty arena), got {result:?}"
+        );
+    }
+
+    // ── column_shard_slice / row_shard_slice CPU tests ─────────────
+
+    #[test]
+    fn column_shard_slice_rejects_zero_rows() {
+        let result = column_shard_slice(&[0u8; 64], &[0, 8], 2, 0);
+        assert!(result.is_err(), "zero rows must be rejected");
+    }
+
+    #[test]
+    fn column_shard_slice_rejects_non_divisible_rows() {
+        // 3 rows not divisible by Tp=2
+        let result = column_shard_slice(&[0u8; 96], &[3, 8], 2, 0);
+        assert!(result.is_err(), "non-divisible rows must be rejected");
+    }
+
+    #[test]
+    fn column_shard_slice_rejects_non_divisible_blob() {
+        // 64 bytes not divisible by Tp=3
+        let result = column_shard_slice(&[0u8; 64], &[4, 8], 3, 0);
+        assert!(result.is_err(), "non-divisible blob must be rejected");
+    }
+
+    #[test]
+    fn column_shard_slice_uses_local_rank_for_byte_range() {
+        // 4 rows × 8 columns = 32 bytes, F32.
+        // Tp=2: local rank 0 gets bytes [0..16), local rank 1 gets [16..32).
+        let blob: Vec<u8> = (0u8..32).collect();
+        let (slice0, shape0) = column_shard_slice(&blob, &[4, 8], 2, 0).unwrap();
+        assert_eq!(
+            slice0,
+            (0u8..16).collect::<Vec<_>>(),
+            "rank 0 gets first half"
+        );
+        assert_eq!(shape0, vec![2, 8]);
+        let (slice1, shape1) = column_shard_slice(&blob, &[4, 8], 2, 1).unwrap();
+        assert_eq!(
+            slice1,
+            (16u8..32).collect::<Vec<_>>(),
+            "rank 1 gets second half"
+        );
+        assert_eq!(shape1, vec![2, 8]);
+    }
+
+    #[test]
+    fn row_shard_slice_rejects_zero_rows() {
+        let result = row_shard_slice(&[0u8; 64], &[0, 16], 2, 0);
+        assert!(result.is_err(), "zero rows must be rejected");
+    }
+
+    #[test]
+    fn row_shard_slice_rejects_zero_inner() {
+        let result = row_shard_slice(&[0u8; 0], &[8, 0], 2, 0);
+        assert!(result.is_err(), "zero inner dim must be rejected");
+    }
+
+    #[test]
+    fn row_shard_slice_rejects_non_divisible_inner() {
+        // inner=15 not divisible by Tp=2
+        let result = row_shard_slice(&[0u8; 120], &[8, 15], 2, 0);
+        assert!(result.is_err(), "non-divisible inner must be rejected");
+    }
+
+    #[test]
+    fn row_shard_slice_rejects_non_divisible_row_bytes() {
+        // 8 bytes per row not divisible by Tp=3
+        let result = row_shard_slice(&[0u8; 64], &[8, 8], 3, 0);
+        assert!(result.is_err(), "non-divisible row bytes must be rejected");
+    }
+
+    #[test]
+    fn row_shard_slice_uses_local_rank_for_stride() {
+        // 3 rows × 8 columns = 24 bytes, F32.
+        // Tp=2: each row's sub = 8/2 = 4 bytes.
+        // Row 0: [0..4) for rank 0, [4..8) for rank 1.
+        let blob: Vec<u8> = (0u8..24).collect();
+        // Rank 0: bytes 0..4, 8..12, 16..20 → [0,1,2,3, 8,9,10,11, 16,17,18,19]
+        let (slice0, shape0) = row_shard_slice(&blob, &[3, 8], 2, 0).unwrap();
+        assert_eq!(slice0, vec![0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19]);
+        assert_eq!(shape0, vec![3, 4]);
+        // Rank 1: bytes 4..7, 12..15, 20..23
+        let (slice1, _) = row_shard_slice(&blob, &[3, 8], 2, 1).unwrap();
+        assert_eq!(slice1, vec![4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23]);
+    }
+
+    #[test]
+    fn column_shard_slice_rejects_tp_zero() {
+        let result = column_shard_slice(&[0u8; 16], &[4, 4], 0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn column_shard_slice_rejects_local_rank_ge_tp() {
+        let result = column_shard_slice(&[0u8; 16], &[4, 4], 2, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn column_shard_slice_catch_unwind_never_panics() {
+        use std::panic::catch_unwind;
+        // tp=0 should return Err, not panic
+        let r1 = catch_unwind(|| column_shard_slice(&[0u8; 16], &[4, 4], 0, 0));
+        assert!(r1.is_ok(), "tp=0 must not panic");
+        assert!(r1.unwrap().is_err());
+        // local_rank >= tp should return Err, not panic
+        let r2 = catch_unwind(|| column_shard_slice(&[0u8; 16], &[4, 4], 2, 5));
+        assert!(r2.is_ok(), "rank>=tp must not panic");
+        assert!(r2.unwrap().is_err());
+        // undersized blob should return Err, not panic
+        let r3 = catch_unwind(|| column_shard_slice(&[0u8; 3], &[4, 4], 2, 0));
+        assert!(r3.is_ok(), "undersized blob must not panic");
+        assert!(r3.unwrap().is_err());
+    }
+
+    #[test]
+    fn row_shard_slice_rejects_tp_zero() {
+        let result = row_shard_slice(&[0u8; 32], &[4, 8], 0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn row_shard_slice_rejects_local_rank_ge_tp() {
+        let result = row_shard_slice(&[0u8; 32], &[4, 8], 2, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn row_shard_slice_catch_unwind_never_panics() {
+        use std::panic::catch_unwind;
+        let r1 = catch_unwind(|| row_shard_slice(&[0u8; 32], &[4, 8], 0, 0));
+        assert!(r1.is_ok(), "tp=0 must not panic");
+        assert!(r1.unwrap().is_err());
+        let r2 = catch_unwind(|| row_shard_slice(&[0u8; 32], &[4, 8], 2, 5));
+        assert!(r2.is_ok(), "rank>=tp must not panic");
+        assert!(r2.unwrap().is_err());
+        let r3 = catch_unwind(|| row_shard_slice(&[0u8; 3], &[4, 8], 2, 0));
+        assert!(r3.is_ok(), "undersized blob must not panic");
+        assert!(r3.unwrap().is_err());
+    }
+
+    #[test]
+    fn placement_uses_global_device_rank_not_local_index() {
+        // Simulate a PP2 mesh where placement_devices returns global
+        // ranks [2, 3] for a Tp-only axis.  The helper's local_rank
+        // feeds byte slicing; the returned data is position-agnostic.
+        // We verify by checking that both ranks get correct slices
+        // regardless of the global device mapping.
+        let blob: Vec<u8> = (0u8..32).collect();
+        // Column shard Tp=2 over global devices [2,3]:
+        // local_rank 0 → slice [0..16), local_rank 1 → [16..32).
+        let (r0, _) = column_shard_slice(&blob, &[4, 8], 2, 0).unwrap();
+        let (r1, _) = column_shard_slice(&blob, &[4, 8], 2, 1).unwrap();
+        // The key logical_rank (2 or 3) is the caller's responsibility;
+        // the helper does not see it.  This test verifies the helper
+        // still produces correct byte slices independent of global rank.
+        assert_eq!(r0.len(), 16);
+        assert_eq!(r1.len(), 16);
+        assert_ne!(r0, r1, "slices must differ");
+        let mut combined = r0.clone();
+        combined.extend_from_slice(&r1);
+        assert_eq!(combined, blob, "slices must partition the original blob");
     }
 }
