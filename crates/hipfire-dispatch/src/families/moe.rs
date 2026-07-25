@@ -36,6 +36,119 @@ use crate::types::*;
 /// error rather than failing deep in the per-bucket dispatch.
 pub const MIXED_SUPPORTED_TIERS: [DType; 3] = [DType::MQ4G256, DType::MQ6G256, DType::ParoQ4G128];
 
+/// The routing operation selected for an MoE layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouterSelection {
+    SoftmaxTopK,
+    SigmoidTopK,
+    BiasAwareTopK,
+    Hash,
+    Precomputed,
+}
+
+/// Typed routing plan shared by decode and prefill MoE execution.
+///
+/// `normalize` describes whether selected routing weights are renormalized;
+/// `route_scale` is applied after that combination. Bias is intentionally only
+/// present on [`RouterPlan::BiasAwareTopK`], and hash operands are only present
+/// on [`RouterPlan::Hash`], so those semantics cannot be silently dropped by a
+/// generic boolean configuration.
+pub enum RouterPlan<'a> {
+    SoftmaxTopK {
+        scores: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        k_top: usize,
+        normalize: bool,
+        route_scale: f32,
+    },
+    SigmoidTopK {
+        scores: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        k_top: usize,
+        normalize: bool,
+        route_scale: f32,
+    },
+    BiasAwareTopK {
+        scores: &'a GpuTensor,
+        gate_bias: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        k_top: usize,
+        normalize: bool,
+        route_scale: f32,
+    },
+    Hash {
+        scores: &'a GpuTensor,
+        tokens: &'a GpuTensor,
+        tid2eid: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        k_top: usize,
+        normalize: bool,
+        route_scale: f32,
+    },
+    Precomputed {
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        k_top: usize,
+        normalize: bool,
+        route_scale: f32,
+    },
+}
+
+impl RouterPlan<'_> {
+    pub fn selection(&self) -> RouterSelection {
+        match self {
+            Self::SoftmaxTopK { .. } => RouterSelection::SoftmaxTopK,
+            Self::SigmoidTopK { .. } => RouterSelection::SigmoidTopK,
+            Self::BiasAwareTopK { .. } => RouterSelection::BiasAwareTopK,
+            Self::Hash { .. } => RouterSelection::Hash,
+            Self::Precomputed { .. } => RouterSelection::Precomputed,
+        }
+    }
+
+    pub fn k_top(&self) -> usize {
+        match self {
+            Self::SoftmaxTopK { k_top, .. }
+            | Self::SigmoidTopK { k_top, .. }
+            | Self::BiasAwareTopK { k_top, .. }
+            | Self::Hash { k_top, .. }
+            | Self::Precomputed { k_top, .. } => *k_top,
+        }
+    }
+
+    pub fn normalizes(&self) -> bool {
+        match self {
+            Self::SoftmaxTopK { normalize, .. }
+            | Self::SigmoidTopK { normalize, .. }
+            | Self::BiasAwareTopK { normalize, .. }
+            | Self::Hash { normalize, .. }
+            | Self::Precomputed { normalize, .. } => *normalize,
+        }
+    }
+
+    pub fn route_scale(&self) -> f32 {
+        match self {
+            Self::SoftmaxTopK { route_scale, .. }
+            | Self::SigmoidTopK { route_scale, .. }
+            | Self::BiasAwareTopK { route_scale, .. }
+            | Self::Hash { route_scale, .. }
+            | Self::Precomputed { route_scale, .. } => *route_scale,
+        }
+    }
+}
+
+/// Expert execution shape. This is an execution choice, not a dtype
+/// eligibility lattice; [`MoeResolution`] remains the owner of the latter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertExecutionPlan {
+    IndexedQuantized,
+    GroupedQuantized,
+    PerExpertFallback,
+}
+
 /// Per-layer dtype snapshot the MoE eligibility lattice reads. Built by the
 /// model from its weight structs; kept dtype-only so this stays GPU-free and
 /// the dispatch crate needs no dependency on any arch crate.
@@ -1637,5 +1750,105 @@ mod tests {
             !r.mixed,
             "a uniform per-expert table must take the fast uniform path"
         );
+    }
+
+    #[test]
+    fn router_plan_preserves_normalization_and_scale() {
+        let tensor = GpuTensor::null_for_test();
+        let plan = RouterPlan::BiasAwareTopK {
+            scores: &tensor,
+            gate_bias: &tensor,
+            topk_indices: &tensor,
+            topk_weights: &tensor,
+            k_top: 6,
+            normalize: true,
+            route_scale: 0.25,
+        };
+
+        assert_eq!(plan.k_top(), 6);
+        assert!(plan.normalizes());
+        assert_eq!(plan.route_scale(), 0.25);
+    }
+
+    #[test]
+    fn router_plan_variants_keep_compatible_operands() {
+        let tensor = GpuTensor::null_for_test();
+        let plans = [
+            RouterPlan::SoftmaxTopK {
+                scores: &tensor,
+                topk_indices: &tensor,
+                topk_weights: &tensor,
+                k_top: 8,
+                normalize: true,
+                route_scale: 1.0,
+            },
+            RouterPlan::SigmoidTopK {
+                scores: &tensor,
+                topk_indices: &tensor,
+                topk_weights: &tensor,
+                k_top: 8,
+                normalize: false,
+                route_scale: 1.0,
+            },
+            RouterPlan::BiasAwareTopK {
+                scores: &tensor,
+                gate_bias: &tensor,
+                topk_indices: &tensor,
+                topk_weights: &tensor,
+                k_top: 6,
+                normalize: true,
+                route_scale: 0.5,
+            },
+            RouterPlan::Hash {
+                scores: &tensor,
+                tokens: &tensor,
+                tid2eid: &tensor,
+                topk_indices: &tensor,
+                topk_weights: &tensor,
+                k_top: 6,
+                normalize: true,
+                route_scale: 1.0,
+            },
+            RouterPlan::Precomputed {
+                topk_indices: &tensor,
+                topk_weights: &tensor,
+                k_top: 4,
+                normalize: false,
+                route_scale: 1.0,
+            },
+        ];
+
+        assert_eq!(plans[0].selection(), RouterSelection::SoftmaxTopK);
+        assert_eq!(plans[1].selection(), RouterSelection::SigmoidTopK);
+        assert_eq!(plans[2].selection(), RouterSelection::BiasAwareTopK);
+        assert_eq!(plans[3].selection(), RouterSelection::Hash);
+        assert_eq!(plans[4].selection(), RouterSelection::Precomputed);
+    }
+
+    #[test]
+    fn router_plan_hash_carries_scores_and_preserves_selection() {
+        let scores = GpuTensor::null_for_test();
+        let tokens = GpuTensor::null_for_test();
+        let tid2eid = GpuTensor::null_for_test();
+        let topk_indices = GpuTensor::null_for_test();
+        let topk_weights = GpuTensor::null_for_test();
+        let plan = RouterPlan::Hash {
+            scores: &scores,
+            tokens: &tokens,
+            tid2eid: &tid2eid,
+            topk_indices: &topk_indices,
+            topk_weights: &topk_weights,
+            k_top: 6,
+            normalize: true,
+            route_scale: 1.0,
+        };
+
+        match &plan {
+            RouterPlan::Hash { scores: actual, .. } => {
+                assert!(std::ptr::eq(*actual, &scores));
+            }
+            _ => unreachable!("constructed a hash routing plan"),
+        }
+        assert_eq!(plan.selection(), RouterSelection::Hash);
     }
 }
