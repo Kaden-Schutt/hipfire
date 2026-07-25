@@ -171,6 +171,13 @@ pub trait Architecture: Send + 'static {
         Vec::new()
     }
 
+    /// Declarative MoE expert-group manifest. The runtime resolves global
+    /// expert ids to owners and compact local slots; non-MoE architectures
+    /// retain their existing behavior through the empty default.
+    fn expert_group_manifest(_cfg: &Self::Config) -> Vec<crate::weight_manifest::ExpertGroupSpec> {
+        Vec::new()
+    }
+
     // Forward pass shapes are arch-specific; declare the surface but
     // don't constrain types in this trait — concrete arch crates
     // expose their own typed forward methods. The runtime's generic

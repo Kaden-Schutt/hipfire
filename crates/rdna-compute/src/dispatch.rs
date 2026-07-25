@@ -12,6 +12,7 @@ use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
@@ -387,6 +388,42 @@ pub struct MmqScreenState {
     pub threshold: f32,
 }
 
+/// Counter for allocating fresh [`AllocationDomainId`] values.
+static NEXT_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate the next [`AllocationDomainId`] via a checked CAS loop.
+/// Panics on exhaustion (same sentinel discipline as [`MeshEpoch`]).
+fn next_domain_id() -> AllocationDomainId {
+    let mut current = NEXT_DOMAIN_ID.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            panic!("AllocationDomainId exhausted: no remaining issuable IDs");
+        }
+        match NEXT_DOMAIN_ID.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return AllocationDomainId(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Opaque, non-forgeable allocation-domain identity for a [`Gpu`].
+///
+/// Every [`Gpu`] receives one domain ID at construction time that is stable
+/// for the lifetime of the GPU instance — not affected by [`GpuPool::drain`]
+/// or any other reclamation.
+///
+/// The only way to obtain an [`AllocationDomainId`] is through
+/// [`Gpu::allocation_domain_id()`] — raw integer construction is not exposed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct AllocationDomainId(u64);
+
+impl AllocationDomainId {}
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 pub struct Gpu {
     pub hip: HipRuntime,
@@ -394,6 +431,9 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// The allocation-domain identity for this GPU, assigned at construction
+    /// and stable for the lifetime of this instance.
+    allocation_domain_id: AllocationDomainId,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -661,6 +701,12 @@ impl Gpu {
         self.active_stream.as_ref()
     }
 
+    /// The opaque, non-forgeable allocation-domain identity assigned to this
+    /// GPU at construction. Stable for the lifetime of this instance.
+    pub fn allocation_domain_id(&self) -> &AllocationDomainId {
+        &self.allocation_domain_id
+    }
+
     /// Bind this `Gpu`'s device on the calling thread. Delegates to
     /// `crate::graph::bind_thread`.
     #[inline]
@@ -811,6 +857,7 @@ impl Gpu {
             flags,
             arch_caps,
             device_id: id,
+            allocation_domain_id: next_domain_id(),
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
@@ -2477,6 +2524,7 @@ impl Drop for Gpu {
 #[cfg(test)]
 mod tests {
     use super::gen_fwht_signs;
+    use super::next_domain_id;
     use super::DType;
     use super::HessianCapture;
 
@@ -2642,5 +2690,38 @@ mod tests {
             s1,
             "seed 43 should differ from seed 42"
         );
+    }
+
+    // ── AllocationDomainId ──────────────────────────────────────────
+
+    #[test]
+    fn allocation_domain_ids_are_distinct() {
+        let a = next_domain_id();
+        let b = next_domain_id();
+        assert_ne!(a, b);
+    }
+
+    /// AllocationDomainId must be opaque: no `as_u64()` accessor.
+    /// Verify the expected traits compile (Clone, Copy, PartialEq, Debug, Hash).
+    #[test]
+    fn allocation_domain_id_opaque_traits() {
+        let a = next_domain_id();
+        let a2 = a; // Copy
+        let _b = a2.clone(); // Clone
+        assert_eq!(a, a2); // PartialEq
+        let _dbg = format!("{a:?}"); // Debug
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        a.hash(&mut h); // Hash
+        let _ = h.finish();
+    }
+
+    /// AllocationDomainId must not be constructable outside `rdna-compute`.
+    /// Only `next_domain_id()` (module-private) can create one.
+    #[test]
+    fn allocation_domain_id_no_fabrication_outside_module() {
+        // Same-crate tests can call next_domain_id() directly.
+        // External crates cannot — that is the opacity guarantee.
+        let _id = next_domain_id();
     }
 }

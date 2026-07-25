@@ -27,7 +27,7 @@ use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{AllocationDomainId, DType, Gpu, GpuTensor};
 
 /// Device-resolution knobs the hardware layer needs at `Gpus` construction
 /// time. Extracted from `hipfire_runtime::config` so this crate is a leaf
@@ -65,38 +65,26 @@ impl DeviceResolveOpts {
     }
 }
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Pool-epoch counter for [`WeightPoolEpoch`] allocation.
-static NEXT_POOL_EPOCH: AtomicU64 = AtomicU64::new(1);
-
-/// Allocate the next [`WeightPoolEpoch`] via a checked CAS loop.
-/// Panics on exhaustion (same sentinel discipline as [`MeshEpoch`]).
-fn next_pool_epoch() -> WeightPoolEpoch {
-    let mut current = NEXT_POOL_EPOCH.load(Ordering::Relaxed);
-    loop {
-        if current == u64::MAX {
-            panic!("WeightPoolEpoch exhausted: no remaining issuable epochs");
-        }
-        match NEXT_POOL_EPOCH.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return WeightPoolEpoch(current),
-            Err(actual) => current = actual,
-        }
-    }
-}
-
 /// Opaque epoch for a weight-allocation domain — one per logical rank.
 ///
 /// Two allocation origins compare equal only when they share the same pool
 /// epoch (i.e., they reference the same allocation-domain generation on the
 /// same logical rank of the same mesh).
+///
+/// `WeightPoolEpoch` cannot be fabricated — it is produced only by
+/// [`Gpus::weight_origin`], [`Gpus::weight_origin_in`], or
+/// [`Gpus::single_weight_origin`], each of which extracts the opaque
+/// [`AllocationDomainId`] from a live [`Gpu`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct WeightPoolEpoch(u64);
+pub struct WeightPoolEpoch(AllocationDomainId);
+
+/// Private helper: create a [`WeightPoolEpoch`] from the live
+/// [`AllocationDomainId`] on a [`Gpu`].  This is the only way to
+/// construct a `WeightPoolEpoch` — external callers receive one from
+/// the `Gpus` methods listed above.
+fn epoch_from_domain(id: AllocationDomainId) -> WeightPoolEpoch {
+    WeightPoolEpoch(id)
+}
 
 /// Identifies a weight-allocation event: which mesh instance, which logical
 /// rank, which physical device, and which pool epoch within that rank.
@@ -128,7 +116,7 @@ impl WeightAllocationOrigin {
     }
 }
 
-/// Errors from [`Gpus::weight_origin`].
+/// Errors from [`Gpus::weight_origin`] / [`Gpus::weight_origin_in`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WeightOriginError {
     /// The `Gpus` was not constructed from a [`DeviceMesh`]; call
@@ -136,6 +124,9 @@ pub enum WeightOriginError {
     UnboundMesh,
     /// The given logical rank is out of range for this `Gpus`.
     UnknownRank(usize),
+    /// The mesh passed to [`Gpus::weight_origin_in`] has a different epoch
+    /// than the mesh bound to this `Gpus` at construction.
+    MeshEpochMismatch,
 }
 
 impl std::fmt::Display for WeightOriginError {
@@ -146,6 +137,12 @@ impl std::fmt::Display for WeightOriginError {
             }
             WeightOriginError::UnknownRank(r) => {
                 write!(f, "logical rank {r} is out of range")
+            }
+            WeightOriginError::MeshEpochMismatch => {
+                write!(
+                    f,
+                    "mesh epoch mismatch: provided mesh is not the same instance bound to this Gpus"
+                )
             }
         }
     }
@@ -214,9 +211,6 @@ pub struct Gpus {
     /// `Some(mesh.epoch())` when constructed via [`Gpus::from_mesh`];
     /// `None` for single / uniform / TP constructors.
     mesh_epoch: Option<MeshEpoch>,
-    /// One pool epoch per logical rank, issued at construction by
-    /// [`Gpus::from_mesh`]. Empty when `mesh_epoch` is `None`.
-    pool_epochs: Vec<WeightPoolEpoch>,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -304,7 +298,6 @@ impl Gpus {
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
             mesh_epoch: None,
-            pool_epochs: Vec::new(),
         }
     }
 
@@ -355,7 +348,6 @@ impl Gpus {
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
             mesh_epoch: None,
-            pool_epochs: Vec::new(),
         })
     }
 
@@ -390,9 +382,7 @@ impl Gpus {
             ));
         };
         Self::validate_mesh_device_count(mesh, gpus.devices.len())?;
-        let n = gpus.devices.len();
         gpus.mesh_epoch = Some(mesh.epoch());
-        gpus.pool_epochs = (0..n).map(|_| next_pool_epoch()).collect();
         Ok(gpus)
     }
 
@@ -613,7 +603,6 @@ impl Gpus {
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
             mesh_epoch: None,
-            pool_epochs: Vec::new(),
         })
     }
 
@@ -1009,16 +998,62 @@ impl Gpus {
     /// `self.devices[rank].device_id` — no synthetic fallback exists.
     pub fn weight_origin(&self, rank: usize) -> Result<WeightAllocationOrigin, WeightOriginError> {
         let mesh_epoch = self.mesh_epoch.ok_or(WeightOriginError::UnboundMesh)?;
-        let pool_epoch = self
-            .pool_epochs
-            .get(rank)
-            .copied()
-            .ok_or(WeightOriginError::UnknownRank(rank))?;
-        let physical_device = self
+        let dev = self
             .devices
             .get(rank)
-            .map(|d| d.device_id)
             .ok_or(WeightOriginError::UnknownRank(rank))?;
+        let physical_device = dev.device_id;
+        let pool_epoch = epoch_from_domain(*dev.allocation_domain_id());
+        Ok(Self::assemble_origin(
+            mesh_epoch,
+            rank,
+            physical_device,
+            pool_epoch,
+        ))
+    }
+
+    // ── weight-origin helpers for single/mesh-aware queries ──────────
+
+    /// Construct a [`WeightAllocationOrigin`] for a single GPU within a
+    /// [`DeviceMesh`], without a `Gpus` wrapper.  The logical rank is always
+    /// 0 (a single GPU is rank 0 of a 1-wide mesh).
+    pub fn single_weight_origin(mesh: &DeviceMesh, gpu: &Gpu) -> WeightAllocationOrigin {
+        Self::assemble_origin(
+            mesh.epoch(),
+            0,
+            gpu.device_id,
+            epoch_from_domain(*gpu.allocation_domain_id()),
+        )
+    }
+
+    /// Return the [`WeightAllocationOrigin`] for `rank`, additionally
+    /// validating that `mesh` matches the mesh bound to this `Gpus`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeightOriginError::UnboundMesh`] when this `Gpus` was never
+    /// bound to a [`DeviceMesh`].
+    ///
+    /// Returns [`WeightOriginError::UnknownRank`] when `rank` is out of range
+    /// for `self.devices`.
+    ///
+    /// Returns [`WeightOriginError::MeshEpochMismatch`] when `mesh.epoch()`
+    /// differs from the bound mesh's epoch.
+    pub fn weight_origin_in(
+        &self,
+        mesh: &DeviceMesh,
+        rank: usize,
+    ) -> Result<WeightAllocationOrigin, WeightOriginError> {
+        let mesh_epoch = self.mesh_epoch.ok_or(WeightOriginError::UnboundMesh)?;
+        if mesh.epoch() != mesh_epoch {
+            return Err(WeightOriginError::MeshEpochMismatch);
+        }
+        let dev = self
+            .devices
+            .get(rank)
+            .ok_or(WeightOriginError::UnknownRank(rank))?;
+        let physical_device = dev.device_id;
+        let pool_epoch = epoch_from_domain(*dev.allocation_domain_id());
         Ok(Self::assemble_origin(
             mesh_epoch,
             rank,
@@ -1164,17 +1199,63 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
 mod tests {
     use super::*;
 
-    // ── assemble_origin (pure helper, no Gpu required) ────────────────
+    // ── assemble_origin / WeightAllocationOrigin ──────────────────────
 
+    /// Private test-only fixture: construct a real single-GPU [`Gpus`]
+    /// bound to a given [`DeviceMesh`].  Requires ROCm hardware; panics
+    /// via `expect` when unavailable.  The caller controls the mesh so they
+    /// can create distinct epochs for mismatch testing.
+    fn make_bound_gpus(mesh: &DeviceMesh) -> Gpus {
+        let gpu = Gpu::init_with_device(0)
+            .expect("requires ROCm GPU — install ROCm or run with --skip ignored");
+        let mut gpus = Gpus::single(gpu, 24);
+        gpus.mesh_epoch = Some(mesh.epoch());
+        gpus
+    }
+
+    /// assemble_origin composition — requires a live Gpu to produce an
+    /// [`AllocationDomainId`] (no public fabricator exists).
     #[test]
+    #[ignore = "requires ROCm GPU"]
     fn assemble_origin_constructs_correctly() {
+        let gpu = Gpu::init_with_device(0).expect("ROCm GPU required");
         let mesh_epoch = DeviceMesh::single().epoch();
-        let pool_epoch = next_pool_epoch();
-        let origin = Gpus::assemble_origin(mesh_epoch, 7, 42, pool_epoch);
+        let epoch = epoch_from_domain(*gpu.allocation_domain_id());
+        let origin = Gpus::assemble_origin(mesh_epoch, 7, 42, epoch);
         assert_eq!(origin.mesh_epoch(), mesh_epoch);
         assert_eq!(origin.logical_rank(), 7);
         assert_eq!(origin.physical_device(), 42);
-        assert_eq!(origin.pool_epoch(), pool_epoch);
+        assert_eq!(origin.pool_epoch(), epoch);
+    }
+
+    /// Equality observes all four fields — requires two distinct
+    /// [`AllocationDomainId`] values from distinct Gpu instances.
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn weight_allocation_origin_equality_observes_all_four_fields() {
+        let gpu1 = Gpu::init_with_device(0).expect("ROCm GPU required");
+        let gpu2 = Gpu::init_with_device(0).expect("ROCm GPU required");
+        let me1 = DeviceMesh::single().epoch();
+        let me2 = DeviceMesh::rect(&[(DimKind::Tp, 2)]).epoch();
+        let epoch = epoch_from_domain(*gpu1.allocation_domain_id());
+        let epoch_diff = epoch_from_domain(*gpu2.allocation_domain_id());
+        let base = Gpus::assemble_origin(me1, 0, 0, epoch);
+        assert_ne!(base, Gpus::assemble_origin(me2, 0, 0, epoch), "mesh epoch");
+        assert_ne!(
+            base,
+            Gpus::assemble_origin(me1, 1, 0, epoch),
+            "logical rank"
+        );
+        assert_ne!(
+            base,
+            Gpus::assemble_origin(me1, 0, 1, epoch),
+            "physical device"
+        );
+        assert_ne!(
+            base,
+            Gpus::assemble_origin(me1, 0, 0, epoch_diff),
+            "pool epoch"
+        );
     }
 
     // ── validate_mesh_device_count (pure helper, no Gpu required) ──────
@@ -1196,14 +1277,14 @@ mod tests {
         );
     }
 
-    // ── pre-existing tests ────────────────────────────────────────────
+    // ── pre-existing pure CPU tests ────────────────────────────────────
 
     #[test]
     fn alias_ids_maps_into_physical_range() {
-        assert_eq!(alias_ids(&[0, 1], 1), vec![0, 0]); // 2 logical -> 1 physical
-        assert_eq!(alias_ids(&[0, 1, 2, 3], 2), vec![0, 1, 0, 1]); // 4 -> 2
-        assert_eq!(alias_ids(&[0, 0], 1), vec![0, 0]); // idempotent
-        assert_eq!(alias_ids(&[0, 1], 2), vec![0, 1]); // no-op when in range
+        assert_eq!(alias_ids(&[0, 1], 1), vec![0, 0]);
+        assert_eq!(alias_ids(&[0, 1, 2, 3], 2), vec![0, 1, 0, 1]);
+        assert_eq!(alias_ids(&[0, 0], 1), vec![0, 0]);
+        assert_eq!(alias_ids(&[0, 1], 2), vec![0, 1]);
     }
 
     #[test]
@@ -1227,21 +1308,135 @@ mod tests {
         }
     }
 
+    // ── WeightOriginError Display (pure, no Gpu required) ──────────────
+
     #[test]
-    fn weight_allocation_origin_equality_observes_all_four_fields() {
-        let me1 = DeviceMesh::single().epoch();
-        let me2 = DeviceMesh::rect(&[(DimKind::Tp, 2)]).epoch();
-        let pe1 = next_pool_epoch();
-        let pe2 = next_pool_epoch();
-        let base = Gpus::assemble_origin(me1, 0, 0, pe1);
-        // Vary each field independently.
-        assert_ne!(base, Gpus::assemble_origin(me2, 0, 0, pe1), "mesh epoch");
-        assert_ne!(base, Gpus::assemble_origin(me1, 1, 0, pe1), "logical rank");
-        assert_ne!(
-            base,
-            Gpus::assemble_origin(me1, 0, 1, pe1),
-            "physical device"
+    fn weight_origin_error_mesh_epoch_mismatch_display() {
+        let err = WeightOriginError::MeshEpochMismatch;
+        let msg = err.to_string();
+        assert!(msg.contains("mesh epoch mismatch"), "error message: {msg}");
+    }
+
+    #[test]
+    fn weight_origin_error_unbound_mesh_display() {
+        let err = WeightOriginError::UnboundMesh;
+        let msg = err.to_string();
+        assert!(msg.contains("not constructed from"), "error message: {msg}");
+    }
+
+    #[test]
+    fn weight_origin_error_unknown_rank_display() {
+        let err = WeightOriginError::UnknownRank(42);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rank") && msg.contains("42"),
+            "error message: {msg}",
         );
-        assert_ne!(base, Gpus::assemble_origin(me1, 0, 0, pe2), "pool epoch");
+    }
+
+    // ── weight_origin / weight_origin_in / single_weight_origin ──────
+    //
+    // All tests below require a real Gpu initialized via
+    // `Gpu::init_with_device(0)` → `HipRuntime::load()` → dlopen of
+    // `libamdhip64.so`.  Without an AMD GPU + ROCm installed they are
+    // skipped with `#[ignore = "requires ROCm GPU"]`.
+    //
+    // The `make_bound_gpus` fixture (above) wraps a bare `Gpu` into a
+    // mesh-bound `Gpus` by mutating the private `mesh_epoch` field, so
+    // the `weight_origin*` methods reach the rank check / epoch check
+    // instead of short-circuiting at `UnboundMesh`.
+
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn gpu_allocation_domain_id_stable_through_drain_pool() {
+        let mut gpu = Gpu::init_with_device(0).expect("ROCm GPU required");
+        let before = *gpu.allocation_domain_id();
+        gpu.drain_pool();
+        let after = *gpu.allocation_domain_id();
+        assert_eq!(
+            before, after,
+            "drain_pool must not change allocation_domain_id"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn gpu_construction_assigns_unique_domain_ids() {
+        let gpu0 = Gpu::init_with_device(0).expect("ROCm GPU required");
+        let gpu1 = Gpu::init_with_device(0).expect("ROCm GPU required");
+        assert_ne!(
+            *gpu0.allocation_domain_id(),
+            *gpu1.allocation_domain_id(),
+            "two independently-constructed Gpu instances must have distinct allocation_domain_ids"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn single_weight_origin_composes_origin_from_gpu_and_mesh() {
+        let gpu = Gpu::init_with_device(0).expect("ROCm GPU required");
+        let mesh = DeviceMesh::single();
+        let origin = Gpus::single_weight_origin(&mesh, &gpu);
+        assert_eq!(origin.mesh_epoch(), mesh.epoch());
+        assert_eq!(origin.logical_rank(), 0);
+        assert_eq!(origin.physical_device(), gpu.device_id);
+        let expected_epoch = epoch_from_domain(*gpu.allocation_domain_id());
+        assert_eq!(origin.pool_epoch(), expected_epoch);
+
+        // Round-trip: extract the domain id from the origin via the
+        // private epoch_from_domain helper — external callers cannot
+        // fabricate a matching WeightPoolEpoch without it.
+        let roundtrip = epoch_from_domain(*gpu.allocation_domain_id());
+        assert_eq!(origin.pool_epoch(), roundtrip);
+    }
+
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn weight_origin_unbound_mesh_error() {
+        let gpu = Gpu::init_with_device(0).expect("ROCm GPU required");
+        let gpus = Gpus::single(gpu, 24);
+        let err = gpus.weight_origin(0).unwrap_err();
+        assert_eq!(err, WeightOriginError::UnboundMesh);
+    }
+
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn weight_origin_unknown_rank_error() {
+        let mesh = DeviceMesh::single();
+        let gpus = make_bound_gpus(&mesh);
+        let err = gpus.weight_origin(99).unwrap_err();
+        assert_eq!(err, WeightOriginError::UnknownRank(99));
+    }
+
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn weight_origin_in_mesh_epoch_mismatch_error() {
+        let mesh = DeviceMesh::single();
+        let other_mesh = DeviceMesh::single();
+        let gpus = make_bound_gpus(&mesh);
+        let err = gpus.weight_origin_in(&other_mesh, 0).unwrap_err();
+        assert_eq!(err, WeightOriginError::MeshEpochMismatch);
+    }
+
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn weight_origin_in_unknown_rank_error() {
+        let mesh = DeviceMesh::single();
+        let gpus = make_bound_gpus(&mesh);
+        let err = gpus.weight_origin_in(&mesh, 99).unwrap_err();
+        assert_eq!(err, WeightOriginError::UnknownRank(99));
+    }
+
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn weight_origin_in_valid_bound_case() {
+        let mesh = DeviceMesh::single();
+        let gpus = make_bound_gpus(&mesh);
+        let origin = gpus.weight_origin_in(&mesh, 0).expect("bound + valid rank");
+        assert_eq!(origin.mesh_epoch(), mesh.epoch());
+        assert_eq!(origin.logical_rank(), 0);
+        assert_eq!(origin.physical_device(), gpus.devices[0].device_id);
+        let expected_epoch = epoch_from_domain(*gpus.devices[0].allocation_domain_id());
+        assert_eq!(origin.pool_epoch(), expected_epoch);
     }
 }
