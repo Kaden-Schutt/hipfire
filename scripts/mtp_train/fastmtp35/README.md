@@ -64,6 +64,22 @@ trajectories remain valid MTP supervision; the trainer masks their final
 recursive targets rather than requiring an EOS-complete SFT answer.
 `training.json` pins the initial K=3 FastMTP optimization recipe.
 
+After GPU work releases the dataset volume, produce a read-only durable audit
+of the original teacher corpus:
+
+```bash
+cargo run --release -p hipfire-mtp-data --bin audit_fastmtp_distill -- \
+  ~/.hipfire/datasets/fastmtp-qwen36-a3b-v1 \
+  --expected-rows 440000 \
+  --output ~/.hipfire/datasets/fastmtp-qwen36-a3b-v1/distill-audit.json
+```
+
+The auditor streams every prompt and completion shard without rewriting valid
+data. It verifies manifest/job hashes, the exact four-way GPU shard set,
+partition ownership and unique indices, prompt IDs, sampling contracts, JSON
+integrity, row and completion-token totals, and records per-job/per-GPU hashes
+and finish-reason counts.
+
 ## Stage 2: exact deployed-trunk features on four R9700s
 
 Stage 2 is deliberately separate from optimization. The full MQ4R trunk

@@ -9,4 +9,5 @@ description = "Portable hidden-state feature shards for Hipfire MTP training"
 half.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
