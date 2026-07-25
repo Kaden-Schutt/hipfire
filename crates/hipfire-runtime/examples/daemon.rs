@@ -2336,6 +2336,11 @@ fn main() {
                     .get("temperature")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_temp) as f32;
+                // Optional OpenAI-compatible per-request sampler seed. Keep
+                // this as an Option so every path retains its historical
+                // default when clients omit it; native Qwen AR and sampled
+                // MTP consume it below for controlled distribution audits.
+                let sample_seed = msg.get("seed").and_then(|v| v.as_u64());
                 let max_tokens = msg
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
@@ -2707,6 +2712,7 @@ fn main() {
                         prompt,
                         system,
                         user_explicit_sampling,
+                        sample_seed,
                         temp,
                         top_p,
                         top_k,
@@ -6416,6 +6422,7 @@ fn generate_qwen35_mtp(
     repeat_window: usize,
     presence_penalty: f32,
     frequency_penalty: f32,
+    sample_seed: Option<u64>,
 ) {
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -6887,11 +6894,14 @@ fn generate_qwen35_mtp(
                 presence_penalty,
                 frequency_penalty,
             },
-            42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
+            sample_seed.unwrap_or(42),
         );
     } else {
         state.set_p_min(p_min); // greedy MTP confidence cutoff
-        state.set_sampling(mtp_spec::MtpSamplingConfig::default(), 42);
+        state.set_sampling(
+            mtp_spec::MtpSamplingConfig::default(),
+            sample_seed.unwrap_or(42),
+        );
     }
     // Match mature AR exactly: penalties see only tokens generated during this
     // request, never the prompt or prior chat history. Prefix-cache retention
@@ -8509,6 +8519,10 @@ fn generate(
     // (top_p/top_k/min_p/penalties). Gates temp>0 spec routing: explicit controls
     // force the AR sampler (the SWOR spec verify can only honor temperature).
     user_explicit_sampling: bool,
+    // Optional OpenAI-compatible request seed. Native single-GPU Qwen AR and
+    // sampled MTP use this to make controlled seed-set comparisons possible.
+    // Other paths retain their historical defaults until explicitly wired.
+    sample_seed: Option<u64>,
     temp: f32,
     top_p: f32,
     top_k: Option<u32>,
@@ -8536,7 +8550,11 @@ fn generate(
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    let qwen_request_seed =
+        sample_seed.map(|seed| ((seed >> 32) as u32) ^ seed as u32);
+    hipfire_runtime::llama::reset_cpu_sampler_rng(
+        qwen_request_seed.unwrap_or(0x13579BDF),
+    );
     // Expert-parallel (task #26): route to generate_ep BEFORE any arch
     // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
@@ -9063,6 +9081,7 @@ fn generate(
             repeat_window,
             presence_penalty,
             frequency_penalty,
+            sample_seed,
         );
         // Silence unused-variable warnings for AR-only / DFlash-only knobs the
         // MTP serve path does not consume.
@@ -10380,7 +10399,7 @@ fn generate(
         // stream as the sample kernel launch, so the copy and compute pipeline
         // naturally.
         let vocab_size = config.vocab_size;
-        let mut rng_state: u32 = 0x13579BDFu32;
+        let mut rng_state: u32 = qwen_request_seed.unwrap_or(0x13579BDFu32);
         // Effective penalty window = request `repeat_window` (default 128),
         // bounded by the GPU repeat_buf capacity (2048). The buffer is sized
         // large so presence/frequency penalties CAN use a wider window when a

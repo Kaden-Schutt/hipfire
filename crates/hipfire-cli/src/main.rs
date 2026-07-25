@@ -3100,6 +3100,7 @@ fn complete_request(
         "frequency_penalty",
         "stop",
         "reasoning_effort",
+        "seed",
     ] {
         if let Some(value) = body.get(name) {
             generate[name] = value.clone();
