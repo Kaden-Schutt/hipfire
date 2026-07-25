@@ -6695,6 +6695,12 @@ fn generate_qwen35_mtp(
     // do it inline (Rust closures can't move `target` piecewise + keep using
     // `m`), so each exit re-packs Qwen35Bundle from target's fields.
     let eos_token = target.config.eos_token;
+    // Qwen chat turns normally terminate with `<|im_end|>`, which can differ
+    // from the model config's document-level EOS. Tell the verifier about the
+    // serve terminator so it truncates the committed block there; otherwise it
+    // may advance target/MTP state past tokens the response loop correctly
+    // withholds after `<|im_end|>`.
+    let spec_eos_token = im_end_token.unwrap_or(eos_token);
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
 
@@ -6986,7 +6992,7 @@ fn generate_qwen35_mtp(
             &mut state,
             cur_pos,
             last_committed,
-            eos_token,
+            spec_eos_token,
         ) {
             Ok(r) => r,
             Err(e) => {
