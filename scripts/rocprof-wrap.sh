@@ -3,6 +3,8 @@
 #
 # Usage:
 #   scripts/rocprof-wrap.sh <output-dir> -- <command...>
+#   HIPFIRE_ROCPROF_OUTPUT_DIR=<output-dir> \
+#   HIPFIRE_ROCPROF_TARGET=<command> scripts/rocprof-wrap.sh <command-args...>
 #
 # Sets HIPFIRE_ROCPROF_CSV=<output-dir>/trace_kernel_stats.csv in the child
 # environment so that a bench binary built with the rdna-compute rocprof
@@ -26,13 +28,22 @@
 
 set -euo pipefail
 
-if [[ $# -lt 3 ]] || [[ "$2" != "--" ]]; then
-    echo "Usage: $0 <output-dir> -- <command...>" >&2
-    exit 1
+if [[ -n "${HIPFIRE_ROCPROF_OUTPUT_DIR:-}" && -n "${HIPFIRE_ROCPROF_TARGET:-}" ]]; then
+    # Daemon-wrapper mode: HIPFIRE_DAEMON_BIN accepts an executable path but
+    # no prefix arguments. Preserve every daemon argument while inserting
+    # rocprofv3 as its parent so child-only attach restrictions do not apply.
+    OUTPUT_DIR="$HIPFIRE_ROCPROF_OUTPUT_DIR"
+    TARGET="$HIPFIRE_ROCPROF_TARGET"
+    set -- "$TARGET" "$@"
+else
+    if [[ $# -lt 3 ]] || [[ "$2" != "--" ]]; then
+        echo "Usage: $0 <output-dir> -- <command...>" >&2
+        echo "   or: HIPFIRE_ROCPROF_OUTPUT_DIR=... HIPFIRE_ROCPROF_TARGET=... $0 <args...>" >&2
+        exit 1
+    fi
+    OUTPUT_DIR="$1"
+    shift 2  # consume <output-dir> and --
 fi
-
-OUTPUT_DIR="$1"
-shift 2  # consume <output-dir> and --
 
 mkdir -p "$OUTPUT_DIR"
 

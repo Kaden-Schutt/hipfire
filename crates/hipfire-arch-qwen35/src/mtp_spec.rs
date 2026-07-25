@@ -184,17 +184,17 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
 }
 
 fn mtp_verify_graph_enabled_from_env() -> bool {
-    // Default on: unlike the proposal graph, a verifier graph coalesces the
-    // dominant full-trunk phase. The captured forward reads changing tokens
-    // and positions from `trunk_pbs`, exactly like DFlash's validated
-    // per-batch verifier graph. Opt out for parity/performance diagnosis with
-    // HIPFIRE_MTP_VERIFY_GRAPH=0.
+    // Opt-in diagnostic: the captured forward reads changing tokens and
+    // positions from `trunk_pbs`, exactly like DFlash's per-batch verifier
+    // graph. On gfx1201 A3B K=3 this was neutral (125.2 tok/s direct vs 124.8
+    // graph), so do not put an extra graph runtime between Redline and the
+    // verifier by default.
     match hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_GRAPH") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
+            v == "1" || v == "true" || v == "on" || v == "yes"
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
