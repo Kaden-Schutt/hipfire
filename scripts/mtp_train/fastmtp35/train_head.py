@@ -620,15 +620,14 @@ def main() -> None:
         raise ValueError("feature state manifests report zero records")
     local_micro_batches = records_per_rank // args.micro_batch_size
     steps_per_epoch = local_micro_batches // accumulation
-    total_steps = steps_per_epoch * args.epochs
-    if args.max_steps:
-        total_steps = min(total_steps, args.max_steps)
-    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
+    planned_steps = steps_per_epoch * args.epochs
+    stop_step = min(planned_steps, args.max_steps) if args.max_steps else planned_steps
+    warmup_steps = max(1, int(planned_steps * args.warmup_ratio))
 
     def lr_scale(step: int) -> float:
         if step < warmup_steps:
             return step / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = (step - warmup_steps) / max(1, planned_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
@@ -708,7 +707,8 @@ def main() -> None:
                             "event": "train",
                             "epoch": epoch,
                             "step": step,
-                            "total_steps": total_steps,
+                            "planned_steps": planned_steps,
+                            "stop_step": stop_step,
                             "loss": float(loss),
                             "step_losses": [float(value) for value in losses],
                             "coverage": coverage,
@@ -740,9 +740,9 @@ def main() -> None:
                     print(json.dumps({"event": "validation", "step": step, "metrics": metrics}), flush=True)
             if args.checkpoint_every and step % args.checkpoint_every == 0:
                 save_checkpoint(args.output, mtp, optimizer, scheduler, step, epoch, rank)
-            if step >= total_steps:
+            if step >= stop_step:
                 break
-        if step >= total_steps:
+        if step >= stop_step:
             break
 
     metrics = evaluate(
@@ -776,6 +776,8 @@ def main() -> None:
             "gradient_accumulation": accumulation,
             "epochs": args.epochs,
             "steps": step,
+            "planned_steps": planned_steps,
+            "stop_step": stop_step,
             "loss_weights": weights.cpu().tolist(),
             "alignment": args.alignment,
             "recurrence_input": args.recurrence_input,
