@@ -172,7 +172,18 @@ def _kill_serve():
     global _serve_proc
     if _serve_proc is not None:
         try:
-            os.killpg(os.getpgid(_serve_proc.pid), signal.SIGKILL)
+            pgid = os.getpgid(_serve_proc.pid)
+            if os.environ.get("HIPFIRE_ROCPROF_GRACEFUL_STOP") == "1":
+                # rocprofv3 must receive a catchable signal and finish writing
+                # its aggregate CSV. The ordinary harness keeps the immediate
+                # scoped SIGKILL behavior below.
+                os.killpg(pgid, signal.SIGINT)
+                try:
+                    _serve_proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             try: _serve_proc.kill()
             except Exception: pass
