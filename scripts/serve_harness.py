@@ -303,6 +303,10 @@ def send(cfg, messages):
         try: ck = json.loads(p)
         except Exception: continue
         event_count += 1
+        if ck.get("error"):
+            error = ck["error"]
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise RuntimeError(f"serve SSE error: {message or 'server error'}")
         if ck.get("usage"): usage = ck["usage"]
         if ck.get("timings"): timings = ck["timings"]
         ch = (ck.get("choices") or [{}])[0]
@@ -362,6 +366,17 @@ def turn_line(i, r, recall=""):
             f"{recall}{fl} | {r['ans_preview']!r}")
 
 
+def persist_rows(path, rows):
+    if not path:
+        return
+    partial = f"{path}.partial"
+    with open(partial, "w") as handle:
+        json.dump(rows, handle, indent=0)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, path)
+
+
 def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
@@ -370,14 +385,16 @@ def run(cfg, args):
     if cfg["mode"] == "battery":
         for genre, prompt in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
-            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
+            rows.append(r); persist_rows(args.out, rows)
+            print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
     elif cfg["mode"] == "chain":
         messages = []
         for genre, prompt in battery:
             messages.append({"role": "user", "content": prompt})
             r = send(cfg, messages)
             messages.append({"role": "assistant", "content": r["assistant_content"]})
-            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
+            rows.append(r); persist_rows(args.out, rows)
+            print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
     elif cfg["mode"] == "session":
         turns = json.load(open(args.session))
         messages = []
@@ -389,15 +406,15 @@ def run(cfg, args):
             if t.get("expect"):
                 hit = sum(1 for e in t["expect"] if e.lower() in r["assistant_content"].lower())
                 recall = f" recall={hit}/{len(t['expect'])}"
-            rows.append(r); print(turn_line(i+1, r, recall), flush=True)
+            rows.append(r); persist_rows(args.out, rows)
+            print(turn_line(i+1, r, recall), flush=True)
     g = rows
     dec = [r["decode_tok_s"] for r in g if isinstance(r["decode_tok_s"], (int, float))]
     pf = [(r["prefill_ms"] or 0)/1000 for r in g]
     print(f"[{label} DONE] turns={len(g)} runaway={sum(r['runaway'] for r in g)} "
           f"empty={sum(r['empty'] for r in g)} attractor={sum(r['attractor'] for r in g)} "
           f"avg_decode={sum(dec)/len(dec):.1f}tok/s" if dec else f"[{label} DONE] turns={len(g)}", flush=True)
-    if args.out:
-        json.dump(rows, open(args.out, "w"), indent=0)
+    persist_rows(args.out, rows)
 
 
 def main():
