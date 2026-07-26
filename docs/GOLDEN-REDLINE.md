@@ -66,6 +66,46 @@ The stationarity ceiling is 120 TG128 rows. This preserves the existing slope,
 spread, confirmation, and median-drift criteria while allowing slow cold-start
 clock convergence. It does not relax the acceptance gates.
 
+## Reproducing on a box that disagrees
+
+`golden-redline.py` pins the model, sampling profile, benchmark contract, PM4
+policy and route identity — but not the compiled code objects or the host
+toolchain. When a contributor reports the same route identity (same dispatch
+count, kernel count and sequence hash) with different throughput, the
+divergence is below the tape and none of the above will catch it.
+
+`scripts/redline-repro-package.sh` closes that gap.
+
+```bash
+# On a box where the fixture passes, right after a successful golden run:
+scripts/redline-repro-package.sh capture --arch gfx1201
+
+# On the box that cannot reproduce:
+scripts/redline-repro-package.sh verify --package repro-gfx1201-*.tar.gz
+scripts/redline-repro-package.sh run    --package repro-gfx1201-*.tar.gz --pin-kernels
+```
+
+The package is ~156 KB and carries the 46 compiled code objects with a manifest
+hash, the ROCm and code-generator versions, GPU state, the PM4 policy, the
+acceptance floors, the required tape, and the reference attestation.
+
+`verify` classifies every difference as BLOCKING (arch, model SHA-256, PM4
+policy) or ADVISORY (source commit, daemon hash, ROCm version, code-generator
+version, code-object manifest) and exits 2 on a blocking mismatch. `--force`
+proceeds anyway.
+
+`--pin-kernels` installs the packaged code objects into
+`kernels/compiled/<arch>/` and shadows the device compilers with failing stubs,
+so the engine takes its "pre-compiled blob, no compiler available" branch and
+runs *our* binaries rather than rebuilding with the local toolchain. The engine
+prints `Output may be incorrect` in that state; under `--pin-kernels` that
+warning is expected and is the confirmation the pinning took effect. A pinned
+run recompiles nothing, which shows up as a much shorter warm-up.
+
+Note the stubs shadow only the compiler *names* — `rocminfo`, `rocm-smi` and
+the rest of `PATH` stay reachable. Removing whole `PATH` directories instead
+would strip device detection along with the compilers and hang the bench.
+
 ## What counts as a pass
 
 Identity is exact. Performance is an evidence-bound floor rather than a demand
