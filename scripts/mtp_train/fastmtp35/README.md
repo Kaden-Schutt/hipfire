@@ -170,6 +170,28 @@ The launcher resumes from the newest matched
 Set `HIPFIRE_FASTMTP_AUTO_RESUME=0` for an intentional fresh start, or pass
 both `--resume-weights` and `--resume-optimizer` to select an explicit pair.
 
+The v3 distribution-alignment pilot uses the deployment-derived map and blends
+realized-token CE with the exact trunk distribution available from the next
+retained hidden row:
+
+```bash
+VOCAB_MAP=~/.hipfire/datasets/fastmtp-qwen36-a3b-v1/features/vocab-map-v3-deployment16k.json \
+OUTPUT=~/.hipfire/training/fastmtp-qwen36-a3b-v3-dist \
+HIPFIRE_FASTMTP_AUTO_RESUME=0 \
+scripts/mtp_train/fastmtp35/run_hiptrx_train.sh \
+  ~/.hipfire/datasets/fastmtp-qwen36-a3b-v1 \
+  --max-steps 1000 \
+  --soft-target-weight 0.5 \
+  --soft-target-topk 256
+```
+
+Soft targets retain the teacher's top-K probabilities individually and one
+aggregate probability bucket for the remaining 16K support. This preserves the
+teacher's tail mass instead of renormalizing the top-K tokens, while avoiding a
+second full-vocabulary projection and large persistent probability tensors.
+Pilot checkpoints must still be selected by sampled product tau rather than
+offline loss alone.
+
 The hiptrx default uses the verified 32 GB R9700 capacity point: 128
 sequences per GPU, an effective global batch of 512, and one DDP all-reduce
 per optimizer step. The peak learning rate is `5e-5`, matching the published

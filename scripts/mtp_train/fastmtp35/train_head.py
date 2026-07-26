@@ -181,13 +181,18 @@ def collate(
         raise ValueError("MTP feature record is too short for the requested alignment")
     width = max(effective_lengths)
     batch = len(records)
-    hidden = torch.zeros((batch, width, dim), dtype=torch.bfloat16)
+    # Preserve K trailing trunk rows when present so distribution training can
+    # score the draft against the exact trunk LM distribution for each
+    # recursive depth. HFMTPF01 stores only one guaranteed trailing hidden row;
+    # deeper tail positions remain zero-padded and are excluded by the
+    # per-depth teacher mask below.
+    hidden = torch.zeros((batch, width + k, dim), dtype=torch.bfloat16)
     token_tail = k + 1 if shifted else k
     tokens = torch.zeros((batch, width + token_tail), dtype=torch.long)
     lengths = torch.tensor(effective_lengths, dtype=torch.long)
     positions = torch.zeros((batch, width), dtype=torch.long)
     for row, (record, n) in enumerate(zip(records, effective_lengths, strict=True)):
-        hidden[row, :n].copy_(record.hidden[:n])
+        hidden[row, : record.hidden_rows].copy_(record.hidden)
         tokens[row, : n + token_tail].copy_(record.tokens[: n + token_tail])
         position_start = record.absolute_start + (1 if shifted else 0)
         positions[row, :n] = torch.arange(
@@ -313,20 +318,23 @@ def train_microbatch(
     k: int,
     alignment: str,
     recurrence_input: str,
-) -> tuple[torch.Tensor, list[torch.Tensor], list[float]]:
+    soft_target_weight: float,
+    soft_target_topk: int,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[float]]:
     batch = collate(records, dim, k, alignment)
-    hidden = batch["hidden"].to(device, non_blocking=True)
+    trunk_hidden = batch["hidden"].to(device, non_blocking=True)
     tokens = batch["tokens"].to(device, non_blocking=True)
     lengths = batch["lengths"].to(device, non_blocking=True)
     positions = batch["positions"].to(device, non_blocking=True)
-    width = hidden.shape[1]
-    mask = causal_mask(lengths, width, hidden.dtype)
-    current_hidden = hidden
+    width = positions.shape[1]
+    mask = causal_mask(lengths, width, trunk_hidden.dtype)
+    current_hidden = trunk_hidden[:, :width]
     token_offset = 1 if alignment == RUNTIME_SHIFTED_ALIGNMENT else 0
     target_offset = token_offset + 1
     current_tokens = tokens[:, token_offset : token_offset + width]
     valid_rows = torch.arange(width, device=device)[None, :] < lengths[:, None]
     losses = []
+    soft_losses = []
     coverage = []
     for depth in range(k):
         if recurrence_input == TEACHER_FORCED_RECURRENCE:
@@ -351,13 +359,65 @@ def train_microbatch(
         # ROCm cross_entropy applies its FP32 opmath internally for BF16 input.
         # Avoid materializing a second FP32 logits tensor: at larger batches it
         # costs multiple GiB per rank without a meaningful gradient benefit.
-        losses.append(F.cross_entropy(logits[keep], target[keep]))
+        hard_loss = F.cross_entropy(logits[keep], target[keep])
+        if soft_target_weight:
+            # For MTP depth d at trunk h[t], the exact teacher distribution is
+            # LM(h[t+d+1]). Feature records contain sequential post-final-norm
+            # trunk rows, so this target requires neither a second trunk
+            # forward nor regenerated Stage 2 features. Near the record tail,
+            # only rows with a retained future hidden state participate.
+            soft_keep = (
+                torch.arange(width, device=device)[None, :]
+                < (lengths - depth).clamp_min(0)[:, None]
+            )
+            with torch.no_grad():
+                teacher_logits = F.linear(
+                    trunk_hidden[:, depth + 1 : depth + 1 + width],
+                    lm_weight,
+                )
+                topk = min(soft_target_topk, teacher_logits.shape[-1])
+                teacher_values, teacher_indices = teacher_logits[soft_keep].topk(
+                    topk, dim=-1
+                )
+                teacher_log_norm = torch.logsumexp(
+                    teacher_logits[soft_keep].float(), dim=-1, keepdim=True
+                )
+                teacher_probs = (teacher_values.float() - teacher_log_norm).exp()
+                teacher_tail = (1.0 - teacher_probs.sum(-1)).clamp_min(0.0)
+                del teacher_logits, teacher_values, teacher_log_norm
+            draft_logits = logits[soft_keep]
+            draft_log_norm = torch.logsumexp(draft_logits.float(), dim=-1, keepdim=True)
+            draft_top_logprob = (
+                draft_logits.gather(1, teacher_indices).float() - draft_log_norm
+            )
+            draft_tail_logprob = torch.log1p(
+                -draft_top_logprob.exp().sum(-1).clamp(max=1.0 - 1e-7)
+            )
+            soft_loss = -(
+                (teacher_probs * draft_top_logprob).sum(-1)
+                + teacher_tail * draft_tail_logprob
+            ).mean()
+            del (
+                draft_logits,
+                teacher_indices,
+                teacher_probs,
+                teacher_tail,
+                draft_log_norm,
+                draft_top_logprob,
+                draft_tail_logprob,
+            )
+        else:
+            soft_loss = hard_loss.new_zeros(())
+        losses.append(
+            hard_loss * (1.0 - soft_target_weight) + soft_loss * soft_target_weight
+        )
+        soft_losses.append(soft_loss)
         coverage.append(float(keep.sum()) / float(valid_rows.sum()))
         if recurrence_input == SELF_ROLLOUT_RECURRENCE:
             with torch.no_grad():
                 current_tokens = vocab_map[logits.argmax(-1)]
     loss = sum(loss_weights[index] * losses[index] for index in range(k))
-    return loss, losses, coverage
+    return loss, losses, soft_losses, coverage
 
 
 @torch.no_grad()
@@ -386,17 +446,19 @@ def evaluate(
         batches(shard_paths, rank, world, seed, 0, micro_batch, max_batches)
     ):
         batch = collate(records, dim, k, alignment)
-        hidden = batch["hidden"].cuda(non_blocking=True)
+        trunk_hidden = batch["hidden"].cuda(non_blocking=True)
         tokens = batch["tokens"].cuda(non_blocking=True)
         lengths = batch["lengths"].cuda(non_blocking=True)
         positions = batch["positions"].cuda(non_blocking=True)
-        width = hidden.shape[1]
-        mask = causal_mask(lengths, width, hidden.dtype)
-        current_hidden = hidden
+        width = positions.shape[1]
+        mask = causal_mask(lengths, width, trunk_hidden.dtype)
+        current_hidden = trunk_hidden[:, :width]
         token_offset = 1 if alignment == RUNTIME_SHIFTED_ALIGNMENT else 0
         target_offset = token_offset + 1
         current_tokens = tokens[:, token_offset : token_offset + width]
-        valid_rows = torch.arange(width, device=hidden.device)[None, :] < lengths[:, None]
+        valid_rows = (
+            torch.arange(width, device=trunk_hidden.device)[None, :] < lengths[:, None]
+        )
         for depth in range(k):
             if recurrence_input == TEACHER_FORCED_RECURRENCE:
                 current_tokens = tokens[
@@ -473,6 +535,18 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--eval-batches", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=0)
+    parser.add_argument(
+        "--soft-target-weight",
+        type=float,
+        default=0.0,
+        help="blend weight for exact-trunk distribution cross entropy",
+    )
+    parser.add_argument(
+        "--soft-target-topk",
+        type=int,
+        default=256,
+        help="teacher support retained per row for distribution cross entropy",
+    )
     parser.add_argument("--resume-optimizer", type=Path)
     parser.add_argument("--resume-weights", type=Path)
     parser.add_argument(
@@ -488,6 +562,17 @@ def main() -> None:
         help="recursive-token source; teacher-forced-v1 matches FastMTP training",
     )
     args = parser.parse_args()
+    if not 0.0 <= args.soft_target_weight <= 1.0:
+        raise SystemExit("--soft-target-weight must be between zero and one")
+    if args.soft_target_topk <= 0:
+        raise SystemExit("--soft-target-topk must be positive")
+    if (
+        args.soft_target_weight
+        and args.alignment != RUNTIME_SHIFTED_ALIGNMENT
+    ):
+        raise SystemExit(
+            "soft targets require runtime-shifted-v1 feature alignment"
+        )
 
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -676,7 +761,7 @@ def main() -> None:
                 else mtp.no_sync()
             )
             with sync_context:
-                loss, losses, coverage = train_microbatch(
+                loss, losses, soft_losses, coverage = train_microbatch(
                     mtp,
                     records,
                     embed_weight,
@@ -689,6 +774,8 @@ def main() -> None:
                     k,
                     args.alignment,
                     args.recurrence_input,
+                    args.soft_target_weight,
+                    args.soft_target_topk,
                 )
                 (loss / accumulation).backward()
             micro_step += 1
@@ -711,6 +798,9 @@ def main() -> None:
                             "stop_step": stop_step,
                             "loss": float(loss),
                             "step_losses": [float(value) for value in losses],
+                            "soft_target_losses": [
+                                float(value) for value in soft_losses
+                            ],
                             "coverage": coverage,
                             "lr": scheduler.get_last_lr()[0],
                             "elapsed_s": time.monotonic() - started,
@@ -781,6 +871,8 @@ def main() -> None:
             "loss_weights": weights.cpu().tolist(),
             "alignment": args.alignment,
             "recurrence_input": args.recurrence_input,
+            "soft_target_weight": args.soft_target_weight,
+            "soft_target_topk": args.soft_target_topk,
             "validation": metrics,
             "output": "final.safetensors",
         }
