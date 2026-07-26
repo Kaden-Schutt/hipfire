@@ -4510,6 +4510,11 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
     "#define HIPFIRE_CQN_BLOCK 512\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b512\n",
     include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
 );
+/// N=2..4 causal verifier lift of the certified gfx1201 B256 conv/QK-norm
+/// schedule. Kept in a separate source so the sealed single-token HSACO and
+/// route hash remain invariant.
+pub const CONV1D_SILU_SPLIT_QKNORM_BATCH4_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm_batch4.gfx1201.hip");
 
 /// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
 /// ancestor chain via parent_indices[] for the 3-tap causal window, falling

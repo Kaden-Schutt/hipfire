@@ -9791,6 +9791,14 @@ fn forward_batch_chunk_impl(
             ));
         }
     }
+    let mtp_golden_conv_qknorm = matches!(batch_semantics, BatchSemantics::Sequential)
+        && tree_verify.is_none()
+        && gdn_tape.is_some()
+        && gpu.arch == "gfx1201"
+        && config.linear_key_head_dim == 128
+        && (2..=4).contains(&n)
+        && hipfire_config::developer_var("HIPFIRE_MTP_GOLDEN_CONV_QKNORM").as_deref()
+            == Ok("batch4");
     debug_assert!(
         routed_out.is_none()
             || band
@@ -10364,7 +10372,23 @@ fn forward_batch_chunk_impl(
                 // caller runs linear replay on the accepted spine
                 // post-acceptance to commit the trajectory.
                 let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
-                if let Some(parents) = tree_parents {
+                if mtp_golden_conv_qknorm {
+                    gpu.conv1d_silu_split_qknorm_batch4_gfx1201(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim,
+                        v_dim,
+                        config.linear_num_key_heads,
+                        hd,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
+                        n,
+                    )?;
+                } else if let Some(parents) = tree_parents {
                     gpu.conv1d_silu_split_tree_f32_n(
                         &pbs.dn_q_raw_batch,
                         &pbs.dn_k_raw_batch,
@@ -10411,7 +10435,32 @@ fn forward_batch_chunk_impl(
                 // The fused kernel reads q_raw/k_raw (unchanged on exit), so
                 // the conv1d output is preserved if downstream readers need it
                 // (no current consumer reads _raw after this).
-                if config.linear_num_key_heads < n_v_heads {
+                if mtp_golden_conv_qknorm {
+                    if config.linear_num_key_heads < n_v_heads {
+                        let ratio = n_v_heads / config.linear_num_key_heads;
+                        gpu.repeat_interleave_qk_f32_batched(
+                            &pbs.dn_q_raw_batch,
+                            &pbs.dn_k_raw_batch,
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            config.linear_num_key_heads,
+                            ratio,
+                            hd,
+                            n,
+                        )?;
+                    } else {
+                        gpu.memcpy_dtod_auto(
+                            &pbs.dn_q_batch.buf,
+                            &pbs.dn_q_raw_batch.buf,
+                            n * k_dim * 4,
+                        )?;
+                        gpu.memcpy_dtod_auto(
+                            &pbs.dn_k_batch.buf,
+                            &pbs.dn_k_raw_batch.buf,
+                            n * k_dim * 4,
+                        )?;
+                    }
+                } else if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
                         &pbs.dn_q_raw_batch,
@@ -12207,7 +12256,23 @@ fn forward_batch_chunk_impl(
                 }
                 // Same tree-aware dispatch gate as dense LA branch above.
                 let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
-                if let Some(parents) = tree_parents {
+                if mtp_golden_conv_qknorm {
+                    gpu.conv1d_silu_split_qknorm_batch4_gfx1201(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim,
+                        v_dim,
+                        config.linear_num_key_heads,
+                        hd,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
+                        n,
+                    )?;
+                } else if let Some(parents) = tree_parents {
                     gpu.conv1d_silu_split_tree_f32_n(
                         &pbs.dn_q_raw_batch,
                         &pbs.dn_k_raw_batch,
@@ -12245,15 +12310,17 @@ fn forward_batch_chunk_impl(
                         n,
                     )?;
                 }
-                gpu.fused_qk_l2_norm_scale_f32_batched(
-                    &pbs.dn_q_raw_batch,
-                    &pbs.dn_k_raw_batch,
-                    config.linear_num_key_heads,
-                    hd,
-                    1.0 / (hd as f32).sqrt(),
-                    config.norm_eps,
-                    n,
-                )?;
+                if !mtp_golden_conv_qknorm {
+                    gpu.fused_qk_l2_norm_scale_f32_batched(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        config.linear_num_key_heads,
+                        hd,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
+                        n,
+                    )?;
+                }
                 if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     gpu.repeat_interleave_qk_f32_batched(
