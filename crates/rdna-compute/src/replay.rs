@@ -3220,7 +3220,6 @@ mod tests {
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "conv1d_silu_split_qknorm_b256_scalar_prep",
-        "conv1d_silu_split_qknorm_batch4_gfx1201",
         "fused_qk_l2_norm_scale_f32",
         "repeat_interleave_qk_f32",
         "repeat_interleave_qk_f32_batched",
