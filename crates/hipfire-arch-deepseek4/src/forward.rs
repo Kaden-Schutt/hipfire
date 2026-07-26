@@ -6091,6 +6091,32 @@ pub(crate) fn precompute_token_id(
     Ok(())
 }
 
+/// Stage the device-resident token and position inputs consumed by a retained
+/// DeepSeek4 decode tape without launching the tape itself.
+///
+/// This is the committed Redline prefix-profiler adapter. It deliberately
+/// reuses the production staging helpers so the decode, EP, and MTP paths keep
+/// their existing behavior and call graph.
+#[doc(hidden)]
+pub fn prepare_retained_decode_inputs(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<(), String> {
+    precompute_positions(cfg, state, gpu, position)?;
+    precompute_token_id(state, gpu, token_id)?;
+    if !config_cache::retained_embedding_on(&gpu.arch, cfg.mq2r) {
+        init_residual_streams(cfg, weights, state, gpu, token_id)?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("DeepSeek V4 retained profiler adapter sync: {e:?}"))?;
+    }
+    Ok(())
+}
+
 /// Host-only update of `token_id_host[0]`. Used by the HIP-graphs
 /// replay path — the captured memcpy node re-reads this byte on
 /// graph_launch and propagates to `token_id_buf`.

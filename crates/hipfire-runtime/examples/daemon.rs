@@ -184,6 +184,62 @@ impl RedlineQwenSnapshot {
     }
 }
 
+#[derive(PartialEq)]
+struct RedlineDeepseek4Snapshot {
+    logits: Vec<u8>,
+    kv: Vec<u8>,
+    recurrent: Vec<u8>,
+}
+
+impl RedlineDeepseek4Snapshot {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "logits_bytes": self.logits.len(),
+            "logits_hash": format!("{:016x}", redline_hash(&self.logits)),
+            "kv_bytes": self.kv.len(),
+            "kv_hash": format!("{:016x}", redline_hash(&self.kv)),
+            "recurrent_bytes": self.recurrent.len(),
+            "recurrent_hash": format!("{:016x}", redline_hash(&self.recurrent)),
+        })
+    }
+}
+
+#[derive(PartialEq)]
+enum RedlineSnapshot {
+    Qwen(RedlineQwenSnapshot),
+    Deepseek4(RedlineDeepseek4Snapshot),
+}
+
+impl RedlineSnapshot {
+    fn logits(&self) -> &[u8] {
+        match self {
+            Self::Qwen(snapshot) => &snapshot.logits,
+            Self::Deepseek4(snapshot) => &snapshot.logits,
+        }
+    }
+
+    fn kv(&self) -> &[u8] {
+        match self {
+            Self::Qwen(snapshot) => &snapshot.kv,
+            Self::Deepseek4(snapshot) => &snapshot.kv,
+        }
+    }
+
+    fn recurrent(&self) -> &[u8] {
+        match self {
+            Self::Qwen(snapshot) => &snapshot.recurrent,
+            Self::Deepseek4(snapshot) => &snapshot.recurrent,
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        match self {
+            Self::Qwen(snapshot) => snapshot.json(),
+            Self::Deepseek4(snapshot) => snapshot.json(),
+        }
+    }
+}
+
 fn redline_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -238,6 +294,69 @@ fn redline_qwen_snapshot(
         kv,
         recurrent,
     })
+}
+
+fn redline_append_tensor(
+    gpu: &rdna_compute::Gpu,
+    output: &mut Vec<u8>,
+    tensor: &Option<rdna_compute::GpuTensor>,
+) -> Result<(), String> {
+    if let Some(tensor) = tensor {
+        redline_append_buffer(gpu, output, &tensor.buf)?;
+    }
+    Ok(())
+}
+
+fn redline_deepseek4_snapshot(
+    gpu: &rdna_compute::Gpu,
+    bundle: &deepseek4::Deepseek4Bundle,
+) -> Result<RedlineDeepseek4Snapshot, String> {
+    let mut logits = Vec::new();
+    redline_append_tensor(gpu, &mut logits, &bundle.state.logits)?;
+
+    let mut kv = Vec::new();
+    for layer in &bundle.state._indexer {
+        redline_append_tensor(gpu, &mut kv, &layer.main_kv_cache)?;
+        redline_append_tensor(gpu, &mut kv, &layer.indexer_kv_cache)?;
+    }
+    for layer in &bundle.state._attention {
+        redline_append_tensor(gpu, &mut kv, &layer.swa_k)?;
+        redline_append_tensor(gpu, &mut kv, &layer.swa_v)?;
+        redline_append_tensor(gpu, &mut kv, &layer.full_k_cache)?;
+        redline_append_tensor(gpu, &mut kv, &layer.full_v_cache)?;
+    }
+
+    let mut recurrent = Vec::new();
+    for layer in &bundle.state._indexer {
+        redline_append_tensor(gpu, &mut recurrent, &layer.main_kv_state)?;
+        redline_append_tensor(gpu, &mut recurrent, &layer.main_score_state)?;
+        redline_append_tensor(gpu, &mut recurrent, &layer.indexer_kv_state)?;
+        redline_append_tensor(gpu, &mut recurrent, &layer.indexer_score_state)?;
+    }
+    redline_append_tensor(gpu, &mut recurrent, &bundle.state.residual_streams)?;
+    redline_append_tensor(gpu, &mut recurrent, &bundle.state.residual_streams_next)?;
+    redline_append_tensor(gpu, &mut recurrent, &bundle.state.attn_state_buf)?;
+
+    Ok(RedlineDeepseek4Snapshot {
+        logits,
+        kv,
+        recurrent,
+    })
+}
+
+fn redline_snapshot(
+    gpu: &rdna_compute::Gpu,
+    loaded: &LoadedModel,
+) -> Result<RedlineSnapshot, String> {
+    match loaded.state.as_ref() {
+        Some(ModelState::Qwen35(bundle)) => {
+            redline_qwen_snapshot(gpu, bundle).map(RedlineSnapshot::Qwen)
+        }
+        Some(ModelState::Deepseek4(bundle)) => {
+            redline_deepseek4_snapshot(gpu, bundle).map(RedlineSnapshot::Deepseek4)
+        }
+        _ => Err("retained snapshot requires Qwen3.5 or DeepSeek4".to_string()),
+    }
 }
 
 fn redline_qwen_debug_hashes(
@@ -399,6 +518,470 @@ fn redline_prime_qwen(
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
+}
+
+fn redline_reset_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut deepseek4::Deepseek4Bundle,
+) -> Result<(), String> {
+    bundle.state.reset();
+    bundle.state.zero_decode_caches(gpu);
+    gpu.invalidate_graph_state();
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+fn redline_prime_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut deepseek4::Deepseek4Bundle,
+    pbs: &deepseek4::forward::PrefillBatchScratch,
+    context: usize,
+) -> Result<(), String> {
+    let synthetic = (0..context as u32)
+        .map(|index| 10 + (index % 1000))
+        .collect::<Vec<_>>();
+    deepseek4::forward::forward_prefill_batch_chunked(
+        &bundle.config,
+        &bundle.weights,
+        &mut bundle.state,
+        gpu,
+        &synthetic,
+        0,
+        pbs,
+    )?;
+    bundle.state.n_tokens = context as u64;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+fn redline_run_deepseek4_decode(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut deepseek4::Deepseek4Bundle,
+    context: usize,
+    iterations: usize,
+) -> Result<(), String> {
+    for index in 0..iterations {
+        let token = 101 + (index as u32 % 1000);
+        deepseek4::forward::decode_step_with_graph(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token,
+            (context + index) as u32,
+        )?;
+    }
+    Ok(())
+}
+
+fn redline_prime_retained_fixture(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+) -> Result<(), String> {
+    match loaded.state.as_mut() {
+        Some(ModelState::Qwen35(bundle)) => {
+            redline_reset_qwen(gpu, bundle)?;
+            redline_prime_qwen(gpu, bundle, context)
+        }
+        Some(ModelState::Deepseek4(bundle)) => {
+            let pbs = loaded
+                .deepseek4_pbs
+                .as_ref()
+                .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
+            redline_reset_deepseek4(gpu, bundle)?;
+            redline_prime_deepseek4(gpu, bundle, pbs, context)
+        }
+        _ => Err("retained fixture requires Qwen3.5 or DeepSeek4".to_string()),
+    }
+}
+
+fn redline_prepare_retained_fixture(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    token_id: u32,
+    context: usize,
+) -> Result<(), String> {
+    match loaded.state.as_mut() {
+        Some(ModelState::Qwen35(bundle)) => qwen35::prepare_scratch_inputs(
+            gpu,
+            &bundle.weights,
+            &bundle.config,
+            token_id,
+            context,
+            &bundle.scratch,
+        )
+        .map_err(|error| error.to_string()),
+        Some(ModelState::Deepseek4(bundle)) => {
+            bundle.state.n_tokens = context as u64;
+            deepseek4::forward::prepare_retained_decode_inputs(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token_id,
+                context as u32,
+            )
+        }
+        _ => Err("retained fixture requires Qwen3.5 or DeepSeek4".to_string()),
+    }
+}
+
+fn redline_run_direct_fixture(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+    iterations: usize,
+) -> Result<(), String> {
+    match loaded.state.as_mut() {
+        Some(ModelState::Qwen35(bundle)) => {
+            for index in 0..iterations {
+                qwen35::forward_scratch(
+                    gpu,
+                    &bundle.weights,
+                    &bundle.config,
+                    101 + index as u32,
+                    context + index,
+                    &mut bundle.kv_cache,
+                    &mut bundle.dn_state,
+                    &bundle.scratch,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        Some(ModelState::Deepseek4(bundle)) => {
+            for index in 0..iterations {
+                bundle.state.n_tokens = (context + index) as u64;
+                deepseek4::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    101 + index as u32,
+                    (context + index) as u32,
+                )?;
+            }
+            Ok(())
+        }
+        _ => Err("retained fixture requires Qwen3.5 or DeepSeek4".to_string()),
+    }
+}
+
+fn redline_bench_decode_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1
+        || loaded.ep.is_some()
+        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+    {
+        return Err("bench_decode requires a loaded single-GPU DeepSeek4 model".to_string());
+    }
+    let context = msg
+        .get("context_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(128) as usize;
+    let iterations = msg
+        .get("iterations")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1) as usize;
+    let capture = msg
+        .get("redline_capture")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let product_route = msg
+        .get("redline_product_route")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let capture_detail = msg
+        .get("redline_detail")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if capture && product_route {
+        return Err("redline_capture and redline_product_route are mutually exclusive".to_string());
+    }
+    if context == 0 || iterations == 0 {
+        return Err("bench_decode context_tokens and iterations must be non-zero".to_string());
+    }
+    if context.saturating_add(iterations).saturating_add(32) > loaded.physical_cap {
+        return Err(format!(
+            "bench_decode context+iterations exceeds loaded physical_cap={}",
+            loaded.physical_cap
+        ));
+    }
+
+    loaded.seq_pos = 0;
+    loaded.conversation_tokens.clear();
+    let pbs = loaded
+        .deepseek4_pbs
+        .as_ref()
+        .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
+    let ModelState::Deepseek4(bundle) = loaded.state.as_mut().unwrap() else {
+        unreachable!()
+    };
+    redline_reset_deepseek4(gpu, bundle)?;
+    redline_prime_deepseek4(gpu, bundle, pbs, context)
+        .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
+    loaded.seq_pos = context;
+
+    if capture {
+        // Manual capture is already the warm path. Skip the product decoder's
+        // lazy-allocation forward so the captured tape starts at this context.
+        bundle.state.ar_forward_warmed_up = true;
+        gpu.replay
+            .begin_capture()
+            .map_err(|reason| format!("redline decode capture refused: {reason}"))?;
+    }
+
+    if product_route {
+        gpu.replay.begin_replay_observation_window();
+    }
+    let replay_before = gpu.replay.replay_observation();
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    redline_run_deepseek4_decode(gpu, bundle, context, iterations)
+        .map_err(|error| format!("bench_decode forward failed: {error}"))?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let replay_after = gpu.replay.replay_observation();
+    let capture_summary = if capture {
+        Some(
+            gpu.replay
+                .finish_capture()
+                .map_err(|reason| format!("redline decode capture failed: {reason}"))?,
+        )
+    } else {
+        None
+    };
+
+    loaded.seq_pos = 0;
+    loaded.conversation_tokens.clear();
+    redline_reset_deepseek4(gpu, bundle)?;
+
+    let mut response = serde_json::json!({
+        "type": "decode_result",
+        "context_tokens": context,
+        "iterations": iterations,
+        "ms": elapsed * 1000.0,
+        "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
+        "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
+    });
+    if let Some(summary) = capture_summary {
+        response["redline_capture"] = redline_capture_json(gpu, summary, capture_detail);
+    }
+    if product_route {
+        let prepared = gpu.replay.prepared_route_identity().map(|identity| {
+            serde_json::json!({
+                "dispatches": identity.dispatch_count,
+                "packets": identity.packet_count,
+                "queue_id": identity.queue_id,
+                "command_dwords": identity.command_dwords,
+            })
+        });
+        let sequence = gpu.replay.capture_summary();
+        let replay_delta = replay_after.count.saturating_sub(replay_before.count);
+        response["redline_route"] = serde_json::json!({
+            "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
+            "transport": gpu.replay.transport_name(),
+            "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
+            "fallback_reason": gpu.replay.fallback_reason(),
+            "execution_mode": "plain_ar",
+            "prepared": prepared,
+            "sequence": {
+                "launches": sequence.launch_count,
+                "unique_kernels": sequence.unique_kernel_count,
+                "hash": format!("{:016x}", sequence.sequence_hash),
+            },
+            "observed": {
+                "count_before": replay_before.count,
+                "count_after": replay_after.count,
+                "count_delta": replay_delta,
+                "first_position": replay_after.first_position,
+                "last_position": replay_after.last_position,
+            },
+            "retained_replay_observed": replay_delta > 0,
+        });
+    }
+    Ok(response)
+}
+
+fn redline_shadow_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    pm4: bool,
+    context: usize,
+    iterations: usize,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1
+        || loaded.ep.is_some()
+        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+    {
+        return Err("redline shadow requires a loaded single-GPU DeepSeek4 model".to_string());
+    }
+    let prepared = if pm4 {
+        let launch_count = gpu.replay.recorded_launches().len();
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, launch_count)
+            .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+    } else {
+        gpu.replay
+            .prepare_linear_aql(gpu.device_id as usize)
+            .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+    }
+    .map_err(|reason| format!("redline AQL prepare failed: {reason}"))?;
+    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+
+    redline_prime_retained_fixture(gpu, loaded, context)?;
+    let started = Instant::now();
+    let mut gpu_us = 0.0;
+    for index in 0..iterations {
+        redline_prepare_retained_fixture(gpu, loaded, 101 + index as u32, context + index)?;
+        if pm4 {
+            let timing = unsafe { gpu.replay.replay_pm4(context + index) }?;
+            gpu_us += timing.span_microseconds();
+        } else {
+            let timing = unsafe { gpu.replay.replay_linear_aql(context + index) }?;
+            gpu_us += timing.span_microseconds();
+        }
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let aql_host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let aql_snapshot = redline_snapshot(gpu, loaded)?;
+
+    redline_prime_retained_fixture(gpu, loaded, context)?;
+    for index in 0..iterations {
+        redline_prepare_retained_fixture(gpu, loaded, 101 + index as u32, context + index)?;
+        gpu.replay_recorded_hip_prefix(prepared.0)
+            .map_err(|error| error.to_string())?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let blob_snapshot = redline_snapshot(gpu, loaded)?;
+
+    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+    redline_prime_retained_fixture(gpu, loaded, context)?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    redline_run_direct_fixture(gpu, loaded, context, iterations)?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let hip_host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let hip_snapshot = redline_snapshot(gpu, loaded)?;
+
+    let logits_equal = aql_snapshot.logits() == hip_snapshot.logits();
+    let kv_equal = aql_snapshot.kv() == hip_snapshot.kv();
+    let recurrent_equal = aql_snapshot.recurrent() == hip_snapshot.recurrent();
+    let blob_bit_exact = aql_snapshot.logits() == blob_snapshot.logits()
+        && aql_snapshot.kv() == blob_snapshot.kv()
+        && aql_snapshot.recurrent() == blob_snapshot.recurrent();
+    Ok(serde_json::json!({
+        "type": "redline_shadow_result",
+        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+        "context_tokens": context,
+        "iterations": iterations,
+        "dispatches": prepared.0,
+        "packets": prepared.1,
+        "queue_id": prepared.2,
+        "command_dwords": prepared.3,
+        "bit_exact": logits_equal && kv_equal && recurrent_equal,
+        "blob_bit_exact": blob_bit_exact,
+        "logits_equal": logits_equal,
+        "kv_equal": kv_equal,
+        "recurrent_equal": recurrent_equal,
+        "aql_host_us": aql_host_us,
+        "aql_gpu_us": gpu_us,
+        "hip_host_us": hip_host_us,
+        "aql": aql_snapshot.json(),
+        "hip": hip_snapshot.json(),
+        "blob": blob_snapshot.json(),
+    }))
+}
+
+fn redline_pm4_prefix_profile_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+    start: usize,
+    step: usize,
+    repeats: usize,
+    steady_state: bool,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1
+        || loaded.ep.is_some()
+        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+    {
+        return Err("prefix profile requires a loaded single-GPU DeepSeek4 model".to_string());
+    }
+    let launch_count = gpu.replay.recorded_launches().len();
+    if launch_count == 0 || step == 0 || repeats == 0 || start == 0 || start > launch_count {
+        return Err(
+            "prefix profile requires captured launches and valid start/step/repeats".into(),
+        );
+    }
+    let mut prefixes = (start..launch_count).step_by(step).collect::<Vec<_>>();
+    if prefixes.last().copied() != Some(launch_count) {
+        prefixes.push(launch_count);
+    }
+    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+    if steady_state {
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+        redline_prime_retained_fixture(gpu, loaded, context)?;
+    }
+    let mut rows = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        let launch = gpu.replay.recorded_launches()[prefix - 1].clone();
+        let (_, dwords, _) = gpu
+            .replay
+            .prepare_pm4_prefix(gpu.device_id as usize, prefix)?;
+        let mut samples = Vec::with_capacity(repeats);
+        for _ in 0..repeats {
+            if !steady_state {
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                redline_prime_retained_fixture(gpu, loaded, context)?;
+            }
+            redline_prepare_retained_fixture(gpu, loaded, 101, context)?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            let timing = unsafe { gpu.replay.replay_pm4(context) }?;
+            samples.push(timing.span_microseconds());
+        }
+        let mut ordered = samples.clone();
+        ordered.sort_by(f64::total_cmp);
+        rows.push(serde_json::json!({
+            "prefix": prefix,
+            "last_kernel": launch.kernel,
+            "last_grid": launch.grid,
+            "last_block": launch.block,
+            "command_dwords": dwords,
+            "samples_gpu_us": samples,
+            "median_gpu_us": ordered[ordered.len() / 2],
+        }));
+    }
+    Ok(serde_json::json!({
+        "type": "redline_pm4_prefix_profile",
+        "context_tokens": context,
+        "launches": launch_count,
+        "start": start,
+        "step": step,
+        "repeats": repeats,
+        "steady_state": steady_state,
+        "rows": rows,
+    }))
 }
 
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
@@ -3142,6 +3725,22 @@ fn main() {
                         continue;
                     }
                 };
+                if m.arch_id == 9 {
+                    match redline_bench_decode_deepseek4(&mut gpu, m, &msg) {
+                        Ok(response) => {
+                            let _ = writeln!(stdout, "{response}");
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type": "error", "message": reason})
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if m.pp > 1 || m.ep.is_some() || (m.arch_id != 5 && m.arch_id != 6) {
                     let _ = writeln!(
                         stdout,
@@ -3424,6 +4023,25 @@ fn main() {
                     .get("iterations")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(1) as usize;
+                if model.as_ref().is_some_and(|loaded| {
+                    matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+                }) {
+                    let loaded = model.as_mut().expect("DeepSeek4 route checked");
+                    match redline_shadow_deepseek4(&mut gpu, loaded, pm4, context, iterations) {
+                        Ok(response) => {
+                            let _ = writeln!(stdout, "{response}");
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type": "error", "message": reason})
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
@@ -3657,6 +4275,37 @@ fn main() {
                     .get("steady_state")
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false);
+                if model.as_ref().is_some_and(|loaded| {
+                    matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+                }) {
+                    let start = msg
+                        .get("start")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(step as u64) as usize;
+                    let loaded = model.as_mut().expect("DeepSeek4 route checked");
+                    match redline_pm4_prefix_profile_deepseek4(
+                        &mut gpu,
+                        loaded,
+                        context,
+                        start,
+                        step,
+                        repeats,
+                        steady_state,
+                    ) {
+                        Ok(response) => {
+                            let _ = writeln!(stdout, "{response}");
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type": "error", "message": reason})
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
