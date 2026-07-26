@@ -31,6 +31,177 @@ use hipfire_dispatch::pipeline::superop::{
 use hipfire_dispatch::types::DispatchError;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+struct DenseActivationWriter {
+    writer: std::io::BufWriter<std::fs::File>,
+    k: usize,
+    rows: u32,
+}
+
+struct DenseActivationDump {
+    out_dir: std::path::PathBuf,
+    writers: std::collections::BTreeMap<String, DenseActivationWriter>,
+    finished: bool,
+}
+
+impl DenseActivationDump {
+    fn new(out_dir: std::path::PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(&out_dir).map_err(|e| {
+            format!(
+                "create dense activation directory {}: {e}",
+                out_dir.display()
+            )
+        })?;
+        Ok(Self {
+            out_dir,
+            writers: std::collections::BTreeMap::new(),
+            finished: false,
+        })
+    }
+
+    fn record(&mut self, tensor_name: &str, k: usize, values: &[f32]) -> Result<(), String> {
+        use std::io::Write;
+
+        if self.finished {
+            return Err("dense activation dump already finalized".to_string());
+        }
+        if k == 0 || values.len() % k != 0 {
+            return Err(format!(
+                "dense activation {tensor_name}: {} values are not whole K={k} rows",
+                values.len()
+            ));
+        }
+        let entry = if let Some(entry) = self.writers.get_mut(tensor_name) {
+            entry
+        } else {
+            let key = tensor_name.replace(['/', '\\'], "_").replace("..", "_");
+            let path = self.out_dir.join(format!("{key}.acts"));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| format!("create dense activation dump {}: {e}", path.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            writer
+                .write_all(&0u32.to_le_bytes())
+                .and_then(|_| writer.write_all(&(k as u32).to_le_bytes()))
+                .map_err(|e| format!("write dense activation header {}: {e}", path.display()))?;
+            self.writers.insert(
+                tensor_name.to_string(),
+                DenseActivationWriter { writer, k, rows: 0 },
+            );
+            self.writers
+                .get_mut(tensor_name)
+                .expect("dense activation writer inserted")
+        };
+        if entry.k != k {
+            return Err(format!(
+                "dense activation {tensor_name}: K changed from {} to {k}",
+                entry.k
+            ));
+        }
+        let rows: u32 = (values.len() / k)
+            .try_into()
+            .map_err(|_| format!("dense activation {tensor_name}: row count overflow"))?;
+        entry.rows = entry
+            .rows
+            .checked_add(rows)
+            .ok_or_else(|| format!("dense activation {tensor_name}: cumulative row overflow"))?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        };
+        entry
+            .writer
+            .write_all(bytes)
+            .map_err(|e| format!("append dense activation {tensor_name}: {e}"))
+    }
+
+    fn finish(&mut self) -> Result<(usize, u64), String> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        if self.finished {
+            return Ok((
+                self.writers.len(),
+                self.writers.values().map(|entry| entry.rows as u64).sum(),
+            ));
+        }
+        let mut total_rows = 0u64;
+        for (name, entry) in &mut self.writers {
+            entry
+                .writer
+                .flush()
+                .and_then(|_| entry.writer.seek(SeekFrom::Start(0)).map(|_| ()))
+                .and_then(|_| entry.writer.write_all(&entry.rows.to_le_bytes()))
+                .and_then(|_| entry.writer.write_all(&(entry.k as u32).to_le_bytes()))
+                .and_then(|_| entry.writer.flush())
+                .map_err(|e| format!("finalize dense activation {name}: {e}"))?;
+            total_rows += entry.rows as u64;
+        }
+        self.finished = true;
+        Ok((self.writers.len(), total_rows))
+    }
+}
+
+fn dense_activation_dump() -> Result<Option<&'static std::sync::Mutex<DenseActivationDump>>, String>
+{
+    use std::sync::{Mutex, OnceLock};
+
+    static DUMP: OnceLock<Result<Option<Mutex<DenseActivationDump>>, String>> = OnceLock::new();
+    match DUMP.get_or_init(|| {
+        let Some(path) = std::env::var_os("HIPFIRE_DS4_DENSE_ACT_DIR") else {
+            return Ok(None);
+        };
+        if path.is_empty() {
+            return Err("HIPFIRE_DS4_DENSE_ACT_DIR must not be empty".to_string());
+        }
+        DenseActivationDump::new(path.into()).map(|dump| Some(Mutex::new(dump)))
+    }) {
+        Ok(dump) => Ok(dump.as_ref()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn dense_activation_dump_enabled() -> Result<bool, String> {
+    Ok(dense_activation_dump()?.is_some())
+}
+
+fn dump_dense_activation_if_enabled(
+    gpu: &Gpu,
+    tensor_name: &str,
+    input: &GpuTensor,
+    k: usize,
+) -> Result<(), String> {
+    let Some(dump) = dense_activation_dump()? else {
+        return Ok(());
+    };
+    let values = gpu
+        .download_f32(input)
+        .map_err(|e| format!("download dense activation {tensor_name}: {e:?}"))?;
+    dump.lock()
+        .map_err(|_| "dense activation dump mutex poisoned".to_string())?
+        .record(tensor_name, k, &values)
+}
+
+/// Finalize the env-gated P1 activation dump produced by the decode path.
+///
+/// Each file uses the `collect_e8_hessian` input contract:
+/// `[u32 n_rows][u32 K][f32 rows...]`. The row count is patched only here so
+/// interrupted captures cannot masquerade as complete calibration inputs.
+pub fn finish_dense_activation_dump() -> Result<(), String> {
+    let Some(dump) = dense_activation_dump()? else {
+        return Ok(());
+    };
+    let mut dump = dump
+        .lock()
+        .map_err(|_| "dense activation dump mutex poisoned".to_string())?;
+    let out_dir = dump.out_dir.clone();
+    let (files, rows) = dump.finish()?;
+    eprintln!(
+        "Finalized DeepSeek P1 dense activation dump: {files} files, {rows} rows ({})",
+        out_dir.display()
+    );
+    Ok(())
+}
+
 /// OnceLock-cached process-policy lookups for the DeepSeek V4 decode hot path.
 /// The generic process snapshot is consulted once per helper; subsequent hot
 /// path reads are atomic loads.
@@ -4144,6 +4315,12 @@ fn ffn_shared_project(
     let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
     let down_needs_fwht = weight_needs_fwht(shared_w2);
+    dump_dense_activation_if_enabled(
+        gpu,
+        &format!("layers.{layer_idx}.ffn.shared_experts.w1.weight"),
+        ffn_x_plain,
+        cfg.hidden_size,
+    )?;
 
     // 2. gate = x @ shared_w1
     gemv_auto(
@@ -4177,9 +4354,33 @@ fn ffn_shared_project(
             .map_err(|e| {
                 format!("deepseek4_fused_silu_mul_clamp_mq_rotate layer {layer_idx}: {e:?}")
             })?;
+        if dense_activation_dump_enabled()? {
+            // As with fused q_norm above, materialize the logical pre-FWHT
+            // input only for calibration; the shipping down GEMV continues to
+            // consume the already-computed silu_rot buffer.
+            let scratch = state
+                .embed_scratch
+                .as_ref()
+                .ok_or_else(|| "dense capture: embed_scratch missing".to_string())?
+                .sub_offset(0, im);
+            gpu.deepseek4_silu_mul_clamp_f32(gate, up, &scratch, cfg.swiglu_limit)
+                .map_err(|e| format!("dense capture shared silu layer {layer_idx}: {e:?}"))?;
+            dump_dense_activation_if_enabled(
+                gpu,
+                &format!("layers.{layer_idx}.ffn.shared_experts.w2.weight"),
+                &scratch,
+                im,
+            )?;
+        }
     } else {
         gpu.deepseek4_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
             .map_err(|e| format!("deepseek4_silu_mul_clamp layer {layer_idx}: {e:?}"))?;
+        dump_dense_activation_if_enabled(
+            gpu,
+            &format!("layers.{layer_idx}.ffn.shared_experts.w2.weight"),
+            gate,
+            im,
+        )?;
     }
 
     // 6. ffn_out = silu_rot @ shared_w2 (down: [hidden, im])
@@ -5229,6 +5430,12 @@ fn attn_stub(
     // (gemv_auto reads x_plain in those paths, not x_rotated).
     let wo_a_needs_fwht = weight_needs_fwht(wo_a);
     let wo_b_needs_fwht = weight_needs_fwht(wo_b);
+    dump_dense_activation_if_enabled(
+        gpu,
+        &format!("layers.{layer_idx}.attn.wo_a.weight"),
+        attn_out_raw,
+        per_group_in,
+    )?;
     if wo_a_needs_fwht {
         gpu.rotate_x_mq_batched(attn_out_raw, attn_out_raw_rot, per_group_in, n_groups)
             .map_err(|e| format!("rotate attn_out batched l{layer_idx}: {e:?}"))?;
@@ -5275,6 +5482,12 @@ fn attn_stub(
             )?;
         }
     }
+    dump_dense_activation_if_enabled(
+        gpu,
+        &format!("layers.{layer_idx}.attn.wo_b.weight"),
+        wo_a_out,
+        groups_o_lora,
+    )?;
     // FWHT-rotate wo_a_out then wo_b GEMV → final_attn_out [hidden].
     // wo_b path: F32/Q8 use plain wo_a_out; MQ4 uses wo_a_out_rot.
     if wo_b_needs_fwht {
@@ -5958,6 +6171,12 @@ fn q_lora(
         gpu.rmsnorm_f32(hc_x_in, attn_norm, tmp_plain, cfg.rms_norm_eps)
             .map_err(|e| format!("rmsnorm_f32 attn-side plain l{layer_idx}: {e:?}"))?;
     }
+    dump_dense_activation_if_enabled(
+        gpu,
+        &format!("layers.{layer_idx}.attn.wq_a.weight"),
+        tmp_plain,
+        cfg.hidden_size,
+    )?;
 
     // 2. wq_a @ tmp → q_lat. M = q_lora_rank, K = hidden.
     gemv_auto(
@@ -5976,6 +6195,24 @@ fn q_lora(
     if wq_b_needs_fwht && config_cache::qnorm_rotate_fused_on(&gpu.arch, cfg.mq2r) {
         gpu.fused_rmsnorm_rotate_mq(q_lat, q_norm, q_lat_rot, cfg.q_lora_rank, cfg.rms_norm_eps)
             .map_err(|e| format!("fused q_norm+rotate layer {layer_idx}: {e:?}"))?;
+        if dense_activation_dump_enabled()? {
+            // The shipping fused route intentionally leaves q_lat in its
+            // pre-norm state. Materialize the logical, pre-FWHT wq_b input in
+            // diagnostic scratch without perturbing q_lat_rot or the forward.
+            let scratch = state
+                .embed_scratch
+                .as_ref()
+                .ok_or_else(|| "dense capture: embed_scratch missing".to_string())?
+                .sub_offset(0, cfg.q_lora_rank);
+            gpu.rmsnorm_f32(q_lat, q_norm, &scratch, cfg.rms_norm_eps)
+                .map_err(|e| format!("dense capture q_norm layer {layer_idx}: {e:?}"))?;
+            dump_dense_activation_if_enabled(
+                gpu,
+                &format!("layers.{layer_idx}.attn.wq_b.weight"),
+                &scratch,
+                cfg.q_lora_rank,
+            )?;
+        }
     } else {
         gpu.rmsnorm_f32(q_lat, q_norm, q_lat, cfg.rms_norm_eps)
             .map_err(|e| format!("q_norm rmsnorm layer {layer_idx}: {e:?}"))?;
@@ -5983,6 +6220,12 @@ fn q_lora(
             gpu.rotate_x_mq(q_lat, q_lat_rot, cfg.q_lora_rank)
                 .map_err(|e| format!("rotate_x_mq q_lat layer {layer_idx}: {e:?}"))?;
         }
+        dump_dense_activation_if_enabled(
+            gpu,
+            &format!("layers.{layer_idx}.attn.wq_b.weight"),
+            q_lat,
+            cfg.q_lora_rank,
+        )?;
     }
 
     // 4. wq_b @ q_lat_rot → q. M = n_heads * head_dim, K = q_lora_rank.
@@ -11420,6 +11663,44 @@ fn bias_aware_topk_weights(scores: &[f32], bias: &[f32], k: usize) -> Option<(Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_activation_dump_writes_collector_contract_and_fails_closed() {
+        let unique = format!(
+            "hipfire-ds4-dense-acts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let out_dir = std::env::temp_dir().join(unique);
+        let tensor_name = "layers.0.attn.wq_b.weight";
+        let path = out_dir.join(format!("{tensor_name}.acts"));
+        let mut dump = DenseActivationDump::new(out_dir.clone()).unwrap();
+
+        dump.record(tensor_name, 4, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        dump.record(tensor_name, 4, &[5.0, 6.0, 7.0, 8.0]).unwrap();
+        assert!(dump
+            .record("layers.0.attn.wo_b.weight", 3, &[1.0, 2.0])
+            .unwrap_err()
+            .contains("not whole"));
+        assert_eq!(dump.finish().unwrap(), (1, 2));
+        assert!(dump.record(tensor_name, 4, &[0.0; 4]).is_err());
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 8 + 2 * 4 * std::mem::size_of::<f32>());
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 4);
+        let values: Vec<f32> = bytes[8..]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(out_dir).unwrap();
+    }
 
     #[test]
     fn mq2r_pins_the_accepted_gfx1151_switches() {
