@@ -123,6 +123,24 @@ progress watchdog also terminates ROCr children that fault without exiting;
 `FEATURE_STALL_TIMEOUT_SECS` (default `240`), `FEATURE_STALL_POLL_SECS`
 (default `15`), and `FEATURE_TERM_GRACE_SECS` (default `10`) control it.
 
+### Build a deployment-derived 16K vocabulary
+
+Do not overwrite the stock sidecar's vocabulary map. Build a distinct map from
+the exact runtime-shifted training targets retained in the Stage 2 features:
+
+```bash
+cargo run --release -p hipfire-mtp-data --bin build_mtp_vocab_map -- \
+  --features ~/.hipfire/datasets/fastmtp-qwen36-a3b-v1/features/train \
+  --base-map ~/.hipfire/datasets/fastmtp-qwen36-a3b-v1/features/vocab-map.json \
+  --output ~/.hipfire/datasets/fastmtp-qwen36-a3b-v1/features/vocab-map-v3-deployment16k.json
+```
+
+The scanner reads token ids and structurally validates every record while
+seeking over the roughly 400 GiB hidden-state payload. It records the exact
+trunk, source-manifest, producer, target coverage, weighting, and overlap with
+the stock map in the output. Full hidden-payload checksums remain the Stage 2
+feature audit's responsibility.
+
 ## Stage 3: head-only K=3 training on four R9700s
 
 Hiptrx currently has the CPU-only Torch wheel. After Stage 1 has released the
