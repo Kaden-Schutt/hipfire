@@ -98,6 +98,9 @@ pub struct KernelCompiler {
     /// hash so blobs built by a different compiler/ROCm don't get reused across
     /// builds sharing one `.hipfire_kernels` dir (the "invalid device image" trap).
     toolchain_id: String,
+    /// Resolved device-compiler binary. Bare "hipcc" when PATH provides it;
+    /// otherwise an absolute path discovered under a resolved ROCm root.
+    hipcc_bin: std::path::PathBuf,
 }
 
 impl KernelCompiler {
@@ -190,7 +193,23 @@ impl KernelCompiler {
 
         // Probe for hipcc once at init, not per-kernel. Capture its version line
         // as a toolchain fingerprint for the cache hash (Fix #1).
-        let hipcc_out = Command::new("hipcc").arg("--version").output().ok();
+        //
+        // PATH stays authoritative so an explicit `module load` / PATH choice
+        // still wins. The resolved-root fallback is strictly additive: it only
+        // engages when PATH has no hipcc at all, which is the common
+        // "ROCm installed under /opt/rocm/core-<ver> but not on PATH" case that
+        // previously degraded silently to has_hipcc=false.
+        let hipcc_bin: std::path::PathBuf = if Command::new("hipcc")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            "hipcc".into()
+        } else {
+            hipfire_config::rocm::tool("hipcc").unwrap_or_else(|| "hipcc".into())
+        };
+        let hipcc_out = Command::new(&hipcc_bin).arg("--version").output().ok();
         let has_hipcc = hipcc_out
             .as_ref()
             .map(|o| o.status.success())
@@ -230,6 +249,7 @@ impl KernelCompiler {
             compiled: HashMap::new(),
             precompiled_dir,
             has_hipcc,
+            hipcc_bin,
             extra_flags,
             gfx1151_cumode_modules,
             toolchain_id,
@@ -328,6 +348,7 @@ impl KernelCompiler {
 
         if !cache_valid {
             Self::hipcc_compile(
+                &self.hipcc_bin,
                 &self.arch,
                 &src_path,
                 &obj_path,
@@ -446,6 +467,7 @@ impl KernelCompiler {
 
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
     fn hipcc_compile(
+        hipcc_bin: &Path,
         arch: &str,
         src_path: &Path,
         obj_path: &Path,
@@ -509,7 +531,7 @@ impl KernelCompiler {
         args.push(obj_path.to_str().unwrap().into());
         args.push(src_path.to_str().unwrap().into());
 
-        let output = Command::new("hipcc")
+        let output = Command::new(hipcc_bin)
             .args(&args)
             .output()
             .map_err(|e| hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}")))?;
@@ -612,6 +634,7 @@ impl KernelCompiler {
         eprintln!("  compiling {n} kernels in parallel...");
         let arch = self.arch.clone();
         let precompiled_dir = self.precompiled_dir.clone();
+        let hipcc_bin = self.hipcc_bin.clone();
 
         // Shared counter so parallel threads can report "[i/N] name" as each one
         // completes. Ordering follows completion (not launch) — matches the pace
@@ -625,10 +648,12 @@ impl KernelCompiler {
                 |(name, source, src_hash, src_path, obj_path, hash_path, module_flags)| {
                     let arch = arch.clone();
                     let precompiled_dir = precompiled_dir.clone();
+                    let hipcc_bin = hipcc_bin.clone();
                     let extra_flags = self.extra_flags.clone();
                     let done = std::sync::Arc::clone(&done);
                     let handle = thread::spawn(move || {
                         let result = Self::hipcc_compile(
+                            &hipcc_bin,
                             &arch,
                             &src_path,
                             &obj_path,
@@ -690,6 +715,7 @@ mod tests {
             extra_flags: extra_flags.to_string(),
             gfx1151_cumode_modules: HashSet::new(),
             toolchain_id: toolchain_id.to_string(),
+            hipcc_bin: PathBuf::from("hipcc"),
         }
     }
 
