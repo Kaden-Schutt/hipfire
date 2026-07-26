@@ -796,10 +796,12 @@ def main() -> None:
                             "step": step,
                             "planned_steps": planned_steps,
                             "stop_step": stop_step,
-                            "loss": float(loss),
-                            "step_losses": [float(value) for value in losses],
+                            "loss": float(loss.detach()),
+                            "step_losses": [
+                                float(value.detach()) for value in losses
+                            ],
                             "soft_target_losses": [
-                                float(value) for value in soft_losses
+                                float(value.detach()) for value in soft_losses
                             ],
                             "coverage": coverage,
                             "lr": scheduler.get_last_lr()[0],

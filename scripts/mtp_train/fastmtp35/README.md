@@ -181,6 +181,8 @@ HIPFIRE_FASTMTP_AUTO_RESUME=0 \
 scripts/mtp_train/fastmtp35/run_hiptrx_train.sh \
   ~/.hipfire/datasets/fastmtp-qwen36-a3b-v1 \
   --max-steps 1000 \
+  --micro-batch-size 64 \
+  --global-batch-size 512 \
   --soft-target-weight 0.5 \
   --soft-target-topk 256
 ```
@@ -190,7 +192,9 @@ aggregate probability bucket for the remaining 16K support. This preserves the
 teacher's tail mass instead of renormalizing the top-K tokens, while avoiding a
 second full-vocabulary projection and large persistent probability tensors.
 Pilot checkpoints must still be selected by sampled product tau rather than
-offline loss alone.
+offline loss alone. The distribution graph requires a 64-sequence microbatch
+with two-way gradient accumulation on 32 GB R9700s; MI300X can use the larger
+microbatch directly.
 
 The hiptrx default uses the verified 32 GB R9700 capacity point: 128
 sequences per GPU, an effective global batch of 512, and one DDP all-reduce
