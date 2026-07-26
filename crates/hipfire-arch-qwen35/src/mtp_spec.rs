@@ -3938,7 +3938,12 @@ pub fn spec_step_mtp_compressed_serial(
     let replay_skipped = full_accept_no_eos;
     if !full_accept_no_eos {
         state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
-        if tape_captured {
+        let use_tape_replay = tape_captured
+            && hipfire_config::developer_var("HIPFIRE_MTP_TAPE_REPLAY")
+                .ok()
+                .as_deref()
+                != Some("0");
+        if use_tape_replay {
             // The batched verify populated the tape this cycle — cheap GDN-only replay.
             state.trunk_gdn_tape.replay_gdn(
                 gpu,
