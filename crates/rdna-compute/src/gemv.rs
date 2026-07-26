@@ -3210,6 +3210,29 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let k = n_heads.checked_mul(head_dim).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "gated_norm_rotate_mq_gfx1100: size overflow")
+        })?;
+        if n_heads != 32 || head_dim != 128 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gated_norm_rotate_mq_gfx1100: expected 32 heads with head_dim=128",
+            ));
+        }
+        if x.numel() < k || z.numel() < k || weight.numel() < head_dim || x_rot.numel() < k {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gated_norm_rotate_mq_gfx1100: undersized tensor (x={}, z={}, weight={}, x_rot={}, required x/z/x_rot={}, weight={})",
+                    x.numel(),
+                    z.numel(),
+                    weight.numel(),
+                    x_rot.numel(),
+                    k,
+                    head_dim,
+                ),
+            ));
+        }
         self.ensure_mq_signs()?;
         let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
             (
@@ -3246,7 +3269,6 @@ impl Gpu {
             &hd as *const _ as *mut c_void,
             &ep as *const _ as *mut c_void,
         ];
-        let k = n_heads * head_dim;
         let bytes = crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(

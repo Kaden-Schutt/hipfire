@@ -4921,8 +4921,9 @@ pub struct Qwen35Scratch {
     pub repeat_buf: GpuTensor, // [repeat_window]
 
     // MagnumQuant rotation scratch: FWHT(x) shared across Q/K/V (or gate/up, etc).
-    // Sized to max(dim, hidden_dim) — one rotation per batch replaces one per GEMV.
-    pub x_rot: GpuTensor, // [max(dim, hidden_dim)]
+    // DeltaNet's output projection consumes v_dim values, which can exceed both
+    // dim and the unused dense hidden_dim on MoE checkpoints.
+    pub x_rot: GpuTensor, // [max(dim, hidden_dim, v_dim)]
 
     // Flash attention partials buffer for tile+reduce 2-kernel path.
     // Size: n_heads * max_tiles * (2 + head_dim) floats.
@@ -4965,6 +4966,10 @@ pub struct Qwen35Scratch {
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
     pub prefill_batch: Option<PrefillBatchScratch>,
+}
+
+fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
+    dim.max(hidden_dim).max(v_dim)
 }
 
 impl Qwen35Scratch {
@@ -5020,7 +5025,10 @@ impl Qwen35Scratch {
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
             repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
-            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
+            x_rot: gpu.alloc_tensor(
+                &[qwen35_x_rot_len(dim, config.hidden_dim, v_dim)],
+                DType::F32,
+            )?,
 
             // Flash attention partials: enough for the smallest tile used by
             // Q8 decode experiments and the fixed tile_size=128 paths.
@@ -17027,6 +17035,12 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x_rot_covers_deltanet_value_width_for_moe_configs() {
+        assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
+        assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
+    }
 
     // ── SP2 — per-expert mixed-tier table builder (CPU-pure) ──────────────
     // `mixed_tier_table` is the testable core of `per_expert_tier_tables`:
