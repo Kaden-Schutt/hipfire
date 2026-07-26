@@ -272,10 +272,11 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 **Do not hand-edit rows below** except by re-running the source scan.
 **Generation method:** token scan over visible `*.rs`, `*.py`, and `*.sh`, excluding ignored/generated files.
 **Columns:** variable; up to two lexical source paths.
-**Count:** 714
+**Count:** 715
 
 | Variable | Example source path(s) |
 |---|---|
+| `HF_ENDPOINT` | crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_9B_MODEL` | scripts/bisect_9b_decode.sh |
 | `HIPFIRE_ADAPTIVE_B_DOWN` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_ADAPTIVE_B_UNSAFE` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |

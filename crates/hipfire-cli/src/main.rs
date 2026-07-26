@@ -1539,7 +1539,9 @@ fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
 }
 
 fn artifact_url(entry: &ModelEntry, file: &str) -> String {
-    let base = env::var("HIPFIRE_HF_BASE").unwrap_or_else(|_| "https://huggingface.co".into());
+    let base = env::var("HIPFIRE_HF_BASE")
+        .or_else(|_| env::var("HF_ENDPOINT"))
+        .unwrap_or_else(|_| "https://huggingface.co".into());
     format!(
         "{}/{}/resolve/main/{}",
         base.trim_end_matches('/'),
@@ -6236,13 +6238,41 @@ mod tests {
     }
 
     #[test]
-    fn artifact_urls_use_registry_repo_and_file() {
+    fn artifact_urls_honor_endpoint_precedence() {
+        struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => env::set_var(self.0, value),
+                    None => env::remove_var(self.0),
+                }
+            }
+        }
+
+        let _hf_base = EnvRestore("HIPFIRE_HF_BASE", env::var_os("HIPFIRE_HF_BASE"));
+        let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
         let (_, entry) = registry.model("qwen3.6:35b-a3b-mq4r").unwrap();
+        let suffix = "schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
+
         env::remove_var("HIPFIRE_HF_BASE");
+        env::remove_var("HF_ENDPOINT");
         assert_eq!(
             artifact_url(entry, &entry.file),
-            "https://huggingface.co/schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r"
+            format!("https://huggingface.co/{suffix}")
+        );
+
+        env::set_var("HF_ENDPOINT", "https://hf-mirror.example/");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://hf-mirror.example/{suffix}")
+        );
+
+        env::set_var("HIPFIRE_HF_BASE", "https://hipfire-mirror.example///");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://hipfire-mirror.example/{suffix}")
         );
     }
 
