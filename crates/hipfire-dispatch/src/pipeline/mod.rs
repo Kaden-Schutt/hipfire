@@ -2020,31 +2020,10 @@ pub fn run_moe_prefill(
     });
     let use_path2 = res.use_path2 && p.batch_size >= grouped_min_batch;
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
-    // gfx1201 short-verifier experiment: once B<=4 is deliberately routed
-    // through the indexed (AR-intrinsics) family, keep the eight routed-down
-    // experts inside one row-owning workgroup and fold their weights directly
-    // into the residual. This removes the expanded-output round trip and the
-    // separate combine dispatch without changing the per-row arithmetic.
-    //
-    // Keep this narrower than the general prefill resolver while it is being
-    // certified: uniform MQ4 only, no mixed expert table, and never the grouped
-    // prompt path. HIPFIRE_MOE_DOWN_FUSED was already the documented research
-    // gate for this kernel; this is its first live dispatch site.
-    static MTP_INDEXED_DOWN_FUSED: std::sync::OnceLock<bool> =
-        std::sync::OnceLock::new();
-    let mtp_indexed_down_fused = !use_path2
-        && ctx.arch.is_gfx1201()
-        && p.batch_size <= 4
-        && p.k_top == 8
-        && p.expert_dtype_tags.is_none()
-        && p.dtypes.routed_down == DType::MQ4G256
-        && *MTP_INDEXED_DOWN_FUSED.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_MOE_DOWN_FUSED").as_deref() == Ok("1")
-        });
     if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[moe-prefill] arch={} shared=({:?},{:?},{:?},{:?}) routed=({:?},{:?}) \
-             path2={} indexed_down_fused={} force_mq4_fp16={} grouped_i8={:?}",
+             path2={} force_mq4_fp16={} grouped_i8={:?}",
             ctx.arch.arch(),
             p.dtypes.shared_gate,
             p.dtypes.shared_expert_gate,
@@ -2053,7 +2032,6 @@ pub fn run_moe_prefill(
             p.dtypes.routed_gate_up,
             p.dtypes.routed_down,
             use_path2,
-            mtp_indexed_down_fused,
             force_mq4_grouped_fp16,
             ctx.flags.moe_grouped_i8,
         );
@@ -2367,18 +2345,6 @@ pub fn run_moe_prefill(
             p.topk_weights,
             out_target,
             down_m,
-            k_top,
-            n,
-        ))?;
-    } else if mtp_indexed_down_fused {
-        hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_fused_acc(
-            p.expert_down_ptrs,
-            p.topk_indices,
-            p.topk_weights,
-            p.rot_batch,
-            out_target,
-            down_m,
-            down_k,
             k_top,
             n,
         ))?;
