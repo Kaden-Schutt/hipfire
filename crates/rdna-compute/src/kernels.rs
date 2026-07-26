@@ -1868,6 +1868,15 @@ pub const MOE_SOFTMAX_TOPK_K8_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched.hip");
 
+/// Preserve the baseline batched geometry while lowering its hot weight
+/// accesses through the same gfx12 buffer/cache intrinsics as golden AR.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_GOLDEN_INTRINSICS_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_BATCHED_K2048 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched.hip")
+);
+
 /// Short-batch verifier lift of the certified gfx12 AR gate/up schedule.
 /// One workgroup computes matching gate and up rows, sharing activation
 /// loads and retaining the golden buffer-load/cache-policy intrinsics.

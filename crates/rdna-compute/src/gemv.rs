@@ -7747,6 +7747,11 @@ impl Gpu {
                 ""
             };
             let (module, source, grid_div) = match schedule {
+                "intrinsics" if k == 2_048 => (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched_golden_intrinsics",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_GOLDEN_INTRINSICS_SRC,
+                    1,
+                ),
                 "1" | "golden" => (
                     "gemv_hfq4g256_moe_gate_up_indexed_batched_golden",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_GOLDEN_SRC,
