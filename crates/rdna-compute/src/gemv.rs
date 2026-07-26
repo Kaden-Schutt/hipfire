@@ -7733,15 +7733,45 @@ impl Gpu {
                 2,
             )
         } else {
+            use std::sync::OnceLock;
+            static GFX12_SHORT_BATCH_ROUTE: OnceLock<String> = OnceLock::new();
+            let schedule = if self.arch_caps.is_rdna4() {
+                GFX12_SHORT_BATCH_ROUTE
+                    .get_or_init(|| {
+                        hipfire_config::developer_var("HIPFIRE_MTP_GOLDEN_GATE_UP")
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                    })
+                    .as_str()
+            } else {
+                ""
+            };
+            let (module, source, grid_div) = match schedule {
+                "1" | "golden" => (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched_golden",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_GOLDEN_SRC,
+                    2,
+                ),
+                "k2048" if k == 2_048 => (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched_golden_k2048",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_GOLDEN_K2048_SRC,
+                    2,
+                ),
+                _ => (
+                    "gemv_hfq4g256_moe_gate_up_indexed_batched",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+                    1,
+                ),
+            };
             self.ensure_kernel(
-                "gemv_hfq4g256_moe_gate_up_indexed_batched",
-                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+                module,
+                source,
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
             )?;
             (
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
                 [32, 1, 1],
-                1,
+                grid_div,
             )
         };
         let pp = expert_ptrs.buf.as_ptr();

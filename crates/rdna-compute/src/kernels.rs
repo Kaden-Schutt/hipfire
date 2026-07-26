@@ -1868,6 +1868,28 @@ pub const MOE_SOFTMAX_TOPK_K8_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched.hip");
 
+/// Short-batch verifier lift of the certified gfx12 AR gate/up schedule.
+/// One workgroup computes matching gate and up rows, sharing activation
+/// loads and retaining the golden buffer-load/cache-policy intrinsics.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_GOLDEN_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_BATCHED 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_batched\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+/// Exact Qwen3.6 A3B K=2048 specialization of the golden short-batch lift.
+/// This lets LLVM remove the dynamic group count and dead HFQ4 tail.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_GOLDEN_K2048_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_BATCHED 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_K2048 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_batched\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// CDNA3 wave64-native batched indexed MoE gate_up. 2 rows per block.
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched_wave64.hip");

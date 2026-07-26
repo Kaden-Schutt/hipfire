@@ -33,6 +33,10 @@ using hipfire_gate_u32x2 = unsigned int __attribute__((ext_vector_type(2)));
 #define HIPFIRE_MOE_GATE_UP_PAIR_VGPR 0
 #endif
 
+#ifndef HIPFIRE_MOE_GATE_UP_BATCHED
+#define HIPFIRE_MOE_GATE_UP_BATCHED 0
+#endif
+
 #if HIPFIRE_MOE_GATE_UP_WG_WAVES == 2
 #define HIPFIRE_MOE_GATE_UP_BLOCK 64
 #ifndef HIPFIRE_MOE_GATE_UP_MIN_BLOCKS
@@ -81,6 +85,9 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     float* __restrict__ y_gate,                          // [K_TOP × MI]
     float* __restrict__ y_up,                            // [K_TOP × MI]
     int M, int K
+#if HIPFIRE_MOE_GATE_UP_BATCHED
+    , int K_TOP
+#endif
 ) {
     const int mi = M >> 1;
 #if HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE
@@ -105,6 +112,15 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const int krank = blockIdx.y;
 #endif
 
+#if HIPFIRE_MOE_GATE_UP_BATCHED
+    const int bid = blockIdx.z;
+    const int route_index = bid * K_TOP + krank;
+    const float* __restrict__ x_row = x + (long long)bid * K;
+#else
+    const int route_index = krank;
+    const float* __restrict__ x_row = x;
+#endif
+
     // Read expert_id from device and index into the pointer table. The
     // gfx1151 route-buffer candidate deliberately keeps both dependent reads
     // on VMEM, then scalarizes their uniform result without touching the
@@ -114,7 +130,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const auto topk_rsrc = __builtin_amdgcn_make_buffer_rsrc(
         const_cast<int*>(topk_indices), 0, 0xffffffffu, 0x31004000u);
     const unsigned int expert_id_v = __builtin_amdgcn_raw_buffer_load_b32(
-        topk_rsrc, (unsigned int)krank * 4u, 0, 0);
+        topk_rsrc, (unsigned int)route_index * 4u, 0, 0);
     const int expert_id = __builtin_amdgcn_readfirstlane(expert_id_v);
     const auto expert_ptrs_rsrc = __builtin_amdgcn_make_buffer_rsrc(
         const_cast<unsigned long long*>(expert_ptrs),
@@ -129,13 +145,13 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         (unsigned long long)expert_ptr_lo | ((unsigned long long)expert_ptr_hi << 32);
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_ptr);
 #else
-    const int expert_id = topk_indices[krank];
+    const int expert_id = topk_indices[route_index];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 #endif
 
-#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_K2048)
-    // The gfx1100 A3B decode route is fixed at K=2048. Host dispatch enforces
+#if defined(HIPFIRE_MOE_GATE_UP_K2048) || defined(HIPFIRE_RDNA3_MOE_GATE_UP_K2048)
+    // The specialized A3B route is fixed at K=2048. Host dispatch enforces
     // that contract so LLVM can delete the runtime divide and constant-fold
     // both row strides and the two-quad loop bound.
     const int groups_per_row = 8;
@@ -155,7 +171,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
 #endif
 #if defined(HIPFIRE_RDNA3_MOE_GATE_UP_X_BUFFER)
     const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
+        const_cast<float*>(x_row), 0, 0xffffffffu, 0x31004000u);
     #define LOAD_X4(index) __builtin_bit_cast(hipfire_gate_f32x4, \
         __builtin_amdgcn_raw_buffer_load_b128( \
             x_rsrc, (unsigned int)(index) * 4u, 0, 0))
@@ -167,10 +183,10 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         asm volatile("" : : "v"(x0a), "v"(x0b), "v"(x1a), "v"(x1b) : "memory")
 #else
     #define DECLARE_PAIR_X(base) \
-        const float4 x0a = *reinterpret_cast<const float4*>(x + (base)); \
-        const float4 x0b = *reinterpret_cast<const float4*>(x + (base) + 4); \
-        const float4 x1a = *reinterpret_cast<const float4*>(x + (base) + 256); \
-        const float4 x1b = *reinterpret_cast<const float4*>(x + (base) + 260)
+        const float4 x0a = *reinterpret_cast<const float4*>(x_row + (base)); \
+        const float4 x0b = *reinterpret_cast<const float4*>(x_row + (base) + 4); \
+        const float4 x1a = *reinterpret_cast<const float4*>(x_row + (base) + 256); \
+        const float4 x1b = *reinterpret_cast<const float4*>(x_row + (base) + 260)
 #endif
 
     float gacc0 = 0.0f, gacc1 = 0.0f, gacc2 = 0.0f, gacc3 = 0.0f;
@@ -205,8 +221,8 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     #define PROCESS_LOW_VGPR(group_index, chain) do { \
         const int group = (group_index); \
         const int base = group * 256 + tid * 8; \
-        const float4 xa = *reinterpret_cast<const float4*>(x + base); \
-        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4); \
+        const float4 xa = *reinterpret_cast<const float4*>(x_row + base); \
+        const float4 xb = *reinterpret_cast<const float4*>(x_row + base + 4); \
         const char* gg = gate_ptr + group * 136; \
         const char* uu = up_ptr + group * 136; \
         const unsigned int group_offset = (unsigned int)group * 136u; \
@@ -311,14 +327,14 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
             "v"(xv0a), "v"(xv0b), "v"(xv1a), "v"(xv1b),
             "v"(xv2a), "v"(xv2b), "v"(xv3a), "v"(xv3b) : "memory");
 #else
-        const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
-        const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
-        const float4 xv1a = *reinterpret_cast<const float4*>(x + base0 + 256);
-        const float4 xv1b = *reinterpret_cast<const float4*>(x + base0 + 260);
-        const float4 xv2a = *reinterpret_cast<const float4*>(x + base0 + 512);
-        const float4 xv2b = *reinterpret_cast<const float4*>(x + base0 + 516);
-        const float4 xv3a = *reinterpret_cast<const float4*>(x + base0 + 768);
-        const float4 xv3b = *reinterpret_cast<const float4*>(x + base0 + 772);
+        const float4 xv0a = *reinterpret_cast<const float4*>(x_row + base0);
+        const float4 xv0b = *reinterpret_cast<const float4*>(x_row + base0 + 4);
+        const float4 xv1a = *reinterpret_cast<const float4*>(x_row + base0 + 256);
+        const float4 xv1b = *reinterpret_cast<const float4*>(x_row + base0 + 260);
+        const float4 xv2a = *reinterpret_cast<const float4*>(x_row + base0 + 512);
+        const float4 xv2b = *reinterpret_cast<const float4*>(x_row + base0 + 516);
+        const float4 xv3a = *reinterpret_cast<const float4*>(x_row + base0 + 768);
+        const float4 xv3b = *reinterpret_cast<const float4*>(x_row + base0 + 772);
 #endif
 
         // MEMORY phase: sequential gate weights, then sequential up weights.
@@ -443,8 +459,8 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     if (tail >= 1) {
         const int g = quads << 2;
         int base = g * 256 + tid * 8;
-        const float4 xa = *reinterpret_cast<const float4*>(x + base);
-        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+        const float4 xa = *reinterpret_cast<const float4*>(x_row + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x_row + base + 4);
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
         const unsigned int goff = gate_row_offset + (unsigned int)g * 136u;
         const unsigned int uoff = up_row_offset + (unsigned int)g * 136u;
@@ -463,8 +479,8 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         int base = g * 256 + tid * 8;
-        const float4 xa = *reinterpret_cast<const float4*>(x + base);
-        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+        const float4 xa = *reinterpret_cast<const float4*>(x_row + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x_row + base + 4);
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
         const unsigned int goff = gate_row_offset + (unsigned int)g * 136u;
         const unsigned int uoff = up_row_offset + (unsigned int)g * 136u;
@@ -483,8 +499,8 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         int base = g * 256 + tid * 8;
-        const float4 xa = *reinterpret_cast<const float4*>(x + base);
-        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+        const float4 xa = *reinterpret_cast<const float4*>(x_row + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x_row + base + 4);
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
         const unsigned int goff = gate_row_offset + (unsigned int)g * 136u;
         const unsigned int uoff = up_row_offset + (unsigned int)g * 136u;
@@ -517,8 +533,15 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     }
 
     if (tid == 0) {
+#if HIPFIRE_MOE_GATE_UP_BATCHED
+        const long long output_base =
+            (long long)bid * K_TOP * mi + (long long)krank * mi;
+        y_gate[output_base + row] = gacc;
+        y_up[output_base + row] = uacc;
+#else
         y_gate[krank * mi + row] = gacc;
         y_up[krank * mi + row] = uacc;
+#endif
     }
 }
 
