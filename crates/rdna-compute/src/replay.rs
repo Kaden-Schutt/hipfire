@@ -372,6 +372,12 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    if kernel == "mtp_golden_stage_input_f32" {
+        return Some(vec![read(0), read(8), write(16), write(24)]);
+    }
+    if kernel == "mtp_golden_copy_f32" {
+        return Some(vec![read(0), write(8)]);
+    }
     if matches!(
         kernel,
         "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"

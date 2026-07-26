@@ -13579,6 +13579,51 @@ pub fn forward_scratch_with_hidden(
     Ok(())
 }
 
+/// Run one verifier token through the exact lowered single-token AR layer
+/// family, but stop after the canonical output norm instead of launching the
+/// per-token lm_head. The caller owns input/position staging and supplies one
+/// output row plus the matching GDN innovation-tape row.
+///
+/// This is deliberately separate from `forward_scratch`: it never consumes,
+/// captures, or replaces the plain-AR replay controller. MTP temporarily swaps
+/// its own controller into `Gpu::replay`, stages dynamic inputs with a tiny
+/// replay-safe glue kernel, then calls this body so every model-compute launch
+/// comes from the same lowered programs and HSACO artifacts as golden AR.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_golden_verify_hidden(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &DeltaNetState,
+    scratch: &Qwen35Scratch,
+    gdn_tape: &mut crate::speculative::GdnTape,
+    tape_row: usize,
+    hidden_out: &GpuTensor,
+) -> HipResult<()> {
+    if tape_row >= gdn_tape.max_n {
+        return Err(HipError::new(
+            0,
+            "golden verifier tape row exceeds allocated GDN tape",
+        ));
+    }
+    gpu.graphs.ar_forward_replay_enabled = false;
+    gpu.graphs.ar_forward_kernel_dirty = true;
+    forward_scratch_layers_lowered(
+        gpu,
+        weights,
+        config,
+        pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        false,
+        Some((gdn_tape, tape_row)),
+    )?;
+    gpu.mtp_golden_copy_f32(&scratch.tmp, hidden_out, config.dim)
+}
+
 /// Zero-alloc forward from pre-computed embedding in scratch.x.
 pub fn forward_scratch_embed(
     gpu: &mut Gpu,
@@ -13736,7 +13781,9 @@ fn forward_scratch_layers(
     // hidden-state ring buffer is active (spec-decode capture engages only the
     // hand path for now). Default off → the hand arms below run unchanged.
     if forward_lowered_enabled() && hidden_rb.is_none() {
-        return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
+        return forward_scratch_layers_lowered(
+            gpu, weights, config, pos, kv_cache, dn_state, s, true, None,
+        );
     }
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -16246,6 +16293,8 @@ fn forward_scratch_layers_lowered(
     kv_cache: &mut llama::KvCache,
     dn_state: &DeltaNetState,
     s: &Qwen35Scratch,
+    emit_logits: bool,
+    mut gdn_tape: Option<(&mut crate::speculative::GdnTape, usize)>,
 ) -> HipResult<()> {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -16307,6 +16356,22 @@ fn forward_scratch_layers_lowered(
             layer,
             LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)
         ) {
+            if let Some((tape, row)) = gdn_tape.as_mut() {
+                let qkv_dst = tape.qkv_bufs[delta_layer_idx]
+                    .sub_offset(*row * tape.qkv_dim, tape.qkv_dim);
+                let alpha_dst = tape.alpha_bufs[delta_layer_idx]
+                    .sub_offset(*row * tape.n_v_heads, tape.n_v_heads);
+                let beta_dst = tape.beta_bufs[delta_layer_idx]
+                    .sub_offset(*row * tape.n_v_heads, tape.n_v_heads);
+                gpu.mtp_golden_copy_f32(&s.dn_qkv, &qkv_dst, tape.qkv_dim)?;
+                gpu.mtp_golden_copy_f32(&s.dn_alpha, &alpha_dst, tape.n_v_heads)?;
+                gpu.mtp_golden_copy_f32(&s.dn_beta, &beta_dst, tape.n_v_heads)?;
+            }
+        }
+        if matches!(
+            layer,
+            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)
+        ) {
             delta_layer_idx += 1;
         }
         if !combine_next_rms || layer_idx + 1 == config.n_layers {
@@ -16314,9 +16379,10 @@ fn forward_scratch_layers_lowered(
         }
     }
 
-    // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
+    // Final norm always runs: MTP consumes the post-output-norm hidden. Only
+    // the standalone per-token lm_head is omitted for batched verification.
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-    {
+    if emit_logits {
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {

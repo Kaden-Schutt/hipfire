@@ -8,9 +8,105 @@ use std::ffi::c_void;
 
 use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
-use hip_bridge::HipResult;
+use hip_bridge::{DeviceBuffer, HipResult};
 
 impl Gpu {
+    /// Stage one already-dequantized embedding row and its position into the
+    /// canonical single-token scratch buffers. Both changing inputs remain
+    /// device-resident, so this launch is safe to retain in a PM4 tape.
+    pub fn mtp_golden_stage_input_f32(
+        &mut self,
+        embeddings: &GpuTensor,
+        positions: &GpuTensor,
+        output: &GpuTensor,
+        pos_out: &DeviceBuffer,
+        row: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "mtp_golden_stage_input_f32",
+            kernels::MTP_GOLDEN_STAGE_INPUT_F32_SRC,
+            "mtp_golden_stage_input_f32",
+        )?;
+
+        let ep = embeddings.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let pop = pos_out.as_ptr();
+        let mut r = row as i32;
+        let mut d = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &pop as *const _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+        let block = 256_u32;
+        let grid = (dim as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "mtp_golden_stage_input_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(pp);
+                b.push_ptr(op);
+                b.push_ptr(pop);
+                b.push_i32(r);
+                b.push_i32(d);
+                b
+            },
+        )
+    }
+
+    /// Replay-recordable D2D copy. This is intentionally a kernel rather than
+    /// `hipMemcpyDtoD`: Redline records compute launches, and the copy must
+    /// remain ordered inside the retained verifier tape.
+    pub fn mtp_golden_copy_f32(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "mtp_golden_copy_f32",
+            kernels::MTP_GOLDEN_COPY_F32_SRC,
+            "mtp_golden_copy_f32",
+        )?;
+
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let mut count = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &mut count as *mut _ as *mut c_void,
+        ];
+        let block = 256_u32;
+        let grid = (n as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "mtp_golden_copy_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(dp);
+                b.push_i32(count);
+                b
+            },
+        )
+    }
+
     /// GPU-side embedding lookup: copy row `token_id` from embedding table to output.
     /// Avoids downloading the entire embedding table to CPU.
     pub fn embedding_lookup(

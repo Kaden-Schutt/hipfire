@@ -36,7 +36,7 @@ use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
-use rdna_compute::replay::{ReplayBackendRequest, ReplayController};
+use rdna_compute::replay::{RecordedHipLaunch, ReplayBackendRequest, ReplayController};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -215,6 +215,19 @@ fn mtp_verify_pm4_enabled(gpu: &Gpu) -> bool {
                 && gpu.replay.request() == ReplayBackendRequest::Auto
                 && gpu.replay.uses_pm4_transport()
         }
+    }
+}
+
+fn mtp_golden_trunk_enabled_from_env() -> bool {
+    // Opt-in until the exact golden-family route clears correctness and the
+    // ≥230 tok/s product gate. Unlike the older per-kernel experiments, this
+    // selects the canonical lowered AR layer programs wholesale.
+    match hipfire_config::developer_var("HIPFIRE_MTP_GOLDEN_TRUNK") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "sequential" | "lowered"
+        ),
+        Err(_) => false,
     }
 }
 
@@ -1328,6 +1341,286 @@ fn abort_mtp_proposal_graph_capture(gpu: &mut Gpu) {
     gpu.graphs.capture_blobs.clear();
 }
 
+fn run_mtp_golden_trunk_body(
+    gpu: &mut Gpu,
+    trunk_weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &qwen35::DeltaNetState,
+    scratch: &qwen35::Qwen35Scratch,
+    pbs: &qwen35::PrefillBatchScratch,
+    gdn_tape: &mut GdnTape,
+    verify_hidden: &GpuTensor,
+    n: usize,
+    cur_pos: usize,
+) -> HipResult<()> {
+    match trunk_weights.embd_format {
+        llama::EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+            &trunk_weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            n,
+            config.dim,
+        )?,
+        llama::EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+            &trunk_weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            n,
+            config.dim,
+        )?,
+        other => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("golden MTP verifier does not support embedding format {other:?}"),
+            ));
+        }
+    }
+
+    for row in 0..n {
+        gpu.mtp_golden_stage_input_f32(
+            &pbs.x_batch,
+            &pbs.positions,
+            &scratch.x,
+            &scratch.pos_buf,
+            row,
+            config.dim,
+        )?;
+        let hidden_row = verify_hidden.sub_offset(row * config.dim, config.dim);
+        qwen35::forward_scratch_golden_verify_hidden(
+            gpu,
+            trunk_weights,
+            config,
+            cur_pos + row,
+            kv_cache,
+            dn_state,
+            scratch,
+            gdn_tape,
+            row,
+            &hidden_row,
+        )?;
+    }
+    Ok(())
+}
+
+fn golden_reference_body(gpu: &Gpu) -> HipResult<Vec<RecordedHipLaunch>> {
+    let launches = gpu.replay.recorded_launches();
+    if launches.is_empty() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "golden MTP verifier requires an already-captured plain-AR Redline route",
+        ));
+    }
+    let final_norm = launches
+        .iter()
+        .rposition(|launch| launch.kernel == "rmsnorm_f32")
+        .ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "plain-AR Redline route has no final rmsnorm_f32 boundary",
+            )
+        })?;
+    Ok(launches[..=final_norm].to_vec())
+}
+
+fn validate_golden_verifier_route(
+    reference_body: &[RecordedHipLaunch],
+    captured: &[RecordedHipLaunch],
+    n: usize,
+) -> Result<(), String> {
+    let model_launches: Vec<&RecordedHipLaunch> = captured
+        .iter()
+        .filter(|launch| {
+            !matches!(
+                launch.kernel.as_str(),
+                "embedding_hfq4g256_batched"
+                    | "embedding_q8_batched"
+                    | "mtp_golden_stage_input_f32"
+                    | "mtp_golden_copy_f32"
+            )
+        })
+        .collect();
+    let expected_len = reference_body.len() * n;
+    if model_launches.len() != expected_len {
+        return Err(format!(
+            "golden verifier route mismatch: expected {expected_len} canonical launches \
+             ({n} × {}), observed {} after removing replay glue",
+            reference_body.len(),
+            model_launches.len(),
+        ));
+    }
+    for (index, actual) in model_launches.iter().enumerate() {
+        let expected = &reference_body[index % reference_body.len()];
+        if actual.kernel != expected.kernel
+            || actual.artifact != expected.artifact
+            || actual.grid != expected.grid
+            || actual.block != expected.block
+            || actual.shared_mem != expected.shared_mem
+            || actual.grid_binding != expected.grid_binding
+        {
+            return Err(format!(
+                "golden verifier route mismatch at canonical launch {} (segment {}): \
+                 expected {} {:?}/{:?}, observed {} {:?}/{:?}",
+                index % reference_body.len(),
+                index / reference_body.len(),
+                expected.kernel,
+                expected.grid,
+                expected.block,
+                actual.kernel,
+                actual.grid,
+                actual.block,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_golden_trunk_verify(
+    gpu: &mut Gpu,
+    trunk_weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &qwen35::DeltaNetState,
+    scratch: &qwen35::Qwen35Scratch,
+    state: &mut MtpSpecState,
+    verify_tokens: &[u32],
+    cur_pos: usize,
+) -> HipResult<()> {
+    let n = verify_tokens.len();
+    if !gpu.arch.starts_with("gfx12") {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "golden MTP verifier is currently admitted only on the gfx12 route",
+        ));
+    }
+    if dn_state.quant != qwen35::StateQuant::Q8 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "golden MTP verifier requires the q8 DeltaNet state used by the sealed AR fixture",
+        ));
+    }
+    if n == 0 || n > state.trunk_pbs.max_batch || n > 4 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "golden MTP verifier requires 1..=4 verify tokens within its persistent scratch",
+        ));
+    }
+
+    qwen35::upload_prefill_batch_inputs(gpu, &state.trunk_pbs, verify_tokens, cur_pos)?;
+    let retained_pm4_ok = mtp_verify_pm4_enabled(gpu)
+        && !state.mtp_verify_pm4_disabled
+        && !gpu.replay.recorded_launches().is_empty();
+    if !retained_pm4_ok {
+        return run_mtp_golden_trunk_body(
+            gpu,
+            trunk_weights,
+            config,
+            kv_cache,
+            dn_state,
+            scratch,
+            &state.trunk_pbs,
+            &mut state.trunk_gdn_tape,
+            &state.verify_hidden,
+            n,
+            cur_pos,
+        );
+    }
+
+    if let Some(controller) = state.mtp_verify_pm4.get_mut(&n) {
+        let replay_position = cur_pos + n - 1;
+        let replay = unsafe { controller.replay_pm4(replay_position) };
+        return match replay {
+            Ok(_) => Ok(()),
+            Err(reason) => {
+                controller.poison(format!(
+                    "retained golden MTP PM4 replay failed for B={n}: {reason}"
+                ));
+                state.mtp_verify_pm4_disabled = true;
+                Err(hip_bridge::HipError::new(0, &reason))
+            }
+        };
+    }
+
+    if state.mtp_verify_pm4_warmed.insert(n) {
+        let result = run_mtp_golden_trunk_body(
+            gpu,
+            trunk_weights,
+            config,
+            kv_cache,
+            dn_state,
+            scratch,
+            &state.trunk_pbs,
+            &mut state.trunk_gdn_tape,
+            &state.verify_hidden,
+            n,
+            cur_pos,
+        );
+        if result.is_ok() {
+            eprintln!("[mtp-redline-golden] PM4 warmup complete for B={n}");
+        }
+        return result;
+    }
+
+    let reference_body = golden_reference_body(gpu)?;
+    let reference_full = gpu.replay.recorded_launches().len();
+    let mut controller = ReplayController::new_retained_pm4_armed();
+    controller
+        .begin_capture()
+        .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+    std::mem::swap(&mut gpu.replay, &mut controller);
+    let captured = run_mtp_golden_trunk_body(
+        gpu,
+        trunk_weights,
+        config,
+        kv_cache,
+        dn_state,
+        scratch,
+        &state.trunk_pbs,
+        &mut state.trunk_gdn_tape,
+        &state.verify_hidden,
+        n,
+        cur_pos,
+    );
+    std::mem::swap(&mut gpu.replay, &mut controller);
+    if let Err(error) = captured {
+        state.mtp_verify_pm4_disabled = true;
+        return Err(error);
+    }
+
+    gpu.hip.device_synchronize()?;
+    let capture = controller
+        .finish_capture()
+        .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+    if let Err(reason) =
+        validate_golden_verifier_route(&reference_body, controller.recorded_launches(), n)
+    {
+        state.mtp_verify_pm4_disabled = true;
+        return Err(hip_bridge::HipError::new(0, &reason));
+    }
+    match controller.prepare_pm4_prefix(gpu.device_id as usize, capture.launch_count) {
+        Ok((dispatches, command_dwords, queue_id)) => {
+            eprintln!(
+                "[mtp-redline-golden] retained PM4 ready B={n} dispatches={dispatches} \
+                 kernels={} command_dwords={command_dwords} queue={queue_id} hash={:016x} \
+                 canonical_body={} plain_ar_full={reference_full}",
+                capture.unique_kernel_count,
+                capture.sequence_hash,
+                reference_body.len(),
+            );
+            state.mtp_verify_pm4.insert(n, controller);
+        }
+        Err(reason) => {
+            state.mtp_verify_pm4_disabled = true;
+            eprintln!(
+                "[mtp-redline-golden] PM4 prepare failed for B={n}; \
+                 keeping direct golden verifier: {reason}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_mtp_trunk_verify(
     gpu: &mut Gpu,
     trunk_weights: &Qwen35Weights,
@@ -1340,6 +1633,19 @@ fn run_mtp_trunk_verify(
     cur_pos: usize,
     tape_captured: bool,
 ) -> HipResult<()> {
+    if mtp_golden_trunk_enabled_from_env() {
+        return run_mtp_golden_trunk_verify(
+            gpu,
+            trunk_weights,
+            config,
+            kv_cache,
+            dn_state,
+            scratch,
+            state,
+            verify_tokens,
+            cur_pos,
+        );
+    }
     let n = verify_tokens.len();
     let retained_pm4_ok = mtp_verify_pm4_enabled(gpu)
         && !state.mtp_verify_pm4_disabled
@@ -3634,14 +3940,20 @@ pub fn spec_step_mtp_compressed_serial(
     // eligibility predicate (single source of truth) so the rollback's
     // cheap-vs-full replay choice tracks exactly whether the tape was written
     // this cycle, and pass the tape only when it will actually be captured.
-    let tape_captured = qwen35::prefill_batch_pbs_eligible(
-        trunk_weights,
-        &target.config,
-        &target.dn_state,
-        n_verify,
-        gpu.arch.as_str(),
-        /* moe_router_logits_present — dense trunk: arm never matched */ true,
-    );
+    let tape_captured = if mtp_golden_trunk_enabled_from_env() {
+        // The golden route copies each canonical single-token layer's raw QKVZA
+        // and post-sigmoid alpha/beta into the same innovation tape.
+        n_verify <= state.trunk_gdn_tape.max_n
+    } else {
+        qwen35::prefill_batch_pbs_eligible(
+            trunk_weights,
+            &target.config,
+            &target.dn_state,
+            n_verify,
+            gpu.arch.as_str(),
+            /* moe_router_logits_present — dense trunk: arm never matched */ true,
+        )
+    };
     run_mtp_trunk_verify(
         gpu,
         trunk_weights,

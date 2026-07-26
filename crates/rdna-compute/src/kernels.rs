@@ -4624,6 +4624,15 @@ pub const EMBEDDING_Q8_BATCHED_SRC: &str =
 pub const EMBEDDING_F16_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_f16_batched.hip");
 
+/// Replay-safe glue around the canonical single-token Qwen verifier:
+/// stage one precomputed embedding row plus its device-resident position.
+pub const MTP_GOLDEN_STAGE_INPUT_F32_SRC: &str =
+    include_str!("../../../kernels/src/mtp_golden_stage_input_f32.hip");
+
+/// Replay-recordable D2D copy for golden-verifier hidden and GDN tape rows.
+pub const MTP_GOLDEN_COPY_F32_SRC: &str =
+    include_str!("../../../kernels/src/mtp_golden_copy_f32.hip");
+
 /// DSpark bidirectional staging assembly. Builds the per-stage attention
 /// key/value buffer `staged[block, head_dim, stage_w]` on-GPU from the
 /// committed main_kv ring + the block KV, replacing a host d2h+assemble+h2d
