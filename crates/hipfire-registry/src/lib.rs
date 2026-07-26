@@ -299,11 +299,12 @@ impl RegistryV1 {
                     ("instruct", &profiles.instruct),
                 ] {
                     if let Some(settings) = settings {
-                        validate_recommendations(tag, settings)
-                            .map_err(|error| fail(format!("model '{tag}' profile '{name}': {error}")))?;
-                        settings
-                            .config_layer()
-                            .map_err(|error| fail(format!("model '{tag}' profile '{name}': {error}")))?;
+                        validate_recommendations(tag, settings).map_err(|error| {
+                            fail(format!("model '{tag}' profile '{name}': {error}"))
+                        })?;
+                        settings.config_layer().map_err(|error| {
+                            fail(format!("model '{tag}' profile '{name}': {error}"))
+                        })?;
                     }
                 }
             }
@@ -689,7 +690,10 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (_, entry) = registry.model("m").unwrap();
-        assert_eq!(entry.sampling_profile("coding").unwrap().temperature, Some(0.6));
+        assert_eq!(
+            entry.sampling_profile("coding").unwrap().temperature,
+            Some(0.6)
+        );
         assert_eq!(entry.sampling_profile("instruct").unwrap().top_p, Some(0.8));
         // general has no explicit profile → falls back to recommended_settings.
         assert_eq!(
