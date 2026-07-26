@@ -123,6 +123,7 @@ def build_config(args):
         sys.exit(f"thinking_budget {args.thinking!r} not a key of {list(THINKING_BUDGET)}")
     return {
         "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
+        "mtp_sidecar": args.mtp_sidecar,
         "mtp_k": args.mtp_k,
         "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
@@ -145,6 +146,7 @@ def show_config(cfg):
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
     print(f"  kv_mode       : {cfg['kv']}   mtp_mode: {cfg['mtp']}   mtp_k: {cfg['mtp_k']}   mode: {cfg['mode']}")
+    print(f"  mtp_sidecar   : {cfg['mtp_sidecar'] or '(auto-discovery)'}")
     print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {cfg['thinking_cap_tokens']} tok (CONCRETE cap)")
     _cap = cfg['thinking_cap_tokens']
@@ -219,6 +221,7 @@ kv_cache = {json.dumps(cfg["kv"])}
 [speculation]
 dflash = "off"
 mtp = {json.dumps(cfg["mtp"])}
+mtp_sidecar = {json.dumps(cfg["mtp_sidecar"])}
 mtp_k = {cfg["mtp_k"]}
 ngram = "off"
 
@@ -442,6 +445,8 @@ def main():
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default="fwht3")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
+    ap.add_argument("--mtp-sidecar", default="",
+                    help="exact trained .mtp sidecar; overrides bundled/sibling discovery")
     ap.add_argument("--mtp-k", type=int, default=3, choices=range(1, 9))
     ap.add_argument("--thinking", default="med", help="thinking_budget preset key")
     ap.add_argument("--max-tokens", type=int, default=2048)

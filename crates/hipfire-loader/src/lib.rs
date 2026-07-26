@@ -912,9 +912,10 @@ fn finish_qwen35_load(
 
     // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
     //
-    // Load the arch_id=21 MTP head when it is present either bundled in the
-    // trunk file (a `.mq4-mtp` trailer, magic HFBNDMTP) or as a sibling `.mtp`
-    // sidecar (`<trunk>.mtp` next to the model path). The head is OPTIONAL:
+    // Load the arch_id=21 MTP head from an explicit `speculation.mtp_sidecar`,
+    // a bundled trailer, or a sibling `.mtp` sidecar, in that order. An
+    // explicit path is strict: never silently fall back to another head.
+    // Auto-discovered heads remain OPTIONAL:
     // `Ok(None)` / a missing sidecar just leaves MTP serving unavailable and
     // the model serves via the unchanged DFlash/AR path. Failures here are
     // non-fatal — log and continue with `qwen35_mtp_head = None`.
@@ -924,46 +925,68 @@ fn finish_qwen35_load(
     let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = {
         use hipfire_arch_qwen35::mtp_head;
         let trunk_path = Path::new(ctx.path);
-        // 1. Bundled trailer inside the trunk file?
-        let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
-                None
+        if let Some(explicit) = ctx.mtp_sidecar {
+            let sidecar = Path::new(explicit);
+            if !sidecar.is_file() {
+                return Err(format!(
+                    "explicit MTP sidecar does not exist or is not a file: {}",
+                    sidecar.display()
+                ));
             }
-        };
-        match bundled {
-            Some(h) => {
-                eprintln!(
-                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={} K-default=3",
-                    h.config.n_embd, h.config.vocab_size
-                );
-                Some(h)
-            }
-            None => {
-                // 2. Sidecar `<trunk>.mtp` next to the model path?
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
-                    match mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
-                        Ok(h) => {
-                            eprintln!(
-                                "  MTP head loaded (sidecar {}): n_embd={} vocab={} K-default=3",
-                                sidecar.display(),
-                                h.config.n_embd,
-                                h.config.vocab_size
-                            );
-                            Some(h)
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
-                                sidecar.display()
-                            );
-                            None
-                        }
-                    }
-                } else {
+            let h = mtp_head::load_mtp_head(sidecar, ctx.gpu, physical_cap)
+                .map_err(|e| format!(
+                    "explicit MTP sidecar {} failed to load: {e}",
+                    sidecar.display()
+                ))?;
+            eprintln!(
+                "  MTP head loaded (explicit sidecar {}): n_embd={} vocab={} K-default=3",
+                sidecar.display(),
+                h.config.n_embd,
+                h.config.vocab_size
+            );
+            Some(h)
+        } else {
+            // 1. Bundled trailer inside the trunk file?
+            let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
                     None
+                }
+            };
+            match bundled {
+                Some(h) => {
+                    eprintln!(
+                        "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={} K-default=3",
+                        h.config.n_embd, h.config.vocab_size
+                    );
+                    Some(h)
+                }
+                None => {
+                    // 2. Sidecar `<trunk>.mtp` next to the model path?
+                    let sidecar = trunk_path.with_extension("mtp");
+                    if sidecar.exists() {
+                        match mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                            Ok(h) => {
+                                eprintln!(
+                                    "  MTP head loaded (sidecar {}): n_embd={} vocab={} K-default=3",
+                                    sidecar.display(),
+                                    h.config.n_embd,
+                                    h.config.vocab_size
+                                );
+                                Some(h)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
+                                    sidecar.display()
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
                 }
             }
         }
@@ -1003,6 +1026,7 @@ pub fn load_model(
     path: &str,
     max_seq: usize,
     draft_path: Option<&str>,
+    mtp_sidecar: Option<&str>,
     kv_mode_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
@@ -1102,6 +1126,7 @@ pub fn load_model(
         path,
         max_seq,
         draft_path,
+        mtp_sidecar,
         kv_mode_override,
         kv_adaptive_override,
         state_quant_override,

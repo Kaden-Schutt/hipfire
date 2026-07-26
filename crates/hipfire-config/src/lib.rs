@@ -1168,6 +1168,18 @@ pub static FIELDS: &[ConfigField] = &[
         "MTP eligibility policy."
     ),
     field!(
+        "speculation.mtp_sidecar",
+        "mtp_sidecar",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::PathOrEmpty,
+        false,
+        false,
+        Some("HIPFIRE_MTP_SIDECAR"),
+        "Explicit MTP head sidecar. When set, this exact artifact overrides bundled and sibling discovery."
+    ),
+    field!(
         "speculation.mtp_k",
         "mtp_k",
         Speculation,

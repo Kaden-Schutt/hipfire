@@ -4039,6 +4039,7 @@ fn load_params(
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
         "mtp_mode": config_string(resolved, "speculation.mtp")?,
+        "mtp_sidecar": config_string(resolved, "speculation.mtp_sidecar")?,
         "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
         "ngram_draft": matches!(config_string(resolved, "speculation.ngram")?.as_str(), "on" | "auto"),
         "ngram_k": config_u64(resolved, "speculation.ngram_k")?,
@@ -6156,15 +6157,26 @@ mod tests {
         let triattn = entry.triattn.as_ref().unwrap();
         let sidecar_path = paths.models.join(&triattn.file);
         fs::write(&sidecar_path, b"sidecar").unwrap();
+        let mtp_sidecar_path = paths
+            .models
+            .join("qwen3.6-35b-a3b.fastmtp-final4575.mtp");
+        fs::write(&mtp_sidecar_path, b"mtp-sidecar").unwrap();
 
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let params = load_params(&defaults, Some(entry), &model_path, 64, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], "");
+        assert_eq!(params["mtp_sidecar"], "");
         assert_eq!(params["prefill_compression"], "off");
 
         let mut explicit = ConfigLayer::default();
         explicit.set_cli("memory.cask.auto_attach", "true").unwrap();
+        explicit
+            .set_cli(
+                "speculation.mtp_sidecar",
+                mtp_sidecar_path.to_str().unwrap(),
+            )
+            .unwrap();
         let enabled = resolve([NamedLayer {
             source: ConfigSource::OneShot {
                 argument: "memory.cask.auto_attach=true".into(),
@@ -6175,6 +6187,10 @@ mod tests {
         let params = load_params(&enabled, Some(entry), &model_path, 64, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
+        assert_eq!(
+            params["mtp_sidecar"],
+            mtp_sidecar_path.display().to_string()
+        );
         assert_eq!(params["prefill_compression"], "off");
         fs::remove_dir_all(&paths.root).unwrap();
     }

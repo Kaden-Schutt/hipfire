@@ -1541,6 +1541,12 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize)
                     .unwrap_or(hipfire_runtime::config::get().mtp_k);
+                let mtp_sidecar = msg
+                    .get("params")
+                    .and_then(|p| p.get("mtp_sidecar"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
 
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
@@ -1855,6 +1861,7 @@ fn main() {
                         path,
                         max_seq,
                         draft_path.as_deref(),
+                        mtp_sidecar.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),

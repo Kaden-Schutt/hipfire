@@ -46,6 +46,7 @@ fn main() -> Result<(), String> {
         &target_path,
         max_seq,
         None, // draft_path (DFlash): not needed, DSpark is a sidecar
+        None, // mtp_sidecar
         None, // kv_mode_override
         None, // kv_adaptive_override
         None, // state_quant_override

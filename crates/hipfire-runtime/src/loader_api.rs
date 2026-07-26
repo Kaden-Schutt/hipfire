@@ -61,6 +61,9 @@ pub struct LoadCtx<'a> {
     pub path: &'a str,
     pub max_seq: usize,
     pub draft_path: Option<&'a str>,
+    /// Explicit Qwen3.5/3.6 MTP head. When present, the loader must use this
+    /// exact artifact instead of bundled or sibling sidecar discovery.
+    pub mtp_sidecar: Option<&'a str>,
     pub kv_mode_override: Option<&'a str>,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,
