@@ -8065,10 +8065,10 @@ impl Gpu {
             bytes,
         );
         // The expanded kernel owns four consecutive output rows per workgroup.
-        // Keep this opt-in while it is qualified on gfx1100: the legacy launch
+        // Keep this opt-in while it is qualified by arch: the legacy launch
         // used `m` workgroups, leaving three quarters to exit at the row0 guard.
         static DOWN_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
-        let tight_grid = if self.arch_caps.is_gfx1100() {
+        let tight_grid = if self.arch_caps.is_gfx1100() || self.arch_caps.is_rdna4() {
             *DOWN_TIGHT_GRID.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() == Ok("1")
             })
