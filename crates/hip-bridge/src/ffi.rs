@@ -276,24 +276,50 @@ impl HipRuntime {
 
         #[cfg(not(target_os = "windows"))]
         let lib = unsafe {
-            // Try unversioned first (canonical with rocm-hip-devel symlink),
-            // then versioned SONAMEs. Fedora's `rocm-hip` package ships only
+            // Unversioned first (canonical with rocm-hip-devel symlink), then
+            // versioned SONAMEs. Fedora's `rocm-hip` package ships only
             // `libamdhip64.so.6` — the unversioned `.so` symlink is in the
             // `-devel` package which most users don't have. Reported in #64.
-            Library::new("libamdhip64.so")
-                .or_else(|_| Library::new("libamdhip64.so.7"))
-                .or_else(|_| Library::new("libamdhip64.so.6"))
-                .or_else(|_| Library::new("libamdhip64.so.5"))
-                .map_err(|e| {
-                    HipError::new(
+            //
+            // Resolution used to be loader-only here, which silently required
+            // LD_LIBRARY_PATH/ldconfig to already point at ROCm and broke on
+            // side-by-side and /opt/rocm/core-<ver> layouts. hipfire_config::rocm
+            // prepends explicitly resolved roots and keeps the bare sonames last
+            // so a correctly configured loader path still wins nothing away.
+            let candidates = hipfire_config::rocm::library_candidates(&[
+                "libamdhip64.so",
+                "libamdhip64.so.7",
+                "libamdhip64.so.6",
+                "libamdhip64.so.5",
+            ]);
+            let mut loaded = None;
+            let mut last_err = None;
+            for candidate in &candidates {
+                match Library::new(candidate) {
+                    Ok(l) => {
+                        loaded = Some(l);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match loaded {
+                Some(l) => l,
+                None => {
+                    return Err(HipError::new(
                         0,
                         &format!(
-                            "failed to dlopen libamdhip64.so: {e}. \
-                             Tried: libamdhip64.so, libamdhip64.so.7, .so.6, .so.5. \
-                             Is ROCm installed?"
+                            "failed to dlopen libamdhip64.so: {}. Tried: {}. \
+                             Is ROCm installed? Set HIPFIRE_ROCM_PATH or ROCM_PATH \
+                             if it lives outside /opt/rocm.",
+                            last_err
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "no candidates".into()),
+                            candidates.join(", ")
                         ),
-                    )
-                })?
+                    ));
+                }
+            }
         };
 
         let runtime = unsafe {
@@ -842,8 +868,12 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump =
-            *DUMP.get_or_init(|| hipfire_config::developer_var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOH_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         if dump {
             eprintln!(
                 "dtoh bytes={} us={} at {}:{}",
@@ -886,8 +916,12 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump =
-            *DUMP.get_or_init(|| hipfire_config::developer_var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOH_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         if dump {
             eprintln!(
                 "dtoh_at bytes={} us={} at {}:{}",
@@ -929,8 +963,12 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump =
-            *DUMP.get_or_init(|| hipfire_config::developer_var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_MEMSET_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         if dump {
             eprintln!(
                 "memset bytes={} us={} at {}:{}",
@@ -960,8 +998,12 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump =
-            *DUMP.get_or_init(|| hipfire_config::developer_var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_MEMSET_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         if dump {
             eprintln!(
                 "memset_async bytes={} us={} at {}:{}",

@@ -1070,6 +1070,7 @@ name = "hsa-bridge"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "libloading",
  "thiserror 2.0.18",
 ]

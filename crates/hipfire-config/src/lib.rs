@@ -9,6 +9,8 @@
 //! persistence, validation, and field-level provenance. Runtime crates consume
 //! resolved values; they do not parse user configuration in hot paths.
 
+pub mod rocm;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
