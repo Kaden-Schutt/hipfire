@@ -49,8 +49,8 @@ Default behavior:
   and the PATH line added by install.sh. Models and settings are preserved.
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh | bash -s -- --dry-run
+  curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/uninstall.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/uninstall.sh | bash -s -- --dry-run
 EOF
 }
 
@@ -220,7 +220,17 @@ source_is_managed() {
     command -v git >/dev/null 2>&1 || return 1
     local origin
     origin="$(git -C "$SRC_DIR" remote get-url origin 2>/dev/null || true)"
+    # The canonical repo moved from Kaden-Schutt/hipfire to warpfront/hipfire.
+    # Checkouts created by an installer from before the transfer still carry the
+    # old origin, so BOTH namespaces must be recognized as managed — otherwise
+    # `uninstall` silently refuses to clean up every pre-transfer install.
     case "$origin" in
+        https://github.com/warpfront/hipfire|\
+        https://github.com/warpfront/hipfire.git|\
+        git@github.com:warpfront/hipfire|\
+        git@github.com:warpfront/hipfire.git|\
+        ssh://git@github.com/warpfront/hipfire|\
+        ssh://git@github.com/warpfront/hipfire.git|\
         https://github.com/Kaden-Schutt/hipfire|\
         https://github.com/Kaden-Schutt/hipfire.git|\
         git@github.com:Kaden-Schutt/hipfire|\

@@ -29,7 +29,11 @@ def uninstaller(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def make_managed_source(source: Path, dirty: bool = False) -> None:
+def make_managed_source(
+    source: Path,
+    dirty: bool = False,
+    remote: str = "https://github.com/warpfront/hipfire.git",
+) -> None:
     source.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(source)], check=True)
     subprocess.run(
@@ -40,7 +44,7 @@ def make_managed_source(source: Path, dirty: bool = False) -> None:
             "remote",
             "add",
             "origin",
-            "https://github.com/Kaden-Schutt/hipfire.git",
+            remote,
         ],
         check=True,
     )
@@ -102,6 +106,27 @@ class UninstallTests(unittest.TestCase):
             self.assertTrue((install / "models" / "model.mq4").is_file())
             self.assertTrue((install / "config.toml").is_file())
             self.assertEqual(bashrc.read_text(), "export EDITOR=vi\n\n")
+
+    def test_default_removes_source_cloned_before_the_org_transfer(self) -> None:
+        # The canonical repo moved Kaden-Schutt/hipfire -> warpfront/hipfire.
+        # Installs predating the transfer still have the old origin; uninstall
+        # must still recognize them as managed or it silently leaves them behind.
+        for legacy_remote in (
+            "https://github.com/Kaden-Schutt/hipfire.git",
+            "git@github.com:Kaden-Schutt/hipfire",
+        ):
+            with self.subTest(remote=legacy_remote):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    install = home / ".hipfire"
+                    (install / "bin").mkdir(parents=True)
+                    (install / "bin" / "hipfire").write_text("binary fixture\n")
+                    make_managed_source(install / "src", remote=legacy_remote)
+
+                    result = uninstaller(home)
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse((install / "src").exists())
 
     def test_default_preserves_source_with_local_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

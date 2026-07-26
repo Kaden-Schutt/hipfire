@@ -235,7 +235,7 @@ Order of work:
 
 ## References
 
-- PR #115: <https://github.com/Kaden-Schutt/hipfire/pull/115>
+- PR #115: <https://github.com/warpfront/hipfire/pull/115>
 - Branch: `lloyd-max-mq3-spike` (local, fetched from upstream).
 - `benchmarks/results/lloyd_max_findings_20260501.md` — PR's full
   empirical writeup.

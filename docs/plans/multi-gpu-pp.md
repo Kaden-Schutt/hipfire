@@ -4,7 +4,7 @@
 **Author:** alpineQ (external contributor)
 **Date:** 2026-05-05
 **Target Release:** v0.2.0 (at maintainer discretion)
-**Related:** issue [#58](https://github.com/Kaden-Schutt/hipfire/issues/58),
+**Related:** issue [#58](https://github.com/warpfront/hipfire/issues/58),
 `docs/multi-gpu.md` (user-facing reference), `AGENTS.md` §threading,
 `CLAUDE.md` "Coherence Gate"
 
@@ -361,7 +361,7 @@ within one layer's body and does not cross boundaries.
 
 ## 8. Open questions for maintainer
 
-These are the four points raised in [issue #58](https://github.com/Kaden-Schutt/hipfire/issues/58)
+These are the four points raised in [issue #58](https://github.com/warpfront/hipfire/issues/58)
 and re-stated here for permanence:
 
 1. **DFlash + PP scope.** v1 refuses the combination. Is that the right
@@ -379,7 +379,7 @@ and re-stated here for permanence:
 
 ## 9. References
 
-- Issue [#58](https://github.com/Kaden-Schutt/hipfire/issues/58) —
+- Issue [#58](https://github.com/warpfront/hipfire/issues/58) —
   multi-GPU roadmap
 - `docs/multi-gpu.md` — user-facing reference (memory budget table,
   deployment recipes, limitations)

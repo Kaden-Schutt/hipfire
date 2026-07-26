@@ -160,7 +160,10 @@ impl KernelCompiler {
         let hot_dir = cache_dir.clone();
         if let Some(ref cold) = precompiled_dir {
             if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
-                eprintln!("  hot-path seed failed at {} ({e}) — falling back to install dir reads", hot_dir.display());
+                eprintln!(
+                    "  hot-path seed failed at {} ({e}) — falling back to install dir reads",
+                    hot_dir.display()
+                );
             }
         }
         // Prefer the hot-path (tmpfs) dir when it exists and has contents.
@@ -218,10 +221,7 @@ impl KernelCompiler {
         if !gfx1151_cumode_modules.is_empty() {
             let mut modules = gfx1151_cumode_modules.iter().cloned().collect::<Vec<_>>();
             modules.sort();
-            eprintln!(
-                "  gfx1151 CU-mode modules: {}",
-                modules.join(",")
-            );
+            eprintln!("  gfx1151 CU-mode modules: {}", modules.join(","));
         }
 
         Ok(Self {
@@ -293,7 +293,7 @@ impl KernelCompiler {
         // Try pre-compiled .hsaco first, validating with a .hash sidecar file.
         // If hash is missing/mismatched AND hipcc is available, prefer recompilation.
         // If hipcc is unavailable (packaged install), use the blob as-is.
-        // See: https://github.com/Kaden-Schutt/hipfire/issues/2
+        // See: https://github.com/warpfront/hipfire/issues/2
         if let Some(ref dir) = self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
             let hash_file = dir.join(format!("{name}.hash"));
@@ -621,38 +621,40 @@ impl KernelCompiler {
         // Spawn hipcc in parallel threads
         let results: Vec<_> = to_compile
             .into_iter()
-            .map(|(name, source, src_hash, src_path, obj_path, hash_path, module_flags)| {
-                let arch = arch.clone();
-                let precompiled_dir = precompiled_dir.clone();
-                let extra_flags = self.extra_flags.clone();
-                let done = std::sync::Arc::clone(&done);
-                let handle = thread::spawn(move || {
-                    let result = Self::hipcc_compile(
-                        &arch,
-                        &src_path,
-                        &obj_path,
-                        &name,
-                        &source,
-                        &extra_flags,
-                        &module_flags,
-                    );
-                    if result.is_ok() {
-                        let _ = std::fs::write(&hash_path, &src_hash);
-                        // Write back to precompiled dir
-                        if let Some(ref dir) = precompiled_dir {
-                            let pre_hash = dir.join(format!("{name}.hash"));
-                            let pre_hsaco = dir.join(format!("{name}.hsaco"));
-                            let _ = std::fs::copy(&obj_path, &pre_hsaco);
-                            let _ = std::fs::write(&pre_hash, &src_hash);
+            .map(
+                |(name, source, src_hash, src_path, obj_path, hash_path, module_flags)| {
+                    let arch = arch.clone();
+                    let precompiled_dir = precompiled_dir.clone();
+                    let extra_flags = self.extra_flags.clone();
+                    let done = std::sync::Arc::clone(&done);
+                    let handle = thread::spawn(move || {
+                        let result = Self::hipcc_compile(
+                            &arch,
+                            &src_path,
+                            &obj_path,
+                            &name,
+                            &source,
+                            &extra_flags,
+                            &module_flags,
+                        );
+                        if result.is_ok() {
+                            let _ = std::fs::write(&hash_path, &src_hash);
+                            // Write back to precompiled dir
+                            if let Some(ref dir) = precompiled_dir {
+                                let pre_hash = dir.join(format!("{name}.hash"));
+                                let pre_hsaco = dir.join(format!("{name}.hsaco"));
+                                let _ = std::fs::copy(&obj_path, &pre_hsaco);
+                                let _ = std::fs::write(&pre_hash, &src_hash);
+                            }
                         }
-                    }
-                    let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let marker = if result.is_ok() { "✓" } else { "✗" };
-                    eprintln!("  [{i:>3}/{n}] {marker} {name}");
-                    (name, obj_path, result)
-                });
-                handle
-            })
+                        let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let marker = if result.is_ok() { "✓" } else { "✗" };
+                        eprintln!("  [{i:>3}/{n}] {marker} {name}");
+                        (name, obj_path, result)
+                    });
+                    handle
+                },
+            )
             .collect();
 
         let mut errors = Vec::new();

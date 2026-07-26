@@ -20,7 +20,7 @@ packages and the NixOS module under `nix/`.
 
 Truth state: **shipped / ref-pinned** for the flake/module surface described
 here. Pin a release tag or commit for production hosts; building
-`github:Kaden-Schutt/hipfire` without a rev follows that input’s default
+`github:warpfront/hipfire` without a rev follows that input’s default
 branch and is **not** a stable release pin. Branch-only inference features
 are not implied by enabling the module.
 
@@ -47,7 +47,7 @@ grep gfx_target_version /sys/class/kfd/kfd/topology/nodes/*/properties
 ### Dev shell
 
 ```bash
-nix develop github:Kaden-Schutt/hipfire
+nix develop github:warpfront/hipfire
 ```
 
 Tools only — not a checkout. From a local tree:
@@ -60,20 +60,20 @@ cargo build --release --features deltanet --example daemon -p hipfire-runtime
 ### Build CLI + daemon
 
 ```bash
-nix build github:Kaden-Schutt/hipfire
+nix build github:warpfront/hipfire
 ./result/bin/hipfire run qwen3.5:9b "Hello"
 ```
 
 Stable pin example (replace rev/hash with a real release or commit):
 
 ```nix
-hipfire.url = "github:Kaden-Schutt/hipfire/<tag-or-commit>";
+hipfire.url = "github:warpfront/hipfire/<tag-or-commit>";
 ```
 
 ### Precompiled kernels package
 
 ```bash
-nix build github:Kaden-Schutt/hipfire#hipfire-kernels
+nix build github:warpfront/hipfire#hipfire-kernels
 ```
 
 Default `gpuTargets = []` produces an empty/near-empty kernels tree; the
@@ -91,7 +91,7 @@ your own package override — an empty default avoids baking the wrong arch.
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    hipfire.url = "github:Kaden-Schutt/hipfire"; # pin rev for production
+    hipfire.url = "github:warpfront/hipfire"; # pin rev for production
   };
 
   outputs = { nixpkgs, hipfire, ... }: {
@@ -298,7 +298,7 @@ From `nix/module.nix` (defaults are module defaults, not every CLI default):
 | `openFirewall` | bool | `false` | Open `port` when the host firewall is enabled; does **not** change listen address (default still `0.0.0.0`) |
 | `package` | package | `pkgs.hipfire` | Package to run |
 | `src` | path or null | `null` | Override source **path** (not a package/derivation) |
-| `github.owner` | str | `"Kaden-Schutt"` | fetch owner |
+| `github.owner` | str |  `"warpfront"`    | fetch owner |
 | `github.repo` | str | `"hipfire"` | fetch repo |
 | `github.rev` | str or null | `null` | branch/tag/commit |
 | `github.hash` | str | `""` | SRI hash for fetch |

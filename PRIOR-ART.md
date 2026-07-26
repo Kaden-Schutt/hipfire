@@ -286,8 +286,8 @@ including:
 Redline is a research/insurance-policy crate: if the userspace HIP
 runtime regresses, breaks on an arch, or vanishes on a future ROCm
 release, hipfire retains a route to the metal. It is not on the
-default execution path. It is published under the dual MIT/Apache-2.0
-license like the rest of hipfire and exists explicitly to be a
+default execution path. It is published under Apache-2.0 like the
+rest of hipfire and exists explicitly to be a
 reference implementation for anyone needing the bare-KMD pattern.
 
 ---
@@ -303,7 +303,8 @@ git log -1 --format='%an %ai' <hash>   # see author + date
 
 The `v-mit-final` tag marks the final commit (`d46f81b6`) before the
 dual-license transition; everything in this PRIOR-ART.md is in the
-pre-tag history and was published under MIT first, then under the
-current MIT/Apache-2.0 dual license. The prior-art claims here do
+pre-tag history and was published under MIT first, then dual
+MIT/Apache-2.0, and is Apache-2.0 as of v0.3.0. The prior-art claims
+here do
 not depend on which license applies — they depend on this being the
 canonical repository where the innovations first shipped.

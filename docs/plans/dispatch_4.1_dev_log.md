@@ -1,7 +1,7 @@
 # Ship 4.1 dev log
 
 **Branch:** `feature/ship-4.1-moe-family-resolution` off `integration/dispatch-unification`
-**Tracking:** [#397](https://github.com/Kaden-Schutt/hipfire/issues/397) Step 4.1
+**Tracking:** [#397](https://github.com/warpfront/hipfire/issues/397) Step 4.1
 **Verification GPU:** gfx1151 (gfx11-family; gfx12 pending per SF-4.1.1)
 
 ---

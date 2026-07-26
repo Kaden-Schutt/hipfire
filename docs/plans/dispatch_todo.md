@@ -29,8 +29,8 @@ Pre-existing quality issues confirmed on master (not dispatch regressions):
 
 Full report: `/tmp/dispatch_validation_gfx1100.md`
 Coherence report: `/tmp/coherence-20260606-211357.md`
-Issue comment: [#397 (comment 4639841863)](https://github.com/Kaden-Schutt/hipfire/issues/397#issuecomment-4639841863)
-Long-context follow-up: [#397 (comment 4639924237)](https://github.com/Kaden-Schutt/hipfire/issues/397#issuecomment-4639924237)
+Issue comment: [#397 (comment 4639841863)](https://github.com/warpfront/hipfire/issues/397#issuecomment-4639841863)
+Long-context follow-up: [#397 (comment 4639924237)](https://github.com/warpfront/hipfire/issues/397#issuecomment-4639924237)
 
 **Remaining:** gfx1201 (RDNA4) coverage + coherence + A/B. Need hardware.
 **Blocks:** Phase 0.6 sign-off (gfx1201 only).

@@ -33,7 +33,7 @@
   },
   "requires": {
     "rocm": "checkout- and target-arch-supported ROCm/HIP toolchain (no universal version floor; e.g. gfx1151-class and gfx12 paths need the toolchain the tree documents for that arch)",
-    "hipfire-tree": "checkout of https://github.com/Kaden-Schutt/hipfire",
+    "hipfire-tree": "checkout of https://github.com/warpfront/hipfire",
     "hardware": "target GPU arch for any perf claim; unmeasured arches stay on portable/opt-in paths"
   },
   "related": [

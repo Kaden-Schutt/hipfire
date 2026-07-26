@@ -7,7 +7,7 @@ repro — do not present as today’s default failure mode. Prefer source +
 triage over this file when they disagree. **Unknown** = status not verified
 on a current binary; fail closed (do not assume default-on or default-off).
 
-Before filing https://github.com/Kaden-Schutt/hipfire/issues, run
+Before filing https://github.com/warpfront/hipfire/issues, run
 `.agents/skills/hipfire-autoheal/triage.sh` and attach its output.
 
 ---

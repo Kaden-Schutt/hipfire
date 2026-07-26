@@ -8,7 +8,7 @@
 
 **Date:** 2026-05-17 (rev 2 — incorporated findings from three adversarial reviews; review files dropped per project memory rule on review-as-scaffolding).
 
-**Issue reference:** [#237 item 2 — WMMA flash attention for prefill](https://github.com/Kaden-Schutt/hipfire/issues/237). lemon-mlx-engine measured **+33-39% prefill on Strix Halo** with BF16 KV. **That number is a ceiling, not a target for hipfire** — hipfire's asym4 baseline has 8× lower K-bandwidth than BF16, so the WMMA lift available to us is the ALU-only portion of lemon-mlx's win, minus the per-nibble dequant overhead. Realistic target: +15-25% prefill on the ALU-bound path; possibly 0% on bandwidth-bound parts.
+**Issue reference:** [#237 item 2 — WMMA flash attention for prefill](https://github.com/warpfront/hipfire/issues/237). lemon-mlx-engine measured **+33-39% prefill on Strix Halo** with BF16 KV. **That number is a ceiling, not a target for hipfire** — hipfire's asym4 baseline has 8× lower K-bandwidth than BF16, so the WMMA lift available to us is the ALU-only portion of lemon-mlx's win, minus the per-nibble dequant overhead. Realistic target: +15-25% prefill on the ALU-bound path; possibly 0% on bandwidth-bound parts.
 
 ## Goal
 

@@ -27,8 +27,9 @@ maintainer's working notes for agents operating ON the repo).
 
 hipfire is an original LLM inference engine for AMD RDNA / CDNA
 GPUs, authored primarily by Kaden Schutt (`kaden@hipfire.dev`) since
-2026-03-20. It is dual-licensed under MIT or Apache-2.0 at the
-recipient's option (see [LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT),
+2026-03-20. It is licensed under Apache-2.0 as of v0.3.0; individual
+files whose authors have not elected Apache-2.0 remain MIT-licensed
+per their SPDX header (see [LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT),
 [LICENSE-APACHE](LICENSE-APACHE), [NOTICE](NOTICE), and
 [CONTRIBUTING.md](CONTRIBUTING.md)).
 
@@ -412,7 +413,7 @@ the draft but DFlash isn't firing" pitfall.
 
 DDTree on gfx1100 is currently a **structural perf regression** —
 the linearization-slot RoPE phase delta skew at FA layers (commit
-[39aa358](https://github.com/Kaden-Schutt/hipfire/commit/39aa358))
+[39aa358](https://github.com/warpfront/hipfire/commit/39aa358))
 makes our tree path slower than our linear path. Lucebox's DDTree
 works on RTX 3090; ours doesn't (yet) on gfx1100.
 

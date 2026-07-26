@@ -53,7 +53,7 @@ the case we want filed.
 ### Setup
 
 ```bash
-git clone https://github.com/Kaden-Schutt/hipfire
+git clone https://github.com/warpfront/hipfire
 cd hipfire
 cargo build --release --features deltanet --example daemon -p hipfire-runtime
 cargo build --release --features deltanet --example test_kernels -p hipfire-runtime
@@ -301,16 +301,17 @@ arch we don't have local numbers for is welcome.
 
 ## Licensing & attribution
 
-hipfire is dual-licensed under either:
+hipfire is licensed under the **Apache License 2.0** (see
+[LICENSE-APACHE](LICENSE-APACHE)) as of v0.3.0.
 
-- **MIT License** (see [LICENSE-MIT](LICENSE-MIT))
-- **Apache License 2.0** (see [LICENSE-APACHE](LICENSE-APACHE))
-
-at the recipient's option. See [LICENSE](LICENSE) for the dual-
-license pointer and [NOTICE](NOTICE) for contributor attribution
-details and per-file SPDX semantics. The decision record (including
-the 2026-05-19 course correction from a unilateral Apache-2.0
-relicense to dual licensing) is at
+Individual files whose substantive authors have not elected Apache-2.0
+remain under the **MIT License** (see [LICENSE-MIT](LICENSE-MIT)) and
+are identified by their per-file SPDX header. Those grants are
+preserved unchanged — nothing is relicensed in absentia. See
+[LICENSE](LICENSE) and [NOTICE](NOTICE) for attribution details and
+per-file SPDX semantics. The decision record (the 2026-05-19 course
+correction from a unilateral relicense to dual licensing, and the
+v0.3.0 move to outbound Apache-2.0) is at
 [docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md).
 
 ### For new contributors
@@ -326,8 +327,8 @@ relicense to dual licensing) is at
   contribution.** State this in the PR description (a short note like
   "license: MIT only" is enough) and the merger will tag the relevant
   files accordingly. The SPDX header will read
-  `SPDX-License-Identifier: MIT`. The project still ships dual-
-  licensed overall; your specific files are MIT-only.
+  `SPDX-License-Identifier: MIT`. The project ships under Apache-2.0
+  overall; your specific files stay MIT-only and keep that grant.
 - Add an SPDX header to every new source file you create. Templates
   live in [docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md).
   For sole-author files the default (Apache-2.0) template is:
@@ -365,11 +366,13 @@ involved on that file has either opted in or declined.
 
 ### For downstream users / forks
 
-Because hipfire is dual-licensed, you pick which license applies to
-your use:
+hipfire as a whole is offered under Apache-2.0, so redistribution must
+satisfy Apache License 2.0 § 4 for the work — including shipping a
+readable copy of NOTICE. Individual MIT-tagged files carry an
+additional, narrower obligation:
 
-- If you redistribute under **MIT**, the LICENSE-MIT text applies:
-  preserve the copyright notice and permission text.
+- For files whose SPDX header reads **MIT**, the LICENSE-MIT text
+  applies: preserve the copyright notice and permission text.
 - If you redistribute under **Apache-2.0**, the LICENSE-APACHE text
   applies, including § 4 obligations:
   - (a) Include a copy of the Apache-2.0 license to recipients.
