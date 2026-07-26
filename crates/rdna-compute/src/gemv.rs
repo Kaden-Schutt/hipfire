@@ -8105,6 +8105,60 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_with_grid(
+            expert_ptrs,
+            topk_indices,
+            rot_batch,
+            expert_outputs,
+            m,
+            k,
+            k_top,
+            batch_size,
+            false,
+        )
+    }
+
+    /// MTP short-verifier sister that defaults to the exact four-row launch
+    /// geometry on gfx12. The ordinary AR entry point above deliberately
+    /// retains its golden launch geometry and sequence hash.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_tight(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_with_grid(
+            expert_ptrs,
+            topk_indices,
+            rot_batch,
+            expert_outputs,
+            m,
+            k,
+            k_top,
+            batch_size,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_with_grid(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+        prefer_gfx12_tight: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         use std::sync::OnceLock;
         static DOWN_CPOL_SLC: OnceLock<bool> = OnceLock::new();
@@ -8223,18 +8277,16 @@ impl Gpu {
             bytes,
         );
         // The expanded kernel owns four consecutive output rows per workgroup.
-        // The legacy launch used `m` workgroups, leaving three quarters to
-        // exit at the row0 guard. gfx12 has been fixed-seed qualified for the
-        // exact grid; gfx1100 remains experimental.
+        // The legacy AR launch used `m` workgroups, leaving three quarters to
+        // exit at the row0 guard. Only the explicitly marked MTP verifier
+        // defaults to the exact grid; gfx1100 remains experimental.
         static DOWN_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
         let tight_grid = if self.arch_caps.is_rdna4() {
-            // The kernel owns four consecutive rows. Launching M workgroups
-            // made three quarters exit at the row0 guard; gfx12 now defaults
-            // to the exact ceil(M/4) geometry. `0` preserves the old launch
-            // for bisecting archived captures.
-            *DOWN_TIGHT_GRID.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() != Ok("0")
-            })
+            match hipfire_config::developer_var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() {
+                Ok("0" | "off") => false,
+                Ok("1" | "on") => true,
+                _ => prefer_gfx12_tight,
+            }
         } else if self.arch_caps.is_gfx1100() {
             *DOWN_TIGHT_GRID.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() == Ok("1")

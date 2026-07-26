@@ -2402,16 +2402,35 @@ pub fn run_moe_prefill(
         // MQ6 only reaches here on archs where it's admitted without WMMA
         // (gfx12 via env override); the Gpu method exists.
         let down_result = match p.dtypes.routed_down {
-            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                p.expert_down_ptrs,
-                p.topk_indices,
-                p.rot_batch,
-                p.down_expanded,
-                down_m,
-                down_k,
-                k_top,
-                n,
-            )),
+            DType::MQ4G256 => {
+                if indexed_short_batch {
+                    hip!(
+                        gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_tight(
+                            p.expert_down_ptrs,
+                            p.topk_indices,
+                            p.rot_batch,
+                            p.down_expanded,
+                            down_m,
+                            down_k,
+                            k_top,
+                            n,
+                        )
+                    )
+                } else {
+                    hip!(
+                        gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                            p.expert_down_ptrs,
+                            p.topk_indices,
+                            p.rot_batch,
+                            p.down_expanded,
+                            down_m,
+                            down_k,
+                            k_top,
+                            n,
+                        )
+                    )
+                }
+            }
             DType::MQ5G256 => hip!(gpu.gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
                 p.topk_indices,
