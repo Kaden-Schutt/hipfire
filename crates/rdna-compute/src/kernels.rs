@@ -4306,6 +4306,12 @@ pub const CONV1D_GATED_DECODE_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.hip");
 
+/// Recordable three-way copy of QKV/alpha/beta rows into the MTP verifier's
+/// GatedDeltaNet rollback tape. Unlike HIP D2D DMA, this survives PM4 lowering.
+#[cfg(feature = "deltanet")]
+pub const GDN_TAPE_CAPTURE_F32_SRC: &str =
+    include_str!("../../../kernels/src/gdn_tape_capture_f32.hip");
+
 /// Gated Delta Net — tiled LDS + warp-shuffle.
 /// S[128×128] tiled into TILE_ROWS=8 row chunks. Each tile = 8×128×4 = 4KB LDS.
 /// 64KB/4KB = 16 blocks/CU → 4 waves/SIMD. Rows are independent → perfect tiling.

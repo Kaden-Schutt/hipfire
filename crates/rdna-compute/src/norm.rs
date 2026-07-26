@@ -2152,6 +2152,70 @@ impl Gpu {
         result
     }
 
+    /// Copy the three per-layer innovation tensors into the MTP rollback tape
+    /// with one recordable dispatch. Retained Redline captures kernels only;
+    /// using HIP D2D DMA here would leave the tape stale after the capture
+    /// cycle even though the verifier body itself replays correctly.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_tape_capture_f32(
+        &mut self,
+        qkv_src: &GpuTensor,
+        alpha_src: &GpuTensor,
+        beta_src: &GpuTensor,
+        qkv_dst: &GpuTensor,
+        alpha_dst: &GpuTensor,
+        beta_dst: &GpuTensor,
+        qkv_count: usize,
+        alpha_count: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gdn_tape_capture_f32",
+            kernels::GDN_TAPE_CAPTURE_F32_SRC,
+            "gdn_tape_capture_f32",
+        )?;
+        let mut qsp = qkv_src.buf.as_ptr();
+        let mut asp = alpha_src.buf.as_ptr();
+        let mut bsp = beta_src.buf.as_ptr();
+        let mut qdp = qkv_dst.buf.as_ptr();
+        let mut adp = alpha_dst.buf.as_ptr();
+        let mut bdp = beta_dst.buf.as_ptr();
+        let mut qc = qkv_count as i32;
+        let mut ac = alpha_count as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qsp as *mut _ as *mut c_void,
+            &mut asp as *mut _ as *mut c_void,
+            &mut bsp as *mut _ as *mut c_void,
+            &mut qdp as *mut _ as *mut c_void,
+            &mut adp as *mut _ as *mut c_void,
+            &mut bdp as *mut _ as *mut c_void,
+            &mut qc as *mut _ as *mut c_void,
+            &mut ac as *mut _ as *mut c_void,
+        ];
+        let block = 256_u32;
+        let grid = (qkv_count.max(alpha_count) as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "gdn_tape_capture_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qsp);
+                b.push_ptr(asp);
+                b.push_ptr(bsp);
+                b.push_ptr(qdp);
+                b.push_ptr(adp);
+                b.push_ptr(bdp);
+                b.push_i32(qc);
+                b.push_i32(ac);
+                b
+            },
+        )
+    }
+
     /// Gated Delta Net recurrence. S matrix in LDS. Processes all tokens sequentially.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_f32(

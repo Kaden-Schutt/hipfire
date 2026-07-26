@@ -9674,6 +9674,60 @@ fn forward_prefill_chunk(
     )
 }
 
+fn capture_gdn_tape_rows(
+    gpu: &mut Gpu,
+    tape: &crate::speculative::GdnTape,
+    pbs: &PrefillBatchScratch,
+    delta_layer_idx: usize,
+    tape_offset: usize,
+    n: usize,
+    n_v_heads: usize,
+) -> HipResult<()> {
+    let qkv_count = n * tape.qkv_dim;
+    let alpha_count = n * n_v_heads;
+    let qkv_offset = tape_offset * tape.qkv_dim;
+    let alpha_offset = tape_offset * n_v_heads;
+
+    if gpu.replay.is_recording() {
+        let qkv_dst = tape.qkv_bufs[delta_layer_idx].sub_offset(qkv_offset, qkv_count);
+        let alpha_dst =
+            tape.alpha_bufs[delta_layer_idx].sub_offset(alpha_offset, alpha_count);
+        let beta_dst = tape.beta_bufs[delta_layer_idx].sub_offset(alpha_offset, alpha_count);
+        gpu.gdn_tape_capture_f32(
+            &pbs.dn_qkv_batch,
+            &pbs.dn_alpha_batch,
+            &pbs.dn_beta_batch,
+            &qkv_dst,
+            &alpha_dst,
+            &beta_dst,
+            qkv_count,
+            alpha_count,
+        )
+    } else {
+        gpu.memcpy_dtod_at_auto(
+            &tape.qkv_bufs[delta_layer_idx].buf,
+            qkv_offset * 4,
+            &pbs.dn_qkv_batch.buf,
+            0,
+            qkv_count * 4,
+        )?;
+        gpu.memcpy_dtod_at_auto(
+            &tape.alpha_bufs[delta_layer_idx].buf,
+            alpha_offset * 4,
+            &pbs.dn_alpha_batch.buf,
+            0,
+            alpha_count * 4,
+        )?;
+        gpu.memcpy_dtod_at_auto(
+            &tape.beta_bufs[delta_layer_idx].buf,
+            alpha_offset * 4,
+            &pbs.dn_beta_batch.buf,
+            0,
+            alpha_count * 4,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_batch_chunk_impl(
     gpu: &mut Gpu,
@@ -10291,32 +10345,14 @@ fn forward_batch_chunk_impl(
                 // dn_qkv_batch / dn_{alpha,beta}_batch, so capture must happen
                 // now (after sigmoid_alpha_gate, before conv1d consumes qkv).
                 if let Some(tape) = gdn_tape.as_ref() {
-                    let qkv_row_bytes = tape.qkv_dim * 4;
-                    let alpha_row_bytes = n_v_heads * 4;
-                    let off_qkv = tape_offset * qkv_row_bytes;
-                    let off_a = tape_offset * alpha_row_bytes;
-                    let copy_qkv = n * qkv_row_bytes;
-                    let copy_a = n * alpha_row_bytes;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.qkv_bufs[delta_layer_idx].buf,
-                        off_qkv,
-                        &pbs.dn_qkv_batch.buf,
-                        0,
-                        copy_qkv,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.alpha_bufs[delta_layer_idx].buf,
-                        off_a,
-                        &pbs.dn_alpha_batch.buf,
-                        0,
-                        copy_a,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.beta_bufs[delta_layer_idx].buf,
-                        off_a,
-                        &pbs.dn_beta_batch.buf,
-                        0,
-                        copy_a,
+                    capture_gdn_tape_rows(
+                        gpu,
+                        tape,
+                        pbs,
+                        delta_layer_idx,
+                        tape_offset,
+                        n,
+                        n_v_heads,
                     )?;
                 }
 
@@ -12159,32 +12195,14 @@ fn forward_batch_chunk_impl(
                     n,
                 )?;
                 if let Some(tape) = gdn_tape.as_ref() {
-                    let qkv_row_bytes = tape.qkv_dim * 4;
-                    let alpha_row_bytes = n_v_heads * 4;
-                    let off_qkv = tape_offset * qkv_row_bytes;
-                    let off_a = tape_offset * alpha_row_bytes;
-                    let copy_qkv = n * qkv_row_bytes;
-                    let copy_a = n * alpha_row_bytes;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.qkv_bufs[delta_layer_idx].buf,
-                        off_qkv,
-                        &pbs.dn_qkv_batch.buf,
-                        0,
-                        copy_qkv,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.alpha_bufs[delta_layer_idx].buf,
-                        off_a,
-                        &pbs.dn_alpha_batch.buf,
-                        0,
-                        copy_a,
-                    )?;
-                    gpu.memcpy_dtod_at_auto(
-                        &tape.beta_bufs[delta_layer_idx].buf,
-                        off_a,
-                        &pbs.dn_beta_batch.buf,
-                        0,
-                        copy_a,
+                    capture_gdn_tape_rows(
+                        gpu,
+                        tape,
+                        pbs,
+                        delta_layer_idx,
+                        tape_offset,
+                        n,
+                        n_v_heads,
                     )?;
                 }
                 // Same tree-aware dispatch gate as dense LA branch above.
