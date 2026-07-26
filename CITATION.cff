@@ -32,6 +32,6 @@ keywords:
   - quantization
   - speculative-decoding
   - flash-attention
-license: MIT OR Apache-2.0
-version: 0.2.0
-date-released: '2026-05-27'
+license: Apache-2.0
+version: 0.3.0
+date-released: '2026-07-26'

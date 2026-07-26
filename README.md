@@ -355,18 +355,20 @@ the prefill MMQ redesign log is at
 
 ## License
 
-hipfire is dual-licensed under MIT or Apache-2.0 at your option. See
-[LICENSE](LICENSE) (dual-license pointer), [LICENSE-MIT](LICENSE-MIT),
-[LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE) for details.
+hipfire is licensed under **Apache-2.0** as of v0.3.0. See
+[LICENSE](LICENSE), [LICENSE-APACHE](LICENSE-APACHE), and
+[NOTICE](NOTICE) for details. Releases up to and including v0.2.1 were
+dual MIT/Apache-2.0; that grant is not revoked.
 
-New contributions default to Apache-2.0 via DCO sign-off; existing
-contributors' MIT-licensed contributions remain MIT unless they opt
-in. Each source file carries an `SPDX-License-Identifier` reflecting
-actual authorship (MIT, Apache-2.0, or `MIT OR Apache-2.0`). See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the contributor side and
+Individual files whose substantive authors have not elected Apache-2.0
+remain MIT-licensed (see [LICENSE-MIT](LICENSE-MIT)) and are identified
+by their per-file `SPDX-License-Identifier`. No contributor's file was
+relicensed in absentia. New contributions default to Apache-2.0 via DCO
+sign-off. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor
+side and
 [docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md)
-for the decision record (including the 2026-05-19 course correction
-from a unilateral Apache-2.0 relicense to dual licensing).
+for the decision record (including the 2026-05-19 course correction and
+the v0.3.0 move to outbound Apache-2.0).
 
 Original architectural innovations originating in hipfire are
 catalogued in [PRIOR-ART.md](PRIOR-ART.md); derivative works
