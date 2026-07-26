@@ -1449,14 +1449,24 @@ impl Pm4MidAcquirePolicy {
         })
     }
 
+    #[cfg(test)]
     fn acquire_between(self, previous: &str, current: &str) -> bool {
+        self.acquire_between_scoped(previous, current, false)
+    }
+
+    fn acquire_between_scoped(
+        self,
+        previous: &str,
+        current: &str,
+        extended_batch: bool,
+    ) -> bool {
         match self {
             // Correctness oracle: pair every serialized dependency wait with
             // a cache acquire. Fence-trimming experiments use the narrower
             // policies below only after this profile is bit-exact.
             Self::Conservative => true,
             Self::EntryOnly => false,
-            Self::RequiredOnly => required_mid_acquire(previous, current),
+            Self::RequiredOnly => required_mid_acquire(previous, current, extended_batch),
             Self::WithoutRepeatInterleave => {
                 conservative_mid_acquire_except(previous, current, Some("repeat_interleave_qk_f32"))
             }
@@ -1475,7 +1485,7 @@ impl Pm4MidAcquirePolicy {
     }
 }
 
-fn required_mid_acquire(previous: &str, current: &str) -> bool {
+fn required_mid_acquire(previous: &str, current: &str, extended_batch: bool) -> bool {
     if previous.starts_with("gated_delta_net_q8_compact2_")
         || current.starts_with("gated_delta_net_q8_compact2_")
     {
@@ -1489,6 +1499,17 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     if previous == "fused_silu_mul_mq_rotate" && current.starts_with("gemv_hfq4g256_residual") {
         return true;
     }
+    let golden_ar_required = matches!(
+        previous,
+        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+    ) || matches!(
+        current,
+        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+    );
+    if golden_ar_required || !extended_batch {
+        return golden_ar_required;
+    }
+
     matches!(
         previous,
         "convert_f32_to_f16"
@@ -1500,9 +1521,7 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
             | "kv_cache_write_q8_0_batched"
             | "kv_cache_write_q8_0_independent"
             | "moe_down_combine_grouped_k8"
-            | "repeat_interleave_qk_f32"
             | "repeat_interleave_qk_f32_batched"
-            | "rope_partial_halfsplit_f32"
             | "softmax_f32"
     ) || matches!(
         current,
@@ -1515,9 +1534,7 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
             | "kv_cache_write_q8_0_batched"
             | "kv_cache_write_q8_0_independent"
             | "moe_down_combine_grouped_k8"
-            | "repeat_interleave_qk_f32"
             | "repeat_interleave_qk_f32_batched"
-            | "rope_partial_halfsplit_f32"
             | "softmax_f32"
     )
 }
@@ -1939,6 +1956,9 @@ pub struct ReplayController {
     pm4_wait_policy: Pm4WaitPolicy,
     pm4_register_policy: Pm4RegisterPolicy,
     pm4_queue_policy: QueuePolicy,
+    /// Extra cache boundaries required by retained batched/MTP tapes. Plain
+    /// AR deliberately keeps the sealed golden required-only encoding.
+    extended_batch_acquires: bool,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
     certified_speedups: Vec<f64>,
@@ -1986,6 +2006,7 @@ impl ReplayController {
             pm4_wait_policy: Pm4WaitPolicy::from_config(),
             pm4_register_policy: Pm4RegisterPolicy::from_config(),
             pm4_queue_policy: pm4_queue_policy_from_config(),
+            extended_batch_acquires: false,
             state,
             recorded: Vec::new(),
             certified_speedups: Vec::new(),
@@ -2021,6 +2042,7 @@ impl ReplayController {
     pub fn new_retained_pm4_armed() -> Self {
         let mut controller = Self::new_armed(ReplayBackendRequest::Auto);
         controller.transport = ReplayTransport::Pm4Ib;
+        controller.extended_batch_acquires = true;
         controller
     }
 
@@ -2621,7 +2643,11 @@ impl ReplayController {
                     if (!independent && commands.requires_dependency_acquire())
                         || self
                             .pm4_mid_acquire_policy
-                            .acquire_between(previous, current)
+                            .acquire_between_scoped(
+                                previous,
+                                current,
+                                self.extended_batch_acquires,
+                            )
                     {
                         commands.acquire_inter_node(
                             gfx12_gcr_trim,
@@ -2743,7 +2769,11 @@ impl ReplayController {
                         if (!independent && commands.requires_dependency_acquire())
                             || self
                                 .pm4_mid_acquire_policy
-                                .acquire_between(previous, current)
+                                .acquire_between_scoped(
+                                    previous,
+                                    current,
+                                    self.extended_batch_acquires,
+                                )
                         {
                             commands.acquire_inter_node(
                                 gfx12_gcr_trim,
@@ -3487,22 +3517,52 @@ mod tests {
             "fused_qk_l2_norm_scale_f32",
             "gated_delta_net_q8_compact2_b2"
         ));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+        assert!(!Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "repeat_interleave_qk_f32_batched"
         ));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between_scoped(
+            "fused_qk_l2_norm_scale_f32",
+            "repeat_interleave_qk_f32_batched",
+            true,
+        ));
+        assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("moe_down_combine_k8_batched", "convert_f32_to_f16"));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between_scoped(
+            "moe_down_combine_k8_batched",
+            "convert_f32_to_f16",
+            true,
+        ));
+        assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("convert_f32_to_f16", "gemm_hfq4g256"));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between_scoped(
+            "convert_f32_to_f16",
+            "gemm_hfq4g256",
+            true,
+        ));
+        assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("gemm_q8_0_batched_chunked", "softmax_f32"));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between_scoped(
+            "gemm_q8_0_batched_chunked",
+            "softmax_f32",
+            true,
+        ));
+        assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("softmax_f32", "moe_topk_renorm_k8"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between_scoped(
+            "softmax_f32",
+            "moe_topk_renorm_k8",
+            true,
+        ));
         assert!(Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("rope_partial_halfsplit_f32", "kv_cache_write_q8_0_independent"));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly
+        assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("moe_down_combine_grouped_k8", "fused_rmsnorm_mq_rotate"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between_scoped(
+            "moe_down_combine_grouped_k8",
+            "fused_rmsnorm_mq_rotate",
+            true,
+        ));
         assert!(!Pm4MidAcquirePolicy::WithoutRepeatInterleave.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "repeat_interleave_qk_f32_batched"
@@ -3982,6 +4042,7 @@ mod tests {
         assert_eq!(controller.request(), ReplayBackendRequest::Auto);
         assert_eq!(controller.state(), ReplayState::Armed);
         assert_eq!(controller.transport_name(), "pm4");
+        assert!(controller.extended_batch_acquires);
         assert!(controller.recorded_launches().is_empty());
     }
 
