@@ -1494,6 +1494,30 @@ fn validate_golden_verifier_route(
     Ok(())
 }
 
+fn maybe_log_mtp_capture_census(route: &str, n: usize, launches: &[RecordedHipLaunch]) {
+    if hipfire_config::developer_var("HIPFIRE_MTP_CAPTURE_CENSUS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+
+    let mut groups = std::collections::BTreeMap::new();
+    for launch in launches {
+        *groups
+            .entry((launch.kernel.as_str(), launch.grid, launch.block))
+            .or_insert(0usize) += 1;
+    }
+    for ((kernel, grid, block), count) in groups {
+        eprintln!(
+            "[mtp-redline-census] route={route} B={n} count={count} \
+             grid={}x{}x{} block={}x{}x{} kernel={kernel}",
+            grid[0], grid[1], grid[2], block[0], block[1], block[2],
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_mtp_golden_trunk_verify(
     gpu: &mut Gpu,
@@ -1648,6 +1672,7 @@ fn run_mtp_golden_trunk_verify(
     let capture = controller
         .finish_capture()
         .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+    maybe_log_mtp_capture_census("golden", n, controller.recorded_launches());
     if let Err(reason) =
         validate_golden_verifier_route(&reference_body, controller.recorded_launches(), n)
     {
@@ -1792,6 +1817,7 @@ fn run_mtp_trunk_verify(
         let capture = controller
             .finish_capture()
             .map_err(|reason| hip_bridge::HipError::new(0, reason))?;
+        maybe_log_mtp_capture_census("batched", n, controller.recorded_launches());
         match controller.prepare_pm4_prefix(gpu.device_id as usize, capture.launch_count) {
             Ok((dispatches, command_dwords, queue_id)) => {
                 eprintln!(
