@@ -1420,7 +1420,11 @@ fn golden_reference_body(gpu: &Gpu) -> HipResult<Vec<RecordedHipLaunch>> {
                 "plain-AR Redline route has no final rmsnorm_f32 boundary",
             )
         })?;
-    let embedding = launches
+    // Redline capture begins before embedding lookup, but the product's
+    // embedding helper is currently outside the recorded launch wrappers on
+    // the sealed MQ4R route. Keep the explicit boundary for formats that do
+    // record it; otherwise the captured tape already begins at layer 0.
+    let body_start = launches
         .iter()
         .position(|launch| {
             matches!(
@@ -1428,13 +1432,7 @@ fn golden_reference_body(gpu: &Gpu) -> HipResult<Vec<RecordedHipLaunch>> {
                 "embedding_hfq4g256" | "embedding_q8"
             )
         })
-        .ok_or_else(|| {
-            hip_bridge::HipError::new(
-                0,
-                "plain-AR Redline route has no canonical embedding boundary",
-            )
-        })?;
-    let body_start = embedding + 1;
+        .map_or(0, |embedding| embedding + 1);
     if body_start > final_norm {
         return Err(hip_bridge::HipError::new(
             0,
