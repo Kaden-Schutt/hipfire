@@ -1420,7 +1420,28 @@ fn golden_reference_body(gpu: &Gpu) -> HipResult<Vec<RecordedHipLaunch>> {
                 "plain-AR Redline route has no final rmsnorm_f32 boundary",
             )
         })?;
-    Ok(launches[..=final_norm].to_vec())
+    let embedding = launches
+        .iter()
+        .position(|launch| {
+            matches!(
+                launch.kernel.as_str(),
+                "embedding_hfq4g256" | "embedding_q8"
+            )
+        })
+        .ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "plain-AR Redline route has no canonical embedding boundary",
+            )
+        })?;
+    let body_start = embedding + 1;
+    if body_start > final_norm {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "plain-AR Redline route final norm precedes its embedding boundary",
+        ));
+    }
+    Ok(launches[body_start..=final_norm].to_vec())
 }
 
 fn validate_golden_verifier_route(
@@ -1481,7 +1502,7 @@ fn run_mtp_golden_trunk_verify(
     trunk_weights: &Qwen35Weights,
     config: &qwen35::Qwen35Config,
     kv_cache: &mut llama::KvCache,
-    dn_state: &qwen35::DeltaNetState,
+    dn_state: &mut qwen35::DeltaNetState,
     scratch: &qwen35::Qwen35Scratch,
     state: &mut MtpSpecState,
     verify_tokens: &[u32],
@@ -1505,6 +1526,43 @@ fn run_mtp_golden_trunk_verify(
             0,
             "golden MTP verifier requires 1..=4 verify tokens within its persistent scratch",
         ));
+    }
+
+    // `serve` may enable MTP before the first ordinary decode token. In that
+    // case the model's automatic Redline controller is still armed and has no
+    // plain-AR launch tape for the verifier to prove itself against. Capture
+    // one exact ordinary forward from the recurrent snapshot saved by the MTP
+    // cycle, then restore that snapshot before doing the real verification.
+    //
+    // The reference forward writes the same first verifier token to the same
+    // KV slot that the real verifier immediately overwrites. DeltaNet is the
+    // only state requiring explicit rollback here. This deliberately calls
+    // `forward_scratch` rather than manufacturing a list of expected names:
+    // the resulting reference is the product's actual, prepared PM4 golden.
+    if mtp_verify_pm4_enabled(gpu)
+        && !state.mtp_verify_pm4_disabled
+        && gpu.replay.recorded_launches().is_empty()
+    {
+        gpu.graphs.ar_graph_eligible = true;
+        let capture = qwen35::forward_scratch(
+            gpu,
+            trunk_weights,
+            config,
+            verify_tokens[0],
+            cur_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+        );
+        let restore = state.trunk_snap.restore_to(dn_state, gpu);
+        capture?;
+        restore?;
+        let summary = gpu.replay.capture_summary();
+        eprintln!(
+            "[mtp-redline-golden] bootstrapped plain-AR reference dispatches={} \
+             kernels={} hash={:016x}",
+            summary.launch_count, summary.unique_kernel_count, summary.sequence_hash,
+        );
     }
 
     qwen35::upload_prefill_batch_inputs(gpu, &state.trunk_pbs, verify_tokens, cur_pos)?;
