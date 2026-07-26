@@ -10070,6 +10070,23 @@ fn forward_batch_chunk_impl(
     } else {
         logical_max_ctx
     };
+    // MTP verifier experiment: carry the certified gfx1201 AR compact-Q/K
+    // contract into the short sequential batch. The existing compact GDN
+    // kernel already accepts n_tokens > 1 and uses the same recurrence body
+    // as the ordinary batched fast path; retaining Q/K at their native head
+    // count only removes the repeat-interleave materialization. Keep this
+    // isolated to tape-producing K+1 verification batches until fixed-seed
+    // product A/B admits it.
+    let mtp_golden_gdn_compact2 = gdn_tape.is_some()
+        && matches!(batch_semantics, BatchSemantics::Sequential)
+        && n <= 4
+        && gpu.arch_caps.is_gfx1201()
+        && dn_state.quant == StateQuant::Q8
+        && config.linear_num_key_heads * 2 == n_v_heads
+        && hipfire_config::developer_var("HIPFIRE_MTP_GOLDEN_GDN")
+            .ok()
+            .as_deref()
+            == Some("compact2");
 
     // ── 2. Per-layer loop ────────────────────────────────────────────────
     // Multi-GPU band-mode: counters seed from the band's running offsets so
@@ -10411,7 +10428,17 @@ fn forward_batch_chunk_impl(
                 // The fused kernel reads q_raw/k_raw (unchanged on exit), so
                 // the conv1d output is preserved if downstream readers need it
                 // (no current consumer reads _raw after this).
-                if config.linear_num_key_heads < n_v_heads {
+                if mtp_golden_gdn_compact2 {
+                    gpu.fused_qk_l2_norm_scale_f32_batched(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        config.linear_num_key_heads,
+                        hd,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
+                        n,
+                    )?;
+                } else if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
                         &pbs.dn_q_raw_batch,
@@ -10546,7 +10573,22 @@ fn forward_batch_chunk_impl(
                             }
                         }
                         StateQuant::Q8 => {
-                            if batch_semantics.is_independent() {
+                            if mtp_golden_gdn_compact2 {
+                                gpu.gated_delta_net_q8_compact2(
+                                    &pbs.dn_q_raw_batch,
+                                    &pbs.dn_k_raw_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &dn_state.s_scales[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                    dn_state.ef_residual(delta_layer_idx),
+                                )?
+                            } else if batch_semantics.is_independent() {
                                 gpu.gated_delta_net_q8_independent(
                                     &pbs.dn_q_batch,
                                     &pbs.dn_k_batch,
@@ -12254,7 +12296,9 @@ fn forward_batch_chunk_impl(
                     config.norm_eps,
                     n,
                 )?;
-                if config.linear_num_key_heads < n_v_heads {
+                if !mtp_golden_gdn_compact2
+                    && config.linear_num_key_heads < n_v_heads
+                {
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     gpu.repeat_interleave_qk_f32_batched(
                         &pbs.dn_q_raw_batch,
@@ -12266,7 +12310,7 @@ fn forward_batch_chunk_impl(
                         hd,
                         n,
                     )?;
-                } else {
+                } else if !mtp_golden_gdn_compact2 {
                     gpu.memcpy_dtod_auto(
                         &pbs.dn_q_batch.buf,
                         &pbs.dn_q_raw_batch.buf,
@@ -12394,7 +12438,22 @@ fn forward_batch_chunk_impl(
                             }
                         }
                         StateQuant::Q8 => {
-                            if batch_semantics.is_independent() {
+                            if mtp_golden_gdn_compact2 {
+                                gpu.gated_delta_net_q8_compact2(
+                                    &pbs.dn_q_raw_batch,
+                                    &pbs.dn_k_raw_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &dn_state.s_scales[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                    dn_state.ef_residual(delta_layer_idx),
+                                )?
+                            } else if batch_semantics.is_independent() {
                                 gpu.gated_delta_net_q8_independent(
                                     &pbs.dn_q_batch,
                                     &pbs.dn_k_batch,
