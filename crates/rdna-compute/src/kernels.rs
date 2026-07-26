@@ -2644,6 +2644,14 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip");
+/// MTP verifier specialization for N=2..4. It lifts the certified gfx12 AR
+/// QKVZA arithmetic and cache lowering, then reuses each decoded weight group
+/// across the live verifier tokens instead of padding them to a WMMA N=16 tile.
+pub const GEMM_QKVZA_HFQ4G256_GOLDEN_BATCH4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_golden_batch4.gfx12.hip")
+);
 // HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
 // lane decomposition; only the inner K-tile unpack differs (3-bit
 // cross-byte vs 4-bit nibble). Used for MQ3 prefill via dispatch
