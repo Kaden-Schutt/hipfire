@@ -499,6 +499,11 @@ pub struct MoePrefillParams<'a> {
     /// routed dtype snapshot is pure MQ4. This keeps pure MQ4 models on the
     /// existing i8 default while avoiding mixed-checkpoint corruption.
     pub force_mq4_grouped_fp16: bool,
+    /// Prefer the indexed AR-style routed-expert family for a short
+    /// speculative verifier batch. This is an explicit model/call-site
+    /// contract, not a generic batch-size heuristic: ordinary prefill keeps
+    /// the grouped-WMMA resolver even when its batch happens to be small.
+    pub prefer_indexed_short_batch: bool,
     // routing inputs (model-produced)
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,

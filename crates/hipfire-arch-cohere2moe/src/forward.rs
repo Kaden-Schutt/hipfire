@@ -863,6 +863,7 @@ pub fn forward_batch(
                     n_exp,
                     m_total_max,
                     force_mq4_grouped_fp16: false,
+                    prefer_indexed_short_batch: false,
                     topk_indices: &topk_idx,
                     topk_weights: &topk_w,
                     x_batch: &x,

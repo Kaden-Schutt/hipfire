@@ -7819,6 +7819,64 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.gemv_hfq4g256_moe_gate_up_k8_indexed_batched_with_schedule(
+            expert_ptrs,
+            topk_indices,
+            x,
+            y_gate,
+            y_up,
+            m,
+            k,
+            k_top,
+            batch_size,
+            false,
+        )
+    }
+
+    /// Short-batch gfx12 sister that defaults to the paired AR gate/up
+    /// schedule. The explicit HIPFIRE_MTP_GOLDEN_GATE_UP developer override
+    /// still wins, which keeps the prior kernel experiments reproducible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_gate_up_k8_indexed_batched_golden(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq4g256_moe_gate_up_k8_indexed_batched_with_schedule(
+            expert_ptrs,
+            topk_indices,
+            x,
+            y_gate,
+            y_up,
+            m,
+            k,
+            k_top,
+            batch_size,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_hfq4g256_moe_gate_up_k8_indexed_batched_with_schedule(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+        prefer_gfx12_golden: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
@@ -7833,16 +7891,16 @@ impl Gpu {
                 2,
             )
         } else {
-            use std::sync::OnceLock;
-            static GFX12_SHORT_BATCH_ROUTE: OnceLock<String> = OnceLock::new();
+            let requested_schedule =
+                hipfire_config::developer_var("HIPFIRE_MTP_GOLDEN_GATE_UP")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
             let schedule = if self.arch_caps.is_rdna4() {
-                GFX12_SHORT_BATCH_ROUTE
-                    .get_or_init(|| {
-                        hipfire_config::developer_var("HIPFIRE_MTP_GOLDEN_GATE_UP")
-                            .unwrap_or_default()
-                            .to_ascii_lowercase()
-                    })
-                    .as_str()
+                if requested_schedule.is_empty() && prefer_gfx12_golden {
+                    "golden"
+                } else {
+                    requested_schedule.as_str()
+                }
             } else {
                 ""
             };
@@ -8165,10 +8223,19 @@ impl Gpu {
             bytes,
         );
         // The expanded kernel owns four consecutive output rows per workgroup.
-        // Keep this opt-in while it is qualified by arch: the legacy launch
-        // used `m` workgroups, leaving three quarters to exit at the row0 guard.
+        // The legacy launch used `m` workgroups, leaving three quarters to
+        // exit at the row0 guard. gfx12 has been fixed-seed qualified for the
+        // exact grid; gfx1100 remains experimental.
         static DOWN_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
-        let tight_grid = if self.arch_caps.is_gfx1100() || self.arch_caps.is_rdna4() {
+        let tight_grid = if self.arch_caps.is_rdna4() {
+            // The kernel owns four consecutive rows. Launching M workgroups
+            // made three quarters exit at the row0 guard; gfx12 now defaults
+            // to the exact ceil(M/4) geometry. `0` preserves the old launch
+            // for bisecting archived captures.
+            *DOWN_TIGHT_GRID.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() != Ok("0")
+            })
+        } else if self.arch_caps.is_gfx1100() {
             *DOWN_TIGHT_GRID.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() == Ok("1")
             })

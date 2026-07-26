@@ -1543,9 +1543,18 @@ impl Gpu {
         cactus_delta: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let parallel_cdf =
-            hipfire_config::developer_var("HIPFIRE_MTP_CHAIN_ACCEPT").as_deref()
-                == Ok("parallel-cdf");
+        // The gfx1201 default preserves the serial kernel's RNG contract while
+        // parallelizing the per-row CDF work. Keep explicit serial/parallel
+        // spellings so archived product captures remain bisectable.
+        let parallel_cdf = match hipfire_config::developer_var("HIPFIRE_MTP_CHAIN_ACCEPT")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "serial" | "0" | "off" => false,
+            "parallel-cdf" | "1" | "on" => true,
+            _ => self.arch_caps.is_gfx1201(),
+        };
         let (module, source, kernel) = if parallel_cdf {
             (
                 "chain_accept_spec_parallel_cdf",

@@ -2018,12 +2018,17 @@ pub fn run_moe_prefill(
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0)
     });
-    let use_path2 = res.use_path2 && p.batch_size >= grouped_min_batch;
+    let indexed_short_batch = p.prefer_indexed_short_batch
+        && ctx.arch.is_gfx1201()
+        && p.batch_size <= 4
+        && hipfire_config::developer_var("HIPFIRE_MTP_INDEXED_MOE").as_deref() != Ok("0");
+    let use_path2 =
+        res.use_path2 && p.batch_size >= grouped_min_batch && !indexed_short_batch;
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
     if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[moe-prefill] arch={} shared=({:?},{:?},{:?},{:?}) routed=({:?},{:?}) \
-             path2={} force_mq4_fp16={} grouped_i8={:?}",
+             path2={} indexed_short_batch={} force_mq4_fp16={} grouped_i8={:?}",
             ctx.arch.arch(),
             p.dtypes.shared_gate,
             p.dtypes.shared_expert_gate,
@@ -2032,6 +2037,7 @@ pub fn run_moe_prefill(
             p.dtypes.routed_gate_up,
             p.dtypes.routed_down,
             use_path2,
+            indexed_short_batch,
             force_mq4_grouped_fp16,
             ctx.flags.moe_grouped_i8,
         );
@@ -2161,17 +2167,33 @@ pub fn run_moe_prefill(
             // MQ4/MQ6 indexed batched GEMV (x_rot_batch is already FWHT-rotated
             // by the model).
             let gate_up_result = match p.dtypes.routed_gate_up {
-                DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                    p.expert_gate_up_ptrs,
-                    p.topk_indices,
-                    p.x_rot_batch,
-                    p.gate_batch,
-                    p.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k_top,
-                    n,
-                )),
+                DType::MQ4G256 => {
+                    if indexed_short_batch {
+                        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched_golden(
+                            p.expert_gate_up_ptrs,
+                            p.topk_indices,
+                            p.x_rot_batch,
+                            p.gate_batch,
+                            p.up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                        ))
+                    } else {
+                        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                            p.expert_gate_up_ptrs,
+                            p.topk_indices,
+                            p.x_rot_batch,
+                            p.gate_batch,
+                            p.up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                        ))
+                    }
+                }
                 DType::MQ5G256 => hip!(gpu.gemv_hfq5g256_moe_gate_up_k8_indexed_batched(
                     p.expert_gate_up_ptrs,
                     p.topk_indices,

@@ -8845,6 +8845,7 @@ fn prefill_moe_ffn_body_batched(
     n: usize,
     ctx: &DispatchCtx,
     model_has_mq6_moe: bool,
+    mtp_short_verifier: bool,
     // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
     // into this zeroed `[n × dim]` partial instead of `pbs.x_batch` (the EP
     // driver all-reduce-sums it across ranks and adds into x_batch). The shared
@@ -9188,17 +9189,17 @@ fn prefill_moe_ffn_body_batched(
 
     // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
     //
-    // The gfx1201 MTP B=4 experiment removes the softmax/top-K dispatch
+    // The certified gfx1201 MTP B=4 route removes the softmax/top-K dispatch
     // boundary. The fused kernel deliberately uses the same reduction seeds
     // and direct divisions as this split path, preserving expert selection
-    // and route weights while deleting one launch per MoE layer.
-    static FUSED_MTP_ROUTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let fused_mtp_router = *FUSED_MTP_ROUTER.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_MTP_FUSED_BATCHED_ROUTER")
-            .ok()
-            .as_deref()
-            == Some("1")
-    });
+    // and route weights while deleting one launch per MoE layer. Ordinary
+    // prefill never sets `mtp_short_verifier`.
+    let fused_mtp_router =
+        match hipfire_config::developer_var("HIPFIRE_MTP_FUSED_BATCHED_ROUTER").as_deref() {
+            Ok("0" | "off") => false,
+            Ok("1" | "on") => true,
+            _ => mtp_short_verifier,
+        };
     if fused_mtp_router && gpu.arch_caps.is_gfx1201() && n == 4 {
         gpu.moe_softmax_topk_renorm_k8_batched(
             router_logits,
@@ -9461,6 +9462,7 @@ fn prefill_moe_ffn_body_batched(
         force_mq4_grouped_fp16: model_has_mq6_moe
             && gpu.arch_caps.is_gfx1151()
             && gpu.flags.moe_grouped_i8.is_none(),
+        prefer_indexed_short_batch: mtp_short_verifier,
         topk_indices,
         topk_weights,
         x_batch: &pbs.x_batch,
@@ -10089,23 +10091,23 @@ fn forward_batch_chunk_impl(
     } else {
         logical_max_ctx
     };
-    // MTP verifier experiment: carry the certified gfx1201 AR compact-Q/K
-    // contract into the short sequential batch. The existing compact GDN
+    // Carry the certified gfx1201 AR compact-Q/K contract into the MTP
+    // verifier's short sequential batch. The existing compact GDN
     // kernel already accepts n_tokens > 1 and uses the same recurrence body
     // as the ordinary batched fast path; retaining Q/K at their native head
     // count only removes the repeat-interleave materialization. Keep this
-    // isolated to tape-producing K+1 verification batches until fixed-seed
-    // product A/B admits it.
+    // isolated to tape-producing K+1 verification batches. Fixed-seed product
+    // A/B admitted this route; `HIPFIRE_MTP_GOLDEN_GDN=0` remains a bisect.
     let mtp_golden_gdn_compact2 = gdn_tape.is_some()
         && matches!(batch_semantics, BatchSemantics::Sequential)
         && n <= 4
         && gpu.arch_caps.is_gfx1201()
         && dn_state.quant == StateQuant::Q8
         && config.linear_num_key_heads * 2 == n_v_heads
-        && hipfire_config::developer_var("HIPFIRE_MTP_GOLDEN_GDN")
-            .ok()
-            .as_deref()
-            == Some("compact2");
+        && !matches!(
+            hipfire_config::developer_var("HIPFIRE_MTP_GOLDEN_GDN").as_deref(),
+            Ok("0" | "off")
+        );
 
     // ── 2. Per-layer loop ────────────────────────────────────────────────
     // Multi-GPU band-mode: counters seed from the band's running offsets so
@@ -12597,14 +12599,12 @@ fn forward_batch_chunk_impl(
                         );
                     }
                 }
-                static MTP_GATED_NORM_ROTATE: std::sync::OnceLock<bool> =
-                    std::sync::OnceLock::new();
-                let mtp_gated_norm_rotate = *MTP_GATED_NORM_ROTATE.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_MTP_GATED_NORM_ROTATE")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                }) && gpu.arch_caps.is_gfx1201()
+                let mtp_gated_norm_rotate =
+                    !matches!(
+                        hipfire_config::developer_var("HIPFIRE_MTP_GATED_NORM_ROTATE").as_deref(),
+                        Ok("0" | "off")
+                    ) && gdn_tape.is_some()
+                    && gpu.arch_caps.is_gfx1201()
                     && n == 4
                     && matches!(batch_semantics, BatchSemantics::Sequential)
                     && n_v_heads == 32
@@ -12769,6 +12769,7 @@ fn forward_batch_chunk_impl(
                     n,
                     &ctx,
                     weights.moe_has_mq6,
+                    gdn_tape.is_some(),
                     routed_out,
                 )?;
 
@@ -13306,6 +13307,7 @@ fn forward_batch_chunk_impl(
                     n,
                     &ctx,
                     weights.moe_has_mq6,
+                    gdn_tape.is_some(),
                     routed_out,
                 )?;
 
