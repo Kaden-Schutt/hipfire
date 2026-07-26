@@ -686,6 +686,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc" => {
             Some(vec![read(0), read(8), read(16), write(24)])
         }
+        "gemv_hfq4g256_moe_down_k8_indexed_fused_acc" => {
+            Some(vec![read(0), read(8), read(16), read(24), write(32)])
+        }
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(vec![
             read(0),
             read(8),
@@ -929,6 +932,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
+        "gemv_hfq4g256_moe_down_k8_indexed_fused_acc" => Some(64),
         "attention_flash_q8_0_tile"
         | "fused_qkv_hfq4g256"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
@@ -3359,6 +3363,7 @@ mod tests {
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151",
+        "gemv_hfq4g256_moe_down_k8_indexed_fused_acc",
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
         "moe_down_combine_k8_batched",
         "moe_down_combine_k8_batched_vec4",
