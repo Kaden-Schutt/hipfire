@@ -728,10 +728,10 @@ fn redline_bench_decode_deepseek4(
         .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
     loaded.seq_pos = context;
 
-    if capture || product_route {
-        // Manual capture and the product fixture are already warm paths. Skip
-        // the product decoder's lazy-allocation forward so capture or replay
-        // starts at this context instead of consuming the first timed token.
+    if capture || (product_route && gpu.replay.prepared_route_identity().is_some()) {
+        // Manual capture and prepared product routes are already warm paths.
+        // The first product warmup must still materialize lazy allocations and
+        // record the route; later requests replay from their first timed token.
         bundle.state.ar_forward_warmed_up = true;
     }
     if capture {
