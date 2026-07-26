@@ -1543,11 +1543,23 @@ impl Gpu {
         cactus_delta: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "chain_accept_spec",
-            kernels::CHAIN_ACCEPT_SPEC_SRC,
-            "chain_accept_spec_f32",
-        )?;
+        let parallel_cdf =
+            hipfire_config::developer_var("HIPFIRE_MTP_CHAIN_ACCEPT").as_deref()
+                == Ok("parallel-cdf");
+        let (module, source, kernel) = if parallel_cdf {
+            (
+                "chain_accept_spec_parallel_cdf",
+                kernels::CHAIN_ACCEPT_SPEC_PARALLEL_CDF_SRC,
+                "chain_accept_spec_parallel_cdf_f32",
+            )
+        } else {
+            (
+                "chain_accept_spec",
+                kernels::CHAIN_ACCEPT_SPEC_SRC,
+                "chain_accept_spec_f32",
+            )
+        };
+        self.ensure_kernel(module, source, kernel)?;
 
         let tgt_p = tgt_probs.buf.as_ptr();
         let dft_p = dft_probs.buf.as_ptr();
@@ -1583,9 +1595,10 @@ impl Gpu {
             &outp as *const _ as *mut c_void,
         ];
 
-        // Single block of 256 threads — the accept chain is sequential.
+        // One 256-thread block. The accept decisions remain sequential; the
+        // opt-in variant parallelizes only the vocabulary CDF walk.
         self.launch_maybe_blob(
-            "chain_accept_spec_f32",
+            kernel,
             [1, 1, 1],
             [256, 1, 1],
             256 * 4 + 32, // s_red[256] + small shared scalars ≈ 1056 bytes

@@ -4698,6 +4698,11 @@ pub const BATCHED_CATEGORICAL_SAMPLE_SRC: &str =
 /// tau/z arrays for both sides, rng_seed, cactus_delta; outputs
 /// {accept_len, bonus_token, rejected_at, new_rng} in a 16-byte int[4].
 pub const CHAIN_ACCEPT_SPEC_SRC: &str = include_str!("../../../kernels/src/chain_accept_spec.hip");
+pub const CHAIN_ACCEPT_SPEC_PARALLEL_CDF_SRC: &str = concat!(
+    "#define HIPFIRE_CHAIN_PARALLEL_CDF 1\n",
+    "#define HIPFIRE_CHAIN_ACCEPT_KERNEL chain_accept_spec_parallel_cdf_f32\n",
+    include_str!("../../../kernels/src/chain_accept_spec.hip")
+);
 
 /// Batched argmax: one block per row, writes B indices with one kernel launch.
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.

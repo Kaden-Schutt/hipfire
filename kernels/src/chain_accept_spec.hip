@@ -75,6 +75,10 @@
 
 #define CASP_NTH 256
 
+#ifndef HIPFIRE_CHAIN_ACCEPT_KERNEL
+#define HIPFIRE_CHAIN_ACCEPT_KERNEL chain_accept_spec_f32
+#endif
+
 // Inline effective-prob helper: applies topp truncation.
 __device__ __forceinline__ float eff_prob(float p, float tau, float inv_z) {
     if (tau <= 0.0f) return p;  // no truncation
@@ -109,7 +113,7 @@ __device__ __forceinline__ float casp_h_val(
     return (j == t) ? gamma_star : scale * pt_j;
 }
 
-extern "C" __global__ void chain_accept_spec_f32(
+extern "C" __global__ void HIPFIRE_CHAIN_ACCEPT_KERNEL(
     const float* __restrict__ tgt_probs,         // [(b+1) * vocab]
     const float* __restrict__ dft_probs,         // [b * draft_vocab]
     const int*   __restrict__ draft_vocab_inverse, // optional [vocab]
@@ -133,6 +137,12 @@ extern "C" __global__ void chain_accept_spec_f32(
 
     __shared__ unsigned int s_rng;
     __shared__ float s_red[CASP_NTH];  // block reduction scratch
+#if defined(HIPFIRE_CHAIN_PARALLEL_CDF)
+    __shared__ int   s_idx[CASP_NTH];
+    __shared__ int   s_cdf_owner;
+    __shared__ float s_cdf_base;
+    __shared__ float s_cdf_draw;
+#endif
     __shared__ int   s_accept_len;
     __shared__ int   s_bonus_token;
     __shared__ int   s_rejected_at;
@@ -243,6 +253,108 @@ extern "C" __global__ void chain_accept_spec_f32(
             float resid_sum = s_red[0];
             __syncthreads();
 
+            // The shipping path retains the original thread-0 vocabulary
+            // walk. The opt-in variant assigns each thread one contiguous
+            // token interval, prefixes the 256 interval masses, then lets
+            // only the selected owner scan its ~vocab/256 slice. Token order
+            // and the categorical boundary rule remain ascending-vocabulary
+            // order; only the interval sums are evaluated in parallel.
+#if defined(HIPFIRE_CHAIN_PARALLEL_CDF)
+            if (tid == 0) {
+                s_rng = s_rng * 1664525u + 1013904223u;
+                s_cdf_draw = (resid_sum > 0.0f)
+                    ? (float)(s_rng >> 8) * (1.0f / 16777216.0f) * resid_sum
+                    : 0.0f;
+                s_bonus_token = vocab - 1;
+            }
+            __syncthreads();
+
+            if (resid_sum <= 0.0f) {
+                // Degenerate residual: parallel argmax of h. Resolve ties by
+                // the lowest vocabulary id, matching the serial `>` walk.
+                float best = -1.0f;
+                int best_idx = vocab - 1;
+                for (int j = tid; j < vocab; j += nth) {
+                    float pt = casp_h_val(
+                        j, draft_tok, eff_prob(trow[j], tau_ti, inv_zt),
+                        use_cx, cx_onehot, gamma_star, cx_scale);
+                    if (pt > best || (pt == best && j < best_idx)) {
+                        best = pt;
+                        best_idx = j;
+                    }
+                }
+                s_red[tid] = best;
+                s_idx[tid] = best_idx;
+                __syncthreads();
+                for (int s = nth / 2; s > 0; s >>= 1) {
+                    if (tid < s) {
+                        float other = s_red[tid + s];
+                        int other_idx = s_idx[tid + s];
+                        if (other > s_red[tid]
+                            || (other == s_red[tid] && other_idx < s_idx[tid])) {
+                            s_red[tid] = other;
+                            s_idx[tid] = other_idx;
+                        }
+                    }
+                    __syncthreads();
+                }
+                if (tid == 0) s_bonus_token = s_idx[0];
+            } else {
+                const int chunk = (vocab + nth - 1) / nth;
+                const int begin = tid * chunk;
+                const int end = (begin + chunk < vocab) ? begin + chunk : vocab;
+                float interval_sum = 0.0f;
+                for (int j = begin; j < end; ++j) {
+                    float pt = casp_h_val(
+                        j, draft_tok, eff_prob(trow[j], tau_ti, inv_zt),
+                        use_cx, cx_onehot, gamma_star, cx_scale);
+                    float pd = draft_eff_prob(
+                        drow, j, draft_vocab_inverse, draft_vocab, tau_di, inv_zd);
+                    float diff = pt - pd;
+                    if (diff > 0.0f) interval_sum += diff;
+                }
+                s_red[tid] = interval_sum;
+                __syncthreads();
+                if (tid == 0) {
+                    float prefix = 0.0f;
+                    s_cdf_owner = -1;
+                    s_cdf_base = 0.0f;
+                    for (int owner = 0; owner < nth; ++owner) {
+                        float next = prefix + s_red[owner];
+                        if (s_cdf_draw < next) {
+                            s_cdf_owner = owner;
+                            s_cdf_base = prefix;
+                            break;
+                        }
+                        prefix = next;
+                    }
+                }
+                __syncthreads();
+                if (tid == s_cdf_owner) {
+                    float acc = s_cdf_base;
+                    for (int j = begin; j < end; ++j) {
+                        float pt = casp_h_val(
+                            j, draft_tok, eff_prob(trow[j], tau_ti, inv_zt),
+                            use_cx, cx_onehot, gamma_star, cx_scale);
+                        float pd = draft_eff_prob(
+                            drow, j, draft_vocab_inverse, draft_vocab, tau_di, inv_zd);
+                        float diff = pt - pd;
+                        if (diff > 0.0f) {
+                            acc += diff;
+                            if (s_cdf_draw < acc) {
+                                s_bonus_token = j;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            if (tid == 0) {
+                s_rejected_at = i;
+                s_done = 1;
+            }
+#else
             // Thread 0: sequential CDF walk over the residual.
             if (tid == 0) {
                 s_rng = s_rng * 1664525u + 1013904223u;
@@ -281,6 +393,7 @@ extern "C" __global__ void chain_accept_spec_f32(
                 s_rejected_at = i;
                 s_done = 1;
             }
+#endif
             __syncthreads();
             // break is handled by the loop guard (!s_done).
         }
@@ -310,6 +423,52 @@ extern "C" __global__ void chain_accept_spec_f32(
         float total_mass = s_red[0];
         __syncthreads();
 
+        // Same contiguous-interval CDF as the residual path above.
+#if defined(HIPFIRE_CHAIN_PARALLEL_CDF)
+        if (tid == 0) {
+            s_rng = s_rng * 1664525u + 1013904223u;
+            s_cdf_draw =
+                (float)(s_rng >> 8) * (1.0f / 16777216.0f) * total_mass;
+            s_bonus_token = vocab - 1;
+        }
+        __syncthreads();
+        const int chunk = (vocab + nth - 1) / nth;
+        const int begin = tid * chunk;
+        const int end = (begin + chunk < vocab) ? begin + chunk : vocab;
+        float interval_mass = 0.0f;
+        for (int j = begin; j < end; ++j) {
+            interval_mass += eff_prob(trow_bonus[j], tau_tb, inv_ztb);
+        }
+        s_red[tid] = interval_mass;
+        __syncthreads();
+        if (tid == 0) {
+            float prefix = 0.0f;
+            s_cdf_owner = -1;
+            s_cdf_base = 0.0f;
+            for (int owner = 0; owner < nth; ++owner) {
+                float next = prefix + s_red[owner];
+                if (s_cdf_draw < next) {
+                    s_cdf_owner = owner;
+                    s_cdf_base = prefix;
+                    break;
+                }
+                prefix = next;
+            }
+        }
+        __syncthreads();
+        if (tid == s_cdf_owner) {
+            float acc = s_cdf_base;
+            for (int j = begin; j < end; ++j) {
+                float pe = eff_prob(trow_bonus[j], tau_tb, inv_ztb);
+                if (pe <= 0.0f) continue;
+                acc += pe;
+                if (s_cdf_draw < acc) {
+                    s_bonus_token = j;
+                    break;
+                }
+            }
+        }
+#else
         // Thread 0: draw and CDF-walk the bonus row.
         if (tid == 0) {
             s_rng = s_rng * 1664525u + 1013904223u;
@@ -325,6 +484,7 @@ extern "C" __global__ void chain_accept_spec_f32(
             s_bonus_token = bonus;
             // s_rejected_at stays -1 (all accepted).
         }
+#endif
         __syncthreads();
     }
 
