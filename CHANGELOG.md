@@ -839,7 +839,7 @@ replacement for anyone running v0.1.7-alpha.
 ### Upgrade path
 
 ```
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/install.sh | bash
 # or: hipfire update
 ```
 
@@ -1067,7 +1067,7 @@ eligibility check requires a dense DeltaNet layer), so pp ≈ decode at
 
 ### Known issues
 
-- **hipGraph + MoE multi-turn corruption** ([#19](https://github.com/Kaden-Schutt/hipfire/issues/19)).
+- **hipGraph + MoE multi-turn corruption** ([#19](https://github.com/warpfront/hipfire/issues/19)).
   Single-shot short decodes with `HIPFIRE_GRAPH=1` on A3B look healthy
   (162 tok/s, byte-coherent at 30 tokens), but state diverges from the
   direct path after ~40 decoded tokens — the model starts skipping a

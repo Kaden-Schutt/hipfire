@@ -293,7 +293,7 @@ impl KernelCompiler {
         // Try pre-compiled .hsaco first, validating with a .hash sidecar file.
         // If hash is missing/mismatched AND hipcc is available, prefer recompilation.
         // If hipcc is unavailable (packaged install), use the blob as-is.
-        // See: https://github.com/Kaden-Schutt/hipfire/issues/2
+        // See: https://github.com/warpfront/hipfire/issues/2
         if let Some(ref dir) = self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
             let hash_file = dir.join(format!("{name}.hash"));

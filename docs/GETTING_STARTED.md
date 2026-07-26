@@ -20,10 +20,10 @@ The revision selector controls the managed source checkout under
 
 ```bash
 # Current master:
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
 
 # Integration/testing branch:
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh \
   | bash -s -- --branch beta
 ```
 
@@ -36,7 +36,7 @@ inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
 PIN=v0.2.1
-curl -fsSL "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/${PIN}/scripts/install.sh" \
+curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
 less /tmp/hipfire-install.sh
@@ -57,10 +57,10 @@ or copies the daemon, installs the native `hipfire` binary under
 
 ```powershell
 # Current master:
-iex (irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1)
+iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1)
 
 # Integration/testing branch:
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1))) `
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1))) `
   -Branch beta
 ```
 
@@ -68,7 +68,7 @@ For a reviewed, pinned installation:
 
 ```powershell
 $Pin = "v0.2.1"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/$Pin/scripts/install.ps1" `
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/warpfront/hipfire/$Pin/scripts/install.ps1" `
   -OutFile "$env:TEMP\hipfire-install.ps1"
 Get-FileHash "$env:TEMP\hipfire-install.ps1" -Algorithm SHA256
 notepad "$env:TEMP\hipfire-install.ps1"
@@ -95,7 +95,7 @@ Copy-Item .\kernels\compiled\<arch>\* $env:USERPROFILE\.hipfire\bin\kernels\comp
 ### Source checkout
 
 ```bash
-git clone https://github.com/Kaden-Schutt/hipfire
+git clone https://github.com/warpfront/hipfire
 cd hipfire
 cargo build --release --features deltanet --example daemon -p hipfire-runtime
 cargo build --release -p hipfire-cli
@@ -114,13 +114,13 @@ source checkout, runtime PID/log files, and the PATH entry created by the
 installer. It preserves downloaded models and settings under `~/.hipfire`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/uninstall.sh | bash
 ```
 
 Preview without changing anything:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/uninstall.sh \
   | bash -s -- --dry-run
 ```
 

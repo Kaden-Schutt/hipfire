@@ -5,7 +5,7 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 
 # hipfire installer — detects GPU, installs deps, builds native binaries + kernels.
-# Usage: curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
 # Branch: curl -fsSL .../master/scripts/install.sh | bash -s -- --branch beta
 set -euo pipefail
 
@@ -13,7 +13,7 @@ HIPFIRE_DIR="$HOME/.hipfire"
 BIN_DIR="$HIPFIRE_DIR/bin"
 MODELS_DIR="$HIPFIRE_DIR/models"
 SRC_DIR="$HIPFIRE_DIR/src"
-GITHUB_REPO="Kaden-Schutt/hipfire"
+GITHUB_REPO="warpfront/hipfire"
 INSTALL_REF="${HIPFIRE_INSTALL_REF:-master}"
 INSTALL_REF_KIND=$([ -n "${HIPFIRE_INSTALL_REF:-}" ] && echo "auto" || echo "branch")
 REF_EXPLICIT=$([ -n "${HIPFIRE_INSTALL_REF:-}" ] && echo "1" || echo "0")
@@ -33,8 +33,8 @@ Revision selectors:
   --commit SHA    Install a pinned 7-40 character commit
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash -s -- --branch beta
+  curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash -s -- --branch beta
 EOF
 }
 

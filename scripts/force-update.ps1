@@ -1,6 +1,6 @@
 # hipfire force-update — clean reinstall preserving models only.
 # Config is regenerated fresh (ensures correct GPU arch detection).
-# Usage: irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/force-update.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/force-update.ps1 | iex
 
 $HipfireDir = "$env:USERPROFILE\.hipfire"
 $BackupDir = "$env:USERPROFILE\.hipfire-backup"
@@ -23,7 +23,7 @@ if (Test-Path $HipfireDir) {
 # Run fresh installer
 Write-Host ""
 Write-Host "Running fresh install..." -ForegroundColor Cyan
-irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1 | iex
 
 # Restore user data
 if (Test-Path $BackupDir) {

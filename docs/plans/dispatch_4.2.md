@@ -1,7 +1,7 @@
 # Ship 4.2 — qwen35 grouped-GEMM MoE prefill → `MoeFamily::run_prefill` (Step 8)
 
 **Branch:** `feature/ship-4.2-moe-prefill` off `integration/dispatch-unification`.
-**Tracking:** [#397](https://github.com/Kaden-Schutt/hipfire/issues/397) Step 4.2 / Step 8.
+**Tracking:** [#397](https://github.com/warpfront/hipfire/issues/397) Step 4.2 / Step 8.
 **Owner:** Kevin (Ship-4 takeover from Nick, aligned). Edits `families/moe.rs` + `pipeline/mod.rs`
 + `qwen35.rs`.
 **Depends on:** 4.1 landed (`31738389`); PR #428 (ds4 `run_bias_aware_prefill` template,

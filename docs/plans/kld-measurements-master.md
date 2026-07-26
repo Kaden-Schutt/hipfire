@@ -108,7 +108,7 @@ the linked detail section. `—` = not recorded in this summary (see detail).
 
 ## TL;DR — strategic headline (2026-05-13 PM, supersedes AM)
 
-**The Tier-2 Q8 floor was an FP32-vs-bf16 precision-class mismatch artifact, not engine drift.** The 2026-05-13 PM pattern-hunt audit (commits `13003256`, `f6d1a59e`, `a75b4a08`, `1b90a663`) proved hipfire's fp32-native kernels (rmsnorm, l2norm, recurrence) are bit-faithful to the fp64 ideal. Then on the same day, [PR #248](https://github.com/Kaden-Schutt/hipfire/pull/248) Tier-3 fused WMMA Q8 prefill kernels (FP16 accumulators, matched to HF's bf16 precision class) landed, and the measured Q8 floor collapsed:
+**The Tier-2 Q8 floor was an FP32-vs-bf16 precision-class mismatch artifact, not engine drift.** The 2026-05-13 PM pattern-hunt audit (commits `13003256`, `f6d1a59e`, `a75b4a08`, `1b90a663`) proved hipfire's fp32-native kernels (rmsnorm, l2norm, recurrence) are bit-faithful to the fp64 ideal. Then on the same day, [PR #248](https://github.com/warpfront/hipfire/pull/248) Tier-3 fused WMMA Q8 prefill kernels (FP16 accumulators, matched to HF's bf16 precision class) landed, and the measured Q8 floor collapsed:
 
 | Model | Tier-2 Q8 floor (FP32 acc) | Tier-3 Q8 floor (FP16 acc) | Reduction |
 |---|---:|---:|---:|
@@ -300,7 +300,7 @@ PPL 9.172 is **within 0.02% of the Tier-3 Q8 floor** (9.189) — indistinguishab
 
 **Cross-engine Δ-above-Tier3-Q8: 0.1613 − 0.0173 = 0.144** — vs llama.cpp Q4_K_M's Δ ≈ 0.109. Hipfire stack now within 1.32× of Q4_K_M, the smallest absolute-KLD gap to llama.cpp K-quants on any hipfire 4-5 bpw recipe to date.
 
-**Note on dispatch:** the same `--kmap-dense --kmap-mode 2` recipe was filed as [issue #249](https://github.com/Kaden-Schutt/hipfire/issues/249) on gfx1100, where the runtime forward pass produces NaN logits (silent corruption). This gfx1151 measurement implies the dispatch NaN is **gfx1100-specific** — the bug class (kernels not enumerating the mixed-format combo) may only trigger on the WMMA path active on gfx1100 but not on gfx1151's RDNA3.5 dispatch. Issue #249 should be re-scoped from "kmd2 produces NaN" to "kmd2 produces NaN on gfx1100 (works on gfx1151)" pending follow-up.
+**Note on dispatch:** the same `--kmap-dense --kmap-mode 2` recipe was filed as [issue #249](https://github.com/warpfront/hipfire/issues/249) on gfx1100, where the runtime forward pass produces NaN logits (silent corruption). This gfx1151 measurement implies the dispatch NaN is **gfx1100-specific** — the bug class (kernels not enumerating the mixed-format combo) may only trigger on the WMMA path active on gfx1100 but not on gfx1151's RDNA3.5 dispatch. Issue #249 should be re-scoped from "kmd2 produces NaN" to "kmd2 produces NaN on gfx1100 (works on gfx1151)" pending follow-up.
 
 ### 1.1h AWQ + K-map mixed MQ4/MQ6 + Q8 conv1d (gfx1151, KV=asym3, prefill, n=256, 2026-05-15)
 
@@ -474,7 +474,7 @@ Source: gfx1151 agent 2026-05-13 PM. Default conv1d (MQ4G256, not Q8), default l
 
 ### 1.1b Hipfire Tier-3 Q8 floor anchor (gfx1151, KV=q8, fused WMMA prefill)
 
-Source: gfx1151 agent 2026-05-13 PM run on PR [#248](https://github.com/Kaden-Schutt/hipfire/pull/248) (HEAD `747315a4`). Kernels: `gemm_qkv_q8_0_wmma`, `gemm_qkvza_q8_0_wmma`, `gemm_gate_up_q8_0_wmma`, `gemm_q8_0_residual_wmma` (all 4 Tier-3 fused kernels confirmed in dispatch log; Tier-2 substrate **not** invoked).
+Source: gfx1151 agent 2026-05-13 PM run on PR [#248](https://github.com/warpfront/hipfire/pull/248) (HEAD `747315a4`). Kernels: `gemm_qkv_q8_0_wmma`, `gemm_qkvza_q8_0_wmma`, `gemm_gate_up_q8_0_wmma`, `gemm_q8_0_residual_wmma` (all 4 Tier-3 fused kernels confirmed in dispatch log; Tier-2 substrate **not** invoked).
 
 | Variant | bpw | KLD (CI) | p99 | PPL | Notes |
 |---|---:|---|---:|---:|---|
@@ -904,7 +904,7 @@ need to be benched before strategic decisions get cemented.
 | MQ3G256 (uniform 3-bit, "mq3-rtn") | 3.25 | `~/.hipfire/models/qwen3.5-9b.mq3` exists | — | **MEASURED §1.4** — 0.5449 (gfx1151, kv-q8, n=256) |
 | MQ3G256 + AWQ + GPTQ | 3.25 | quant produced via stage-A F2 + stage-B GPTQ | — | **MEASURED §1.4** — 0.1967 (gfx1151, kv-q8, n=256) |
 | MQ3G256-Lloyd (3-bit + per-block Lloyd-Max 8-entry FP16 codebook) | 3.50 | `~/.hipfire/models/qwen3.5-9b.mq3-lloyd` exists | — | **NOT MEASURED** |
-| MQ4G256-Lloyd (4-bit + Lloyd codebook, prefill kernel) | ~4.5 | not quantized | PR [#197](https://github.com/Kaden-Schutt/hipfire/pull/197) (`feat/issue-182-mq4-lloyd`, open) | **NOT MEASURED** |
+| MQ4G256-Lloyd (4-bit + Lloyd codebook, prefill kernel) | ~4.5 | not quantized | PR [#197](https://github.com/warpfront/hipfire/pull/197) (`feat/issue-182-mq4-lloyd`, open) | **NOT MEASURED** |
 | MQ2G256-Lloyd (2-bit + Lloyd codebook) | ~2.5 | check `~/.hipfire/models/` | — | **NOT MEASURED** |
 
 ### 4A.2 Lloyd-transform uplift — investigation note
@@ -942,7 +942,7 @@ how non-uniform the post-FWHT distribution is.
 
 ### 4A.3 How to measure mq4-lloyd (gated on PR #197)
 
-PR `Kaden-Schutt/hipfire#197` (`feat/issue-182-mq4-lloyd`, OPEN) ships
+PR `warpfront/hipfire#197` (`feat/issue-182-mq4-lloyd`, OPEN) ships
 the MQ4-Lloyd WMMA prefill kernels. To measure mq4-lloyd KLD without
 merging:
 
@@ -951,7 +951,7 @@ merging:
 git checkout -b backup-feat-mq-v2 feat/mq-v2-quant-format
 
 # Fetch + check out the PR
-gh pr checkout 197 -R Kaden-Schutt/hipfire
+gh pr checkout 197 -R warpfront/hipfire
 
 # Quantize a candidate
 cargo run --release -p hipfire-quantize -- \
@@ -992,7 +992,7 @@ SHA in the row's "Notes" field (e.g. "engine=PR#197@<sha>").
 - **2026-05-13 PM — Cross-engine KLD-vs-HF reframed: absolute is invalid; use Δ-above-own-Q8.** First-order independence of {weight-quant noise, engine floor, embedding noise} makes `(KLD(quant) − KLD(Q8))` cancel engine + embedding terms within each engine, yielding pure quantizer cost. Cross-engine claim is then `Δ_hipfire(MQ4) vs Δ_llamacpp(Q4_K_M)`, not absolute KLDs vs HF. See TL;DR.
 - **2026-05-13 PM — Hipfire architecture-dependent floor: refined after Tier-3 measurement.** Original framing: "DeltaNet amplifies bf16-cast drift ~8×" (Q3-0.6B dense Q8 0.0098 vs Q3.5-0.8B DeltaNet Q8 0.0796 on Tier-2). Refined: that 8× ratio conflated two effects — (a) the Tier-2 FP32-vs-bf16 precision-class mismatch (now closed by PR-#248 Tier-3, see next finding) and (b) genuine DeltaNet recurrence drift accumulation. On Tier-3, Q3.5-0.8B DeltaNet Q8 floor is **0.0041** (not 0.0796), and Q3.5-9B DeltaNet Q8 floor is **0.0173**. The per-layer DeltaNet amplification is real but ~1.20× per additional LA layer (4.2× over the 8 extra layers from 24-layer 0.8B to 32-layer 9B), much smaller than the Tier-2 phantom 8× factor. The "engine floor" is more precisely "DeltaNet recurrence amplifies hipfire-vs-HF dtype mismatch, with magnitude proportional to the precision-class gap" — Tier-3 closes the gap and reduces the absolute floor accordingly.
 - **2026-05-13 PM — MQ6+Q8conv1d is hipfire's first format competitive with llama.cpp K-quants absolute KLD.** gfx1151 measurement: 6.5 bpw KLD 0.0568 / PPL 9.281 — matches Llama.cpp UD-Q4_K_XL at +1.2 bpw cost, beats Q4_K_M by 2.2×. PPL only +1% above Tier-3 Q8 floor. **Viable shipping format for "high-quality 4-5 bpw" target.** Cross-engine Δ-above-own-Q8 at 6-bit: 0.040 vs 0.009 = 4.4× — same penalty ratio as 4-bit (1.86×), confirming the gap is format-level (per-block scale fitting, group size, asymmetric vs symmetric), not bpw-specific.
-- **2026-05-13 PM — `--kmap-dense --kmap-mode 2` produces NaN logits on gfx1100 only — gfx1151 works.** Filed as [#249](https://github.com/Kaden-Schutt/hipfire/issues/249), originally framed as a unconditional dispatch bug. **Revised 2026-05-14** after gfx1151 agent successfully measured the same `mq4-kmd2 + Q8 conv1d` quant at n=512 and got KLD 0.1613 / PPL 9.172 (see §1.1g) — the dispatch correctly handles mixed MQ4/MQ6 on RDNA3.5 (Strix Halo). gfx1100 (RDNA3) still hits the NaN on the same .hfq file: must be a WMMA-dispatch-path-specific issue with the (MQ4 gate/up, MQ6 down) combination that doesn't manifest on gfx1151's dispatcher. Issue #249 needs updating to "kmd2 dispatch NaN is gfx1100-specific; mq4-kmd2 + Q8 conv1d ships fine for gfx1151 users today." **Shipping note:** mq4-kmd2 + Q8 conv1d at ~5.04 bpw is a Pareto-frontier 5-bit recipe (see §1.1g) — but gated on the gfx1100 dispatch fix before it can be the universal default 5-bit format.
+- **2026-05-13 PM — `--kmap-dense --kmap-mode 2` produces NaN logits on gfx1100 only — gfx1151 works.** Filed as [#249](https://github.com/warpfront/hipfire/issues/249), originally framed as a unconditional dispatch bug. **Revised 2026-05-14** after gfx1151 agent successfully measured the same `mq4-kmd2 + Q8 conv1d` quant at n=512 and got KLD 0.1613 / PPL 9.172 (see §1.1g) — the dispatch correctly handles mixed MQ4/MQ6 on RDNA3.5 (Strix Halo). gfx1100 (RDNA3) still hits the NaN on the same .hfq file: must be a WMMA-dispatch-path-specific issue with the (MQ4 gate/up, MQ6 down) combination that doesn't manifest on gfx1151's dispatcher. Issue #249 needs updating to "kmd2 dispatch NaN is gfx1100-specific; mq4-kmd2 + Q8 conv1d ships fine for gfx1151 users today." **Shipping note:** mq4-kmd2 + Q8 conv1d at ~5.04 bpw is a Pareto-frontier 5-bit recipe (see §1.1g) — but gated on the gfx1100 dispatch fix before it can be the universal default 5-bit format.
 - **2026-05-13 PM — MQ4-Lloyd doesn't help at 9B 4-bit.** n=512 q8-KV measurement (gfx1151) gave KLD 0.3114 / PPL 9.085, essentially tied with mq4-base under q8-KV (estimated converged at 0.27-0.32 from §1.1 + KV-normalization). Lloyd codebook costs +0.66 bpw avg (file size 6.06 GB vs mq4-base 5.31 GB) for null KLD improvement. Confirms §4A.2 prediction: FWHT-256 Gaussianizes per-block distribution, removing the heavy-tail Lloyd is designed to attack. **Active calibration roadmap should drop MQ4-Lloyd**; MQ3-Lloyd remains theoretically interesting (uniform 3-bit is on the cliff edge where heavy-tail loss matters most) and untested.
 - **2026-05-13 PM — Per-tensor quant-contribution smoke + n=512 confirmation (9B q8-KV).** Quantized 9B MQ4 with `HIPFIRE_QUANTIZE_LM_HEAD_Q8=1` / `HIPFIRE_QUANTIZE_CONV_Q8=1` / `HIPFIRE_QUANTIZE_CONV_F16=1` (env vars added in `crates/hipfire-quantize/src/main.rs` lines 4055-4084).
   - **n=20 smoke (q8-KV prefill, 9B, gfx1100):** mq4-base 0.3182; mq4-q8lmhead 0.3083 (−3.1% KLD); **mq4-q8conv1d 0.2360 (−25.8% KLD)**; mq4-f16conv1d 0.2388; mq4-f16conv1d-q8lmhead 0.2293.

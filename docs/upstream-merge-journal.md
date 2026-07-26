@@ -1,7 +1,7 @@
 # Upstream Merge Journal — feature/dispatch-unification
 
 **Date:** 2026-06-05  
-**Upstream remote:** https://github.com/Kaden-Schutt/hipfire.git  
+**Upstream remote:** https://github.com/warpfront/hipfire.git  
 **Upstream/master HEAD:** `02634f4c` (same as our local master — fully in sync)  
 **Our branch HEAD:** `715f966c` refactor(dispatch): route ParoQ4G128 through per-op gemv path (Phase 2c)  
 **Commits behind upstream/master:** 0  

@@ -8,8 +8,8 @@ authors:
     family-names: Schutt
     email: kaden@hipfire.dev
     affiliation: Independent
-repository-code: 'https://github.com/Kaden-Schutt/hipfire'
-url: 'https://github.com/Kaden-Schutt/hipfire'
+repository-code: 'https://github.com/warpfront/hipfire'
+url: 'https://github.com/warpfront/hipfire'
 abstract: >-
   hipfire is a Rust-native LLM inference engine for AMD RDNA / CDNA
   GPUs. It targets the full RDNA1 -> RDNA4 family (plus CDNA where

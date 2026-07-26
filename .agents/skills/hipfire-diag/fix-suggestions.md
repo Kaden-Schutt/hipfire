@@ -189,7 +189,7 @@ Do not claim a tok/s regression from a single cold `test_inference` sample.
 1. Re-run `.agents/skills/hipfire-diag/run-diagnostics.sh` and keep full JSON.
 2. If inventory is green → `.agents/skills/hipfire-autoheal/triage.sh`.
 3. Still stuck → GitHub issue with diag JSON + `rocminfo` gfx name +
-   repro steps: https://github.com/Kaden-Schutt/hipfire/issues
+   repro steps: https://github.com/warpfront/hipfire/issues
 
 Do not require retired `scripts/coherence-gate-*.sh` batteries as a
 diagnostic exit criterion ([docs/VALIDATION.md](../../../docs/VALIDATION.md)).

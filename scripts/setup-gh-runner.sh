@@ -9,14 +9,14 @@
 # each run). Idempotent: re-running stops/uninstalls the old service and reconfigures.
 #
 # Mint a registration token first (repo admin):
-#   RUNNER_TOKEN="$(gh api -X POST repos/Kaden-Schutt/hipfire/actions/runners/registration-token --jq .token)"
+#   RUNNER_TOKEN="$(gh api -X POST repos/warpfront/hipfire/actions/runners/registration-token --jq .token)"
 # Then, ON the target box:
 #   RUNNER_TOKEN=<token> bash scripts/setup-gh-runner.sh <name> <labels> [work_dir]
 # e.g.
 #   RUNNER_TOKEN=... bash scripts/setup-gh-runner.sh hipx-gpu gfx1100,gfx1151
 set -euo pipefail
 
-REPO_URL="https://github.com/Kaden-Schutt/hipfire"
+REPO_URL="https://github.com/warpfront/hipfire"
 NAME="${1:?runner name, e.g. hipx-gpu}"
 LABELS="${2:?comma-separated labels, e.g. gfx1100,gfx1151}"
 WORK="${3:-_work}"

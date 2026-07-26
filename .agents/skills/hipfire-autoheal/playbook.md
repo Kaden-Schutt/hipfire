@@ -369,7 +369,7 @@ Do not kill unknown PIDs without user confirmation of what they are.
    daemon required for env experiments).
 3. Escalate to GitHub with full `triage.sh` output, `rocminfo` gfx line,
    repro steps, expected vs actual, and `tail -n 100 ~/.hipfire/serve.log`.
-   Repo: https://github.com/Kaden-Schutt/hipfire/issues
+   Repo: https://github.com/warpfront/hipfire/issues
 
 Do not claim kernel/forward correctness from serve success alone. Pick the
 route in [`docs/VALIDATION.md`](../../../docs/VALIDATION.md).

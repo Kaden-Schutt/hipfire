@@ -21,7 +21,7 @@ use thiserror::Error;
 
 pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_REGISTRY_URL: &str =
-    "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/registry/v1.json";
+    "https://raw.githubusercontent.com/warpfront/hipfire/master/registry/v1.json";
 pub const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_millis(3500);
 const BUNDLED_REGISTRY: &str = include_str!("../../../registry/v1.json");

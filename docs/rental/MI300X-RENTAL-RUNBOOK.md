@@ -115,7 +115,7 @@ require it). Get one at https://huggingface.co/settings/tokens.
 export HF_TOKEN="hf_..."  # your token
 
 # Fetch just the bootstrap script (avoids needing a full clone yet)
-curl -sL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/worktree-awq-raw-sumsq-converter/scripts/mi300x_bootstrap.sh \
+curl -sL https://raw.githubusercontent.com/warpfront/hipfire/worktree-awq-raw-sumsq-converter/scripts/mi300x_bootstrap.sh \
     -o /tmp/mi300x_bootstrap.sh
 chmod +x /tmp/mi300x_bootstrap.sh
 ```

@@ -53,7 +53,7 @@ the case we want filed.
 ### Setup
 
 ```bash
-git clone https://github.com/Kaden-Schutt/hipfire
+git clone https://github.com/warpfront/hipfire
 cd hipfire
 cargo build --release --features deltanet --example daemon -p hipfire-runtime
 cargo build --release --features deltanet --example test_kernels -p hipfire-runtime

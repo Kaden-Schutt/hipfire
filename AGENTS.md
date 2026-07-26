@@ -413,7 +413,7 @@ the draft but DFlash isn't firing" pitfall.
 
 DDTree on gfx1100 is currently a **structural perf regression** —
 the linearization-slot RoPE phase delta skew at FA layers (commit
-[39aa358](https://github.com/Kaden-Schutt/hipfire/commit/39aa358))
+[39aa358](https://github.com/warpfront/hipfire/commit/39aa358))
 makes our tree path slower than our linear path. Lucebox's DDTree
 works on RTX 3090; ours doesn't (yet) on gfx1100.
 
