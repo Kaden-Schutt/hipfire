@@ -1,0 +1,6 @@
+[
+  {
+    "genre": "code",
+    "prompt": "Design a concrete, production-grade architecture for a Rust command-line tool that scans very large directory trees, detects duplicate files, supports incremental persistent state, and safely plans deletions. Explain the crate layout, data flow, concurrency model, error handling, storage schema, and testing strategy in enough detail for an engineer to begin implementation."
+  }
+]
