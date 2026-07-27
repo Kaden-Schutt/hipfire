@@ -523,11 +523,11 @@ impl KernelCompiler {
 
         let extra = extra_flags;
         let per_kernel = Self::per_kernel_flags(source);
-        let mut args: Vec<String> = vec![
-            "--genco".into(),
-            format!("--offload-arch={arch}"),
-            "-O3".into(),
-        ];
+        // Radiowave owns the policy boundary between HIP source and
+        // LLVM/AMDGPU: it emits --genco/--offload-arch/-O3, injects the
+        // reviewed lowering header, and inspects the emitted code object.
+        // Everything hipfire adds on top is passed through as extra args.
+        let mut args: Vec<String> = Vec::new();
         // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
         // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
         // fails with "file not found". Add well-known candidates as -I flags;
@@ -567,25 +567,48 @@ impl KernelCompiler {
                 .collect::<Vec<_>>();
             eprintln!("  {name}: per-kernel flags: {}", flags.join(" "));
         }
-        args.push("-o".into());
-        args.push(obj_path.to_str().unwrap().into());
-        args.push(src_path.to_str().unwrap().into());
+        // Radiowave adds -mwavefrontsize64 itself from the request, so lift it
+        // out of the passthrough flags rather than passing it twice.
+        let wavefront = if args.iter().any(|f| f == "-mwavefrontsize64") {
+            radiowave::Wavefront::Wave64
+        } else {
+            radiowave::Wavefront::Wave32
+        };
+        args.retain(|f| f != "-mwavefrontsize64");
 
-        let mut cmd = Command::new(hipcc_bin);
-        cmd.args(&args);
+        let mut request = radiowave::CompileRequest::new(src_path, obj_path, arch)
+            .wavefront(wavefront)
+            .hipcc(hipcc_bin);
+        request.extra_args = args.iter().map(std::ffi::OsString::from).collect();
         if let Some(root) = rocm_env_root {
-            cmd.env("ROCM_PATH", root);
+            request = request.env("ROCM_PATH", root);
         }
-        let output = cmd
-            .output()
-            .map_err(|e| hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}")))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("hipcc compilation failed for {name}:\n{stderr}"),
-            ));
+        let artifact = radiowave::Compiler
+            .compile(&request)
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("radiowave failed for {name}: {e}")))?;
+
+        // The resource contract that produced the certified code objects:
+        // a kernel that spills or takes a private segment cannot be dispatched
+        // by the GFX10/GFX11 retained-PM4 path, which fails closed on scratch.
+        // Surface it at compile time instead of as a replay fallback later.
+        if let Some(inspection) = artifact.inspection.as_ref() {
+            for kernel in &inspection.kernels {
+                if kernel.vgpr_spill_count != 0
+                    || kernel.sgpr_spill_count != 0
+                    || kernel.private_segment_fixed_size != 0
+                {
+                    eprintln!(
+                        "  [radiowave] {}: vgpr={} spills={}/{} scratch={}B \
+                         — retained PM4 cannot dispatch a kernel with scratch",
+                        kernel.name,
+                        kernel.vgpr_count,
+                        kernel.vgpr_spill_count,
+                        kernel.sgpr_spill_count,
+                        kernel.private_segment_fixed_size,
+                    );
+                }
+            }
         }
         Ok(())
     }
