@@ -6,7 +6,7 @@
 //! Keeping this module small is intentional: it is an auditable dynamic-ABI
 //! boundary, not a replacement for generated HSA bindings.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
 use std::sync::Arc;
 

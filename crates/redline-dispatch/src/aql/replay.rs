@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use redline_rocr::abi;
 use redline_rocr::packet::{
-    BarrierAndPacket, KernelDispatchPacket, LaunchGeometry, PacketError, PacketImage,
-    BARRIER_DEPENDENCY_CAPACITY,
+    BARRIER_DEPENDENCY_CAPACITY, BarrierAndPacket, KernelDispatchPacket, LaunchGeometry,
+    PacketError, PacketImage,
 };
 use redline_rocr::{
-    CompletionSignal, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer, GpuDevice, HeaderPolicy,
-    KernargBuffer, KernargPool, Kernel, Pm4BuildError, QueueDepthReport, QueueSet, RuntimeError,
-    DEFAULT_WAIT_TIMEOUT,
+    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
+    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, Pm4BuildError, QueueDepthReport,
+    QueueSet, RuntimeError,
 };
 
 fn retained_queue_size(
