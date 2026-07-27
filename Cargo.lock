@@ -1746,6 +1746,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "radiowave"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1925,6 +1935,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "radiowave",
  "rayon",
  "redline-dispatch",
 ]
