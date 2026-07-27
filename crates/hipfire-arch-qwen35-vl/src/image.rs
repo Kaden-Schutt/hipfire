@@ -9,10 +9,76 @@
 use std::path::Path;
 
 /// Maximum total pixel count, checked from format-header dimensions BEFORE
-/// the pixel buffer is allocated (decompression bomb guard). 4M pixels is
-/// well above `smart_resize`'s `max_pixels` target of ~1M but caps the
-/// pre-decode memory request from a malicious 50000×50000 PNG.
-const MAX_DIMENSION_PIXELS: usize = 4_000_000;
+/// the pixel buffer is allocated (decompression bomb guard). This is ONLY a
+/// bomb guard — it must stay well above [`VISION_MAX_PIXELS`], because any
+/// image between the two is legitimately handled by downscaling in
+/// [`smart_resize`], not by rejection.
+///
+/// It used to be 4M, which was the same order as the input budget and so
+/// *rejected* ordinary documents: a 300 DPI A4 scan is ~8.7 MP and was
+/// refused outright instead of being downscaled.
+///
+/// The value is the model's own `preprocessor_config.json`
+/// `size.longest_edge`, giving a clean contract: accept anything the model's
+/// config contemplates, then downscale to what our attention kernel can
+/// actually hold ([`VISION_MAX_PIXELS`]). That covers 300–400 DPI A4 scans
+/// (8.7–15.5 MP) while still rejecting a malicious 50000×50000 PNG (2500 MP)
+/// before any pixel buffer is allocated.
+const MAX_DIMENSION_PIXELS: usize = 16_777_216;
+
+/// Lower bound on resized total pixels, from the model's own
+/// `preprocessor_config.json` (`size.shortest_edge`). Images below this are
+/// upscaled. Previously hardcoded to `56*56 = 3136` — a stale Qwen2-VL
+/// constant — which produced a SMALLER patch grid than HF for small images
+/// (measured 2026-07-26: a 224×288 input gave hipfire 252 patches vs HF 320).
+const VISION_MIN_PIXELS: usize = 65_536;
+
+/// Upper bound on resized total pixels fed to the vision tower.
+///
+/// The model's `preprocessor_config.json` allows `size.longest_edge =
+/// 16_777_216`, but we CANNOT use that value: `vit_attention_f32` holds its
+/// per-query score row in LDS, sized `(N + block_size) * 4` bytes. With a
+/// 64 KB LDS budget and `block_size <= 256` that caps N at
+/// `65536/4 - 256 = 16_128` patches. At `patch_size = 16` each patch covers
+/// 256 px, so the hard ceiling is `16_128 * 256 = 4_128_768` px. We take
+/// 4.0 MP for margin (15_625 patches).
+///
+/// The previous value was `14*14*4*1280 = 1_003_520` — a Qwen2-VL patch-14
+/// constant that starved this patch-16 model of resolution. For dense
+/// document OCR that is the difference between ~10 px and ~20 px tall body
+/// text.
+///
+/// 2.0 MP is chosen from measurement, not from the ceiling. Sweep on the
+/// dense-table OCR page (gfx1201, OvisOCR2 q8, 2026-07-26):
+///
+/// | budget | visual tokens | vision encode | content recall |
+/// |--------|--------------:|--------------:|---------------:|
+/// | 1.0 MP |         1_019 |        2.61 s |            5/9 |
+/// | 2.0 MP |         1_947 |        7.76 s |        **8/9** |
+/// | 4.0 MP |         3_757 |       28.67 s |            5/9 |
+///
+/// Vision attention is O(N^2), so cost grows ~13x from 1->4 MP while quality
+/// peaks in the middle: 4 MP is both slower AND worse. Raising this further
+/// needs a tiled/flash vision attention kernel that does not keep all N
+/// scores in LDS; until then 2 MP is the quality optimum.
+///
+/// Override with `HIPFIRE_VL_MAX_PIXELS` for experiments; values above the
+/// LDS ceiling are clamped rather than trusted.
+const VISION_MAX_PIXELS: usize = 2_000_000;
+
+/// LDS-derived hard ceiling on patch count for `vit_attention_f32`.
+const VISION_LDS_MAX_PIXELS: usize = 4_128_768;
+
+/// Resolve the vision input pixel budget, honouring `HIPFIRE_VL_MAX_PIXELS`
+/// but never exceeding what the attention kernel's LDS can hold.
+fn vision_max_pixels() -> usize {
+    std::env::var("HIPFIRE_VL_MAX_PIXELS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map(|v| v.min(VISION_LDS_MAX_PIXELS))
+        .unwrap_or(VISION_MAX_PIXELS)
+}
 
 /// Smart resize matching HuggingFace Qwen2_5_VLImageProcessor.
 ///
@@ -66,8 +132,8 @@ fn preprocess_dynamic_image(
     let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
 
     let factor = patch_size * spatial_merge_size;
-    let min_pixels = 56 * 56;
-    let max_pixels = 14 * 14 * 4 * 1280;
+    let min_pixels = VISION_MIN_PIXELS;
+    let max_pixels = vision_max_pixels();
     let (final_h, final_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
 
     // HF's `Qwen2VLImageProcessorFast` uses PIL's BICUBIC (`resample=3`).
