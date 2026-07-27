@@ -579,6 +579,10 @@ impl KernelCompiler {
         let mut request = radiowave::CompileRequest::new(src_path, obj_path, arch)
             .wavefront(wavefront)
             .hipcc(hipcc_bin);
+        // hipfire's JIT has never passed -ffast-math. Radiowave defaults it on,
+        // and inheriting that would silently change the numerics of every
+        // kernel in the engine, so the port keeps hipfire's semantics.
+        request.fast_math = false;
         request.extra_args = args.iter().map(std::ffi::OsString::from).collect();
         if let Some(root) = rocm_env_root {
             request = request.env("ROCM_PATH", root);
