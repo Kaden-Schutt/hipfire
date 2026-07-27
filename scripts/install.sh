@@ -234,6 +234,19 @@ for node_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
         110501)         GPU_ARCH="gfx1151"; break ;;
         120000)         GPU_ARCH="gfx1200"; break ;;
         120001)         GPU_ARCH="gfx1201"; break ;;
+        *)
+            # The table above maps known-compatible steppings onto the base
+            # arch hipfire ships kernels for (110001 -> gfx1100, 100302 ->
+            # gfx1030), so it must stay authoritative. But an unlisted part
+            # previously fell through to "unknown" and prompted the user, even
+            # though gfx_target_version encodes the arch directly as
+            # major*10000 + minor*100 + stepping. Derive it so the report is
+            # accurate; the runtime still JITs per-arch.
+            if [ -n "$ver" ]; then
+                GPU_ARCH="gfx$(( ver / 10000 ))$(( (ver / 100) % 100 ))$(( ver % 100 ))"
+                break
+            fi
+            ;;
     esac
 done
 
@@ -245,7 +258,7 @@ fi
 # Fallback: ask user
 if [ "$GPU_ARCH" = "unknown" ]; then
     echo "  WARNING: Could not detect GPU architecture."
-    echo "  Supported: gfx906 (Vega 20), gfx908 (MI100), gfx1010 (5700 XT), gfx1030 (6800 XT), gfx1100 (7900 XTX), gfx1151 (Strix Halo), gfx1200 (R9700), gfx1201 (9070 XT)"
+    echo "  Supported: gfx906 (Vega 20), gfx908 (MI100), gfx1010 (5700 XT), gfx1030 (6800 XT), gfx1100 (7900 XTX), gfx1151 (Strix Halo), gfx1200 (RX 9060), gfx1201 (RX 9070 XT / Radeon AI PRO R9700)"
     GPU_ARCH=$(ask "  Enter your GPU arch [or Enter to skip]: " "unknown")
 fi
 echo "  GPU arch: $GPU_ARCH"
@@ -260,9 +273,21 @@ HIP_LIB=""
 # package installs only `libamdhip64.so.6` — the unversioned symlink ships
 # in `rocm-hip-devel` which most users don't have. So checking only `.so`
 # misses Fedora installs entirely.
-for dir in /opt/rocm/lib /opt/rocm/lib64 \
-           /usr/lib /usr/lib64 \
-           /usr/lib/x86_64-linux-gnu /usr/lib64/rocm; do
+# Candidate roots, most authoritative first. ROCM_PATH/HIP_PATH were not
+# consulted at all before, and only a literal /opt/rocm was probed — so a
+# perfectly good install at /opt/rocm/core-7.14 or /opt/rocm-6.4 reported
+# "HIP runtime not found" unless ldconfig happened to cover it. Mirrors
+# hipfire_config::rocm in the engine.
+hip_search_dirs() {
+    local root
+    for root in "${ROCM_PATH:-}" "${HIP_PATH%/hip}" /opt/rocm /opt/rocm-* /opt/rocm/core-*; do
+        [ -n "$root" ] && [ -d "$root" ] || continue
+        printf '%s\n' "$root/lib" "$root/lib64"
+    done
+    printf '%s\n' /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib64/rocm
+}
+
+for dir in $(hip_search_dirs); do
     for suffix in "" ".6" ".7" ".8"; do
         lib="$dir/libamdhip64.so${suffix}"
         if [ -f "$lib" ]; then
