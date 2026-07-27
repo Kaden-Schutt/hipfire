@@ -135,6 +135,63 @@ fn post_rotation_variant_paro_is_plain_mq_is_prerotated() {
     assert_eq!(dtype_post_rotation_variant(DType::MQ8G256), GemvVariant::Prerotated);
     assert_eq!(dtype_post_rotation_variant(DType::MQ4G128), GemvVariant::Prerotated);
     assert_eq!(dtype_post_rotation_variant(DType::HFQ4G256), GemvVariant::Plain);
+    assert_eq!(dtype_post_rotation_variant(DType::MFP3G32E8), GemvVariant::Plain);
+    assert_eq!(dtype_post_rotation_variant(DType::MFP2G32E8), GemvVariant::Plain);
+}
+
+#[test]
+fn every_rotated_dtype_has_deliberate_post_rotation_variant() {
+    use hipfire_dispatch::types::{
+        dtype_post_rotation_variant, dtype_rotation_plan, GemvVariant, RotationPlan,
+    };
+    use rdna_compute::DType;
+
+    fn deliberate_post_rotation_variant(dtype: DType) -> Option<GemvVariant> {
+        use DType::*;
+        use GemvVariant::*;
+
+        // Intentionally exhaustive: a new DType must be classified here instead
+        // of silently inheriting dtype_post_rotation_variant's Plain fallback.
+        match dtype {
+            MQ4G256 | MQ4G128 | MQ8G256 | MQ6G256 | MQ5G256 | MQ3G256 | MQ2G256
+            | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd
+            | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA => Some(Prerotated),
+            MFP3G32E8 | MFP2G32E8 | ParoQ4G128 => Some(Plain),
+            F32 | F16 | BF16 | Q4K | Q6K | Q8_0 | Q4F16G64 | Q4F16G32 | Q8HFQ
+            | HFQ4G256 | HFQ4G128 | HFQ3G256 | HFQ3G128 | HFP4G32 | HFQ2G256
+            | HFQ2G128 | HFQ6G256 | Raw => None,
+        }
+    }
+
+    use DType::*;
+    let all_dtypes = [
+        F32, F16, BF16, Q4K, Q6K, Q8_0, Q4F16G64, Q4F16G32, Q8HFQ,
+        HFQ4G256, HFQ4G128, HFQ3G256, HFQ3G128, MQ4G256, MQ4G128,
+        MQ8G256, MQ6G256, MQ5G256, MQ3G256, MQ2G256, MQ2G256Lloyd,
+        MQ3G256Lloyd, MQ4G256Lloyd, HFP4G32, MFP4G32, MFP4G32Lloyd,
+        MFP4G32P, MFP4G32E8, MFP4G32E8SOA, MFP3G32E8, MFP2G32E8,
+        HFQ2G256, HFQ2G128, HFQ6G256, ParoQ4G128, Raw,
+    ];
+
+    for dtype in all_dtypes {
+        let plan = dtype_rotation_plan(dtype);
+        match (plan, deliberate_post_rotation_variant(dtype)) {
+            (RotationPlan::None, None) => {}
+            (RotationPlan::None, Some(variant)) => {
+                panic!("DType::{dtype:?} deliberately expects {variant:?} but has no rotation")
+            }
+            (plan, None) => {
+                panic!(
+                    "DType::{dtype:?} gained rotation plan {plan:?}; classify its post-rotation variant"
+                )
+            }
+            (_, Some(expected)) => assert_eq!(
+                dtype_post_rotation_variant(dtype),
+                expected,
+                "DType::{dtype:?} has the wrong post-rotation GEMV variant"
+            ),
+        }
+    }
 }
 
 #[test]

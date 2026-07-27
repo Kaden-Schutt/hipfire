@@ -134,6 +134,9 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
+        // These formats are rotated, but only DeepSeek4's arch-private path has kernels
+        // for them. Generic `run_auto` is not a supported route.
+        MFP3G32E8 | MFP2G32E8 => GemvVariant::Plain,
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
             GemvVariant::Prerotated
