@@ -8,7 +8,23 @@ Measured 2026-07-27 on hipx / gfx1151 (Radeon 8060S, 103.1 GB, ROCR index 1,
 rocm-smi index 3, `/sys/class/drm/card1`). Model: MQ2R P3
 `/home/kaden/.cache/hipfire-surgery/deepseek-v4-flash.mq2r` (82,191,362,222 B).
 
+## READ THIS FIRST
+
+`.codeinsight+research/ds4-gfx1151-campaign/ledger.jsonl` (149 entries, active)
+is the authoritative record of what has been tried on this route. This brief was
+originally written without consulting it and contained a lever the ledger had
+already rejected the same day. Check it before proposing anything.
+
+See also
+[`docs/perf-checkpoints/2026-07-27-ds4-gfx1151-ar-roofline-amendment-1.md`](../perf-checkpoints/2026-07-27-ds4-gfx1151-ar-roofline-amendment-1.md).
+
 ## Established facts — do not re-derive
+
+**Product baseline is 28.079 tok/s** (settled screening, `auto`/retained-PM4
+arm, spread 0.149%) per the campaign ledger. The figures below are the
+IN-PROCESS `--ar-ref` reference — a micro, not a product claim. GPU-us savings
+have measured a ~3% transfer ratio to shipping throughput on this route; do not
+convert ms to tok/s without the settled product instrument.
 
 ```
 AR decode wall      35.08 ms/token (28.50 tok/s)  in-process, pos 2048
@@ -78,7 +94,16 @@ no kernel work.
 
 ## Kernel levers, ranked
 
-1. **Fusion of the small-kernel bucket — 3.02 ms, the only path past 191 GB/s.**
+1. ~~**Fusion of the small-kernel bucket — 3.02 ms, the only path past 191 GB/s.**~~
+   **REJECTED 2026-07-27 by the campaign ledger — do not pursue as written.**
+   Ledger entry `2026-07-27-gate-e-swa-compressor-product-rejection` removed 231
+   dispatches (2320 -> 2089): full-prefix micro +1.477% (495 GPU us saved),
+   settled product +0.041%. The micro magnitude agrees with the 1.77 us floor
+   below (231 x 1.77 = 409 us), so the floor is right and the INFERENCE was
+   wrong: "launch-count reduction is not the shipping bottleneck for these copy
+   kernels once the retained one-IB path is resident". A fusion that also removes
+   retained-path waits/acquires is a different, still-open candidate.
+   Original sizing retained below for reference only.
    1704 launches/step across 26 kernels, 3.85 us average, floor 1.77 us. 92% of
    the mass runs below ONE occupancy fill. A family runs exactly 1 or 8 waves on
    100% of dispatches: `fused_rmsnorm_mq_rotate_plain_nox` (86/step),
