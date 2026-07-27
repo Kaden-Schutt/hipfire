@@ -34107,7 +34107,29 @@ fn build_vl_mrope_ctx(
         eprintln!("[daemon/vl] mrope disabled ({why}) — falling back to 1D positions");
         None
     };
-    let start = prompt_ids.iter().position(|&t| t == image_pad_id)?;
+    // Cross-turn cursor continuity is NOT modelled: this context is built per
+    // request with prompt positions shifted by `base`, but HF would resume a
+    // later turn at `previous_max + 1` (i.e. `base` + the earlier turn's
+    // rope_delta), not at `base`. The multi-image-pad bail below only inspects
+    // THIS turn's `prompt_ids`, so it cannot catch an image in an earlier turn.
+    //
+    // The generate handler at daemon.rs:2434 force-resets `m.seq_pos = 0` (and
+    // clears `conversation_tokens`) whenever a VL request arrives with
+    // `seq_pos > 0` — "Force a reset so VL always starts from a clean KV
+    // state." So `base` is always 0 for a VL-with-image request and this guard
+    // is expected not to fire. It is here so that if that upstream reset is
+    // ever moved, weakened, or bypassed by a new VL entry point, we fail loudly
+    // to the 1D path instead of silently mis-positioning every token after the
+    // image.
+    if base > 0 {
+        return bail("base > 0: cross-turn mrope cursor continuity not modelled");
+    }
+    let Some(start) = prompt_ids.iter().position(|&t| t == image_pad_id) else {
+        // The daemon splices these pads itself a few lines above the call
+        // site, so `n_visual > 0` with no pad in the prompt is a real
+        // inconsistency, not an ordinary text-only request.
+        return bail("no <|image_pad|> in the prompt despite n_visual > 0");
+    };
     if start + n_visual > prompt_ids.len() {
         return bail("image span runs past the prompt");
     }
