@@ -44,6 +44,31 @@ CERTIFIED_PM4_POLICY = {
 }
 
 
+def pm4_policy_with_overrides(overrides):
+    """Apply explicit, reportable experiment overrides to certified PM4 policy."""
+    policy = dict(CERTIFIED_PM4_POLICY)
+    forbidden = {
+        "HIPFIRE_REPLAY_BACKEND",
+        "HIPFIRE_REPLAY_MANUAL_CAPTURE",
+        "HIPFIRE_REPLAY_TRANSPORT",
+    }
+    for item in overrides:
+        key, separator, value = item.partition("=")
+        if (
+            not separator
+            or not key.startswith("HIPFIRE_REPLAY_PM4_")
+            or key in forbidden
+            or not value
+        ):
+            raise ValueError(
+                "--pm4-policy-override expects "
+                "HIPFIRE_REPLAY_PM4_<NAME>=<VALUE>; backend, transport, and "
+                "manual-capture controls are not policy overrides"
+            )
+        policy[key] = value
+    return policy
+
+
 def backend_config_value(backend):
     """Map report-arm vocabulary to the typed replay config vocabulary."""
     return "redline" if backend == "auto" else backend
@@ -364,6 +389,7 @@ class Daemon:
         timeout: float,
         kv_mode: str,
         dpm_warmup_secs: float,
+        pm4_policy,
     ):
         self.timeout = timeout
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -383,7 +409,7 @@ class Daemon:
             HIPFIRE_GRAPH="1",
             HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
         )
-        env.update(CERTIFIED_PM4_POLICY)
+        env.update(pm4_policy)
         env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -434,6 +460,7 @@ def run_arm(args, backend):
         args.timeout,
         args.kv_mode,
         args.dpm_warmup_secs,
+        args.pm4_policy,
     )
     try:
         loaded = daemon.request(
@@ -444,6 +471,7 @@ def run_arm(args, backend):
                     "max_seq": args.max_seq,
                     "kv_mode": args.kv_mode,
                     "dflash_mode": "off",
+                    "dspark_mode": "off",
                 },
             }
         )
@@ -626,7 +654,22 @@ def main():
         "--expected-model-sha256",
         help="fail before loading the GPU when the model digest differs",
     )
+    parser.add_argument(
+        "--pm4-policy-override",
+        action="append",
+        default=[],
+        metavar="HIPFIRE_REPLAY_PM4_NAME=VALUE",
+        help=(
+            "explicit candidate-only override layered onto the certified PM4 "
+            "policy; repeat for multiple settings and inspect pm4_policy in "
+            "the output report"
+        ),
+    )
     args = parser.parse_args()
+    try:
+        args.pm4_policy = pm4_policy_with_overrides(args.pm4_policy_override)
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.settle_window < 3:
         parser.error("--settle-window must be at least 3")
@@ -675,7 +718,7 @@ def main():
         "dpm_warmup_secs": args.dpm_warmup_secs,
         "runs": args.runs,
         "transport": args.transport,
-        "pm4_policy": dict(CERTIFIED_PM4_POLICY),
+        "pm4_policy": dict(args.pm4_policy),
         "kv_mode": args.kv_mode,
         "hip": run_arm(args, "hip"),
         "auto": run_arm(args, "auto"),
