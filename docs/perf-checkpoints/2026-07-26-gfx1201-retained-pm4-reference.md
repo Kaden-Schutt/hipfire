@@ -18,6 +18,8 @@ own, not inferred.
 | RAS: GFX / SDMA | DISABLED / DISABLED | n/a |
 | CPU | Threadripper 9970X (family 26, Zen 5), 64 threads | Ryzen 9 3900X (family 23, Zen 2), 24 threads |
 | Kernel | 7.0.0-27-generic | 6.17.0-35-generic |
+| amdgpu driver | **in-tree** (`kernel/drivers/gpu/drm/amd/amdgpu`) | **in-tree** (same path) |
+| amdgpu version string | N/A (in-tree reports none) | N/A (in-tree reports none) |
 | ROCm | 7.14.0 | 7.14.0 |
 | HIP | 7.14.60850-0000000 | 7.14.60850-0000000 |
 | Code generator | AMD clang 23.0.0git `46fcb339fb61…` | AMD clang 23.0.0git `46fcb339fb61…` |
@@ -74,11 +76,28 @@ identity `[338,1,2,9662]`. Within-arm spread ≤0.43%; arms do not overlap.
 | Variable | hiptrx | k9lin | taniguchi | HUSRCF |
 |---|---|---|---|---|
 | VBIOS | `00158738` | consumer | **`00158742`** | unknown |
-| amdgpu build | — | — | `6.19.14.31400000` | unknown |
+| amdgpu driver | **in-tree**, no DKMS | **in-tree**, no DKMS | **`6.19.14.31400000`** = packaged DKMS | unknown |
 | Kernel | 7.0.0-27 | 6.17.0-35 | unknown | unknown |
 | CPU / platform | Zen 5 TR, 64t | **Zen 2 AM4, 24t** | Zen 4 AM5, 16t | unknown |
 | perf level / achieved clock | unknown at load | unknown at load | unknown | unknown |
 | RAS / ECC posture | UMC+parity on | n/a | unknown | unknown |
+
+### The driver difference is categorical, not a version delta
+
+Both our boxes load amdgpu from
+`/lib/modules/<ver>/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko.zst` with an
+empty `dkms status` — the in-tree kernel driver, which reports no version
+string, hence `amd-smi ... VERSION: N/A`. A reported version like
+`6.19.14.31400000` comes from the packaged out-of-tree ROCm DKMS driver.
+
+That is a different driver, not a newer one. amdgpu owns HSA queue
+management, command-processor programming, and doorbell/IB submission — the
+machinery the retained path depends on and that ordinary HIP dispatch exercises
+differently. On the evidence above (identical tape, identical `.text`, pinning
+excluded), driver provenance is a stronger candidate than VBIOS for a
+path-specific divergence.
+
+We have no in-house DKMS box, so we cannot test this ourselves.
 
 Two caveats on our own control, stated plainly:
 
