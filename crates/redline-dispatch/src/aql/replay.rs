@@ -11,8 +11,8 @@ use redline_rocr::packet::{
 };
 use redline_rocr::{
     CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
-    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, QueueDepthReport, QueueSet,
-    RuntimeError,
+    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, Pm4BuildError, QueueDepthReport,
+    QueueSet, RuntimeError,
 };
 
 fn retained_queue_size(
@@ -127,6 +127,40 @@ impl SingleQueuePm4Ib {
             commands.len_dwords(),
             None,
             None,
+        )
+    }
+
+    /// Build a retained tape instrumented with one GPU-clock write per
+    /// dispatch, for attribution rather than certification.
+    ///
+    /// The resulting tape has a different dword count and sequence hash than
+    /// the certified route, so it cannot satisfy a golden fixture — that is
+    /// inherent, not an oversight. Pair with [`replay_and_wait_dispatch_spans`].
+    pub fn create_dispatch_profiled(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        commands: &Gfx12Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        if commands.is_empty() {
+            return Err(ReplayError::EmptyGraph);
+        }
+        let slots = commands
+            .timestamp_slot_count()
+            .map_err(ReplayError::Pm4Build)?;
+        let mut timestamps = pool.allocate_executable_bytes(slots * 8)?;
+        timestamps.as_mut_bytes().fill(0);
+        let base = timestamps.address() as usize as u64;
+        let timed = commands
+            .with_per_dispatch_timestamps(base)
+            .map_err(ReplayError::Pm4Build)?;
+        let frequency_hz = device.gpu_timestamp_frequency_hz()?;
+        Self::create_encoded(
+            device,
+            pool,
+            &timed.as_bytes(),
+            timed.len_dwords(),
+            Some(timestamps),
+            Some(frequency_hz),
         )
     }
 
@@ -317,6 +351,47 @@ impl SingleQueuePm4Ib {
             last_end: end,
             frequency_hz,
         })
+    }
+
+    /// Replay once and return per-dispatch GPU-clock spans in nanoseconds.
+    ///
+    /// `spans[i]` is the interval from the timestamp written before dispatch
+    /// `i` to the one written after it, so the sum is the whole retained span
+    /// and the distribution shows whether a deficit is spread evenly across
+    /// dispatches or concentrated in a few.
+    ///
+    /// Requires a tape built by [`create_dispatch_profiled`]. A tape with only
+    /// the two bracketing timestamps yields a single span, which is what
+    /// [`replay_and_wait_profiled`] already reports.
+    pub unsafe fn replay_and_wait_dispatch_spans(&mut self) -> Result<Vec<u64>, ReplayError> {
+        let frequency_hz = self
+            .timestamp_frequency_hz
+            .ok_or(ReplayError::ProfilingUnavailable)?;
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner()? };
+        let bytes = self
+            .timestamps
+            .as_mut()
+            .ok_or(ReplayError::ProfilingUnavailable)?
+            .as_mut_bytes();
+        let ticks: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+            .collect();
+        if ticks.len() < 2 {
+            return Err(ReplayError::ProfilingUnavailable);
+        }
+        let mut spans = Vec::with_capacity(ticks.len() - 1);
+        for pair in ticks.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            // A zero or non-monotonic pair means the write did not land; report
+            // it rather than silently producing a plausible-looking number.
+            if start == 0 || end < start {
+                return Err(ReplayError::InvalidGpuTimestamp { start, end });
+            }
+            spans.push((end - start).saturating_mul(1_000_000_000) / frequency_hz);
+        }
+        Ok(spans)
     }
 
     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
@@ -512,8 +587,9 @@ impl PhasedMultiQueuePm4Ib {
             .any(|commands| !commands.ends_with_compute_idle())
         {
             return Err(ReplayError::PolicyShapeMismatch {
-                detail: "native PM4 semaphore publication requires every phase lane to end compute-idle"
-                    .to_owned(),
+                detail:
+                    "native PM4 semaphore publication requires every phase lane to end compute-idle"
+                        .to_owned(),
             });
         }
         let queue_count = phases.iter().map(Vec::len).max().unwrap();
@@ -525,15 +601,19 @@ impl PhasedMultiQueuePm4Ib {
         let parallel_phase_count = phases.iter().filter(|phase| phase.len() > 1).count();
         if parallel_phase_count == 1 {
             return Err(ReplayError::PolicyShapeMismatch {
-                detail: "native PM4 retained epochs require either zero or at least two parallel phases"
-                    .to_owned(),
+                detail:
+                    "native PM4 retained epochs require either zero or at least two parallel phases"
+                        .to_owned(),
             });
         }
-        let semaphore_bytes = (queue_count - 1)
-            .checked_mul(8)
-            .ok_or_else(|| ReplayError::PolicyShapeMismatch {
-                detail: format!("native PM4 semaphore count for {queue_count} queues overflowed"),
-            })?;
+        let semaphore_bytes =
+            (queue_count - 1)
+                .checked_mul(8)
+                .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                    detail: format!(
+                        "native PM4 semaphore count for {queue_count} queues overflowed"
+                    ),
+                })?;
         let mut semaphores = pool.allocate_executable_bytes(semaphore_bytes)?;
         semaphores.as_mut_bytes().fill(0);
         let semaphore_base = semaphores.address() as usize as u64;
@@ -549,11 +629,12 @@ impl PhasedMultiQueuePm4Ib {
                 streams[0].append_stream(&phase[0]);
                 continue;
             }
-            parallel_epoch = parallel_epoch.checked_add(1).ok_or_else(|| {
-                ReplayError::PolicyShapeMismatch {
-                    detail: "native PM4 parallel phase count exceeds u32".to_owned(),
-                }
-            })?;
+            parallel_epoch =
+                parallel_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                        detail: "native PM4 parallel phase count exceeds u32".to_owned(),
+                    })?;
             for lane in 1..phase.len() {
                 let (start, _) = semaphore_addresses(lane);
                 streams[lane].wait_memory_value(start, parallel_epoch);
@@ -601,11 +682,8 @@ impl PhasedMultiQueuePm4Ib {
             let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
             indirect.write_exact(&bytes)?;
             let completion = CompletionSignal::new(device)?;
-            let packet = PacketImage::pm4_indirect_buffer(
-                indirect.address(),
-                dwords,
-                completion.raw(),
-            )?;
+            let packet =
+                PacketImage::pm4_indirect_buffer(indirect.address(), dwords, completion.raw())?;
             timestamps.push(timestamp);
             indirects.push(indirect);
             completions.push(completion);
@@ -2870,6 +2948,9 @@ fn validate_nodes(
 pub enum ReplayError {
     Runtime(RuntimeError),
     Packet(PacketError),
+    /// PM4 stream construction failed. Only reachable from the diagnostic
+    /// per-dispatch timestamp path.
+    Pm4Build(Pm4BuildError),
     EmptyGraph,
     EmptyPhaseSet,
     EmptyTokenBatch,
@@ -2957,6 +3038,7 @@ impl fmt::Display for ReplayError {
         match self {
             Self::Runtime(error) => error.fmt(f),
             Self::Packet(error) => error.fmt(f),
+            Self::Pm4Build(error) => error.fmt(f),
             Self::EmptyGraph => write!(f, "cannot record an empty AQL graph"),
             Self::EmptyPhaseSet => write!(f, "two-queue replay requires at least one phase"),
             Self::EmptyTokenBatch => {

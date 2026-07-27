@@ -427,26 +427,14 @@ cmd_run() {
     # Evict locally-JIT'd blobs so the pinned ones are what actually load.
     rm -rf "${HIPFIRE_KERNEL_CACHE:-.hipfire_kernels}/$arch"
 
-    # Make the engine take the "no valid hash AND no compiler" branch so our
-    # blobs are used verbatim.
+    # Force the engine to treat the device compiler as absent.
     #
-    # Do NOT do this by deleting PATH entries: the ROCm bin directory holds the
-    # compilers AND rocminfo/rocm-smi, so dropping it breaks device detection
-    # and the bench hangs until its 1200s timeout. Instead SHADOW just the
-    # compiler names with stubs that exit non-zero. The engine's probe is
-    # `Command::new("hipcc").arg("--version")` and it keys off
-    # `status.success()`, so a failing stub is sufficient and everything else
-    # on PATH survives untouched.
-    local shim; shim="$(mktemp -d)"
-    SHIM_DIR="$shim"
-    local cc
-    for cc in "${DEVICE_COMPILERS[@]}"; do
-      printf '#!/bin/sh\nexit 1\n' > "$shim/$cc"
-      chmod +x "$shim/$cc"
-    done
-    env_prefix=(env "PATH=$shim:$PATH")
-    echo "  shadowed device compilers with failing stubs (${DEVICE_COMPILERS[*]})"
-    echo "  rocminfo/rocm-smi and the rest of PATH are left intact"
+    # This used to be done by shadowing compiler names on PATH, which worked
+    # while the probe was a bare `Command::new("hipcc")`. Resolved-root
+    # discovery now finds the compiler regardless of PATH, so shadowing
+    # silently recompiled instead of pinning. Use the explicit switch.
+    env_prefix=(env "HIPFIRE_NO_DEVICE_COMPILER=1")
+    echo "  HIPFIRE_NO_DEVICE_COMPILER=1 — engine will treat the compiler as absent"
     echo "  the engine will warn 'Output may be incorrect' — that is EXPECTED here"
     echo "  and is the confirmation that OUR code objects are executing."
   fi

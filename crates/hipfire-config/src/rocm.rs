@@ -210,6 +210,43 @@ pub fn device_compiler() -> Option<PathBuf> {
     DEVICE_COMPILERS.iter().find_map(|c| tool(c))
 }
 
+/// `ROCM_PATH` value a spawned device compiler needs, or `None` when the
+/// environment already sets it.
+///
+/// `hipcc` locates its own LLVM as `$ROCM_PATH/lib/llvm/bin/clang++`, and
+/// `ROCM_PATH` defaults to `/opt/rocm`. On an install rooted elsewhere —
+/// `/opt/rocm/core` on this fleet — `hipcc` is found on PATH, reports a
+/// correct `--version`, and then fails every compile with
+///
+///   sh: 1: /opt/rocm/lib/llvm/bin/clang++: not found
+///
+/// so `has_hipcc` is true and JIT is broken anyway. Resolving hipcc's path
+/// (see [`tool`]) is not sufficient; the child process needs the root too.
+///
+/// Returns `None` when `ROCM_PATH` is already set, so an explicit operator
+/// choice is never overridden.
+pub fn compiler_env_root() -> Option<PathBuf> {
+    if std::env::var_os("ROCM_PATH").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    root()
+}
+
+#[cfg(test)]
+mod compiler_env_tests {
+    use super::*;
+
+    #[test]
+    fn compiler_env_root_defers_to_an_explicit_rocm_path() {
+        // Not asserting the Some(..) branch: it depends on the host's real
+        // /opt/rocm layout. The contract that matters is that an operator's
+        // ROCM_PATH is never overridden.
+        if std::env::var_os("ROCM_PATH").is_some_and(|v| !v.is_empty()) {
+            assert!(compiler_env_root().is_none());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
