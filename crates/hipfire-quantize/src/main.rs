@@ -18,6 +18,7 @@ mod reap_overlay;
 use clap::Parser;
 use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
+use hipfire_quantize::scale_fit::{fit_mq4_affine, set_mq4_scale_search};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -184,6 +185,12 @@ struct QuantizeArgs {
     /// Ingest only tensors whose names start with this prefix.
     #[arg(long, value_name = "PREFIX")]
     include_prefix: Option<String>,
+
+    /// Restore the legacy min/max MQ4 scale fit instead of the MSE clip
+    /// search. Only needed to byte-reproduce artifacts quantized before the
+    /// search landed, or to A/B its quality effect.
+    #[arg(long)]
+    no_mq4_scale_search: bool,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected
@@ -858,44 +865,163 @@ pub(crate) fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
+///
+/// The affine bounds come from `fit_mq4_affine` (MSE clip search); the wire
+/// format, group size and byte layout are unchanged, so this needs no kernel
+/// or loader change.
 pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 136;
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    for b in 0..n_blocks {
-        let start = b * group_size;
-        let end = (start + group_size).min(n);
+    output
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
 
-        // Copy group and pad to 256
-        let mut group = [0.0f32; 256];
-        let actual_len = end - start;
-        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            // Copy group and pad to 256
+            let mut group = [0.0f32; 256];
+            group[..end - start].copy_from_slice(&f32_data[start..end]);
 
-        // Apply FWHT rotation — this equalizes outliers across the group
-        cpu_fwht_256(&mut group, signs1, signs2);
+            // Apply FWHT rotation — this equalizes outliers across the group
+            cpu_fwht_256(&mut group, signs1, signs2);
 
-        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let (min_val, max_val) = fit_mq4_affine(&group);
 
-        let range = max_val - min_val;
-        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
-        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+            let range = max_val - min_val;
+            let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+            let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
 
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
-        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+            out_chunk[0..4].copy_from_slice(&scale.to_le_bytes());
+            out_chunk[4..8].copy_from_slice(&min_val.to_le_bytes());
 
-        for i in 0..128 {
-            let lo_q = ((group[2 * i] - min_val) * inv_scale + 0.5) as u8;
-            let hi_q = ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8;
-            output[out_off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+            for i in 0..128 {
+                let lo_q = ((group[2 * i] - min_val) * inv_scale + 0.5) as u8;
+                let hi_q = ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8;
+                out_chunk[8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+            }
+        });
+
+    output
+}
+
+#[cfg(test)]
+mod mq4_wire_tests {
+    use super::*;
+
+    /// Deterministic Gaussian sample via Box-Muller over a small LCG.
+    fn gaussian(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed;
+        let mut next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((s >> 8) as f32 / 16777216.0).clamp(1e-7, 1.0 - 1e-7)
+        };
+        (0..n)
+            .map(|_| {
+                let (u1, u2) = (next(), next());
+                (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+            })
+            .collect()
+    }
+
+    /// A constant block has zero range: the degenerate path (scale 1.0,
+    /// all-zero nibbles) must survive the scale search unchanged.
+    #[test]
+    fn degenerate_constant_block_keeps_legacy_encoding() {
+        let signs1 = gen_fwht_signs(0x9E37_79B9, 256);
+        let signs2 = gen_fwht_signs(0x85EB_CA6B, 256);
+        let out = quantize_mq4g256(&[0.0f32; 256], &signs1, &signs2);
+        assert_eq!(out.len(), 136);
+        assert_eq!(f32::from_le_bytes(out[0..4].try_into().unwrap()), 1.0);
+        assert!(out[8..136].iter().all(|&b| b == 0));
+    }
+
+    /// The wire format is untouched by the scale search: 136 B per 256
+    /// weights, 8 B affine header then 128 B of nibbles.
+    #[test]
+    fn wire_layout_is_unchanged() {
+        let signs1 = gen_fwht_signs(0x9E37_79B9, 256);
+        let signs2 = gen_fwht_signs(0x85EB_CA6B, 256);
+        for blocks in [1usize, 3, 8] {
+            let data = gaussian(256 * blocks, 42 + blocks as u32);
+            let out = quantize_mq4g256(&data, &signs1, &signs2);
+            assert_eq!(out.len(), 136 * blocks, "{blocks} blocks");
         }
     }
 
-    output
+    /// End-to-end proof that the scale search lowers real reconstruction error
+    /// through the production encoder.
+    ///
+    /// Deliberately does NOT touch `set_mq4_scale_search`: that flag is
+    /// process-wide, and mutating it here races other tests in this binary
+    /// that encode MQ4 (notably `reap_overlay::tests`). The legacy encoding is
+    /// recomputed inline instead, which is also a stronger check — it compares
+    /// against an independent implementation rather than the same code path
+    /// under a different flag. Flag semantics are covered in
+    /// `scale_fit::tests`, whose lib test binary runs in its own process.
+    #[test]
+    fn search_lowers_reconstruction_error_end_to_end() {
+        let signs1 = gen_fwht_signs(0x9E37_79B9, 256);
+        let signs2 = gen_fwht_signs(0x85EB_CA6B, 256);
+        let blocks = 16;
+        let data = gaussian(256 * blocks, 99);
+        let searched = quantize_mq4g256(&data, &signs1, &signs2);
+
+        // Decode a 136-B block back to the rotated domain.
+        let decode = |blk: &[u8]| -> Vec<f32> {
+            let scale = f32::from_le_bytes(blk[0..4].try_into().unwrap());
+            let min = f32::from_le_bytes(blk[4..8].try_into().unwrap());
+            (0..256)
+                .map(|i| {
+                    let byte = blk[8 + i / 2];
+                    let q = if i % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                    q as f32 * scale + min
+                })
+                .collect()
+        };
+
+        let (mut err_searched, mut err_legacy) = (0.0f64, 0.0f64);
+        let mut differs = false;
+        for b in 0..blocks {
+            let mut g = [0.0f32; 256];
+            g.copy_from_slice(&data[b * 256..b * 256 + 256]);
+            cpu_fwht_256(&mut g, &signs1, &signs2);
+
+            // Independent legacy min/max encode + decode.
+            let lo = g.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = g.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let range = hi - lo;
+            let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+            let inv = if range > 0.0 { 1.0 / scale } else { 0.0 };
+            let mut legacy = vec![0u8; 136];
+            legacy[0..4].copy_from_slice(&scale.to_le_bytes());
+            legacy[4..8].copy_from_slice(&lo.to_le_bytes());
+            for i in 0..128 {
+                let l = ((g[2 * i] - lo) * inv + 0.5) as u8;
+                let h = ((g[2 * i + 1] - lo) * inv + 0.5) as u8;
+                legacy[8 + i] = l.min(15) | (h.min(15) << 4);
+            }
+
+            let blk = &searched[b * 136..b * 136 + 136];
+            differs |= blk != legacy.as_slice();
+            for (i, (&s, &l)) in decode(blk).iter().zip(decode(&legacy).iter()).enumerate() {
+                err_searched += ((g[i] - s) as f64).powi(2);
+                err_legacy += ((g[i] - l) as f64).powi(2);
+            }
+        }
+
+        assert!(differs, "search must actually change the emitted bytes");
+        let gain_db = 10.0 * (err_legacy / err_searched).log10();
+        assert!(
+            gain_db > 0.5,
+            "end-to-end encode gained only {gain_db:.3} dB over min/max; expected > 0.5 dB"
+        );
+    }
 }
 
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
@@ -6217,6 +6343,11 @@ fn run_gguf_pipeline(
 
 fn main() {
     let args = QuantizeArgs::parse();
+
+    if args.no_mq4_scale_search {
+        set_mq4_scale_search(false);
+        eprintln!("MQ4 scale fit: legacy min/max (--no-mq4-scale-search)");
+    }
 
     // Bound rayon's pool to 80% of cores (default cap; override with --threads N
     // or HIPFIRE_QUANT_THREADS env). Quantization is CPU-bound and saturates

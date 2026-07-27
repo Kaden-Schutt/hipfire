@@ -6,3 +6,4 @@ pub mod float16;
 pub mod gptq;
 pub mod hessian_io;
 pub mod safetensors_file;
+pub mod scale_fit;
