@@ -4824,6 +4824,22 @@ pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str =
 pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
 
+/// 3D mrope, half-split convention. Twin of ROPE_PARTIAL_HALFSPLIT_SRC,
+/// differing only in which position each frequency index reads: band mapping
+/// is H if (d%3==1 && d < 3*sec_h), W if (d%3==2 && d < 3*sec_w), else T
+/// (the interleaved [THWTHW...TT] layout HF's apply_interleaved_mrope
+/// produces). See `hipfire_arch_qwen35_vl::mrope::mrope_axis_for_freq` for
+/// the CPU-side spec this arithmetic must match exactly.
+#[cfg(feature = "deltanet")]
+pub const ROPE_MROPE_HALFSPLIT_SRC: &str =
+    include_str!("../../../kernels/src/rope_mrope_halfsplit.hip");
+
+/// Batched twin of ROPE_MROPE_HALFSPLIT_SRC — see that const for the
+/// band-mapping rationale.
+#[cfg(feature = "deltanet")]
+pub const ROPE_MROPE_HALFSPLIT_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_mrope_halfsplit_batched.hip");
+
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
 /// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.
 /// out[c] = w[0]*x[c] + w[1]*state[c][0] + w[2]*state[c][1] + w[3]*state[c][2]
