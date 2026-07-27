@@ -256,7 +256,20 @@ impl Pm4Commands {
                 architecture: Pm4Architecture::Gfx12,
                 ..
             } => unreachable!("gfx12 never uses the legacy PM4 command variant"),
-            Self::Gfx12(commands) => SingleQueuePm4Ib::create_profiled(device, pool, commands),
+            Self::Gfx12(commands) => {
+                // HIPFIRE_REDLINE_DISPATCH_PROFILE=1 builds a tape carrying one
+                // GPU-clock write per dispatch, so a machine whose retained path
+                // underperforms can report WHERE the time goes instead of only
+                // how much there is. The instrumented tape necessarily has a
+                // different dword count and sequence hash, so such a run cannot
+                // satisfy a golden fixture — it is a diagnostic, not a
+                // certification.
+                if dispatch_profile_enabled() {
+                    SingleQueuePm4Ib::create_dispatch_profiled(device, pool, commands)
+                } else {
+                    SingleQueuePm4Ib::create_profiled(device, pool, commands)
+                }
+            }
         }
         .map_err(|error| error.to_string())?;
         if let Some(cu_mask) = cu_mask {
@@ -1711,6 +1724,45 @@ impl PreparedLinearAqlReplay {
     }
 }
 
+/// True when the per-dispatch timestamp diagnostic is requested.
+pub fn dispatch_profile_enabled() -> bool {
+    std::env::var_os("HIPFIRE_REDLINE_DISPATCH_PROFILE")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Summarise per-dispatch spans so a slow machine reports a distribution
+/// rather than a single throughput number.
+///
+/// The shape is the diagnostic: overhead spread evenly across every dispatch
+/// points at per-dispatch cost (fetch, launch, submission), whereas a few
+/// dispatches dominating points at specific stalls — a barrier or a cache
+/// release. Those two have different causes and different fixes, and an
+/// end-to-end tok/s cannot tell them apart.
+fn report_dispatch_spans(spans: &[u64]) {
+    if spans.is_empty() {
+        return;
+    }
+    let mut sorted: Vec<u64> = spans.to_vec();
+    sorted.sort_unstable();
+    let total: u64 = sorted.iter().sum();
+    let pick = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
+    // Contribution of the slowest 5% — the number that separates "everything is
+    // slightly slow" from "a handful of dispatches dominate".
+    let tail_start = sorted.len() - sorted.len().div_ceil(20);
+    let tail: u64 = sorted[tail_start..].iter().sum();
+    eprintln!(
+        "[redline] dispatch spans n={} total={}us p50={}ns p90={}ns p99={}ns max={}ns \
+         slowest5%={:.1}% of total",
+        sorted.len(),
+        total / 1_000,
+        pick(0.50),
+        pick(0.90),
+        pick(0.99),
+        sorted[sorted.len() - 1],
+        100.0 * tail as f64 / total.max(1) as f64,
+    );
+}
+
 enum PreparedPm4Graph {
     Single(SingleQueuePm4Ib),
     Phased(PhasedMultiQueuePm4Ib),
@@ -1718,6 +1770,24 @@ enum PreparedPm4Graph {
 
 impl PreparedPm4Graph {
     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
+        // Report the per-dispatch distribution once per process. Emitting it
+        // every replay would bury the benchmark output; the shape is what
+        // matters and it is stable across replays.
+        if dispatch_profile_enabled() {
+            if let Self::Single(graph) = self {
+                static REPORTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: forwarded from this method's caller.
+                    match unsafe { graph.replay_and_wait_dispatch_spans() } {
+                        Ok(spans) => report_dispatch_spans(&spans),
+                        Err(error) => {
+                            eprintln!("[redline] dispatch-span capture failed: {error}")
+                        }
+                    }
+                }
+            }
+        }
         match self {
             Self::Single(graph) => unsafe { graph.replay_and_wait_profiled() },
             Self::Phased(graph) => unsafe { graph.replay_and_wait_profiled() },
