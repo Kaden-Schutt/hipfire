@@ -942,11 +942,11 @@ impl MtpSpecState {
             repeat_buf,
             draft_vocab_size,
             hypothetical,
-            compressed.then_some(
+            compressed.then(|| {
                 self.draft_vocab_inverse
                     .as_deref()
-                    .expect("compressed sampled MTP requires a host inverse vocabulary map"),
-            ),
+                    .expect("compressed sampled MTP requires a host inverse vocabulary map")
+            }),
         )
     }
 
