@@ -67,21 +67,30 @@ non-kernel gap         1.407                        —              1.41
                                                                    6.41 ms
 ```
 
-**Max kernel-side recovery = 6.41 ms -> 28.67 ms/token = 34.9 tok/s = 191 GB/s.
-200 GB/s requires 27.40 ms and is UNREACHABLE by kernel work**, because the
-dispatch floor alone (1704 small-kernel launches x 1.77 us) is 3.02 ms of that
-budget. Reaching 200 GB/s requires launching FEWER kernels, not faster ones.
+Max kernel-side recovery is 6.41 ms of GPU time. **Do NOT convert that to
+tok/s.** The ledger measured 495 GPU us of bit-exact saving producing +0.041%
+product throughput — a ~3% transfer ratio — so ms-to-tok/s arithmetic on this
+route is Exploratory at best. The earlier form of this section claimed
+"6.41 ms -> 34.9 tok/s = 191 GB/s, and reaching 200 GB/s requires launching
+FEWER kernels": the first half is unwarranted extrapolation and the second half
+is falsified (see lever 1).
 
 ## The biggest lever is BYTES, not kernels
 
 Dense is 65% of bytes/token at 4.25 bpw while experts run at 2.25 bpw.
 
 ```
-                dense/token  total/token  @162.7 GB/s (today's bandwidth)
-MFP4 E8 (now)     3.58 GB      5.48 GB     33.7 ms = 29.7 tok/s
-MFP3 dense        2.74         4.64        28.5    = 35.1 tok/s
-MQ2 dense         1.90         3.79        23.3    = 42.9 tok/s
+                dense/token  total/token   bytes removed vs today
+MFP4 E8 (now)     3.58 GB      5.48 GB      —
+MFP3 dense        2.74         4.64        -15.3%
+MQ2 dense         1.90         3.79        -30.8%
 ```
+
+Stated as BYTES, deliberately. The tok/s these imply (35.1 and 42.9 at today's
+bandwidth) are Exploratory arithmetic, not forecasts — but unlike a scheduling
+change, a byte reduction alters the work itself rather than its ordering, which
+is the one category the ledger's ~3% transfer finding does not obviously
+apply to. That is the argument for measuring it, not a claim about the result.
 
 Artifact already built and unbenchmarked:
 `/home/kaden/ds4-mfp3-p1-gptq-v1/standalone/deepseek-v4-flash-mfp3p1.mq2r`
