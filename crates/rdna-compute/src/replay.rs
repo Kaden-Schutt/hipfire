@@ -1726,7 +1726,7 @@ impl PreparedLinearAqlReplay {
 
 /// True when the per-dispatch timestamp diagnostic is requested.
 pub fn dispatch_profile_enabled() -> bool {
-    std::env::var_os("HIPFIRE_REDLINE_DISPATCH_PROFILE")
+    hipfire_config::developer_var_os("HIPFIRE_REDLINE_DISPATCH_PROFILE")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 

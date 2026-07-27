@@ -1509,7 +1509,7 @@ impl KernargPool {
             // which pool a machine selected, so two boxes reporting different
             // retained throughput can be compared on placement rather than
             // guessed at.
-            if std::env::var_os("HIPFIRE_REDLINE_POOL_DEBUG")
+            if hipfire_config::developer_var_os("HIPFIRE_REDLINE_POOL_DEBUG")
                 .is_some_and(|v| v != "0" && !v.is_empty())
             {
                 let mut size = 0_usize;

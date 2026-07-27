@@ -2269,6 +2269,28 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_REPLAY_MANUAL_CAPTURE",
         "Arm replay recording manually instead of using the model lifecycle."
     ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.pool_debug",
+        "replay_pool_debug",
+        false,
+        "HIPFIRE_REDLINE_POOL_DEBUG",
+        "Report which memory pool backs the retained indirect buffer."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.dispatch_profile",
+        "replay_dispatch_profile",
+        false,
+        "HIPFIRE_REDLINE_DISPATCH_PROFILE",
+        "Emit a GPU-clock write per dispatch and report the span distribution. \
+         Changes the tape identity, so an instrumented run cannot satisfy a golden fixture."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.compiler.no_device_compiler",
+        "no_device_compiler",
+        false,
+        "HIPFIRE_NO_DEVICE_COMPILER",
+        "Treat the device compiler as absent so pre-compiled code objects are used verbatim."
+    ),
     diagnostic_field!(
         "diagnostic.replay.pm4_min_parallel_width",
         "replay_pm4_min_parallel_width",

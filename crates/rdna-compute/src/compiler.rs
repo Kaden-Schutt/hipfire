@@ -230,7 +230,7 @@ impl KernelCompiler {
         // "pin these exact code objects" quietly recompile instead. Verified:
         // a pinned cross-machine run reported 0 recompiles while actually
         // executing locally-built blobs.
-        let compiler_disabled = std::env::var_os("HIPFIRE_NO_DEVICE_COMPILER")
+        let compiler_disabled = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER")
             .is_some_and(|v| v != "0" && !v.is_empty());
 
         let hipcc_out = if compiler_disabled {

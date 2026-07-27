@@ -1953,6 +1953,7 @@ dependencies = [
 name = "redline-rocr"
 version = "0.3.0"
 dependencies = [
+ "hipfire-config",
  "libloading",
  "proptest",
 ]
