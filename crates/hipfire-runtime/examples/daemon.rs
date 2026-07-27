@@ -34070,6 +34070,106 @@ fn generate_qwen2(
     }
 }
 
+/// Build the 3D mrope context for one VL request, or `None` when the request
+/// has no image tokens (→ the original 1D rope kernels and their dispatch
+/// identity, which the certified retained-PM4 tape depends on).
+///
+/// Qwen3.5-VL positions image tokens by their (t, h, w) grid coordinate and
+/// resumes text after the image at `max(image position) + 1`. hipfire's plain
+/// sequential positions advance by the visual TOKEN count instead, so a
+/// 70×54 grid (945 merged tokens, cursor should advance 35) diverges by 910
+/// positions and corrupts everything after the image.
+///
+/// `base` is the conversation cursor at the start of this request's prefill;
+/// the returned positions are absolute (already offset by it).
+///
+/// SPAN VALIDATION lives here on purpose. `build_mrope_positions` only
+/// `debug_assert!`s span ordering and carries no post-condition that
+/// `positions.len() == n_tokens`, so a malformed/overlapping span would
+/// silently over-push in a release build. Every precondition it relies on is
+/// checked below; anything unexpected returns `None` (1D fallback + a loud
+/// log) rather than producing a mis-sized position vector.
+#[allow(clippy::too_many_arguments)]
+fn build_vl_mrope_ctx(
+    prompt_ids: &[u32],
+    image_pad_id: u32,
+    n_visual: usize,
+    grid_h: usize,
+    grid_w: usize,
+    spatial_merge_size: usize,
+    base: usize,
+    config: &qwen35::Qwen35Config,
+) -> Option<qwen35::MropeCtx> {
+    if n_visual == 0 || spatial_merge_size == 0 {
+        return None;
+    }
+    let bail = |why: &str| -> Option<qwen35::MropeCtx> {
+        eprintln!("[daemon/vl] mrope disabled ({why}) — falling back to 1D positions");
+        None
+    };
+    let start = prompt_ids.iter().position(|&t| t == image_pad_id)?;
+    if start + n_visual > prompt_ids.len() {
+        return bail("image span runs past the prompt");
+    }
+    // The span must be exactly one contiguous run of `n_visual` pads.
+    if !prompt_ids[start..start + n_visual]
+        .iter()
+        .all(|&t| t == image_pad_id)
+    {
+        return bail("image-pad run is not contiguous");
+    }
+    if prompt_ids[start + n_visual..].contains(&image_pad_id) {
+        return bail("more than one image-pad run (multi-image not wired)");
+    }
+    // Merged grid must account for exactly the spliced visual tokens —
+    // otherwise `build_mrope_positions` pushes a different count than the
+    // prompt has and every downstream index is off.
+    let merged = (grid_h / spatial_merge_size) * (grid_w / spatial_merge_size);
+    if merged != n_visual {
+        return bail(&format!(
+            "merged grid {merged} != spliced visual tokens {n_visual}"
+        ));
+    }
+
+    let spans = [hipfire_arch_qwen35_vl::mrope::ImageSpan {
+        start,
+        len: n_visual,
+        grid_h,
+        grid_w,
+    }];
+    let built = hipfire_arch_qwen35_vl::mrope::build_mrope_positions(
+        prompt_ids.len(),
+        &spans,
+        spatial_merge_size,
+    );
+    // Post-condition the library does not assert for us.
+    if built.positions.len() != prompt_ids.len() {
+        return bail(&format!(
+            "build_mrope_positions returned {} positions for {} tokens",
+            built.positions.len(),
+            prompt_ids.len()
+        ));
+    }
+
+    let base_i = base as i32;
+    let positions: Vec<[i32; 3]> = built
+        .positions
+        .iter()
+        .map(|p| [p[0] + base_i, p[1] + base_i, p[2] + base_i])
+        .collect();
+    eprintln!(
+        "[daemon/vl] mrope: span start={start} len={n_visual} grid={grid_h}x{grid_w} \
+         merge={spatial_merge_size} base={base} rope_delta={} section={:?}",
+        built.rope_delta, config.mrope_section
+    );
+    Some(qwen35::MropeCtx::new(
+        config,
+        base,
+        positions,
+        built.rope_delta,
+    ))
+}
+
 fn generate_vl(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -34348,6 +34448,32 @@ fn generate_vl(
         return;
     }
 
+    // 3D mrope positions for this request. Built from the image span we just
+    // spliced, BEFORE any GPU work so a validation bail is cheap.
+    //
+    // Disabled while eviction is armed: TriAttention renumbers physical slots
+    // mid-prefill (`m.seq_pos = new_phys`), and `MropeCtx::positions` is indexed
+    // by physical position. Rather than silently mis-indexing, that
+    // configuration keeps today's 1D behavior.
+    let mrope_ctx = if m.eviction.is_some() {
+        if n_visual_tokens > 0 {
+            eprintln!("[daemon/vl] mrope disabled (eviction armed) — falling back to 1D positions");
+        }
+        None
+    } else {
+        build_vl_mrope_ctx(
+            &prompt_tokens,
+            image_pad_id,
+            n_visual_tokens,
+            grid_h,
+            grid_w,
+            vision_config.spatial_merge_size,
+            m.seq_pos,
+            config,
+        )
+    };
+    let mrope = mrope_ctx.as_ref();
+
     // Now safe to run the expensive GPU vision encoder.
     let patches = hipfire_arch_qwen35_vl::image::extract_patches(
         &pixels,
@@ -34415,9 +34541,9 @@ fn generate_vl(
     for &token in prompt_tokens.iter() {
         if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
-            if let Err(e) =
-                qwen35::forward_scratch_embed(gpu, weights, config, emb, m.seq_pos, kv, dn, scratch)
-            {
+            if let Err(e) = qwen35::forward_scratch_embed_mrope(
+                gpu, weights, config, emb, m.seq_pos, kv, dn, scratch, mrope,
+            ) {
                 vl_forward_fail(
                     stdout,
                     id,
@@ -34434,9 +34560,9 @@ fn generate_vl(
                 return;
             }
             visual_idx += 1;
-        } else if let Err(e) =
-            qwen35::forward_scratch(gpu, weights, config, token, m.seq_pos, kv, dn, scratch)
-        {
+        } else if let Err(e) = qwen35::forward_scratch_mrope(
+            gpu, weights, config, token, m.seq_pos, kv, dn, scratch, mrope,
+        ) {
             vl_forward_fail(
                 stdout,
                 id,
@@ -34605,9 +34731,9 @@ fn generate_vl(
         // generated/conversation/committed/token text. On failure: cold-reset
         // + request error only (no failed token). Terminators break after a
         // successful commit (same as AR).
-        if let Err(e) =
-            qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch)
-        {
+        if let Err(e) = qwen35::forward_scratch_mrope(
+            gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch, mrope,
+        ) {
             vl_forward_fail(
                 stdout,
                 id,
@@ -34769,8 +34895,8 @@ fn generate_vl(
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {
                         // KV write before any emit — same contract as main decode.
-                        if let Err(e) = qwen35::forward_scratch(
-                            gpu, weights, config, t, m.seq_pos, kv, dn, scratch,
+                        if let Err(e) = qwen35::forward_scratch_mrope(
+                            gpu, weights, config, t, m.seq_pos, kv, dn, scratch, mrope,
                         ) {
                             vl_forward_fail(
                                 stdout,
@@ -34914,9 +35040,9 @@ fn generate_vl(
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
     if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
-            if let Err(e) =
-                qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
-            {
+            if let Err(e) = qwen35::forward_scratch_mrope(
+                gpu, weights, config, t, m.seq_pos, kv, dn, scratch, mrope,
+            ) {
                 vl_forward_fail(
                     stdout,
                     id,
