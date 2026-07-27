@@ -39,7 +39,7 @@
 
 #![cfg_attr(not(test), allow(dead_code))]  // suppress until main.rs wires it
 
-use faer::linalg::solvers::{DenseSolveCore, Solve};
+use faer::linalg::solvers::Solve;
 use faer::{Mat, Side};
 use rayon::prelude::*;
 

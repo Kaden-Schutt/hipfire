@@ -11,8 +11,7 @@
 //! `.gguf` file and produces a `.hfq` (HipFire Quantized) file with
 //! RDNA-native quantized weights.
 
-mod e8;
-mod e8_gptq;
+use hipfire_quantize::{e8, e8_gptq};
 mod gguf_input;
 mod reap_overlay;
 
