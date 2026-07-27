@@ -206,6 +206,7 @@ pub fn finish_dense_activation_dump() -> Result<(), String> {
 /// The generic process snapshot is consulted once per helper; subsequent hot
 /// path reads are atomic loads.
 mod config_cache {
+    use std::sync::atomic;
     use std::sync::OnceLock;
 
     fn flag_one(name: &'static str) -> bool {
@@ -298,6 +299,25 @@ mod config_cache {
                         != Some("0")
                 }))
     }
+    /// `HIPFIRE_DEEPSEEK4_FUSED_ROUTE_ACT` — fold the MoE routing activation
+    /// `sqrt(softplus(.))` into the store of the gate GEMV instead of running
+    /// the standalone `sqrt_softplus_f32` launch.
+    ///
+    /// In the retained gfx1151 ds4 route the gate GEMV (M = 256 experts) has a
+    /// NEGATIVE marginal — already fully hidden — and so does the `topk` that
+    /// consumes it, while the activation between them costs ~1.43 ms/token on a
+    /// 1x1x1 grid that is almost entirely launch and drain. Fusing into the
+    /// producer moves exposed work into a kernel that already runs for free.
+    /// Default OFF pending its own shadow and product evidence.
+    pub(super) fn moe_route_fused_activation() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_ROUTE_ACT")
+                .ok()
+                .as_deref()
+                == Some("1")
+        })
+    }
     /// `HIPFIRE_DEEPSEEK4_E8_PREFILL_B2` — reuse decoded E8 fragments across
     /// two 16-token WMMA tiles on gfx1151. Set `=0` for the B1 admission
     /// baseline.
@@ -325,6 +345,36 @@ mod config_cache {
                         != Some("0")
                 }))
     }
+    /// `HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV` — largest batch size routed through
+    /// the batched E8 decode GEMV instead of the WMMA token tile. `0` (the
+    /// default) keeps every batch size on WMMA.
+    ///
+    /// The WMMA prefill GEMM tiles the token axis at 16 and launches only M/16
+    /// waves, so a B-token speculative verify pays a full 16-token tile at
+    /// 1/16th the occupancy. The batched GEMV keeps the decode GEMV's M waves
+    /// and single weight-row read, and — unlike WMMA, which converts X to f16
+    /// via `ensure_fp16_x` — consumes f32 activations, so B=1 is bit-identical
+    /// to the AR decode GEMV.
+    ///
+    /// Cached in an atomic rather than a `OnceLock` so a bench can A/B both
+    /// arms in one process via [`super::set_e8_batched_gemv_max_batch`]. The
+    /// trunk is ~80 GB on gfx1151; a per-arm reload would dominate the
+    /// measurement and put the two arms in different thermal states.
+    pub(super) fn e8_batched_gemv_max_batch() -> usize {
+        let cur = E8_BATCHED_GEMV_MAX.load(atomic::Ordering::Relaxed);
+        if cur != E8_BATCHED_GEMV_UNSET {
+            return cur;
+        }
+        let parsed = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        E8_BATCHED_GEMV_MAX.store(parsed, atomic::Ordering::Relaxed);
+        parsed
+    }
+    pub(super) const E8_BATCHED_GEMV_UNSET: usize = usize::MAX;
+    pub(super) static E8_BATCHED_GEMV_MAX: atomic::AtomicUsize =
+        atomic::AtomicUsize::new(E8_BATCHED_GEMV_UNSET);
     /// `HIPFIRE_DEEPSEEK4_FFN_OVERLAP` — evaluate the shared E8 expert
     /// concurrently with the routed MQ2 experts on gfx1151. The fresh-process
     /// A/B gate retained this route; set `=0` for the serial fallback.
@@ -413,16 +463,17 @@ pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
 }
 
 #[inline]
-fn mfp4_e8_row_bytes(dtype: DType, k: usize) -> usize {
+fn mfp_e8_row_bytes(dtype: DType, k: usize) -> usize {
     debug_assert_eq!(k % 256, 0);
     let n_blocks = k / 32;
     match dtype {
         DType::MFP4G32E8 => 16 + n_blocks * 17,
+        DType::MFP3G32E8 => 16 + n_blocks * 13,
         DType::MFP4G32E8SOA => {
             let scale_bytes_padded = (n_blocks + 15) & !15;
             16 + scale_bytes_padded + n_blocks * 16
         }
-        _ => unreachable!("mfp4_e8_row_bytes called for {dtype:?}"),
+        _ => unreachable!("mfp_e8_row_bytes called for {dtype:?}"),
     }
 }
 
@@ -458,7 +509,10 @@ fn gemv_auto(
     // scratch. `run_auto` treats its input as plain and would rotate a typed
     // E8 weight a second time. Dispatch the prepared E8 activation explicitly;
     // legacy Q8/F16/Raw behavior remains unchanged.
-    if matches!(weight.dtype, DType::MFP4G32E8 | DType::MFP4G32E8SOA) {
+    if matches!(
+        weight.dtype,
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8
+    ) {
         return match weight.dtype {
             DType::MFP4G32E8 => gpu
                 .gemv_mfp4g32_e8_prerotated(weight, x_rotated, y, m, k)
@@ -466,13 +520,15 @@ fn gemv_auto(
             DType::MFP4G32E8SOA
                 if config_cache::e8_u4_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1) =>
             {
-                gpu
-                .gemv_mfp4g32_e8_soa_u4(weight, x_rotated, y, m, k)
-                .map_err(|e| format!("gemv MFP4-E8-SoA-U4: {e:?}"))
+                gpu.gemv_mfp4g32_e8_soa_u4(weight, x_rotated, y, m, k)
+                    .map_err(|e| format!("gemv MFP4-E8-SoA-U4: {e:?}"))
             }
             DType::MFP4G32E8SOA => gpu
                 .gemv_mfp4g32_e8_soa_prerotated(weight, x_rotated, y, m, k)
                 .map_err(|e| format!("gemv MFP4-E8-SoA: {e:?}")),
+            DType::MFP3G32E8 => gpu
+                .gemv_mfp3g32_e8_prerotated(weight, x_rotated, y, m, k)
+                .map_err(|e| format!("gemv MFP3-E8: {e:?}")),
             _ => unreachable!(),
         };
     }
@@ -559,6 +615,29 @@ fn e8_prefill_batch_tiles(batch_size: usize, b2_available: bool, b4_available: b
     }
 }
 
+/// Override `HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV` for the rest of the process.
+///
+/// Exists so a bench can measure the WMMA and batched-GEMV arms against one
+/// loaded copy of the trunk. `0` restores the WMMA path for every batch size.
+pub fn set_e8_batched_gemv_max_batch(n: usize) {
+    config_cache::E8_BATCHED_GEMV_MAX.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this dense projection should take the batched E8 decode GEMV
+/// instead of the WMMA token tile.
+///
+/// Gated on an explicit batch ceiling because the crossover is real in both
+/// directions: measured on gfx1151 at M=K=4096 the batched GEMV runs 3.72x the
+/// WMMA tile at B=1 and 1.40x at B=6, but only 0.60x at B=16, where the tile is
+/// finally full and its 16x arithmetic reuse wins.
+#[inline]
+fn e8_batched_gemv_applies(arch: &str, batch_size: usize, k: usize) -> bool {
+    arch == "gfx1151"
+        && batch_size <= config_cache::e8_batched_gemv_max_batch()
+        && k % 256 == 0
+        && Gpu::E8_BATCHED_GEMV_BATCHES.contains(&batch_size)
+}
+
 fn gemv_auto_batched_wmma(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -570,12 +649,13 @@ fn gemv_auto_batched_wmma(
     batch_size: usize,
     x_f16_scratch: Option<&GpuTensor>,
 ) -> Result<(), String> {
-    let e8_b2 =
-        config_cache::e8_prefill_b2_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1);
-    let e8_b4 =
-        config_cache::e8_prefill_b4_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1);
+    let e8_b2 = config_cache::e8_prefill_b2_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1);
+    let e8_b4 = config_cache::e8_prefill_b4_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1);
     let e8_tiles = e8_prefill_batch_tiles(batch_size, e8_b2, e8_b4);
     match weight.dtype {
+        DType::MFP4G32E8SOA if e8_batched_gemv_applies(&gpu.arch, batch_size, k) => gpu
+            .gemv_mfp4g32_e8_soa_batched_gfx1151(weight, x_rotated_batch, y, batch_size, m, k)
+            .map_err(|e| format!("gemv MFP4-E8-SoA batched B{batch_size}: {e:?}")),
         DType::MFP4G32E8SOA if e8_tiles == 4 => gpu
             .gemm_mfp4g32_e8_soa_wmma_b4(weight, x_rotated_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B4: {e:?}")),
@@ -585,7 +665,7 @@ fn gemv_auto_batched_wmma(
         DType::MFP4G32E8SOA if gpu.arch == "gfx1151" => gpu
             .gemm_mfp4g32_e8_soa_wmma(weight, x_rotated_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B1: {e:?}")),
-        DType::MFP4G32E8 | DType::MFP4G32E8SOA => {
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8 => {
             // AoS and non-gfx1151 SoA retain the correctness fallback until an
             // architecture-specific dense batched kernel is admitted.
             for b in 0..batch_size {
@@ -5418,8 +5498,11 @@ fn attn_stub(
     // Only E8 layouts carry the per-row header/scales accounted by the helper.
     // Keep the legacy Q8/F32/MQ paths out of it entirely: the match below never
     // consumes this value for those dtypes.
-    let per_group_wa_bytes_e8 = if matches!(wo_a.dtype, DType::MFP4G32E8 | DType::MFP4G32E8SOA) {
-        o_lora_rank * mfp4_e8_row_bytes(wo_a.dtype, per_group_in)
+    let per_group_wa_bytes_e8 = if matches!(
+        wo_a.dtype,
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8
+    ) {
+        o_lora_rank * mfp_e8_row_bytes(wo_a.dtype, per_group_in)
     } else {
         0
     };
@@ -5465,7 +5548,7 @@ fn attn_stub(
                     view
                 }
                 DType::Q8_0 => wo_a.sub_offset(g * per_group_wa_bytes_q8, per_group_wa_bytes_q8),
-                DType::MFP4G32E8 | DType::MFP4G32E8SOA => {
+                DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8 => {
                     wo_a.sub_offset(g * per_group_wa_bytes_e8, per_group_wa_bytes_e8)
                 }
                 _ => wo_a.sub_offset(g * per_group_wa_bytes_raw, per_group_wa_bytes_raw),
@@ -5595,23 +5678,48 @@ fn moe_route(
     })?;
 
     // logits = gate.weight @ x  (dispatch on gate.weight dtype)
-    gemv_auto(
-        gpu,
-        gate_w,
-        ffn_x_rot,
-        ffn_x_plain,
-        scores,
-        n_exp,
-        cfg.hidden_size,
-    )?;
+    //
+    // On the gfx1151 MQ2R route this lands on the E8-SoA U4 buffer kernel,
+    // whose 256-row router launches carry a negative marginal in the retained
+    // tape — they are already fully hidden. The sqrt(softplus(.)) that follows
+    // is not: it costs ~1.43 ms/token on a 1x1x1 grid that is almost entirely
+    // launch and drain. When the fused route is enabled the activation rides in
+    // the GEMV's store, where the reduced row sum is already in a register.
+    let fused_activation = config_cache::moe_route_fused_activation()
+        && gpu.arch_caps.is_gfx1151()
+        && gate_w.dtype == DType::MFP4G32E8SOA
+        && config_cache::e8_u4_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1);
+    if fused_activation {
+        gpu.gemv_mfp4g32_e8_soa_u4_buffer_sqrt_softplus_gfx1151(
+            gate_w,
+            ffn_x_rot,
+            scores,
+            n_exp,
+            cfg.hidden_size,
+        )
+        .map_err(|e| format!("fused gate gemv + sqrt_softplus layer {layer_idx}: {e:?}"))?;
+    } else {
+        gemv_auto(
+            gpu,
+            gate_w,
+            ffn_x_rot,
+            ffn_x_plain,
+            scores,
+            n_exp,
+            cfg.hidden_size,
+        )?;
+    }
 
     // logits += gate.bias (bias is F16, scores is F32 — need a kernel
     // for f16-bias-add. Skip for now; bias is small magnitude).
     let _ = _gate_b;
 
-    // scores = sqrt(softplus(logits))
-    gpu.sqrt_softplus_f32(scores)
-        .map_err(|e| format!("sqrt_softplus layer {layer_idx}: {e:?}"))?;
+    // scores = sqrt(softplus(logits)) — already applied at the GEMV store when
+    // the fused route ran.
+    if !fused_activation {
+        gpu.sqrt_softplus_f32(scores)
+            .map_err(|e| format!("sqrt_softplus layer {layer_idx}: {e:?}"))?;
+    }
     let _ = layer_idx;
 
     Ok(())
@@ -7218,7 +7326,10 @@ fn wo_per_group_batched_e8_fallback(
     per_group_in: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    debug_assert!(matches!(wo_a.dtype, DType::MFP4G32E8 | DType::MFP4G32E8SOA));
+    debug_assert!(matches!(
+        wo_a.dtype,
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8
+    ));
     if wo_a.dtype == DType::MFP4G32E8SOA
         && batch_size > 16
         && config_cache::e8_prefill_b2_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1)
@@ -7249,7 +7360,7 @@ fn wo_per_group_batched_e8_fallback(
             .map_err(|e| format!("grouped batched E8 O-LoRA A: {e:?}"));
     }
 
-    let group_weight_bytes = rank * mfp4_e8_row_bytes(wo_a.dtype, per_group_in);
+    let group_weight_bytes = rank * mfp_e8_row_bytes(wo_a.dtype, per_group_in);
     let input_stride = n_groups * per_group_in;
     let output_stride = n_groups * rank;
     for b in 0..batch_size {
@@ -7588,7 +7699,7 @@ fn attention_block_batched_swa_only(
             )
             .map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
         }
-        DType::MFP4G32E8 | DType::MFP4G32E8SOA => {
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8 => {
             wo_per_group_batched_e8_fallback(
                 gpu,
                 wo_a,
@@ -8505,7 +8616,7 @@ fn attention_block_batched_mixed(
             )
             .map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
         }
-        DType::MFP4G32E8 | DType::MFP4G32E8SOA => {
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8 => {
             wo_per_group_batched_e8_fallback(
                 gpu,
                 wo_a,
@@ -11713,7 +11824,6 @@ mod tests {
         assert!(config_cache::hc_pingpong_on(arch, true));
         assert!(config_cache::hc_finalize_fused_on(arch, true));
         assert!(config_cache::hc_control_finalize_fused_on(arch, true));
-
         assert!(!config_cache::retained_embedding_on(arch, true));
         assert!(!config_cache::hc_control_rsqrt_once_on(arch, true));
         assert!(!config_cache::hc_finalize_input_map_on(arch, true));
@@ -11807,12 +11917,14 @@ mod tests {
     }
 
     #[test]
-    fn mfp4_e8_row_bytes_match_wire_layouts() {
-        assert_eq!(mfp4_e8_row_bytes(DType::MFP4G32E8, 4096), 2192);
-        assert_eq!(mfp4_e8_row_bytes(DType::MFP4G32E8SOA, 4096), 2192);
+    fn mfp_e8_row_bytes_match_wire_layouts() {
+        assert_eq!(mfp_e8_row_bytes(DType::MFP4G32E8, 4096), 2192);
+        assert_eq!(mfp_e8_row_bytes(DType::MFP4G32E8SOA, 4096), 2192);
+        assert_eq!(mfp_e8_row_bytes(DType::MFP3G32E8, 4096), 1680);
         // At K=256 the SoA scale plane pads eight block scales to 16 B.
-        assert_eq!(mfp4_e8_row_bytes(DType::MFP4G32E8, 256), 152);
-        assert_eq!(mfp4_e8_row_bytes(DType::MFP4G32E8SOA, 256), 160);
+        assert_eq!(mfp_e8_row_bytes(DType::MFP4G32E8, 256), 152);
+        assert_eq!(mfp_e8_row_bytes(DType::MFP4G32E8SOA, 256), 160);
+        assert_eq!(mfp_e8_row_bytes(DType::MFP3G32E8, 256), 120);
     }
 
     #[test]

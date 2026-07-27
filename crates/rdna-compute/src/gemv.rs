@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-use crate::dispatch::{DType, FP8_GEMV_MIN_M, Gpu, GpuTensor};
+use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
 use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
@@ -3778,6 +3778,57 @@ impl Gpu {
         self.gemv_mfp4g32_e8(a_raw, x_rot, y, m, k)
     }
 
+    /// mfp3-E8 GEMV. The caller supplies an already FWHT-rotated F32
+    /// activation. Each row is a 16-byte header followed by K/32 13-byte
+    /// blocks (one E4M3 scale and four 24-bit E8 codewords).
+    pub fn gemv_mfp3g32_e8(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp3g32_e8 requires K%256==0, got K={k}");
+        const KERNEL: &str = "gemv_mfp3g32_e8";
+        self.ensure_kernel(KERNEL, kernels::GEMV_MFP3G32_E8_SRC, KERNEL)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(KERNEL, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(a_ptr);
+            blob.push_ptr(x_ptr);
+            blob.push_ptr(y_ptr);
+            blob.push_i32(m_val);
+            blob.push_i32(k_val);
+            blob
+        })
+    }
+
+    /// mfp3-E8 prerotated entry point.
+    pub fn gemv_mfp3g32_e8_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp3g32_e8(a_raw, x_rot, y, m, k)
+    }
+
     /// Fused gate+up mfp4-E8 decode GEMV — gfx1151 ONLY (Strix Halo).
     /// Two GEMVs (gate, up) in one launch over [gate_m + up_m] blocks. x must
     /// already be FWHT-rotated (the execute_steps RmsnormAutomatic producer does
@@ -4033,8 +4084,57 @@ impl Gpu {
 
     /// One-launch gfx1151 E8-SoA block-diagonal GEMV:
     /// `A[G,M,K] @ x[G,K] -> y[G,M]`.
+    /// Grouped E8 GEMV with buffer-SRD weight loads + gfx12 cache policy.
+    /// Bit-exact with `gemv_mfp4g32_e8_soa_grouped_gfx1151`; only the weight
+    /// fetch path differs. See
+    /// `kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BUFFER_GFX1151_SRC`.
+    pub fn gemv_mfp4g32_e8_soa_grouped_buffer_gfx1151(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        groups: usize,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_grouped_impl(
+            "gemv_mfp4g32_e8_soa_grouped_buffer_gfx1151",
+            kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BUFFER_GFX1151_SRC,
+            a,
+            x,
+            y,
+            groups,
+            m,
+            k,
+        )
+    }
+
     pub fn gemv_mfp4g32_e8_soa_grouped_gfx1151(
         &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        groups: usize,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_grouped_impl(
+            "gemv_mfp4g32_e8_soa_grouped_gfx1151",
+            kernels::GEMV_MFP4G32_E8_SOA_GROUPED_GFX1151_SRC,
+            a,
+            x,
+            y,
+            groups,
+            m,
+            k,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_mfp4g32_e8_soa_grouped_impl(
+        &mut self,
+        kname: &str,
+        source: &str,
         a: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
@@ -4051,12 +4151,9 @@ impl Gpu {
             k % 256 == 0,
             "grouped E8 kernel requires K%256==0, got K={k}"
         );
-        const KNAME: &str = "gemv_mfp4g32_e8_soa_grouped_gfx1151";
-        self.ensure_kernel(
-            KNAME,
-            kernels::GEMV_MFP4G32_E8_SOA_GROUPED_GFX1151_SRC,
-            KNAME,
-        )?;
+        let kname_owned = kname.to_owned();
+        let kname: &str = &kname_owned;
+        self.ensure_kernel(kname, source, kname)?;
         let a_ptr = a.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -4072,7 +4169,7 @@ impl Gpu {
             &k_i32 as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            KNAME,
+            kname,
             [m as u32, groups as u32, 1],
             [32, 1, 1],
             0,
@@ -4090,7 +4187,9 @@ impl Gpu {
         )
     }
 
-    /// SoA E8 GEMV, 4-way unroll (bench experiment — cache-roofline MLP sweep).
+    /// SoA E8 GEMV, 4-way unroll. DeepSeek4 MQ2R route v3 uses the accepted
+    /// gfx1151 temporal raw-buffer form; the tri-state override retains an
+    /// exact portable control and allows isolated use on other gfx1151 routes.
     pub fn gemv_mfp4g32_e8_soa_u4(
         &mut self,
         a: &GpuTensor,
@@ -4099,6 +4198,13 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        let temporal_buffer = self
+            .flags
+            .gfx1151_e8_buffer
+            .unwrap_or(self.deepseek4_mq2r_route_v1);
+        if self.arch_caps.is_gfx1151() && temporal_buffer {
+            return self.gemv_mfp4g32_e8_soa_u4_buffer_cpol_gfx1151(0, a, x, y, m, k);
+        }
         self.gemv_mfp4g32_e8_soa_variant(
             "gemv_mfp4g32_e8_soa_u4",
             kernels::GEMV_MFP4G32_E8_SOA_U4_SRC,
@@ -4109,6 +4215,163 @@ impl Gpu {
             k,
         )
     }
+
+    pub fn gemv_mfp4g32_e8_soa_u4_buffer_cpol_gfx1151(
+        &mut self,
+        cache_policy: u32,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(
+            self.arch_caps.is_gfx1151(),
+            "E8 cache-policy route is gfx1151-only"
+        );
+        let (name, source) = match cache_policy {
+            0 => (
+                "gemv_mfp4g32_e8_soa_u4_buffer_cpol0_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_U4_BUFFER_CPOL0_GFX1151_SRC,
+            ),
+            20 => (
+                "gemv_mfp4g32_e8_soa_u4_buffer_cpol20_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_U4_BUFFER_CPOL20_GFX1151_SRC,
+            ),
+            22 => (
+                "gemv_mfp4g32_e8_soa_u4_buffer_cpol22_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_U4_BUFFER_CPOL22_GFX1151_SRC,
+            ),
+            _ => panic!("unsupported gfx1151 E8 cache policy {cache_policy}"),
+        };
+        self.gemv_mfp4g32_e8_soa_variant(name, source, a, x, y, m, k)
+    }
+
+    /// gfx1151 E8-SoA U4 buffer GEMV with `sqrt(softplus(.))` fused into the
+    /// store, for the DeepSeek V4 MoE router (`gate.weight @ x` then the routing
+    /// affinity activation). Saves the standalone `sqrt_softplus_f32` launch and
+    /// its dependent boundary; see
+    /// `kernels::GEMV_MFP4G32_E8_SOA_U4_BUFFER_SQRT_SOFTPLUS_GFX1151_SRC`.
+    ///
+    /// Numerically identical to `gemv_mfp4g32_e8_soa_u4_buffer_cpol_gfx1151(0, ..)`
+    /// followed by `sqrt_softplus_f32`: the reduction is unchanged and the
+    /// activation applies the same branched formulation to the same f32 value,
+    /// which the unfused path would have round-tripped through memory exactly.
+    pub fn gemv_mfp4g32_e8_soa_u4_buffer_sqrt_softplus_gfx1151(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(
+            self.arch_caps.is_gfx1151(),
+            "fused sqrt-softplus E8 route is gfx1151-only"
+        );
+        self.gemv_mfp4g32_e8_soa_variant(
+            "gemv_mfp4g32_e8_soa_u4_buffer_sqrt_softplus_gfx1151",
+            kernels::GEMV_MFP4G32_E8_SOA_U4_BUFFER_SQRT_SOFTPLUS_GFX1151_SRC,
+            a,
+            x,
+            y,
+            m,
+            k,
+        )
+    }
+
+    /// Batch sizes with a compiled batched-E8-GEMV instantiation.
+    ///
+    /// `E8_BATCHED_B` is a compile-time constant in the kernel (the per-token
+    /// accumulators must live in registers, not scratch), so each supported
+    /// `B` is a separate specialization and unlisted sizes have no kernel to
+    /// launch. Callers must check membership before dispatching.
+    pub const E8_BATCHED_GEMV_BATCHES: &'static [usize] = &[1, 2, 3, 4, 5, 6, 7, 8, 16];
+
+    /// Batched E8-SoA decode GEMV: `A[M,K] @ X[B,K]^T -> Y[B,M]`, one wave per
+    /// output row with the weight row read once for all B tokens.
+    ///
+    /// Intended for speculative-verify batch sizes (B < 16), where the prefill
+    /// WMMA GEMM computes a full 16-token tile regardless of B and launches
+    /// only M/16 waves. B must be one of the compiled instantiations.
+    pub fn gemv_mfp4g32_e8_soa_batched_gfx1151(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        batch: usize,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(
+            self.arch_caps.is_gfx1151(),
+            "batched E8 decode GEMV is gfx1151-only"
+        );
+        assert!(k % 256 == 0, "batched E8 GEMV requires K%256==0, got K={k}");
+        let (name, source) = match batch {
+            1 => (
+                "gemv_mfp4g32_e8_soa_batched_b1_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B1_GFX1151_SRC,
+            ),
+            2 => (
+                "gemv_mfp4g32_e8_soa_batched_b2_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B2_GFX1151_SRC,
+            ),
+            3 => (
+                "gemv_mfp4g32_e8_soa_batched_b3_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B3_GFX1151_SRC,
+            ),
+            4 => (
+                "gemv_mfp4g32_e8_soa_batched_b4_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B4_GFX1151_SRC,
+            ),
+            5 => (
+                "gemv_mfp4g32_e8_soa_batched_b5_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B5_GFX1151_SRC,
+            ),
+            6 => (
+                "gemv_mfp4g32_e8_soa_batched_b6_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B6_GFX1151_SRC,
+            ),
+            7 => (
+                "gemv_mfp4g32_e8_soa_batched_b7_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B7_GFX1151_SRC,
+            ),
+            8 => (
+                "gemv_mfp4g32_e8_soa_batched_b8_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B8_GFX1151_SRC,
+            ),
+            16 => (
+                "gemv_mfp4g32_e8_soa_batched_b16_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_BATCHED_B16_GFX1151_SRC,
+            ),
+            other => panic!("no batched E8 GEMV instantiation for B={other}"),
+        };
+        self.bind_thread()?;
+        self.ensure_kernel(name, source, name)?;
+        let a_ptr = a.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(name, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(a_ptr);
+            blob.push_ptr(x_ptr);
+            blob.push_ptr(y_ptr);
+            blob.push_i32(m_i32);
+            blob.push_i32(k_i32);
+            blob
+        })
+    }
+
     /// SoA E8 GEMV, 8-way unroll (bench experiment — cache-roofline MLP sweep).
     pub fn gemv_mfp4g32_e8_soa_u8(
         &mut self,
@@ -9478,7 +9741,7 @@ impl Gpu {
         k_top: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx1151 route v2 pins the accepted K8-all kernel. This is route
+        // gfx1151 route v3 pins the accepted K8-all kernel. This is route
         // policy, not MQ2R tensor identity: another architecture may load the
         // same artifact and fall through to its portable kernel.
         let rankpair = !self.deepseek4_mq2r_route_v1
@@ -9808,7 +10071,6 @@ impl Gpu {
         }
         result
     }
-
     /// MiniMax-M2 (arch_id=10) MoE gate_up GEMV for MQ3-Lloyd experts
     /// (3-bit + 8-entry codebook, 112 B/group). Sibling of
     /// `deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed` — only the
