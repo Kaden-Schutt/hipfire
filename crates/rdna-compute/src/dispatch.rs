@@ -202,8 +202,8 @@ pub enum DType {
     //   + [n_blocks B: E4M3 scales, pad to 16B boundary]
     //   + [n_blocks*16 B: 4xu32 E8 codewords/block, 16B-aligned].
     // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
-    MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
-    MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
+    MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 4), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
+    MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 2),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -532,7 +532,11 @@ impl BlockHessianAcc {
                 n += 1;
             }
         }
-        if n == 0 { 0.0 } else { s / n as f64 }
+        if n == 0 {
+            0.0
+        } else {
+            s / n as f64
+        }
     }
 }
 
@@ -1125,6 +1129,14 @@ impl Gpu {
     /// legacy stream depend on a capturing blocking stream" under capture
     /// mode Global. Use this helper whenever the copy might live inside
     /// a captured region.
+    /// `HIPFIRE_DTOD_DUMP=1` prints `file:line` and size per D→D copy.
+    ///
+    /// Mirrors `HIPFIRE_MEMSET_DUMP`. Added because `__amd_rocclr_copyBuffer`
+    /// costs 0.378 ms/step (19.8 calls) in the ds4 gfx1151 AR decode — a 64 KB
+    /// copy taking 19.11 us against 0.33 us of actual traffic, 57x off — and
+    /// there are a dozen `memcpy_dtod_auto` call sites in the ds4 forward with
+    /// no way to tell which ones fire. Grep the dump by source location.
+    #[track_caller]
     pub fn memcpy_dtod_at_auto(
         &self,
         dst: &hip_bridge::DeviceBuffer,
@@ -1134,6 +1146,17 @@ impl Gpu {
         size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOD_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        if dump {
+            let loc = std::panic::Location::caller();
+            eprintln!("dtod bytes={} at {}:{}", size, loc.file(), loc.line());
+        }
         if let Some(stream) = self.active_stream.as_ref() {
             self.hip
                 .memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
@@ -1144,6 +1167,10 @@ impl Gpu {
     }
 
     /// D→D copy (whole buffer) that picks async on the active stream when set.
+    ///
+    /// `#[track_caller]` so `HIPFIRE_DTOD_DUMP` attributes the copy to the real
+    /// call site rather than to this forwarder.
+    #[track_caller]
     pub fn memcpy_dtod_auto(
         &self,
         dst: &hip_bridge::DeviceBuffer,
@@ -2703,9 +2730,9 @@ impl Drop for Gpu {
 
 #[cfg(test)]
 mod tests {
+    use super::gen_fwht_signs;
     use super::DType;
     use super::HessianCapture;
-    use super::gen_fwht_signs;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
