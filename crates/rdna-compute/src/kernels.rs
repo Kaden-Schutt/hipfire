@@ -5093,6 +5093,28 @@ pub const INDEXER_KV_GATHER_SRC: &str = include_str!("../../../kernels/src/index
 pub const HC_COMPUTE_CONTROL_SRC: &str =
     include_str!("../../../kernels/src/hc_compute_control.hip");
 
+/// Wide-block `hc_compute_control_vec4_finalize`: 1024 threads instead of 256.
+///
+/// The shipped 256-thread launch runs 24 blocks x 8 waves = 192 waves = 0.15
+/// occupancy fills on gfx1151, and moves 786 KB at 71.8 GB/s against a
+/// measured 207 GB/s ceiling — 35% efficiency, the worst of any kernel in the
+/// ds4 AR decode step. Its critical path is one block's full 16384-element
+/// reduction, because blocks 1..23 spin on block 0's rsqrt and the last block
+/// to finish runs the sinkhorn epilogue; 1024 threads cuts that block's loop
+/// from 16 iterations to 4 and lifts occupancy to 0.6 fills.
+///
+/// Distinct module AND symbol name: the JIT cache is keyed by module name, so
+/// a variant loaded under the shipped name would silently be dead code.
+///
+/// NOT bit-exact with the 256-thread kernel — the LDS partial tree is 32-wide
+/// instead of 8-wide, so the summation order differs. Validate through
+/// `serve_harness.py`, not a ULP gate.
+pub const HC_COMPUTE_CONTROL_T1024_SRC: &str = concat!(
+    "#define THREADS_PER_BLOCK 1024\n",
+    "#define HC_CTRL_FINALIZE_KERNEL hc_compute_control_vec4_finalize_t1024\n",
+    include_str!("../../../kernels/src/hc_compute_control.hip")
+);
+
 pub const HC_SINKHORN_4X4_SRC: &str = include_str!("../../../kernels/src/hc_sinkhorn_4x4.hip");
 
 pub const HC_MIX_4STREAM_SRC: &str = include_str!("../../../kernels/src/hc_mix_4stream.hip");

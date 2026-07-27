@@ -4,10 +4,10 @@
 
 //! Attention, KV cache, DFlash, pflash, triattn, kv_compact, and vision attention dispatch.
 
+use crate::kernels;
 use crate::DType;
 use crate::Gpu;
 use crate::GpuTensor;
-use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -8431,8 +8431,30 @@ impl Gpu {
         rsqrt_once: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let logical_name = "hc_compute_control_vec4_finalize";
-        self.ensure_kernel(logical_name, kernels::HC_COMPUTE_CONTROL_SRC, logical_name)?;
+        // `HIPFIRE_HC_CTRL_T1024=1` selects the 1024-thread variant. See
+        // `kernels::HC_COMPUTE_CONTROL_T1024_SRC` — same algorithm, wider
+        // block, NOT bit-exact (the LDS partial tree widens 8 -> 32).
+        static T1024: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let t1024 = *T1024.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_HC_CTRL_T1024")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        let (logical_name, src, threads) = if t1024 {
+            (
+                "hc_compute_control_vec4_finalize_t1024",
+                kernels::HC_COMPUTE_CONTROL_T1024_SRC,
+                1024u32,
+            )
+        } else {
+            (
+                "hc_compute_control_vec4_finalize",
+                kernels::HC_COMPUTE_CONTROL_SRC,
+                256u32,
+            )
+        };
+        self.ensure_kernel(logical_name, src, logical_name)?;
         let xp = x_flat.buf.as_ptr();
         let wp = w_fn.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8460,7 +8482,7 @@ impl Gpu {
         self.launch_maybe_blob(
             logical_name,
             [n_ctrl as u32, 1, 1],
-            [256, 1, 1],
+            [threads, 1, 1],
             0,
             &mut params,
             || {
@@ -9405,16 +9427,63 @@ impl Gpu {
                 .as_deref()
                 == Some("1")
         });
-        let parallel =
-            self.arch == "gfx1151" && self.deepseek4_mq2r_route_v1 && !force_serial;
+        static FORCE_PARALLEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_parallel = *FORCE_PARALLEL.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_PARALLEL")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        let parallel = self.arch == "gfx1151"
+            && (self.deepseek4_mq2r_route_v1 || force_parallel)
+            && !force_serial;
+        static FORCE_BOUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_bounded = *FORCE_BOUNDED.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BOUNDED")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        static FORCE_BLOCK1024: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_block1024 = *FORCE_BLOCK1024.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BLOCK1024")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        static FORCE_UNROLLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_unrolled = *FORCE_UNROLLED.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_UNROLLED")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         let (logical_name, source, symbol, block, smem) = if parallel {
-            (
-                "indexer_top_k_buf_parallel",
-                kernels::INDEXER_TOP_K_BUF_PARALLEL_GFX1151_SRC,
-                "indexer_top_k_buf_parallel",
-                [256, 1, 1],
-                0,
-            )
+            if force_unrolled {
+                (
+                    "indexer_top_k_buf_unrolled",
+                    kernels::INDEXER_TOP_K_BUF_UNROLLED_GFX1151_SRC,
+                    "indexer_top_k_buf_parallel",
+                    [if force_block1024 { 1024 } else { 256 }, 1, 1],
+                    0,
+                )
+            } else if force_bounded {
+                (
+                    "indexer_top_k_buf_bounded",
+                    kernels::INDEXER_TOP_K_BUF_BOUNDED_GFX1151_SRC,
+                    "indexer_top_k_buf_parallel",
+                    [if force_block1024 { 1024 } else { 256 }, 1, 1],
+                    0,
+                )
+            } else {
+                (
+                    "indexer_top_k_buf_parallel",
+                    kernels::INDEXER_TOP_K_BUF_PARALLEL_GFX1151_SRC,
+                    "indexer_top_k_buf_parallel",
+                    [256, 1, 1],
+                    0,
+                )
+            }
         } else {
             (
                 "indexer_top_k_buf",
@@ -10659,6 +10728,9 @@ impl Gpu {
         static WARP_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static ILP4_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static SCOREGRID_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SCOREGRID_XLANE_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SCOREGRID_LARGE_SERIAL_GFX1151: std::sync::OnceLock<bool> =
+            std::sync::OnceLock::new();
         let scoregrid = self.arch == "gfx1151"
             && head_dim == 512
             && (self.deepseek4_mq2r_route_v1
@@ -10684,32 +10756,64 @@ impl Gpu {
                     .as_deref()
                     == Some("1")
             });
-        let (logical_name, symbol, block) = if scoregrid {
+        let scoregrid_xlane = scoregrid
+            && *SCOREGRID_XLANE_GFX1151.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_XLANE")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            });
+        let scoregrid_large_serial = scoregrid
+            && *SCOREGRID_LARGE_SERIAL_GFX1151.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_LARGE_SERIAL")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            });
+        let (logical_name, symbol, block, source) = if scoregrid_large_serial {
+            (
+                "deepseek4_attn_swa_topk_scoregrid_large_serial_gfx1151",
+                "deepseek4_attn_swa_topk_scoregrid_f32_buf",
+                [512, 1, 1],
+                kernels::V4F_ATTN_SWA_TOPK_BUF_LARGE_SERIAL_GFX1151_SRC,
+            )
+        } else if scoregrid_xlane {
+            (
+                "deepseek4_attn_swa_topk_scoregrid_xlane_gfx1151",
+                "deepseek4_attn_swa_topk_scoregrid_f32_buf",
+                [512, 1, 1],
+                kernels::V4F_ATTN_SWA_TOPK_BUF_XLANE_GFX1151_SRC,
+            )
+        } else if scoregrid {
             (
                 "deepseek4_attn_swa_topk_scoregrid_f32_buf",
                 "deepseek4_attn_swa_topk_scoregrid_f32_buf",
                 [512, 1, 1],
+                kernels::V4F_ATTN_SWA_TOPK_BUF_SRC,
             )
         } else if ilp4 {
             (
                 "deepseek4_attn_swa_topk_ilp4_f32_buf",
                 "deepseek4_attn_swa_topk_ilp4_f32_buf",
                 [512, 1, 1],
+                kernels::V4F_ATTN_SWA_TOPK_BUF_SRC,
             )
         } else if warp {
             (
                 "deepseek4_attn_swa_topk_warp_f32_buf",
                 "deepseek4_attn_swa_topk_warp_f32_buf",
                 [256, 1, 1],
+                kernels::V4F_ATTN_SWA_TOPK_BUF_SRC,
             )
         } else {
             (
                 "deepseek4_attn_swa_topk_f32_buf",
                 "deepseek4_attn_swa_topk_f32_buf",
                 [head_dim as u32, 1, 1],
+                kernels::V4F_ATTN_SWA_TOPK_BUF_SRC,
             )
         };
-        self.ensure_kernel(logical_name, kernels::V4F_ATTN_SWA_TOPK_BUF_SRC, symbol)?;
+        self.ensure_kernel(logical_name, source, symbol)?;
         let qp = q.buf.as_ptr();
         let kp = swa_k.buf.as_ptr();
         let vp = swa_v.buf.as_ptr();

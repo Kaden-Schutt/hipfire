@@ -21,7 +21,18 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+// Overridable so a wider-block variant can be built from the same source.
+// The finalize kernel's critical path is ONE block's full x_dim reduction:
+// blocks 1..n_ctrl-1 spin on block 0's rsqrt, and the last block to finish
+// runs the sinkhorn epilogue. Fewer loop iterations per block therefore
+// releases every spinner sooner, on top of the raw occupancy gain
+// (24 blocks x 256t = 192 waves = 0.15 fills on gfx1151's 1280 slots).
+#ifndef THREADS_PER_BLOCK
 #define THREADS_PER_BLOCK 256
+#endif
+#ifndef HC_CTRL_FINALIZE_KERNEL
+#define HC_CTRL_FINALIZE_KERNEL hc_compute_control_vec4_finalize
+#endif
 
 __launch_bounds__(THREADS_PER_BLOCK)
 extern "C" __global__ void hc_compute_control(
@@ -146,7 +157,7 @@ extern "C" __global__ void hc_compute_control_vec4(
 // last workgroup resets it to zero before the kernel completes, so the buffer
 // is reusable by a retained tape.
 __launch_bounds__(THREADS_PER_BLOCK)
-extern "C" __global__ void hc_compute_control_vec4_finalize(
+extern "C" __global__ void HC_CTRL_FINALIZE_KERNEL(
     const float*  __restrict__ x_flat,
     const __half* __restrict__ w_fn,
     const __half* __restrict__ base,
