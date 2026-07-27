@@ -1419,6 +1419,7 @@ impl QueueSet {
     }
 }
 
+
 #[derive(Clone)]
 pub struct KernargPool {
     inner: Arc<KernargPoolInner>,
@@ -1503,6 +1504,46 @@ impl KernargPool {
             if granule == 0 || !alignment.is_power_of_two() {
                 continue;
             }
+            // The retained PM4 indirect buffer is allocated from THIS pool
+            // (SingleQueuePm4Ib::indirect is a KernargBuffer), so the command
+            // processor re-fetches the whole IB from host-agent memory on every
+            // replay. Ordinary HIP dispatch does not do that, which makes the
+            // retained path far more sensitive to host-memory and PCIe
+            // behaviour than the HIP arm — and that behaviour is an amdgpu
+            // decision. Set HIPFIRE_REDLINE_POOL_DEBUG=1 to report exactly
+            // which pool a machine selected, so two boxes reporting different
+            // retained throughput can be compared on placement rather than
+            // guessed at.
+            if std::env::var_os("HIPFIRE_REDLINE_POOL_DEBUG")
+                .is_some_and(|v| v != "0" && !v.is_empty())
+            {
+                let mut size = 0_usize;
+                let _ = query_pool(
+                    &device.runtime.symbols,
+                    pool,
+                    abi::AMD_MEMORY_POOL_INFO_SIZE,
+                    (&mut size as *mut usize).cast(),
+                );
+                let kind = if flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED != 0 {
+                    "fine-grained"
+                } else if flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED != 0 {
+                    "coarse-grained"
+                } else {
+                    "unflagged"
+                };
+                eprintln!(
+                    "[redline] retained-IB pool: handle=0x{:x} owner=CPU-agent segment=global \
+                     kind={kind} kernarg_init={} flags=0x{flags:08x} size={size} \
+                     granule={granule} alignment={alignment}",
+                    pool.0,
+                    flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT != 0,
+                );
+                eprintln!(
+                    "[redline] the retained indirect buffer lives in this pool, so the command \
+                     processor fetches it over the host interface on every replay"
+                );
+            }
+
             return Ok(Self {
                 inner: Arc::new(KernargPoolInner {
                     runtime: device.runtime.clone(),
@@ -1529,6 +1570,16 @@ impl KernargPool {
     /// Allocate CPU-writable, GPU-accessible command memory. The executable
     /// flag is required for MEC indirect-buffer fetches even though the PM4
     /// words are data rather than shader ISA.
+    ///
+    /// This is host-resident fine-grained memory (see `discover`). That is the
+    /// correct trade and was measured, not assumed: placing the retained IB in
+    /// a device-local coarse-grained pool instead is SLOWER on both reference
+    /// boards — hiptrx 565.52 -> 560.84 tok/s (-0.83%), k9lin 548.02 -> 544.28
+    /// (-0.68%), qwen3.5-0.8b.mq4, two alternating reps each. Retained replay
+    /// patches kernargs into this buffer from the CPU between replays; host
+    /// memory is cached and fast to write, whereas VRAM through the BAR is
+    /// write-combined and uncached, so the CPU-write cost outweighs any saving
+    /// on the command processor's read. Do not "optimise" this into VRAM.
     pub fn allocate_executable_bytes(&self, length: usize) -> Result<KernargBuffer, RuntimeError> {
         self.allocate_bytes(length, 16, abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG)
     }
