@@ -1251,6 +1251,56 @@ pub const GEMV_MFP4G32_E8_SOA_BATCHED_B16_GFX1151_SRC: &str = concat!(
     "#define E8_BATCHED_KERNEL gemv_mfp4g32_e8_soa_batched_b16_gfx1151\n",
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_batched.gfx1151.hip")
 );
+/// Batched grouped E8-SoA decode GEMV: `A[G,M,K] @ X[B,G,K] -> Y[B,G,M]`.
+/// One wave per (group, row), weight row read once, applied to B activation
+/// vectors. Replaces `gemm_mfp4g32_e8_soa_grouped_wmma` below B=16, where the
+/// grouped WMMA computes a full 16-token tile for however many tokens are
+/// real. See `kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip`.
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B1_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 1\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b1_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B2_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 2\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b2_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B3_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 3\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b3_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B4_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 4\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b4_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B5_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 5\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b5_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B6_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 6\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b6_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B7_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 7\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b7_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B8_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 8\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b8_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
+pub const GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B16_GFX1151_SRC: &str = concat!(
+    "#define E8_GROUPED_BATCHED_B 16\n",
+    "#define E8_GROUPED_BATCHED_KERNEL gemv_mfp4g32_e8_soa_grouped_batched_b16_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip")
+);
 pub const GEMV_MFP4G32_E8_SOA_U4_BUFFER_SQRT_SOFTPLUS_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",

@@ -4372,6 +4372,105 @@ impl Gpu {
         })
     }
 
+    /// Batched grouped E8-SoA decode GEMV: `A[G,M,K] @ X[B,G,K] -> Y[B,G,M]`,
+    /// one wave per (group, row) with the weight row read once for all B
+    /// tokens.
+    ///
+    /// Intended for speculative-verify batch sizes, where
+    /// `gemm_mfp4g32_e8_soa_grouped_wmma` computes a full 16-token tile
+    /// regardless of B. `batch` must be in [`Self::E8_BATCHED_GEMV_BATCHES`].
+    pub fn gemv_mfp4g32_e8_soa_grouped_batched_gfx1151(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        batch: usize,
+        g: usize,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(
+            self.arch_caps.is_gfx1151(),
+            "batched grouped E8 GEMV is gfx1151-only"
+        );
+        assert!(
+            k % 256 == 0,
+            "batched grouped E8 GEMV requires K%256==0, got K={k}"
+        );
+        let (name, source) = match batch {
+            1 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b1_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B1_GFX1151_SRC,
+            ),
+            2 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b2_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B2_GFX1151_SRC,
+            ),
+            3 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b3_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B3_GFX1151_SRC,
+            ),
+            4 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b4_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B4_GFX1151_SRC,
+            ),
+            5 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b5_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B5_GFX1151_SRC,
+            ),
+            6 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b6_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B6_GFX1151_SRC,
+            ),
+            7 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b7_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B7_GFX1151_SRC,
+            ),
+            8 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b8_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B8_GFX1151_SRC,
+            ),
+            16 => (
+                "gemv_mfp4g32_e8_soa_grouped_batched_b16_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GROUPED_BATCHED_B16_GFX1151_SRC,
+            ),
+            other => panic!("no batched grouped E8 GEMV instantiation for B={other}"),
+        };
+        self.bind_thread()?;
+        self.ensure_kernel(name, source, name)?;
+        let a_ptr = a.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let g_i32 = g as i32;
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &g_i32 as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [m as u32, g as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y_ptr);
+                blob.push_i32(g_i32);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
     /// SoA E8 GEMV, 8-way unroll (bench experiment — cache-roofline MLP sweep).
     pub fn gemv_mfp4g32_e8_soa_u8(
         &mut self,

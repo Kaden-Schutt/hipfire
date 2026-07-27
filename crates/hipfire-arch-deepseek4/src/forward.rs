@@ -7330,6 +7330,25 @@ fn wo_per_group_batched_e8_fallback(
         wo_a.dtype,
         DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8
     ));
+    // Same 16-token-tile pathology as the plain dense path, in the grouped
+    // tier: profiled at B=1 the grouped WMMA costs 14.61 ms against the
+    // decode grouped GEMV's 4.23 ms, the single largest term in the gap
+    // between a batched forward and an AR decode step.
+    if wo_a.dtype == DType::MFP4G32E8SOA
+        && e8_batched_gemv_applies(&gpu.arch, batch_size, per_group_in)
+    {
+        return gpu
+            .gemv_mfp4g32_e8_soa_grouped_batched_gfx1151(
+                wo_a,
+                x_rotated_batch,
+                y_batch,
+                batch_size,
+                n_groups,
+                rank,
+                per_group_in,
+            )
+            .map_err(|e| format!("grouped batched E8 O-LoRA A B{batch_size}: {e:?}"));
+    }
     if wo_a.dtype == DType::MFP4G32E8SOA
         && batch_size > 16
         && config_cache::e8_prefill_b2_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1)
