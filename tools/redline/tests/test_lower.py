@@ -123,6 +123,100 @@ class LowerKernelArgvTests(unittest.TestCase):
             self.assertEqual(argv[1:], ["inspect", "--input", "a.hsaco"])
             self.assertNotIn("--radiowave", argv)
 
+    def test_kernel_relative_dot_radiowave_resolved_against_caller_cwd(self):
+        """./radiowave must not collapse to bare PATH lookup after cwd=REPO."""
+        old = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                caller = base / "caller"
+                repo = base / "repo"
+                caller.mkdir()
+                repo.mkdir()
+                rw = caller / "radiowave"
+                rw.write_text("#!/bin/sh\n# relative override\n", encoding="utf-8")
+                rw.chmod(0o755)
+                # Competing REPO-relative path must not win.
+                decoy = repo / "radiowave"
+                decoy.write_text("#!/bin/sh\n# decoy\n", encoding="utf-8")
+                decoy.chmod(0o755)
+                completed = MagicMock(returncode=0)
+                expected = str(rw.resolve())
+                with (
+                    patch.object(self.lower, "REPO", repo),
+                    patch.object(self.lower.subprocess, "run", return_value=completed) as run,
+                ):
+                    os.chdir(caller)
+                    code = self.lower.main(
+                        [
+                            "kernel",
+                            "--radiowave",
+                            "./radiowave",
+                            "inspect",
+                            "--input",
+                            "a.hsaco",
+                        ]
+                    )
+                    os.chdir(old)
+                self.assertEqual(code, 0)
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[0], expected)
+                self.assertTrue(Path(argv[0]).is_absolute(), argv[0])
+                self.assertNotEqual(argv[0], "./radiowave")
+                self.assertNotEqual(argv[0], "radiowave")
+                self.assertNotEqual(argv[0], str(decoy))
+                self.assertEqual(argv[1:], ["inspect", "--input", "a.hsaco"])
+                self.assertNotIn("--radiowave", argv)
+                self.assertEqual(run.call_args.kwargs.get("cwd"), repo)
+        finally:
+            os.chdir(old)
+
+    def test_kernel_relative_parent_radiowave_resolved_against_caller_cwd(self):
+        """../radiowave must resolve against invocation cwd, not REPO."""
+        old = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                parent = base / "parent"
+                caller = parent / "caller"
+                repo = base / "repo"
+                parent.mkdir()
+                caller.mkdir()
+                repo.mkdir()
+                rw = parent / "radiowave"
+                rw.write_text("#!/bin/sh\n# parent-relative override\n", encoding="utf-8")
+                rw.chmod(0o755)
+                completed = MagicMock(returncode=0)
+                expected = str(rw.resolve())
+                with (
+                    patch.object(self.lower, "REPO", repo),
+                    patch.object(self.lower.subprocess, "run", return_value=completed) as run,
+                ):
+                    os.chdir(caller)
+                    code = self.lower.main(
+                        [
+                            "kernel",
+                            "--radiowave",
+                            "../radiowave",
+                            "inspect",
+                            "--input",
+                            "a.hsaco",
+                        ]
+                    )
+                    os.chdir(old)
+                self.assertEqual(code, 0)
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[0], expected)
+                self.assertTrue(Path(argv[0]).is_absolute(), argv[0])
+                self.assertNotEqual(argv[0], "../radiowave")
+                self.assertEqual(argv[1:], ["inspect", "--input", "a.hsaco"])
+                self.assertNotIn("--radiowave", argv)
+                self.assertEqual(run.call_args.kwargs.get("cwd"), repo)
+        finally:
+            os.chdir(old)
+
+
+
 
     def test_kernel_prefers_release_over_debug_over_cargo(self):
         with tempfile.TemporaryDirectory() as tmp:

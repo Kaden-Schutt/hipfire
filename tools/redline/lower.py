@@ -39,15 +39,22 @@ def resolve_radiowave(args: list[str]) -> tuple[list[str], list[str]] | int:
         if len(forwarded) < 2:
             _err("--radiowave requires PATH; attempted: --radiowave <missing>")
             return 2
-        path = Path(forwarded[1])
+        raw = forwarded[1]
         forwarded = forwarded[2:]
+        # Resolve relative overrides against invocation cwd before cwd=REPO spawn.
+        path = Path(raw)
+        if not path.is_absolute():
+            path = (Path(os.getcwd()) / path).resolve()
+        else:
+            path = path.resolve()
         if not path.is_file():
             _err(
-                f"radiowave not found at --radiowave {path}; "
+                f"radiowave not found at --radiowave {raw}; "
                 f"attempted: {path}"
             )
             return 2
         return [str(path)], forwarded
+
 
     release = REPO / "target" / "release" / "radiowave"
     debug = REPO / "target" / "debug" / "radiowave"
