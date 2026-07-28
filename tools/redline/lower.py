@@ -76,20 +76,23 @@ def run_kernel(args: list[str]) -> int:
 
 def run_pm4(args: list[str]) -> int:
     harness = REPO / "scripts" / "redline_daemon_harness.py"
+    forwarded = list(args)
+    pm4_count = sum(1 for a in forwarded if a == "--pm4")
+    if pm4_count > 1:
+        _err("multiple --pm4 flags (pass zero or exactly one)")
+        return 2
+    if pm4_count == 0:
+        child_args = ["--pm4", *forwarded]
+    else:
+        # Exactly one: preserve caller argv byte-for-byte and position-for-position.
+        child_args = forwarded
+    argv = [sys.executable, str(harness), *child_args]
     if not harness.is_file():
         _err(
             f"missing scripts/redline_daemon_harness.py; attempted: "
-            f"{sys.executable} {harness} --pm4 {' '.join(args)}"
+            f"{' '.join(argv)}"
         )
         return 2
-    forwarded = list(args)
-    if "--pm4" in forwarded:
-        # Keep caller non-flag order; enforce exactly one --pm4 after script.
-        without = [a for a in forwarded if a != "--pm4"]
-        child_args = ["--pm4", *without]
-    else:
-        child_args = ["--pm4", *forwarded]
-    argv = [sys.executable, str(harness), *child_args]
     return _run(argv)
 
 

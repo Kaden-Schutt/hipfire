@@ -368,62 +368,79 @@ class LowerPm4ArgvTests(unittest.TestCase):
             ):
                 self.assertNotIn(forbidden, kwargs)
 
-    def test_pm4_caller_provided_flag_not_duplicated(self):
+    def test_pm4_single_caller_flag_preserves_position(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             harness = root / "scripts" / "redline_daemon_harness.py"
             harness.parent.mkdir(parents=True)
             harness.write_text("# harness\n", encoding="utf-8")
             completed = MagicMock(returncode=0)
+            forwarded = ["--prefill", "128", "--pm4", "--model", "M"]
             with (
                 patch.object(self.lower, "REPO", root),
                 patch.object(self.lower.subprocess, "run", return_value=completed) as run,
             ):
-                # Duplicate caller --pm4 flags must collapse to exactly one.
-                self.lower.main(
-                    [
-                        "pm4",
-                        "--pm4",
-                        "--model",
-                        "M",
-                        "--pm4",
-                        "--daemon",
-                        "D",
-                        "--prefix",
-                        "32",
-                    ]
-                )
-            argv = run.call_args.args[0]
-            self.assertEqual(argv[0], sys.executable)
-            self.assertEqual(argv[1], str(harness))
-            self.assertEqual(argv.count("--pm4"), 1)
-            self.assertEqual(argv[2], "--pm4")
-            # Non-flag args preserved in caller order after the single --pm4.
+                code = self.lower.main(["pm4", *forwarded])
+            self.assertEqual(code, 0)
             self.assertEqual(
-                argv[3:],
-                ["--model", "M", "--daemon", "D", "--prefix", "32"],
+                run.call_args.args[0],
+                [sys.executable, str(harness), *forwarded],
             )
 
-    def test_pm4_missing_harness_exits_2(self):
+    def test_pm4_duplicate_caller_flags_exit_2_without_spawn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            harness = root / "scripts" / "redline_daemon_harness.py"
+            harness.parent.mkdir(parents=True)
+            harness.write_text("# harness\n", encoding="utf-8")
+            err = io.StringIO()
+            with (
+                patch.object(self.lower, "REPO", root),
+                patch.object(self.lower.subprocess, "run") as run,
+                patch.object(sys, "stderr", err),
+            ):
+                code = self.lower.main(
+                    ["pm4", "--pm4", "--model", "M", "--pm4"]
+                )
+            self.assertEqual(code, 2)
+            run.assert_not_called()
+            self.assertIn("tools.redline.lower:", err.getvalue())
+            self.assertIn("multiple --pm4", err.getvalue())
+
+    def test_pm4_missing_harness_reports_inserted_flag_in_exact_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             harness = root / "scripts" / "redline_daemon_harness.py"
             err = io.StringIO()
-            sentinel = ["--model", "SENTINEL_M", "--daemon", "SENTINEL_D"]
+            forwarded = ["--model", "SENTINEL_M", "--daemon", "SENTINEL_D"]
             with (
                 patch.object(self.lower, "REPO", root),
                 patch.object(sys, "stderr", err),
             ):
-                code = self.lower.main(["pm4", *sentinel])
+                code = self.lower.main(["pm4", *forwarded])
             self.assertEqual(code, 2)
-            msg = err.getvalue()
-            self.assertIn("tools.redline.lower:", msg)
-            self.assertIn("redline_daemon_harness.py", msg)
-            self.assertIn(sys.executable, msg)
-            self.assertIn(str(harness), msg)
-            self.assertIn("--pm4", msg)
-            for part in sentinel:
-                self.assertIn(part, msg)
+            expected = [
+                sys.executable,
+                str(harness),
+                "--pm4",
+                *forwarded,
+            ]
+            self.assertIn(f"attempted: {' '.join(expected)}", err.getvalue())
+
+    def test_pm4_missing_harness_preserves_single_flag_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            harness = root / "scripts" / "redline_daemon_harness.py"
+            err = io.StringIO()
+            forwarded = ["--prefill", "128", "--pm4", "--model", "M"]
+            with (
+                patch.object(self.lower, "REPO", root),
+                patch.object(sys, "stderr", err),
+            ):
+                code = self.lower.main(["pm4", *forwarded])
+            self.assertEqual(code, 2)
+            expected = [sys.executable, str(harness), *forwarded]
+            self.assertIn(f"attempted: {' '.join(expected)}", err.getvalue())
 
     def test_pm4_spawn_oserror_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:

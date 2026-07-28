@@ -1,14 +1,14 @@
 # Redline Lowering Tools Design
 
-**Status:** Approved design intent
-**Lifecycle:** `active`
-**Allowed claim states:** Planned design requirements only
+**Status:** Implemented interim developer tooling (design + thin wrapper landed)
+**Lifecycle:** `active` (interim; not a stable product surface)
+**Allowed claim states:** Interim developer-only tooling; no stable UX or compatibility promise; product/runtime/performance claims remain disclaimed
 **Canonical domain:** Developer CLI discoverability for existing Radiowave kernel lowering and Redline retained-PM4 lowering surfaces
-**Last checked:** 2026-07-27
+**Last checked:** 2026-07-28
 
-This document uses **MUST**, **MUST NOT**, **SHOULD**, and **MAY** normatively. It is implementation intent for a thin Python delegation layer under `python3 -m tools.redline lower`. It does **not** claim that the layer is implemented, measured, or shipped until source and tests land.
+This document uses **MUST**, **MUST NOT**, **SHOULD**, and **MAY** normatively. It describes the thin Python delegation layer under `python3 -m tools.redline lower` as **interim developer-only tooling**. The wrapper exists for contributor discoverability; it is **not** a stable product UX, public API, or compatibility contract. Product, runtime, and performance claims remain owned by Radiowave, the daemon/retained-PM4 path, `docs/REDLINE.md`, and `docs/VALIDATION.md`—this surface MUST NOT be cited for those claims.
 
-Python is a stable discoverability and delegation layer. Compiler and lowering logic remain in the existing Rust and runtime surfaces (`radiowave`, daemon/retained-PM4 path via `scripts/redline_daemon_harness.py`). This design MUST NOT duplicate lowering algorithms or move Rust sources.
+Python is an interim discoverability and delegation shim only—not a stable layer. Compiler and lowering logic remain in the existing Rust and runtime surfaces (`radiowave`, daemon/retained-PM4 path via `scripts/redline_daemon_harness.py`). This design MUST NOT duplicate lowering algorithms or move Rust sources.
 
 ## Motivation
 
@@ -30,7 +30,7 @@ The fix is thin subprocess delegation: expose both engines under `python3 -m too
    - `python3 -m tools.redline lower pm4 [Redline harness args...]`
 3. Extend the existing `tools.redline` dispatcher (`tools/redline/__main__.py`) later so `lower` is a first-class peer of `golden`, `bench`, and `serve-diff`.
 4. Resolve the Radiowave binary with a fixed preference order (see Binary and script resolution).
-5. Run PM4 lowering via the current Python interpreter on `scripts/redline_daemon_harness.py`, always enforcing `--pm4`, and forwarding the caller’s remaining args unchanged aside from that enforcement.
+5. Run PM4 lowering via the current Python interpreter on `scripts/redline_daemon_harness.py`, enforcing `--pm4` per the zero/one/many contract below, and otherwise preserving caller argv byte-for-byte and position-for-position when exactly one `--pm4` is already present.
 6. Pass through child stdout, stderr, and exit status on successful process start.
 7. Exit `2` with a clear error naming the attempted command when a required surface cannot be resolved or started.
 8. Keep tests process-mocked: unit tests mock process execution; a smoke path exercises delegated help without requiring a GPU or a built daemon.
@@ -117,17 +117,18 @@ python3 -m tools.redline lower pm4 [Redline harness args...]
 Runs:
 
 ```text
-<current python> scripts/redline_daemon_harness.py --pm4 [Redline harness args...]
+<current python> scripts/redline_daemon_harness.py [normalized harness args containing exactly one --pm4]
 ```
 
 working directory = repository root (same root `tools.redline` already assumes).
 
-`--pm4` is mandatory for this mode. The wrapper MUST ensure the child argv contains `--pm4` exactly for enforcement purposes:
+`--pm4` is mandatory for this mode. Count exact argv tokens equal to `--pm4` among the caller’s forwarded harness args (no scanning inside other flags’ values). Behavior:
 
-- If the caller already passed `--pm4`, do not insert a second copy.
-- If the caller omitted it, insert `--pm4` immediately after the script path (before forwarded args).
+- **Zero** `--pm4`: insert exactly one `--pm4` immediately after the script path (before all forwarded args).
+- **Exactly one** `--pm4`: preserve the entire caller argument list byte-for-byte and position-for-position—do not move, strip, or re-insert `--pm4`; spawn with caller args unchanged after the script path.
+- **More than one** `--pm4`: reject at the wrapper with exit `2`, a stderr diagnostic prefixed `tools.redline.lower:` that contains `multiple --pm4`, and **no child spawn**.
 
-The wrapper MUST NOT strip or rewrite other harness flags (`--model`, `--daemon`, `--prefix`, `--kv-mode`, etc.).
+The wrapper MUST NOT strip or rewrite other harness flags (`--model`, `--daemon`, `--prefix`, `--kv-mode`, etc.) except for the zero-`--pm4` insertion above. Missing-harness attempted-command diagnostics MUST describe the same normalized argv that would have been spawned (including inserted `--pm4` when applicable).
 
 Examples:
 
@@ -139,7 +140,7 @@ python3 -m tools.redline lower pm4 \
   --decode-context 128 \
   --shadow-iterations 1
 
-# caller may also pass --pm4 explicitly; still a single --pm4 in child argv
+# caller may pass exactly one --pm4; location and all other argv preserved as given
 python3 -m tools.redline lower pm4 --pm4 \
   --model "$MODEL" \
   --daemon target/release/examples/daemon \
@@ -215,12 +216,13 @@ Use `subprocess.run(..., check=False)` or equivalent with inherited stdio. Do no
 
 ### Wrapper-level failures (child not started)
 
-Exit **`2`**, message on stderr, including the **attempted command** (shell-join or `list` repr of the argv that would have run, or the resolution step that failed).
+Exit **`2`**, message on stderr, including the **attempted command** (shell-join or `list` repr of the argv that would have run, or the resolution step that failed). For PM4 missing-harness errors, the attempted argv MUST match the normalized spawn argv (zero → inserted `--pm4` after script path; exactly one → caller args preserved). Multiple `--pm4` is a wrapper reject before spawn and MUST NOT invent a child argv as if spawn were attempted.
 
 Cases:
 
 - unknown `lower` mode;
 - missing `kernel`/`pm4` mode token;
+- more than one `--pm4` in `lower pm4` forwarded args;
 - `--radiowave` provided without `PATH`, or path not found;
 - no Radiowave binary and cargo prefix cannot be constructed (implementation still attempts cargo fallback when binaries are absent; spawn failure of cargo is exit `2` with attempted argv if `FileNotFoundError`, else cargo exit code);
 - harness script missing;
@@ -254,6 +256,7 @@ Example shapes (informative, not exact string freeze):
 ```text
 tools.redline.lower: radiowave not found (tried --radiowave, target/release/radiowave, target/debug/radiowave, cargo run -q -p radiowave --); attempted: cargo run -q -p radiowave -- ...
 tools.redline.lower: missing scripts/redline_daemon_harness.py; attempted: /usr/bin/python3 /repo/scripts/redline_daemon_harness.py --pm4 ...
+tools.redline.lower: multiple --pm4 in lower pm4 args; refusing to spawn
 tools.redline.lower: unknown mode 'foo' (expected kernel or pm4)
 ```
 
@@ -268,8 +271,10 @@ Scope: fast, offline, no GPU, no requirement for a built daemon or radiowave art
    - Assert argv for:
      - `lower kernel compile ...` → release/debug/`cargo` prefix + forwarded args;
      - `lower kernel --radiowave /tmp/rw ...` → `["/tmp/rw", ...]` and `--radiowave` stripped;
-     - `lower pm4 --model M` → `[sys.executable, str(harness), "--pm4", "--model", "M"]`;
-     - `lower pm4 --pm4 --model M` → still a single `--pm4`.
+     - `lower pm4 --model M` → `[sys.executable, str(harness), "--pm4", "--model", "M"]` (zero → insert after script path);
+     - `lower pm4 --pm4 --model M` → `[sys.executable, str(harness), "--pm4", "--model", "M"]` (exactly one → full caller list preserved, including `--pm4` position);
+     - `lower pm4 --model M --pm4` → `[sys.executable, str(harness), "--model", "M", "--pm4"]` (exactly one mid/tail position preserved);
+     - `lower pm4 --pm4 --model M --pm4` → exit `2`, stderr contains `multiple --pm4`, `subprocess` not called.
    - Assert return code equals mocked child return code.
 
 2. **Resolution unit tests**
@@ -320,8 +325,8 @@ if command == "lower":
 - [ ] Only thin delegation; no duplicated lowering logic; no Rust moves.
 - [ ] Commands: `lower kernel [Radiowave args...]`, `lower pm4 [Redline harness args...]`.
 - [ ] Radiowave resolution: `--radiowave PATH`, then `target/release/radiowave`, then `target/debug/radiowave`, then `cargo run -q -p radiowave --`.
-- [ ] PM4: `sys.executable` + `scripts/redline_daemon_harness.py`, enforce `--pm4`, forward remaining args.
+- [ ] PM4: `sys.executable` + `scripts/redline_daemon_harness.py`; zero `--pm4` inserts one after script path; exactly one preserves full caller argv positions; more than one exits `2` with `multiple --pm4` and no spawn; missing-harness diagnostics use the same normalized argv.
 - [ ] Child stdout/stderr/exit pass through after successful spawn.
 - [ ] Missing surfaces exit `2` with attempted command on stderr.
 - [ ] Tests mock process execution and smoke delegated help.
-- [ ] Python remains discoverability/delegation; compiler/lowering stay in existing Radiowave and runtime/harness surfaces.
+- [ ] Python remains interim discoverability/delegation only (not a stable product layer); compiler/lowering stay in existing Radiowave and runtime/harness surfaces.
