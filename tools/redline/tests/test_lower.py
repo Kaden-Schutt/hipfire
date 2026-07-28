@@ -53,6 +53,20 @@ class LowerDispatcherTests(unittest.TestCase):
             result.stderr,
         )
 
+    def test_package_dispatcher_forwards_exact_rest_to_lower_main(self):
+        """Package main must hand lower the exact remainder argv and status."""
+        from tools.redline import __main__ as redline_main
+
+        sentinel_rest = ["kernel", "--sentinel-mode", "alpha", "--flag", "42"]
+        with patch(
+            "tools.redline.lower.main",
+            return_value=17,
+        ) as lower_main:
+            code = redline_main.main(["lower", *sentinel_rest])
+        self.assertEqual(code, 17)
+        lower_main.assert_called_once_with(sentinel_rest)
+
+
 
 class LowerKernelArgvTests(unittest.TestCase):
     def setUp(self):
@@ -85,6 +99,7 @@ class LowerKernelArgvTests(unittest.TestCase):
                 ["compile", "--source", "x.hip", "--arch", "gfx1201"],
             )
             self.assertEqual(kwargs.get("cwd"), root)
+            self.assertIs(kwargs.get("env"), os.environ)
             self.assertFalse(kwargs.get("check", False))
             # Inherited stdio: do not capture or redirect child streams.
             for forbidden in (
@@ -282,6 +297,8 @@ class LowerKernelArgvTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             # No binaries → cargo prefix; true base OSError (not FileNotFoundError).
+            err = io.StringIO()
+            sentinel = ["compile", "--source", "sentinel.hip", "--arch", "gfxTEST"]
             with (
                 patch.object(self.lower, "REPO", root),
                 patch.object(
@@ -289,13 +306,21 @@ class LowerKernelArgvTests(unittest.TestCase):
                     "run",
                     side_effect=OSError("spawn failed"),
                 ),
-                patch.object(sys, "stderr", io.StringIO()) as err,
+                patch.object(sys, "stderr", err),
             ):
-                code = self.lower.main(["kernel", "compile"])
+                code = self.lower.main(["kernel", *sentinel])
             self.assertEqual(code, 2)
             msg = err.getvalue()
             self.assertIn("tools.redline.lower:", msg)
             self.assertIn("spawn failed", msg)
+            # Failure must surface the attempted cargo launch + forwarded args.
+            cargo_prefix = ["cargo", "run", "-q", "-p", "radiowave", "--"]
+            for part in cargo_prefix:
+                self.assertIn(part, msg)
+            for part in sentinel:
+                self.assertIn(part, msg)
+            # Full attempted argv appears as a Python list repr.
+            self.assertIn(repr(cargo_prefix + sentinel), msg)
 
 
 
@@ -332,6 +357,7 @@ class LowerPm4ArgvTests(unittest.TestCase):
             )
             self.assertEqual(argv.count("--pm4"), 1)
             self.assertEqual(kwargs.get("cwd"), root)
+            self.assertIs(kwargs.get("env"), os.environ)
             # Inherited stdio: do not capture or redirect child streams.
             for forbidden in (
                 "capture_output",
@@ -378,20 +404,26 @@ class LowerPm4ArgvTests(unittest.TestCase):
                 ["--model", "M", "--daemon", "D", "--prefix", "32"],
             )
 
-
     def test_pm4_missing_harness_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            harness = root / "scripts" / "redline_daemon_harness.py"
             err = io.StringIO()
+            sentinel = ["--model", "SENTINEL_M", "--daemon", "SENTINEL_D"]
             with (
                 patch.object(self.lower, "REPO", root),
                 patch.object(sys, "stderr", err),
             ):
-                code = self.lower.main(["pm4", "--model", "M"])
+                code = self.lower.main(["pm4", *sentinel])
             self.assertEqual(code, 2)
             msg = err.getvalue()
             self.assertIn("tools.redline.lower:", msg)
             self.assertIn("redline_daemon_harness.py", msg)
+            self.assertIn(sys.executable, msg)
+            self.assertIn(str(harness), msg)
+            self.assertIn("--pm4", msg)
+            for part in sentinel:
+                self.assertIn(part, msg)
 
     def test_pm4_spawn_oserror_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -400,6 +432,7 @@ class LowerPm4ArgvTests(unittest.TestCase):
             harness.parent.mkdir(parents=True)
             harness.write_text("# harness\n", encoding="utf-8")
             err = io.StringIO()
+            sentinel = ["--model", "SENTINEL_M", "--daemon", "SENTINEL_D"]
             with (
                 patch.object(self.lower, "REPO", root),
                 patch.object(
@@ -409,16 +442,18 @@ class LowerPm4ArgvTests(unittest.TestCase):
                 ),
                 patch.object(sys, "stderr", err),
             ):
-                code = self.lower.main(["pm4", "--model", "M"])
+                code = self.lower.main(["pm4", *sentinel])
             self.assertEqual(code, 2)
             msg = err.getvalue()
             self.assertIn("tools.redline.lower:", msg)
-            self.assertTrue(
-                sys.executable in msg
-                or "Permission denied" in msg
-                or "redline_daemon_harness" in msg,
-                msg,
-            )
+            # Failure must surface the attempted harness command.
+            self.assertIn(sys.executable, msg)
+            self.assertIn(str(harness), msg)
+            self.assertIn("--pm4", msg)
+            for part in sentinel:
+                self.assertIn(part, msg)
+            attempted = [sys.executable, str(harness), "--pm4", *sentinel]
+            self.assertIn(repr(attempted), msg)
 
 
 
