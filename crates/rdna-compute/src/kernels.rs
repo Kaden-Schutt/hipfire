@@ -1892,6 +1892,21 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
 );
+
+/// Nine-path fused MoE gate_up (routed k=8, decode T=1): one CTA stages the
+/// activation into LDS once and all 8 routed-expert warps share it, replacing
+/// the per-(row,krank) x restaging of `gemv_hfq4g256_moe_gate_up_k8_indexed`.
+/// Byte-exact per-row math with the indexed kernel. See kernel header.
+pub const GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d3.hip");
+
+/// Nine-path fused MoE down + weighted combine (routed k=8, decode T=1):
+/// folds the expanded [8 × down_m] intermediate into LDS (never written to
+/// global) and applies the weighted k-ordered fold in the same kernel,
+/// replacing the expanded down GEMV + `moe_down_combine_k8_batched` pair.
+/// Byte-exact with that pair at down_k=512. See kernel header.
+pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d4.hip");
 /// Exact gfx1151 temporal-buffer candidate for the K=512 routed down stream.
 /// The kernel ABI, four-row mapping, reduction tree, and launch geometry stay
 /// unchanged; only weight addressing is lowered differently.
