@@ -1412,21 +1412,31 @@ fn main() {
                     .and_then(|p| p.get("dflash_mode"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("auto");
-                let raw_draft = msg
-                    .get("params")
-                    .and_then(|p| p.get("draft"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty());
+                // `HIPFIRE_DFLASH_DRAFT` (documented in AGENTS.md §7) forces a
+                // draft path for clients that cannot pass `params.draft` (the
+                // serve prewarm / HTTP-reload path has no --model-draft flag):
+                // non-empty → wins over params.draft; explicitly EMPTY → opt out
+                // of draft loading entirely; unset → params.draft as before.
+                let env_draft = std::env::var("HIPFIRE_DFLASH_DRAFT").ok();
+                let raw_draft: Option<String> = match env_draft.as_deref() {
+                    Some("") => None,
+                    Some(p) => Some(p.to_string()),
+                    None => msg
+                        .get("params")
+                        .and_then(|p| p.get("draft"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                };
                 let draft_path = if dflash_mode == "off" {
-                    if raw_draft.is_some() {
+                    if let Some(d) = raw_draft {
                         eprintln!(
-                            "[hipfire-daemon] dflash_mode=off — skipping draft load ({})",
-                            raw_draft.unwrap()
+                            "[hipfire-daemon] dflash_mode=off — skipping draft load ({d})"
                         );
                     }
                     None
                 } else {
-                    raw_draft.map(|s| s.to_string())
+                    raw_draft
                 };
                 let kv_mode_override = msg
                     .get("params")

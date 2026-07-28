@@ -123,6 +123,7 @@ def build_config(args):
         sys.exit(f"thinking_budget {args.thinking!r} not a key of {list(THINKING_BUDGET)}")
     return {
         "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
+        "dflash": getattr(args, "dflash", "off"),
         "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
@@ -205,7 +206,7 @@ max_seq = {cfg.get("max_seq", 32768)}
 kv_cache = {json.dumps(cfg["kv"])}
 
 [speculation]
-dflash = "off"
+dflash = {json.dumps(cfg["dflash"])}
 mtp = {json.dumps(cfg["mtp"])}
 ngram = "off"
 
@@ -400,6 +401,8 @@ def main():
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default="fwht3")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
+    ap.add_argument("--dflash", default="off", choices=["off", "on", "auto"],
+                    help="DFlash draft decode; pin the draft with HIPFIRE_DFLASH_DRAFT=<path>")
     ap.add_argument("--thinking", default="med", help="thinking_budget preset key")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--max-seq", type=int, default=32768)
