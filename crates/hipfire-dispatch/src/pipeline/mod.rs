@@ -601,10 +601,11 @@ pub fn run_moe_decode(
     // Shape rule from .research/microbench/FINDINGS-moe.md: fused wins only
     // for k≥8 with small per-expert intermediate; LFM-class (k=4, I=1792)
     // stays on the chain. HIPFIRE_MOE_NINEPATH=0 opts out.
-    static MOE_NINEPATH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").as_deref() != Ok("0")
+    static MOE_NINEPATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").unwrap_or_default()
     });
-    let ninepath = p.k == 8
+    let ninepath_mode = MOE_NINEPATH.as_str();
+    let ninepath_eligible = p.k == 8
         && p.batch_size == 1
         && p.hidden <= 2048
         && p.mi == 512
@@ -612,8 +613,15 @@ pub fn run_moe_decode(
         && p.dtypes.routed_down == DType::MQ4G256
         && p.expert_dtype_tags.is_none()
         && p.expert_down_awq_ptrs.is_none()
-        && !p.defer_routed_combine
-        && *MOE_NINEPATH;
+        && !p.defer_routed_combine;
+    // Modes: "0"/off = chain; "d3" = D3 only (RESEARCH: 1-ULP codegen
+    // divergence from the baseline gate_up — not byte-exact, and slower);
+    // "1"/"on" = D3+D4 (research); anything else incl. unset = D4 only
+    // (production default: byte-exact with the chain, +0.8% on the A3B
+    // serve battery — .research/microbench/FINDINGS-moe.md).
+    let ninepath_d3 = ninepath_eligible && matches!(ninepath_mode, "1" | "d3" | "on");
+    let ninepath_d4 =
+        ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3");
 
     {
         // ── Routed-expert dispatch via device-indexed merged kernels ──────────
@@ -630,7 +638,7 @@ pub fn run_moe_decode(
         // routed_indexable_mqN flag — so the mixed "mq6-down" file (gate_up MQ4,
         // down MQ6) dispatches the MQ4 gate_up GEMV and the MQ6 down GEMV. The
         // all-MQ4 and all-MQ6 files select the same kernels as before (byte-identical).
-        if ninepath {
+        if ninepath_d3 {
             hip!(gpu.gemv_hfq4g256_moe_ninepath_d3(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
@@ -802,7 +810,7 @@ pub fn run_moe_decode(
 
         // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
         // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-        if ninepath {
+        if ninepath_d4 {
             hip!(gpu.gemv_hfq4g256_moe_ninepath_d4(
                 p.expert_down_ptrs,
                 p.topk_indices,
@@ -954,7 +962,7 @@ pub fn run_moe_decode(
                 p.dtypes.routed_down,
                 DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
             ));
-    if !ninepath && !routed_down_self_combines && !p.defer_routed_combine {
+    if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,
