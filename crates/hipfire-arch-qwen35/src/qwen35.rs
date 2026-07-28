@@ -6451,7 +6451,7 @@ pub fn forward_prefill_batch_with_pbs(
 /// Like `forward_prefill_batch`, but accepts a caller-owned `PrefillBatchScratch`
 /// so the ~25 per-cycle tensor allocations can be amortized across many calls.
 ///
-/// `pbs = None` preserves the original behavior (per-call allocate + free);
+/// `pbs = None` allocates and frees a right-sized scratch per call;
 /// `pbs = Some(&pbs)` reuses the provided scratch. The provided scratch's
 /// `max_batch` determines the chunk size — `tokens` is processed in chunks of
 /// up to `pbs.max_batch`. Callers driving DFlash verify should size `pbs`
@@ -6692,17 +6692,25 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // Allocate the batch scratch once per call (or reuse a caller-owned one).
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains
     // ownership across DFlash cycles to avoid ~25 per-cycle tensor alloc/free
-    // pairs on the hot verify path. When None we fall back to the original
-    // allocate-here / free-on-exit pattern so unmodified callers behave the
-    // same. The chunk size is `pbs.max_batch` so a caller-owned scratch sized
-    // to e.g. `block_size` or `1 + tree_budget` keeps DFlash verify in one
-    // chunk without the full 256-row MAX_BATCH footprint.
+    // pairs on the hot verify path. When None, size the allocation to this
+    // call's largest possible chunk and allocate the DeltaNet S-state tape only
+    // for tree verify. Plain prefill never consumes that tape, and short
+    // prompts should not pay the full 256-row scratch footprint. The chunk size
+    // is `pbs.max_batch` so a caller-owned scratch sized to e.g. `block_size`
+    // or `1 + tree_budget` keeps DFlash verify in one chunk.
     let mut own_pbs: Option<PrefillBatchScratch> = None;
     let result = (|| -> HipResult<()> {
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
             None => {
-                own_pbs = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
+                let (owned_max_batch, cap_gdn_tape) =
+                    owned_prefill_scratch_plan(n, max_batch, tree_verify.is_some());
+                own_pbs = Some(PrefillBatchScratch::new_opt(
+                    gpu,
+                    config,
+                    owned_max_batch,
+                    cap_gdn_tape,
+                )?);
                 own_pbs.as_ref().unwrap()
             }
         };
@@ -7225,6 +7233,22 @@ fn moe_ffn_batched_admissible_for_dtypes(
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
+
+/// Plan scratch owned by one prefill call.
+///
+/// Large prompts retain the configured chunk size, while a short prompt gets
+/// exactly one right-sized chunk. The DeltaNet S-state tape is consumed only by
+/// tree verify; ordinary prefill advances recurrent state in place.
+#[inline]
+fn owned_prefill_scratch_plan(
+    n: usize,
+    configured_max_batch: usize,
+    tree_verify: bool,
+) -> (usize, bool) {
+    debug_assert!(n > 0);
+    debug_assert!(configured_max_batch >= MIN_BATCH);
+    (configured_max_batch.min(n.max(MIN_BATCH)), tree_verify)
+}
 
 /// Whether `forward_prefill_batch_with_pbs` will take the tape-capturing
 /// batched (PBS) path for an `n`-token call — equivalently, whether a `GdnTape`
@@ -17802,6 +17826,21 @@ mod tests {
         assert!(prefill_should_emit_last_token_logits(true, true));
         assert!(prefill_should_emit_last_token_logits(false, false));
         assert!(!prefill_should_emit_last_token_logits(true, false));
+    }
+
+    #[test]
+    fn owned_prefill_scratch_is_right_sized_without_tree_tape() {
+        assert_eq!(owned_prefill_scratch_plan(1, 256, false), (2, false));
+        assert_eq!(owned_prefill_scratch_plan(2, 256, false), (2, false));
+        assert_eq!(owned_prefill_scratch_plan(32, 256, false), (32, false));
+        assert_eq!(owned_prefill_scratch_plan(256, 256, false), (256, false));
+        assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+    }
+
+    #[test]
+    fn owned_prefill_scratch_preserves_tree_verify_tape() {
+        assert_eq!(owned_prefill_scratch_plan(22, 256, true), (22, true));
+        assert_eq!(owned_prefill_scratch_plan(64, 64, true), (64, true));
     }
 
     #[test]
