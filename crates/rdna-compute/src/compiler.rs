@@ -215,8 +215,9 @@ impl KernelCompiler {
         // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
         // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
         // still succeeds while every real compile fails, so hand the child the
-        // resolved root unless the operator already set one.
-        let rocm_env_root = hipfire_config::rocm::compiler_env_root();
+        // selected compiler's installation root unless the operator already
+        // set one that matches.
+        let rocm_env_root = hipfire_config::rocm::compiler_env_root(&hipcc_bin);
 
         // HIPFIRE_NO_DEVICE_COMPILER=1 makes the engine behave as if no device
         // compiler exists, so pre-compiled blobs are used verbatim instead of
@@ -366,8 +367,12 @@ impl KernelCompiler {
                 }
                 // No valid hash — only reject if hipcc can recompile
                 if !self.has_hipcc {
-                    eprintln!("  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)");
-                    eprintln!("           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.");
+                    eprintln!(
+                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
+                    );
+                    eprintln!(
+                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
+                    );
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
@@ -504,6 +509,25 @@ impl KernelCompiler {
         p.to_string()
     }
 
+    /// Core hipcc argv: genco/arch/O3, then passthrough, then -o out src.
+    fn direct_hipcc_args(
+        arch: &str,
+        src_path: &Path,
+        obj_path: &Path,
+        passthrough: Vec<String>,
+    ) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "--genco".into(),
+            format!("--offload-arch={arch}"),
+            "-O3".into(),
+        ];
+        args.extend(passthrough);
+        args.push("-o".into());
+        args.push(obj_path.to_str().unwrap().into());
+        args.push(src_path.to_str().unwrap().into());
+        args
+    }
+
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
     fn hipcc_compile(
         hipcc_bin: &Path,
@@ -523,11 +547,7 @@ impl KernelCompiler {
 
         let extra = extra_flags;
         let per_kernel = Self::per_kernel_flags(source);
-        // Radiowave owns the policy boundary between HIP source and
-        // LLVM/AMDGPU: it emits --genco/--offload-arch/-O3, injects the
-        // reviewed lowering header, and inspects the emitted code object.
-        // Everything hipfire adds on top is passed through as extra args.
-        let mut args: Vec<String> = Vec::new();
+        let mut passthrough: Vec<String> = Vec::new();
         // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
         // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
         // fails with "file not found". Add well-known candidates as -I flags;
@@ -546,18 +566,18 @@ impl KernelCompiler {
                 // C:\PROGRA~1\AMD\ROCm\6.4\include) which contains no spaces.
                 // Reported in #82.
                 let resolved = Self::win_short_path_if_needed(&candidate);
-                args.push(format!("-I{resolved}"));
+                passthrough.push(format!("-I{resolved}"));
                 break;
             }
         }
         for flag in extra.split_whitespace() {
-            args.push(flag.to_string());
+            passthrough.push(flag.to_string());
         }
         for flag in module_flags {
-            args.push(flag.clone());
+            passthrough.push(flag.clone());
         }
         for flag in &per_kernel {
-            args.push(flag.clone());
+            passthrough.push(flag.clone());
         }
         if !module_flags.is_empty() || !per_kernel.is_empty() {
             let flags = module_flags
@@ -567,52 +587,24 @@ impl KernelCompiler {
                 .collect::<Vec<_>>();
             eprintln!("  {name}: per-kernel flags: {}", flags.join(" "));
         }
-        // Radiowave adds -mwavefrontsize64 itself from the request, so lift it
-        // out of the passthrough flags rather than passing it twice.
-        let wavefront = if args.iter().any(|f| f == "-mwavefrontsize64") {
-            radiowave::Wavefront::Wave64
-        } else {
-            radiowave::Wavefront::Wave32
-        };
-        args.retain(|f| f != "-mwavefrontsize64");
 
-        let mut request = radiowave::CompileRequest::new(src_path, obj_path, arch)
-            .wavefront(wavefront)
-            .hipcc(hipcc_bin);
-        // hipfire's JIT has never passed -ffast-math. Radiowave defaults it on,
-        // and inheriting that would silently change the numerics of every
-        // kernel in the engine, so the port keeps hipfire's semantics.
-        request.fast_math = false;
-        request.extra_args = args.iter().map(std::ffi::OsString::from).collect();
+        let args = Self::direct_hipcc_args(arch, src_path, obj_path, passthrough);
+
+        let mut cmd = Command::new(hipcc_bin);
+        cmd.args(&args);
         if let Some(root) = rocm_env_root {
-            request = request.env("ROCM_PATH", root);
+            cmd.env("ROCM_PATH", root);
         }
+        let output = cmd
+            .output()
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}")))?;
 
-        let artifact = radiowave::Compiler
-            .compile(&request)
-            .map_err(|e| hip_bridge::HipError::new(0, &format!("radiowave failed for {name}: {e}")))?;
-
-        // The resource contract that produced the certified code objects:
-        // a kernel that spills or takes a private segment cannot be dispatched
-        // by the GFX10/GFX11 retained-PM4 path, which fails closed on scratch.
-        // Surface it at compile time instead of as a replay fallback later.
-        if let Some(inspection) = artifact.inspection.as_ref() {
-            for kernel in &inspection.kernels {
-                if kernel.vgpr_spill_count != 0
-                    || kernel.sgpr_spill_count != 0
-                    || kernel.private_segment_fixed_size != 0
-                {
-                    eprintln!(
-                        "  [radiowave] {}: vgpr={} spills={}/{} scratch={}B \
-                         — retained PM4 cannot dispatch a kernel with scratch",
-                        kernel.name,
-                        kernel.vgpr_count,
-                        kernel.vgpr_spill_count,
-                        kernel.sgpr_spill_count,
-                        kernel.private_segment_fixed_size,
-                    );
-                }
-            }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("hipcc compilation failed for {name}:\n{stderr}"),
+            ));
         }
         Ok(())
     }
@@ -809,6 +801,33 @@ mod tests {
         assert_ne!(
             base, toolchain_changed,
             "cache key must change when hipcc toolchain changes"
+        );
+    }
+
+    #[test]
+    fn direct_hipcc_args_keep_rocm_as_the_default_compiler() {
+        let args = KernelCompiler::direct_hipcc_args(
+            "gfx1100",
+            Path::new("kernel.hip"),
+            Path::new("kernel.hsaco"),
+            vec!["-I/opt/rocm/include".to_owned()],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--genco",
+                "--offload-arch=gfx1100",
+                "-O3",
+                "-I/opt/rocm/include",
+                "-o",
+                "kernel.hsaco",
+                "kernel.hip",
+            ]
+        );
+        assert!(
+            args.iter().all(|arg| !arg.contains("RADIOWAVE")),
+            "the product compiler must not inject Radiowave"
         );
     }
 

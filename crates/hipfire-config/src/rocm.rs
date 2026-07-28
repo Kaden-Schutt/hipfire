@@ -211,25 +211,76 @@ pub fn device_compiler() -> Option<PathBuf> {
 }
 
 /// `ROCM_PATH` value a spawned device compiler needs, or `None` when the
-/// environment already sets it.
+/// configured environment already matches the selected compiler's install root.
 ///
 /// `hipcc` locates its own LLVM as `$ROCM_PATH/lib/llvm/bin/clang++`, and
 /// `ROCM_PATH` defaults to `/opt/rocm`. On an install rooted elsewhere —
-/// `/opt/rocm/core` on this fleet — `hipcc` is found on PATH, reports a
-/// correct `--version`, and then fails every compile with
+/// `/opt/rocm/core-7.14` on this fleet — pairing that hipcc with a different
+/// `ROCM_PATH` makes every compile fail with
 ///
 ///   sh: 1: /opt/rocm/lib/llvm/bin/clang++: not found
 ///
-/// so `has_hipcc` is true and JIT is broken anyway. Resolving hipcc's path
-/// (see [`tool`]) is not sufficient; the child process needs the root too.
+/// so the child must receive the root of the *selected* compiler, not a
+/// conflicting ambient install. When `ROCM_PATH` already points at that root,
+/// returns `None` so an explicit matching operator choice is left alone.
 ///
-/// Returns `None` when `ROCM_PATH` is already set, so an explicit operator
-/// choice is never overridden.
-pub fn compiler_env_root() -> Option<PathBuf> {
-    if std::env::var_os("ROCM_PATH").is_some_and(|v| !v.is_empty()) {
-        return None;
+/// `compiler` is the selected device compiler path (absolute or bare name).
+/// When the path cannot be resolved to a root, falls back to the previous
+/// "set `ROCM_PATH` only if unset" semantics via [`root`].
+pub fn compiler_env_root(compiler: &Path) -> Option<PathBuf> {
+    let configured = std::env::var_os("ROCM_PATH")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    compiler_env_root_from(compiler, configured.as_deref())
+}
+
+/// Pure form of [`compiler_env_root`] for tests: `configured` is the ambient
+/// `ROCM_PATH` (if any).
+fn compiler_env_root_from(compiler: &Path, configured: Option<&Path>) -> Option<PathBuf> {
+    match root_from_compiler(compiler) {
+        Some(selected) => match configured {
+            Some(cfg) if paths_same_root(cfg, &selected) => None,
+            _ => Some(selected),
+        },
+        None => {
+            // Resolution failed — keep prior semantics: leave an explicit
+            // ROCM_PATH alone, otherwise supply the discovered install root.
+            if configured.is_some() { None } else { root() }
+        }
     }
-    root()
+}
+
+/// Derive `<root>` from a selected compiler path (`<root>/bin/<tool>`).
+/// Absolute/relative paths are canonicalized when possible; bare names are
+/// resolved on `PATH` the same way [`root_from_path_tools`] probes tools.
+fn root_from_compiler(compiler: &Path) -> Option<PathBuf> {
+    let resolved = if compiler.components().count() == 1 {
+        // Bare tool name — walk PATH like root_from_path_tools.
+        let name = compiler.as_os_str();
+        let path = std::env::var_os("PATH")?;
+        let mut found = None;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                found = Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+                break;
+            }
+        }
+        found?
+    } else {
+        std::fs::canonicalize(compiler).unwrap_or_else(|_| compiler.to_path_buf())
+    };
+    // <root>/bin/<tool> -> <root>
+    resolved
+        .parent()
+        .and_then(|bin| bin.parent())
+        .map(|root| root.to_path_buf())
+}
+
+fn paths_same_root(a: &Path, b: &Path) -> bool {
+    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
 }
 
 #[cfg(test)]
@@ -237,13 +288,17 @@ mod compiler_env_tests {
     use super::*;
 
     #[test]
-    fn compiler_env_root_defers_to_an_explicit_rocm_path() {
-        // Not asserting the Some(..) branch: it depends on the host's real
-        // /opt/rocm layout. The contract that matters is that an operator's
-        // ROCM_PATH is never overridden.
-        if std::env::var_os("ROCM_PATH").is_some_and(|v| !v.is_empty()) {
-            assert!(compiler_env_root().is_none());
-        }
+    fn compiler_root_follows_the_selected_toolchain() {
+        let selected = Path::new("/opt/rocm/core-7.14/bin/hipcc");
+
+        assert_eq!(
+            compiler_env_root_from(selected, Some(Path::new("/opt/rocm"))),
+            Some(PathBuf::from("/opt/rocm/core-7.14"))
+        );
+        assert_eq!(
+            compiler_env_root_from(selected, Some(Path::new("/opt/rocm/core-7.14"))),
+            None
+        );
     }
 }
 
