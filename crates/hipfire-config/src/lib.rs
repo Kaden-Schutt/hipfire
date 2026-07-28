@@ -2250,7 +2250,7 @@ pub static FIELDS: &[ConfigField] = &[
         experimental: false,
         env_compat: Some("HIPFIRE_REPLAY_BACKEND"),
         include_builtin_in_process_config: false,
-        help: "Preferred launch backend, subject to immutable admission policy.",
+        help: "Preferred launch backend; runtime default selection is distinct from certification/admission.",
     },
     process_field!(
         "replay.transport",
@@ -2260,14 +2260,14 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Enum(&["auto", "aql", "pm4", "pm4_ib", "ib"]),
         true,
         "HIPFIRE_REPLAY_TRANSPORT",
-        "Retained replay transport; auto follows the certified model route."
+        "Retained replay transport; auto follows the runtime default route predicate, not certification/admission."
     ),
     diagnostic_bool_field!(
         "diagnostic.replay.route_proof_log",
         "replay_route_proof_log",
         false,
         "HIPFIRE_REPLAY_ROUTE_PROOF_LOG",
-        "Emit one stable stderr marker on the first successful retained replay so product coherence can prove route identity without enabling capture."
+        "When enabled, the daemon emits one post-generate retained-route proof marker per successful request (fields: transport, position, request_id, replays) so product coherence can prove route identity without enabling capture."
     ),
     diagnostic_bool_field!(
         "diagnostic.replay.manual_capture",
@@ -3752,7 +3752,7 @@ fn read_string(path: &Path) -> Result<String> {
 ///
 /// Custom profiles live under `~/.hipfire/profiles/<name>.toml`. Profile names are
 /// control-plane identifiers only; they are never persisted inside `config.toml`.
-pub const CONFIG_PROFILE_NAMES: &[&str] = &["default", "dev", "redline"];
+pub const CONFIG_PROFILE_NAMES: &[&str] = &["default", "dev", "hip", "redline"];
 
 /// Origin of a selectable configuration profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3997,6 +3997,7 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("developer.verify_graph", ConfigValue::Bool(false)),
             ("developer.dspark_profile", ConfigValue::Bool(true)),
         ],
+        "hip" => vec![("replay.backend", ConfigValue::String("hip".to_owned()))],
         "redline" => vec![
             ("replay.backend", ConfigValue::String("redline".to_owned())),
             ("replay.transport", ConfigValue::String("pm4".to_owned())),
@@ -4549,6 +4550,17 @@ mod tests {
     }
 
     #[test]
+    fn hip_profile_is_an_explicit_redline_opt_out() {
+        let paths = ConfigPaths::under(temp_root("profile-hip"));
+        let layer = load_config_profile(&paths, "hip").unwrap();
+        assert_eq!(
+            layer.get("replay.backend"),
+            Some(&ConfigValue::String("hip".to_owned()))
+        );
+        let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
     fn apply_config_profile_rejects_unknown_names() {
         let root = temp_root("profile-unknown");
         let paths = ConfigPaths::under(&root);
@@ -4592,6 +4604,7 @@ mod tests {
             "default",
             "dev",
             "redline",
+            "hip",
             "..",
             "../x",
             "a/b",
@@ -4624,6 +4637,7 @@ mod tests {
             vec![
                 ("default".into(), ConfigProfileKind::Builtin),
                 ("dev".into(), ConfigProfileKind::Builtin),
+                ("hip".into(), ConfigProfileKind::Builtin),
                 ("redline".into(), ConfigProfileKind::Builtin),
                 ("alpha".into(), ConfigProfileKind::Custom),
                 ("zeta".into(), ConfigProfileKind::Custom),

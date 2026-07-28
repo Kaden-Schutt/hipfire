@@ -1819,12 +1819,13 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let redline_default = hipfire_runtime::config::gfx12_mq4r_redline_default(
+                        let redline_default = hipfire_runtime::config::a3b_mq4r_redline_default(
                             &gpu.arch, path, m.arch_id, pp, tp,
                         );
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
-                                "[redline] enabling fail-closed gfx12 MQ4R default (transport={})",
+                                "[redline] enabling fail-closed A3B MQ4R default on {} (transport={})",
+                                gpu.arch,
                                 gpu.replay.transport_name()
                             );
                         }
@@ -2086,6 +2087,7 @@ fn main() {
                 };
 
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                gpu.replay.begin_replay_observation_window();
                 let prompt = msg
                     .get("prompt")
                     .and_then(|v| v.as_str())
@@ -2646,6 +2648,9 @@ fn main() {
                         think_mode,
                         &stop_seqs, // hunt3 M-F
                     );
+                }
+                if let Some(marker) = gpu.replay.replay_observation_marker(id) {
+                    eprintln!("{marker}");
                 }
             }
 
@@ -10152,6 +10157,7 @@ fn generate(
             // Emit aborted+done so the CLI's drain loop terminates
             // cleanly without an extra max_tokens worth of wasted decode.
             if check_abort(id) {
+                gpu.replay.invalidate_replay_observation_window();
                 // Client cancelled mid-decode. The tokens generated so far were
                 // advanced into the DeltaNet recurrent state (`dn`) and pushed to
                 // `m.conversation_tokens`, but they are UNCOMMITTED — the client

@@ -143,8 +143,12 @@ both reports use the same 604-launch / 23-kernel tape with sequence hash
 
 The high-water report predates the embedded coherence step. Coherence is
 therefore certified by the later same-binary report, not inferred from the
-114.209 tok/s number alone. Silver remains below the 115.021 tok/s Golden
-floor and must classify as a stopgap, never as a Golden reproduction.
+114.209 tok/s number alone. The retained route is unchanged. Against the
+115.021 tok/s Golden floor, the Silver high-water is 0.812 tok/s slower
+(0.71%, conventionally reported as the small approximately 1 tok/s loss).
+ROCm 7.14 is only a hypothesis for that gap; neither causality nor absence of
+a Redline route regression is proven. Silver remains a stopgap and never a
+Golden reproduction.
 
 Results are classified explicitly:
 

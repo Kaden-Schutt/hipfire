@@ -79,7 +79,7 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
 /// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
 /// recompile instead of loading a stale "invalid device image".
-const KERNEL_CACHE_ABI: u32 = 1;
+const KERNEL_CACHE_ABI: u32 = 2;
 
 /// Compiles HIP kernel sources to code objects, with caching.
 /// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
@@ -784,6 +784,11 @@ mod tests {
             hipcc_bin: PathBuf::from("hipcc"),
             rocm_env_root: None,
         }
+    }
+
+    #[test]
+    fn cache_abi_invalidates_pre_radiowave_compiler_entries() {
+        assert_eq!(KERNEL_CACHE_ABI, 2);
     }
 
     #[test]

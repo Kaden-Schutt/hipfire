@@ -158,7 +158,7 @@ enum ConfigAction {
 enum ConfigProfileAction {
     /// Replace the global sparse config with a built-in or custom profile.
     Set {
-        /// Built-in (`default`, `dev`, `redline`) or custom profile name.
+        /// Built-in (`default`, `dev`, `hip`, `redline`) or custom profile name.
         name: String,
     },
     /// Snapshot the current global sparse config as a new custom profile.
@@ -6737,7 +6737,7 @@ mod tests {
 
     #[test]
     fn config_profile_helpers_replace_layer_and_are_global_only() {
-        assert_eq!(CONFIG_PROFILE_NAMES, &["default", "dev", "redline"]);
+        assert_eq!(CONFIG_PROFILE_NAMES, &["default", "dev", "hip", "redline"]);
         let root = env::temp_dir().join(format!("hipfire-cli-profile-{}", std::process::id()));
         let config_paths = ConfigPaths::under(&root);
         let mut layer = ConfigLayer::default();

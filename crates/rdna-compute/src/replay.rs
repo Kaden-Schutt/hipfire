@@ -8,8 +8,12 @@
 //! the fail-closed selection state. It deliberately does not reinterpret
 //! `void**` arguments: a model adapter must supply explicit resource accesses
 //! and a kernarg ABI to `redline-dispatch` before installing a prepared plan.
-//! Replay remains default-off except for the product-certified, single-GPU
-//! gfx12 Qwen A3B `.mq4r` route selected by the daemon after model load.
+//! Replay remains default-off except for the runtime automatic default
+//! `a3b_mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, single-GPU
+//! Qwen A3B `arch_id == 6`, case-insensitive `.mq4r`; `gfx1200`/others opt-in)
+//! selected by the daemon after model load. Runtime default ≠ Redline
+//! certification/registry admission; built-in `hip` profile or explicit backend
+//! selection disables the automatic default.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -1671,6 +1675,7 @@ pub struct ReplayObservation {
     pub count: u64,
     pub first_position: Option<usize>,
     pub last_position: Option<usize>,
+    pub failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1966,7 +1971,7 @@ pub struct ReplayController {
     auto_lifecycle: bool,
     forward_eligible: bool,
     replay_observation: ReplayObservation,
-    /// Opt-in once-per-window stderr proof line; latched from process config.
+    /// Opt-in latch for daemon-owned post-generate route-proof markers.
     route_proof_log: bool,
 }
 
@@ -2030,10 +2035,11 @@ impl ReplayController {
     /// An explicit backend selection always wins. Otherwise every successful
     /// model load resets the process-local controller so prepared queues,
     /// command buffers, and fallback state cannot bleed across model swaps.
-    /// The certified gfx12 MQ4R route defaults to retained PM4; all other
-    /// models return to ordinary HIP. An explicit transport still overrides
-    /// the PM4 transport choice for diagnostics.
-    pub fn configure_model_default(&mut self, enable_gfx12_mq4r: bool) -> bool {
+    /// The exact A3B MQ4R runtime predicate may default to retained PM4 on
+    /// gfx1100, gfx1151, and gfx1201; this is runtime policy, not certification.
+    /// All other models return to ordinary HIP. An explicit transport still
+    /// overrides the PM4 transport choice for diagnostics.
+    pub fn configure_model_default(&mut self, enable_a3b_mq4r: bool) -> bool {
         let manual = manual_capture_requested();
         let backend = hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND");
         let explicit_backend = backend.as_deref().is_some_and(|value| value != "auto");
@@ -2047,7 +2053,7 @@ impl ReplayController {
         }
 
         let transport_override = hipfire_config::process_value("HIPFIRE_REPLAY_TRANSPORT");
-        let transport = if enable_gfx12_mq4r
+        let transport = if enable_a3b_mq4r
             && !transport_override
                 .as_deref()
                 .is_some_and(|value| value != "auto")
@@ -2056,12 +2062,12 @@ impl ReplayController {
         } else {
             ReplayTransport::from_config()
         };
-        self.apply_model_default(enable_gfx12_mq4r, transport);
+        self.apply_model_default(enable_a3b_mq4r, transport);
         true
     }
 
-    fn apply_model_default(&mut self, enable_gfx12_mq4r: bool, transport: ReplayTransport) {
-        let request = if enable_gfx12_mq4r {
+    fn apply_model_default(&mut self, enable_a3b_mq4r: bool, transport: ReplayTransport) {
+        let request = if enable_a3b_mq4r {
             ReplayBackendRequest::Auto
         } else {
             ReplayBackendRequest::Hip
@@ -2161,6 +2167,37 @@ impl ReplayController {
     /// Start a request-local route-proof window without changing replay state.
     pub fn begin_replay_observation_window(&mut self) {
         self.replay_observation = ReplayObservation::default();
+    }
+
+    /// Invalidate the current request-local proof window after cancellation or
+    /// another request-level failure that is not itself a replay error.
+    pub fn invalidate_replay_observation_window(&mut self) {
+        self.replay_observation.failed = true;
+    }
+
+    /// Build one request-scoped retained-replay proof marker.
+    ///
+    /// The daemon owns request boundaries and stderr emission. Invalid request
+    /// IDs fail closed so an untrusted ID cannot inject or alias log lines.
+    pub fn replay_observation_marker(&self, request_id: &str) -> Option<String> {
+        if !self.route_proof_log
+            || self.replay_observation.failed
+            || self.replay_observation.count == 0
+            || request_id.is_empty()
+            || !request_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return None;
+        }
+        let position = self.replay_observation.first_position?;
+        Some(format!(
+            "HIPFIRE_REPLAY_ROUTE_PROOF transport={} position={} request_id={} replays={}",
+            self.transport_name(),
+            position,
+            request_id,
+            self.replay_observation.count
+        ))
     }
 
     pub fn is_recording(&self) -> bool {
@@ -2791,22 +2828,18 @@ impl ReplayController {
         position: usize,
         result: Result<T, String>,
     ) -> Result<T, String> {
-        let value = result?;
-        let first_in_window = self.replay_observation.count == 0;
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.replay_observation.failed = true;
+                return Err(error);
+            }
+        };
         self.replay_observation.count = self.replay_observation.count.saturating_add(1);
         self.replay_observation
             .first_position
             .get_or_insert(position);
         self.replay_observation.last_position = Some(position);
-        // One stable stderr line on the first success in this observation window.
-        // Env is latched at construction so the hot path never re-reads config.
-        if first_in_window && self.route_proof_log {
-            eprintln!(
-                "HIPFIRE_REPLAY_ROUTE_PROOF transport={} position={}",
-                self.transport_name(),
-                position
-            );
-        }
         Ok(value)
     }
 
@@ -3934,14 +3967,13 @@ mod tests {
     }
 
     #[test]
-    fn route_observation_records_only_success_and_resets() {
+    fn route_observation_records_success_failure_and_resets() {
         let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
         let failed: Result<(), String> = Err("dispatch failed".to_owned());
         assert!(controller.observe_replay_result(127, failed).is_err());
-        assert_eq!(
-            controller.replay_observation(),
-            ReplayObservation::default()
-        );
+        assert!(controller.replay_observation().failed);
+
+        controller.begin_replay_observation_window();
 
         controller.observe_replay_result(127, Ok(())).unwrap();
         controller.observe_replay_result(128, Ok(())).unwrap();
@@ -3951,6 +3983,7 @@ mod tests {
                 count: 2,
                 first_position: Some(127),
                 last_position: Some(128),
+                failed: false,
             }
         );
 
@@ -3980,7 +4013,79 @@ mod tests {
                 count: 1,
                 first_position: Some(512),
                 last_position: Some(512),
+                failed: false,
             }
+        );
+    }
+
+    #[test]
+    fn route_proof_marker_is_request_scoped() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.route_proof_log = true;
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
+        );
+
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        controller.observe_replay_result(128, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            Some(
+                "HIPFIRE_REPLAY_ROUTE_PROOF transport=aql position=127 \
+                 request_id=chatcmpl-turn-1 replays=2"
+                    .to_owned()
+            )
+        );
+        assert_eq!(controller.replay_observation_marker(""), None);
+
+        controller.begin_replay_observation_window();
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-2"),
+            None
+        );
+        controller.observe_replay_result(512, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation_marker("invalid request id"),
+            None
+        );
+    }
+
+    #[test]
+    fn route_proof_marker_fails_closed_after_replay_error() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.route_proof_log = true;
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        assert!(controller
+            .observe_replay_result::<()>(128, Err("dispatch failed".to_owned()))
+            .is_err());
+
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
+        );
+        controller.observe_replay_result(129, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
+        );
+    }
+
+    #[test]
+    fn route_proof_marker_fails_closed_after_request_abort() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.route_proof_log = true;
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        controller.invalidate_replay_observation_window();
+
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
+        );
+        controller.observe_replay_result(128, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
         );
     }
 

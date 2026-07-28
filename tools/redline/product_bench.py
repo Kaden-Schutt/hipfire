@@ -50,8 +50,20 @@ assert COHERENCE_MAX_TOKENS > COHERENCE_THINKING_CAP_TOKENS
 # serve_harness TOML (`diagnostic.replay.route_proof_log`); the runtime still lowers
 # through HIPFIRE_REPLAY_ROUTE_PROOF_LOG / process_value.
 ROUTE_PROOF_MARKER = "HIPFIRE_REPLAY_ROUTE_PROOF"
+# Current well-formed marker: transport, position, request_id, replays (all required).
+_ROUTE_PROOF_CURRENT_RE = re.compile(
+    r"HIPFIRE_REPLAY_ROUTE_PROOF\s+transport=([A-Za-z0-9_]+)\s+position=(\d+)\b"
+    r"\s+request_id=([A-Za-z0-9_.:-]+)\s+replays=(\d+)\b"
+)
+# Legacy/unscoped form (transport+position only). Kept for non-cert parse compatibility;
+# certification validators reject these via full literal-vs-valid accounting.
+_ROUTE_PROOF_LEGACY_RE = re.compile(
+    r"HIPFIRE_REPLAY_ROUTE_PROOF\s+transport=([A-Za-z0-9_]+)\s+position=(\d+)\b"
+)
+# Back-compat alias: optional request_id/replays (first match only was the old contract).
 _ROUTE_PROOF_LINE_RE = re.compile(
     r"HIPFIRE_REPLAY_ROUTE_PROOF\s+transport=([A-Za-z0-9_]+)\s+position=(\d+)\b"
+    r"(?:\s+request_id=([A-Za-z0-9_.:-]+)\s+replays=(\d+)\b)?"
 )
 
 # Product certification must not inherit an old PM4 experiment from the
@@ -686,31 +698,151 @@ def _allocate_loopback_port():
     """Reserve an ephemeral loopback TCP port (OS-assigned, released after bind)."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
-        sock.listen(1)
         return int(sock.getsockname()[1])
 
 
 def parse_route_proof_log(text):
-    """Extract HIPFIRE_REPLAY_ROUTE_PROOF lines from serve/daemon log text."""
+    """Extract HIPFIRE_REPLAY_ROUTE_PROOF markers with full literal accounting.
+
+    Every literal ``HIPFIRE_REPLAY_ROUTE_PROOF`` occurrence is counted. A hit is
+    emitted only for a well-formed single-marker line (current form preferred;
+    legacy transport+position still parses for non-cert consumers). Lines with
+    two+ markers, or a marker that fails both forms, are recorded as malformed
+    so validators cannot ignore unparsed evidence.
+    """
     if not text:
-        return []
+        return {
+            "hits": [],
+            "occurrences": [],
+            "malformed": [],
+            "literal_count": 0,
+            "lines": [],
+        }
     hits = []
+    occurrences = []
+    malformed = []
+    lines = []
     for raw in text.splitlines():
-        match = _ROUTE_PROOF_LINE_RE.search(raw)
-        if not match:
+        if ROUTE_PROOF_MARKER not in raw:
             continue
-        hits.append(
+        stripped = raw.strip()
+        # Count every literal marker token on the line (not regex .search once).
+        start = 0
+        line_occ_indices = []
+        while True:
+            idx = raw.find(ROUTE_PROOF_MARKER, start)
+            if idx < 0:
+                break
+            line_occ_indices.append(idx)
+            start = idx + len(ROUTE_PROOF_MARKER)
+        if not line_occ_indices:
+            continue
+        lines.append(stripped)
+        for occ_idx in line_occ_indices:
+            occurrences.append(
+                {
+                    "line": stripped,
+                    "offset": occ_idx,
+                }
+            )
+        # Two+ markers on one line: none are valid certification hits.
+        if len(line_occ_indices) != 1:
+            malformed.append(
+                {
+                    "line": stripped,
+                    "reason": "multiple_markers_on_line",
+                    "marker_count": len(line_occ_indices),
+                }
+            )
+            continue
+        current = _ROUTE_PROOF_CURRENT_RE.search(raw)
+        if current is not None:
+            # Reject if the match does not cover the sole marker token, or if
+            # extra marker-shaped garbage remains after the matched span.
+            if current.start() > line_occ_indices[0]:
+                malformed.append(
+                    {
+                        "line": stripped,
+                        "reason": "malformed_marker",
+                    }
+                )
+                continue
+            trailing = raw[current.end() :]
+            if ROUTE_PROOF_MARKER in trailing:
+                malformed.append(
+                    {
+                        "line": stripped,
+                        "reason": "multiple_markers_on_line",
+                        "marker_count": 2,
+                    }
+                )
+                continue
+            hits.append(
+                {
+                    "line": stripped,
+                    "transport": current.group(1),
+                    "position": int(current.group(2)),
+                    "request_id": current.group(3),
+                    "replays": int(current.group(4)),
+                }
+            )
+            continue
+        legacy = _ROUTE_PROOF_LEGACY_RE.search(raw)
+        if legacy is not None and legacy.start() <= line_occ_indices[0]:
+            trailing = raw[legacy.end() :]
+            # Current-form fields after legacy prefix are handled above; leftover
+            # non-marker text is allowed on legacy lines for parse compatibility.
+            if ROUTE_PROOF_MARKER in trailing:
+                malformed.append(
+                    {
+                        "line": stripped,
+                        "reason": "multiple_markers_on_line",
+                        "marker_count": 2,
+                    }
+                )
+                continue
+            # If the line has request_id/replays-shaped text that failed CURRENT,
+            # treat as malformed rather than silently dropping fields.
+            if "request_id=" in raw[legacy.end() :] or "replays=" in raw[legacy.end() :]:
+                malformed.append(
+                    {
+                        "line": stripped,
+                        "reason": "malformed_marker",
+                    }
+                )
+                continue
+            hits.append(
+                {
+                    "line": stripped,
+                    "transport": legacy.group(1),
+                    "position": int(legacy.group(2)),
+                    "request_id": None,
+                    "replays": None,
+                }
+            )
+            continue
+        malformed.append(
             {
-                "line": raw.strip(),
-                "transport": match.group(1),
-                "position": int(match.group(2)),
+                "line": stripped,
+                "reason": "malformed_marker",
             }
         )
-    return hits
+    return {
+        "hits": hits,
+        "occurrences": occurrences,
+        "malformed": malformed,
+        "literal_count": len(occurrences),
+        "lines": lines,
+    }
 
 
 def collect_route_proof_evidence(serve_log_path, stdout="", stderr=""):
-    """Parse serve.log plus harness stdout/stderr for retained-route proof lines."""
+    """Parse serve.log plus harness stdout/stderr for retained-route proof lines.
+
+    Preserves every literal marker occurrence and malformed line so validators
+    cannot ignore unparsed evidence. ``hits`` remains the list of successfully
+    parsed markers (legacy included); ``count`` is ``len(hits)`` for back-compat.
+    """
     chunks = []
     path = Path(serve_log_path) if serve_log_path is not None else None
     if path is not None and path.is_file():
@@ -722,41 +854,205 @@ def collect_route_proof_evidence(serve_log_path, stdout="", stderr=""):
         chunks.append(stdout)
     if stderr:
         chunks.append(stderr)
-    hits = parse_route_proof_log("\n".join(chunks))
+    parsed = parse_route_proof_log("\n".join(chunks))
+    hits = parsed["hits"]
     first = hits[0] if hits else None
+    literal_count = parsed["literal_count"]
     return {
-        "observed": bool(hits),
+        "observed": bool(hits) or literal_count > 0 or bool(parsed["malformed"]),
         "transport": None if first is None else first["transport"],
         "position": None if first is None else first["position"],
         "marker": None if first is None else first["line"],
-        "lines": [hit["line"] for hit in hits],
+        "lines": list(parsed["lines"]),
         "count": len(hits),
+        "hits": hits,
+        "occurrences": list(parsed["occurrences"]),
+        "malformed": list(parsed["malformed"]),
+        "literal_count": literal_count,
     }
 
 
-def validate_coherence_route_evidence(backend, transport, evidence):
-    """Gate CLI/serve coherence on direct retained-replay proof from the daemon."""
+def validate_coherence_route_evidence(backend, transport, evidence, rows=None):
+    """Gate CLI/serve coherence on request-bound retained-replay proof markers.
+
+    Successful harness rows bind markers by nonempty ``request_id``. Auto/PM4
+    requires exactly one well-formed current PM4 marker per successful row
+    (positive ``replays``), rejects legacy/unscoped markers, extras, malformed
+    literal occurrences, two markers on one line, and keeps HIP at zero literal
+    marker occurrences.
+    """
     errors = []
     required = backend == "auto" and transport == "pm4"
-    observed = bool(evidence.get("observed"))
+    hits = evidence.get("hits")
+    if not isinstance(hits, list):
+        hits = []
+    occurrences = evidence.get("occurrences")
+    if not isinstance(occurrences, list):
+        occurrences = []
+    malformed = evidence.get("malformed")
+    if not isinstance(malformed, list):
+        malformed = []
+    literal_count = evidence.get("literal_count")
+    if not isinstance(literal_count, int) or isinstance(literal_count, bool):
+        # Fall back: count from occurrences, else from hit lines (legacy evidence).
+        if occurrences:
+            literal_count = len(occurrences)
+        else:
+            # Reconstruct literal count from lines/hits when older evidence lacks
+            # occurrence accounting (still reject if hits alone look incomplete).
+            lines = evidence.get("lines") or []
+            if lines:
+                literal_count = sum(
+                    str(line).count(ROUTE_PROOF_MARKER) for line in lines
+                )
+            else:
+                literal_count = sum(
+                    str(hit.get("line") or "").count(ROUTE_PROOF_MARKER) for hit in hits
+                )
+                if literal_count == 0 and hits:
+                    literal_count = len(hits)
+
+    observed = (
+        bool(hits)
+        or literal_count > 0
+        or bool(malformed)
+        or bool(evidence.get("observed"))
+    )
     got_transport = evidence.get("transport")
+    if hits and got_transport is None:
+        got_transport = hits[0].get("transport")
+
+    successful_rows = []
+    if isinstance(rows, list):
+        for index, row in enumerate(rows, 1):
+            if isinstance(row, dict):
+                successful_rows.append((index, row))
+
+    # Full accounting: every literal marker must parse to exactly one hit.
+    accounting_mismatch = literal_count != len(hits) or bool(malformed)
+
     if backend == "hip":
-        if observed:
+        if hits or observed or literal_count > 0 or malformed:
             errors.append(
                 "HIP coherence must not emit retained route proof "
-                f"(got transport={got_transport!r} position={evidence.get('position')!r})"
+                f"(got transport={got_transport!r} position={evidence.get('position')!r}"
+                f", literal_count={literal_count}, malformed={len(malformed)})"
             )
     elif required:
-        if not observed:
-            errors.append(
-                "auto PM4 coherence requires HIPFIRE_REPLAY_ROUTE_PROOF "
-                "marker from the serve daemon"
-            )
-        elif got_transport != "pm4":
-            errors.append(
-                "auto PM4 coherence route proof transport must be 'pm4', "
-                f"got {got_transport!r}"
-            )
+        total_hits = len(hits)
+        if not successful_rows:
+            if total_hits == 0 and literal_count == 0 and not observed:
+                errors.append(
+                    "auto PM4 coherence requires HIPFIRE_REPLAY_ROUTE_PROOF "
+                    "marker from the serve daemon"
+                )
+            else:
+                # Markers alone cannot certify without successful harness rows.
+                errors.append(
+                    "auto PM4 coherence requires successful harness row(s) with "
+                    "nonempty request_id to bind route proof markers"
+                )
+                if accounting_mismatch:
+                    errors.append(
+                        "auto PM4 coherence rejects unparsed/malformed route proof "
+                        f"marker occurrence(s) (literal_count={literal_count}, "
+                        f"parsed_hits={total_hits}, malformed={len(malformed)})"
+                    )
+        else:
+            expected = len(successful_rows)
+            if literal_count == 0 and total_hits == 0:
+                errors.append(
+                    "auto PM4 coherence requires HIPFIRE_REPLAY_ROUTE_PROOF "
+                    "marker from the serve daemon"
+                )
+            else:
+                if accounting_mismatch:
+                    errors.append(
+                        "auto PM4 coherence rejects unparsed/malformed route proof "
+                        f"marker occurrence(s) (literal_count={literal_count}, "
+                        f"parsed_hits={total_hits}, malformed={len(malformed)})"
+                    )
+
+                # Count every parsed hit before transport filtering; also require
+                # literal occurrence count to match expected row count.
+                if total_hits != expected:
+                    errors.append(
+                        f"auto PM4 coherence expected exactly {expected} route "
+                        f"proof marker(s) total, got {total_hits}"
+                    )
+                elif literal_count != expected:
+                    errors.append(
+                        f"auto PM4 coherence expected exactly {expected} route "
+                        f"proof marker(s) total, got {literal_count} literal "
+                        f"occurrence(s) (parsed_hits={total_hits})"
+                    )
+
+                legacy_hits = [
+                    hit
+                    for hit in hits
+                    if hit.get("request_id") is None or hit.get("replays") is None
+                ]
+                if legacy_hits:
+                    errors.append(
+                        "auto PM4 coherence rejects legacy/unscoped route proof "
+                        f"marker(s) (legacy_hits={len(legacy_hits)}, "
+                        f"total_hits={total_hits})"
+                    )
+
+                non_pm4 = [hit for hit in hits if hit.get("transport") != "pm4"]
+                if non_pm4:
+                    transports = sorted(
+                        {
+                            str(hit.get("transport"))
+                            for hit in non_pm4
+                            if hit.get("transport") is not None
+                        }
+                    )
+                    errors.append(
+                        "auto PM4 coherence rejects non-PM4 route proof markers "
+                        f"(found transports={transports!r}, total_hits={total_hits})"
+                    )
+
+                pm4_hits = [hit for hit in hits if hit.get("transport") == "pm4"]
+                seen_request_ids = set()
+                for index, row in successful_rows:
+                    request_id = row.get("request_id")
+                    label = f"row {index}" if expected > 1 else "row"
+                    if not isinstance(request_id, str) or not request_id:
+                        errors.append(
+                            f"auto PM4 coherence {label}: request_id must be nonempty"
+                        )
+                        continue
+                    if request_id in seen_request_ids:
+                        errors.append(
+                            f"auto PM4 coherence {label}: duplicate harness "
+                            f"request_id {request_id!r}"
+                        )
+                    seen_request_ids.add(request_id)
+
+                    matches = [
+                        hit for hit in pm4_hits if hit.get("request_id") == request_id
+                    ]
+                    if len(matches) != 1:
+                        errors.append(
+                            f"auto PM4 coherence {label}: expected exactly one PM4 "
+                            f"route proof marker for request_id {request_id!r}, "
+                            f"got {len(matches)}"
+                        )
+                        continue
+
+                    replays = matches[0].get("replays")
+                    if (
+                        not isinstance(replays, int)
+                        or isinstance(replays, bool)
+                        or replays <= 0
+                    ):
+                        errors.append(
+                            f"auto PM4 coherence {label}: route proof marker for "
+                            f"request_id {request_id!r} requires positive replays, "
+                            f"got {replays!r}"
+                        )
+
     return {
         "required": required,
         "observed": observed,
@@ -764,6 +1060,10 @@ def validate_coherence_route_evidence(backend, transport, evidence):
         "position": evidence.get("position"),
         "marker": evidence.get("marker"),
         "lines": list(evidence.get("lines") or []),
+        "hits": list(hits),
+        "occurrences": list(occurrences),
+        "malformed": list(malformed),
+        "literal_count": literal_count,
         "valid": not errors,
         "errors": errors,
     }
@@ -966,8 +1266,10 @@ def run_coherence_smoke(args, backend):
                 errors.append("attractor generation")
 
     raw_evidence = collect_route_proof_evidence(serve_log, stdout=stdout, stderr=stderr)
+    # Bind markers only through successful harness row request_id(s).
+    route_rows = [row] if isinstance(row, dict) else None
     route_evidence = validate_coherence_route_evidence(
-        backend, args.transport, raw_evidence
+        backend, args.transport, raw_evidence, rows=route_rows
     )
     errors.extend(route_evidence["errors"])
 
@@ -996,6 +1298,12 @@ def run_coherence_smoke(args, backend):
             "position": route_evidence["position"],
             "marker": route_evidence["marker"],
             "lines": route_evidence["lines"],
+            "hits": route_evidence["hits"],
+            "occurrences": route_evidence.get("occurrences", []),
+            "malformed": route_evidence.get("malformed", []),
+            "literal_count": route_evidence.get("literal_count", 0),
+            "valid": route_evidence["valid"],
+            "errors": list(route_evidence["errors"]),
         },
     }
     if errors:
@@ -1125,6 +1433,9 @@ def run_pm4_multiturn_session(args):
         str(serve_log),
         "--out",
         str(out_path),
+        # Temporary TOML path: serve_harness writes
+        # diagnostic.replay.route_proof_log=true under the isolated HIPFIRE_HOME.
+        "--replay-route-proof-log",
     ]
 
     env = dict(os.environ)
@@ -1140,6 +1451,7 @@ def run_pm4_multiturn_session(args):
         HIPFIRE_GRAPH="1",
     )
     env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
+    env.pop("HIPFIRE_REPLAY_ROUTE_PROOF_LOG", None)
     env.pop("HIPFIRE_HOME", None)
 
     serve_pid_path = smoke_dir / "serve-auto-multiturn.pid"
@@ -1169,6 +1481,9 @@ def run_pm4_multiturn_session(args):
         "daemon_basename": unique_daemon.name,
         "serve_pid_file": str(serve_pid_path),
         "command": argv,
+        # Requested via temporary serve_harness config.toml, not ambient env.
+        "replay_route_proof_log": True,
+        "diagnostic_replay_route_proof_log": "diagnostic.replay.route_proof_log",
     }
 
     started = time.monotonic()
@@ -1247,6 +1562,20 @@ def run_pm4_multiturn_session(args):
                             f"{label}: answer missing expected substring {needle!r}"
                         )
 
+    # Successful dict rows only — bind markers by nonempty request_id exactly
+    # as one-turn coherence does (exact validator, full literal accounting).
+    route_rows = None
+    if isinstance(rows, list) and len(rows) == len(turns):
+        route_rows = [row for row in rows if isinstance(row, dict)]
+        if len(route_rows) != len(rows):
+            route_rows = None
+
+    raw_evidence = collect_route_proof_evidence(serve_log, stdout=stdout, stderr=stderr)
+    route_evidence = validate_coherence_route_evidence(
+        backend, "pm4", raw_evidence, rows=route_rows
+    )
+    errors.extend(route_evidence["errors"])
+
     report = {
         "backend": backend,
         "seconds": time.monotonic() - started,
@@ -1265,6 +1594,20 @@ def run_pm4_multiturn_session(args):
         "smoke_dir": str(smoke_dir),
         "port": port,
         "daemon_basename": unique_daemon.name,
+        "route_evidence": {
+            "required": route_evidence["required"],
+            "observed": route_evidence["observed"],
+            "transport": route_evidence["transport"],
+            "position": route_evidence["position"],
+            "marker": route_evidence["marker"],
+            "lines": route_evidence["lines"],
+            "hits": route_evidence["hits"],
+            "occurrences": route_evidence.get("occurrences", []),
+            "malformed": route_evidence.get("malformed", []),
+            "literal_count": route_evidence.get("literal_count", 0),
+            "valid": route_evidence["valid"],
+            "errors": list(route_evidence["errors"]),
+        },
     }
     if errors:
         detail = "; ".join(errors)

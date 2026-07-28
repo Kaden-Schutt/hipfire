@@ -46,6 +46,290 @@ DEFAULTS = {
 }
 
 
+class RouteProofLogTests(unittest.TestCase):
+    def test_parser_extracts_request_scoped_marker(self):
+        parsed = product_bench.parse_route_proof_log(
+            "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=128 "
+            "request_id=chatcmpl-turn-7 replays=64"
+        )
+        self.assertEqual(parsed["literal_count"], 1)
+        self.assertEqual(parsed["malformed"], [])
+        self.assertEqual(
+            parsed["hits"],
+            [
+                {
+                    "line": (
+                        "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=128 "
+                        "request_id=chatcmpl-turn-7 replays=64"
+                    ),
+                    "transport": "pm4",
+                    "position": 128,
+                    "request_id": "chatcmpl-turn-7",
+                    "replays": 64,
+                }
+            ],
+        )
+
+    def test_parser_records_malformed_and_same_line_duplicates(self):
+        malformed_line = "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 bogus"
+        dual = (
+            "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=1 "
+            "request_id=a replays=1 "
+            "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=2 "
+            "request_id=b replays=2"
+        )
+        parsed = product_bench.parse_route_proof_log(
+            f"noise\n{malformed_line}\n{dual}\n"
+        )
+        self.assertEqual(parsed["literal_count"], 3)
+        self.assertEqual(parsed["hits"], [])
+        self.assertEqual(len(parsed["malformed"]), 2)
+        reasons = {item["reason"] for item in parsed["malformed"]}
+        self.assertIn("malformed_marker", reasons)
+        self.assertIn("multiple_markers_on_line", reasons)
+
+
+class CoherenceRouteEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def _hit(
+        *,
+        transport="pm4",
+        position=1,
+        request_id="chatcmpl-coherence-1",
+        replays=64,
+        legacy=False,
+    ):
+        if legacy:
+            line = (
+                f"HIPFIRE_REPLAY_ROUTE_PROOF transport={transport} "
+                f"position={position}"
+            )
+            return {
+                "line": line,
+                "transport": transport,
+                "position": position,
+                "request_id": None,
+                "replays": None,
+            }
+        line = (
+            f"HIPFIRE_REPLAY_ROUTE_PROOF transport={transport} "
+            f"position={position} request_id={request_id} replays={replays}"
+        )
+        return {
+            "line": line,
+            "transport": transport,
+            "position": position,
+            "request_id": request_id,
+            "replays": replays,
+        }
+
+    @staticmethod
+    def _evidence(hits, *, occurrences=None, malformed=None, literal_count=None):
+        first = hits[0] if hits else None
+        if occurrences is None:
+            occurrences = [{"line": hit["line"], "offset": 0} for hit in hits]
+        if malformed is None:
+            malformed = []
+        if literal_count is None:
+            literal_count = len(occurrences)
+        return {
+            "observed": bool(hits) or literal_count > 0 or bool(malformed),
+            "transport": None if first is None else first["transport"],
+            "position": None if first is None else first["position"],
+            "marker": None if first is None else first["line"],
+            "lines": [hit["line"] for hit in hits]
+            + [item.get("line") for item in malformed if item.get("line")],
+            "count": len(hits),
+            "hits": hits,
+            "occurrences": occurrences,
+            "malformed": malformed,
+            "literal_count": literal_count,
+        }
+
+    def test_accepts_one_valid_bound_single_marker(self):
+        hit = self._hit()
+        result = product_bench.validate_coherence_route_evidence(
+            "auto",
+            "pm4",
+            self._evidence([hit]),
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertTrue(result["valid"], result["errors"])
+        self.assertTrue(result["required"])
+        self.assertTrue(result["observed"])
+        self.assertEqual(result["transport"], "pm4")
+        self.assertEqual(result["hits"], [hit])
+        self.assertEqual(result["literal_count"], 1)
+        self.assertEqual(result["errors"], [])
+
+    def test_rejects_legacy_marker(self):
+        result = product_bench.validate_coherence_route_evidence(
+            "auto",
+            "pm4",
+            self._evidence([self._hit(legacy=True)]),
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertFalse(result["valid"])
+        self.assertTrue(
+            any("legacy/unscoped" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_rejects_wrong_request_id(self):
+        result = product_bench.validate_coherence_route_evidence(
+            "auto",
+            "pm4",
+            self._evidence([self._hit(request_id="chatcmpl-other")]),
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertFalse(result["valid"])
+        self.assertTrue(
+            any(
+                "expected exactly one PM4 route proof marker for request_id "
+                "'chatcmpl-coherence-1'"
+                in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_rejects_extra_aql_marker(self):
+        hits = [
+            self._hit(request_id="chatcmpl-coherence-1", position=1),
+            self._hit(
+                transport="aql",
+                request_id="chatcmpl-coherence-1",
+                position=2,
+            ),
+        ]
+        result = product_bench.validate_coherence_route_evidence(
+            "auto",
+            "pm4",
+            self._evidence(hits),
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertFalse(result["valid"])
+        self.assertTrue(
+            any("non-PM4" in error for error in result["errors"]),
+            result["errors"],
+        )
+        self.assertTrue(
+            any("exactly 1 route proof marker(s) total, got 2" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_rejects_zero_replays(self):
+        result = product_bench.validate_coherence_route_evidence(
+            "auto",
+            "pm4",
+            self._evidence([self._hit(replays=0)]),
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertFalse(result["valid"])
+        self.assertTrue(
+            any("positive replays" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_hip_requires_zero_markers(self):
+        result = product_bench.validate_coherence_route_evidence(
+            "hip",
+            "aql",
+            self._evidence([]),
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertTrue(result["valid"], result["errors"])
+        bad = product_bench.validate_coherence_route_evidence(
+            "hip",
+            "aql",
+            self._evidence([self._hit()]),
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertFalse(bad["valid"])
+        self.assertTrue(
+            any("HIP coherence must not emit" in error for error in bad["errors"]),
+            bad["errors"],
+        )
+
+    def test_hip_rejects_malformed_marker_occurrence(self):
+        evidence = self._evidence(
+            [],
+            occurrences=[{"line": "HIPFIRE_REPLAY_ROUTE_PROOF broken", "offset": 0}],
+            malformed=[
+                {
+                    "line": "HIPFIRE_REPLAY_ROUTE_PROOF broken",
+                    "reason": "malformed_marker",
+                }
+            ],
+            literal_count=1,
+        )
+        result = product_bench.validate_coherence_route_evidence(
+            "hip",
+            "aql",
+            evidence,
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertFalse(result["valid"])
+        self.assertTrue(
+            any("HIP coherence must not emit" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_auto_rejects_malformed_extra_alongside_valid(self):
+        hit = self._hit()
+        evidence = self._evidence(
+            [hit],
+            occurrences=[
+                {"line": hit["line"], "offset": 0},
+                {"line": "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 broken", "offset": 0},
+            ],
+            malformed=[
+                {
+                    "line": "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 broken",
+                    "reason": "malformed_marker",
+                }
+            ],
+            literal_count=2,
+        )
+        result = product_bench.validate_coherence_route_evidence(
+            "auto",
+            "pm4",
+            evidence,
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertFalse(result["valid"])
+        self.assertTrue(
+            any("unparsed/malformed" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_auto_rejects_two_same_line_markers(self):
+        dual = (
+            "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=1 "
+            "request_id=chatcmpl-coherence-1 replays=64 "
+            "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=2 "
+            "request_id=chatcmpl-coherence-1 replays=8"
+        )
+        parsed = product_bench.parse_route_proof_log(dual)
+        evidence = product_bench.collect_route_proof_evidence(
+            None, stdout=dual, stderr=""
+        )
+        self.assertEqual(parsed["literal_count"], 2)
+        self.assertEqual(parsed["hits"], [])
+        self.assertTrue(parsed["malformed"])
+        result = product_bench.validate_coherence_route_evidence(
+            "auto",
+            "pm4",
+            evidence,
+            rows=[{"request_id": "chatcmpl-coherence-1"}],
+        )
+        self.assertFalse(result["valid"])
+        self.assertTrue(
+            any("unparsed/malformed" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+
 class StationarityTests(unittest.TestCase):
     def test_stable_signal_requires_confirmation(self):
         values = [100.0 + (0.02 if i % 2 else -0.02) for i in range(20)]
@@ -504,6 +788,7 @@ class CoherenceSmokeTests(unittest.TestCase):
     @staticmethod
     def coherent_row(**overrides):
         row = {
+            "request_id": "chatcmpl-coherence-1",
             "finish": "stop",
             "empty": False,
             "runaway": False,
@@ -532,13 +817,29 @@ class CoherenceSmokeTests(unittest.TestCase):
         return model, daemon, cli
 
     @staticmethod
-    def _write_route_proof_marker(argv, transport="pm4", position=1):
+    def _write_route_proof_marker(
+        argv,
+        transport="pm4",
+        position=1,
+        request_id="chatcmpl-coherence-1",
+        replays=64,
+        legacy=False,
+    ):
         """Emit the retained-replay proof line into the harness --serve-log path."""
         if "--serve-log" not in argv:
             return
         serve_log = Path(argv[argv.index("--serve-log") + 1])
         serve_log.parent.mkdir(parents=True, exist_ok=True)
-        marker = f"HIPFIRE_REPLAY_ROUTE_PROOF transport={transport} position={position}\n"
+        if legacy:
+            marker = (
+                f"HIPFIRE_REPLAY_ROUTE_PROOF transport={transport} "
+                f"position={position}\n"
+            )
+        else:
+            marker = (
+                f"HIPFIRE_REPLAY_ROUTE_PROOF transport={transport} "
+                f"position={position} request_id={request_id} replays={replays}\n"
+            )
         with serve_log.open("a", encoding="utf-8") as handle:
             handle.write(marker)
 
@@ -1055,6 +1356,14 @@ class CoherenceSmokeTests(unittest.TestCase):
         self.assertEqual(result["route_evidence"]["transport"], "pm4")
         self.assertEqual(result["route_evidence"]["position"], 3)
         self.assertIn("HIPFIRE_REPLAY_ROUTE_PROOF", result["route_evidence"]["marker"])
+        self.assertTrue(result["route_evidence"]["valid"])
+        self.assertEqual(result["route_evidence"]["errors"], [])
+        hits = result["route_evidence"]["hits"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["transport"], "pm4")
+        self.assertEqual(hits[0]["request_id"], "chatcmpl-coherence-1")
+        self.assertEqual(hits[0]["replays"], 64)
+        self.assertEqual(hits[0]["position"], 3)
 
     def test_quality_only_verdict_ignores_speed(self):
         def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
@@ -1339,6 +1648,7 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
     @staticmethod
     def coherent_row(**overrides):
         row = {
+            "request_id": "chatcmpl-turn-1",
             "finish": "stop",
             "empty": False,
             "runaway": False,
@@ -1366,6 +1676,20 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
         path = Path(work_dir) / "session.json"
         path.write_text(json.dumps(turns) + "\n", encoding="utf-8")
         return path
+
+    @staticmethod
+    def _write_route_proof_markers(argv, request_ids, *, transport="pm4", replays=64):
+        """Emit one well-formed PM4 marker per request_id into --serve-log."""
+        if "--serve-log" not in argv:
+            return
+        serve_log = Path(argv[argv.index("--serve-log") + 1])
+        serve_log.parent.mkdir(parents=True, exist_ok=True)
+        with serve_log.open("a", encoding="utf-8") as handle:
+            for index, request_id in enumerate(request_ids, 1):
+                handle.write(
+                    f"HIPFIRE_REPLAY_ROUTE_PROOF transport={transport} "
+                    f"position={index} request_id={request_id} replays={replays}\n"
+                )
 
     def test_cli_rejects_multiturn_without_pm4_transport(self):
         with tempfile.TemporaryDirectory() as work_dir:
@@ -1509,14 +1833,19 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
 
         def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
             out_path = Path(argv[argv.index("--out") + 1])
-            out_path.write_text(
-                json.dumps(
-                    [
-                        self.coherent_row(assistant_content="The codeword is ALPHA."),
-                        self.coherent_row(assistant_content="Still ALPHA only."),
-                    ]
-                )
-                + "\n"
+            rows = [
+                self.coherent_row(
+                    request_id="chatcmpl-turn-1",
+                    assistant_content="The codeword is ALPHA.",
+                ),
+                self.coherent_row(
+                    request_id="chatcmpl-turn-2",
+                    assistant_content="Still ALPHA only.",
+                ),
+            ]
+            out_path.write_text(json.dumps(rows) + "\n")
+            self._write_route_proof_markers(
+                argv, [row["request_id"] for row in rows]
             )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -1542,18 +1871,24 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
             captured["argv"] = list(argv)
             captured["env"] = dict(env)
             out_path = Path(argv[argv.index("--out") + 1])
-            out_path.write_text(
-                json.dumps(
-                    [
-                        self.coherent_row(assistant_content="Stored ALPHA."),
-                        self.coherent_row(assistant_content="It was ALPHA."),
-                        self.coherent_row(
-                            assistant_content="You're welcome.",
-                            decode_tok_s=0.01,
-                        ),
-                    ]
-                )
-                + "\n"
+            rows = [
+                self.coherent_row(
+                    request_id="chatcmpl-turn-1",
+                    assistant_content="Stored ALPHA.",
+                ),
+                self.coherent_row(
+                    request_id="chatcmpl-turn-2",
+                    assistant_content="It was ALPHA.",
+                ),
+                self.coherent_row(
+                    request_id="chatcmpl-turn-3",
+                    assistant_content="You're welcome.",
+                    decode_tok_s=0.01,
+                ),
+            ]
+            out_path.write_text(json.dumps(rows) + "\n")
+            self._write_route_proof_markers(
+                argv, [row["request_id"] for row in rows]
             )
             return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
 
@@ -1578,6 +1913,7 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
             self.assertEqual(argv[argv.index("--max-tokens") + 1], "1024")
             self.assertEqual(argv[argv.index("--seed") + 1], "1")
             self.assertEqual(argv[argv.index("--sampling") + 1], "registry")
+            self.assertIn("--replay-route-proof-log", argv)
             port = int(argv[argv.index("--port") + 1])
             self.assertNotEqual(port, 11623)
             self.assertEqual(result["port"], port)
@@ -1587,10 +1923,16 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
             for key, value in CERTIFIED_PM4_POLICY.items():
                 self.assertEqual(env[key], value)
             self.assertNotIn("HIPFIRE_HOME", env)
+            self.assertNotIn("HIPFIRE_REPLAY_ROUTE_PROOF_LOG", env)
             smoke_dir = Path(result["smoke_dir"])
             self.assertTrue(smoke_dir.is_dir())
             self.assertIn(f"product-auto-multiturn-{os.getpid()}-", smoke_dir.name)
             self.assertEqual(result["config"]["smoke_dir"], str(smoke_dir))
+            self.assertTrue(result["config"]["replay_route_proof_log"])
+            self.assertEqual(
+                result["config"]["diagnostic_replay_route_proof_log"],
+                "diagnostic.replay.route_proof_log",
+            )
             self.assertEqual(
                 env["HIPFIRE_SERVE_HARNESS_PID_FILE"],
                 str(smoke_dir / "serve-auto-multiturn.pid"),
@@ -1599,23 +1941,24 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
             self.assertFalse(result["speed_checked"])
             self.assertEqual(result["turns"], 3)
             self.assertEqual(len(result["rows"]), 3)
+            self.assertTrue(result["route_evidence"]["required"])
+            self.assertTrue(result["route_evidence"]["observed"])
+            self.assertTrue(result["route_evidence"]["valid"])
+            self.assertEqual(result["route_evidence"]["literal_count"], 3)
+            self.assertEqual(len(result["route_evidence"]["hits"]), 3)
 
     def test_quality_only_ignores_speed(self):
         turns = [{"content": "hi", "expect": ["hello"]}]
 
         def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
             out_path = Path(argv[argv.index("--out") + 1])
-            out_path.write_text(
-                json.dumps(
-                    [
-                        self.coherent_row(
-                            assistant_content="Hello there.",
-                            decode_tok_s=0.001,
-                        )
-                    ]
-                )
-                + "\n"
+            row = self.coherent_row(
+                request_id="chatcmpl-turn-1",
+                assistant_content="Hello there.",
+                decode_tok_s=0.001,
             )
+            out_path.write_text(json.dumps([row]) + "\n")
+            self._write_route_proof_markers(argv, [row["request_id"]])
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as work_dir:
@@ -1630,6 +1973,74 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertFalse(result["speed_checked"])
         self.assertEqual(result["rows"][0]["decode_tok_s"], 0.001)
+
+    def test_multiturn_fails_without_bound_markers_and_passes_with_one_each(self):
+        turns = [
+            {"content": "Remember ALPHA.", "expect": ["ALPHA"]},
+            {"content": "Recall it.", "expect": ["ALPHA"]},
+        ]
+
+        def fake_run_no_markers(
+            argv, cwd=None, env=None, capture_output=None, text=None, timeout=None
+        ):
+            out_path = Path(argv[argv.index("--out") + 1])
+            rows = [
+                self.coherent_row(
+                    request_id="chatcmpl-turn-1",
+                    assistant_content="Stored ALPHA.",
+                ),
+                self.coherent_row(
+                    request_id="chatcmpl-turn-2",
+                    assistant_content="It was ALPHA.",
+                ),
+            ]
+            out_path.write_text(json.dumps(rows) + "\n")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def fake_run_with_markers(
+            argv, cwd=None, env=None, capture_output=None, text=None, timeout=None
+        ):
+            out_path = Path(argv[argv.index("--out") + 1])
+            rows = [
+                self.coherent_row(
+                    request_id="chatcmpl-turn-1",
+                    assistant_content="Stored ALPHA.",
+                ),
+                self.coherent_row(
+                    request_id="chatcmpl-turn-2",
+                    assistant_content="It was ALPHA.",
+                ),
+            ]
+            out_path.write_text(json.dumps(rows) + "\n")
+            self._write_route_proof_markers(
+                argv, [row["request_id"] for row in rows]
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            self._prepare_binaries(work_dir)
+            session = self._write_session(work_dir, turns)
+            args = self.args(work_dir, session=str(session))
+            with patch(
+                "tools.redline.product_bench.subprocess.run",
+                side_effect=fake_run_no_markers,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, r"HIPFIRE_REPLAY_ROUTE_PROOF marker"
+                ):
+                    run_pm4_multiturn_session(args)
+
+            with patch(
+                "tools.redline.product_bench.subprocess.run",
+                side_effect=fake_run_with_markers,
+            ):
+                result = run_pm4_multiturn_session(args)
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["route_evidence"]["literal_count"], 2)
+        self.assertEqual(len(result["route_evidence"]["hits"]), 2)
+        self.assertEqual(result["route_evidence"]["malformed"], [])
+        self.assertTrue(result["route_evidence"]["valid"])
 
     def test_timeout_killpg_when_leader_gone_group_remains(self):
         """Shared cleanup: killpg known PGID even if getpgid(leader) would ESRCH."""
@@ -1848,6 +2259,28 @@ class ServeHarnessWarmTests(unittest.TestCase):
             self.assertTrue(
                 sh._native_service_warm(9, expected_model=model, proc=alive)
             )
+
+    def test_send_records_sse_completion_id(self):
+        sh = self._load_serve_harness()
+        chunks = [
+            (
+                'data: {"id":"chatcmpl-turn-1","choices":[{"delta":{"content":"ok"},'
+                '"finish_reason":"stop"}],"usage":{"prompt_tokens":3,'
+                '"completion_tokens":1}}\n'
+            ).encode(),
+            b"data: [DONE]\n",
+        ]
+        cfg = {
+            "model": "test-model",
+            "port": 11435,
+            "max_tokens": 8,
+            "sampling": {},
+            "seed": None,
+            "expect_visible": True,
+        }
+        with patch.object(sh.urllib.request, "urlopen", return_value=chunks):
+            row = sh.send(cfg, [{"role": "user", "content": "hello"}])
+        self.assertEqual(row["request_id"], "chatcmpl-turn-1")
 
     def test_write_native_config_emits_route_proof_log_when_requested(self):
         sh = self._load_serve_harness()

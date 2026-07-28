@@ -396,7 +396,7 @@ def send(cfg, messages):
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
     t0 = time.time(); ttft = None; think = []; ans = []; tools = []
-    usage = {}; timings = {}; finish = None
+    usage = {}; timings = {}; finish = None; completion_id = None
     req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
@@ -407,6 +407,8 @@ def send(cfg, messages):
         if p == "[DONE]": break
         try: ck = json.loads(p)
         except Exception: continue
+        if isinstance(ck.get("id"), str):
+            completion_id = ck["id"]
         if ck.get("usage"): usage = ck["usage"]
         if ck.get("timings"): timings = ck["timings"]
         ch = (ck.get("choices") or [{}])[0]
@@ -433,6 +435,7 @@ def send(cfg, messages):
     bad = (bool(first) and (uniq(first) < 0.15 or maxfreq(first) > 0.50)) or \
           (bool(last) and (uniq(last) < 0.30 or maxfreq(last) > 0.50)) or (gram3(half) > 0.50)
     return {
+        "request_id": completion_id,
         "ctx": usage.get("prompt_tokens", 0),
         "cached": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
         "gen": usage.get("completion_tokens", 0), "finish": finish,
@@ -530,7 +533,7 @@ def main():
         action="store_true",
         help="Write diagnostic.replay.route_proof_log=true into the temporary "
              "$HIPFIRE_HOME/config.toml so the daemon emits one retained-replay "
-             "proof marker on first success (coherence/product gates).",
+             "proof marker per successful serve request (coherence/product gates).",
     )
     args = ap.parse_args()
     cfg = build_config(args); cfg["max_seq"] = args.max_seq

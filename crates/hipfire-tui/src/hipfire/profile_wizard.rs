@@ -678,6 +678,19 @@ mod tests {
     }
 
     #[test]
+    fn selecting_hip_profile_persists_redline_opt_out() {
+        let paths = test_paths("hip-opt-out");
+        let mut wizard = ProfileWizard::load_from_paths(paths.clone()).unwrap();
+        wizard.apply_named_profile("hip").unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert_eq!(
+            loaded.layer.get("replay.backend"),
+            Some(&ConfigValue::String("hip".to_owned()))
+        );
+        let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
     fn creating_custom_profile_snapshots_current_layer() {
         let paths = test_paths("create");
         let mut wizard = ProfileWizard::load_from_paths(paths.clone()).unwrap();

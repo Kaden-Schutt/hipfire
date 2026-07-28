@@ -55,6 +55,7 @@ def _validate_arm(turns: list[dict], rows: object, backend: str, route: dict) ->
     if len(rows) != len(turns):
         errors.append(f"{backend}: expected {len(turns)} turns, got {len(rows)}")
         return errors
+    successful_rows: list[dict] = []
     for index, (turn, row) in enumerate(zip(turns, rows), 1):
         label = f"{backend} turn {index}"
         if not isinstance(row, dict):
@@ -72,7 +73,10 @@ def _validate_arm(turns: list[dict], rows: object, backend: str, route: dict) ->
         for needle in turn.get("expect", []):
             if needle.lower() not in content.lower():
                 errors.append(f"{label}: answer missing expected substring {needle!r}")
-    route_result = validate_coherence_route_evidence(backend, "pm4", route)
+        successful_rows.append(row)
+    route_result = validate_coherence_route_evidence(
+        backend, "pm4", route, rows=successful_rows
+    )
     errors.extend(f"{backend}: {error}" for error in route_result["errors"])
     return errors
 

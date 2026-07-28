@@ -215,7 +215,7 @@ impl CompileRequest {
             hipcc: resolve_hipcc(),
             working_directory: None,
             optimization_level: 3,
-            fast_math: true,
+            fast_math: false,
             scheduler_profile: SchedulerProfile::Default,
             defines: Vec::new(),
             extra_args: Vec::new(),
@@ -1405,6 +1405,27 @@ mod tests {
             Path::new("/tmp/radiowave.h"),
         );
         assert!(args.iter().any(|arg| arg == "--offload-arch=future-amdgpu"));
+    }
+
+    #[test]
+    fn compile_request_uses_strict_math_unless_fast_math_is_explicit() {
+        let mut request = CompileRequest::new("kernel.hip", "kernel.hsaco", "gfx1201");
+        let strict_args = compile_args(
+            &request,
+            Path::new("/tmp/kernel.hip"),
+            Path::new("/tmp/kernel.hsaco"),
+            Path::new("/tmp/radiowave.h"),
+        );
+        assert!(!strict_args.iter().any(|arg| arg == "-ffast-math"));
+
+        request.fast_math = true;
+        let fast_args = compile_args(
+            &request,
+            Path::new("/tmp/kernel.hip"),
+            Path::new("/tmp/kernel.hsaco"),
+            Path::new("/tmp/radiowave.h"),
+        );
+        assert!(fast_args.iter().any(|arg| arg == "-ffast-math"));
     }
 
     #[test]

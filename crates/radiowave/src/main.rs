@@ -62,7 +62,7 @@ fn compile(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let mut defines = Vec::new();
     let mut extra_args = Vec::new();
     let mut inspect = true;
-    let mut fast_math = true;
+    let mut fast_math = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.to_str() {
@@ -90,6 +90,7 @@ fn compile(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
             }
             Some("--arg") => extra_args.push(next(&mut iter, "--arg")?),
             Some("--no-inspect") => inspect = false,
+            Some("--fast-math") => fast_math = true,
             Some("--no-fast-math") => fast_math = false,
             Some("--help" | "-h") => {
                 usage();
@@ -793,7 +794,7 @@ where
 
 fn usage() {
     println!(
-        "radiowave compile --source KERNEL.hip --output KERNEL.hsaco --arch TARGET [--wave32|--wave64] [--scheduler-profile default|max-ilp|iterative-ilp|memory-clause|pipeline-ilp] [--define NAME=VALUE] [--arg FLAG] [--manifest PATH] [--no-inspect]\n\
+        "radiowave compile --source KERNEL.hip --output KERNEL.hsaco --arch TARGET [--wave32|--wave64] [--scheduler-profile default|max-ilp|iterative-ilp|memory-clause|pipeline-ilp] [--define NAME=VALUE] [--arg FLAG] [--manifest PATH] [--no-inspect] [--fast-math|--no-fast-math]\n\
          radiowave inspect --input KERNEL.hsaco --arch TARGET\n\
          radiowave oracle hip --manifest MANIFEST.json --kernel NAME --workgroup X[,Y,Z] [--output REPORT.json]\n\
          radiowave oracle aco --input ACO.dump --input-artifact SHADER.spv --kernel NAME --arch TARGET --wavefront 32|64 [--workgroup X,Y,Z] [--compiler-version TEXT] [--output REPORT.json]\n\
