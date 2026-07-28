@@ -241,6 +241,7 @@ impl Pm4Commands {
         &self,
         device: &GpuDevice,
         pool: &KernargPool,
+        ib_pool: Option<&KernargPool>,
         cu_mask: Option<&[u32; 2]>,
     ) -> Result<SingleQueuePm4Ib, String> {
         let graph = match self {
@@ -266,6 +267,8 @@ impl Pm4Commands {
                 // certification.
                 if dispatch_profile_enabled() {
                     SingleQueuePm4Ib::create_dispatch_profiled(device, pool, commands)
+                } else if let Some(ib_pool) = ib_pool {
+                    SingleQueuePm4Ib::create_profiled_with_ib_pool(device, pool, ib_pool, commands)
                 } else {
                     SingleQueuePm4Ib::create_profiled(device, pool, commands)
                 }
@@ -2573,7 +2576,37 @@ impl ReplayController {
             }
             commands.wait_compute_idle();
             let command_dwords = commands.len_dwords();
-            let graph = commands.create_graph(&device, &pool, cu_mask.as_ref())?;
+            // HIPFIRE_REDLINE_IB_POOL=vmem: allocate the retained indirect
+            // buffer from a GPU-agent (VRAM) pool so the command processor
+            // fetches the tape from VRAM instead of re-reading it over the
+            // host interface on every replay. Host-read surfaces
+            // (timestamps, completion signals) stay on the CPU-agent pool.
+            // Falls back to the host pool with a warning when no device-local
+            // pool exists.
+            static IB_VMEM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                hipfire_config::developer_var("HIPFIRE_REDLINE_IB_POOL").as_deref()
+                    == Ok("vmem")
+            });
+            let ib_pool = if *IB_VMEM {
+                match KernargPool::discover_device_local(&device) {
+                    Ok(p) => Some(p),
+                    Err(error) => {
+                        eprintln!(
+                            "[redline] HIPFIRE_REDLINE_IB_POOL=vmem but no device-local pool \
+                             found ({error}); using host pool"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let graph = commands.create_graph(
+                &device,
+                &pool,
+                ib_pool.as_ref(),
+                cu_mask.as_ref(),
+            )?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
             let min_parallel_width = pm4_min_parallel_width_from_config();

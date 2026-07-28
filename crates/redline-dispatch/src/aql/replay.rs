@@ -90,10 +90,58 @@ impl SingleQueuePm4Ib {
         Self::create_encoded(
             device,
             pool,
+            None,
             &commands.as_bytes(),
             commands.len_dwords(),
             None,
             None,
+        )
+    }
+
+    /// [`Self::create`] with the indirect buffer allocated from a separate
+    /// (device-local/VRAM) pool; everything host-read stays on `pool`.
+    pub fn create_with_ib_pool(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        ib_pool: &KernargPool,
+        commands: &Gfx12Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        Self::create_encoded(
+            device,
+            pool,
+            Some(ib_pool),
+            &commands.as_bytes(),
+            commands.len_dwords(),
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::create_with_ib_pool`] with GPU-clock timestamps (the shadow
+    /// harness's AQL batch profiling contract): timestamps stay on the
+    /// host pool, IB on the device-local pool.
+    pub fn create_profiled_with_ib_pool(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        ib_pool: &KernargPool,
+        commands: &Gfx12Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        if commands.is_empty() {
+            return Err(ReplayError::EmptyGraph);
+        }
+        let mut timestamps = pool.allocate_executable_bytes(16)?;
+        timestamps.as_mut_bytes().fill(0);
+        let start = timestamps.address() as usize as u64;
+        let timed = commands.with_gpu_timestamps(start, start + 8);
+        let frequency_hz = device.gpu_timestamp_frequency_hz()?;
+        Self::create_encoded(
+            device,
+            pool,
+            Some(ib_pool),
+            &timed.as_bytes(),
+            timed.len_dwords(),
+            Some(timestamps),
+            Some(frequency_hz),
         )
     }
 
@@ -106,6 +154,7 @@ impl SingleQueuePm4Ib {
         Self::create_encoded(
             device,
             pool,
+            None,
             &commands.as_bytes(),
             commands.len_dwords(),
             None,
@@ -123,6 +172,7 @@ impl SingleQueuePm4Ib {
         Self::create_encoded(
             device,
             pool,
+            None,
             &commands.as_bytes(),
             commands.len_dwords(),
             None,
@@ -157,6 +207,7 @@ impl SingleQueuePm4Ib {
         Self::create_encoded(
             device,
             pool,
+            None,
             &timed.as_bytes(),
             timed.len_dwords(),
             Some(timestamps),
@@ -180,6 +231,7 @@ impl SingleQueuePm4Ib {
         Self::create_encoded(
             device,
             pool,
+            None,
             &timed.as_bytes(),
             timed.len_dwords(),
             Some(timestamps),
@@ -219,6 +271,7 @@ impl SingleQueuePm4Ib {
         Self::create_encoded(
             device,
             pool,
+            None,
             &timed.as_bytes(),
             timed.len_dwords(),
             Some(timestamps),
@@ -229,6 +282,7 @@ impl SingleQueuePm4Ib {
     fn create_encoded(
         device: &GpuDevice,
         pool: &KernargPool,
+        ib_pool: Option<&KernargPool>,
         bytes: &[u8],
         dwords: u32,
         timestamps: Option<KernargBuffer>,
@@ -238,8 +292,17 @@ impl SingleQueuePm4Ib {
             return Err(ReplayError::EmptyGraph);
         }
         let dispatch_workgroup_offsets = pm4_dispatch_workgroup_offsets(bytes)?;
-        let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
+        // The IB may live in a device-local (VRAM) pool so the command
+        // processor fetches the tape from VRAM instead of re-reading it over
+        // the host interface on every replay; everything host-read
+        // (timestamps, completion) stays on the CPU-agent pool.
+        let mut indirect = ib_pool
+            .unwrap_or(pool)
+            .allocate_executable_bytes(bytes.len())?;
+        // Device-local (VRAM) IBs are host-mapped on ReBAR systems, so the
+        // same store path works for both pools.
         indirect.write_exact(bytes)?;
+
         let completion = CompletionSignal::new(device)?;
         let packet =
             PacketImage::pm4_indirect_buffer(indirect.address(), dwords, completion.raw())?;
