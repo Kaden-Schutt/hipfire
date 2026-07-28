@@ -86,22 +86,43 @@ class LowerKernelArgvTests(unittest.TestCase):
             )
             self.assertEqual(kwargs.get("cwd"), root)
             self.assertFalse(kwargs.get("check", False))
+            # Inherited stdio: do not capture or redirect child streams.
+            for forbidden in (
+                "capture_output",
+                "input",
+                "stdin",
+                "stdout",
+                "stderr",
+            ):
+                self.assertNotIn(forbidden, kwargs)
+
 
     def test_kernel_radiowave_override_stripped_and_used(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rw = Path(tmp) / "custom-radiowave"
-            rw.write_text("#!/bin/sh\n", encoding="utf-8")
+            root = Path(tmp)
+            # Competing default release binary must lose to explicit --radiowave.
+            release = root / "target" / "release" / "radiowave"
+            release.parent.mkdir(parents=True)
+            release.write_text("#!/bin/sh\n# release\n", encoding="utf-8")
+            release.chmod(0o755)
+            rw = root / "custom-radiowave"
+            rw.write_text("#!/bin/sh\n# override\n", encoding="utf-8")
             rw.chmod(0o755)
             completed = MagicMock(returncode=0)
-            with patch.object(self.lower.subprocess, "run", return_value=completed) as run:
+            with (
+                patch.object(self.lower, "REPO", root),
+                patch.object(self.lower.subprocess, "run", return_value=completed) as run,
+            ):
                 code = self.lower.main(
                     ["kernel", "--radiowave", str(rw), "inspect", "--input", "a.hsaco"]
                 )
             self.assertEqual(code, 0)
             argv = run.call_args.args[0]
             self.assertEqual(argv[0], str(rw))
+            self.assertNotEqual(argv[0], str(release))
             self.assertEqual(argv[1:], ["inspect", "--input", "a.hsaco"])
             self.assertNotIn("--radiowave", argv)
+
 
     def test_kernel_prefers_release_over_debug_over_cargo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,24 +184,25 @@ class LowerKernelArgvTests(unittest.TestCase):
         self.assertIn("tools.redline.lower:", msg)
         self.assertIn(str(missing), msg)
 
-    def test_kernel_spawn_file_not_found_exits_2(self):
+    def test_kernel_spawn_oserror_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            completed_path = root / "target" / "release" / "radiowave"
-            # No binaries → cargo prefix; force spawn OSError
+            # No binaries → cargo prefix; force general spawn OSError
             with (
                 patch.object(self.lower, "REPO", root),
                 patch.object(
                     self.lower.subprocess,
                     "run",
-                    side_effect=FileNotFoundError("cargo"),
+                    side_effect=OSError(2, "No such file or directory", "cargo"),
                 ),
                 patch.object(sys, "stderr", io.StringIO()) as err,
             ):
                 code = self.lower.main(["kernel", "compile"])
             self.assertEqual(code, 2)
-            self.assertIn("tools.redline.lower:", err.getvalue())
-            self.assertIn("cargo", err.getvalue())
+            msg = err.getvalue()
+            self.assertIn("tools.redline.lower:", msg)
+            self.assertIn("cargo", msg)
+
 
 
 class LowerPm4ArgvTests(unittest.TestCase):
@@ -204,7 +226,8 @@ class LowerPm4ArgvTests(unittest.TestCase):
                     ["pm4", "--model", "M", "--daemon", "D", "--prefix", "32"]
                 )
             self.assertEqual(code, 3)
-            argv = run.call_args.args[0]
+            args, kwargs = run.call_args
+            argv = args[0]
             self.assertEqual(argv[0], sys.executable)
             self.assertEqual(argv[1], str(harness))
             self.assertEqual(argv[2], "--pm4")
@@ -213,7 +236,16 @@ class LowerPm4ArgvTests(unittest.TestCase):
                 ["--model", "M", "--daemon", "D", "--prefix", "32"],
             )
             self.assertEqual(argv.count("--pm4"), 1)
-            self.assertEqual(run.call_args.kwargs.get("cwd"), root)
+            self.assertEqual(kwargs.get("cwd"), root)
+            # Inherited stdio: do not capture or redirect child streams.
+            for forbidden in (
+                "capture_output",
+                "input",
+                "stdin",
+                "stdout",
+                "stderr",
+            ):
+                self.assertNotIn(forbidden, kwargs)
 
     def test_pm4_caller_provided_flag_not_duplicated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -226,11 +258,31 @@ class LowerPm4ArgvTests(unittest.TestCase):
                 patch.object(self.lower, "REPO", root),
                 patch.object(self.lower.subprocess, "run", return_value=completed) as run,
             ):
-                self.lower.main(["pm4", "--pm4", "--model", "M"])
+                # Duplicate caller --pm4 flags must collapse to exactly one.
+                self.lower.main(
+                    [
+                        "pm4",
+                        "--pm4",
+                        "--model",
+                        "M",
+                        "--pm4",
+                        "--daemon",
+                        "D",
+                        "--prefix",
+                        "32",
+                    ]
+                )
             argv = run.call_args.args[0]
+            self.assertEqual(argv[0], sys.executable)
+            self.assertEqual(argv[1], str(harness))
             self.assertEqual(argv.count("--pm4"), 1)
             self.assertEqual(argv[2], "--pm4")
-            self.assertEqual(argv[3:], ["--model", "M"])
+            # Non-flag args preserved in caller order after the single --pm4.
+            self.assertEqual(
+                argv[3:],
+                ["--model", "M", "--daemon", "D", "--prefix", "32"],
+            )
+
 
     def test_pm4_missing_harness_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -245,6 +297,34 @@ class LowerPm4ArgvTests(unittest.TestCase):
             msg = err.getvalue()
             self.assertIn("tools.redline.lower:", msg)
             self.assertIn("redline_daemon_harness.py", msg)
+
+    def test_pm4_spawn_oserror_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            harness = root / "scripts" / "redline_daemon_harness.py"
+            harness.parent.mkdir(parents=True)
+            harness.write_text("# harness\n", encoding="utf-8")
+            err = io.StringIO()
+            with (
+                patch.object(self.lower, "REPO", root),
+                patch.object(
+                    self.lower.subprocess,
+                    "run",
+                    side_effect=OSError(13, "Permission denied", sys.executable),
+                ),
+                patch.object(sys, "stderr", err),
+            ):
+                code = self.lower.main(["pm4", "--model", "M"])
+            self.assertEqual(code, 2)
+            msg = err.getvalue()
+            self.assertIn("tools.redline.lower:", msg)
+            self.assertTrue(
+                sys.executable in msg
+                or "Permission denied" in msg
+                or "redline_daemon_harness" in msg,
+                msg,
+            )
+
 
 
 class LowerModeTests(unittest.TestCase):
@@ -284,32 +364,40 @@ class LowerHelpSmokeTests(unittest.TestCase):
 
     def test_kernel_help_delegates_without_gpu(self):
         result = self.run_lower("kernel", "-h")
-        # Child started: not wrapper resolution failure (2 only if radiowave/cargo missing entirely)
-        # Accept 0 (help ok) or child non-zero; reject pure import/dispatch failure patterns.
+        # Must reach real child help: not package unknown-subcommand, not empty.
         self.assertNotIn("unknown subcommand", result.stderr)
-        combined = (result.stdout or "") + (result.stderr or "")
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
+        )
+        combined = ((result.stdout or "") + (result.stderr or "")).lower()
         self.assertTrue(
-            result.returncode != 2
-            or "tools.redline.lower:" in result.stderr
-            or "radiowave" in combined.lower()
-            or "usage" in combined.lower()
-            or "help" in combined.lower(),
+            "usage" in combined
+            or "help" in combined
+            or "radiowave" in combined
+            or "compile" in combined
+            or "inspect" in combined,
             f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
         )
 
     def test_pm4_help_delegates_without_gpu(self):
         result = self.run_lower("pm4", "-h")
         self.assertNotIn("unknown subcommand", result.stderr)
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
+        )
         combined = (result.stdout or "") + (result.stderr or "")
-        # Harness argparse help should mention pm4 or usage; must not require GPU.
-        self.assertIn(
-            True,
-            [
-                result.returncode == 0,
-                "--pm4" in combined,
-                "usage" in combined.lower(),
-                "pm4" in combined.lower(),
-            ],
+        combined_l = combined.lower()
+        # Harness argparse help must surface; reject generic errors / empty.
+        self.assertTrue(
+            "--pm4" in combined
+            or "usage" in combined_l
+            or "help" in combined_l
+            or "model" in combined_l
+            or "daemon" in combined_l,
             f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
         )
 
