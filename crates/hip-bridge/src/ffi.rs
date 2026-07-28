@@ -744,6 +744,9 @@ impl HipRuntime {
     /// Return the base and byte extent of the HIP allocation containing
     /// `device_ptr`. This is used by retained replay to conservatively treat
     /// distinct subviews of one allocation as aliasing resources.
+    ///
+    /// HIP treats `device_ptr` as an opaque GPU address; Rust never dereferences it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn mem_get_address_range(
         &self,
         device_ptr: *mut c_void,
