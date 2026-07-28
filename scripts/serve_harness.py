@@ -24,7 +24,7 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, json, os, re, shutil, signal, subprocess, sys, time, urllib.request
+import argparse, atexit, errno, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
 # concrete token cap, not just the preset name).
@@ -161,21 +161,82 @@ def show_config(cfg):
 
 
 # ---------- serve spawn (robust, self-contained) ----------
+# Popen(start_new_session=True) makes the CLI leader PID also the session PGID.
+# Retain that known PGID so cleanup can killpg even after the leader exits
+# (os.getpgid(leader) then returns ESRCH while descendants may still live).
 _serve_proc = None
+_serve_pgid = None
+
+
+def _pid_file_path():
+    """Optional cross-process PID path for the active CLI process-group leader."""
+    path = os.environ.get("HIPFIRE_SERVE_HARNESS_PID_FILE")
+    return path if path else None
+
+
+def _clear_pid_file():
+    path = _pid_file_path()
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _write_pid_file(pid):
+    """Atomically publish the CLI process-group leader PID for a parent observer."""
+    path = _pid_file_path()
+    if not path:
+        return
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".serve_harness_pid.", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(f"{int(pid)}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
 
 def _kill_serve():
     """Kill ONLY this harness's own native serve tree (the Rust CLI + its child daemon),
     scoped by process group — NOT a broad `pkill -x daemon`, which would execute
     the parallel autoresearch daemons pinned to OTHER GPUs. spawn_serve starts the
-    serve in its own session (start_new_session) so this group kill is exact."""
-    global _serve_proc
-    if _serve_proc is not None:
+    serve in its own session (start_new_session) so this group kill is exact.
+
+    Always killpg the retained session PGID (equal to the CLI Popen PID). Do not
+    gate on os.getpgid(leader): after the leader exits getpgid returns ESRCH even
+    when the process group still has descendants. ESRCH from killpg is benign."""
+    global _serve_proc, _serve_pgid
+    pgid = _serve_pgid
+    if pgid is None and _serve_proc is not None:
+        pgid = _serve_proc.pid
+    if pgid is not None:
         try:
-            os.killpg(os.getpgid(_serve_proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            try: _serve_proc.kill()
-            except Exception: pass
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as err:
+            # ESRCH: group already gone (benign race). Other errors: last-ditch
+            # kill the Popen handle if it is still around.
+            if getattr(err, "errno", None) != errno.ESRCH and _serve_proc is not None:
+                try:
+                    _serve_proc.kill()
+                except Exception:
+                    pass
     _serve_proc = None
+    _serve_pgid = None
+    _clear_pid_file()
 
 
 def _native_cli():
@@ -219,20 +280,43 @@ budget = {json.dumps(cfg["thinking_budget"])}
         handle.write(text)
 
 
-def _native_service_warm(port):
+def _native_service_warm(port, expected_model=None, proc=None):
+    """True only when health is ready for *this* spawn.
+
+    Rejects an unrelated warm service after the newly spawned leader has already
+    exited: require ``proc`` still alive when provided, and when
+    ``expected_model`` is set require health reports that same model path.
+    """
+    if proc is not None and proc.poll() is not None:
+        return False
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
             health = json.load(response)
-        return bool(health.get("model")) and not health.get("loading_model")
     except Exception:
         return False
+    if not bool(health.get("model")) or health.get("loading_model"):
+        return False
+    if expected_model is not None:
+        reported = health.get("model")
+        if not isinstance(reported, str):
+            return False
+        # Compare resolved paths so relative vs absolute forms still match.
+        try:
+            if os.path.realpath(reported) != os.path.realpath(expected_model):
+                return False
+        except OSError:
+            if reported != expected_model:
+                return False
+    if proc is not None and proc.poll() is not None:
+        return False
+    return True
 
 
 def spawn_serve(cfg, home, log):
     """Spawn native `hipfire serve` with the resolved serve config; retry on the flaky
     daemon-spawn; return when warm. The per-request sampling is sent by the driver, so
     one serve handles all recipes/modes."""
-    global _serve_proc
+    global _serve_proc, _serve_pgid
     os.makedirs(os.path.join(home, ".hipfire"), exist_ok=True)
     models = os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
     for ln in ("models", "templates"):
@@ -256,13 +340,18 @@ def spawn_serve(cfg, home, log):
     for attempt in range(1, 5):
         _kill_serve(); time.sleep(3)
         open(log, "w").close()
+        # Drop any stale observer PID before the next CLI process-group leader exists.
+        _clear_pid_file()
         _serve_proc = subprocess.Popen(
             [cli, "serve", "127.0.0.1", str(cfg["port"])],
             cwd=REPO, env=env, stdout=open(log, "a"), stderr=subprocess.STDOUT,
             start_new_session=True)   # own process group so _kill_serve's group-kill is exact + scoped
+        # Leader PID == PGID under start_new_session; retain it for dead-leader cleanup.
+        _serve_pgid = _serve_proc.pid
+        _write_pid_file(_serve_pgid)
         for _ in range(90):
             txt = open(log).read() if os.path.exists(log) else ""
-            if _native_service_warm(cfg["port"]):
+            if _native_service_warm(cfg["port"], expected_model=cfg.get("model"), proc=_serve_proc):
                 return True
             if re.search(r"out of memory|error loading|panic", txt, re.I):
                 break

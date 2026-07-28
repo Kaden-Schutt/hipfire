@@ -16,6 +16,9 @@ tok/s respectively; final turns remain at 160.3 tok/s at 18.2K, 82.5 tok/s at
 approximately 110 to 203.9 tok/s without speculative decoding or manual clock
 pinning.
 
+The gfx1151 HFQ4 QKVZA hybrid header-load experiment remains developer-only:
+the coherent all-buffer schedule is the production default.
+
 Contributor deltas staged for this release:
 
 - #465: LLaMA Site A attention dispatch and expanded HFQ KV policy.

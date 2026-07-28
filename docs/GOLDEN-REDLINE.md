@@ -7,8 +7,8 @@ retained-PM4 routes on gfx1100, gfx1151, and gfx1201.
 |---|---|
 | Page state | **branch-implemented** |
 | Fixture registry | [`registry/redline-golden-v1.json`](../registry/redline-golden-v1.json) |
-| Runner | [`scripts/golden-redline.py`](../scripts/golden-redline.py) |
-| Product harness | [`scripts/redline_product_bench.py`](../scripts/redline_product_bench.py) |
+| Runner | [`tools/redline/golden.py`](../tools/redline/golden.py) (`python3 -m tools.redline golden`) |
+| Product harness | [`tools/redline/product_bench.py`](../tools/redline/product_bench.py) (`python3 -m tools.redline bench`) |
 | Certification policy | [`REDLINE.md`](REDLINE.md) |
 
 This runner is developer orchestration. Persistent product configuration still
@@ -21,7 +21,7 @@ not create a model/route admission; admissions remain owned exclusively by
 From a source checkout:
 
 ```bash
-python3 scripts/golden-redline.py
+python3 -m tools.redline golden
 ```
 
 The runner:
@@ -44,19 +44,19 @@ Useful forms:
 
 ```bash
 # Show fixtures without touching a GPU.
-python3 scripts/golden-redline.py --list
+python3 -m tools.redline golden --list
 
 # Pull the model when absent and pin it as the default after a pass.
-python3 scripts/golden-redline.py --pull --set-default --yes
+python3 -m tools.redline golden --pull --set-default --yes
 
 # Select a physical device on a multi-GPU host.
-python3 scripts/golden-redline.py --device 3
+python3 -m tools.redline golden --device 3
 
 # Print the exact command without building, hashing, loading, or running.
-python3 scripts/golden-redline.py --arch gfx1201 --dry-run
+python3 -m tools.redline golden --arch gfx1201 --dry-run
 
 # Audit an existing report; exact source and daemon hashes are mandatory here.
-python3 scripts/golden-redline.py \
+python3 -m tools.redline golden \
   --arch gfx1100 \
   --report /path/to/report.json \
   --strict-binary
@@ -68,7 +68,7 @@ clock convergence. It does not relax the acceptance gates.
 
 ## Reproducing on a box that disagrees
 
-`golden-redline.py` pins the model, sampling profile, benchmark contract, PM4
+`python3 -m tools.redline golden` pins the model, sampling profile, benchmark contract, PM4
 policy and route identity — but not the compiled code objects or the host
 toolchain. When a contributor reports the same route identity (same dispatch
 count, kernel count and sequence hash) with different throughput, the

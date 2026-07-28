@@ -24,9 +24,8 @@ from pathlib import Path
 from typing import Any
 
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY = REPO / "registry" / "redline-golden-v1.json"
-PRODUCT_BENCH = REPO / "scripts" / "redline_product_bench.py"
 DEFAULT_MODEL = Path("~/.hipfire/models/qwen3.6-35b-a3b.mq4r").expanduser()
 DEFAULT_DAEMON = REPO / "target" / "release" / "examples" / "daemon"
 ARCH_RE = re.compile(r"\bgfx(?:10|11|12)\d{2}\b")
@@ -114,9 +113,56 @@ def visible_environment(device: int) -> dict[str, str]:
     return env
 
 
+def detect_architecture_from_kfd(
+    device: int,
+    topology_root: Path = Path("/sys/class/kfd/kfd/topology/nodes"),
+) -> str:
+    try:
+        nodes = sorted(
+            (path for path in topology_root.iterdir() if path.name.isdigit()),
+            key=lambda path: int(path.name),
+        )
+    except OSError as error:
+        raise GoldenError(
+            "automatic architecture detection requires rocminfo or readable "
+            f"KFD topology: {error}"
+        ) from error
+
+    gpu_arches = []
+    for node in nodes:
+        try:
+            properties = {
+                key: value
+                for line in (node / "properties").read_text().splitlines()
+                if len(parts := line.split(maxsplit=1)) == 2
+                for key, value in (parts,)
+            }
+        except OSError:
+            continue
+        if properties.get("cpu_cores_count") != "0":
+            continue
+        try:
+            target = int(properties["gfx_target_version"])
+        except (KeyError, ValueError):
+            continue
+        if target <= 0:
+            continue
+        major = target // 10_000
+        minor = (target // 100) % 100
+        stepping = target % 100
+        gpu_arches.append(f"gfx{major}{minor}{stepping}")
+
+    if device < 0 or device >= len(gpu_arches):
+        raise GoldenError(
+            f"physical device {device} is outside the KFD GPU inventory "
+            f"({len(gpu_arches)} devices)"
+        )
+    return gpu_arches[device]
+
+
 def detect_architecture(device: int) -> str:
     if shutil.which("rocminfo") is None:
-        raise GoldenError("rocminfo is required for automatic architecture detection")
+        return detect_architecture_from_kfd(device)
     proc = subprocess.run(
         ["rocminfo"],
         env=visible_environment(device),
@@ -225,7 +271,7 @@ def ensure_daemon(daemon: Path, *, build: bool) -> None:
         raise GoldenError(f"cargo build completed but {daemon} is absent")
 
 
-def product_command(
+def product_bench_argv(
     fixture: dict[str, Any],
     golden: dict[str, Any],
     *,
@@ -235,10 +281,9 @@ def product_command(
     output: Path,
     timeout: float,
 ) -> list[str]:
+    """CLI argv for ``python3 -m tools.redline bench`` (no executable prefix)."""
     bench = fixture["benchmark"]
-    args = [
-        sys.executable,
-        str(PRODUCT_BENCH),
+    return [
         "--model",
         str(model),
         "--daemon",
@@ -282,7 +327,68 @@ def product_command(
         "--expected-model-sha256",
         golden["model"]["sha256"],
     ]
-    return args
+
+
+def product_command(
+    fixture: dict[str, Any],
+    golden: dict[str, Any],
+    *,
+    model: Path,
+    daemon: Path,
+    work_dir: Path,
+    output: Path,
+    timeout: float,
+) -> list[str]:
+    """Full shell-style command for dry-run display and logs."""
+    return [
+        sys.executable,
+        "-m",
+        "tools.redline",
+        "bench",
+        *product_bench_argv(
+            fixture,
+            golden,
+            model=model,
+            daemon=daemon,
+            work_dir=work_dir,
+            output=output,
+            timeout=timeout,
+        ),
+    ]
+
+
+def run_product_bench(
+    fixture: dict[str, Any],
+    golden: dict[str, Any],
+    *,
+    model: Path,
+    daemon: Path,
+    work_dir: Path,
+    output: Path,
+    timeout: float,
+    env: dict[str, str],
+) -> None:
+    """Invoke the product benchmark in-process with a temporary environment."""
+    from tools.redline import product_bench
+
+    argv = product_bench_argv(
+        fixture,
+        golden,
+        model=model,
+        daemon=daemon,
+        work_dir=work_dir,
+        output=output,
+        timeout=timeout,
+    )
+    saved = os.environ.copy()
+    try:
+        os.environ.clear()
+        os.environ.update(env)
+        # product_bench.main raises SystemExit on failure; let it propagate.
+        product_bench.main(argv)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 def validate_report(
@@ -480,9 +586,10 @@ def print_fixtures(registry: dict[str, Any]) -> None:
         )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="One-command sealed Redline MQ4R reproduction"
+        prog="python3 -m tools.redline golden",
+        description="One-command sealed Redline MQ4R reproduction",
     )
     parser.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     parser.add_argument("--fixture")
@@ -504,11 +611,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--validate-registry", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     registry_path = Path(args.registry).expanduser().resolve()
     registry = load_registry(registry_path)
     validate_model_registry_card(registry)
@@ -583,11 +690,15 @@ def main() -> int:
         ensure_daemon(daemon, build=not args.no_build)
         output.parent.mkdir(parents=True, exist_ok=True)
         work_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            command,
-            cwd=REPO,
+        run_product_bench(
+            fixture,
+            registry,
+            model=model,
+            daemon=daemon,
+            work_dir=work_dir,
+            output=output,
+            timeout=args.timeout,
             env=visible_environment(args.device),
-            check=True,
         )
     report = json.loads(output.read_text())
     actual_model_sha = report.get("model_sha256", expected_model_sha)

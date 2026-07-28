@@ -1,0 +1,1495 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+"""Resident HipGraph-vs-Redline product decode benchmark.
+
+Unlike redline_daemon_harness.py (manual shadow capture), this drives the real
+default-off product lifecycle: the explicit ``redline`` backend records one
+ordinary AR forward and routes later forwards through the prepared replay. The
+HIP arm leaves the existing AR HipGraph enabled. Models stay resident within
+each arm, clocks are never modified, and every row uses the daemon's full Qwen
+reset and prefill-prime path.
+"""
+
+import argparse
+import errno
+import hashlib
+import json
+import os
+import re
+import secrets
+import tempfile
+import select
+import signal
+import socket
+import statistics
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+REPO = Path(__file__).resolve().parents[2]
+
+# One-turn Flagstaff smoke through scripts/serve_harness.py (CLI/serve path).
+# Thinking budget must stay strictly below max_tokens so a visible answer fits.
+COHERENCE_PROMPT = "What is the origin of Flagstaff, Arizona's name?"
+COHERENCE_THINKING = "low"
+COHERENCE_THINKING_CAP_TOKENS = 512
+COHERENCE_MAX_TOKENS = 768
+COHERENCE_SEED = 1
+COHERENCE_SAMPLING = "registry"
+COHERENCE_MODE = "battery"
+COHERENCE_MTP = "off"
+assert COHERENCE_MAX_TOKENS > COHERENCE_THINKING_CAP_TOKENS
+
+# Product certification must not inherit an old PM4 experiment from the
+# caller's environment or ~/.hipfire/config.toml. In particular, fully
+# stateful gfx12 register elision depends on compiler-produced descriptor
+# equality and has produced shorter, slower IBs on otherwise identical
+# gfx1201 tapes. Static mode retains only queue-global invariant registers and
+# re-emits program/resource/workgroup/user-data state for every dispatch.
+CERTIFIED_PM4_POLICY = {
+    "HIPFIRE_REPLAY_PM4_QUEUES": "1",
+    "HIPFIRE_REPLAY_PM4_STATEFUL": "static",
+    "HIPFIRE_REPLAY_PM4_WAIT_POLICY": "resource",
+    "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY": "required-only",
+    "HIPFIRE_REPLAY_PM4_GCR_TRIM": "1",
+    "HIPFIRE_REPLAY_PM4_NATIVE_PHASES": "0",
+    "HIPFIRE_REPLAY_PM4_DYNAMIC_GRID": "0",
+}
+
+
+def backend_config_value(backend):
+    """Map report-arm vocabulary to the typed replay config vocabulary."""
+    return "redline" if backend == "auto" else backend
+
+
+def _kill_serve_process_group(serve_pid_path):
+    """Timeout cleanup: killpg the known session PGID from the PID file.
+
+    With Popen(start_new_session=True) the CLI leader PID equals the PGID.
+    Call os.killpg(pid, SIGKILL) directly — do not gate on os.getpgid(leader),
+    which returns ESRCH after the leader exits while descendants may remain.
+    Missing/invalid PID values and unexpected kill errors are cleanup failures;
+    ESRCH / ProcessLookupError from killpg are benign.
+    """
+    cleanup_errors = []
+    try:
+        raw = Path(serve_pid_path).read_text(encoding="utf-8").strip()
+    except OSError as read_error:
+        cleanup_errors.append(
+            f"serve PID file unreadable ({serve_pid_path}): {read_error}"
+        )
+        return cleanup_errors
+    try:
+        pid = int(raw)
+    except ValueError:
+        cleanup_errors.append(
+            f"serve PID file invalid contents {raw!r} ({serve_pid_path})"
+        )
+        return cleanup_errors
+    if pid <= 0:
+        cleanup_errors.append(
+            f"serve PID not positive: {pid} ({serve_pid_path})"
+        )
+        return cleanup_errors
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as kill_error:
+        # ESRCH is benign (race with natural exit / empty group).
+        if kill_error.errno != errno.ESRCH:
+            cleanup_errors.append(f"killpg({pid}) failed: {kill_error}")
+    return cleanup_errors
+
+
+def _flagstaff_answer_errors(content):
+    """Semantic checks for the one-turn Flagstaff coherence answer.
+
+    Require a real flag-object concept plus a naming/history cue.
+    Accept standalone ``flag``, ``flagpole``, ``flag pole``, ``flag-staff``,
+    or ``flagstaff`` only when explicitly accompanied by ``pole``/``mast``.
+    Reject bare city facts and pine-tree naming without a real flag object.
+    """
+    errors = []
+    lowered = content.lower()
+
+    # Word-ish tokens: letters with internal hyphen/apostrophe.
+    tokens = re.findall(r"[a-z0-9]+(?:['-][a-z0-9]+)*", lowered)
+    token_set = set(tokens)
+
+    has_standalone_flag = "flag" in token_set
+    has_flagpole_word = "flagpole" in token_set or "flag-staff" in token_set
+    # Multi-word "flag pole" / "flag staff" as adjacent tokens.
+    has_flag_pole_phrase = any(
+        tokens[i] == "flag" and tokens[i + 1] in ("pole", "staff")
+        for i in range(len(tokens) - 1)
+    )
+    # Bare "flagstaff" (the city name) only counts with an explicit pole/mast.
+    has_flagstaff_with_support = "flagstaff" in token_set and (
+        "pole" in token_set or "mast" in token_set
+    )
+    has_flag_object = (
+        has_standalone_flag
+        or has_flagpole_word
+        or has_flag_pole_phrase
+        or has_flagstaff_with_support
+    )
+    if not has_flag_object:
+        errors.append(
+            "answer missing real flag object "
+            "(standalone flag / flagpole / flag pole / flag-staff / "
+            "flagstaff with pole or mast)"
+        )
+
+    naming_cues = (
+        "named",
+        "name",
+        "origin",
+        "1876",
+        "centennial",
+        "boston party",
+        "fourth of july",
+        "4th of july",
+    )
+    if not any(cue in lowered for cue in naming_cues):
+        errors.append(
+            "answer missing naming/history cue "
+            "(named/name/origin/1876/centennial/boston party/fourth of july/4th of july)"
+        )
+    return errors
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_head():
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def window_statistics(values, window, max_slope_pct, max_spread_pct):
+    if window < 3 or len(values) < window:
+        return None
+    sample = values[-window:]
+    median = statistics.median(sample)
+    scale = abs(median)
+    if scale == 0.0:
+        slope_pct = float("inf")
+        spread_pct = float("inf")
+    else:
+        x_mid = (window - 1) / 2.0
+        denominator = sum((i - x_mid) ** 2 for i in range(window))
+        slope = sum(
+            (i - x_mid) * (value - statistics.mean(sample))
+            for i, value in enumerate(sample)
+        ) / denominator
+        slope_pct = 100.0 * slope / scale
+        spread_pct = 100.0 * (max(sample) - min(sample)) / scale
+    return {
+        "window": window,
+        "first_row": len(values) - window + 1,
+        "last_row": len(values),
+        "min": min(sample),
+        "median": median,
+        "max": max(sample),
+        "slope_pct_per_row": slope_pct,
+        "spread_pct": spread_pct,
+        "stable": abs(slope_pct) <= max_slope_pct
+        and spread_pct <= max_spread_pct,
+    }
+
+
+def analyze_stationarity(
+    values,
+    *,
+    window,
+    min_runs,
+    confirmation_runs,
+    max_slope_pct,
+    max_spread_pct,
+    max_median_drift_pct,
+):
+    candidate = None
+    rejections = []
+    latest = None
+    for end in range(1, len(values) + 1):
+        latest = window_statistics(
+            values[:end], window, max_slope_pct, max_spread_pct
+        )
+        if latest is None or end < min_runs:
+            continue
+
+        if candidate is not None:
+            drift_pct = (
+                100.0
+                * abs(latest["median"] - candidate["window"]["median"])
+                / abs(candidate["window"]["median"])
+            )
+            rejection = None
+            if not latest["stable"]:
+                rejection = "confirmation_window_unstable"
+            elif drift_pct > max_median_drift_pct:
+                rejection = "confirmation_median_drift"
+            if rejection is not None:
+                rejections.append(
+                    {
+                        "candidate_row": candidate["at_row"],
+                        "rejected_at_row": end,
+                        "reason": rejection,
+                        "median_drift_pct": drift_pct,
+                    }
+                )
+                candidate = None
+
+        if candidate is None and latest["stable"]:
+            candidate = {"at_row": end, "window": dict(latest)}
+
+        if (
+            candidate is not None
+            and end - candidate["at_row"] >= confirmation_runs
+        ):
+            drift_pct = (
+                100.0
+                * abs(latest["median"] - candidate["window"]["median"])
+                / abs(candidate["window"]["median"])
+            )
+            return {
+                "stationary": True,
+                "candidate": candidate,
+                "confirmed_at_row": end,
+                "confirmed_window": dict(latest),
+                "median_drift_pct": drift_pct,
+                "rejections": rejections,
+            }
+
+    return {
+        "stationary": False,
+        "candidate": candidate,
+        "confirmed_at_row": None,
+        "confirmed_window": latest,
+        "median_drift_pct": None,
+        "rejections": rejections,
+    }
+
+
+def stationarity_kwargs(args):
+    return {
+        "window": args.settle_window,
+        "min_runs": args.settle_min_runs,
+        "confirmation_runs": args.settle_confirmation_runs,
+        "max_slope_pct": args.settle_max_slope_pct,
+        "max_spread_pct": args.settle_max_spread_pct,
+        "max_median_drift_pct": args.settle_max_median_drift_pct,
+    }
+
+
+def validate_measurement(values, settlement, args):
+    window = min(args.settle_window, len(values))
+    stats = window_statistics(
+        values,
+        window,
+        args.settle_max_slope_pct,
+        args.settle_max_spread_pct,
+    )
+    reference = settlement["confirmed_window"]["median"]
+    measured = statistics.median(values)
+    drift_pct = 100.0 * abs(measured - reference) / abs(reference)
+    enough_rows = len(values) >= 5
+    return {
+        "valid": enough_rows
+        and stats is not None
+        and stats["stable"]
+        and drift_pct <= args.settle_max_median_drift_pct,
+        "enough_rows": enough_rows,
+        "median_drift_from_settlement_pct": drift_pct,
+        "window": stats,
+    }
+
+
+def validate_route_proof(
+    rows, backend, transport, require_complete_replay=False
+):
+    errors = []
+    proofs = []
+    identities = set()
+    sequences = set()
+    observed_positions = set()
+    retained_rows = 0
+
+    for index, row in enumerate(rows):
+        proof = row.get("redline_route")
+        if not isinstance(proof, dict):
+            errors.append(f"row {index}: missing redline_route")
+            continue
+        proofs.append(proof)
+        if proof.get("requested_backend") != backend:
+            errors.append(
+                f"row {index}: backend={proof.get('requested_backend')!r}, expected {backend!r}"
+            )
+        if proof.get("transport") != transport:
+            errors.append(
+                f"row {index}: transport={proof.get('transport')!r}, expected {transport!r}"
+            )
+        if proof.get("fallback_reason") is not None:
+            errors.append(f"row {index}: fallback={proof['fallback_reason']!r}")
+
+        observed = proof.get("observed") or {}
+        delta = observed.get("count_delta")
+        if not isinstance(delta, int) or delta < 0:
+            errors.append(f"row {index}: invalid observed count delta {delta!r}")
+            delta = 0
+        for key in ("first_position", "last_position"):
+            position = observed.get(key)
+            if isinstance(position, int):
+                observed_positions.add(position)
+
+        prepared = proof.get("prepared")
+        sequence = proof.get("sequence") or {}
+        if backend == "hip":
+            if proof.get("state") != "hip":
+                errors.append(f"row {index}: HIP baseline state={proof.get('state')!r}")
+            if proof.get("retained_replay_observed") or delta:
+                errors.append(f"row {index}: HIP baseline observed retained replay")
+            if prepared is not None:
+                errors.append(f"row {index}: HIP baseline owns a prepared route")
+            continue
+
+        if proof.get("state") != "ready":
+            errors.append(f"row {index}: automatic route state={proof.get('state')!r}")
+        if proof.get("execution_mode") != "plain_ar":
+            errors.append(f"row {index}: automatic route was not plain AR")
+        if require_complete_replay:
+            iterations = row.get("iterations")
+            if not proof.get("retained_replay_observed"):
+                errors.append(f"row {index}: timed row observed no retained replay")
+            if not isinstance(iterations, int) or iterations <= 0:
+                errors.append(
+                    f"row {index}: invalid timed iteration count {iterations!r}"
+                )
+            elif delta != iterations:
+                errors.append(
+                    f"row {index}: observed {delta} retained replays for "
+                    f"{iterations} timed iterations"
+                )
+            context = row.get("context_tokens")
+            if not isinstance(context, int) or context <= 0:
+                errors.append(
+                    f"row {index}: invalid timed context position {context!r}"
+                )
+            elif isinstance(iterations, int) and iterations > 0:
+                first_position = observed.get("first_position")
+                last_position = observed.get("last_position")
+                expected_last = context + iterations - 1
+                if first_position != context:
+                    errors.append(
+                        f"row {index}: first replay position {first_position!r} "
+                        f"!= {context}"
+                    )
+                if last_position != expected_last:
+                    errors.append(
+                        f"row {index}: last replay position {last_position!r} "
+                        f"!= {expected_last}"
+                    )
+        if not isinstance(prepared, dict):
+            errors.append(f"row {index}: automatic route has no prepared identity")
+            continue
+        packets = prepared.get("packets")
+        if not isinstance(packets, int) or packets <= 0:
+            errors.append(f"row {index}: packet identity unavailable")
+        dispatches = prepared.get("dispatches")
+        if not isinstance(dispatches, int) or dispatches <= 0:
+            errors.append(f"row {index}: invalid dispatch count {dispatches!r}")
+        command_dwords = prepared.get("command_dwords")
+        if transport == "pm4" and (
+            not isinstance(command_dwords, int) or command_dwords <= 0
+        ):
+            errors.append(f"row {index}: PM4 command identity unavailable")
+        if transport == "aql" and command_dwords is not None:
+            errors.append(f"row {index}: AQL row unexpectedly reports PM4 commands")
+        identities.add(
+            (
+                dispatches,
+                packets,
+                prepared.get("queue_id"),
+                command_dwords,
+            )
+        )
+        launches = sequence.get("launches")
+        sequence_hash = sequence.get("hash")
+        if launches != dispatches:
+            errors.append(
+                f"row {index}: sequence launches {launches!r} != dispatches {dispatches!r}"
+            )
+        if not isinstance(sequence_hash, str) or sequence_hash == "0000000000000000":
+            errors.append(f"row {index}: invalid sequence hash {sequence_hash!r}")
+        sequences.add(
+            (launches, sequence.get("unique_kernels"), sequence_hash)
+        )
+        if proof.get("retained_replay_observed") and delta > 0:
+            retained_rows += 1
+
+    if not proofs:
+        errors.append("no route-proof rows")
+    if backend == "auto":
+        if retained_rows == 0:
+            errors.append("automatic arm observed no successful retained replay")
+        if len(observed_positions) < 2:
+            errors.append("automatic arm did not observe multiple replay positions")
+        if len(identities) != 1:
+            errors.append(f"prepared identity changed across rows: {sorted(identities)!r}")
+        if len(sequences) != 1:
+            errors.append(f"sequence identity changed across rows: {sorted(sequences)!r}")
+
+    return {
+        "valid": not errors,
+        "backend": backend,
+        "transport": transport,
+        "rows": len(proofs),
+        "require_complete_replay": require_complete_replay,
+        "retained_rows": retained_rows,
+        "observed_positions": sorted(observed_positions),
+        "prepared_identities": [list(identity) for identity in sorted(identities)],
+        "sequences": [list(sequence) for sequence in sorted(sequences)],
+        "errors": errors,
+    }
+
+
+def require_retained_pm4(row):
+    proof = validate_route_proof([row], "auto", "pm4")
+    if proof["valid"]:
+        return
+    route = row.get("redline_route") or {}
+    fallback = route.get("fallback_reason")
+    detail = f": {fallback}" if fallback else ""
+    raise RuntimeError(
+        "Redline PM4 did not engage on the first automatic decode row"
+        f"{detail}; route proof: {'; '.join(proof['errors'])}"
+    )
+
+
+class Daemon:
+    def __init__(
+        self,
+        binary: Path,
+        backend: str,
+        transport: str,
+        log_path: Path,
+        timeout: float,
+        kv_mode: str,
+        dpm_warmup_secs: float,
+    ):
+        self.timeout = timeout
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log = log_path.open("w")
+        env = dict(os.environ)
+        # ``auto`` is the report-arm name and ReplayBackendRequest value. In
+        # the typed config surface it means "follow immutable model admission";
+        # ``redline`` is the explicit opt-in required to certify an unadmitted
+        # architecture without changing product defaults first.
+        configured_backend = backend_config_value(backend)
+        env.update(
+            HIPFIRE_REPLAY_BACKEND=configured_backend,
+            HIPFIRE_REPLAY_TRANSPORT=transport,
+            HIPFIRE_KV_MODE=kv_mode,
+            HIPFIRE_CASK_OFF="1",
+            HIPFIRE_AR_GRAPH="1",
+            HIPFIRE_GRAPH="1",
+            HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
+        )
+        env.update(CERTIFIED_PM4_POLICY)
+        env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
+        self.proc = subprocess.Popen(
+            [str(binary)],
+            cwd=REPO,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.log,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+
+    def request(self, message):
+        if self.proc.poll() is not None:
+            raise RuntimeError(f"daemon exited with {self.proc.returncode}")
+        self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+        ready, _, _ = select.select([self.proc.stdout], [], [], self.timeout)
+        if not ready:
+            raise TimeoutError(f"daemon timed out on {message['type']}")
+        response = json.loads(self.proc.stdout.readline())
+        if response.get("type") == "error":
+            raise RuntimeError(response.get("message", "daemon error"))
+        return response
+
+    def close(self):
+        if self.proc.poll() is None:
+            try:
+                self.request({"type": "unload"})
+            except Exception:
+                pass
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+                self.proc.wait(timeout=5)
+            except Exception:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait(timeout=5)
+        self.log.close()
+
+
+def run_pm4_preflight(args):
+    daemon = Daemon(
+        Path(args.daemon).resolve(),
+        "auto",
+        "pm4",
+        Path(args.work_dir) / "product-pm4-preflight.log",
+        args.timeout,
+        args.kv_mode,
+        0.0,
+    )
+    started = time.monotonic()
+    try:
+        loaded = daemon.request(
+            {
+                "type": "load",
+                "model": str(Path(args.model).expanduser().resolve()),
+                "params": {
+                    "max_seq": args.max_seq,
+                    "kv_mode": args.kv_mode,
+                    "dflash_mode": "off",
+                },
+            }
+        )
+        row = daemon.request(
+            {
+                "type": "bench_decode",
+                "context_tokens": args.context,
+                # The first decode prepares the tape; two more prove replay at
+                # distinct positions without entering benchmark warmup.
+                "iterations": 3,
+                "redline_product_route": True,
+            }
+        )
+        require_retained_pm4(row)
+        return {
+            "seconds": time.monotonic() - started,
+            "loaded": loaded,
+            "smoke": row,
+            "redline_route": row.get("redline_route"),
+        }
+    finally:
+        daemon.close()
+
+
+
+def _unique_coherence_daemon(src: Path, work_dir: Path, backend: str) -> Path:
+    """Hard-link (or copy) daemon under a unique basename for orphan-safe pkill."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    dest = work_dir / f"daemon-product-{backend}-coherence-{os.getpid()}"
+    if dest.exists():
+        dest.unlink()
+    try:
+        os.link(src, dest)
+    except OSError:
+        shutil.copy2(src, dest)
+        mode = dest.stat().st_mode
+        dest.chmod(mode | 0o111)
+    return dest
+
+
+def _allocate_loopback_port():
+    """Reserve an ephemeral loopback TCP port (OS-assigned, released after bind)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+def _unique_smoke_dir(work_root: Path, label: str) -> Path:
+    """Create a unique smoke work directory under work_root (PID + secure suffix)."""
+    work_root.mkdir(parents=True, exist_ok=True)
+    suffix = secrets.token_hex(4)
+    path = Path(
+        tempfile.mkdtemp(
+            prefix=f"product-{label}-{os.getpid()}-",
+            suffix=f"-{suffix}",
+            dir=str(work_root),
+        )
+    )
+    return path
+
+
+def run_coherence_smoke(args, backend):
+    """One Flagstaff turn via scripts/serve_harness.py; quality gate only (no tok/s)."""
+    if backend not in ("hip", "auto"):
+        raise ValueError(f"unsupported coherence backend {backend!r}")
+    if COHERENCE_MAX_TOKENS <= COHERENCE_THINKING_CAP_TOKENS:
+        raise RuntimeError(
+            f"coherence max_tokens ({COHERENCE_MAX_TOKENS}) must exceed "
+            f"thinking cap ({COHERENCE_THINKING_CAP_TOKENS})"
+        )
+
+    model = Path(args.model).expanduser().resolve()
+    daemon_src = Path(args.daemon).expanduser().resolve()
+    cli = Path(getattr(args, "cli", REPO / "target/release/hipfire")).expanduser().resolve()
+    work_root = Path(args.work_dir)
+    smoke_dir = _unique_smoke_dir(work_root, f"{backend}-coherence")
+
+    prompts_path = smoke_dir / "prompts.json"
+    out_path = smoke_dir / "harness.json"
+    home_path = smoke_dir / "home"
+    serve_log = smoke_dir / "serve.log"
+    prompts_path.write_text(
+        json.dumps([{"genre": "factual", "prompt": COHERENCE_PROMPT}], indent=2) + "\n"
+    )
+    if out_path.exists():
+        out_path.unlink()
+
+    unique_daemon = _unique_coherence_daemon(daemon_src, smoke_dir, backend)
+    configured_backend = backend_config_value(backend)
+    # Ephemeral loopback port so concurrent CLI/serve gates never collide.
+    port = _allocate_loopback_port()
+    argv = [
+        sys.executable,
+        str(REPO / "scripts" / "serve_harness.py"),
+        "--model",
+        str(model),
+        "--kv",
+        args.kv_mode,
+        "--mtp",
+        COHERENCE_MTP,
+        "--thinking",
+        COHERENCE_THINKING,
+        "--max-tokens",
+        str(COHERENCE_MAX_TOKENS),
+        "--max-seq",
+        str(args.max_seq),
+        "--sampling",
+        COHERENCE_SAMPLING,
+        "--mode",
+        COHERENCE_MODE,
+        "--seed",
+        str(COHERENCE_SEED),
+        "--prompts-file",
+        str(prompts_path),
+        "--port",
+        str(port),
+        "--home",
+        str(home_path),
+        "--serve-log",
+        str(serve_log),
+        "--out",
+        str(out_path),
+    ]
+
+    env = dict(os.environ)
+    env.update(CERTIFIED_PM4_POLICY)
+    env.update(
+        HIPFIRE_CLI_BIN=str(cli),
+        HIPFIRE_DAEMON_BIN=str(unique_daemon),
+        HIPFIRE_REPLAY_BACKEND=configured_backend,
+        HIPFIRE_REPLAY_TRANSPORT=args.transport,
+        HIPFIRE_KV_MODE=args.kv_mode,
+        HIPFIRE_CASK_OFF="1",
+        HIPFIRE_AR_GRAPH="1",
+        HIPFIRE_GRAPH="1",
+    )
+    env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
+    env.pop("HIPFIRE_HOME", None)
+
+    # Cross-file contract with serve_harness.py: product owns the path; harness
+    # writes the CLI session leader PID after Popen(start_new_session=True).
+    serve_pid_path = smoke_dir / f"serve-{backend}.pid"
+    if serve_pid_path.exists():
+        serve_pid_path.unlink()
+    env["HIPFIRE_SERVE_HARNESS_PID_FILE"] = str(serve_pid_path)
+
+    config = {
+        "backend": backend,
+        "configured_backend": configured_backend,
+        "transport": args.transport,
+        "thinking": COHERENCE_THINKING,
+        "thinking_cap_tokens": COHERENCE_THINKING_CAP_TOKENS,
+        "max_tokens": COHERENCE_MAX_TOKENS,
+        "seed": COHERENCE_SEED,
+        "sampling": COHERENCE_SAMPLING,
+        "mode": COHERENCE_MODE,
+        "mtp": COHERENCE_MTP,
+        "kv_mode": args.kv_mode,
+        "max_seq": args.max_seq,
+        "prompt": COHERENCE_PROMPT,
+        "port": port,
+        "smoke_dir": str(smoke_dir),
+        "cli": str(cli),
+        "daemon_bin": str(unique_daemon),
+        "daemon_basename": unique_daemon.name,
+        "serve_pid_file": str(serve_pid_path),
+        "command": argv,
+    }
+
+    started = time.monotonic()
+    proc = None
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(REPO),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        cleanup_errors = _kill_serve_process_group(serve_pid_path)
+        detail = f"{backend} coherence smoke timed out after {args.timeout}s"
+        if cleanup_errors:
+            detail = f"{detail}; cleanup failed: {'; '.join(cleanup_errors)}"
+        raise RuntimeError(detail) from error
+    finally:
+        try:
+            if unique_daemon.exists():
+                unique_daemon.unlink()
+        except OSError:
+            pass
+
+    assert proc is not None
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    errors = []
+    rows = None
+    row = None
+    if proc.returncode != 0:
+        errors.append(f"serve_harness exited {proc.returncode}")
+    if out_path.is_file():
+        try:
+            rows = json.loads(out_path.read_text())
+        except json.JSONDecodeError as error:
+            errors.append(f"harness JSON unreadable: {error}")
+    else:
+        errors.append(f"missing harness output {out_path}")
+
+    if isinstance(rows, list):
+        if len(rows) != 1:
+            errors.append(f"expected exactly one harness row, got {len(rows)}")
+        elif rows:
+            row = rows[0]
+    elif rows is not None:
+        errors.append(f"harness JSON must be a list, got {type(rows).__name__}")
+
+    if row is not None:
+        if not isinstance(row, dict):
+            errors.append(f"harness row must be a dict, got {type(row).__name__}")
+        else:
+            finish = row.get("finish")
+            if finish != "stop":
+                errors.append(f"finish must be 'stop', got {finish!r}")
+            content = row.get("assistant_content")
+            if not isinstance(content, str) or not content.strip():
+                errors.append("assistant_content must be a nonempty string")
+            else:
+                errors.extend(_flagstaff_answer_errors(content))
+            if row.get("empty"):
+                errors.append("empty generation")
+            if row.get("runaway"):
+                errors.append("runaway generation (finish=length)")
+            if row.get("attractor"):
+                errors.append("attractor generation")
+
+    report = {
+        "backend": backend,
+        "seconds": time.monotonic() - started,
+        "valid": not errors,
+        "errors": errors,
+        "speed_checked": False,
+        "prompt": COHERENCE_PROMPT,
+        "config": config,
+        "row": row,
+        "rows": rows,
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "out_path": str(out_path),
+        "serve_log": str(serve_log),
+        "smoke_dir": str(smoke_dir),
+        "port": port,
+        "daemon_basename": unique_daemon.name,
+    }
+    if errors:
+        detail = "; ".join(errors)
+        tail = (stderr or stdout)[-1500:]
+        raise RuntimeError(
+            f"{backend} coherence smoke failed: {detail}"
+            + (f"\n{tail}" if tail else "")
+        )
+    return report
+
+
+def load_pm4_multiturn_session(path):
+    """Parse and validate session JSON before any GPU / harness work.
+
+    Each turn must be a dict with nonempty string ``content``. ``expect`` is
+    optional (setup turns may omit it), but when present must be a nonempty
+    list of nonempty strings — no coercion. At least one turn in the session
+    must declare expectations.
+    """
+    session_path = Path(path).expanduser().resolve()
+    if not session_path.is_file():
+        raise RuntimeError(f"multiturn session not found: {session_path}")
+    try:
+        turns = json.loads(session_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"multiturn session JSON unreadable: {error}") from error
+    if not isinstance(turns, list) or not turns:
+        raise RuntimeError("multiturn session must be a nonempty list")
+
+    has_expectation = False
+    for index, turn in enumerate(turns):
+        label = f"turn {index}"
+        if not isinstance(turn, dict):
+            raise RuntimeError(f"{label}: must be a dict, got {type(turn).__name__}")
+        content = turn.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(f"{label}: content must be a nonempty string")
+        if "expect" not in turn:
+            continue
+        expect = turn["expect"]
+        if not isinstance(expect, list):
+            raise RuntimeError(
+                f"{label}: expect must be a nonempty list of nonempty strings, "
+                f"got {type(expect).__name__}"
+            )
+        if not expect:
+            raise RuntimeError(
+                f"{label}: expect must be a nonempty list of nonempty strings"
+            )
+        for needle_index, needle in enumerate(expect):
+            if not isinstance(needle, str) or not needle:
+                raise RuntimeError(
+                    f"{label}: expect[{needle_index}] must be a nonempty string "
+                    f"(no coercion), got {needle!r}"
+                )
+        has_expectation = True
+
+    if not has_expectation:
+        raise RuntimeError(
+            "multiturn session must declare at least one nonempty expect list"
+        )
+    return session_path, turns
+
+
+def run_pm4_multiturn_session(args):
+    """Optional auto/redline PM4 multi-turn quality gate via serve_harness session mode.
+
+    Runs only when requested; quality only (never tok/s). Uses the same certified
+    PM4 env and PID-file process-group timeout cleanup as one-turn coherence.
+    """
+    if getattr(args, "transport", None) != "pm4":
+        raise RuntimeError("--pm4-multiturn-session requires --transport pm4")
+    if COHERENCE_MAX_TOKENS <= COHERENCE_THINKING_CAP_TOKENS:
+        raise RuntimeError(
+            f"coherence max_tokens ({COHERENCE_MAX_TOKENS}) must exceed "
+            f"thinking cap ({COHERENCE_THINKING_CAP_TOKENS})"
+        )
+
+    session_path, turns = load_pm4_multiturn_session(args.pm4_multiturn_session)
+
+    backend = "auto"
+    model = Path(args.model).expanduser().resolve()
+    daemon_src = Path(args.daemon).expanduser().resolve()
+    cli = Path(getattr(args, "cli", REPO / "target/release/hipfire")).expanduser().resolve()
+    work_root = Path(args.work_dir)
+    smoke_dir = _unique_smoke_dir(work_root, "auto-multiturn")
+
+    out_path = smoke_dir / "harness.json"
+    home_path = smoke_dir / "home"
+    serve_log = smoke_dir / "serve.log"
+    if out_path.exists():
+        out_path.unlink()
+
+    unique_daemon = _unique_coherence_daemon(daemon_src, smoke_dir, "auto-multiturn")
+
+    configured_backend = backend_config_value(backend)
+    port = _allocate_loopback_port()
+    argv = [
+        sys.executable,
+        str(REPO / "scripts" / "serve_harness.py"),
+        "--model",
+        str(model),
+        "--kv",
+        args.kv_mode,
+        "--mtp",
+        COHERENCE_MTP,
+        "--thinking",
+        COHERENCE_THINKING,
+        "--max-tokens",
+        str(COHERENCE_MAX_TOKENS),
+        "--max-seq",
+        str(args.max_seq),
+        "--sampling",
+        COHERENCE_SAMPLING,
+        "--mode",
+        "session",
+        "--session",
+        str(session_path),
+        "--seed",
+        str(COHERENCE_SEED),
+        "--port",
+        str(port),
+        "--home",
+        str(home_path),
+        "--serve-log",
+        str(serve_log),
+        "--out",
+        str(out_path),
+    ]
+
+    env = dict(os.environ)
+    env.update(CERTIFIED_PM4_POLICY)
+    env.update(
+        HIPFIRE_CLI_BIN=str(cli),
+        HIPFIRE_DAEMON_BIN=str(unique_daemon),
+        HIPFIRE_REPLAY_BACKEND=configured_backend,
+        HIPFIRE_REPLAY_TRANSPORT="pm4",
+        HIPFIRE_KV_MODE=args.kv_mode,
+        HIPFIRE_CASK_OFF="1",
+        HIPFIRE_AR_GRAPH="1",
+        HIPFIRE_GRAPH="1",
+    )
+    env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
+    env.pop("HIPFIRE_HOME", None)
+
+    serve_pid_path = smoke_dir / "serve-auto-multiturn.pid"
+    if serve_pid_path.exists():
+        serve_pid_path.unlink()
+    env["HIPFIRE_SERVE_HARNESS_PID_FILE"] = str(serve_pid_path)
+
+    config = {
+        "backend": backend,
+        "configured_backend": configured_backend,
+        "transport": "pm4",
+        "thinking": COHERENCE_THINKING,
+        "thinking_cap_tokens": COHERENCE_THINKING_CAP_TOKENS,
+        "max_tokens": COHERENCE_MAX_TOKENS,
+        "seed": COHERENCE_SEED,
+        "sampling": COHERENCE_SAMPLING,
+        "mode": "session",
+        "mtp": COHERENCE_MTP,
+        "kv_mode": args.kv_mode,
+        "max_seq": args.max_seq,
+        "session": str(session_path),
+        "turns": len(turns),
+        "port": port,
+        "smoke_dir": str(smoke_dir),
+        "cli": str(cli),
+        "daemon_bin": str(unique_daemon),
+        "daemon_basename": unique_daemon.name,
+        "serve_pid_file": str(serve_pid_path),
+        "command": argv,
+    }
+
+    started = time.monotonic()
+    proc = None
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(REPO),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        cleanup_errors = _kill_serve_process_group(serve_pid_path)
+        detail = f"auto multiturn session timed out after {args.timeout}s"
+        if cleanup_errors:
+            detail = f"{detail}; cleanup failed: {'; '.join(cleanup_errors)}"
+        raise RuntimeError(detail) from error
+    finally:
+        try:
+            if unique_daemon.exists():
+                unique_daemon.unlink()
+        except OSError:
+            pass
+
+    assert proc is not None
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    errors = []
+    rows = None
+    if proc.returncode != 0:
+        errors.append(f"serve_harness exited {proc.returncode}")
+    if out_path.is_file():
+        try:
+            rows = json.loads(out_path.read_text())
+        except json.JSONDecodeError as error:
+            errors.append(f"harness JSON unreadable: {error}")
+    else:
+        errors.append(f"missing harness output {out_path}")
+
+    if isinstance(rows, list):
+        if len(rows) != len(turns):
+            errors.append(
+                f"expected {len(turns)} harness row(s) (one per turn), got {len(rows)}"
+            )
+    elif rows is not None:
+        errors.append(f"harness JSON must be a list, got {type(rows).__name__}")
+
+    if isinstance(rows, list) and len(rows) == len(turns):
+        for index, (turn, row) in enumerate(zip(turns, rows)):
+            label = f"turn {index}"
+            if not isinstance(row, dict):
+                errors.append(f"{label}: harness row must be a dict, got {type(row).__name__}")
+                continue
+            finish = row.get("finish")
+            if finish != "stop":
+                errors.append(f"{label}: finish must be 'stop', got {finish!r}")
+            content = row.get("assistant_content")
+            if not isinstance(content, str) or not content.strip():
+                errors.append(f"{label}: assistant_content must be a nonempty string")
+                content = ""
+            if row.get("empty"):
+                errors.append(f"{label}: empty generation")
+            if row.get("runaway"):
+                errors.append(f"{label}: runaway generation (finish=length)")
+            if row.get("attractor"):
+                errors.append(f"{label}: attractor generation")
+            expect = turn.get("expect") if isinstance(turn, dict) else None
+            if expect is not None:
+                # Loader already validated shape; enforce every declared needle.
+                lowered = content.lower()
+                for needle in expect:
+                    if needle.lower() not in lowered:
+                        errors.append(
+                            f"{label}: answer missing expected substring {needle!r}"
+                        )
+
+    report = {
+        "backend": backend,
+        "seconds": time.monotonic() - started,
+        "valid": not errors,
+        "errors": errors,
+        "speed_checked": False,
+        "session": str(session_path),
+        "turns": len(turns),
+        "config": config,
+        "rows": rows,
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "out_path": str(out_path),
+        "serve_log": str(serve_log),
+        "smoke_dir": str(smoke_dir),
+        "port": port,
+        "daemon_basename": unique_daemon.name,
+    }
+    if errors:
+        detail = "; ".join(errors)
+        tail = (stderr or stdout)[-1500:]
+        raise RuntimeError(
+            f"auto multiturn session failed: {detail}"
+            + (f"\n{tail}" if tail else "")
+        )
+    return report
+
+
+
+def run_arm(args, backend):
+    daemon = Daemon(
+        Path(args.daemon).resolve(),
+        backend,
+        args.transport,
+        Path(args.work_dir) / f"product-{backend}.log",
+        args.timeout,
+        args.kv_mode,
+        args.dpm_warmup_secs,
+    )
+    try:
+        loaded = daemon.request(
+            {
+                "type": "load",
+                "model": str(Path(args.model).expanduser().resolve()),
+                "params": {
+                    "max_seq": args.max_seq,
+                    "kv_mode": args.kv_mode,
+                    "dflash_mode": "off",
+                },
+            }
+        )
+        warmup_request = {
+            "type": "bench_decode",
+            "context_tokens": args.context,
+            "iterations": args.warmup_iterations,
+            "redline_product_route": True,
+        }
+        request = {
+            "type": "bench_decode",
+            "context_tokens": args.context,
+            "iterations": args.iterations,
+            "redline_product_route": True,
+        }
+        pm4_checked = False
+
+        def request_decode(payload):
+            nonlocal pm4_checked
+            row = daemon.request(payload)
+            if backend == "auto" and args.transport == "pm4" and not pm4_checked:
+                require_retained_pm4(row)
+                pm4_checked = True
+            return row
+
+        warmup_started = time.monotonic()
+        warmups = [request_decode(warmup_request) for _ in range(args.warmups)]
+        warmup_seconds = time.monotonic() - warmup_started
+        if warmups:
+            print(
+                f"{backend}: warming caches... took {warmup_seconds:.2f}s",
+                flush=True,
+            )
+
+        settling_started = time.monotonic()
+        settling_rows = []
+        settlement = None
+        for _ in range(args.settle_max_runs):
+            settling_rows.append(request_decode(request))
+            settlement = analyze_stationarity(
+                [row["tok_s"] for row in settling_rows],
+                **stationarity_kwargs(args),
+            )
+            if settlement["stationary"]:
+                break
+        settling_seconds = time.monotonic() - settling_started
+        if settlement is None or not settlement["stationary"]:
+            latest = settlement["confirmed_window"] if settlement else None
+            raise RuntimeError(
+                f"{backend} failed to become stationary after "
+                f"{len(settling_rows)} full-tg rows; latest={latest}"
+            )
+        settled = settlement["confirmed_window"]
+        print(
+            f"{backend}: stationary after {len(settling_rows)} full-tg rows "
+            f"({settling_seconds:.2f}s, median={settled['median']:.3f}, "
+            f"slope={settled['slope_pct_per_row']:+.4f}%/row, "
+            f"spread={settled['spread_pct']:.3f}%)",
+            flush=True,
+        )
+
+        rows = [request_decode(request) for _ in range(args.runs)]
+        values = [row["tok_s"] for row in rows]
+        measurement_validation = validate_measurement(values, settlement, args)
+        print(
+            f"{backend}: measured median={statistics.median(values):.3f} tok/s "
+            f"valid={measurement_validation['valid']}",
+            flush=True,
+        )
+        lifecycle_route_proof = validate_route_proof(
+            warmups + settling_rows + rows, backend, args.transport
+        )
+        route_proof = validate_route_proof(
+            rows,
+            backend,
+            args.transport,
+            require_complete_replay=backend == "auto",
+        )
+        print(
+            f"{backend}: timed route proof valid={route_proof['valid']} "
+            f"retained_rows={route_proof['retained_rows']} "
+            f"positions={route_proof['observed_positions']} "
+            f"lifecycle_valid={lifecycle_route_proof['valid']}",
+            flush=True,
+        )
+        return {
+            "loaded": loaded,
+            "warmups": warmups,
+            "warmup_seconds": warmup_seconds,
+            "settling": {
+                "rows": settling_rows,
+                "seconds": settling_seconds,
+                "decision": settlement,
+            },
+            "rows": rows,
+            "tok_s": {
+                "min": min(values),
+                "median": statistics.median(values),
+                "max": max(values),
+            },
+            "measurement_validation": measurement_validation,
+            "lifecycle_route_proof": lifecycle_route_proof,
+            "route_proof": route_proof,
+        }
+    finally:
+        daemon.close()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="python3 -m tools.redline bench")
+    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--daemon", default=str(REPO / "target/release/examples/daemon")
+    )
+    parser.add_argument(
+        "--cli",
+        default=str(REPO / "target/release/hipfire"),
+        help="native hipfire CLI used by the serve_harness coherence smoke",
+    )
+    parser.add_argument("--context", type=int, default=128)
+    parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--warmups",
+        type=int,
+        default=10,
+        help="number of short replay warmup requests (default: 10)",
+    )
+    parser.add_argument(
+        "--warmup-iterations",
+        type=int,
+        default=32,
+        help="decode iterations per replay warmup request (default: 32)",
+    )
+    parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument(
+        "--settle-window",
+        type=int,
+        default=10,
+        help="rolling full-tg rows used for stationarity (default: 10)",
+    )
+    parser.add_argument(
+        "--settle-min-runs",
+        type=int,
+        default=10,
+        help="minimum full-tg settling rows before a candidate (default: 10)",
+    )
+    parser.add_argument(
+        "--settle-confirmation-runs",
+        type=int,
+        default=10,
+        help="consecutive stable rows required after a candidate (default: 10)",
+    )
+    parser.add_argument(
+        "--settle-max-runs",
+        type=int,
+        default=120,
+        help="fail instead of reporting if stationarity is absent (default: 120)",
+    )
+    parser.add_argument(
+        "--settle-max-slope-pct",
+        type=float,
+        default=0.05,
+        help="maximum absolute rolling slope in percent per row (default: 0.05)",
+    )
+    parser.add_argument(
+        "--settle-max-spread-pct",
+        type=float,
+        default=1.0,
+        help="maximum rolling min/max spread in percent (default: 1.0)",
+    )
+    parser.add_argument(
+        "--settle-max-median-drift-pct",
+        type=float,
+        default=0.5,
+        help="maximum confirmation/measurement median drift percent (default: 0.5)",
+    )
+    parser.add_argument("--transport", choices=("aql", "pm4"), default="aql")
+    parser.add_argument(
+        "--kv-mode",
+        choices=("q8", "fwht2", "fwht3", "fwht4"),
+        default="q8",
+        help="KV layout used by both the HipGraph and retained-replay arms",
+    )
+    parser.add_argument("--max-seq", type=int, default=2048)
+    parser.add_argument(
+        "--dpm-warmup-secs",
+        type=float,
+        default=0.0,
+        help="optional legacy memset warmup per daemon arm (default: 0)",
+    )
+    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--work-dir", default=str(REPO / ".redline-work"))
+    parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--expected-model-sha256",
+        help="fail before loading the GPU when the model digest differs",
+    )
+    parser.add_argument(
+        "--pm4-multiturn-session",
+        default=None,
+        help=(
+            "optional multi-turn session JSON run after both performance arms "
+            "on auto/redline PM4 via serve_harness --mode session (requires --transport pm4)"
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if args.settle_window < 3:
+        parser.error("--settle-window must be at least 3")
+    if args.settle_min_runs < args.settle_window:
+        parser.error("--settle-min-runs must be at least --settle-window")
+    if args.settle_confirmation_runs < 1:
+        parser.error("--settle-confirmation-runs must be positive")
+    if args.settle_max_runs < args.settle_min_runs + args.settle_confirmation_runs:
+        parser.error(
+            "--settle-max-runs must cover the minimum plus confirmation rows"
+        )
+    if args.runs < 5:
+        parser.error("--runs must be at least 5 for measurement validation")
+    if args.pm4_multiturn_session is not None and args.transport != "pm4":
+        parser.error("--pm4-multiturn-session requires --transport pm4")
+
+
+    model = Path(args.model).expanduser().resolve()
+    daemon = Path(args.daemon).expanduser().resolve()
+    cli = Path(args.cli).expanduser().resolve()
+    if not model.is_file():
+        raise SystemExit(f"model not found: {model}")
+    if not daemon.is_file():
+        raise SystemExit(f"daemon not found: {daemon}")
+    if not cli.is_file():
+        raise SystemExit(f"cli not found: {cli}")
+    model_sha256 = sha256_file(model)
+    if (
+        args.expected_model_sha256 is not None
+        and model_sha256.lower() != args.expected_model_sha256.lower()
+    ):
+        raise SystemExit(
+            "model SHA-256 mismatch: "
+            f"expected {args.expected_model_sha256.lower()}, got {model_sha256}"
+        )
+    # Validate optional multiturn session JSON before any GPU work.
+    if args.pm4_multiturn_session is not None:
+        try:
+            load_pm4_multiturn_session(args.pm4_multiturn_session)
+        except Exception as error:
+            raise SystemExit(f"PM4 multiturn session invalid before GPU work: {error}")
+
+    pm4_preflight = None
+    if args.transport == "pm4":
+        print("pm4: preflighting retained replay before benchmark warmup...", flush=True)
+        try:
+            pm4_preflight = run_pm4_preflight(args)
+        except Exception as error:
+            raise SystemExit(f"PM4 preflight failed before benchmark warmup: {error}")
+        route = pm4_preflight["redline_route"] or {}
+        prepared = route.get("prepared") or {}
+        print(
+            "pm4: preflight passed "
+            f"({prepared.get('dispatches', 0)} dispatches, "
+            f"{pm4_preflight['seconds']:.2f}s)",
+            flush=True,
+        )
+
+    print("coherence: HIP CLI/serve Flagstaff smoke...", flush=True)
+    try:
+        coherence_hip = run_coherence_smoke(args, "hip")
+    except Exception as error:
+        raise SystemExit(f"HIP coherence smoke failed before benchmark warmup: {error}")
+    print(
+        f"coherence: HIP passed ({coherence_hip['seconds']:.2f}s)",
+        flush=True,
+    )
+    print("coherence: auto CLI/serve Flagstaff smoke...", flush=True)
+    try:
+        coherence_auto = run_coherence_smoke(args, "auto")
+    except Exception as error:
+        raise SystemExit(
+            f"auto coherence smoke failed before benchmark warmup: {error}"
+        )
+    print(
+        f"coherence: auto passed ({coherence_auto['seconds']:.2f}s)",
+        flush=True,
+    )
+
+    report = {
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "host": socket.gethostname(),
+        "git_commit": git_head(),
+        "model": str(model),
+        "model_bytes": model.stat().st_size,
+        "model_sha256": model_sha256,
+        "daemon": str(daemon),
+        "daemon_sha256": sha256_file(daemon),
+        "cli": str(cli),
+        "cli_sha256": sha256_file(cli),
+        "device_visibility": {
+            "HIP_VISIBLE_DEVICES": os.environ.get("HIP_VISIBLE_DEVICES"),
+            "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
+        },
+        "automatic_clocks": True,
+        "context": args.context,
+        "iterations": args.iterations,
+        "warmups": args.warmups,
+        "warmup_iterations": args.warmup_iterations,
+        "stationarity": stationarity_kwargs(args)
+        | {"max_runs": args.settle_max_runs},
+        "dpm_warmup_secs": args.dpm_warmup_secs,
+        "runs": args.runs,
+        "transport": args.transport,
+        "pm4_policy": dict(CERTIFIED_PM4_POLICY),
+        "kv_mode": args.kv_mode,
+        "pm4_preflight": pm4_preflight,
+        "coherence": {
+            "hip": coherence_hip,
+            "auto": coherence_auto,
+            "multiturn": None,
+        },
+        "hip": run_arm(args, "hip"),
+        "auto": run_arm(args, "auto"),
+    }
+    if args.pm4_multiturn_session is not None:
+        print(
+            "coherence: auto/redline PM4 multiturn session via serve_harness...",
+            flush=True,
+        )
+        try:
+            report["coherence"]["multiturn"] = run_pm4_multiturn_session(args)
+        except Exception as error:
+            raise SystemExit(f"PM4 multiturn session failed after performance arms: {error}")
+        print(
+            "coherence: multiturn passed "
+            f"({report['coherence']['multiturn']['seconds']:.2f}s, "
+            f"{report['coherence']['multiturn']['turns']} turns)",
+            flush=True,
+        )
+    hip = report["hip"]["tok_s"]["median"]
+    auto = report["auto"]["tok_s"]["median"]
+    report["speedup"] = auto / hip
+    report["valid"] = (
+        report["coherence"]["hip"]["valid"]
+        and report["coherence"]["auto"]["valid"]
+        and report["hip"]["measurement_validation"]["valid"]
+        and report["auto"]["measurement_validation"]["valid"]
+        and report["hip"]["route_proof"]["valid"]
+        and report["auto"]["route_proof"]["valid"]
+        and report["hip"]["lifecycle_route_proof"]["valid"]
+        and report["auto"]["lifecycle_route_proof"]["valid"]
+    )
+    if report["coherence"]["multiturn"] is not None:
+        report["valid"] = (
+            report["valid"] and report["coherence"]["multiturn"]["valid"]
+        )
+    output = Path(args.out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2) + "\n")
+    print(
+        f"hip={hip:.3f} tok/s auto={auto:.3f} tok/s "
+        f"speedup={report['speedup']:.5f} valid={report['valid']} report={output}"
+    )
+    if not report["valid"]:
+        raise SystemExit("benchmark samples or route proof are invalid")
+
+
+if __name__ == "__main__":
+    main()

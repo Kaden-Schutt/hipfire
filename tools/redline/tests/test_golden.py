@@ -3,17 +3,12 @@
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
 
-import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-
-SCRIPT = Path(__file__).with_name("golden-redline.py")
-SPEC = importlib.util.spec_from_file_location("golden_redline", SCRIPT)
-golden_redline = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(golden_redline)
+from tools.redline import golden as golden_redline
 
 
 class GoldenRegistryTests(unittest.TestCase):
@@ -49,6 +44,12 @@ class GoldenRegistryTests(unittest.TestCase):
             output=Path("/tmp/report.json"),
             timeout=1200,
         )
+        self.assertEqual(command[:4], [
+            command[0],
+            "-m",
+            "tools.redline",
+            "bench",
+        ])
         self.assertIn("--expected-model-sha256", command)
         self.assertEqual(command[command.index("--iterations") + 1], "128")
         self.assertEqual(command[command.index("--settle-max-runs") + 1], "120")
@@ -96,6 +97,36 @@ class GoldenRegistryTests(unittest.TestCase):
                 "qwen3.6:35b-a3b-mq4r",
             ],
         )
+
+
+class GoldenArchitectureTests(unittest.TestCase):
+    def test_kfd_fallback_maps_physical_gpu_index(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            for node, properties in (
+                (0, "cpu_cores_count 24\ngfx_target_version 0\n"),
+                (1, "cpu_cores_count 0\ngfx_target_version 110000\n"),
+                (2, "cpu_cores_count 0\ngfx_target_version 110501\n"),
+            ):
+                path = root / str(node)
+                path.mkdir()
+                (path / "properties").write_text(properties)
+            self.assertEqual(
+                golden_redline.detect_architecture_from_kfd(1, root),
+                "gfx1151",
+            )
+
+    def test_architecture_detection_uses_kfd_without_rocminfo(self):
+        with (
+            mock.patch.object(golden_redline.shutil, "which", return_value=None),
+            mock.patch.object(
+                golden_redline,
+                "detect_architecture_from_kfd",
+                return_value="gfx1151",
+            ) as detect_kfd,
+        ):
+            self.assertEqual(golden_redline.detect_architecture(1), "gfx1151")
+        detect_kfd.assert_called_once_with(1)
 
 
 class GoldenReportTests(unittest.TestCase):

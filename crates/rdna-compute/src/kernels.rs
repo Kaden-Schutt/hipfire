@@ -1553,6 +1553,10 @@ pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
 /// expert-pointers table. hipGraph-capture-safe replacement for the
 /// kernarg-pointer variant.
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str = concat!(
+    // gfx1151 product: current-toolchain private0-capable occupancy dial.
+    "#if defined(__gfx1151__)\n",
+    "#define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 12\n",
+    "#endif\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")

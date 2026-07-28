@@ -107,7 +107,7 @@ they are measurement artifacts rather than source inputs.
 The product lifecycle must arm capture at the first eligible plain-AR forward;
 recording from model load accidentally mixes prefill setup into the decode tape
 and correctly triggers fail-closed artifact validation. Reproduce with
-`scripts/redline_product_bench.py --transport pm4`; `.redline-work/` holds the
+`python3 -m tools.redline bench --transport pm4`; `.redline-work/` holds the
 local raw JSON and daemon logs and is not a source artifact.
 
 The user-facing `serve_harness.py` transport/performance gate also completed at

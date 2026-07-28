@@ -8,9 +8,6 @@
 using hipfire_qkvza_i32x4 = int __attribute__((ext_vector_type(4)));
 using hipfire_qkvza_f32x4 = float __attribute__((ext_vector_type(4)));
 #endif
-#if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
-using hipfire_qkvza_u32x2 = unsigned int __attribute__((ext_vector_type(2)));
-#endif
 
 // 4-way fused HFQ4-G256 GEMV for the Qwen3.5 DeltaNet linear-attention
 // layer preamble. One kernel launch performs all four projections from a
@@ -191,14 +188,10 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
                  + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
         {
 #if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
-            const hipfire_qkvza_u32x2 h0 =
-                *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp0;
-            const hipfire_qkvza_u32x2 h1 =
-                *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp1;
-            float sc0 = __builtin_bit_cast(float, h0.x);
-            float zp0 = __builtin_bit_cast(float, h0.y);
-            float sc1 = __builtin_bit_cast(float, h1.x);
-            float zp1 = __builtin_bit_cast(float, h1.y);
+            float sc0 = __builtin_bit_cast(float, *(const unsigned int*)gp0);
+            float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
+            float sc1 = __builtin_bit_cast(float, *(const unsigned int*)gp1);
+            float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
 #else
             float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
             float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
@@ -213,14 +206,10 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         }
         {
 #if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
-            const hipfire_qkvza_u32x2 h2 =
-                *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp2;
-            const hipfire_qkvza_u32x2 h3 =
-                *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp3;
-            float sc2 = __builtin_bit_cast(float, h2.x);
-            float zp2 = __builtin_bit_cast(float, h2.y);
-            float sc3 = __builtin_bit_cast(float, h3.x);
-            float zp3 = __builtin_bit_cast(float, h3.y);
+            float sc2 = __builtin_bit_cast(float, *(const unsigned int*)gp2);
+            float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
+            float sc3 = __builtin_bit_cast(float, *(const unsigned int*)gp3);
+            float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
 #else
             float sc2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136));
             float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
@@ -236,22 +225,14 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         #undef DOG_PAIR
 #else
 #if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
-        const hipfire_qkvza_u32x2 h0 =
-            *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp0;
-        const hipfire_qkvza_u32x2 h1 =
-            *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp1;
-        const hipfire_qkvza_u32x2 h2 =
-            *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp2;
-        const hipfire_qkvza_u32x2 h3 =
-            *(const hipfire_qkvza_u32x2 __attribute__((address_space(4)))*)gp3;
-        float sc0 = __builtin_bit_cast(float, h0.x);
-        float zp0 = __builtin_bit_cast(float, h0.y);
-        float sc1 = __builtin_bit_cast(float, h1.x);
-        float zp1 = __builtin_bit_cast(float, h1.y);
-        float sc2 = __builtin_bit_cast(float, h2.x);
-        float zp2 = __builtin_bit_cast(float, h2.y);
-        float sc3 = __builtin_bit_cast(float, h3.x);
-        float zp3 = __builtin_bit_cast(float, h3.y);
+        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)gp0);
+        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
+        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)gp1);
+        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
+        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)gp2);
+        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
+        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)gp3);
+        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
 #else
         float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
         float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));

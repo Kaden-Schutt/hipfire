@@ -383,7 +383,7 @@ HIPFIRE_REPLAY_BACKEND=shadow \
 python3 scripts/redline_daemon_harness.py \
   --model "$MODEL" --skip-prefill --pm4 --shadow-iterations 15
 
-python3 scripts/redline_product_bench.py \
+python3 -m tools.redline bench \
   --model "$MODEL" \
   --daemon target/release/examples/daemon \
   --context 128 --iterations 100 --warmups 3 --runs 10 \
@@ -397,7 +397,7 @@ They do **not** emit the full Section 7 timed-arm route-proof ledger.
 
 ### Current tooling gap (route proof)
 
-`scripts/redline_product_bench.py` records requested backend/transport and
+`python3 -m tools.redline bench` records requested backend/transport and
 throughput, but not controller `Ready`, fallback reason, observed replay
 positions, packet/queue/dword identity, or anti-HIP/HipGraph proof.
 
@@ -474,7 +474,7 @@ arms that both executed ordinary HIP is invalid evidence. A stable manual-captur
 fingerprint is discovery evidence; it does not install a plan or prove that a
 user-facing forward selected retained AQL or PM4.
 
-`scripts/redline_product_bench.py` now emits the minimum Gate 5 ledger for
+`python3 -m tools.redline bench` now emits the minimum Gate 5 ledger for
 both timed arms. A candidate report is route-proof-capable only when its
 `lifecycle_route_proof.valid` and `route_proof.valid` fields are true, every
 required retained row reports `state=ready`, `fallback_reason=null`, a stable
@@ -482,7 +482,7 @@ prepared/tape identity, and positive replay-position deltas. Older reports
 without those fields remain discovery evidence and cannot be stitched to a
 separate daemon-harness fingerprint.
 
-`scripts/golden-redline.py` is a narrow sealed-fixture wrapper around that
+`python3 -m tools.redline golden` is a narrow sealed-fixture wrapper around that
 product harness. It pins the MQ4R model, TG128 parameters, PM4 policy,
 architecture-specific prepared/tape identity, registry sampling snapshot, and
 stationary acceptance floor recorded in `registry/redline-golden-v1.json`.
@@ -772,7 +772,7 @@ HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY=required-only \
 HIPFIRE_REPLAY_PM4_QUEUES=1 \
 HIPFIRE_REPLAY_PM4_STATEFUL=stateful \
 HIPFIRE_REPLAY_PM4_GCR_TRIM=1 \
-python3 scripts/redline_product_bench.py \
+python3 -m tools.redline bench \
   --model ~/.hipfire/models/lfm2.5-350m.mq4 \
   --daemon target/release/examples/daemon \
   --context 127 --transport pm4 --kv-mode q8 \
@@ -858,8 +858,8 @@ Prefer paths and symbols over line numbers.
 | PM4-IB vendor packet | `crates/redline-rocr/src/packet.rs` — `PacketImage::pm4_indirect_buffer` |
 | Architecture PM4 builders | `crates/redline-rocr/src/pm4.rs`; `crates/redline-rocr/src/pm4_gfx10.rs` |
 | Manual capture/shadow diagnostic | `scripts/redline_daemon_harness.py` |
-| Product stationary comparison | `scripts/redline_product_bench.py` |
-| Sealed MQ4R fixture reproduction | `scripts/golden-redline.py`; `registry/redline-golden-v1.json`; `docs/GOLDEN-REDLINE.md` |
+| Product stationary comparison | `python3 -m tools.redline bench` |
+| Sealed MQ4R fixture reproduction | `python3 -m tools.redline golden`; `registry/redline-golden-v1.json`; `docs/GOLDEN-REDLINE.md` |
 | Claim → validation route selector | [`VALIDATION.md`](VALIDATION.md) |
 | Graft and ABI provenance | `crates/redline-dispatch/HIPFIRE-GRAFT.md`; `crates/redline-rocr/PROVENANCE.md` |
 | Positive dated gfx1201 evidence | `docs/perf-checkpoints/2026-07-11-redline-qwen36-a3b-ar.md`; `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` |

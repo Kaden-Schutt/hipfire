@@ -2361,20 +2361,7 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.fused_qkv_hfq4g256_impl(
-            a_q,
-            a_k,
-            a_v,
-            x,
-            y_q,
-            y_k,
-            y_v,
-            q_m,
-            k_m,
-            v_m,
-            k,
-            None,
-        )
+        self.fused_qkv_hfq4g256_impl(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, None)
     }
 
     /// Qwen2-only bias-fold entry. It uses a distinct kernel symbol and kernarg
@@ -2833,32 +2820,32 @@ impl Gpu {
         let rdna3_wavepack4 = self.arch_caps.is_rdna3_dgpu()
             && self.flags.rdna3_hfq4_qkvza_wavepack4
             && total_m <= 2_048;
-        let rdna3_ldsx8 = self.arch_caps.is_gfx1100()
-            && self.flags.rdna3_hfq4_qkvza_ldsx8
-            && k == 2_048;
+        let rdna3_ldsx8 =
+            self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_ldsx8 && k == 2_048;
         let rdna3_reduce_chain =
             self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_reduce_chain;
-        let rdna3_k2048 = self.arch_caps.is_gfx1100()
-            && self.flags.rdna3_hfq4_qkvza_k2048
-            && k == 2_048;
+        let rdna3_k2048 =
+            self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 && k == 2_048;
         static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
-                    || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA").as_deref()
+                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref()
+                    == Ok("1")
+                    || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA")
+                        .as_deref()
                         == Ok("1")
             });
         let gfx1151_k2048_all_buffer = self.arch_caps.is_gfx1151() && k == 2_048;
-        let gfx1151_k2048_hybrid_buffer = self.arch_caps.is_gfx1151()
-            && k == 2_048
-            && total_m == 1_281;
+        let gfx1151_k2048_hybrid_buffer =
+            self.arch_caps.is_gfx1151() && k == 2_048 && total_m == 1_281;
         static GFX1151_QKVZA_X_BUFFER_LARGE: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_x_buffer_large = self.arch_caps.is_gfx1151()
             && k == 2_048
             && total_m > 2_048
             && *GFX1151_QKVZA_X_BUFFER_LARGE.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE").as_deref()
+                    == Ok("1")
             });
         static GFX1151_QKVZA_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
         let gfx1151_k2048_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
@@ -2876,19 +2863,22 @@ impl Gpu {
         let gfx1151_k2048_ldsx8_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_LDSX8_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_QKVZA_PAIR_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_pair_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_PAIR_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_QKVZA_K2048_HOIST: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_hoist = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_K2048_HOIST.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_K2048_HOIST").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_K2048_HOIST").as_deref()
+                    == Ok("1")
             });
         static GFX1151_QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_r2 = self.arch_caps.is_gfx1151()
@@ -2900,7 +2890,8 @@ impl Gpu {
         let gfx1151_k2048_r2_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_R2_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R2_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R2_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_QKVZA_R4_STREAM: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_r4_stream = self.arch_caps.is_gfx1151()
@@ -2911,13 +2902,15 @@ impl Gpu {
             && beta_m.is_multiple_of(4)
             && alpha_m.is_multiple_of(4)
             && *GFX1151_QKVZA_R4_STREAM.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R4_STREAM").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R4_STREAM").as_deref()
+                    == Ok("1")
             });
         static GFX1151_QKVZA_WAVE64_SHARE_X: OnceLock<bool> = OnceLock::new();
         let gfx1151_wave64_share_x = self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_QKVZA_WAVE64_SHARE_X.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X").as_deref()
+                    == Ok("1")
             });
         static QKVZA_R2: OnceLock<bool> = OnceLock::new();
         let rdna3_k2048_r2 = rdna3_k2048
@@ -2999,11 +2992,7 @@ impl Gpu {
                 kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC,
                 "fused_qkvza_hfq4g256_k2048",
             )?;
-            (
-                "fused_qkvza_hfq4g256_k2048",
-                [32u32, 1, 1],
-                total_m as u32,
-            )
+            ("fused_qkvza_hfq4g256_k2048", [32u32, 1, 1], total_m as u32)
         } else if gfx1151_wave64_share_x {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_wave64_share_x_gfx1151",
@@ -21052,11 +21041,7 @@ impl Gpu {
             "gemm_q8_0_mmq_gfx1030: K must be multiple of 128"
         );
         let kernel_name = "gemm_q8_0_mmq_gfx1030";
-        self.ensure_kernel(
-            kernel_name,
-            kernels::GEMM_Q8_0_MMQ_GFX1030_SRC,
-            kernel_name,
-        )?;
+        self.ensure_kernel(kernel_name, kernels::GEMM_Q8_0_MMQ_GFX1030_SRC, kernel_name)?;
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
         let ap = a.buf.as_ptr();
         let xp = x_q8_ptr;

@@ -322,7 +322,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_CANARY_MODEL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_PREFILL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_RUNS` | scripts/gfx906_fallback_canary.sh |
-| `HIPFIRE_CASK_OFF` | crates/hipfire-loader/src/lib.rs, scripts/redline_daemon_harness.py, scripts/redline_product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
+| `HIPFIRE_CASK_OFF` | crates/hipfire-loader/src/lib.rs, scripts/redline_daemon_harness.py, tools/redline/product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
 | `HIPFIRE_CASK_SIDECAR` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_CHATML` | crates/hipfire-runtime/examples/probe_argmax_agreement.rs |
 | `HIPFIRE_CHAT_CURRENT_DATE` | crates/hipfire-runtime/src/prompt_frame.rs |
