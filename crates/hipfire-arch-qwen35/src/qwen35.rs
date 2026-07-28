@@ -5629,6 +5629,10 @@ pub struct PrefillBatchScratch {
     // Uploaded once at the start of each chunk and reused by rope + kv_write
     // + attention kernels.
     pub positions: GpuTensor,
+    // Depth-based RoPE angles for DDTree verify (39aa358 fix). Uploaded in
+    // tree-verify mode; FA RoPE reads it instead of `positions` while KV
+    // writes and attention seq_len keep the flat physical slots.
+    pub rope_positions: GpuTensor,
     // Token-ids buffer feeding the batched embedding kernel. [max_batch] i32
     // stored as F32 (same dtype-cosmetic pattern as `positions`). Uploaded
     // once per batched forward and read by `embedding_lookup_hfq4g256_batched`.
@@ -5818,6 +5822,15 @@ impl PrefillBatchScratch {
             // attention / kv_write kernels cast the pointer to `const int*`,
             // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
             positions: alloc!(&[max_batch], DType::F32),
+            // Depth-based RoPE angles for DDTree verify (39aa358 fix):
+            // `positions` stays the flat linear KV slot index; this buffer
+            // carries `base_pos + depth(node)` so FA-layer RoPE rotates Q/K
+            // at the logically-correct phase while KV writes stay on
+            // distinct linear slots. Uploaded per cycle in tree-verify mode
+            // from `TreeVerifyCtx.positions`; FA RoPE kernels read it ONLY
+            // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
+            // pattern as `positions`.
+            rope_positions: alloc!(&[max_batch], DType::F32),
             tokens: alloc!(&[max_batch], DType::F32),
             fa_q_full_batch: alloc!(&[max_batch * q_dim * 2], DType::F32),
             fa_q_batch: alloc!(&[max_batch * q_dim], DType::F32),
@@ -8638,11 +8651,28 @@ fn forward_prefill_chunk(
     // or a scatter-kernel for commit. `ctx.positions` is accepted for API
     // compatibility but ignored — the DdNode depths it carries are only
     // used by `linearize_tree` to build the attn_bias mask.
+    //
+    // 39aa358 DECOUPLING (2026-07-28): the "costs little" trade was wrong
+    // — it was the gfx1100 DDTree regression. Sibling logits computed with
+    // slot-based phases depress non-rank-0 acceptance, collapsing τ toward
+    // the chain and making tree strictly slower than linear. Fix: upload
+    // `ctx.positions` (depth-based, `base_pos + depth`) to
+    // `pbs.rope_positions`; FA RoPE reads THAT (correct sibling phases),
+    // while KV writes + attention seq_len keep the flat physical slots
+    // (no sibling write race, contiguous-cache invariants intact).
     if !pre_uploaded {
         let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
         let positions_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+        if let Some(tv) = tree_verify.as_ref() {
+            debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
+            let rope_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(tv.positions.as_ptr() as *const u8, n * 4)
+            };
+            gpu.hip
+                .memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
+        }
     }
 
     // Decide whether the FA layers can take the batched path. Requires
@@ -9979,10 +10009,18 @@ fn forward_prefill_chunk(
                 // after eviction (cached keys are absolute-phased); pbs.positions
                 // stays physical for the KV-write below. 0 when no compaction.
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                // 39aa358: in DDTree verify, rotate at DEPTH positions (correct
+                // sibling phases); KV writes below still use flat physical
+                // slots. Linear path unchanged.
+                let rope_pos_buf = if tree_verify.is_some() {
+                    &pbs.rope_positions
+                } else {
+                    &pbs.positions
+                };
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
                     &pbs.fa_k_batch,
-                    &pbs.positions,
+                    rope_pos_buf,
                     config.n_heads,
                     config.n_kv_heads,
                     config.head_dim,
@@ -11513,10 +11551,17 @@ fn forward_prefill_chunk(
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 // pos_offset = compact_offset (absolute RoPE phase post-eviction);
                 // pbs.positions stays physical for the KV-write. 0 when no compaction.
+                // 39aa358: in DDTree verify, rotate at DEPTH positions instead
+                // (correct sibling phases); KV write below stays physical.
+                let rope_pos_buf = if tree_verify.is_some() {
+                    &pbs.rope_positions
+                } else {
+                    &pbs.positions
+                };
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
                     &pbs.fa_k_batch,
-                    &pbs.positions,
+                    rope_pos_buf,
                     config.n_heads,
                     config.n_kv_heads,
                     config.head_dim,

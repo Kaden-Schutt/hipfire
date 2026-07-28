@@ -2319,6 +2319,17 @@ fn verify_dflash_block_inner(
         // Pre-capture: pre-upload inputs and ensure a stream exists. memcpy_htod
         // runs on the host/null-stream side and is NOT captured.
         qwen35::upload_prefill_batch_inputs(gpu, pbs, draft_tokens, start_pos)?;
+        // 39aa358: tree verify also needs the depth-based RoPE angles on
+        // device before replay (the captured RoPE kernel reads
+        // pbs.rope_positions; pbs.positions stays the flat KV slot array).
+        if let Some(tv) = tree_verify.as_ref() {
+            debug_assert_eq!(tv.positions.len(), b, "tree RoPE positions length");
+            let rope_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(tv.positions.as_ptr() as *const u8, b * 4)
+            };
+            gpu.hip
+                .memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
+        }
         if gpu.active_stream.is_none() {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
