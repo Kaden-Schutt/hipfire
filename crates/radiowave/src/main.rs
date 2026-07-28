@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Kaden Schutt <kaden@hipfire.dev>
 
 use radiowave::{
-    resolve_hipcc, ArchProfile, CampaignLedger, CampaignStarted, CandidateSubmission,
-    CandidateVerdict, CompileRequest, Compiler, Inspector, KernelReport, ResourceAssessment,
-    ResourceContract, SchedulerProfile, Wavefront, support_header_path,
+    ArchProfile, CampaignLedger, CampaignStarted, CandidateSubmission, CandidateVerdict,
+    CompileRequest, Compiler, Inspector, KernelReport, ResourceAssessment, ResourceContract,
+    SchedulerProfile, Wavefront, materialize_support_header, resolve_hipcc,
 };
 use std::env;
 use std::error::Error;
@@ -22,7 +22,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("assess") => assess(args.collect()),
         Some("campaign") => campaign(args.collect()),
         Some("header") => {
-            println!("{}", support_header_path().display());
+            let path = materialize_support_header(&support_header_cache_directory())?;
+            println!("{}", path.display());
             Ok(())
         }
         Some("--help" | "-h") | None => {
@@ -33,13 +34,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn support_header_cache_directory() -> PathBuf {
+    let cache_root = env::var_os("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
+        .unwrap_or_else(env::temp_dir);
+    cache_root.join("radiowave")
+}
+
 fn compile(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let mut source = None;
     let mut output = None;
     let mut arch = env::var("RADIOWAVE_ARCH").ok();
     let mut wavefront = Wavefront::Wave32;
     let mut scheduler_profile = SchedulerProfile::Default;
-    let mut hipcc = env::var_os("HIPCC").filter(|v| !v.is_empty()).map(PathBuf::from);
+    let mut hipcc = env::var_os("HIPCC")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
     let mut manifest = None;
     let mut defines = Vec::new();
     let mut extra_args = Vec::new();
