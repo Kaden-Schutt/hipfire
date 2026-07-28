@@ -1,10 +1,10 @@
 # Redline Lowering Tools Design
 
-**Status:** Approved design intent  
-**Lifecycle:** `active`  
-**Allowed claim states:** Planned design requirements only  
-**Canonical domain:** Developer CLI discoverability for existing Radiowave kernel lowering and Redline retained-PM4 lowering surfaces  
-**Last checked:** 2026-07-27  
+**Status:** Approved design intent
+**Lifecycle:** `active`
+**Allowed claim states:** Planned design requirements only
+**Canonical domain:** Developer CLI discoverability for existing Radiowave kernel lowering and Redline retained-PM4 lowering surfaces
+**Last checked:** 2026-07-27
 
 This document uses **MUST**, **MUST NOT**, **SHOULD**, and **MAY** normatively. It is implementation intent for a thin Python delegation layer under `python3 -m tools.redline lower`. It does **not** claim that the layer is implemented, measured, or shipped until source and tests land.
 
@@ -180,13 +180,13 @@ Repository root `REPO` is `Path(__file__).resolve().parents[2]` from `tools/redl
 
 Build a command prefix using the first match in order:
 
-1. **Explicit override:** `--radiowave PATH`  
-   - `PATH` MUST exist and be executable enough to spawn (file present).  
+1. **Explicit override:** `--radiowave PATH`
+   - `PATH` MUST exist and be executable enough to spawn (file present).
    - Prefix: `[PATH]`.
 2. **Release binary:** `REPO / "target/release/radiowave"` if it is a file.
 3. **Debug binary:** `REPO / "target/debug/radiowave"` if it is a file.
-4. **Cargo fallback:** `["cargo", "run", "-q", "-p", "radiowave", "--"]`  
-   - Used only when no binary file matched.  
+4. **Cargo fallback:** `["cargo", "run", "-q", "-p", "radiowave", "--"]`
+   - Used only when no binary file matched.
    - Requires `cargo` on `PATH` at spawn time; failure to spawn is handled as a missing-surface error if the OS cannot execute cargo, otherwise cargo’s own exit status passes through.
 
 Resolution is about the **program prefix** only. Radiowave subcommand args follow the prefix unchanged.
@@ -263,25 +263,25 @@ Do not raise uncaught stack traces for expected user errors; expected paths end 
 
 Scope: fast, offline, no GPU, no requirement for a built daemon or radiowave artifact in CI unit tests.
 
-1. **Process execution mocked**  
-   - Patch `subprocess.run` (or the single internal helper `lower.py` uses).  
+1. **Process execution mocked**
+   - Patch `subprocess.run` (or the single internal helper `lower.py` uses).
    - Assert argv for:
-     - `lower kernel compile ...` → release/debug/`cargo` prefix + forwarded args;  
-     - `lower kernel --radiowave /tmp/rw ...` → `["/tmp/rw", ...]` and `--radiowave` stripped;  
-     - `lower pm4 --model M` → `[sys.executable, str(harness), "--pm4", "--model", "M"]`;  
-     - `lower pm4 --pm4 --model M` → still a single `--pm4`.  
+     - `lower kernel compile ...` → release/debug/`cargo` prefix + forwarded args;
+     - `lower kernel --radiowave /tmp/rw ...` → `["/tmp/rw", ...]` and `--radiowave` stripped;
+     - `lower pm4 --model M` → `[sys.executable, str(harness), "--pm4", "--model", "M"]`;
+     - `lower pm4 --pm4 --model M` → still a single `--pm4`.
    - Assert return code equals mocked child return code.
 
-2. **Resolution unit tests**  
-   - Fake filesystem or temporary dirs covering preference order: explicit > release > debug > cargo.  
+2. **Resolution unit tests**
+   - Fake filesystem or temporary dirs covering preference order: explicit > release > debug > cargo.
    - Missing harness file → exit `2`, attempted command in stderr.
 
-3. **Smoke delegated help**  
-   - Optional lightweight test that invokes module main with `kernel -h` or `pm4 -h` under mock, or integration smoke when a radiowave binary exists.  
-   - MUST NOT require GPU.  
+3. **Smoke delegated help**
+   - Optional lightweight test that invokes module main with `kernel -h` or `pm4 -h` under mock, or integration smoke when a radiowave binary exists.
+   - MUST NOT require GPU.
    - Goal: prove delegation wiring, not engine correctness (engine tests stay in `crates/radiowave` and harness/scripts coverage).
 
-4. **Dispatcher**  
+4. **Dispatcher**
    - When `__main__.py` gains `lower`, one test that unknown package subcommands still exit `2` and that `lower` dispatches into `tools.redline.lower.main`.
 
 Non-goals for tests: bit-exact PM4 bodies, tok/s, Golden floors, real `hipcc` compiles.
