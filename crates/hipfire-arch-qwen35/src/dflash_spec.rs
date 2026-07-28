@@ -78,17 +78,51 @@ pub fn load_dflash_state(
     // (CLI `--ddtree-budget` / `--ddtree-topk`). Env wins, else these, else default.
     ddtree_budget_param: Option<usize>,
     ddtree_topk_param: Option<usize>,
+    // CASK eviction active for this load. Windowed draft mode refuses the
+    // combination (the eviction rebuild re-projects rows the window has
+    // already dropped) and falls back to Legacy — gather-compact over the
+    // rings is a follow-up.
+    eviction_active: bool,
 ) -> Result<DflashState, String> {
     let requested_ctx = ctx_capacity;
-    let ctx_capacity = match std::env::var("HIPFIRE_DFLASH_CTX_CAP")
+    // HIPFIRE_DFLASH_WINDOW=<rows> opts into the windowed draft context
+    // (NInfer 1-full + (n−1)-SWA pattern): layers 0..n−2 attend over the
+    // last `window` rows, the last layer over min(requested, 4×window).
+    // Draft-side VRAM pins at the window size regardless of max_seq, and
+    // requests past the window degrade τ gracefully instead of hitting the
+    // Legacy AR fallback. Unset/0 ⇒ Legacy (cap + AR fallback, unchanged).
+    let window = std::env::var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(0) => ctx_capacity, // explicit opt-out: legacy uncapped
-        Some(cap) => ctx_capacity.min(cap),
-        None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
+        .filter(|&v| v > 0);
+    let window = match (window, eviction_active) {
+        (Some(w), true) => {
+            eprintln!(
+                "  DFlash windowed mode ({w}) disabled: CASK eviction rebuild is not \
+                 ring-aware — falling back to Legacy capped mode"
+            );
+            None
+        }
+        (w, _) => w,
     };
-    if ctx_capacity < requested_ctx {
+    let ctx_capacity = match window {
+        Some(w) => w,
+        None => match std::env::var("HIPFIRE_DFLASH_CTX_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(0) => ctx_capacity, // explicit opt-out: legacy uncapped
+            Some(cap) => ctx_capacity.min(cap),
+            None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
+        },
+    };
+    if let Some(w) = window {
+        eprintln!(
+            "  DFlash draft windowed: SWA W={w} rows on layers 0..n-2, full-attention \
+             last layer over {} rows (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy)",
+            requested_ctx.min(4 * w)
+        );
+    } else if ctx_capacity < requested_ctx {
         eprintln!(
             "  DFlash draft ctx capped: {} -> {} rows (draft-side VRAM scales with this; \
              HIPFIRE_DFLASH_CTX_CAP=0 for uncapped, or set a larger cap)",
@@ -115,13 +149,23 @@ pub fn load_dflash_state(
     // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
     // refactor regressed this to the `with_mq=false` `::new` constructor →
     // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
-    let draft_scratch = DflashScratch::new_with_mq(
-        gpu,
-        &draft_config,
-        block_size,
-        ctx_capacity,
-        draft_weights.has_mq,
-    )
+    let draft_scratch = match window {
+        Some(w) => DflashScratch::new_windowed(
+            gpu,
+            &draft_config,
+            block_size,
+            w,
+            requested_ctx.min(4 * w),
+            draft_weights.has_mq,
+        ),
+        None => DflashScratch::new_with_mq(
+            gpu,
+            &draft_config,
+            block_size,
+            ctx_capacity,
+            draft_weights.has_mq,
+        ),
+    }
     .map_err(|e| format!("{e}"))?;
     let _ = draft_hfq;
     // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
@@ -182,7 +226,15 @@ pub fn load_dflash_state(
         target_snap,
         gdn_tape,
         target_hidden_host,
-        ctx_capacity,
+        // Windowed mode reports the TARGET's physical capacity: the draft
+        // degrades τ past its window instead of refusing, so the spec
+        // loop's overflow guard and the daemon's capacity fallback track
+        // the true cliff, not the window.
+        ctx_capacity: if window.is_some() {
+            requested_ctx
+        } else {
+            ctx_capacity
+        },
         block_size,
         ddtree,
     })
@@ -347,8 +399,25 @@ impl Speculator for DflashSpeculator {
             scatter_off,
             scatter_len,
             scatter_len,
+            self.df.draft_scratch.ctx_modulus(),
         ) {
             eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+        }
+        // Windowed mode, cold prefill longer than the SWA window: the last
+        // (full-attention) draft layer still needs K/V for every prompt row,
+        // but hidden_rb and the draft ring only retain the last W. Backfill
+        // the last layer's long-reach ring from the host shadow (cumulative
+        // on the cold path) before the first spec step.
+        if !cache_hit {
+            hipfire_runtime::dflash::draft_seed_backfill(
+                gpu,
+                &self.df.draft_weights,
+                &self.df.draft_config,
+                &mut self.df.draft_scratch,
+                &self.df.target_hidden_host,
+                prompt_tokens.len(),
+            )
+            .map_err(|e| e.to_string())?;
         }
         self.df.draft_scratch.thlog.seed_prompt(prompt_tokens.len());
         if let Some(ckpt) = resume_from {

@@ -565,6 +565,7 @@ pub fn spec_step_dflash_mtp(
         position,
         n_verify,
         rows_to_keep,
+        draft_scratch.ctx_modulus(),
     )?;
     let co = target.kv_cache.compact_offset as i32;
     draft_scratch
@@ -1258,6 +1259,7 @@ pub fn spec_step_dflash_mtp_tree(
         position,
         n_total,
         rows_to_keep,
+        draft_scratch.ctx_modulus(),
     )?;
     draft_scratch
         .thlog

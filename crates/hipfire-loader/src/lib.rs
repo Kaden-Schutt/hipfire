@@ -823,6 +823,7 @@ fn finish_qwen35_load(
             ctx.gpu,
             ctx.spec.ddtree_budget,
             ctx.spec.ddtree_topk,
+            eviction.is_some(),
         ) {
             Ok(s) => {
                 eprintln!(

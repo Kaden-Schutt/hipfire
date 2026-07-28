@@ -2652,6 +2652,7 @@ pub fn scatter_hidden_block_to_interleaved(
     dst_row_offset: usize,
     block_size: usize,
     n_rows: usize,
+    dst_modulus: usize,
 ) -> HipResult<()> {
     assert!(
         n_rows <= block_size,
@@ -2663,15 +2664,27 @@ pub fn scatter_hidden_block_to_interleaved(
     let head = hidden_rb.head;
     let written = hidden_rb.written;
     assert!(
-        block_size <= written,
+        block_size <= written.max(max_pos),
         "scatter: block_size {block_size} > written {written}"
     );
     let row_bytes = hidden * 4;
-    let start_slot = (head + max_pos - block_size) % max_pos;
+    // The ring physically holds only the last `max_pos` rows of a logical
+    // block longer than that — skip the fallen-off prefix (windowed draft
+    // mode: SWA layers never read out-of-window rows; the last layer's
+    // long-reach fill is the post-seed backfill's job). Legacy callers pass
+    // block_size <= max_pos ⇒ r_skip = 0, identical behaviour.
+    let r_skip = block_size.saturating_sub(max_pos);
+    let start_slot = (head + max_pos - (block_size - r_skip)) % max_pos;
 
-    for r in 0..n_rows {
-        let slot = (start_slot + r) % max_pos;
-        let dst_row = dst_row_offset + r;
+    for r in r_skip..n_rows {
+        let slot = (start_slot + (r - r_skip)) % max_pos;
+        // dst_row_offset is an absolute row index; windowed-mode dst rings
+        // address it by slot (row % modulus). Legacy passes usize::MAX.
+        let dst_row = if dst_modulus == usize::MAX {
+            dst_row_offset + r
+        } else {
+            (dst_row_offset + r) % dst_modulus
+        };
         let dst_row_base_bytes = dst_row * num_extract * row_bytes;
         for ext in 0..num_extract {
             let src_offset_bytes = slot * row_bytes;
@@ -3923,6 +3936,7 @@ pub fn spec_step_dflash(
             position,
             b,
             rows_to_keep,
+            draft_scratch.ctx_modulus(),
         )?;
         // Keep draft_forward's incremental-upload tracker in sync so any future
         // ctx_slice=Some call in the same session doesn't try to re-upload what
@@ -5142,6 +5156,7 @@ pub fn spec_step_ddtree_batched(
             position,
             1,
             1,
+            draft_scratch.ctx_modulus(),
         )?;
         let co = target.kv_cache.compact_offset as i32;
         draft_scratch.thlog.append_committed(position, 1, co);
@@ -5476,6 +5491,7 @@ pub fn spec_step_ddtree_batched(
             position,
             block_size,
             rows_to_keep,
+            draft_scratch.ctx_modulus(),
         )?;
         let co = target.kv_cache.compact_offset as i32;
         draft_scratch

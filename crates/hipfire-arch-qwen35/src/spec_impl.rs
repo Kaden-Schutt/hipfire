@@ -460,6 +460,7 @@ impl SpecTarget for ModelSlot {
                 0,
                 block.len(),
                 block.len(),
+                usize::MAX, // DSpark hidden dst is not a windowed draft ring
             )
             .map_err(|e| e.to_string())?;
         }
@@ -553,6 +554,7 @@ impl SpecTarget for ModelSlot {
                 0,
                 block.len(),
                 block.len(),
+                usize::MAX, // DSpark hidden dst is not a windowed draft ring
             )
             .map_err(|e| e.to_string())?;
         }

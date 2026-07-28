@@ -648,13 +648,47 @@ fn main() {
             draft_scratch_b, draft_cfg.block_size,
         );
     }
-    let mut draft_scratch = DflashScratch::new_with_mq(
-        &mut gpu,
-        &draft_cfg,
-        draft_scratch_b,
-        ctx_capacity,
-        draft_weights.has_mq,
-    )
+    // HIPFIRE_DFLASH_WINDOW=<rows> opts into the windowed draft context
+    // (SWA W on layers 0..n-2 + 4W-reach last layer). Unset/0 = Legacy.
+    // Refused with CASK eviction (the eviction rebuild is not ring-aware).
+    let dflash_window = std::env::var("HIPFIRE_DFLASH_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0);
+    let dflash_window = match (dflash_window, cask_sidecar.is_some()) {
+        (Some(w), true) => {
+            eprintln!(
+                "draft: windowed mode ({w}) disabled — CASK eviction rebuild is not \
+                 ring-aware; using Legacy"
+            );
+            None
+        }
+        (w, _) => w,
+    };
+    let mut draft_scratch = match dflash_window {
+        Some(w) => {
+            eprintln!(
+                "draft: windowed mode W={} (last layer reach {})",
+                w,
+                ctx_capacity.min(4 * w)
+            );
+            DflashScratch::new_windowed(
+                &mut gpu,
+                &draft_cfg,
+                draft_scratch_b,
+                w,
+                ctx_capacity.min(4 * w),
+                draft_weights.has_mq,
+            )
+        }
+        None => DflashScratch::new_with_mq(
+            &mut gpu,
+            &draft_cfg,
+            draft_scratch_b,
+            ctx_capacity,
+            draft_weights.has_mq,
+        ),
+    }
     .expect("alloc draft scratch");
     if draft_weights.has_mq {
         eprintln!("draft: MQ weights detected, FWHT rotation scratch enabled");
@@ -1012,8 +1046,21 @@ fn main() {
             0,
             prompt_tokens.len(), // block_size: seed wrote prompt_len contiguous slots
             prompt_tokens.len(), // n_rows:     keep all of them
+            draft_scratch.ctx_modulus(),
         )
         .expect("seed scatter");
+        // Windowed mode + prompt longer than the SWA window: backfill the
+        // last (full-attention) draft layer's long-reach K/V ring from the
+        // cumulative host shadow before the first spec step.
+        hipfire_runtime::dflash::draft_seed_backfill(
+            &mut gpu,
+            &draft_weights,
+            &draft_cfg,
+            &mut draft_scratch,
+            &target_hidden_host,
+            prompt_tokens.len(),
+        )
+        .expect("seed backfill");
         // Seed the upload watermark + per-row absolute positions for the
         // draft's cross-attention RoPE. Pre-eviction these match [0..prompt_len)
         // exactly, so FlashCASK-free runs stay byte-identical.

@@ -317,6 +317,7 @@ fn main() {
         0,
         prompt_tokens.len(),
         prompt_tokens.len(),
+        draft_scratch.ctx_modulus(),
     )
     .expect("seed scatter");
     draft_scratch.thlog.seed_prompt(prompt_tokens.len());
