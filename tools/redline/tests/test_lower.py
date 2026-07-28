@@ -187,13 +187,13 @@ class LowerKernelArgvTests(unittest.TestCase):
     def test_kernel_spawn_oserror_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            # No binaries → cargo prefix; force general spawn OSError
+            # No binaries → cargo prefix; true base OSError (not FileNotFoundError).
             with (
                 patch.object(self.lower, "REPO", root),
                 patch.object(
                     self.lower.subprocess,
                     "run",
-                    side_effect=OSError(2, "No such file or directory", "cargo"),
+                    side_effect=OSError("spawn failed"),
                 ),
                 patch.object(sys, "stderr", io.StringIO()) as err,
             ):
@@ -201,7 +201,8 @@ class LowerKernelArgvTests(unittest.TestCase):
             self.assertEqual(code, 2)
             msg = err.getvalue()
             self.assertIn("tools.redline.lower:", msg)
-            self.assertIn("cargo", msg)
+            self.assertIn("spawn failed", msg)
+
 
 
 
@@ -364,7 +365,7 @@ class LowerHelpSmokeTests(unittest.TestCase):
 
     def test_kernel_help_delegates_without_gpu(self):
         result = self.run_lower("kernel", "-h")
-        # Must reach real child help: not package unknown-subcommand, not empty.
+        # Must reach real Radiowave child help: not package unknown-subcommand.
         self.assertNotIn("unknown subcommand", result.stderr)
         self.assertEqual(
             result.returncode,
@@ -372,12 +373,15 @@ class LowerHelpSmokeTests(unittest.TestCase):
             f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
         )
         combined = ((result.stdout or "") + (result.stderr or "")).lower()
-        self.assertTrue(
-            "usage" in combined
-            or "help" in combined
-            or "radiowave" in combined
-            or "compile" in combined
-            or "inspect" in combined,
+        # Child-specific Radiowave markers — not generic usage/help alone.
+        self.assertIn(
+            "radiowave compile",
+            combined,
+            f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
+        )
+        self.assertIn(
+            "radiowave inspect",
+            combined,
             f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
         )
 
@@ -390,14 +394,15 @@ class LowerHelpSmokeTests(unittest.TestCase):
             f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
         )
         combined = (result.stdout or "") + (result.stderr or "")
-        combined_l = combined.lower()
-        # Harness argparse help must surface; reject generic errors / empty.
-        self.assertTrue(
-            "--pm4" in combined
-            or "usage" in combined_l
-            or "help" in combined_l
-            or "model" in combined_l
-            or "daemon" in combined_l,
+        # Harness-specific argparse flags — not generic usage/help alone.
+        self.assertIn(
+            "--model",
+            combined,
+            f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
+        )
+        self.assertIn(
+            "--pm4",
+            combined,
             f"rc={result.returncode} out={result.stdout!r} err={result.stderr!r}",
         )
 
