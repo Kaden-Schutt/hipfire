@@ -10,7 +10,7 @@
 
 use std::sync::OnceLock;
 
-/// Product-certified Redline default: one Qwen A3B MQ4R model on one gfx12 GPU.
+/// Product-certified Redline default: one Qwen A3B MQ4R model on one certified GPU.
 ///
 /// Keep this predicate deliberately narrower than the replay implementation's
 /// capability surface. Other models and multi-GPU layouts remain opt-in until
@@ -22,7 +22,7 @@ pub fn gfx12_mq4r_redline_default(
     pp: usize,
     tp: usize,
 ) -> bool {
-    gpu_arch.starts_with("gfx12")
+    (gpu_arch == "gfx1151" || gpu_arch.starts_with("gfx12"))
         && model_arch_id == 6
         && pp == 1
         && tp == 1
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn redline_default_is_limited_to_single_gpu_gfx12_a3b_mq4r() {
+    fn redline_default_is_limited_to_single_gpu_certified_a3b_mq4r() {
         assert!(gfx12_mq4r_redline_default(
             "gfx1201",
             "/models/qwen3.6-35b-a3b.mq4r",
@@ -247,6 +247,14 @@ mod tests {
         assert!(gfx12_mq4r_redline_default(
             "gfx1200",
             "/models/QWEN3.6-35B-A3B.MQ4R",
+            6,
+            1,
+            1,
+        ));
+
+        assert!(gfx12_mq4r_redline_default(
+            "gfx1151",
+            "/models/qwen3.6-35b-a3b.mq4r",
             6,
             1,
             1,
