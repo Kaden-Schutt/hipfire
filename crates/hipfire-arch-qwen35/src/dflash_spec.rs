@@ -156,6 +156,7 @@ pub fn load_dflash_state(
             block_size,
             w,
             requested_ctx.min(4 * w),
+            requested_ctx,
             draft_weights.has_mq,
         ),
         None => DflashScratch::new_with_mq(

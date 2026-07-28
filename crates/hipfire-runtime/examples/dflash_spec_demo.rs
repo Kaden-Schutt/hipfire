@@ -678,6 +678,7 @@ fn main() {
                 draft_scratch_b,
                 w,
                 ctx_capacity.min(4 * w),
+                ctx_capacity,
                 draft_weights.has_mq,
             )
         }

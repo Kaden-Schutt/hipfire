@@ -763,16 +763,22 @@ impl DflashScratch {
     /// buffers are sized exactly as `new_with_mq(gpu, cfg, b, w, ..)` — so
     /// windowed-mode VRAM is the Legacy-at-ctx=w footprint plus one
     /// `w_full`-sized layer (≈270 MB at w_full=32K, kvd=1024, f32).
+    /// `max_ctx` is the target's physical context capacity: the rings wrap
+    /// forever, so `l` may grow past `w_full` (spans stay suffixes).
     pub fn new_windowed(
         gpu: &mut Gpu,
         cfg: &DflashConfig,
         max_block_size: usize,
         w: usize,
         w_full: usize,
+        max_ctx: usize,
         with_mq: bool,
     ) -> HipResult<Self> {
         let kvd = cfg.kv_dim();
         let b = max_block_size;
+        // The long-reach layer never has a SHORTER window than the SWA layers
+        // (possible when physical_cap < w): its span must contain theirs.
+        let w_full = w_full.max(w);
         // Base at ctx=w: SWA rings, (w+B) concat buffers, w-row target_hidden
         // ring — the entire draft footprint except the one long-reach layer.
         let mut s = Self::new_with_mq(gpu, cfg, b, w, with_mq)?;
@@ -788,11 +794,13 @@ impl DflashScratch {
         s.v_full_cached = Some(gpu.alloc_tensor(&[w_full * kvd], DType::F32)?);
         s.k_cat_full = Some(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)?);
         s.v_cat_full = Some(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)?);
-        // positions_k must index up to w_full + B rows for the last layer.
+        // positions_k holds the last w_full context rows + the B noise rows
+        // (the forward uploads only that suffix; every layer's span is one).
         let new_positions_k = gpu.alloc_tensor(&[w_full + b], DType::F32)?;
         let _ = gpu.free_tensor(std::mem::replace(&mut s.positions_k, new_positions_k));
-        // The forward's ctx bound is the long-reach window, not the SWA one.
-        s.max_ctx_len = w_full;
+        // The ctx bound is the target's physical capacity, not the window —
+        // l may cross w_full (the last layer's span just slides).
+        s.max_ctx_len = max_ctx;
         s.ctx_mode = DraftCtxMode::Windowed { w, w_full };
         Ok(s)
     }
@@ -1502,6 +1510,15 @@ pub fn draft_forward_opts(
         DraftCtxMode::Windowed { w, w_full } => (w, w_full),
     };
     let windowed = !matches!(scratch.ctx_mode, DraftCtxMode::Legacy);
+    // Windowed positions base: the device positions_k buffer holds only the
+    // suffix [pos_base..tot) (last full_w context rows + B noise) — every
+    // layer's attention span lives inside it. Device index of row r is
+    // r − pos_base. Legacy: pos_base = 0, the full upload as before.
+    let pos_base = if windowed {
+        l.saturating_sub(full_w)
+    } else {
+        0
+    };
     // Backfill-invariant probe: past the SWA window the last layer's
     // out-of-window K/V must come from the post-seed backfill. If a driver
     // skipped it (research demos on non-speculator paths), its ring holds
@@ -1592,7 +1609,11 @@ pub fn draft_forward_opts(
         // since caller always appends, but harmless).
     }
     upload_slice_i32(gpu, &scratch.positions_q, positions_q)?;
-    upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
+    if windowed {
+        upload_slice_i32(gpu, &scratch.positions_k, &positions_k[pos_base..])?;
+    } else {
+        upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
+    }
 
     // ── 1. target_hidden_proj = hidden_norm(fc @ target_hidden) ──────────
     // Incremental-projection fast path (2026-04-20): only compute the
@@ -1885,9 +1906,11 @@ pub fn draft_forward_opts(
         // Call 2: rotate K_cat with positions_k. n_heads_q = 0 skips Q.
         // Windowed: the layer's context rows are the suffix [span_start..l),
         // so its positions slice is the device buffer's contiguous
-        // sub-range [span_start..tot) — zero extra upload, absolute RoPE
-        // phases preserved. Legacy: span_start=0 ⇒ the full buffer.
-        let positions_k_span = scratch.positions_k.sub_offset(span_start, span + b);
+        // sub-range [span_start−pos_base..tot−pos_base) — zero extra upload,
+        // absolute RoPE phases preserved. Legacy: both bases 0 ⇒ full buffer.
+        let positions_k_span = scratch
+            .positions_k
+            .sub_offset(span_start - pos_base, span + b);
         gpu.rope_batched_f32(
             &scratch.q, // ignored because n_heads_q = 0
             k_cat_l,
