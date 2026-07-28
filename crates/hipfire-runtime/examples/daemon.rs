@@ -3674,6 +3674,243 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            "redline_dispatch_profile" => {
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(128) as usize;
+                let warmup_replays = msg
+                    .get("warmup_replays")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(5) as usize;
+                let sample_replays = msg
+                    .get("sample_replays")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(20) as usize;
+                let validate_correctness = msg
+                    .get("validate_correctness")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+                let eligible = model.as_ref().is_some_and(|loaded| {
+                    loaded.pp == 1
+                        && loaded.ep.is_none()
+                        && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+                });
+                let launch_count = gpu.replay.recorded_launches().len();
+                if !eligible || launch_count == 0 || sample_replays == 0 {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "redline_dispatch_profile requires captured single-GPU Qwen3.5 and sample_replays > 0",
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
+                let route = gpu.replay.capture_summary();
+                let prepared = match gpu
+                    .replay
+                    .prepare_pm4_dispatch_profile(gpu.device_id as usize, launch_count)
+                {
+                    Ok(summary) => summary,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("retained PM4 dispatch-profile prepare failed: {reason}"),
+                            })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let boundaries = gpu
+                    .replay
+                    .prepared_pm4_dispatch_boundaries()
+                    .expect("dispatch-profile prepare installed boundary metadata");
+                let dispatches = gpu
+                    .replay
+                    .recorded_launches()
+                    .iter()
+                    .zip(boundaries)
+                    .enumerate()
+                    .map(|(index, (launch, boundary))| {
+                        serde_json::json!({
+                            "index": index,
+                            "kernel": launch.kernel,
+                            "previous_kernel": index.checked_sub(1).map(|previous| {
+                                gpu.replay.recorded_launches()[previous].kernel.as_str()
+                            }),
+                            "grid": launch.grid,
+                            "block": launch.block,
+                            "boundary": {
+                                "entry_acquire": boundary.entry_acquire,
+                                "wait_compute_idle": boundary.wait_compute_idle,
+                                "acquire_inter_node": boundary.acquire_inter_node,
+                                "acquire_vmem": boundary.acquire_vmem,
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                let result = (|| -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
+                    let loaded = model.as_mut().expect("eligibility checked");
+                    let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                    redline_reset_qwen(&mut gpu, bundle)?;
+                    redline_prime_qwen(&mut gpu, bundle, context)?;
+                    for _ in 0..warmup_replays {
+                        qwen35::prepare_scratch_inputs(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101,
+                            context,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        // SAFETY: the loaded model owns every captured pointer.
+                        unsafe { gpu.replay.replay_pm4_dispatch_profile(context) }?;
+                    }
+
+                    let mut samples = Vec::with_capacity(sample_replays);
+                    for sample in 0..sample_replays {
+                        qwen35::prepare_scratch_inputs(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101,
+                            context,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let started = Instant::now();
+                        // SAFETY: the loaded model owns every captured pointer.
+                        let profile = unsafe { gpu.replay.replay_pm4_dispatch_profile(context) }?;
+                        if profile.spans_nanoseconds.len() != launch_count {
+                            return Err(format!(
+                                "dispatch span length mismatch: expected {launch_count}, got {}",
+                                profile.spans_nanoseconds.len()
+                            ));
+                        }
+                        let total_gpu_ns = profile
+                            .timing
+                            .last_end
+                            .saturating_sub(profile.timing.first_start)
+                            .saturating_mul(1_000_000_000)
+                            / profile.timing.frequency_hz;
+                        samples.push(serde_json::json!({
+                            "sample": sample,
+                            "host_ns": started.elapsed().as_nanos(),
+                            "total_gpu_ns": total_gpu_ns,
+                            "spans_ns": profile.spans_nanoseconds,
+                        }));
+                    }
+
+                    let correctness = if validate_correctness {
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                        redline_reset_qwen(&mut gpu, bundle)?;
+                        redline_prime_qwen(&mut gpu, bundle, context)?;
+                        qwen35::prepare_scratch_inputs(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101,
+                            context,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        // SAFETY: the loaded model owns every captured pointer.
+                        unsafe { gpu.replay.replay_pm4_dispatch_profile(context) }?;
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
+                        let instrumented = redline_qwen_snapshot(&gpu, bundle)?;
+
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                        redline_reset_qwen(&mut gpu, bundle)?;
+                        redline_prime_qwen(&mut gpu, bundle, context)?;
+                        qwen35::forward_scratch(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101,
+                            context,
+                            &mut bundle.kv_cache,
+                            &mut bundle.dn_state,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
+                        let hip = redline_qwen_snapshot(&gpu, bundle)?;
+                        serde_json::json!({
+                            "performed": true,
+                            "bit_exact": instrumented == hip,
+                            "logits_equal": instrumented.logits == hip.logits,
+                            "kv_equal": instrumented.kv == hip.kv,
+                            "recurrent_equal": instrumented.recurrent == hip.recurrent,
+                            "instrumented_pm4": instrumented.json(),
+                            "hip": hip.json(),
+                        })
+                    } else {
+                        serde_json::json!({"performed": false})
+                    };
+                    Ok((samples, correctness))
+                })();
+
+                match result {
+                    Ok((samples, correctness)) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "schema_version": 1,
+                                "type": "redline_dispatch_profile",
+                                "context_tokens": context,
+                                "warmup_replays": warmup_replays,
+                                "sample_replays": sample_replays,
+                                "steady_state": true,
+                                "exactly_once_per_sample": true,
+                                "timestamp_semantics": "baseline before stream plus post-dispatch stamps; span i is PM4 after timestamp i through dispatch i (entry acquire in span 0; later spans include intervening boundary packets)",
+                                "route": {
+                                    "launches": route.launch_count,
+                                    "unique_kernels": route.unique_kernel_count,
+                                    "sequence_hash": format!("{:016x}", route.sequence_hash),
+                                    "command_dwords": prepared.1,
+                                    "timestamp_slots": route.launch_count + 1,
+                                    "queue_id": prepared.2,
+                                },
+                                "dispatches": dispatches,
+                                "samples": samples,
+                                "correctness": correctness,
+                            })
+                        );
+                    }
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("retained PM4 dispatch profile failed: {reason}"),
+                            })
+                        );
+                    }
+                }
+                let _ = stdout.flush();
+            }
+
             "redline_pm4_prefix_profile" => {
                 let context = msg
                     .get("context_tokens")

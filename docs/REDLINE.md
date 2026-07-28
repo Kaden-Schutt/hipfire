@@ -411,6 +411,25 @@ Section 7 ledger. The diagnostic commands above still do **not** emit that full
 ledger; use the product bench (or the Golden wrapper around it) for certification
 evidence.
 
+### Steady-state dispatch profiler (attribution-only diagnostic)
+
+`scripts/redline_dispatch_profile.py` is a **named manual diagnostic** for
+steady-state, exactly-once retained-PM4 per-dispatch span attribution on an
+instrumented GFX12 tape. It is **not** route proof, **not** Section 7
+certification or registry admission, and **not** absolute or pure kernel timing.
+
+Reasons it cannot prove those claims:
+
+- timestamp `COPY_DATA` packets change the tape (dword count and sequence hash)
+  and introduce observer overhead on every dispatch;
+- span *i* is every PM4 command after timestamp *i* through dispatch *i*, so
+  spans include preceding boundary packets (entry acquire on span 0; waits and
+  mid-tape acquires on later spans), not kernel-only time.
+
+Use product bench / Golden for certification evidence. Use this profiler only
+to attribute relative stall shape across dispatches under the instrumented tape.
+
+
 ## 6. PM4 lowering and hazard policy
 
 `Pm4Architecture::from_device` selects distinct gfx10, gfx11, and gfx12

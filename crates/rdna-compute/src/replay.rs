@@ -241,11 +241,37 @@ impl Pm4Commands {
         }
     }
 
+    fn populate_dispatch_span_boundaries(
+        &self,
+        boundaries: &mut [Pm4DispatchBoundary],
+    ) -> Result<(), String> {
+        let Self::Gfx12(commands) = self else {
+            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+        };
+        let attributions = commands
+            .dispatch_span_attributions()
+            .map_err(|error| error.to_string())?;
+        if attributions.len() != boundaries.len() {
+            return Err(format!(
+                "generated PM4 dispatch attribution mismatch: expected {}, got {}",
+                boundaries.len(),
+                attributions.len()
+            ));
+        }
+        for (boundary, attribution) in boundaries.iter_mut().zip(attributions) {
+            boundary.entry_acquire = attribution.entry_acquire;
+            boundary.wait_compute_idle = attribution.wait_compute_idle;
+            boundary.acquire_inter_node = attribution.acquire_inter_node;
+        }
+        Ok(())
+    }
+
     fn create_graph(
         &self,
         device: &GpuDevice,
         pool: &KernargPool,
         cu_mask: Option<&[u32; 2]>,
+        dispatch_profile: bool,
     ) -> Result<SingleQueuePm4Ib, String> {
         let graph = match self {
             Self::Legacy {
@@ -268,7 +294,7 @@ impl Pm4Commands {
                 // different dword count and sequence hash, so such a run cannot
                 // satisfy a golden fixture — it is a diagnostic, not a
                 // certification.
-                if dispatch_profile_enabled() {
+                if dispatch_profile || dispatch_profile_enabled() {
                     SingleQueuePm4Ib::create_dispatch_profiled(device, pool, commands)
                 } else {
                     SingleQueuePm4Ib::create_profiled(device, pool, commands)
@@ -318,6 +344,10 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
             | "rmsnorm_f32"
             | "sigmoid_mul_f32"
     )
+}
+
+fn pm4_vmem_acquire_enabled(architecture: Pm4Architecture, configured: bool, kernel: &str) -> bool {
+    architecture != Pm4Architecture::Gfx12 && configured && radiowave_vmem_only_consumer(kernel)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1784,22 +1814,18 @@ enum PreparedPm4Graph {
 
 impl PreparedPm4Graph {
     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
-        // Report the per-dispatch distribution once per process. Emitting it
-        // every replay would bury the benchmark output; the shape is what
-        // matters and it is stable across replays.
         if dispatch_profile_enabled() {
             if let Self::Single(graph) = self {
+                // Execute the instrumented graph once. Reuse the same timestamp
+                // vector for whole-tape timing and the one-line legacy report.
+                let (timing, spans) = unsafe { graph.replay_and_wait_dispatch_profiled() }
+                    .map_err(|error| error.to_string())?;
                 static REPORTED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    // SAFETY: forwarded from this method's caller.
-                    match unsafe { graph.replay_and_wait_dispatch_spans() } {
-                        Ok(spans) => report_dispatch_spans(&spans),
-                        Err(error) => {
-                            eprintln!("[redline] dispatch-span capture failed: {error}")
-                        }
-                    }
+                    report_dispatch_spans(&spans);
                 }
+                return Ok(timing);
             }
         }
         match self {
@@ -1807,6 +1833,21 @@ impl PreparedPm4Graph {
             Self::Phased(graph) => unsafe { graph.replay_and_wait_profiled() },
         }
         .map_err(|error| error.to_string())
+    }
+
+    fn read_dispatch_profile(&mut self) -> Result<Pm4DispatchProfile, String> {
+        match self {
+            Self::Single(graph) => graph
+                .read_dispatch_profile()
+                .map(|(timing, spans_nanoseconds)| Pm4DispatchProfile {
+                    timing,
+                    spans_nanoseconds,
+                })
+                .map_err(|error| error.to_string()),
+            Self::Phased(_) => {
+                Err("per-dispatch PM4 profiling requires a single retained queue".to_owned())
+            }
+        }
     }
 
     fn queue_id(&self) -> u64 {
@@ -1849,6 +1890,22 @@ impl PreparedPm4Graph {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Pm4DispatchBoundary {
+    /// Entry ownership acquire emitted before the first dispatch.
+    /// Distinct from mid-tape `acquire_inter_node`.
+    pub entry_acquire: bool,
+    pub wait_compute_idle: bool,
+    pub acquire_inter_node: bool,
+    pub acquire_vmem: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Pm4DispatchProfile {
+    pub timing: GpuMultiQueueTiming,
+    pub spans_nanoseconds: Vec<u64>,
+}
+
 pub struct PreparedPm4Replay {
     graph: PreparedPm4Graph,
     // Kernels retain their HSA executables and kernargs retain every pointer
@@ -1860,6 +1917,7 @@ pub struct PreparedPm4Replay {
     pm4_architecture: Pm4Architecture,
     dispatch_count: usize,
     command_dwords: u32,
+    dispatch_boundaries: Option<Vec<Pm4DispatchBoundary>>,
 }
 
 impl PreparedPm4Replay {
@@ -1905,12 +1963,33 @@ impl PreparedPm4Replay {
         unsafe { self.graph.replay_and_wait_profiled() }
     }
 
+    /// Replay one instrumented retained graph exactly once.
+    ///
+    /// # Safety
+    ///
+    /// Every captured pointer must remain live, as for [`Self::replay_and_wait`].
+    pub unsafe fn replay_and_wait_dispatch_profiled(
+        &mut self,
+        position: usize,
+    ) -> Result<Pm4DispatchProfile, String> {
+        if self.dispatch_boundaries.is_none() {
+            return Err("prepared PM4 graph has no per-dispatch timestamps".to_owned());
+        }
+        // SAFETY: forwarded from the caller that owns the model allocations.
+        unsafe { self.replay_and_wait(position)? };
+        self.graph.read_dispatch_profile()
+    }
+
     pub fn dispatch_count(&self) -> usize {
         self.dispatch_count
     }
 
     pub fn command_dwords(&self) -> u32 {
         self.command_dwords
+    }
+
+    pub fn dispatch_boundaries(&self) -> Option<&[Pm4DispatchBoundary]> {
+        self.dispatch_boundaries.as_deref()
     }
 
     pub fn queue_id(&self) -> u64 {
@@ -2441,6 +2520,24 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false)
+    }
+
+    /// Lower a captured prefix to a single GFX12 IB with per-dispatch timestamps.
+    pub fn prepare_pm4_dispatch_profile(
+        &mut self,
+        device_ordinal: usize,
+        prefix: usize,
+    ) -> Result<(usize, u32, u64), String> {
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, true)
+    }
+
+    fn prepare_pm4_prefix_inner(
+        &mut self,
+        device_ordinal: usize,
+        prefix: usize,
+        dispatch_profile: bool,
+    ) -> Result<(usize, u32, u64), String> {
         if self.recorded.is_empty() {
             return Err("no captured launch sequence".to_owned());
         }
@@ -2456,6 +2553,9 @@ impl ReplayController {
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
+        if dispatch_profile && pm4_architecture != Pm4Architecture::Gfx12 {
+            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+        }
         let dispatch_initiator_policy =
             gfx10_dispatch_initiator_policy(pm4_architecture, device.name());
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
@@ -2567,7 +2667,9 @@ impl ReplayController {
         // Dynamic direct-dispatch patching is intentionally limited to the
         // certified one-IB path. Multi-queue phases duplicate and reorder
         // command buffers, so a global capture index is not a safe patch key.
-        let queue_limit = if dynamic_grids.is_empty() {
+        let queue_limit = if dispatch_profile {
+            1
+        } else if dynamic_grids.is_empty() {
             self.pm4_queue_policy.resolve(device.name(), usize::MAX)
         } else {
             1
@@ -2575,6 +2677,7 @@ impl ReplayController {
         if cu_mask.is_some() && queue_limit != 1 {
             return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
         }
+        let mut dispatch_boundaries = Vec::new();
         let (graph, command_dwords) = if queue_limit == 1 {
             let mut commands = Pm4Commands::new(
                 pm4_architecture,
@@ -2586,6 +2689,7 @@ impl ReplayController {
             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
             let mut resource_frontier = ResourceFrontier::default();
             for index in 0..prefix {
+                let mut boundary = Pm4DispatchBoundary::default();
                 if index != 0 {
                     let previous_launch = &self.recorded[index - 1];
                     let current_launch = &self.recorded[index];
@@ -2608,10 +2712,9 @@ impl ReplayController {
                             .pm4_mid_acquire_policy
                             .acquire_between(previous, current)
                     {
-                        commands.acquire_inter_node(
-                            gfx12_gcr_trim,
-                            gfx11_vmem_acquire && radiowave_vmem_only_consumer(current),
-                        );
+                        boundary.acquire_vmem =
+                            pm4_vmem_acquire_enabled(pm4_architecture, gfx11_vmem_acquire, current);
+                        commands.acquire_inter_node(gfx12_gcr_trim, boundary.acquire_vmem);
                     }
                 } else {
                     resource_frontier.advance(&self.recorded[index], false);
@@ -2624,10 +2727,17 @@ impl ReplayController {
                         kernargs[index].address(),
                     )
                     .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
+                if dispatch_profile {
+                    dispatch_boundaries.push(boundary);
+                }
             }
             commands.wait_compute_idle();
+            if dispatch_profile {
+                commands.populate_dispatch_span_boundaries(&mut dispatch_boundaries)?;
+            }
             let command_dwords = commands.len_dwords();
-            let graph = commands.create_graph(&device, &pool, cu_mask.as_ref())?;
+            let graph =
+                commands.create_graph(&device, &pool, cu_mask.as_ref(), dispatch_profile)?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
             let min_parallel_width = pm4_min_parallel_width_from_config();
@@ -2732,7 +2842,11 @@ impl ReplayController {
                         {
                             commands.acquire_inter_node(
                                 gfx12_gcr_trim,
-                                gfx11_vmem_acquire && radiowave_vmem_only_consumer(current),
+                                pm4_vmem_acquire_enabled(
+                                    pm4_architecture,
+                                    gfx11_vmem_acquire,
+                                    current,
+                                ),
                             );
                         }
                     } else {
@@ -2787,6 +2901,7 @@ impl ReplayController {
             pm4_architecture,
             dispatch_count: prefix,
             command_dwords,
+            dispatch_boundaries: dispatch_profile.then_some(dispatch_boundaries),
         });
         self.state = ReplayState::Ready;
         Ok((prefix, command_dwords, queue_id))
@@ -2822,6 +2937,32 @@ impl ReplayController {
             unsafe { prepared.replay_and_wait(position) }
         };
         self.observe_replay_result(position, result)
+    }
+
+    /// Replay one explicitly instrumented PM4 graph exactly once.
+    ///
+    /// # Safety
+    ///
+    /// Captured model allocations and pointed-to buffers must remain live.
+    pub unsafe fn replay_pm4_dispatch_profile(
+        &mut self,
+        position: usize,
+    ) -> Result<Pm4DispatchProfile, String> {
+        let result = {
+            let prepared = self
+                .prepared_pm4
+                .as_mut()
+                .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
+            // SAFETY: forwarded from the model owner.
+            unsafe { prepared.replay_and_wait_dispatch_profiled(position) }
+        };
+        self.observe_replay_result(position, result)
+    }
+
+    pub fn prepared_pm4_dispatch_boundaries(&self) -> Option<&[Pm4DispatchBoundary]> {
+        self.prepared_pm4
+            .as_ref()
+            .and_then(PreparedPm4Replay::dispatch_boundaries)
     }
     fn observe_replay_result<T>(
         &mut self,
@@ -3265,6 +3406,21 @@ mod tests {
         ));
         assert!(!radiowave_vmem_only_consumer("fused_qkvza_hfq4g256"));
         assert!(!radiowave_vmem_only_consumer("unknown_kernel"));
+    }
+
+    #[test]
+    fn gfx12_never_reports_gfx11_vmem_acquire() {
+        let kernel = "fused_rmsnorm_mq_rotate";
+        assert!(pm4_vmem_acquire_enabled(
+            Pm4Architecture::Gfx11,
+            true,
+            kernel
+        ));
+        assert!(!pm4_vmem_acquire_enabled(
+            Pm4Architecture::Gfx12,
+            true,
+            kernel
+        ));
     }
 
     #[test]
