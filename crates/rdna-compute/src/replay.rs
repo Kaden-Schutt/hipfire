@@ -1591,6 +1591,11 @@ fn manual_capture_requested() -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
 }
 
+fn route_proof_log_requested() -> bool {
+    hipfire_config::process_value("HIPFIRE_REPLAY_ROUTE_PROOF_LOG")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayState {
     Hip,
@@ -1674,6 +1679,10 @@ pub struct PreparedReplayIdentity {
     pub packet_count: Option<usize>,
     pub queue_id: u64,
     pub command_dwords: Option<u32>,
+    /// Prepared graph queue width (AQL linear batch is always 1).
+    pub queue_count: usize,
+    /// Prepared graph logical phase count (AQL linear batch is always 1).
+    pub phase_count: usize,
 }
 
 fn pm4_packet_identity(queue_count: usize, phase_count: usize) -> Option<usize> {
@@ -1957,6 +1966,8 @@ pub struct ReplayController {
     auto_lifecycle: bool,
     forward_eligible: bool,
     replay_observation: ReplayObservation,
+    /// Opt-in once-per-window stderr proof line; latched from process config.
+    route_proof_log: bool,
 }
 
 impl ReplayController {
@@ -2002,6 +2013,7 @@ impl ReplayController {
             auto_lifecycle: false,
             forward_eligible: true,
             replay_observation: ReplayObservation::default(),
+            route_proof_log: route_proof_log_requested(),
         }
     }
 
@@ -2119,6 +2131,9 @@ impl ReplayController {
                         packet_count: Some(prepared.packet_count()),
                         queue_id: prepared.queue_id(),
                         command_dwords: None,
+                        // Linear AQL is a single-queue, single-phase batch graph.
+                        queue_count: 1,
+                        phase_count: 1,
                     })
             }
             ReplayTransport::Pm4Ib => {
@@ -2132,6 +2147,8 @@ impl ReplayController {
                         ),
                         queue_id: prepared.queue_id(),
                         command_dwords: Some(prepared.command_dwords()),
+                        queue_count: prepared.queue_count(),
+                        phase_count: prepared.phase_count(),
                     })
             }
         }
@@ -2769,18 +2786,27 @@ impl ReplayController {
         };
         self.observe_replay_result(position, result)
     }
-
     fn observe_replay_result<T>(
         &mut self,
         position: usize,
         result: Result<T, String>,
     ) -> Result<T, String> {
         let value = result?;
+        let first_in_window = self.replay_observation.count == 0;
         self.replay_observation.count = self.replay_observation.count.saturating_add(1);
         self.replay_observation
             .first_position
             .get_or_insert(position);
         self.replay_observation.last_position = Some(position);
+        // One stable stderr line on the first success in this observation window.
+        // Env is latched at construction so the hot path never re-reads config.
+        if first_in_window && self.route_proof_log {
+            eprintln!(
+                "HIPFIRE_REPLAY_ROUTE_PROOF transport={} position={}",
+                self.transport_name(),
+                position
+            );
+        }
         Ok(value)
     }
 

@@ -395,24 +395,21 @@ python3 -m tools.redline bench \
 Set `MODEL` to the exact digested fixture. These commands are diagnostics only.
 They do **not** emit the full Section 7 timed-arm route-proof ledger.
 
-### Current tooling gap (route proof)
+### Route-proof product harness
 
-`python3 -m tools.redline bench` records requested backend/transport and
-throughput, but not controller `Ready`, fallback reason, observed replay
-positions, packet/queue/dword identity, or anti-HIP/HipGraph proof.
+`python3 -m tools.redline bench` is the route-proof-capable product harness. It
+records controller `Ready`, fallback reason, observed replay positions,
+prepared submission identity (packets, queue_id, queues, phases, PM4 command
+dwords), tape identity, and anti-fallback evidence on both timed arms. Manual
+shadow/capture via `scripts/redline_daemon_harness.py --pm4` remains discovery
+evidence only and still cannot be stitched into positive timed-arm proof
+([`INDEX.md`](INDEX.md), [`VALIDATION.md`](VALIDATION.md)).
 
-`scripts/redline_daemon_harness.py --pm4` can supply separate manual
-shadow/capture evidence, but it does not prove that the timed user-facing
-product arm actually routed.
-
-**Those two reports cannot be inferred or joined into positive timed-arm route
-proof.** Stitching them is explicitly **blocked** ([`INDEX.md`](INDEX.md),
-[`VALIDATION.md`](VALIDATION.md)).
-
-A route-proof-capable product harness/report must exist before any new or
-widened route can satisfy full certification under this guide. Until then, such
-routes remain experiments, not fully certified promotions. Do not present the
-commands above as complete Section 7 proof.
+A candidate report is route-proof-capable only when its
+`lifecycle_route_proof.valid` and `route_proof.valid` fields are true under the
+Section 7 ledger. The diagnostic commands above still do **not** emit that full
+ledger; use the product bench (or the Golden wrapper around it) for certification
+evidence.
 
 ## 6. PM4 lowering and hazard policy
 

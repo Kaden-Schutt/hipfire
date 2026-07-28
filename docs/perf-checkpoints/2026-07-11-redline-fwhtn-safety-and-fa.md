@@ -97,7 +97,7 @@ python3 scripts/redline_daemon_harness.py \
 
 # Matched product measurement at 8K context.
 HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
-python3 scripts/redline_product_bench.py \
+python3 -m tools.redline bench \
   --model /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r \
   --daemon target/release/examples/daemon --kv-mode fwht3 \
   --context 8192 --iterations 20 --warmups 1 --runs 5 \

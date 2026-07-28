@@ -10,6 +10,7 @@ pub mod doctor;
 pub mod knobs;
 pub mod log_tail;
 pub mod model_actions;
+pub mod profile_wizard;
 pub mod registry;
 pub mod serve_ctrl;
 pub mod status;

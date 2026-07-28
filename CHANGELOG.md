@@ -16,8 +16,10 @@ tok/s respectively; final turns remain at 160.3 tok/s at 18.2K, 82.5 tok/s at
 approximately 110 to 203.9 tok/s without speculative decoding or manual clock
 pinning.
 
-The gfx1151 HFQ4 QKVZA hybrid header-load experiment remains developer-only:
-the coherent all-buffer schedule is the production default.
+gfx1151 QKVZA uses the hybrid header-load kernel for the K=2048/total_m=1281
+production shape and the all-buffer kernel for its production shape. The Silver
+baseline repairs the hybrid path’s coefficient-domain numerics and certifies
+coherent retained-PM4 output.
 
 Contributor deltas staged for this release:
 
@@ -44,6 +46,12 @@ the installed binary and runtime images carry no Bun, Node.js, or TypeScript
 payload. Sparse typed TOML is the persistent policy surface, while environment
 variables remain for bootstrap, one-shot compatibility, and explicit developer
 experiments.
+
+Named `default`, `dev`, and `redline` configuration profiles now have a clean
+`hipfire config profile set|create` control surface. Bare
+`hipfire config profile` opens a profile wizard that can select or snapshot
+profiles and search the complete typed variable catalog by key, compatibility
+name, environment variable, scope, category, or help text.
 
 Registry `recommended_settings` now lower through the typed config resolver,
 including temperature, top-p, top-k, min-p, presence penalty, repeat penalty,

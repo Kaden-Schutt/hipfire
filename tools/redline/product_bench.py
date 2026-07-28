@@ -34,16 +34,25 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 # One-turn Flagstaff smoke through scripts/serve_harness.py (CLI/serve path).
-# Thinking budget must stay strictly below max_tokens so a visible answer fits.
+# Reserve a full 512-token visible-answer window beyond the concrete think cap;
+# gfx1100 can otherwise produce a coherent answer but hit finish=length at 768.
 COHERENCE_PROMPT = "What is the origin of Flagstaff, Arizona's name?"
 COHERENCE_THINKING = "low"
 COHERENCE_THINKING_CAP_TOKENS = 512
-COHERENCE_MAX_TOKENS = 768
+COHERENCE_MAX_TOKENS = 1024
 COHERENCE_SEED = 1
 COHERENCE_SAMPLING = "registry"
 COHERENCE_MODE = "battery"
 COHERENCE_MTP = "off"
 assert COHERENCE_MAX_TOKENS > COHERENCE_THINKING_CAP_TOKENS
+
+# Opt-in retained-replay proof marker. Product coherence enables it via temporary
+# serve_harness TOML (`diagnostic.replay.route_proof_log`); the runtime still lowers
+# through HIPFIRE_REPLAY_ROUTE_PROOF_LOG / process_value.
+ROUTE_PROOF_MARKER = "HIPFIRE_REPLAY_ROUTE_PROOF"
+_ROUTE_PROOF_LINE_RE = re.compile(
+    r"HIPFIRE_REPLAY_ROUTE_PROOF\s+transport=([A-Za-z0-9_]+)\s+position=(\d+)\b"
+)
 
 # Product certification must not inherit an old PM4 experiment from the
 # caller's environment or ~/.hipfire/config.toml. In particular, fully
@@ -297,6 +306,15 @@ def stationarity_kwargs(args):
         "max_median_drift_pct": args.settle_max_median_drift_pct,
     }
 
+def _is_positive_int(value):
+    """Reject bool (bool subclasses int) and non-positive values."""
+    return type(value) is int and value > 0
+
+
+def _is_non_negative_int(value):
+    return type(value) is int and value >= 0
+
+
 
 def validate_measurement(values, settlement, args):
     window = min(args.settle_window, len(values))
@@ -311,10 +329,12 @@ def validate_measurement(values, settlement, args):
     drift_pct = 100.0 * abs(measured - reference) / abs(reference)
     enough_rows = len(values) >= 5
     return {
-        "valid": enough_rows
-        and stats is not None
-        and stats["stable"]
-        and drift_pct <= args.settle_max_median_drift_pct,
+        "valid": bool(
+            enough_rows
+            and stats is not None
+            and stats["stable"]
+            and drift_pct <= args.settle_max_median_drift_pct
+        ),
         "enough_rows": enough_rows,
         "median_drift_from_settlement_pct": drift_pct,
         "window": stats,
@@ -350,12 +370,12 @@ def validate_route_proof(
 
         observed = proof.get("observed") or {}
         delta = observed.get("count_delta")
-        if not isinstance(delta, int) or delta < 0:
+        if not _is_non_negative_int(delta):
             errors.append(f"row {index}: invalid observed count delta {delta!r}")
             delta = 0
         for key in ("first_position", "last_position"):
             position = observed.get(key)
-            if isinstance(position, int):
+            if type(position) is int:
                 observed_positions.add(position)
 
         prepared = proof.get("prepared")
@@ -377,7 +397,7 @@ def validate_route_proof(
             iterations = row.get("iterations")
             if not proof.get("retained_replay_observed"):
                 errors.append(f"row {index}: timed row observed no retained replay")
-            if not isinstance(iterations, int) or iterations <= 0:
+            if not _is_positive_int(iterations):
                 errors.append(
                     f"row {index}: invalid timed iteration count {iterations!r}"
                 )
@@ -387,11 +407,11 @@ def validate_route_proof(
                     f"{iterations} timed iterations"
                 )
             context = row.get("context_tokens")
-            if not isinstance(context, int) or context <= 0:
+            if not _is_positive_int(context):
                 errors.append(
                     f"row {index}: invalid timed context position {context!r}"
                 )
-            elif isinstance(iterations, int) and iterations > 0:
+            elif _is_positive_int(iterations):
                 first_position = observed.get("first_position")
                 last_position = observed.get("last_position")
                 expected_last = context + iterations - 1
@@ -409,37 +429,84 @@ def validate_route_proof(
             errors.append(f"row {index}: automatic route has no prepared identity")
             continue
         packets = prepared.get("packets")
-        if not isinstance(packets, int) or packets <= 0:
+        packets_ok = _is_positive_int(packets)
+        if not packets_ok:
             errors.append(f"row {index}: packet identity unavailable")
         dispatches = prepared.get("dispatches")
-        if not isinstance(dispatches, int) or dispatches <= 0:
+        dispatches_ok = _is_positive_int(dispatches)
+        if not dispatches_ok:
             errors.append(f"row {index}: invalid dispatch count {dispatches!r}")
+        # prepared identity tuple index 2 is queue_id (a queue identifier), never a phase count
+        queue_id = prepared.get("queue_id")
+        queue_id_ok = _is_positive_int(queue_id)
+        if not queue_id_ok:
+            errors.append(f"row {index}: invalid queue_id {queue_id!r}")
+        queues = prepared.get("queues")
+        queues_ok = _is_positive_int(queues)
+        if not queues_ok:
+            errors.append(f"row {index}: invalid queues {queues!r}")
+        phases = prepared.get("phases")
+        phases_ok = _is_positive_int(phases)
+        if not phases_ok:
+            errors.append(f"row {index}: invalid phases {phases!r}")
         command_dwords = prepared.get("command_dwords")
-        if transport == "pm4" and (
-            not isinstance(command_dwords, int) or command_dwords <= 0
-        ):
-            errors.append(f"row {index}: PM4 command identity unavailable")
-        if transport == "aql" and command_dwords is not None:
+        command_dwords_ok = True
+        if transport == "pm4":
+            command_dwords_ok = _is_positive_int(command_dwords)
+            if not command_dwords_ok:
+                errors.append(f"row {index}: PM4 command identity unavailable")
+        elif transport == "aql" and command_dwords is not None:
+            command_dwords_ok = False
             errors.append(f"row {index}: AQL row unexpectedly reports PM4 commands")
-        identities.add(
-            (
-                dispatches,
-                packets,
-                prepared.get("queue_id"),
-                command_dwords,
+        # Report shape:
+        # [dispatches, packets, queue_id, command_dwords, queues, phases]
+        # Only record fully-valid tuples so sorted() never TypeErrors on None.
+        if (
+            packets_ok
+            and dispatches_ok
+            and queue_id_ok
+            and command_dwords_ok
+            and queues_ok
+            and phases_ok
+        ):
+            identities.add(
+                (
+                    dispatches,
+                    packets,
+                    queue_id,
+                    command_dwords,
+                    queues,
+                    phases,
+                )
             )
-        )
         launches = sequence.get("launches")
+        unique_kernels = sequence.get("unique_kernels")
         sequence_hash = sequence.get("hash")
-        if launches != dispatches:
+        launches_ok = _is_positive_int(launches)
+        if not launches_ok:
+            errors.append(f"row {index}: invalid sequence launches {launches!r}")
+        elif dispatches_ok and launches != dispatches:
+            launches_ok = False
             errors.append(
                 f"row {index}: sequence launches {launches!r} != dispatches {dispatches!r}"
             )
-        if not isinstance(sequence_hash, str) or sequence_hash == "0000000000000000":
-            errors.append(f"row {index}: invalid sequence hash {sequence_hash!r}")
-        sequences.add(
-            (launches, sequence.get("unique_kernels"), sequence_hash)
+        unique_kernels_ok = _is_positive_int(unique_kernels)
+        if not unique_kernels_ok:
+            errors.append(
+                f"row {index}: invalid unique_kernels {unique_kernels!r}"
+            )
+        hash_ok = (
+            isinstance(sequence_hash, str)
+            and len(sequence_hash) == 16
+            and all(ch in "0123456789abcdefABCDEF" for ch in sequence_hash)
+            and sequence_hash != "0000000000000000"
         )
+        if not hash_ok:
+            errors.append(f"row {index}: invalid sequence hash {sequence_hash!r}")
+        if launches_ok and unique_kernels_ok and hash_ok:
+            sequences.add(
+                (launches, unique_kernels, sequence_hash)
+            )
         if proof.get("retained_replay_observed") and delta > 0:
             retained_rows += 1
 
@@ -587,11 +654,13 @@ def run_pm4_preflight(args):
             }
         )
         require_retained_pm4(row)
+        route_proof = validate_route_proof([row], "auto", "pm4")
         return {
             "seconds": time.monotonic() - started,
             "loaded": loaded,
             "smoke": row,
             "redline_route": row.get("redline_route"),
+            "route_proof": route_proof,
         }
     finally:
         daemon.close()
@@ -619,6 +688,85 @@ def _allocate_loopback_port():
         sock.bind(("127.0.0.1", 0))
         sock.listen(1)
         return int(sock.getsockname()[1])
+
+
+def parse_route_proof_log(text):
+    """Extract HIPFIRE_REPLAY_ROUTE_PROOF lines from serve/daemon log text."""
+    if not text:
+        return []
+    hits = []
+    for raw in text.splitlines():
+        match = _ROUTE_PROOF_LINE_RE.search(raw)
+        if not match:
+            continue
+        hits.append(
+            {
+                "line": raw.strip(),
+                "transport": match.group(1),
+                "position": int(match.group(2)),
+            }
+        )
+    return hits
+
+
+def collect_route_proof_evidence(serve_log_path, stdout="", stderr=""):
+    """Parse serve.log plus harness stdout/stderr for retained-route proof lines."""
+    chunks = []
+    path = Path(serve_log_path) if serve_log_path is not None else None
+    if path is not None and path.is_file():
+        try:
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            pass
+    if stdout:
+        chunks.append(stdout)
+    if stderr:
+        chunks.append(stderr)
+    hits = parse_route_proof_log("\n".join(chunks))
+    first = hits[0] if hits else None
+    return {
+        "observed": bool(hits),
+        "transport": None if first is None else first["transport"],
+        "position": None if first is None else first["position"],
+        "marker": None if first is None else first["line"],
+        "lines": [hit["line"] for hit in hits],
+        "count": len(hits),
+    }
+
+
+def validate_coherence_route_evidence(backend, transport, evidence):
+    """Gate CLI/serve coherence on direct retained-replay proof from the daemon."""
+    errors = []
+    required = backend == "auto" and transport == "pm4"
+    observed = bool(evidence.get("observed"))
+    got_transport = evidence.get("transport")
+    if backend == "hip":
+        if observed:
+            errors.append(
+                "HIP coherence must not emit retained route proof "
+                f"(got transport={got_transport!r} position={evidence.get('position')!r})"
+            )
+    elif required:
+        if not observed:
+            errors.append(
+                "auto PM4 coherence requires HIPFIRE_REPLAY_ROUTE_PROOF "
+                "marker from the serve daemon"
+            )
+        elif got_transport != "pm4":
+            errors.append(
+                "auto PM4 coherence route proof transport must be 'pm4', "
+                f"got {got_transport!r}"
+            )
+    return {
+        "required": required,
+        "observed": observed,
+        "transport": got_transport,
+        "position": evidence.get("position"),
+        "marker": evidence.get("marker"),
+        "lines": list(evidence.get("lines") or []),
+        "valid": not errors,
+        "errors": errors,
+    }
 
 
 def _unique_smoke_dir(work_root: Path, label: str) -> Path:
@@ -696,6 +844,9 @@ def run_coherence_smoke(args, backend):
         str(serve_log),
         "--out",
         str(out_path),
+        # Temporary TOML path: serve_harness writes
+        # diagnostic.replay.route_proof_log=true under the isolated HIPFIRE_HOME.
+        "--replay-route-proof-log",
     ]
 
     env = dict(os.environ)
@@ -711,6 +862,7 @@ def run_coherence_smoke(args, backend):
         HIPFIRE_GRAPH="1",
     )
     env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
+    env.pop("HIPFIRE_REPLAY_ROUTE_PROOF_LOG", None)
     env.pop("HIPFIRE_HOME", None)
 
     # Cross-file contract with serve_harness.py: product owns the path; harness
@@ -736,11 +888,14 @@ def run_coherence_smoke(args, backend):
         "prompt": COHERENCE_PROMPT,
         "port": port,
         "smoke_dir": str(smoke_dir),
-        "cli": str(cli),
-        "daemon_bin": str(unique_daemon),
-        "daemon_basename": unique_daemon.name,
+        "home": str(home_path),
+        "serve_log": str(serve_log),
         "serve_pid_file": str(serve_pid_path),
-        "command": argv,
+        "daemon_basename": unique_daemon.name,
+        "cli": str(cli),
+        # Requested via temporary serve_harness config.toml, not ambient env.
+        "replay_route_proof_log": True,
+        "diagnostic_replay_route_proof_log": "diagnostic.replay.route_proof_log",
     }
 
     started = time.monotonic()
@@ -810,6 +965,12 @@ def run_coherence_smoke(args, backend):
             if row.get("attractor"):
                 errors.append("attractor generation")
 
+    raw_evidence = collect_route_proof_evidence(serve_log, stdout=stdout, stderr=stderr)
+    route_evidence = validate_coherence_route_evidence(
+        backend, args.transport, raw_evidence
+    )
+    errors.extend(route_evidence["errors"])
+
     report = {
         "backend": backend,
         "seconds": time.monotonic() - started,
@@ -828,6 +989,14 @@ def run_coherence_smoke(args, backend):
         "smoke_dir": str(smoke_dir),
         "port": port,
         "daemon_basename": unique_daemon.name,
+        "route_evidence": {
+            "required": route_evidence["required"],
+            "observed": route_evidence["observed"],
+            "transport": route_evidence["transport"],
+            "position": route_evidence["position"],
+            "marker": route_evidence["marker"],
+            "lines": route_evidence["lines"],
+        },
     }
     if errors:
         detail = "; ".join(errors)
@@ -1467,18 +1636,19 @@ def main(argv=None):
     auto = report["auto"]["tok_s"]["median"]
     report["speedup"] = auto / hip
     report["valid"] = (
-        report["coherence"]["hip"]["valid"]
-        and report["coherence"]["auto"]["valid"]
-        and report["hip"]["measurement_validation"]["valid"]
-        and report["auto"]["measurement_validation"]["valid"]
-        and report["hip"]["route_proof"]["valid"]
-        and report["auto"]["route_proof"]["valid"]
-        and report["hip"]["lifecycle_route_proof"]["valid"]
-        and report["auto"]["lifecycle_route_proof"]["valid"]
+        report["coherence"]["hip"]["valid"] is True
+        and report["coherence"]["auto"]["valid"] is True
+        and report["hip"]["measurement_validation"]["valid"] is True
+        and report["auto"]["measurement_validation"]["valid"] is True
+        and report["hip"]["route_proof"]["valid"] is True
+        and report["auto"]["route_proof"]["valid"] is True
+        and report["hip"]["lifecycle_route_proof"]["valid"] is True
+        and report["auto"]["lifecycle_route_proof"]["valid"] is True
     )
     if report["coherence"]["multiturn"] is not None:
         report["valid"] = (
-            report["valid"] and report["coherence"]["multiturn"]["valid"]
+            report["valid"] is True
+            and report["coherence"]["multiturn"]["valid"] is True
         )
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)

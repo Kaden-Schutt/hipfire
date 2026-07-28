@@ -108,15 +108,21 @@ class RouteProofTests(unittest.TestCase):
                 "fallback_reason": None,
                 "execution_mode": "plain_ar",
                 "prepared": {
+                    # prepared identity:
+                    # [dispatches, packets, queue_id, command_dwords, queues, phases]
+                    # index 2 is queue_id (queue identifier), never a phase count
                     "dispatches": 604,
                     "packets": 1,
-                    "queue_id": 7,
-                    "command_dwords": 16832 if transport == "pm4" else None,
+                    "queue_id": 2,
+                    "command_dwords": 16831 if transport == "pm4" else None,
+                    "queues": 1,
+                    "phases": 1,
                 },
                 "sequence": {
+                    # tape identity: [launches, unique_kernels, hash]
                     "launches": 604,
-                    "unique_kernels": 22,
-                    "hash": "440bb2b5df220117",
+                    "unique_kernels": 23,
+                    "hash": "42f566b752920679",
                 },
                 "observed": {
                     "count_delta": delta,
@@ -173,6 +179,260 @@ class RouteProofTests(unittest.TestCase):
         require_retained_pm4(row)
 
 
+    def test_prepared_identity_is_dispatches_packets_queue_id_command_dwords_queues_phases(self):
+        rows = [
+            self.route_row(iterations=8, delta=8, retained=True),
+            self.route_row(iterations=8, delta=8, retained=True),
+        ]
+        # Distinct observed positions so multi-position auto check passes.
+        rows[1]["redline_route"]["observed"]["first_position"] = 137
+        rows[1]["redline_route"]["observed"]["last_position"] = 144
+        rows[1]["context_tokens"] = 137
+        proof = validate_route_proof(rows, "auto", "pm4")
+        self.assertTrue(proof["valid"], proof["errors"])
+        self.assertEqual(proof["prepared_identities"], [[604, 1, 2, 16831, 1, 1]])
+        self.assertEqual(
+            proof["sequences"], [[604, 23, "42f566b752920679"]]
+        )
+
+    def test_rejects_null_queue_id(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["prepared"]["queue_id"] = None
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid queue_id" in error for error in proof["errors"])
+        )
+
+    def test_rejects_zero_queue_id(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["prepared"]["queue_id"] = 0
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid queue_id" in error for error in proof["errors"])
+        )
+
+    def test_rejects_missing_queues(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        del row["redline_route"]["prepared"]["queues"]
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid queues" in error for error in proof["errors"])
+        )
+
+    def test_rejects_zero_queues(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["prepared"]["queues"] = 0
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid queues" in error for error in proof["errors"])
+        )
+
+    def test_rejects_missing_phases(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        del row["redline_route"]["prepared"]["phases"]
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid phases" in error for error in proof["errors"])
+        )
+
+    def test_rejects_zero_phases(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["prepared"]["phases"] = 0
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid phases" in error for error in proof["errors"])
+        )
+
+    def test_rejects_bool_queue_id(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["prepared"]["queue_id"] = True
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid queue_id" in error for error in proof["errors"])
+        )
+
+    def test_rejects_bool_queues(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["prepared"]["queues"] = True
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid queues" in error for error in proof["errors"])
+        )
+
+    def test_rejects_bool_phases(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["prepared"]["phases"] = True
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid phases" in error for error in proof["errors"])
+        )
+
+    def test_rejects_bool_dispatches(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["prepared"]["dispatches"] = True
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid dispatch count" in error for error in proof["errors"])
+        )
+
+
+    def test_rejects_inconsistent_queues_across_rows(self):
+        rows = [
+            self.route_row(iterations=8, delta=8, retained=True),
+            self.route_row(iterations=8, delta=8, retained=True),
+        ]
+        rows[1]["redline_route"]["prepared"]["queues"] = 2
+        rows[1]["redline_route"]["observed"]["first_position"] = 137
+        rows[1]["redline_route"]["observed"]["last_position"] = 144
+        rows[1]["context_tokens"] = 137
+        proof = validate_route_proof(rows, "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any(
+                "prepared identity changed across rows" in error
+                for error in proof["errors"]
+            )
+        )
+
+    def test_rejects_inconsistent_phases_across_rows(self):
+        rows = [
+            self.route_row(iterations=8, delta=8, retained=True),
+            self.route_row(iterations=8, delta=8, retained=True),
+        ]
+        rows[1]["redline_route"]["prepared"]["phases"] = 2
+        rows[1]["redline_route"]["observed"]["first_position"] = 137
+        rows[1]["redline_route"]["observed"]["last_position"] = 144
+        rows[1]["context_tokens"] = 137
+        proof = validate_route_proof(rows, "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any(
+                "prepared identity changed across rows" in error
+                for error in proof["errors"]
+            )
+        )
+
+    def test_rejects_zero_unique_kernels(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["sequence"]["unique_kernels"] = 0
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid unique_kernels" in error for error in proof["errors"])
+        )
+
+    def test_rejects_missing_unique_kernels(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        del row["redline_route"]["sequence"]["unique_kernels"]
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid unique_kernels" in error for error in proof["errors"])
+        )
+
+    def test_rejects_empty_sequence_hash(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["sequence"]["hash"] = ""
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid sequence hash" in error for error in proof["errors"])
+        )
+
+    def test_rejects_nonhex_sequence_hash(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["sequence"]["hash"] = "gggggggggggggggg"
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid sequence hash" in error for error in proof["errors"])
+        )
+
+    def test_rejects_zero_sequence_hash(self):
+        row = self.route_row(iterations=8, delta=8, retained=True)
+        row["redline_route"]["sequence"]["hash"] = "0000000000000000"
+        proof = validate_route_proof([row], "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid sequence hash" in error for error in proof["errors"])
+        )
+
+    def test_rejects_inconsistent_prepared_identity_across_rows(self):
+        rows = [
+            self.route_row(iterations=8, delta=8, retained=True),
+            self.route_row(iterations=8, delta=8, retained=True),
+        ]
+        rows[1]["redline_route"]["prepared"]["queue_id"] = 9
+        rows[1]["redline_route"]["observed"]["first_position"] = 137
+        rows[1]["redline_route"]["observed"]["last_position"] = 144
+        rows[1]["context_tokens"] = 137
+        proof = validate_route_proof(rows, "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any(
+                "prepared identity changed across rows" in error
+                for error in proof["errors"]
+            )
+        )
+
+    def test_rejects_inconsistent_sequence_identity_across_rows(self):
+        rows = [
+            self.route_row(iterations=8, delta=8, retained=True),
+            self.route_row(iterations=8, delta=8, retained=True),
+        ]
+        rows[1]["redline_route"]["sequence"]["unique_kernels"] = 24
+        rows[1]["redline_route"]["observed"]["first_position"] = 137
+        rows[1]["redline_route"]["observed"]["last_position"] = 144
+        rows[1]["context_tokens"] = 137
+        proof = validate_route_proof(rows, "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any(
+                "sequence identity changed across rows" in error
+                for error in proof["errors"]
+            )
+        )
+
+    def test_mixed_valid_and_malformed_rows_fail_closed_without_throwing(self):
+        rows = [
+            self.route_row(iterations=8, delta=8, retained=True),
+            self.route_row(iterations=8, delta=8, retained=True),
+        ]
+        rows[1]["redline_route"]["prepared"]["queue_id"] = None
+        rows[1]["redline_route"]["sequence"]["unique_kernels"] = None
+        rows[1]["redline_route"]["sequence"]["hash"] = None
+        rows[1]["redline_route"]["observed"]["first_position"] = 137
+        rows[1]["redline_route"]["observed"]["last_position"] = 144
+        rows[1]["context_tokens"] = 137
+        proof = validate_route_proof(rows, "auto", "pm4")
+        self.assertFalse(proof["valid"])
+        self.assertTrue(
+            any("invalid queue_id" in error for error in proof["errors"])
+        )
+        self.assertTrue(
+            any("invalid unique_kernels" in error for error in proof["errors"])
+        )
+        self.assertTrue(
+            any("invalid sequence hash" in error for error in proof["errors"])
+        )
+        # Valid row still contributes its identity; malformed row is omitted.
+        self.assertEqual(proof["prepared_identities"], [[604, 1, 2, 16831, 1, 1]])
+        self.assertEqual(
+            proof["sequences"], [[604, 23, "42f566b752920679"]]
+        )
+
+
+
 
 class Pm4PreflightTests(unittest.TestCase):
     @staticmethod
@@ -210,6 +470,9 @@ class Pm4PreflightTests(unittest.TestCase):
         self.assertEqual(smoke["iterations"], 3)
         self.assertTrue(smoke["redline_product_route"])
         self.assertEqual(result["redline_route"]["state"], "ready")
+        self.assertIn("route_proof", result)
+        self.assertTrue(result["route_proof"]["valid"], result["route_proof"])
+        self.assertGreater(result["route_proof"]["retained_rows"], 0)
         fake.close.assert_called_once_with()
 
     def test_preflight_fast_fails_with_fallback_reason(self):
@@ -268,10 +531,21 @@ class CoherenceSmokeTests(unittest.TestCase):
         cli.chmod(0o755)
         return model, daemon, cli
 
+    @staticmethod
+    def _write_route_proof_marker(argv, transport="pm4", position=1):
+        """Emit the retained-replay proof line into the harness --serve-log path."""
+        if "--serve-log" not in argv:
+            return
+        serve_log = Path(argv[argv.index("--serve-log") + 1])
+        serve_log.parent.mkdir(parents=True, exist_ok=True)
+        marker = f"HIPFIRE_REPLAY_ROUTE_PROOF transport={transport} position={position}\n"
+        with serve_log.open("a", encoding="utf-8") as handle:
+            handle.write(marker)
+
     def test_budget_allows_visible_answer(self):
         self.assertEqual(COHERENCE_THINKING, "low")
         self.assertEqual(COHERENCE_THINKING_CAP_TOKENS, 512)
-        self.assertEqual(COHERENCE_MAX_TOKENS, 768)
+        self.assertEqual(COHERENCE_MAX_TOKENS, 1024)
         self.assertGreater(COHERENCE_MAX_TOKENS, COHERENCE_THINKING_CAP_TOKENS)
         self.assertEqual(
             COHERENCE_PROMPT, "What is the origin of Flagstaff, Arizona's name?"
@@ -292,6 +566,7 @@ class CoherenceSmokeTests(unittest.TestCase):
             out_idx = argv.index("--out") + 1
             out_path = Path(argv[out_idx])
             out_path.write_text(json.dumps([self.coherent_row()]) + "\n")
+            self._write_route_proof_marker(argv, transport="pm4")
             daemon_bin = Path(env["HIPFIRE_DAEMON_BIN"])
             captured["daemon_bin"] = str(daemon_bin)
             captured["daemon_exists_during_run"] = daemon_bin.is_file()
@@ -316,7 +591,7 @@ class CoherenceSmokeTests(unittest.TestCase):
             self.assertEqual(argv[1], str(product_bench.REPO / "scripts" / "serve_harness.py"))
             self.assertIn("--thinking", argv)
             self.assertEqual(argv[argv.index("--thinking") + 1], "low")
-            self.assertEqual(argv[argv.index("--max-tokens") + 1], "768")
+            self.assertEqual(argv[argv.index("--max-tokens") + 1], "1024")
             self.assertEqual(argv[argv.index("--seed") + 1], "1")
             self.assertEqual(argv[argv.index("--sampling") + 1], "registry")
             self.assertEqual(argv[argv.index("--mode") + 1], "battery")
@@ -347,6 +622,17 @@ class CoherenceSmokeTests(unittest.TestCase):
                 self.assertEqual(env[key], value)
             self.assertNotIn("HIPFIRE_REPLAY_MANUAL_CAPTURE", env)
             self.assertNotIn("HIPFIRE_HOME", env)
+            # Route proof is requested through temporary TOML, not ambient env.
+            self.assertNotIn("HIPFIRE_REPLAY_ROUTE_PROOF_LOG", env)
+            self.assertIn("--replay-route-proof-log", argv)
+            self.assertTrue(result["config"]["replay_route_proof_log"])
+            self.assertEqual(
+                result["config"]["diagnostic_replay_route_proof_log"],
+                "diagnostic.replay.route_proof_log",
+            )
+            self.assertTrue(result["route_evidence"]["required"])
+            self.assertTrue(result["route_evidence"]["observed"])
+            self.assertEqual(result["route_evidence"]["transport"], "pm4")
             expected_pid = str(smoke_dir / "serve-auto.pid")
             self.assertEqual(env["HIPFIRE_SERVE_HARNESS_PID_FILE"], expected_pid)
             self.assertEqual(result["config"]["serve_pid_file"], expected_pid)
@@ -695,6 +981,9 @@ class CoherenceSmokeTests(unittest.TestCase):
             out_path = Path(argv[argv.index("--out") + 1])
             dirs.append(out_path.parent)
             out_path.write_text(json.dumps([self.coherent_row()]) + "\n")
+            # auto+pm4 coherence requires retained route proof in serve.log.
+            if "auto" in Path(out_path).parent.name:
+                self._write_route_proof_marker(argv, transport="pm4")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as work_dir:
@@ -717,6 +1006,55 @@ class CoherenceSmokeTests(unittest.TestCase):
             for smoke in (r1["smoke_dir"], r2["smoke_dir"]):
                 self.assertTrue(str(smoke).startswith(work_dir))
                 self.assertIn(str(os.getpid()), Path(smoke).name)
+
+    def test_auto_pm4_requires_route_proof_marker(self):
+        def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+            out_path = Path(argv[argv.index("--out") + 1])
+            out_path.write_text(json.dumps([self.coherent_row()]) + "\n")
+            # Intentionally omit serve.log marker.
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            self._prepare_binaries(work_dir)
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_run):
+                with self.assertRaisesRegex(
+                    RuntimeError, r"HIPFIRE_REPLAY_ROUTE_PROOF marker"
+                ):
+                    run_coherence_smoke(self.args(work_dir, transport="pm4"), "auto")
+
+    def test_hip_rejects_unexpected_route_proof_marker(self):
+        def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+            out_path = Path(argv[argv.index("--out") + 1])
+            out_path.write_text(json.dumps([self.coherent_row()]) + "\n")
+            self._write_route_proof_marker(argv, transport="pm4")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            self._prepare_binaries(work_dir)
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_run):
+                with self.assertRaisesRegex(
+                    RuntimeError, r"HIP coherence must not emit retained route proof"
+                ):
+                    run_coherence_smoke(self.args(work_dir, transport="aql"), "hip")
+
+    def test_auto_success_reports_route_evidence(self):
+        def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+            out_path = Path(argv[argv.index("--out") + 1])
+            out_path.write_text(json.dumps([self.coherent_row()]) + "\n")
+            self._write_route_proof_marker(argv, transport="pm4", position=3)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            self._prepare_binaries(work_dir)
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_run):
+                result = run_coherence_smoke(self.args(work_dir, transport="pm4"), "auto")
+
+        self.assertTrue(result["valid"])
+        self.assertTrue(result["route_evidence"]["required"])
+        self.assertTrue(result["route_evidence"]["observed"])
+        self.assertEqual(result["route_evidence"]["transport"], "pm4")
+        self.assertEqual(result["route_evidence"]["position"], 3)
+        self.assertIn("HIPFIRE_REPLAY_ROUTE_PROOF", result["route_evidence"]["marker"])
 
     def test_quality_only_verdict_ignores_speed(self):
         def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
@@ -1237,7 +1575,7 @@ class Pm4MultiturnSessionTests(unittest.TestCase):
                 Path(argv[argv.index("--session") + 1]).resolve(), session.resolve()
             )
             self.assertEqual(argv[argv.index("--thinking") + 1], "low")
-            self.assertEqual(argv[argv.index("--max-tokens") + 1], "768")
+            self.assertEqual(argv[argv.index("--max-tokens") + 1], "1024")
             self.assertEqual(argv[argv.index("--seed") + 1], "1")
             self.assertEqual(argv[argv.index("--sampling") + 1], "registry")
             port = int(argv[argv.index("--port") + 1])
@@ -1511,6 +1849,92 @@ class ServeHarnessWarmTests(unittest.TestCase):
                 sh._native_service_warm(9, expected_model=model, proc=alive)
             )
 
+    def test_write_native_config_emits_route_proof_log_when_requested(self):
+        sh = self._load_serve_harness()
+        with tempfile.TemporaryDirectory() as home:
+            cfg = {
+                "model": "/tmp/model.hfq",
+                "port": 11520,
+                "max_seq": 2048,
+                "kv": "q8",
+                "mtp": "off",
+                "thinking_budget": "low",
+                "replay_route_proof_log": True,
+            }
+            os.makedirs(os.path.join(home, ".hipfire"), exist_ok=True)
+            sh._write_native_config(cfg, home)
+            text = Path(home, ".hipfire", "config.toml").read_text()
+            self.assertIn("[diagnostic.replay]", text)
+            self.assertIn("route_proof_log = true", text)
+
+    def test_write_native_config_omits_route_proof_log_by_default(self):
+        sh = self._load_serve_harness()
+        with tempfile.TemporaryDirectory() as home:
+            cfg = {
+                "model": "/tmp/model.hfq",
+                "port": 11520,
+                "max_seq": 2048,
+                "kv": "q8",
+                "mtp": "off",
+                "thinking_budget": "low",
+            }
+            os.makedirs(os.path.join(home, ".hipfire"), exist_ok=True)
+            sh._write_native_config(cfg, home)
+            text = Path(home, ".hipfire", "config.toml").read_text()
+            self.assertNotIn("route_proof_log", text)
+            self.assertNotIn("[diagnostic.replay]", text)
+
+    def test_spawn_serve_strips_harness_pid_file_from_child_env(self):
+        """HIPFIRE_SERVE_HARNESS_PID_FILE is parent IPC only — never hand to serve."""
+        sh = self._load_serve_harness()
+        captured = {}
+
+        class _FakeProc:
+            def __init__(self, pid=4242):
+                self.pid = pid
+
+            def poll(self):
+                return None
+
+        def fake_popen(argv, cwd=None, env=None, stdout=None, stderr=None, start_new_session=None):
+            captured["env"] = dict(env)
+            captured["argv"] = list(argv)
+            return _FakeProc()
+
+        with tempfile.TemporaryDirectory() as home:
+            log = Path(home) / "serve.log"
+            pid_path = Path(home) / "parent.pid"
+            cfg = {
+                "model": "/tmp/model.hfq",
+                "port": 11520,
+                "max_seq": 2048,
+                "kv": "q8",
+                "mtp": "off",
+                "thinking_budget": "low",
+            }
+            os.makedirs(os.path.join(home, ".hipfire"), exist_ok=True)
+            inherited = dict(os.environ)
+            inherited["HIPFIRE_SERVE_HARNESS_PID_FILE"] = str(pid_path)
+            inherited["HIPFIRE_CLI_BIN"] = str(Path(home) / "fake-cli")
+            Path(inherited["HIPFIRE_CLI_BIN"]).write_bytes(b"x")
+            Path(inherited["HIPFIRE_CLI_BIN"]).chmod(0o755)
+
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch.object(sh.subprocess, "Popen", side_effect=fake_popen),
+                patch.object(sh, "_native_service_warm", return_value=True),
+                patch.object(sh.time, "sleep", return_value=None),
+                patch.object(sh, "_native_cli", return_value=inherited["HIPFIRE_CLI_BIN"]),
+                patch.object(sh, "atexit", SimpleNamespace(register=lambda *_a, **_k: None)),
+            ):
+                ok = sh.spawn_serve(cfg, home, str(log))
+
+            self.assertTrue(ok)
+            self.assertIn("env", captured)
+            self.assertNotIn("HIPFIRE_SERVE_HARNESS_PID_FILE", captured["env"])
+            # Parent still wrote the PID file via its own os.environ.
+            self.assertTrue(pid_path.is_file())
+            self.assertEqual(pid_path.read_text(encoding="utf-8").strip(), "4242")
 
 
 if __name__ == "__main__":

@@ -124,6 +124,28 @@ gfx1151 record also pins the sealed certification payload, HIP-source
 aggregate, dispatch-source aggregate, 23-HSACO manifest, model, and daemon
 hashes.
 
+### gfx1151 Silver baseline
+
+**Silver** is the coherent stopgap on the path back to, and then beyond, the
+gfx1151 Golden result. It does not lower or replace the Golden acceptance
+floor above.
+
+The preserved Silver source snapshot is
+`8445fca2acd462d8e9d7547de2fe3823874c24bb`. Its daemon SHA-256 is
+`73a89a1ea57f8938ea02e264ebdd55b8d0b11f950a95f08def4553f580dc795f`;
+both reports use the same 604-launch / 23-kernel tape with sequence hash
+`42f566b752920679`.
+
+| Evidence | PM4 median | What it proves | Report SHA-256 |
+|---|---:|---|---|
+| Silver high-water | **114.209 tok/s** | Stationary 8-run measurement and complete retained-route proof | `27f04979fc98fe8315936916c67e9b4560fafde0c2408a909c3d069bb81f8234` |
+| Silver coherence certification | **113.652 tok/s** | Same daemon and tape; HIP and retained-PM4 CLI/serve Flagstaff checks passed | `c728740e9f0446124d75ea850cb363c79cf0dfa4c37d52b1386d7fcc8902f681` |
+
+The high-water report predates the embedded coherence step. Coherence is
+therefore certified by the later same-binary report, not inferred from the
+114.209 tok/s number alone. Silver remains below the 115.021 tok/s Golden
+floor and must classify as a stopgap, never as a Golden reproduction.
+
 Results are classified explicitly:
 
 - `exact-reference-binary`: source commit, daemon bytes, model, benchmark

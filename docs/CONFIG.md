@@ -21,7 +21,22 @@ Persistent stores under `~/.hipfire/`:
 
 Copyable sparse profiles for users, kernel developers, and retained-PM4 work
 live in [`docs/configs/`](configs/README.md). They include direct mappings from
-historical `HIPFIRE_*` inputs to their persistent TOML keys.
+historical `HIPFIRE_*` inputs to their persistent TOML keys. Apply a whole
+bundle with the dedicated profile command:
+
+```bash
+hipfire config profile set default
+hipfire config profile set dev
+hipfire config profile set redline
+hipfire config profile create lab
+hipfire config profile              # interactive wizard
+```
+
+Selection replaces the complete sparse global `config.toml` with the chosen
+built-in or custom profile layer (no stale keys remain). Custom snapshots live
+under `~/.hipfire/profiles/<name>.toml`. Profile names are not schema fields and
+are never written into `config.toml`. The Settings TUI and CLI share the
+hipfire-config helpers. Profiles are global-only.
 
 Edit global settings interactively with `hipfire config`. Per-model overlays use
 the typed commands: `hipfire config <tag> list|get|set|reset ...`. Global

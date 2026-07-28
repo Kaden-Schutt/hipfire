@@ -82,7 +82,7 @@ and never changes clocks:
 
 ```bash
 HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
-python3 scripts/redline_product_bench.py \
+python3 -m tools.redline bench \
   --model /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r \
   --daemon target/release/examples/daemon \
   --context 128 \

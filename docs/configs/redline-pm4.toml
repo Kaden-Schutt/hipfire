@@ -12,6 +12,8 @@ pm4_gfx11_vmem_acquire = "auto"
 
 [diagnostic.replay]
 manual_capture = false
+# Product coherence enables this via temporary serve_harness config.toml.
+#route_proof_log = true
 pm4_min_parallel_width = 2
 pm4_min_parallel_workgroups = 0
 # Omit pm4_max_parallel_phases to leave the phase count unlimited.

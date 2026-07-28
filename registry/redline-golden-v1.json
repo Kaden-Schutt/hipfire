@@ -73,7 +73,9 @@
       "route": {
         "dispatches": 604,
         "packets": 1,
-        "phases": 2,
+        "queues": 1,
+        "phases": 1,
+        "queue_id": 2,
         "command_dwords": 16832,
         "unique_kernels": 22,
         "sequence_hash": "43754a60ca25f47c",
@@ -127,7 +129,9 @@
       "route": {
         "dispatches": 604,
         "packets": 1,
-        "phases": 2,
+        "queues": 1,
+        "phases": 1,
+        "queue_id": 2,
         "command_dwords": 16708,
         "unique_kernels": 23,
         "sequence_hash": "42f566b752920679",
@@ -135,6 +139,42 @@
           128,
           255
         ]
+      },
+      "silver_baseline": {
+        "status": "coherent-stopgap",
+        "created_at_utc": "2026-07-27",
+        "source_commit": "8445fca2acd462d8e9d7547de2fe3823874c24bb",
+        "daemon_sha256": "73a89a1ea57f8938ea02e264ebdd55b8d0b11f950a95f08def4553f580dc795f",
+        "cli_sha256": "0b29e68d425c308bcd14507b7791f76864735f9ef9943b6e8d52567ce648c120",
+        "route": {
+          "dispatches": 604,
+          "packets": 1,
+          "queues": 1,
+          "phases": 1,
+          "queue_id": 2,
+          "command_dwords": 16831,
+          "unique_kernels": 23,
+          "sequence_hash": "42f566b752920679"
+        },
+        "high_water": {
+          "report_sha256": "27f04979fc98fe8315936916c67e9b4560fafde0c2408a909c3d069bb81f8234",
+          "hip_median_tok_s": 101.15920674320344,
+          "pm4_min_tok_s": 114.11144400163151,
+          "pm4_median_tok_s": 114.20878617548057,
+          "pm4_max_tok_s": 114.23598909360095,
+          "speedup": 1.1290004128383884,
+          "embedded_coherence": false
+        },
+        "coherence_certification": {
+          "report_sha256": "c728740e9f0446124d75ea850cb363c79cf0dfa4c37d52b1386d7fcc8902f681",
+          "hip_median_tok_s": 101.50382195750399,
+          "pm4_median_tok_s": 113.65174802335181,
+          "speedup": 1.119679494146868,
+          "hip_coherence_valid": true,
+          "pm4_coherence_valid": true,
+          "route_proof_valid": true
+        },
+        "disposition": "Coherent stopgap; the Golden acceptance floor remains unchanged."
       },
       "sealed_bundle": {
         "source_commit": "661cb5d63a08ac4fde6dc9e2cebc45c5db347317",
@@ -192,7 +232,9 @@
       "route": {
         "dispatches": 733,
         "packets": 1,
-        "phases": 2,
+        "queues": 1,
+        "phases": 1,
+        "queue_id": 2,
         "command_dwords": 20511,
         "unique_kernels": 23,
         "sequence_hash": "3318ffca3daf2338",

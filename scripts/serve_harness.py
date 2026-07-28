@@ -127,6 +127,7 @@ def build_config(args):
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
+        "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
 
 
@@ -255,7 +256,12 @@ def _native_cli():
 
 
 def _write_native_config(cfg, home):
-    """Write the isolated harness configuration in the native sparse TOML format."""
+    """Write the isolated harness configuration in the native sparse TOML format.
+
+    product_bench isolates HIPFIRE_HOME so the daemon never inherits
+    ~/.hipfire/config.toml. Opt-in diagnostics such as route_proof_log are
+    requested here as temporary TOML rather than ad-hoc env exports.
+    """
     text = f"""[serve]
 host = "127.0.0.1"
 port = {cfg["port"]}
@@ -276,9 +282,13 @@ max_tokens = 16384
 [reasoning]
 budget = {json.dumps(cfg["thinking_budget"])}
 """
+    if cfg.get("replay_route_proof_log"):
+        text += """
+[diagnostic.replay]
+route_proof_log = true
+"""
     with open(os.path.join(home, ".hipfire", "config.toml"), "w") as handle:
         handle.write(text)
-
 
 def _native_service_warm(port, expected_model=None, proc=None):
     """True only when health is ready for *this* spawn.
@@ -335,6 +345,9 @@ def spawn_serve(cfg, home, log):
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1", HIPFIRE_MTP_PREFIX_CACHE="1")
+    # Harness-only parent IPC: must never reach hipfire serve / process config
+    # (would otherwise lower as developer.serve_harness_pid_file).
+    env.pop("HIPFIRE_SERVE_HARNESS_PID_FILE", None)
     cli = _native_cli()
     atexit.register(_kill_serve)
     for attempt in range(1, 5):
@@ -350,7 +363,11 @@ def spawn_serve(cfg, home, log):
         _serve_pgid = _serve_proc.pid
         _write_pid_file(_serve_pgid)
         for _ in range(90):
-            txt = open(log).read() if os.path.exists(log) else ""
+            if os.path.exists(log):
+                with open(log, encoding="utf-8", errors="replace") as handle:
+                    txt = handle.read()
+            else:
+                txt = ""
             if _native_service_warm(cfg["port"], expected_model=cfg.get("model"), proc=_serve_proc):
                 return True
             if re.search(r"out of memory|error loading|panic", txt, re.I):
@@ -508,6 +525,13 @@ def main():
     ap.add_argument("--prompts-file", default=None,
                     help="JSON [{\"genre\":..,\"prompt\":..}] replacing the built-in genre battery "
                          "(e.g. battery + the coherence_prompts_<arch> guard set).")
+    ap.add_argument(
+        "--replay-route-proof-log",
+        action="store_true",
+        help="Write diagnostic.replay.route_proof_log=true into the temporary "
+             "$HIPFIRE_HOME/config.toml so the daemon emits one retained-replay "
+             "proof marker on first success (coherence/product gates).",
+    )
     args = ap.parse_args()
     cfg = build_config(args); cfg["max_seq"] = args.max_seq
     show_config(cfg)

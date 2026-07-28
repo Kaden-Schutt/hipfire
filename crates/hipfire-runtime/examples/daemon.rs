@@ -3363,6 +3363,8 @@ fn main() {
                                 "packets": identity.packet_count,
                                 "queue_id": identity.queue_id,
                                 "command_dwords": identity.command_dwords,
+                                "queues": identity.queue_count,
+                                "phases": identity.phase_count,
                             })
                         });
                         let sequence = gpu.replay.capture_summary();
@@ -15309,9 +15311,7 @@ mod render_tail_think_tests {
 
     #[test]
     fn qwen_jinja_think_tail_primes_reasoning_channel() {
-        assert!(render_tail_opens_think(
-            "<|im_start|>assistant\n<think>\n"
-        ));
+        assert!(render_tail_opens_think("<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]

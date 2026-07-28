@@ -13,10 +13,10 @@ use hipfire_client::{
     complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
 };
 use hipfire_config::{
-    canonical_config_key, developer_env_for_key, field, fields, is_developer_key, load_catalog,
-    load_env_layer, load_global, resolve, write_catalog_toml, write_global_toml, CatalogFormat,
-    ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer, ValueRule,
-    CONFIG_SCHEMA_VERSION,
+    apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
+    field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
+    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
+    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
@@ -147,6 +147,25 @@ enum ConfigAction {
     Schema(OutputArgs),
     /// Convert legacy config.json to sparse config.toml without deleting JSON.
     Migrate,
+    /// Select or create named configuration profiles.
+    Profile {
+        #[command(subcommand)]
+        action: Option<ConfigProfileAction>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigProfileAction {
+    /// Replace the global sparse config with a built-in or custom profile.
+    Set {
+        /// Built-in (`default`, `dev`, `redline`) or custom profile name.
+        name: String,
+    },
+    /// Snapshot the current global sparse config as a new custom profile.
+    Create {
+        /// New custom profile name (not a built-in).
+        name: String,
+    },
 }
 
 #[derive(Args, Debug, Clone, Copy)]
@@ -904,6 +923,38 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             }
             Ok(())
         }
+        ConfigAction::Profile { action } => config_profile_command(paths, action),
+    }
+}
+
+fn config_profile_command(paths: &Paths, action: Option<ConfigProfileAction>) -> Result<()> {
+    let Some(action) = action else {
+        return launch_tui(paths, &["--config-profile-wizard".to_owned()]);
+    };
+    match action {
+        ConfigProfileAction::Set { name } => {
+            let mut loaded = load_global(&paths.config)?;
+            apply_config_profile(&mut loaded.layer, &paths.config, &name)?;
+            write_global_toml(&paths.config, &loaded.layer)?;
+            println!("applied configuration profile '{name}'");
+            if loaded.format == ConfigFormat::LegacyJson {
+                println!(
+                    "migrated active configuration to {}; preserved {} as a rollback copy",
+                    paths.config.config_toml.display(),
+                    paths.config.config_json.display()
+                );
+            }
+            Ok(())
+        }
+        ConfigProfileAction::Create { name } => {
+            let loaded = load_global(&paths.config)?;
+            let path = create_config_profile(&paths.config, &name, &loaded.layer)?;
+            println!(
+                "created configuration profile '{name}' at {}",
+                path.display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -918,8 +969,11 @@ fn model_config_command(
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
         .unwrap_or((None, None));
     let action = action.unwrap_or(ConfigAction::List(OutputArgs { json: false }));
-    if matches!(action, ConfigAction::Migrate | ConfigAction::Schema(_)) {
-        bail!("config migrate/schema are global; omit the model argument");
+    if matches!(
+        action,
+        ConfigAction::Migrate | ConfigAction::Schema(_) | ConfigAction::Profile { .. }
+    ) {
+        bail!("config migrate/schema/profile are global; omit the model argument");
     }
 
     match action {
@@ -1117,7 +1171,9 @@ fn model_config_command(
             }
             Ok(())
         }
-        ConfigAction::Migrate | ConfigAction::Schema(_) => unreachable!(),
+        ConfigAction::Migrate | ConfigAction::Schema(_) | ConfigAction::Profile { .. } => {
+            unreachable!()
+        }
     }
 }
 
@@ -6091,6 +6147,7 @@ fn registry_source(source: RegistrySource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_config::CONFIG_PROFILE_NAMES;
 
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
@@ -6640,6 +6697,83 @@ mod tests {
             schema.action,
             Some(ConfigAction::Schema(OutputArgs { json: true }))
         ));
+    }
+
+    #[test]
+    fn config_profile_set_and_create_parse_as_dedicated_actions() {
+        let set = Cli::try_parse_from(["hipfire", "config", "profile", "set", "dev"]).unwrap();
+        let Some(Commands::Config(args)) = set.command else {
+            panic!("expected config command")
+        };
+        assert!(args.model.is_none());
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Set { ref name })
+            }) if name == "dev"
+        ));
+
+        let create =
+            Cli::try_parse_from(["hipfire", "config", "profile", "create", "lab"]).unwrap();
+        let Some(Commands::Config(args)) = create.command else {
+            panic!("expected config command")
+        };
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Create { ref name })
+            }) if name == "lab"
+        ));
+
+        let bare = Cli::try_parse_from(["hipfire", "config", "profile"]).unwrap();
+        let Some(Commands::Config(args)) = bare.command else {
+            panic!("expected config command")
+        };
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile { action: None })
+        ));
+    }
+
+    #[test]
+    fn config_profile_helpers_replace_layer_and_are_global_only() {
+        assert_eq!(CONFIG_PROFILE_NAMES, &["default", "dev", "redline"]);
+        let root = env::temp_dir().join(format!("hipfire-cli-profile-{}", std::process::id()));
+        let config_paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer
+            .set(
+                "generation.temperature",
+                hipfire_config::ConfigValue::Float(0.5),
+            )
+            .unwrap();
+        apply_config_profile(&mut layer, &config_paths, "redline").unwrap();
+        assert!(layer.get("generation.temperature").is_none());
+        assert_eq!(
+            layer.get("replay.backend"),
+            Some(&hipfire_config::ConfigValue::String("redline".into()))
+        );
+
+        let model = Cli::try_parse_from([
+            "hipfire",
+            "config",
+            "qwen:test",
+            "profile",
+            "set",
+            "default",
+        ])
+        .unwrap();
+        let Some(Commands::Config(args)) = model.command else {
+            panic!("expected config command")
+        };
+        assert_eq!(args.model.as_deref(), Some("qwen:test"));
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Set { .. })
+            })
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

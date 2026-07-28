@@ -175,6 +175,7 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_REPLAY_TRANSPORT` | `pm4` / AQL family |
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
+| `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | Developer-only / one-shot compat for `diagnostic.replay.route_proof_log`. When `1`/`true`/`on` (or TOML `true`), the first successful retained replay in each `ReplayController` observation window emits one stable stderr line: `HIPFIRE_REPLAY_ROUTE_PROOF transport=<name> position=<n>`. Off by default; product coherence smoke enables it only via temporary serve_harness `config.toml`, not ambient env. |
 
 ### Chat template
 
@@ -924,6 +925,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_REPLAY_PM4_QUEUES` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_STATEFUL` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_WAIT_POLICY` | crates/rdna-compute/src/replay.rs |
+| `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | crates/hipfire-config/src/lib.rs (`diagnostic.replay.route_proof_log`), crates/rdna-compute/src/replay.rs, tools/redline/product_bench.py, scripts/serve_harness.py |
 | `HIPFIRE_REPLAY_TRANSPORT` | crates/hipfire-cli/src/main.rs, crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPO` | scripts/quantize-dspark.sh |
 | `HIPFIRE_RESIDUAL_CPOL` | crates/rdna-compute/src/gemv.rs |
