@@ -5362,7 +5362,12 @@ fn generate_dflash(
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
     // field can reach it without re-touching this signature.
     cactus_delta: f32,
-) {
+    // Returns false in exactly one case: the request does not fit the loaded
+    // speculator's reported ctx capacity (draft-side structures are capped at
+    // load — see DEFAULT_DFLASH_CTX_CAP) — and NO output/events were emitted,
+    // so the caller must fall through to the arch's AR path. Every other exit
+    // (success, abort, error) has already written its envelope → true.
+) -> bool {
     // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
     // SpecStats that this function used to drive inline now live behind the
     // arch-generic `Speculator` trait (the loader's `DflashSpeculator`) and the
@@ -5463,6 +5468,32 @@ fn generate_dflash(
     } else {
         None
     };
+
+    // DFlash ctx-capacity downgrade. The draft's context-indexed structures
+    // (target_hidden, per-layer K/V caches, hidden ring) are sized at load to
+    // min(max_seq, HIPFIRE_DFLASH_CTX_CAP|8192) to bound draft-side VRAM on
+    // large-max_seq serve loads. A request that outgrows the cap cannot run
+    // spec — but DFlash is verify-gated, so AR produces the same tokens, just
+    // slower. Emit nothing on the wire beyond an info event and hand the
+    // request back to the caller's AR fallthrough. (Mirrors the hard guard in
+    // generate_spec, which stays as the belt-and-suspenders last line.)
+    let spec_ctx_capacity = m
+        .speculator
+        .as_ref()
+        .map(|s| s.ctx_capacity())
+        .unwrap_or(usize::MAX);
+    if prompt_tokens.len().saturating_add(max_tokens) > spec_ctx_capacity {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"info","id":"{}","message":"prompt={} + max_tokens={} exceeds DFlash draft ctx capacity {} — falling back to AR (identical output, slower; raise HIPFIRE_DFLASH_CTX_CAP to re-enable spec)"}}"#,
+            id,
+            prompt_tokens.len(),
+            max_tokens,
+            spec_ctx_capacity
+        );
+        let _ = stdout.flush();
+        return false;
+    }
 
     // Prompt-cache plan (native DFlash reuse). For non-jinja chat with history,
     // decide whether this turn is a pure extension of the cached conversation.
@@ -5588,7 +5619,7 @@ fn generate_dflash(
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
-        None => return,
+        None => return true,
     };
     debug_assert_eq!(run.prefill_tokens_len, prefill_tokens_full);
 
@@ -5707,6 +5738,7 @@ fn generate_dflash(
         "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({} tok, {} windows)",
         run.generated, run.spec_cycles
     );
+    true
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -8156,13 +8188,7 @@ fn generate(
         .map(|s| !s.requires_greedy())
         .unwrap_or(false);
     if m.arch_id == 7 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
-        let _ = (
-            budget_alert_at_tok,
-            budget_alert_text,
-            pflash_state,
-            pflash_cfg,
-        );
-        generate_dflash(
+        if generate_dflash(
             m,
             gpu,
             stdout,
@@ -8181,8 +8207,12 @@ fn generate(
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
-        );
-        return;
+        ) {
+            return;
+        }
+        // generate_dflash returned false: request exceeds the loaded speculator's
+        // ctx capacity (draft-side structures are capped at load) — nothing was
+        // emitted; fall through to this arch's AR path (same tokens, no spec speedup).
     }
     if m.arch_id == 7 {
         // Silence the qwen35/llama-only params we deliberately don't
@@ -8288,13 +8318,7 @@ fn generate(
     // arch-generic spec loop, like qwen2 (7) / minimax (10). Without a speculator
     // it falls through to the plain `generate_lfm2moe` short-circuit below.
     if m.arch_id == 11 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
-        let _ = (
-            budget_alert_at_tok,
-            budget_alert_text,
-            pflash_state,
-            pflash_cfg,
-        );
-        generate_dflash(
+        if generate_dflash(
             m,
             gpu,
             stdout,
@@ -8313,8 +8337,12 @@ fn generate(
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
-        );
-        return;
+        ) {
+            return;
+        }
+        // generate_dflash returned false: request exceeds the loaded speculator's
+        // ctx capacity (draft-side structures are capped at load) — nothing was
+        // emitted; fall through to this arch's AR path (same tokens, no spec speedup).
     }
     if m.arch_id == 11 {
         // arch_id=11 (LFM2.5-8B-A1B). Standalone bring-up — same shape as
@@ -8353,13 +8381,7 @@ fn generate(
     // arch-generic spec loop, like qwen2 (7) / minimax (10) / lfm2moe (11).
     // Without a speculator it falls through to the plain `generate_cohere2moe`.
     if m.arch_id == 12 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
-        let _ = (
-            budget_alert_at_tok,
-            budget_alert_text,
-            pflash_state,
-            pflash_cfg,
-        );
-        generate_dflash(
+        if generate_dflash(
             m,
             gpu,
             stdout,
@@ -8378,8 +8400,12 @@ fn generate(
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
-        );
-        return;
+        ) {
+            return;
+        }
+        // generate_dflash returned false: request exceeds the loaded speculator's
+        // ctx capacity (draft-side structures are capped at load) — nothing was
+        // emitted; fall through to this arch's AR path (same tokens, no spec speedup).
     }
     if m.arch_id == 12 {
         // arch_id=12 (Cohere2-MoE / North-Mini-Code). Standalone bring-up
@@ -8416,13 +8442,7 @@ fn generate(
     // qwen2 (7) above. Without a speculator it falls through to the plain
     // `generate_minimax` short-circuit below.
     if m.arch_id == 10 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
-        let _ = (
-            budget_alert_at_tok,
-            budget_alert_text,
-            pflash_state,
-            pflash_cfg,
-        );
-        generate_dflash(
+        if generate_dflash(
             m,
             gpu,
             stdout,
@@ -8441,8 +8461,12 @@ fn generate(
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
-        );
-        return;
+        ) {
+            return;
+        }
+        // generate_dflash returned false: request exceeds the loaded speculator's
+        // ctx capacity (draft-side structures are capped at load) — nothing was
+        // emitted; fall through to this arch's AR path (same tokens, no spec speedup).
     }
     if m.arch_id == 10 {
         // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
@@ -8766,7 +8790,7 @@ fn generate(
         // mirrors the AR path's <think>/</think> counter). The "ignored
         // on DFlash" warning that used to live here is gone -- the cap
         // is real on both paths now.
-        generate_dflash(
+        if generate_dflash(
             m,
             gpu,
             stdout,
@@ -8785,19 +8809,23 @@ fn generate(
             top_p, // nucleus cutoff: honored on the chain sampled path (ignored by the ddtree SWOR arm)
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (chain path; recipe → folded into tau)
             cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
-        );
-        // Silence unused-variable warnings for the params DFlash doesn't
-        // consume. top_p IS now applied to the spec sampling (nucleus on both
-        // draft + target). repeat penalties are AR-only sampling knobs;
-        // pflash_state is bypassed on the DFlash decode path.
-        let _ = (
-            repeat_penalty,
-            repeat_window,
-            budget_alert_at_tok,
-            budget_alert_text,
-            pflash_state,
-        );
-        return;
+        ) {
+            // Silence unused-variable warnings for the params DFlash doesn't
+            // consume. top_p IS now applied to the spec sampling (nucleus on both
+            // draft + target). repeat penalties are AR-only sampling knobs;
+            // pflash_state is bypassed on the DFlash decode path.
+            let _ = (
+                repeat_penalty,
+                repeat_window,
+                budget_alert_at_tok,
+                budget_alert_text,
+                pflash_state,
+            );
+            return;
+        }
+        // generate_dflash returned false: request exceeds the loaded speculator's
+        // ctx capacity (draft-side structures are capped at load) — nothing was
+        // emitted; fall through to the AR path below (same tokens, no spec speedup).
     }
 
     // Auto-reset on multi-turn rollover. When eviction is active (operator

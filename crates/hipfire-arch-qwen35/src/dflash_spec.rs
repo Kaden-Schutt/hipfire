@@ -56,6 +56,18 @@ pub struct DflashState {
 // ─── DFlash state load ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+/// Default ceiling for the DFlash draft's context-indexed structures
+/// (`target_hidden` [L × extract×hidden], the per-layer K/V caches, the
+/// hidden ring, `mq_x_rot`, and the host hidden log). Serve loads default
+/// `max_seq` to 32768+, which sized ALL of these to 32K rows — on a 27B
+/// target with a 5-layer-extract MQ4 draft that is ~11 GB of draft-side
+/// VRAM, vs ~1.4 GB at the ≤4K contexts DFlash benches actually run. The
+/// draft only affects acceptance rate (verify is target-gated), so a
+/// request that outgrows the cap simply falls back to AR in the daemon —
+/// emitted tokens are never at risk. `HIPFIRE_DFLASH_CTX_CAP=0` opts out
+/// (legacy uncapped behaviour); any other value overrides the ceiling.
+pub const DEFAULT_DFLASH_CTX_CAP: usize = 8192;
+
 pub fn load_dflash_state(
     draft_path: &str,
     ctx_capacity: usize,
@@ -67,6 +79,22 @@ pub fn load_dflash_state(
     ddtree_budget_param: Option<usize>,
     ddtree_topk_param: Option<usize>,
 ) -> Result<DflashState, String> {
+    let requested_ctx = ctx_capacity;
+    let ctx_capacity = match std::env::var("HIPFIRE_DFLASH_CTX_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(0) => ctx_capacity, // explicit opt-out: legacy uncapped
+        Some(cap) => ctx_capacity.min(cap),
+        None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
+    };
+    if ctx_capacity < requested_ctx {
+        eprintln!(
+            "  DFlash draft ctx capped: {} -> {} rows (draft-side VRAM scales with this; \
+             HIPFIRE_DFLASH_CTX_CAP=0 for uncapped, or set a larger cap)",
+            requested_ctx, ctx_capacity
+        );
+    }
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
