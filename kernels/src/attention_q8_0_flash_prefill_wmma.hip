@@ -112,6 +112,11 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
 
         // ── Phase A: S = Q · K^T on the matrix cores ────────────────────
         // This lane owns key (kt + half); it walks head_dim in 16-dim chunks.
+        // K is read straight from global, NOT staged in LDS. Staging it the
+        // same coalesced way V is staged was measured and REJECTED: it costs
+        // 8 KB, dropping occupancy 3 -> 2 WG/CU, and made the kernel 2.26x
+        // slower at CTX=8192 (9.45 -> 21.38 ms). Occupancy dominates the
+        // coalescing gain here, matching the Stage A tile-size finding.
         float8_t s_acc = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         {
             const int my_k = kt + half;
@@ -176,17 +181,28 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         __syncthreads();
 
         // ── Phase C: stage V^T (dequantised) then O += P · V ────────────
-        for (int i = lane; i < head_dim * N_TILE; i += 32) {
-            const int d  = i / N_TILE;
-            const int kr = i % N_TILE;
-            _Float16 val = (_Float16)0.0f;
+        // Lane L owns the contiguous dim run [L*DPL, (L+1)*DPL). Two things
+        // fall out: the 32 lanes together read one key's 272 contiguous cache
+        // bytes (coalesced) instead of each lane touching a different cache
+        // position row_stride apart, and a lane's whole run lives inside ONE
+        // 32-dim Q8_0 block, so the fp16 scale is loaded once per key rather
+        // than once per element.
+        const int dpl = head_dim / 32;              // dims per lane
+        const int d_lo = lane * dpl;
+        const int v_blk = d_lo >> 5;                // block index (run-uniform)
+        const int v_off = 2 + (d_lo & 31);          // byte offset within block
+        for (int kr = 0; kr < N_TILE; ++kr) {
             if (kr < t_len) {
-                const unsigned char* vb =
-                    v_cache + (size_t)(kt + kr) * row_stride + kv_blk * 34 + (d >> 5) * 34;
+                const unsigned char* vb = v_cache + (size_t)(kt + kr) * row_stride
+                                        + kv_blk * 34 + v_blk * 34;
                 const float vs = (float)*((const _Float16*)vb);
-                val = (_Float16)(vs * (float)((signed char)vb[2 + (d & 31)]));
+                for (int e = 0; e < dpl; ++e)
+                    V_lds_T[(d_lo + e) * V_STRIDE + kr] =
+                        (_Float16)(vs * (float)((signed char)vb[v_off + e]));
+            } else {
+                for (int e = 0; e < dpl; ++e)
+                    V_lds_T[(d_lo + e) * V_STRIDE + kr] = (_Float16)0.0f;
             }
-            V_lds_T[d * V_STRIDE + kr] = val;
         }
         __syncthreads();
 
