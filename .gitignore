@@ -138,3 +138,6 @@ docs/investigations/*/sources/
 *_results.csv
 *.rocpd
 *.pftrace
+
+# Local research scratch (agent surveys, microbenches)
+.research/

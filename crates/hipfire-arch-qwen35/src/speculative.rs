@@ -3772,6 +3772,27 @@ pub fn spec_step_dflash(
         accept_len = acc.accepted;
         bonus_token = *acc.committed.last().expect("eos=None yields a bonus");
 
+        // Accept-path trace (observation only, zero cost unset). Prints the
+        // drafted tokens beside the target's argmax picks for the same cycle,
+        // on BOTH the GPU-argmax and host-recompute paths — the two disagree
+        // on prompt-cache-HIT turns (τ collapses to 0 on the GPU path only)
+        // and this is what lets the same cycle be diffed across the two.
+        static ACCEPT_TRACE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ACCEPT_TRACE_ENV.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DFLASH_ACCEPT_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+        }) {
+            let n = b.min(8);
+            let drafted: Vec<u32> = block[1..b].iter().take(n).copied().collect();
+            let picks: Vec<u32> = argmax_per_pos.iter().take(n).copied().collect();
+            eprintln!(
+                "DFLACC pos={} b={} host_path={} accept={} bonus={} drafted={:?} target={:?}",
+                position, b, host_path_active as u8, accept_len, bonus_token, drafted, picks
+            );
+        }
+
         if logit_dump_active {
             // Inspect the acceptance boundary. If accept_len < b-1 the block
             // was rejected at position accept_len (drafted loser = block[accept_len+1]);
