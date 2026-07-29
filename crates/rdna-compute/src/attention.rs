@@ -1906,6 +1906,88 @@ impl Gpu {
         )
     }
 
+    /// WMMA (matrix-core) variant of `attention_q8_0_flash_prefill`.
+    ///
+    /// Fixed 16-query / 16-key tiles (the WMMA fragment shape), one wave32 per
+    /// workgroup. head_dim must be a multiple of 32 (Q8_0 block width) and at
+    /// most 512 so `d_chunks <= MAX_D_CHUNKS`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(head_dim % 32 == 0, "head_dim {head_dim} must be a multiple of 32");
+        assert!(head_dim <= 256, "head_dim {head_dim} exceeds MAX_D_CHUNKS*16");
+        self.ensure_kernel(
+            "attention_q8_0_flash_prefill_wmma",
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC,
+            "attention_q8_0_flash_prefill_wmma",
+        )?;
+        const M_TILE: usize = 16;
+        const N_TILE: usize = 16;
+        const S_STRIDE: usize = 18;
+        const V_STRIDE: usize = 18;
+        // Q f16 + V^T f16 + S f16 + (m,l,alpha) f32
+        let lds = (M_TILE * head_dim + head_dim * V_STRIDE + M_TILE * S_STRIDE) * 2
+            + M_TILE * 3 * 4;
+        assert!(lds <= 64 * 1024, "wmma flash prefill LDS {lds} exceeds 64KB");
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let grid_x = batch_size.div_ceil(M_TILE) as u32;
+        self.launch_maybe_blob(
+            "attention_q8_0_flash_prefill_wmma",
+            [grid_x, n_heads as u32, 1],
+            [32, 1, 1],
+            lds as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        )
+    }
+
     /// Batched flash attention for Q8_0 KV — tile + reduce two-kernel path.
     /// No LDS capacity limit: tiles seq_len into chunks of `tile_size` only,
     /// so shared memory is O(tile_size), not O(max_ctx_len). Replaces the

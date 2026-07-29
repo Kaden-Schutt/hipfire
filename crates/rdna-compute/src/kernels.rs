@@ -3832,6 +3832,12 @@ pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
 pub const ATTENTION_Q8_0_FLASH_PREFILL_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill.hip");
 
+/// WMMA (matrix-core) variant of ATTENTION_Q8_0_FLASH_PREFILL_SRC. Same
+/// algorithm; QK^T and P·V run on RDNA3 wave32 matrix cores, and the Q8
+/// dequant is amortised 16x by the 16x16x16 fragment layout.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.hip");
+
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each
 /// of the 3 internal phases (QK^T, softmax, V-weighted-sum). Writes per-head

@@ -133,6 +133,21 @@ fn main() {
         new_ms / flash_ms
     );
 
+    // WMMA (matrix-core) variant of the query-tiled kernel. Fixed 16x16 tiles.
+    let wmma_ms = time(&mut gpu, &|g: &mut Gpu| {
+        g.attention_q8_0_flash_prefill_wmma(
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, n,
+        )
+        .expect("wmma flash prefill");
+    });
+    println!(
+        "flash_wmma       CTX={ctx} N={n}: {wmma_ms:8.2} ms  \
+         ({:6.1} us/query-row)  vs_tiled={:.2}x  vs_scalar_flash={:.2}x",
+        wmma_ms * 1000.0 / n as f64,
+        new_ms / wmma_ms,
+        flash_ms / wmma_ms
+    );
+
     // The legacy LDS-backed kernel is only launchable while
     // (max_ctx_len + block + head_dim) * 4 <= 64 KB; above that it cannot run
     // at all, which is exactly why dispatch crosses over at 8192.
