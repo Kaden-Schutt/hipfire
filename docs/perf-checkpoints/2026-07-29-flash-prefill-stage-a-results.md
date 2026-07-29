@@ -257,6 +257,53 @@ f32 top-1 remains inside the f16 top-8 in **99.76%** of cases — a reshuffle
 among near-ties, not a lost token. Under greedy decoding this still means
 generated text will drift; under sampling it is largely masked.
 
+### Where the f16 error actually lives, and the split-Q mode
+
+Attributed by isolation (round one quantity on the CANDIDATE only, run through
+an otherwise-f32 kernel, so that quantity's precision is the only difference):
+
+| term | contribution | note |
+|---|---|---|
+| **Q** (A fragment) | **5.36e-4 of 5.48e-4 — 98%** | dominant |
+| K + V | ~3.2e-4 | `KVEXACT=1` control |
+| P (probabilities) | ~2.6e-4 | `SPLIT_P` control |
+
+Three earlier hypotheses were wrong before this was measured properly: the score
+round-trip through f16 (fixing it cost 58% perf for zero accuracy), K/V, and P.
+Each moved the total only 0–19% because each is a minor term.
+
+`HIPFIRE_FLASH_PREFILL_SPLITQ=1` carries Q as a double-single (hi+lo) pair
+through two WMMA passes per d-chunk:
+
+| CTX | base rel_l2 | split-Q | accuracy | time |
+|---:|---:|---:|---:|---:|
+| 512 | 7.04e-4 | 3.76e-4 | 1.87× | 1.59× |
+| 4096 | 5.79e-4 | 1.16e-4 | 4.97× | 1.66× |
+| 12288 | 5.28e-4 | 1.16e-4 | 4.54× | 1.59× |
+
+End-to-end quality, 2048 paired positions:
+
+| metric | base | split-Q |
+|---|---:|---:|
+| ppl vs f32 7.4812 | 7.5310 (+0.67%) | **7.4910 (+0.13%)** |
+| paired ΔNLL | +0.0066 nats | **+0.0013** |
+| std error | 0.0087 | **0.0049** |
+| top-1 agreement | 95.17% | 95.46% |
+| top-8 overlap | 7.30/8 | 7.30/8 |
+
+**The distributional gap narrows 5×; behaviour does not change.** Top-1 moves
++0.29pp and top-8 overlap not at all, because top-1 disagreements sit at
+genuinely uncertain positions (median NLL 2.81 nats vs 0.30 where the arms
+agree) whose leading candidates are separated by less than split-Q's *residual*
+error. More precision cannot resolve a near-tie.
+
+**Default off.** 1.6× is not worth paying for a distributional improvement on a
+gap that is already statistically undetectable, when it does not change which
+tokens are chosen. It is kept as a real high-accuracy operating point: even at
+1.6× it beats every alternative (15.10 ms at CTX=8192 vs ~22 ms legacy, ~45 ms
+tiled). Turn it on if you have a reason to want maximum fidelity to the f32
+path; otherwise leave it alone.
+
 ### The trade
 
 WMMA computes in f16. Measured relative L2 against the f32 reference is
