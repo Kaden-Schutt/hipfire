@@ -116,4 +116,41 @@ fn main() {
         "WINDOW={window:6} CTX={ctx:6} N={n:4} HD={hd} : batched flash {new_ms:8.2} ms  ({:6.1} us/query-row)",
         new_ms * 1000.0 / n as f64
     );
+
+    // Query-tiled flash prefill. BR/BC swept via env; LDS is independent of ctx.
+    let br = env_usize("BR", 16);
+    let bc = env_usize("BC", 32);
+    let flash_ms = time(&mut gpu, &|g: &mut Gpu| {
+        g.attention_q8_0_flash_prefill(
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, n, br, bc,
+        )
+        .expect("flash prefill");
+    });
+    println!(
+        "flash_prefill br={br} bc={bc} CTX={ctx} N={n}: {flash_ms:8.2} ms  \
+         ({:6.1} us/query-row)  speedup_vs_tiled={:.2}x",
+        flash_ms * 1000.0 / n as f64,
+        new_ms / flash_ms
+    );
+
+    // The legacy LDS-backed kernel is only launchable while
+    // (max_ctx_len + block + head_dim) * 4 <= 64 KB; above that it cannot run
+    // at all, which is exactly why dispatch crosses over at 8192.
+    let legacy_lds = (ctx + 256 + hd) * 4;
+    if legacy_lds <= 64 * 1024 {
+        let legacy_ms = time(&mut gpu, &|g: &mut Gpu| {
+            g.attention_q8_0_kv_batched_masked(
+                &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, None, 0, 0,
+            )
+            .expect("legacy lds kernel");
+        });
+        println!(
+            "legacy_lds       CTX={ctx} N={n}: {legacy_ms:8.2} ms  \
+             ({:6.1} us/query-row)  flash_speedup_vs_legacy={:.2}x",
+            legacy_ms * 1000.0 / n as f64,
+            legacy_ms / flash_ms
+        );
+    } else {
+        println!("legacy_lds       CTX={ctx}: N/A (needs {legacy_lds} B LDS > 64 KB)");
+    }
 }
