@@ -896,6 +896,7 @@ dependencies = [
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

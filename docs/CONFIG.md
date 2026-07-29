@@ -479,7 +479,7 @@ policy and filename/registry discovery.
 
 Note: CLI `ddtree_budget` default is `0` while bare `RuntimeConfig` default is `256` when only env/runtime path is used — CLI load params are the product path for `hipfire run`/`serve`.
 
-Redline eligibility helper `a3b_mq4r_redline_default` (same file) is a **narrow runtime-default predicate** for replay backend selection (exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + `arch_id == 6` + case-insensitive `.mq4r` + pp=tp=1; `gfx1200` and all other arches remain opt-in), not a general config key and not Redline certification/registry admission. Built-in `hip` config profile or an explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
+Redline eligibility helper `mq4r_redline_default` (same file) is a **narrow runtime-default predicate** for replay backend selection (exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1; model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), not a general config key and not Redline certification/registry admission. Built-in `hip` config profile or an explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
 
 ---
 
