@@ -5709,6 +5709,39 @@ pub fn spec_step_ddtree_batched(
             rows_to_keep,
             draft_scratch.ctx_modulus(),
         )?;
+        // Post-commit poison check: catch the exact cycle whose committed rows
+        // land NaN in target_hidden. Once a row is poisoned the draft forward
+        // is NaN from that cycle on (and stays poisoned across a prompt-cache
+        // HIT, which is how this first surfaced).
+        static COMMIT_CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static COMMIT_POISONED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if *COMMIT_CHECK.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DFLASH_TH_PROBE").ok().as_deref() == Some("1")
+        }) && !COMMIT_POISONED.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let committed = draft_scratch
+                .target_hidden
+                .sub_offset(position * ne * h, rows_to_keep * ne * h);
+            if let Ok(v) = gpu.download_f32(&committed) {
+                let nans = v.iter().filter(|x| x.is_nan()).count();
+                if nans > 0 {
+                    COMMIT_POISONED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "DFLPOISON first at position={} rows={} block_size={} big_n={} \
+                         fast_tape_ok={} accept_len={} nans={}/{}",
+                        position,
+                        rows_to_keep,
+                        block_size,
+                        big_n,
+                        fast_tape_ok,
+                        accept_len,
+                        nans,
+                        v.len()
+                    );
+                }
+            }
+        }
         let co = target.kv_cache.compact_offset as i32;
         draft_scratch
             .thlog
