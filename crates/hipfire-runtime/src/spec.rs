@@ -642,6 +642,33 @@ pub trait Speculator {
         Ok(())
     }
 
+    /// Advance the target over emitter-FORCED tokens (think-budget force-close,
+    /// empty-turn guards) while keeping drafter-local per-position state in sync.
+    ///
+    /// The plain [`SpecTarget::spec_advance`] moves KV + recurrent state only and
+    /// performs no hidden extraction, so a drafter that caches one row of target
+    /// hidden state per position would be left with an UNWRITTEN hole at the
+    /// forced positions — uninitialized memory, i.e. NaN, which poisons every
+    /// later draft forward and silently collapses acceptance to zero for the rest
+    /// of the session (it also survives a prompt-cache HIT).
+    ///
+    /// Returns `true` when the speculator advanced the target itself (the caller
+    /// must then NOT also call `spec_advance` — the recurrent state would advance
+    /// twice). Default returns `false`: no drafter-local per-position state, so
+    /// the caller's plain advance is correct and this is byte-identical to the
+    /// pre-hook behavior.
+    fn on_forced_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        let _ = (gpu, target, tokens, start_pos, abort);
+        Ok(false)
+    }
+
     /// Rewind drafter-LOCAL state for a fresh conversation. The target's KV /
     /// recurrent state is the daemon's concern (it owns the bundle); this clears
     /// only the drafter's own scratch + checkpoint ring.

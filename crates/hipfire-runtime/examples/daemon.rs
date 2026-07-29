@@ -6970,9 +6970,23 @@ fn generate_spec(
         // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
         if !forced_after.is_empty() {
             for ft in std::mem::take(&mut forced_after) {
-                if let Err(e) =
-                    slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
-                {
+                // Give the speculator first refusal: a drafter with per-position
+                // cached target-hidden rows (DFlash) must advance the target
+                // ITSELF, with hidden extraction, or those positions are left as
+                // an uninitialized (NaN) hole that kills acceptance for the rest
+                // of the session. `false` ⇒ no drafter-local per-position state,
+                // take the plain KV+recurrent advance below.
+                let forced_res = spec
+                    .on_forced_advance(gpu, slot, &[ft], position, &|| check_abort(id))
+                    .and_then(|handled| {
+                        if handled {
+                            Ok(())
+                        } else {
+                            slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
+                                .map(|_| ())
+                        }
+                    });
+                if let Err(e) = forced_res {
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"error","id":"{}","message":"forced-token advance: {}"}}"#,

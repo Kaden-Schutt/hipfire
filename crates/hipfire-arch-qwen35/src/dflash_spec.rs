@@ -455,6 +455,65 @@ impl Speculator for DflashSpeculator {
         Ok(PrefillOutcome::Ready { first_token })
     }
 
+    /// Forced tokens (think-budget force-close) must land in the drafter's
+    /// per-position `target_hidden` cache, not just the target's KV. Seeding via
+    /// the same suffix path the prompt-cache HIT uses advances the target WITH
+    /// hidden extraction, so the rows exist and `thlog` stays contiguous.
+    ///
+    /// Skipping this is what previously left an uninitialized (NaN) hole at the
+    /// forced positions: the next draft forward read it, produced all-NaN logits,
+    /// and `argmax` collapsed to token 0 — τ went to 0 for the rest of the
+    /// session and stayed dead across prompt-cache HITs.
+    fn on_forced_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        if tokens.is_empty() {
+            return Ok(true);
+        }
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        let aborted = seed_target_hidden_suffix_abortable(
+            gpu,
+            slot,
+            &mut self.df.hidden_rb,
+            tokens,
+            start_pos,
+            abort,
+            None,
+            self.ck_interval,
+            self.ck_cap,
+        )
+        .map_err(|e| e.to_string())?;
+        if aborted {
+            // Caller tears the request down; leaving the rows unwritten is fine
+            // because the drafter state is reset on the way out.
+            return Ok(true);
+        }
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            &self.df.hidden_rb,
+            &self.df.draft_scratch.target_hidden,
+            start_pos,
+            tokens.len(),
+            tokens.len(),
+            self.df.draft_scratch.ctx_modulus(),
+        )
+        .map_err(|e| e.to_string())?;
+        let co = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0) as i32;
+        self.df
+            .draft_scratch
+            .thlog
+            .append_committed(start_pos, tokens.len(), co);
+        Ok(true)
+    }
+
     /// Temp>0 verify is distribution-correct only on the ddtree-batched arm
     /// (SWOR); chain mode is greedy, so a non-ddtree drafter must NOT receive
     /// temp>0 routing.
