@@ -1524,6 +1524,18 @@ pub struct HiddenStateRingBuffer {
 }
 
 impl HiddenStateRingBuffer {
+    /// Physical ring slot holding block-local row `r` of the most recent
+    /// `block_size`-row block — the same mapping
+    /// [`scatter_hidden_block_to_interleaved`] walks, exposed so callers that
+    /// need to address block rows directly (DDTree post-accept gather) do not
+    /// re-derive the ring arithmetic.
+    pub fn block_row_slot(&self, block_size: usize, r: usize) -> usize {
+        let r_skip = block_size.saturating_sub(self.max_positions);
+        let start_slot =
+            (self.head + self.max_positions - (block_size - r_skip)) % self.max_positions;
+        (start_slot + r.saturating_sub(r_skip)) % self.max_positions
+    }
+
     /// Allocate GPU ring buffer for `num_extract` target layers.
     ///
     /// `max_batch` sizes the staging buffers used by the graph-capture path.
@@ -5014,6 +5026,152 @@ pub fn spec_step_ddtree(
     })
 }
 
+/// Committed-order row moves for a DDTree post-accept gather, in BLOCK-LOCAL
+/// row space (row 0 is the seed slot and never moves).
+///
+/// Committed row `i + 1` must end up holding linearization slot
+/// `accepted_node_indices[i] + 1`. Consecutive moves with the same
+/// source→destination delta are coalesced into one run. A spine accept yields
+/// an empty list, which is exactly the existing fast path.
+fn ddtree_commit_row_runs(accepted_node_indices: &[usize]) -> Vec<(usize, usize, usize)> {
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, &ni) in accepted_node_indices.iter().enumerate() {
+        let (dst, src) = (i + 1, ni + 1);
+        if dst == src {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((d, s, n)) if *d + *n == dst && *s + *n == src => *n += 1,
+            _ => runs.push((dst, src, 1)),
+        }
+    }
+    runs
+}
+
+/// Move rows within a single position-addressed buffer, in place.
+///
+/// `moves` are `(dst_row, src_row, n_rows)` in PHYSICAL row space, ordered by
+/// ascending `dst_row`.
+///
+/// No scratch buffer is required, and that is a property of the linearization
+/// rather than luck: slots are assigned in depth order, so the i-th accepted
+/// node can never occupy a slot below `i` (`src >= dst` for every move). Writing
+/// row `d` can therefore only alias the source of a LATER move, whose source
+/// `s' >= d' > d` — every source is read before anything overwrites it. Distinct
+/// block rows map to distinct physical rows, so this also holds when the caller
+/// maps through a ring modulus.
+fn move_rows_in_place(
+    gpu: &Gpu,
+    buf: &GpuTensor,
+    row_bytes: usize,
+    moves: &[(usize, usize, usize)],
+) -> HipResult<()> {
+    for &(dst, src, n) in moves {
+        let (dst_off, src_off, size) = (dst * row_bytes, src * row_bytes, n * row_bytes);
+        match gpu.active_stream.as_ref() {
+            // Stream-ordered: the moves serialize against each other and against
+            // the verify that produced the rows, with no host-side drain.
+            Some(stream) => gpu.hip.memcpy_dtod_async_at(
+                &buf.buf, dst_off, &buf.buf, src_off, size, stream,
+            )?,
+            None => gpu
+                .hip
+                .memcpy_dtod_at(&buf.buf, dst_off, &buf.buf, src_off, size)?,
+        }
+    }
+    Ok(())
+}
+
+/// DDTree post-accept gather: relocate the accepted chain's rows from their
+/// linearization slots into the committed linear slots.
+///
+/// The tree verify already wrote every node's K/V at its OWN slot (commit
+/// 39aa358 decoupled the two: RoPE rotates at DEPTH positions while KV writes
+/// use flat physical slots), and the i-th accepted node sits at depth `i + 1`,
+/// so its baked-in RoPE phase already equals its committed linear position.
+/// The bytes are correct where they sit — only the row INDEX is wrong when the
+/// greedy walk detoured off the spine. Moving them is therefore equivalent to
+/// (and cheaper than) re-running the committed prefix through a second verify.
+///
+/// Covers all three row-addressed structures the rest of the cycle consumes:
+/// the target KV cache (per full-attention layer, plus the separate scale planes
+/// in `quant_int8` mode), the GDN tape (per linear-attention layer), and the
+/// extracted-hidden ring. Afterwards the cycle is indistinguishable from a spine
+/// accept, so every downstream consumer takes its fast path unchanged.
+fn ddtree_gather_committed_rows(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    gdn_tape: &GdnTape,
+    hidden_rb: &HiddenStateRingBuffer,
+    position: usize,
+    block_size: usize,
+    accepted_node_indices: &[usize],
+) -> HipResult<()> {
+    let runs = ddtree_commit_row_runs(accepted_node_indices);
+    if runs.is_empty() {
+        return Ok(());
+    }
+
+    // ── target KV cache ───────────────────────────────────────────────────
+    // Row stride is derived from the allocation rather than recomputed per
+    // quant mode: every K/V layout here is `physical_cap` rows of equal size,
+    // and re-deriving it would duplicate five mode-specific formulas.
+    let cap = target.kv_cache.physical_cap.max(1);
+    let kv_moves: Vec<(usize, usize, usize)> = runs
+        .iter()
+        .map(|&(d, s, n)| (position + d, position + s, n))
+        .collect();
+    for li in 0..target.config.layer_types.len() {
+        if target.config.layer_types[li] != qwen35::LayerType::FullAttention {
+            continue;
+        }
+        for plane in [
+            target.kv_cache.k_gpu.get(li),
+            target.kv_cache.v_gpu.get(li),
+            target.kv_cache.k_scales.get(li),
+            target.kv_cache.v_scales.get(li),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let bytes = plane.byte_size();
+            if bytes == 0 {
+                continue;
+            }
+            move_rows_in_place(gpu, plane, bytes / cap, &kv_moves)?;
+        }
+    }
+
+    // ── GDN tape (block-local rows) ───────────────────────────────────────
+    let gate_row_bytes = gdn_tape.n_v_heads * 4;
+    for la in 0..gdn_tape.qkv_bufs.len() {
+        move_rows_in_place(gpu, &gdn_tape.qkv_bufs[la], gdn_tape.qkv_dim * 4, &runs)?;
+        move_rows_in_place(gpu, &gdn_tape.alpha_bufs[la], gate_row_bytes, &runs)?;
+        move_rows_in_place(gpu, &gdn_tape.beta_bufs[la], gate_row_bytes, &runs)?;
+    }
+
+    // ── extracted-hidden ring ─────────────────────────────────────────────
+    // Ring slots wrap, so these go row-by-row through the ring mapping instead
+    // of as coalesced runs (the no-scratch argument above survives the wrap
+    // because distinct block rows map to distinct slots).
+    let ring_moves: Vec<(usize, usize, usize)> = runs
+        .iter()
+        .flat_map(|&(d, s, n)| (0..n).map(move |k| (d + k, s + k, 1)))
+        .map(|(d, s, n)| {
+            (
+                hidden_rb.block_row_slot(block_size, d),
+                hidden_rb.block_row_slot(block_size, s),
+                n,
+            )
+        })
+        .collect();
+    let hidden_row_bytes = hidden_rb.hidden_dim * 4;
+    for buf in &hidden_rb.layer_bufs {
+        move_rows_in_place(gpu, buf, hidden_row_bytes, &ring_moves)?;
+    }
+    Ok(())
+}
+
 /// Batched tree-verify counterpart of `spec_step_ddtree`. Replaces the
 /// per-path DFS with a single `verify_dflash_block_tree` call using the
 /// FA tree-attention mask infrastructure (commits 835aa46 / f0ee980 /
@@ -5072,8 +5230,6 @@ pub fn spec_step_ddtree_batched(
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
     let vocab = target.config.vocab_size;
-    let h = draft_cfg.hidden;
-    let ne = draft_cfg.num_extract();
     assert!(b >= 2, "spec_step_ddtree_batched: block_size must be ≥ 2");
     // Stage 1b: target_hidden_host is no longer maintained in the GPU-resident
     // default path (ctx_slice=None). The length-invariant assert is removed
@@ -5458,6 +5614,10 @@ pub fn spec_step_ddtree_batched(
             fast_tape_ok, accept_len, spine_accept, use_tree_la, fast, slow,
         );
     }
+    // True when the block's rows sit in committed order (either the accept
+    // followed the spine, or the gather below put them there), which is what
+    // lets the hidden commit take its GPU-resident fast path.
+    let committed_row_order;
     let hidden_rows_written;
     if fast_tape_ok {
         // Tape already captured in tree verify. Restore + replay directly.
@@ -5470,6 +5630,34 @@ pub fn spec_step_ddtree_batched(
             accept_len + 1,
         )?;
         hidden_rows_written = big_n;
+        committed_row_order = true;
+    } else if !force_slow {
+        // Post-accept gather instead of a second forward: the tree verify
+        // already produced every accepted row at its own linearization slot,
+        // with the correct baked-in RoPE phase (the i-th accepted node has
+        // depth i+1, so its phase IS its committed position). Relocating those
+        // rows into the committed slots reproduces what the re-verify below
+        // would compute, without the ~40-50 ms forward that fired on ~31% of
+        // cycles at topk=2.
+        ddtree_gather_committed_rows(
+            gpu,
+            target,
+            gdn_tape,
+            hidden_rb,
+            position,
+            big_n,
+            &accepted_node_indices,
+        )?;
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+        gdn_tape.replay_gdn(
+            gpu,
+            &target.weights,
+            &target.config,
+            &mut target.dn_state,
+            accept_len + 1,
+        )?;
+        hidden_rows_written = big_n;
+        committed_row_order = true;
     } else {
         // Slow path (non-spine accept): re-verify the committed prefix to
         // get a linear-order tape AND correctly RoPE'd K written to committed
@@ -5495,6 +5683,8 @@ pub fn spec_step_ddtree_batched(
             accept_len + 1,
         )?;
         hidden_rows_written = tape_block.len();
+        // The re-verify wrote committed-order rows itself.
+        committed_row_order = true;
     }
 
     // ── 11. D2D-scatter committed rows into draft_scratch.target_hidden ─
@@ -5512,47 +5702,38 @@ pub fn spec_step_ddtree_batched(
     // Slow-tape: the 2nd verify (above) wrote exactly accept_len+1 rows in
     // committed order to hidden_rb. Pass block_size=rows_to_keep.
     //
-    // CPU-gather branch (hidden_rows_written==big_n && !fast_tape_ok): reachable
-    // only via HIPFIRE_DDTREE_FORCE_SLOW=1 on a topk-1 (linear) tree whose whole
-    // chain is accepted, where the slow path writes big_n linear rows. Every
-    // other case takes the GPU-resident scatter (else) below.
+    // Every branch above leaves hidden_rb in committed row order — the accept
+    // followed the spine, the post-accept gather relocated the rows, or the
+    // force-slow re-verify wrote them directly — so this is unconditionally the
+    // GPU-resident scatter. (The old host-gather arm that read
+    // `accepted_node_indices` on the CPU is gone: it maintained only
+    // `target_hidden_host`, skipping both the GPU scatter and the thlog append,
+    // which would leave the drafter with an unwritten row hole.)
     let rows_to_keep = accept_len + 1;
-    let row_stride = ne * h;
-    if hidden_rows_written == big_n && !fast_tape_ok {
-        // CPU-gather from the big_n-row block. The host download is kept here
-        // because this branch gathers via host indices — it would need a
-        // separate D2D gather kernel to go fully GPU-resident. The CPU path
-        // (target_hidden_host) is the only consumer.
-        let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
-        target_hidden_host.extend_from_slice(&hidden_block[0..row_stride]);
-        for i in 0..accept_len {
-            let src_row = accepted_node_indices[i] + 1;
-            let src_start = src_row * row_stride;
-            target_hidden_host.extend_from_slice(&hidden_block[src_start..src_start + row_stride]);
-        }
-    } else {
-        // Fast-tape: block_size=big_n, n_rows=rows_to_keep (take committed prefix).
-        // Slow-tape: block_size=rows_to_keep=hidden_rows_written (linear order).
-        let block_size = hidden_rows_written; // big_n for fast, rows_to_keep for slow
-        scatter_hidden_block_to_interleaved(
-            gpu,
-            hidden_rb,
-            &draft_scratch.target_hidden,
-            position,
-            block_size,
-            rows_to_keep,
-            draft_scratch.ctx_modulus(),
-        )?;
-        let co = target.kv_cache.compact_offset as i32;
-        draft_scratch
-            .thlog
-            .append_committed(position, rows_to_keep, co);
-        // Stage 1b: GPU buffer (scratch.target_hidden) is now authoritative —
-        // the D2D scatter above populated it. No CPU download needed; the
-        // next cycle's draft_forward receives None and skips H2D entirely.
-        // target_hidden_host is intentionally NOT updated (it's unused in the
-        // GPU-resident path).
-    }
+    debug_assert!(
+        committed_row_order,
+        "hidden_rb rows must be in committed order before the scatter"
+    );
+    // Fast/gathered: block_size=big_n, n_rows=rows_to_keep (committed prefix).
+    // Force-slow: block_size=rows_to_keep=hidden_rows_written (linear order).
+    let block_size = hidden_rows_written;
+    scatter_hidden_block_to_interleaved(
+        gpu,
+        hidden_rb,
+        &draft_scratch.target_hidden,
+        position,
+        block_size,
+        rows_to_keep,
+        draft_scratch.ctx_modulus(),
+    )?;
+    let co = target.kv_cache.compact_offset as i32;
+    draft_scratch
+        .thlog
+        .append_committed(position, rows_to_keep, co);
+    // Stage 1b: GPU buffer (scratch.target_hidden) is now authoritative — the
+    // D2D scatter above populated it. No CPU download needed; the next cycle's
+    // draft_forward receives None and skips H2D entirely. target_hidden_host is
+    // intentionally NOT updated (it's unused in the GPU-resident path).
 
     if debug_tm {
         let total = t_all.elapsed();
@@ -5880,6 +6061,63 @@ pub fn apply_eviction_retain_to_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spine accept needs no row motion — this is what keeps the existing
+    /// fast path free of any gather work.
+    #[test]
+    fn commit_runs_empty_on_spine_accept() {
+        assert!(ddtree_commit_row_runs(&[]).is_empty());
+        assert!(ddtree_commit_row_runs(&[0]).is_empty());
+        assert!(ddtree_commit_row_runs(&[0, 1, 2, 3]).is_empty());
+    }
+
+    /// Committed row `i+1` must take linearization slot `accepted[i]+1`, and a
+    /// contiguous stretch sharing one delta must coalesce into a single copy —
+    /// per-row copies would still be correct but cost one D2D launch each,
+    /// across every KV plane and tape buffer.
+    #[test]
+    fn commit_runs_coalesce_uniform_delta() {
+        // Detour at depth 1: slots 2,3,4 carry committed rows 1,2,3 (delta +1).
+        assert_eq!(ddtree_commit_row_runs(&[1, 2, 3]), vec![(1, 2, 3)]);
+        // Spine prefix stays put; only the tail shifts.
+        assert_eq!(ddtree_commit_row_runs(&[0, 1, 3, 4]), vec![(3, 4, 2)]);
+    }
+
+    /// Two detours with different deltas cannot share a run.
+    #[test]
+    fn commit_runs_split_on_delta_change() {
+        // rows 1,2 <- slots 2,3 (delta +1); row 3 <- slot 5 (delta +2).
+        assert_eq!(
+            ddtree_commit_row_runs(&[1, 2, 4]),
+            vec![(1, 2, 2), (3, 5, 1)]
+        );
+    }
+
+    /// The in-place, scratch-free move is only sound because every move reads a
+    /// row at or after the row it writes, with runs ordered by ascending
+    /// destination. Assert that invariant over every monotonically increasing
+    /// accept pattern up to a small bound.
+    #[test]
+    fn commit_runs_never_write_below_a_later_source() {
+        fn check(accepted: &[usize]) {
+            let runs = ddtree_commit_row_runs(accepted);
+            let mut prev_dst_end = 0usize;
+            for &(dst, src, n) in &runs {
+                assert!(src >= dst, "src {src} < dst {dst} would need scratch");
+                assert!(dst >= prev_dst_end, "runs must ascend by destination");
+                prev_dst_end = dst + n;
+            }
+        }
+        // Accepted node indices are strictly increasing (root-to-leaf walk over
+        // a depth-ordered linearization), so enumerate those shapes.
+        for a in 0..6 {
+            for b in (a + 1)..7 {
+                for c in (b + 1)..8 {
+                    check(&[a, b, c]);
+                }
+            }
+        }
+    }
 
     /// CPU mirror of the GPU `softmax_temp_topp_batched_f32` nucleus phase:
     /// bisect tau over [0, p_max] for the inclusive crossing threshold and
