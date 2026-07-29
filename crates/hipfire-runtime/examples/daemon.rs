@@ -5878,13 +5878,28 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
 /// JSONL wire format, byte-identical to `generate_dflash`'s old inline writes.
 /// `t_ms` is the per-step timestamp the inline path attached to committed +
 /// token frames (`t0.elapsed()`); tool_calls frames carry no timing.
-fn render_client_events(stdout: &mut std::io::Stdout, id: &str, events: &[ClientEvent], t_ms: u64) {
+/// `visible` accumulates the client-visible assistant text (the `Token`
+/// payloads, NOT `Reasoning` — those ride a separate channel the client does
+/// not echo back as content). The asst-turn cache fingerprint must hash exactly
+/// these bytes: an OpenAI-compatible client returns this concatenation as the
+/// next turn's assistant content, so hashing the raw token decode instead makes
+/// the store and lookup disagree whenever the emitter's visible output differs
+/// from `decode(streamed_tokens)` — which is precisely what a reasoning channel
+/// guarantees.
+fn render_client_events(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    events: &[ClientEvent],
+    t_ms: u64,
+    visible: &mut String,
+) {
     for ev in events {
         match ev {
             ClientEvent::Committed { id: tok_id, idx } => {
                 emit_committed_event(stdout, id, *tok_id, *idx, t_ms);
             }
             ClientEvent::Token(text) => {
+                visible.push_str(text);
                 let _ = writeln!(
                     stdout,
                     r#"{{"type":"token","id":"{}","text":{}}}"#,
@@ -5957,6 +5972,12 @@ struct SpecRun {
     /// Empty for emitters that don't track it (deepseek4 — its spec path stores
     /// no asst-turn cache).
     streamed_tokens: Vec<u32>,
+    /// Client-visible assistant text, i.e. the concatenated `Token` payloads the
+    /// client echoes back as this turn's assistant content next turn. The
+    /// asst-turn cache fingerprint hashes THIS, not `decode(streamed_tokens)`:
+    /// reasoning rides a separate event channel, so the two differ and hashing
+    /// the raw decode made the store and lookup disagree.
+    visible_text: String,
     /// Newly-prefilled token count (the suffix actually fed through the model).
     prefill_tokens_len: usize,
     /// The terminal flush summary (tool-call count drives the wrapper's
@@ -6397,8 +6418,21 @@ fn generate_dflash(
         }
     }
     if !cached_seq.is_empty() {
-        let stripped = strip_think_for_fingerprint(&decoded_full);
-        let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+        // Hash the bytes the CLIENT will send back next turn — the emitter's
+        // visible `Token` stream — not `decode(streamed_tokens)`. Reasoning is a
+        // separate event channel, so the raw decode still contains thinking text
+        // that never reached the client, and reconstructing the visible form by
+        // tag-stripping is only approximate: it left a whole reasoning block in
+        // (and dropped the answer's leading indentation) on a review-style turn,
+        // so the store hashed 4871 bytes while the lookup hashed the client's
+        // 4865 — a silent miss that cost a 40 s full re-prefill on a 16.5K turn.
+        // Falls back to the decode for emitters that don't track visible text.
+        let visible = if run.visible_text.is_empty() {
+            decoded_full.as_str()
+        } else {
+            run.visible_text.as_str()
+        };
+        let emit_text = normalize_asst_turn_for_fingerprint(visible);
         let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
@@ -6811,12 +6845,14 @@ fn generate_spec(
     // pushes + filters it, seeds the grammar matcher, and reports whether the
     // first token is itself a terminator (→ skip the spec loop entirely, so
     // spec_step_dflash never drafts a whole block seeded on a terminal token).
+    let mut visible_text = String::new();
     let first_begin = emit.begin(first_token);
     render_client_events(
         stdout,
         id,
         &first_begin.events,
         t0.elapsed().as_millis() as u64,
+        &mut visible_text,
     );
     // Count the first token only when the emitter emitted it (see the same guard
     // in the accept loop). qwen35 always emits a `Committed`; the ds4 emitter
@@ -6915,7 +6951,7 @@ fn generate_spec(
             if outcome.stop == Some(StopReason::GrammarViolation) {
                 // Rejected before emit — not added to the repeat context, not
                 // streamed, not counted. Treat as EOS for this turn.
-                render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
+                render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64, &mut visible_text);
                 hit_eos = true;
                 break;
             }
@@ -6928,7 +6964,7 @@ fn generate_spec(
             // broke on accepted-EOS before push/increment).
             if !outcome.events.is_empty() {
                 emitted.push(tok);
-                render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
+                render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64, &mut visible_text);
                 generated += 1;
             }
             // Generation-intervention hook: the emitter may request tokens to
@@ -7001,7 +7037,7 @@ fn generate_spec(
                 let fo = emit.observe(ft);
                 if !fo.events.is_empty() {
                     emitted.push(ft);
-                    render_client_events(stdout, id, &fo.events, t0.elapsed().as_millis() as u64);
+                    render_client_events(stdout, id, &fo.events, t0.elapsed().as_millis() as u64, &mut visible_text);
                     generated += 1;
                 }
                 seed_token = ft;
@@ -7077,13 +7113,14 @@ fn generate_spec(
     // cache; ds4: `spec_k`/`spec_windows`/`spec_accept_pct`), so this core
     // returns a `SpecRun` summary instead of writing them itself.
     let finish = emit.finish();
-    render_client_events(stdout, id, &finish.events, 0);
+    render_client_events(stdout, id, &finish.events, 0, &mut visible_text);
 
     let t_end = Instant::now();
     Some(SpecRun {
         generated,
         spec_cycles,
         spec_accepted,
+        visible_text,
         streamed_tokens,
         prefill_tokens_len: prefill_tokens.len(),
         finish,
