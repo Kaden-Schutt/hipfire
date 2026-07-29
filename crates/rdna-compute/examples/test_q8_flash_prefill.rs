@@ -28,8 +28,22 @@ fn main() {
     // Deterministic pseudo-random KV: varied scales and codes so a wrong
     // dequant, wrong block stride or wrong GQA head cannot pass by symmetry.
     let mut kv = vec![0u8; cache_bytes];
+    // KVEXACT=1 forces every block scale to 1.0, so the dequantised value is
+    // just the int8 code — exactly representable in f16. Any residual WMMA
+    // error under this mode therefore cannot come from K/V rounding.
+    let kv_exact = std::env::var("KVEXACT").as_deref() == Ok("1");
     for (bi, blk) in kv.chunks_mut(34).enumerate() {
-        let scale: f32 = 0.02 + ((bi % 13) as f32) * 0.005;
+        // Powers of two in the SAME magnitude band as the normal scales
+        // (0.031/0.016/0.008 vs 0.02-0.08), so only representability changes:
+        // a power-of-two scale times an 8-bit code is exact in f16. Using
+        // scale=1.0 instead would blow the score magnitudes up and collapse
+        // the softmax to near one-hot — a different regime, not a controlled
+        // precision isolation.
+        let scale: f32 = if kv_exact {
+            [0.03125f32, 0.015625, 0.0078125][bi % 3]
+        } else {
+            0.02 + ((bi % 13) as f32) * 0.005
+        };
         let h = half_from_f32(scale);
         blk[0] = (h & 0xFF) as u8;
         blk[1] = (h >> 8) as u8;
@@ -46,9 +60,17 @@ fn main() {
     }
     let v_cache = gpu.upload_raw(&kv2, &[cache_bytes]).expect("v upload");
 
-    let q_data: Vec<f32> = (0..n * nh * hd)
+    let mut q_data: Vec<f32> = (0..n * nh * hd)
         .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.01)
         .collect();
+    // QF16=1: pre-round Q through f16 and back. Run with KERNEL=scalar (an
+    // otherwise-f32 path) to isolate how much of the WMMA kernel's error comes
+    // from the A fragment having to be f16, independent of everything else.
+    if std::env::var("QF16").as_deref() == Ok("1") {
+        for v in q_data.iter_mut() {
+            *v = f32::from_bits(round_f16(*v));
+        }
+    }
     let q = gpu.upload_f32(&q_data, &[n * nh * hd]).expect("q upload");
 
     // POS=tail  : positions[b] = ctx - n + b   (contiguous tail chunk)
@@ -116,6 +138,8 @@ fn main() {
     // cancellation amplifies input rounding, even when the vector is correct.
     let mut min_cos = 1.0f32;
     let mut max_rel_l2 = 0.0f32;
+    let mut compared = 0usize;
+    let mut degenerate = 0usize;
     for vec_i in 0..(n * nh) {
         let s = vec_i * hd;
         let (mut dot, mut na, mut nb, mut nd) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -128,8 +152,29 @@ fn main() {
         if na > 0.0 && nb > 0.0 {
             min_cos = min_cos.min((dot / (na.sqrt() * nb.sqrt())) as f32);
             max_rel_l2 = max_rel_l2.max((nd.sqrt() / na.sqrt()) as f32);
+            compared += 1;
+        } else if na > 0.0 {
+            // Reference has signal but the candidate vector is all-zero.
+            // Without this branch such a vector is silently SKIPPED, leaving
+            // min_cos at 1.0 and rel_l2 at 0.0 — so an all-zero kernel output
+            // passes VACUOUSLY. Observed for real: a broken SPLIT_Q variant
+            // emitted all zeros and this suite reported PASS.
+            degenerate += 1;
         }
     }
+    assert!(
+        b.iter().all(|v| v.is_finite()),
+        "candidate output contains non-finite values"
+    );
+    assert!(
+        degenerate == 0,
+        "{degenerate} candidate vectors are all-zero while the reference is not"
+    );
+    assert!(
+        compared == n * nh,
+        "only {compared} of {} vectors were comparable",
+        n * nh
+    );
     println!("kernel={kernel} nh={nh} nkv={nkv} hd={hd} n={n} ctx={ctx} br={br} bc={bc} pos={pos_mode}");
     println!(
         "max_abs={max_abs_all:.3e} worst_tol_ratio={worst_ratio:.3} \
@@ -176,4 +221,30 @@ fn half_from_f32(x: f32) -> u16 {
         return sign | 0x7C00;
     }
     sign | ((exp as u16) << 10) | (mant as u16)
+}
+
+/// Round an f32 through IEEE binary16 and back, returning the f32 bit pattern.
+/// Round-to-nearest-even on the mantissa; the magnitudes here never reach the
+/// f16 exponent limits.
+fn round_f16(x: f32) -> u32 {
+    let b = x.to_bits();
+    let sign = b & 0x8000_0000;
+    let exp = ((b >> 23) & 0xFF) as i32;
+    let mant = b & 0x007F_FFFF;
+    if exp == 0 || exp == 0xFF {
+        return b;
+    }
+    // f16 keeps 10 mantissa bits; round-to-nearest-even on bit 13.
+    let keep = mant & !0x1FFF;
+    let rem = mant & 0x1FFF;
+    let mut out_mant = keep;
+    let mut out_exp = exp;
+    if rem > 0x1000 || (rem == 0x1000 && (keep & 0x2000) != 0) {
+        out_mant = keep + 0x2000;
+        if out_mant > 0x007F_FFFF {
+            out_mant = 0;
+            out_exp += 1;
+        }
+    }
+    sign | ((out_exp as u32) << 23) | out_mant
 }
