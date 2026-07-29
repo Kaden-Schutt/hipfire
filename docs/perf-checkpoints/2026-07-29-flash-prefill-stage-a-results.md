@@ -325,6 +325,60 @@ storing LDS as f16 and never staging K — each B fragment is dequantised straig
 from the Q8_0 cache, and the 16×16×16 fragment shape reuses it across 16 query
 rows, amortising the dequant by the layout itself.
 
+## The intermittent long-context degeneracy: four dead hypotheses
+
+Throughout this work, long-context real-prose runs occasionally produce
+degenerate output (`finish=length` with a handful of answer words; content is
+multilingual gibberish). It is NOT caused by anything on this branch, and it is
+not explained. Recording the negative results so nobody repeats them.
+
+Measured rates, degeneracy = `finish=length` AND `ans_words < 100` (a long
+answer merely truncated at the token cap does not count):
+
+| arm | rate |
+|---|---|
+| WMMA (flip replication + fragile-prompt probe) | **0/36** |
+| flash OFF, ctx<8192 → legacy LDS kernel | **0/18** |
+| flash OFF, ctx>8192 → tiled fallback | **0/18** |
+| flash OFF, earlier batch, ctx>8192 | **8/24 (33%)** |
+| flash ON (scalar), earlier batch | 6/30 (20%) |
+| flash OFF, earliest batch | 1/18 (5.6%) |
+
+**Ruled out:**
+
+1. **Redline retained routes.** Claimed, then retracted: repeats gave 5/6, 5/6,
+   2/6, 0/6, 0/6, 0/6, and a matched flash-OFF control degenerated too
+   (6/30 vs 1/18, Fisher p=0.231, not significant).
+2. **PM4 register elision.** `HIPFIRE_REPLAY_PM4_STATEFUL=legacy` was clean —
+   but so was the default `static` in the same session.
+3. **The flash/WMMA kernel.** 0/36, and the default-on flip measured 0/24
+   against 8/24 for the control (p=0.004) — i.e. if anything the new kernel
+   looks *better*, which is itself a reason not to trust the comparison.
+4. **The tiled fallback.** 0/18 at ctx>8192 with flash off, in the same band
+   and configuration that previously gave 8/24.
+
+**What survives:** the rate is unstable across batches under a *fixed* nominal
+configuration (0% → 33%), and the only variable that differs between the 8/24
+batch and the 0/18 batch is which corpus slices were used. Per-prompt rates do
+vary (one slice degenerated 3/8 while another was 0/8 in the same pooled data) —
+but that same 3/8 slice later ran 0/8 with fresh prefill each time. So content
+matters and content alone does not determine it.
+
+The most likely remaining explanation is intrinsic: occasional sampling collapse
+at long context on documentation-style text (`temperature 0.7`, `top_p 0.8`,
+`presence_penalty 1.5`), whose probability depends on the specific text. That is
+a model/sampling characteristic, not a kernel defect — but it is not proven, and
+it should not be asserted without evidence.
+
+**Why this method cannot settle it, and what would:** end-to-end output
+classification has a per-request cost of ~25-45 s at these contexts and a noisy
+binary outcome, so distinguishing a 5% from a 20% rate needs hundreds of
+requests per arm. The efficient instrument is logit-level: capture the
+per-position distribution at the point where a run diverges from a known-good
+reference, and compare entropy/top-1 margin at the divergence point rather than
+classifying the final text. `flash_prefill_quality.rs` already emits per-position
+records and is the natural place to build that.
+
 ## Next
 
 1. Stage C (WMMA inner math) is **unblocked** — the tiling foundation is in
