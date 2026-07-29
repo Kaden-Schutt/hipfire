@@ -567,6 +567,25 @@ mod target_hidden_log {
                 base_pos,
                 "append_committed: abs_positions out of sync with base_pos"
             );
+            // Release-visible companion to the assert above: a `base_pos` ahead
+            // of the row count means positions advanced without committing
+            // their target_hidden rows, so the buffer keeps an UNWRITTEN hole
+            // (uninitialized => NaN) that poisons every later draft forward.
+            // The debug_assert is compiled out in release, which is how this
+            // stayed invisible.
+            if self.abs_positions.len() != base_pos {
+                static GAP_SEEN: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if GAP_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    eprintln!(
+                        "[dflash] THLOG GAP: rows={} base_pos={} n={} (hole of {} row(s))",
+                        self.abs_positions.len(),
+                        base_pos,
+                        n,
+                        base_pos.saturating_sub(self.abs_positions.len())
+                    );
+                }
+            }
             self.uploaded_rows = base_pos + n;
             for p in 0..n {
                 self.abs_positions
