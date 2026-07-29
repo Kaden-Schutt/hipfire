@@ -60,18 +60,25 @@ fn main() {
     }
     let v_cache = gpu.upload_raw(&kv2, &[cache_bytes]).expect("v upload");
 
-    let mut q_data: Vec<f32> = (0..n * nh * hd)
+    let q_data: Vec<f32> = (0..n * nh * hd)
         .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.01)
         .collect();
-    // QF16=1: pre-round Q through f16 and back. Run with KERNEL=scalar (an
-    // otherwise-f32 path) to isolate how much of the WMMA kernel's error comes
-    // from the A fragment having to be f16, independent of everything else.
-    if std::env::var("QF16").as_deref() == Ok("1") {
-        for v in q_data.iter_mut() {
-            *v = f32::from_bits(round_f16(*v));
-        }
-    }
+    // QF16=1 isolates Q's rounding contribution: the REFERENCE keeps full-f32
+    // Q while the CANDIDATE gets Q pre-rounded through f16. Pair with
+    // KERNEL=scalar (otherwise an f32 path) so Q's precision is the ONLY
+    // difference between the two arms.
+    //
+    // An earlier version rounded q_data before a SINGLE shared upload, so both
+    // arms saw the same rounded Q and the comparison measured nothing — it
+    // reported ~1e-6 and led me to wrongly clear Q as a contributor.
+    let qf16 = std::env::var("QF16").as_deref() == Ok("1");
     let q = gpu.upload_f32(&q_data, &[n * nh * hd]).expect("q upload");
+    let q_cand = if qf16 {
+        let rounded: Vec<f32> = q_data.iter().map(|&v| f32::from_bits(round_f16(v))).collect();
+        gpu.upload_f32(&rounded, &[n * nh * hd]).expect("q_cand upload")
+    } else {
+        gpu.upload_f32(&q_data, &[n * nh * hd]).expect("q_cand upload")
+    };
 
     // POS=tail  : positions[b] = ctx - n + b   (contiguous tail chunk)
     // POS=ragged: every row gets a different, non-monotonic causal window,
@@ -102,12 +109,12 @@ fn main() {
     match kernel.as_str() {
         "wmma" => gpu
             .attention_q8_0_flash_prefill_wmma(
-                &q, &k_cache, &v_cache, &out_new, &positions, nh, nkv, hd, n,
+                &q_cand, &k_cache, &v_cache, &out_new, &positions, nh, nkv, hd, n,
             )
             .expect("wmma flash prefill kernel"),
         _ => gpu
             .attention_q8_0_flash_prefill(
-                &q, &k_cache, &v_cache, &out_new, &positions, nh, nkv, hd, ctx, n, br, bc,
+                &q_cand, &k_cache, &v_cache, &out_new, &positions, nh, nkv, hd, ctx, n, br, bc,
             )
             .expect("flash prefill kernel"),
     }

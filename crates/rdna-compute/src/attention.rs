@@ -1927,17 +1927,38 @@ impl Gpu {
         self.bind_thread()?;
         assert!(head_dim % 32 == 0, "head_dim {head_dim} must be a multiple of 32");
         assert!(head_dim <= 256, "head_dim {head_dim} exceeds MAX_D_CHUNKS*16");
-        self.ensure_kernel(
-            "attention_q8_0_flash_prefill_wmma",
-            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC,
-            "attention_q8_0_flash_prefill_wmma",
-        )?;
+        // HIPFIRE_FLASH_PREFILL_SPLITQ=1 carries Q as a double-single (hi+lo)
+        // pair through two WMMA passes per d-chunk. Q's f16 rounding is the
+        // dominant error term — f16 Q alone through an otherwise-f32 kernel
+        // gives rel_l2 5.36e-4 of a 5.48e-4 total at CTX=12288 — so this is the
+        // accuracy lever. Costs one extra matrix op per d-chunk and a second Q
+        // plane in LDS.
+        let split_q = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_SPLITQ")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let module = if split_q {
+            "attention_q8_0_flash_prefill_wmma_splitq"
+        } else {
+            "attention_q8_0_flash_prefill_wmma"
+        };
+        let src = format!(
+            "#define SPLIT_Q {}\n{}",
+            split_q as u32,
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC
+        );
+        self.ensure_kernel(module, &src, "attention_q8_0_flash_prefill_wmma")?;
         const M_TILE: usize = 16;
         const N_TILE: usize = 16;
         const S_STRIDE: usize = 18;
         const V_STRIDE: usize = 18;
-        // Q f16 + V^T f16 + S f16 + (m,l,alpha) f32
-        let lds = (M_TILE * head_dim + head_dim * V_STRIDE + M_TILE * S_STRIDE) * 2
+        // MUST track the kernel's LDS layout: SPLIT_Q adds a second Q plane.
+        // Under-allocating here overruns V_lds_T / S_lds / m_lds and the kernel
+        // silently emits all zeros — observed, and it passed the accuracy gate
+        // until that gate was hardened to reject degenerate output.
+        let q_planes = if split_q { 2 } else { 1 };
+        // Q(xN planes) f16 + V^T f16 + S f16 + (m,l,alpha) f32
+        let lds = (q_planes * M_TILE * head_dim + head_dim * V_STRIDE + M_TILE * S_STRIDE) * 2
             + M_TILE * 3 * 4;
         assert!(lds <= 64 * 1024, "wmma flash prefill LDS {lds} exceeds 64KB");
 

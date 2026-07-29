@@ -40,6 +40,14 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
 #define S_STRIDE 18 // N_TILE + 2 padding, breaks LDS bank conflicts
 #define V_STRIDE 18 // N_TILE + 2 padding
 #define MAX_D_CHUNKS 16 // head_dim / 16, bounded so O_frags is a fixed array
+#ifndef SPLIT_Q
+// 1 = carry Q as a double-single (hi+lo) pair through two WMMA passes.
+// Rounding Q to f16 for the A fragment was MEASURED to be the dominant error
+// term: f16 Q alone through an otherwise-f32 kernel gives rel_l2 5.36e-4 of a
+// 5.48e-4 total at CTX=12288 (82-98% across shapes). Everything else -- K, V,
+// P, the accumulator -- contributes ~1.1e-4 combined.
+#define SPLIT_Q 0
+#endif
 
 extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wmma(
     const float* __restrict__ q,               // [batch_size × n_heads × head_dim]
@@ -75,7 +83,12 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
 
     extern __shared__ char smem_raw[];
     _Float16* Q_lds   = (_Float16*)smem_raw;                        // [M_TILE][head_dim]
+#if SPLIT_Q
+    _Float16* Q_lo_lds = Q_lds + M_TILE * head_dim;                 // [M_TILE][head_dim]
+    _Float16* V_lds_T = Q_lo_lds + M_TILE * head_dim;               // [head_dim][V_STRIDE]
+#else
     _Float16* V_lds_T = Q_lds + M_TILE * head_dim;                  // [head_dim][V_STRIDE]
+#endif
     _Float16* S_lds   = V_lds_T + head_dim * V_STRIDE;              // [M_TILE][S_STRIDE]
     float*    m_lds   = (float*)(S_lds + M_TILE * S_STRIDE);        // [M_TILE]
     float*    l_lds   = m_lds + M_TILE;                             // [M_TILE]
@@ -87,9 +100,14 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     for (int i = lane; i < M_TILE * head_dim; i += 32) {
         const int r = i / head_dim;
         const int d = i % head_dim;
-        Q_lds[i] = (r < rows)
-            ? (_Float16)q[(long long)(q_base + r) * q_stride + h * head_dim + d]
-            : (_Float16)0.0f;
+        const float qv = (r < rows)
+            ? q[(long long)(q_base + r) * q_stride + h * head_dim + d]
+            : 0.0f;
+        const _Float16 qhi = (_Float16)qv;
+        Q_lds[i] = qhi;
+#if SPLIT_Q
+        Q_lo_lds[i] = (_Float16)(qv - (float)qhi);
+#endif
     }
     if (lane < M_TILE) {
         m_lds[lane] = -INFINITY;
@@ -128,7 +146,10 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
                 const int d0 = dc * 16;
                 half16_t a_reg;
                 for (int j = 0; j < 16; ++j) a_reg[j] = Q_lds[half * head_dim + d0 + j];
-
+#if SPLIT_Q
+                half16_t a_lo;
+                for (int j = 0; j < 16; ++j) a_lo[j] = Q_lo_lds[half * head_dim + d0 + j];
+#endif
                 half16_t b_reg;
                 if (k_ok) {
                     // 16 consecutive dims sit inside one 32-dim Q8_0 block.
@@ -141,6 +162,9 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
                     for (int j = 0; j < 16; ++j) b_reg[j] = (_Float16)0.0f;
                 }
                 s_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, s_acc);
+#if SPLIT_Q
+                s_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_lo, b_reg, s_acc);
+#endif
             }
         }
 
