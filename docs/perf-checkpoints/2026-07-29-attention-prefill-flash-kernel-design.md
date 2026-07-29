@@ -128,10 +128,18 @@ Three tiers, cheapest first. Every stage must pass all three.
    kernel. Concrete tolerance (fp32 re-association over ≤16K accumulation
    steps): **max relative error ≤ 1e-4** on any output element with
    `|ref| > 1e-3`, **max absolute error ≤ 1e-5** otherwise, and **cosine
-   similarity ≥ 1 - 1e-6** per (query, head) output vector. A failure outside
-   these bounds is a bug, not re-association. Must cover: `seq_len` not a
-   multiple of Bc, `seq_len < Bc`, ragged `positions[]`, and
-   `n_kv_heads < n_heads` (GQA).
+   similarity ≥ 1 - 1e-6** per (query, head) output vector.
+
+   **Superseded during Task 1.** That split criterion is discontinuous at the
+   `1e-3` boundary — an identical absolute error passes or fails depending on
+   which side `|ref|` lands — and it produced a spurious failure on the first
+   *correct* kernel (max_abs 1.2e-7, cosine exactly 1.0, yet "max_rel 2.7e-4").
+   The implemented criterion is the numpy-`allclose` combined form:
+   **|ref − new| ≤ ATOL + RTOL·|ref|** with ATOL=1e-5, RTOL=1e-4, plus cosine
+   ≥ 1 − 1e-6. It remains strict: the passing single-tile kernel consumes 6.3%
+   of the tolerance budget at its worst element. A failure outside these bounds
+   is a bug, not re-association. Must cover: `seq_len` not a multiple of Bc,
+   `seq_len < Bc`, ragged `positions[]`, and `n_kv_heads < n_heads` (GQA).
 2. **Kernel perf** — `crates/rdna-compute/examples/q8_batched_attn_microbench.rs`
    (env-parameterised `NH/NKV/HD/N/CTX/ITERS`), swept over CTX, plus a Br/Bc
    sweep. No model load.

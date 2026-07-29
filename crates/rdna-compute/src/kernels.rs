@@ -3827,6 +3827,11 @@ pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/atten
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
 
+/// Query-tiled Q8_0 flash prefill attention. LDS depends only on BR/BC,
+/// never on context length, so one kernel serves every sequence length.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill.hip");
+
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each
 /// of the 3 internal phases (QK^T, softmax, V-weighted-sum). Writes per-head

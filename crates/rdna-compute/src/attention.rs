@@ -1812,6 +1812,100 @@ impl Gpu {
         result
     }
 
+    /// Query-tiled Q8_0 flash prefill attention.
+    ///
+    /// `br`/`bc` are compile-time tile sizes; each (br, bc) pair compiles to
+    /// its own module so they can be swept without editing the source. LDS is
+    /// a function of br/bc only — never of context length — so this kernel has
+    /// no capacity crossover and no occupancy decay as the context grows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        br: usize,
+        bc: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const NTHREADS: usize = 256;
+        // The kernel's per-thread accumulator is a fixed float[32]; dpt must
+        // fit it or the kernel would silently overrun its stack array.
+        let dpt = head_dim / (NTHREADS / br);
+        assert!(
+            dpt <= 32,
+            "flash prefill dpt {dpt} > 32 (br={br} head_dim={head_dim}); \
+             raise NTHREADS or lower br"
+        );
+        let module = format!("attention_q8_0_flash_prefill_br{br}_bc{bc}");
+        let src = format!(
+            "#define BR {br}\n#define BC {bc}\n#define NTHREADS {NTHREADS}\n{}",
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
+        );
+        self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill")?;
+
+        let bph = head_dim / 32;
+        let lds = (br * bc + 3 * br + br * head_dim) * 4 + 2 * bc * bph * 34;
+        assert!(
+            lds <= 64 * 1024,
+            "flash prefill LDS {lds} exceeds 64KB (br={br} bc={bc})"
+        );
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let _ = max_ctx_len; // cache stride derives from n_kv_heads/head_dim
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let grid_x = batch_size.div_ceil(br) as u32;
+        self.launch_maybe_blob(
+            "attention_q8_0_flash_prefill",
+            [grid_x, n_heads as u32, 1],
+            [NTHREADS as u32, 1, 1],
+            lds as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        )
+    }
+
     /// Batched flash attention for Q8_0 KV — tile + reduce two-kernel path.
     /// No LDS capacity limit: tiles seq_len into chunks of `tile_size` only,
     /// so shared memory is O(tile_size), not O(max_ctx_len). Replaces the
