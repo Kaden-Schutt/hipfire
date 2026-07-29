@@ -20,6 +20,22 @@
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
 #include <hip/hip_runtime.h>
 
+static __device__ __forceinline__ unsigned int q8_tile_load_u32(
+    const unsigned char* p
+) {
+    unsigned int packed;
+    __builtin_memcpy(&packed, p, sizeof(packed));
+    return packed;
+}
+
+static __device__ __forceinline__ unsigned long long q8_tile_load_u64(
+    const unsigned char* p
+) {
+    unsigned long long packed;
+    __builtin_memcpy(&packed, p, sizeof(packed));
+    return packed;
+}
+
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_q8_0_tile_batched(
     const float* __restrict__ q,               // [sub_batch × n_heads × head_dim]
@@ -110,6 +126,14 @@ __global__ void attention_flash_q8_0_tile_batched(
     // mq[]/out_vec[] arrays stay sized 8 (the hd=256 max).
     const int dpt = head_dim / 32;
     const int d0 = tid * dpt;
+    // dpt is a runtime kernarg-derived trip count, so LLVM cannot prove that
+    // d0=tid*dpt is block-aligned and does not LICM the Q8 address/scale loads.
+    // A lane's span shares one Q8_0 block only when the head has complete
+    // 32-element blocks and the span does not cross a block boundary. The
+    // production hd=128/256 shapes satisfy this with dpt=4/8; retain the
+    // original per-dimension addressing as the fallback for every other shape.
+    const bool lane_one_q8_block = head_dim % 32 == 0 && dpt <= 32
+                                && (d0 % 32) + dpt <= 32;
     float mq[8];
     for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
 
@@ -121,13 +145,40 @@ __global__ void attention_flash_q8_0_tile_batched(
             continue;                      // t is wave-uniform, so all lanes skip together
         }
         float partial = 0.0f;
-        for (int i = 0; i < dpt; i++) {
-            const int d = d0 + i;
-            const int bi = d / 32;
-            const int bj = d % 32;
-            const unsigned char* kb = k_cache + (size_t)t * row_stride + (kv_head_blk + bi) * 34;
-            float ks = (float)*((const _Float16*)kb);
-            partial += mq[i] * (ks * (float)((signed char)kb[2 + bj]));
+        if (lane_one_q8_block && dpt == 8) {
+            const int bi = d0 / 32;
+            const int bj = d0 % 32;
+            const unsigned char* kb = k_cache + (size_t)t * row_stride
+                                    + (kv_head_blk + bi) * 34;
+            const float ks = (float)*((const _Float16*)kb);
+            const unsigned long long packed = q8_tile_load_u64(kb + 2 + bj);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const signed char quant = (signed char)(packed >> (8 * i));
+                partial += mq[i] * (ks * (float)quant);
+            }
+        } else if (lane_one_q8_block && dpt == 4) {
+            const int bi = d0 / 32;
+            const int bj = d0 % 32;
+            const unsigned char* kb = k_cache + (size_t)t * row_stride
+                                    + (kv_head_blk + bi) * 34;
+            const float ks = (float)*((const _Float16*)kb);
+            const unsigned int packed = q8_tile_load_u32(kb + 2 + bj);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const signed char quant = (signed char)(packed >> (8 * i));
+                partial += mq[i] * (ks * (float)quant);
+            }
+        } else {
+            for (int i = 0; i < dpt; i++) {
+                const int d = d0 + i;
+                const int bi = d / 32;
+                const int bj = d % 32;
+                const unsigned char* kb = k_cache + (size_t)t * row_stride
+                                        + (kv_head_blk + bi) * 34;
+                const float ks = (float)*((const _Float16*)kb);
+                partial += mq[i] * (ks * (float)((signed char)kb[2 + bj]));
+            }
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
@@ -162,17 +213,51 @@ __global__ void attention_flash_q8_0_tile_batched(
 
     // Phase D: V-weighted accumulation (Q8_0)
     float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        float w = scores[t_local];
-        int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * row_stride;
-        for (int i = 0; i < dpt; i++) {
-            const int d = d0 + i;
-            const int bi = d / 32;
-            const int bj = d % 32;
-            const unsigned char* vbh = vb + (kv_head_blk + bi) * 34;
-            float vs = (float)*((const _Float16*)vbh);
-            out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+    if (lane_one_q8_block && dpt == 8) {
+        const int bi = d0 / 32;
+        const int bj = d0 % 32;
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            const float w = scores[t_local];
+            const int t = tile_start + t_local;
+            const unsigned char* vbh = v_cache + (size_t)t * row_stride
+                                     + (kv_head_blk + bi) * 34;
+            const float vs = (float)*((const _Float16*)vbh);
+            const unsigned long long packed = q8_tile_load_u64(vbh + 2 + bj);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const signed char quant = (signed char)(packed >> (8 * i));
+                out_vec[i] += w * (vs * (float)quant);
+            }
+        }
+    } else if (lane_one_q8_block && dpt == 4) {
+        const int bi = d0 / 32;
+        const int bj = d0 % 32;
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            const float w = scores[t_local];
+            const int t = tile_start + t_local;
+            const unsigned char* vbh = v_cache + (size_t)t * row_stride
+                                     + (kv_head_blk + bi) * 34;
+            const float vs = (float)*((const _Float16*)vbh);
+            const unsigned int packed = q8_tile_load_u32(vbh + 2 + bj);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const signed char quant = (signed char)(packed >> (8 * i));
+                out_vec[i] += w * (vs * (float)quant);
+            }
+        }
+    } else {
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            const float w = scores[t_local];
+            const int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * row_stride;
+            for (int i = 0; i < dpt; i++) {
+                const int d = d0 + i;
+                const int bi = d / 32;
+                const int bj = d % 32;
+                const unsigned char* vbh = vb + (kv_head_blk + bi) * 34;
+                const float vs = (float)*((const _Float16*)vbh);
+                out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+            }
         }
     }
 
