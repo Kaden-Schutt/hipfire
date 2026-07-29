@@ -3116,70 +3116,6 @@ pub fn spec_step_dflash(
             (None, 0)
         };
 
-        // Conditioning-row probe (observation only, zero cost unset). On a
-        // prompt-cache HIT the draft goes dead (all-zero logits → token 0);
-        // this reports whether the rows it is about to attend over are
-        // actually populated, and where the hole starts.
-        static TH_PROBE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static TH_PROBE_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        static TH_PROBE_LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        static TH_PROBE_BURST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let th_probe_on = *TH_PROBE_ENV.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DFLASH_TH_PROBE").ok().as_deref() == Some("1")
-        });
-        let th_probe_fire = th_probe_on && {
-            use std::sync::atomic::Ordering::Relaxed;
-            // A request boundary shows up as a position jump larger than one
-            // block (decode advances by <= b each cycle). Burst a few cycles
-            // there — that is where the cache-HIT draft dies.
-            let last = TH_PROBE_LAST.swap(position, Relaxed);
-            if position > last + 24 || position < last {
-                TH_PROBE_BURST.store(4, Relaxed);
-            }
-            let first_few = TH_PROBE_N.fetch_add(1, Relaxed) < 2;
-            let bursting = TH_PROBE_BURST
-                .fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1))
-                .is_ok();
-            first_few || bursting
-        };
-        if th_probe_fire
-        {
-            let stride = ne * h;
-            let probe_rows = [
-                0usize,
-                position / 2,
-                position.saturating_sub(40),
-                position.saturating_sub(2),
-                position.saturating_sub(1),
-            ];
-            let mut parts: Vec<String> = Vec::new();
-            for r in probe_rows {
-                let n = stride.min(64);
-                let view = draft_scratch.target_hidden.sub_offset(r * stride, n);
-                match gpu.download_f32(&view) {
-                    Ok(v) => {
-                        let amax = v.iter().fold(0f32, |a, &x| a.max(x.abs()));
-                        parts.push(format!("r{r}:amax={amax:.4}"));
-                    }
-                    Err(e) => parts.push(format!("r{r}:err({e})")),
-                }
-            }
-            let x_pre = match gpu.download_f32(&draft_scratch.x.sub_offset(h, h)) {
-                Ok(v) => format!("{:.4}", v.iter().fold(0f32, |a, &x| a.max(x.abs()))),
-                Err(e) => format!("err({e})"),
-            };
-            eprintln!(
-                "DFLTH pos={} ctx_len={} uploaded={} proj={} full={} x_pre={} | {}",
-                position,
-                effective_ctx_len,
-                draft_scratch.thlog.uploaded_rows(),
-                draft_scratch.thlog.proj_cached_rows(),
-                draft_scratch.thlog.full_cached_rows(),
-                x_pre,
-                parts.join(" ")
-            );
-        }
-
         // ── 4. draft_forward ────────────────────────────────────────────────
         // noise_embedding = None: we wrote embeddings directly into
         // draft_scratch.x above via D2D (no host round-trip).
@@ -3328,87 +3264,6 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
-            // Draft-output probe: separates "dead logits" (lm_head/GEMM),
-            // "dead hidden" (draft forward), and "dead cached K" (the
-            // proj_cached_rows reuse assumption) on a cache-HIT turn.
-            if th_probe_fire {
-                let l0 = logits_batch.sub_offset(0, vocab.min(4096));
-                let x1 = draft_scratch.x.sub_offset(h, h);
-                // NaN-aware: `f32::max` IGNORES NaN, so a plain amax fold
-                // reports 0.0 for an all-NaN buffer. Report both.
-                let stat = |g: &mut Gpu, t: &rdna_compute::GpuTensor| -> String {
-                    match g.download_f32(t) {
-                        Ok(v) => {
-                            let nans = v.iter().filter(|x| x.is_nan()).count();
-                            let infs = v.iter().filter(|x| x.is_infinite()).count();
-                            let amax = v
-                                .iter()
-                                .filter(|x| x.is_finite())
-                                .fold(0f32, |a, &x| a.max(x.abs()));
-                            format!("amax={amax:.4},nan={nans},inf={infs},n={}", v.len())
-                        }
-                        Err(e) => format!("err({e})"),
-                    }
-                };
-                let l_s = stat(gpu, &l0);
-                let x_s = stat(gpu, &x1);
-                let pc = draft_scratch.thlog.proj_cached_rows();
-                // Locate the first poisoned row: scan layer-0 k_ctx (smallest
-                // per-row footprint) and the fc output over the live context.
-                let scan = |g: &mut Gpu, t: &rdna_compute::GpuTensor, rows: usize| -> String {
-                    let numel = t.numel();
-                    let per_row = if rows > 0 { numel / rows.max(1) } else { 0 };
-                    match g.download_f32(t) {
-                        Ok(v) => {
-                            let first = v.iter().position(|x| x.is_nan());
-                            let nans = v.iter().filter(|x| x.is_nan()).count();
-                            match (first, per_row) {
-                                (Some(i), pr) if pr > 0 => {
-                                    format!("first_nan_row={} (elem {i}) nans={nans}", i / pr)
-                                }
-                                (Some(i), _) => format!("first_nan_elem={i} nans={nans}"),
-                                (None, _) => "clean".to_string(),
-                            }
-                        }
-                        Err(e) => format!("err({e})"),
-                    }
-                };
-                let kfull = draft_scratch.k_ctx_cached[0].sub_offset(0, draft_scratch.k_ctx_cached[0].numel());
-                let k_scan = scan(gpu, &kfull, draft_scratch.max_ctx_len);
-                let thp = draft_scratch
-                    .target_hidden_proj
-                    .sub_offset(0, effective_ctx_len * h);
-                let thp_scan = scan(gpu, &thp, effective_ctx_len);
-                // Source buffer: if the fc output is poisoned, the rows it read
-                // are the real origin. Also report the capacities so a NaN row
-                // that lands on a buffer boundary is obvious.
-                let th_live = draft_scratch
-                    .target_hidden
-                    .sub_offset(0, effective_ctx_len * ne * h);
-                let th_scan = scan(gpu, &th_live, effective_ctx_len);
-                let th_rows = draft_scratch.target_hidden.numel() / (ne * h);
-                let k_s = format!(
-                    "{k_scan} | thp: {thp_scan} | th: {th_scan} | max_ctx={} th_rows={} ne={} h={}",
-                    draft_scratch.max_ctx_len, th_rows, ne, h
-                );
-                let pq = (positions_q.first().copied(), positions_q.last().copied());
-                let pk = (positions_k.first().copied(), positions_k.last().copied());
-                eprintln!(
-                    "DFLOUT pos={} batch={} proj={} ctx_len={} pq={:?}..{:?} pk={:?}..{:?} pk_len={} | logits[{}] x1[{}] kctx0[{}]",
-                    position,
-                    batch,
-                    pc,
-                    effective_ctx_len,
-                    pq.0,
-                    pq.1,
-                    pk.0,
-                    pk.1,
-                    positions_k.len(),
-                    l_s,
-                    x_s,
-                    k_s
-                );
-            }
             if use_temp_sampling && fast_sample_active {
                 // C8 GPU-sample path: softmax stays device-resident; only
                 // draft_tokens + draft_p_at_token (batch×8 bytes) come back.
@@ -3936,27 +3791,6 @@ pub fn spec_step_dflash(
         let acc = hipfire_runtime::spec::accept_greedy_prefix(&block[1..b], &argmax_per_pos, None);
         accept_len = acc.accepted;
         bonus_token = *acc.committed.last().expect("eos=None yields a bonus");
-
-        // Accept-path trace (observation only, zero cost unset). Prints the
-        // drafted tokens beside the target's argmax picks for the same cycle,
-        // on BOTH the GPU-argmax and host-recompute paths — the two disagree
-        // on prompt-cache-HIT turns (τ collapses to 0 on the GPU path only)
-        // and this is what lets the same cycle be diffed across the two.
-        static ACCEPT_TRACE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ACCEPT_TRACE_ENV.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DFLASH_ACCEPT_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1")
-        }) {
-            let n = b.min(8);
-            let drafted: Vec<u32> = block[1..b].iter().take(n).copied().collect();
-            let picks: Vec<u32> = argmax_per_pos.iter().take(n).copied().collect();
-            eprintln!(
-                "DFLACC pos={} b={} host_path={} accept={} bonus={} drafted={:?} target={:?}",
-                position, b, host_path_active as u8, accept_len, bonus_token, drafted, picks
-            );
-        }
 
         if logit_dump_active {
             // Inspect the acceptance boundary. If accept_len < b-1 the block
@@ -5709,39 +5543,6 @@ pub fn spec_step_ddtree_batched(
             rows_to_keep,
             draft_scratch.ctx_modulus(),
         )?;
-        // Post-commit poison check: catch the exact cycle whose committed rows
-        // land NaN in target_hidden. Once a row is poisoned the draft forward
-        // is NaN from that cycle on (and stays poisoned across a prompt-cache
-        // HIT, which is how this first surfaced).
-        static COMMIT_CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static COMMIT_POISONED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if *COMMIT_CHECK.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DFLASH_TH_PROBE").ok().as_deref() == Some("1")
-        }) && !COMMIT_POISONED.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            let committed = draft_scratch
-                .target_hidden
-                .sub_offset(position * ne * h, rows_to_keep * ne * h);
-            if let Ok(v) = gpu.download_f32(&committed) {
-                let nans = v.iter().filter(|x| x.is_nan()).count();
-                if nans > 0 {
-                    COMMIT_POISONED.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "DFLPOISON first at position={} rows={} block_size={} big_n={} \
-                         fast_tape_ok={} accept_len={} nans={}/{}",
-                        position,
-                        rows_to_keep,
-                        block_size,
-                        big_n,
-                        fast_tape_ok,
-                        accept_len,
-                        nans,
-                        v.len()
-                    );
-                }
-            }
-        }
         let co = target.kv_cache.compact_offset as i32;
         draft_scratch
             .thlog

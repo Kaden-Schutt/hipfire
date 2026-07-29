@@ -567,21 +567,27 @@ mod target_hidden_log {
                 base_pos,
                 "append_committed: abs_positions out of sync with base_pos"
             );
-            // Release-visible companion to the assert above: a `base_pos` ahead
-            // of the row count means positions advanced without committing
-            // their target_hidden rows, so the buffer keeps an UNWRITTEN hole
-            // (uninitialized => NaN) that poisons every later draft forward.
-            // The debug_assert is compiled out in release, which is how this
-            // stayed invisible.
+            // Release-visible companion to the assert above. A `base_pos` ahead
+            // of the row count means positions advanced WITHOUT committing their
+            // target_hidden rows, so the buffer keeps an unwritten hole —
+            // uninitialized VRAM, i.e. NaN — which poisons every later draft
+            // forward, collapses acceptance to zero for the rest of the session,
+            // and survives a prompt-cache HIT (whose `seed_prompt` rebuilds
+            // `abs_positions` contiguously, hiding the skew but not the hole).
+            // The `debug_assert` is compiled out in release, which is exactly how
+            // the think-budget force-close path went unnoticed; warn loudly once
+            // instead of silently poisoning the drafter.
             if self.abs_positions.len() != base_pos {
-                static GAP_SEEN: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                if GAP_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                static GAP_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !GAP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
-                        "[dflash] THLOG GAP: rows={} base_pos={} n={} (hole of {} row(s))",
+                        "[dflash] WARNING target-hidden row gap: have {} rows but committing at \
+                         position {} ({} row(s) never written) — acceptance will degrade until \
+                         the drafter is reseeded. This is a bug in whichever path advanced the \
+                         target without committing its hidden rows.",
                         self.abs_positions.len(),
                         base_pos,
-                        n,
                         base_pos.saturating_sub(self.abs_positions.len())
                     );
                 }

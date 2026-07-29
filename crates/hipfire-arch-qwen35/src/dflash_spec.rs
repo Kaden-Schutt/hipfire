@@ -426,15 +426,6 @@ impl Speculator for DflashSpeculator {
             // projection cursor so the first spec step re-projects from `ckpt`.
             self.df.draft_scratch.thlog.set_resume_checkpoint(ckpt);
         }
-        if cache_hit {
-            // EXPERIMENT: on a prompt-cache HIT the draft forward collapses to
-            // an all-zero hidden state (τ→0) whenever a sizeable prefix is
-            // reused, while a HIT that re-projects via the resume checkpoint
-            // stays healthy. target_hidden rows are populated and correct
-            // (probed), so the suspect is the reused fc/k_ctx/v_ctx projection
-            // cache; drop the cursor and re-project the prefix.
-            self.df.draft_scratch.thlog.set_resume_checkpoint(0);
-        }
 
         // First emit = target argmax at the final prompt position (seed already
         // ran the per-token forward; scratch.logits holds the post-prompt logits).
