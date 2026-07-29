@@ -6398,13 +6398,21 @@ fn generate_dflash(
     let decoded_full = tokenizer.decode(&run.streamed_tokens);
     let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
 
-    // Trim trailing `<|im_end|>` + newline from streamed_tokens so the
-    // cached body slots cleanly between the assistant_prefix and the
+    // Trim the trailing `<|im_end|>` + newline trailer from streamed_tokens so
+    // the cached body slots cleanly between the assistant_prefix and the
     // im_end+nl trailer that `build_cached_history` re-adds on replay
     // (mirrors qwen35 cache writer).
+    //
+    // Only strip it when it IS the trailer. A turn cut short by max_tokens never
+    // emitted `im_end`, so if its last token happens to be a newline that
+    // newline is BODY: popping it made the replayed body one token shorter than
+    // what KV holds, the re-added `im_end` then landed on the newline's slot, and
+    // the LCP stopped one token before `prior_len` — turning a clean hit into a
+    // checkpoint resume (measured: 29 s of re-prefill on a 16.5K turn).
     let nl_token = tokenizer.encode("\n");
     let nl_set: std::collections::HashSet<u32> = nl_token.iter().copied().collect();
     let mut cached_seq: Vec<u32> = run.streamed_tokens.clone();
+    let body_len_before_trim = cached_seq.len();
     while let Some(&last) = cached_seq.last() {
         if nl_set.contains(&last) {
             cached_seq.pop();
@@ -6412,10 +6420,13 @@ fn generate_dflash(
             break;
         }
     }
-    if let Some(&last) = cached_seq.last() {
-        if im_end_token == Some(last) {
+    match cached_seq.last() {
+        Some(&last) if im_end_token == Some(last) => {
             cached_seq.pop();
         }
+        // No `im_end` behind the newlines ⇒ they were never a trailer. Restore
+        // the body verbatim.
+        _ => cached_seq = run.streamed_tokens[..body_len_before_trim].to_vec(),
     }
     if !cached_seq.is_empty() {
         // Hash the bytes the CLIENT will send back next turn — the emitter's
