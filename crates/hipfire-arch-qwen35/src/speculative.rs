@@ -3291,6 +3291,28 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
+            // Draft-output probe: separates "dead logits" (lm_head/GEMM),
+            // "dead hidden" (draft forward), and "dead cached K" (the
+            // proj_cached_rows reuse assumption) on a cache-HIT turn.
+            if th_probe_fire {
+                let l0 = logits_batch.sub_offset(0, vocab.min(4096));
+                let x1 = draft_scratch.x.sub_offset(h, h);
+                let amax = |g: &mut Gpu, t: &rdna_compute::GpuTensor| -> String {
+                    match g.download_f32(t) {
+                        Ok(v) => format!("{:.4}", v.iter().fold(0f32, |a, &x| a.max(x.abs()))),
+                        Err(e) => format!("err({e})"),
+                    }
+                };
+                let l_amax = amax(gpu, &l0);
+                let x_amax = amax(gpu, &x1);
+                let pc = draft_scratch.thlog.proj_cached_rows();
+                let kc0 = draft_scratch.k_ctx_cached[0].sub_offset(0, 64);
+                let k_old = amax(gpu, &kc0);
+                eprintln!(
+                    "DFLOUT pos={} batch={} proj={} logits_amax={} x1_amax={} kctx_row0_amax={}",
+                    position, batch, pc, l_amax, x_amax, k_old
+                );
+            }
             if use_temp_sampling && fast_sample_active {
                 // C8 GPU-sample path: softmax stays device-resident; only
                 // draft_tokens + draft_p_at_token (batch×8 bytes) come back.
