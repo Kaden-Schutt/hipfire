@@ -3379,7 +3379,18 @@ pub fn spec_step_dflash(
                     .target_hidden_proj
                     .sub_offset(0, effective_ctx_len * h);
                 let thp_scan = scan(gpu, &thp, effective_ctx_len);
-                let k_s = format!("{k_scan} | thp: {thp_scan}");
+                // Source buffer: if the fc output is poisoned, the rows it read
+                // are the real origin. Also report the capacities so a NaN row
+                // that lands on a buffer boundary is obvious.
+                let th_live = draft_scratch
+                    .target_hidden
+                    .sub_offset(0, effective_ctx_len * ne * h);
+                let th_scan = scan(gpu, &th_live, effective_ctx_len);
+                let th_rows = draft_scratch.target_hidden.numel() / (ne * h);
+                let k_s = format!(
+                    "{k_scan} | thp: {thp_scan} | th: {th_scan} | max_ctx={} th_rows={} ne={} h={}",
+                    draft_scratch.max_ctx_len, th_rows, ne, h
+                );
                 let pq = (positions_q.first().copied(), positions_q.last().copied());
                 let pk = (positions_k.first().copied(), positions_k.last().copied());
                 eprintln!(
