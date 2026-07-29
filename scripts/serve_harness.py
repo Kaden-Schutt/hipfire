@@ -102,18 +102,33 @@ def resolve_sampling(spec, tag, registry_path):
         # through the existing budget machinery (no daemon request-JSON change).
         if profile == "instruct":
             vals["reasoning_effort"] = "none"; source["reasoning_effort"] = label
-        if not vals:
+        # Registry stays the PREFERENCE; this only covers entries that carry nothing
+        # usable. Guard on the sampling keys, not on `vals` — the instruct profile has
+        # already inserted reasoning_effort above, so `not vals` would never fire here.
+        if not [k for k in vals if k != "reasoning_effort"]:
+            # 38/54 registry models still lack recommended_settings, and a hard exit
+            # strands callers that cannot pass --sampling (tools.redline bench's
+            # coherence smoke hard-codes "registry" and forwards no --tag).
+            fb = "coding" if profile == "coding" else "nothink" if profile == "instruct" else "general"
             what = f"sampling_profiles.{profile}" if profile else "recommended_settings"
-            sys.exit(f"  registry has no {what} for tag {tag!r} — refusing to fall back to a "
-                     f"naive default. Pass --tag <registry-tag> or --sampling recipe:coding explicitly.")
+            print(f"  [warn] registry has no {what} for tag {tag!r} — falling back to "
+                  f"recipe({fb}). Pass --tag <registry-tag> or --sampling explicitly to pin it.",
+                  file=sys.stderr)
+            for k, v in RECIPES[fb].items():
+                vals[k] = v
+                source[k] = f"registry-fallback:recipe({fb})"
         return vals, source
     sys.exit(f"bad --sampling {spec!r}")
 
 
 def infer_tag(model_path):
-    """Best-effort registry tag from a model filename, e.g. qwen3.6-27b-awq.mq4 -> qwen3.6:27b."""
+    """Best-effort registry tag from a model filename, e.g. qwen3.6-27b-awq.mq4 -> qwen3.6:27b.
+
+    Sizes may be decimal (qwen3.5-0.8b.mq4 -> qwen3.5:0.8b); the registry carries
+    those tags, so the size group must admit a fractional part.
+    """
     b = os.path.basename(model_path)
-    m = re.match(r"(qwen3\.\d+)-(\d+b(?:-a\d+b)?)", b)
+    m = re.match(r"(qwen3\.\d+)-(\d+(?:\.\d+)?b(?:-a\d+b)?)", b)
     if m:
         return f"{m.group(1)}:{m.group(2)}"
     return None

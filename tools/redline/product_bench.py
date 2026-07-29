@@ -1817,6 +1817,17 @@ def main(argv=None):
     )
     parser.add_argument("--transport", choices=("aql", "pm4"), default="aql")
     parser.add_argument(
+        "--skip-coherence",
+        action="store_true",
+        help=(
+            "skip the pre-warmup Flagstaff quality gates and go straight to the timed "
+            "arms. The gate is quality-only and never contributes tok/s, but it aborts "
+            "the whole run on models whose capability cannot satisfy it (e.g. the "
+            "qwen3.5:0.8b reference fixture). Reports produced this way are marked "
+            "coherence_skipped and can never be `valid`, so they are diagnostics only."
+        ),
+    )
+    parser.add_argument(
         "--kv-mode",
         choices=("q8", "fwht2", "fwht3", "fwht4"),
         default="q8",
@@ -1903,26 +1914,37 @@ def main(argv=None):
             flush=True,
         )
 
-    print("coherence: HIP CLI/serve Flagstaff smoke...", flush=True)
-    try:
-        coherence_hip = run_coherence_smoke(args, "hip")
-    except Exception as error:
-        raise SystemExit(f"HIP coherence smoke failed before benchmark warmup: {error}")
-    print(
-        f"coherence: HIP passed ({coherence_hip['seconds']:.2f}s)",
-        flush=True,
-    )
-    print("coherence: auto CLI/serve Flagstaff smoke...", flush=True)
-    try:
-        coherence_auto = run_coherence_smoke(args, "auto")
-    except Exception as error:
-        raise SystemExit(
-            f"auto coherence smoke failed before benchmark warmup: {error}"
+    if args.skip_coherence:
+        # Explicitly opted out: record the skip instead of a pass so no downstream
+        # consumer can mistake this for a certified run (`valid` requires `is True`).
+        skipped = {"skipped": True, "valid": None, "seconds": 0.0}
+        coherence_hip = dict(skipped)
+        coherence_auto = dict(skipped)
+        print(
+            "coherence: SKIPPED via --skip-coherence (report cannot be `valid`)",
+            flush=True,
         )
-    print(
-        f"coherence: auto passed ({coherence_auto['seconds']:.2f}s)",
-        flush=True,
-    )
+    else:
+        print("coherence: HIP CLI/serve Flagstaff smoke...", flush=True)
+        try:
+            coherence_hip = run_coherence_smoke(args, "hip")
+        except Exception as error:
+            raise SystemExit(f"HIP coherence smoke failed before benchmark warmup: {error}")
+        print(
+            f"coherence: HIP passed ({coherence_hip['seconds']:.2f}s)",
+            flush=True,
+        )
+        print("coherence: auto CLI/serve Flagstaff smoke...", flush=True)
+        try:
+            coherence_auto = run_coherence_smoke(args, "auto")
+        except Exception as error:
+            raise SystemExit(
+                f"auto coherence smoke failed before benchmark warmup: {error}"
+            )
+        print(
+            f"coherence: auto passed ({coherence_auto['seconds']:.2f}s)",
+            flush=True,
+        )
 
     report = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
