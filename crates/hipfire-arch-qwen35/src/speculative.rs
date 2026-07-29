@@ -554,6 +554,7 @@ impl ModelSlot {
             scratch,
             kv_cache,
             dn_state,
+            kv_adaptive: _,
         } = bundle;
         Ok(Self {
             name: String::from("target"),
@@ -579,6 +580,8 @@ impl ModelSlot {
             scratch: self.scratch,
             kv_cache: self.kv_cache,
             dn_state: self.dn_state,
+            // Controller lives on LoadedModel, not ModelSlot.
+            kv_adaptive: None,
         }
     }
 }
@@ -1109,7 +1112,10 @@ impl GdnTape {
         dn_state: &mut qwen35::DeltaNetState,
         n_steps: usize,
     ) -> HipResult<()> {
-        let graph_enabled = hipfire_config::developer_var("HIPFIRE_REPLAY_GRAPH").ok().as_deref() == Some("1");
+        let graph_enabled = hipfire_config::developer_var("HIPFIRE_REPLAY_GRAPH")
+            .ok()
+            .as_deref()
+            == Some("1");
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
@@ -1300,7 +1306,6 @@ impl GdnTape {
         }
         Ok(())
     }
-
 }
 
 impl DeltaNetTape {
@@ -2208,6 +2213,16 @@ fn verify_dflash_block_inner(
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
     let dim = target.config.dim;
+    let required_tokens = start_pos.checked_add(b).ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!("DFlash verify KV token range overflow ({start_pos} + {b})"),
+        )
+    })?;
+    // Verify replay bypasses the regular qwen35 forward wrappers.
+    target
+        .kv_cache
+        .ensure_mapped_capacity(gpu, required_tokens)?;
 
     assert!(
         b <= verify_scratch.max_n,
@@ -2223,7 +2238,8 @@ fn verify_dflash_block_inner(
     // shapes. sub_offset returns a non-owning view; do NOT free these.
     let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
     let tree_verify_present = tree_verify.is_some();
-    let moe_lmhead_graph_env = hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
+    let moe_lmhead_graph_env =
+        hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
     let moe_lmhead_graph_ok =
         dflash_moe_verify_graph_lmhead_eligible(
             target.config.num_experts,
@@ -2269,8 +2285,10 @@ fn verify_dflash_block_inner(
     // the parent_indices-driven conv1d path. DO NOT ENABLE in production.
     //
     // Gate kept live so the next session can bisect without re-plumbing.
-    let tree_graph_enabled =
-        hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH_TREE").ok().as_deref() == Some("1");
+    let tree_graph_enabled = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH_TREE")
+        .ok()
+        .as_deref()
+        == Some("1");
     if tree_graph_enabled && tree_verify_present {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -2290,7 +2308,10 @@ fn verify_dflash_block_inner(
     // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
     // would skip a verify-graph that now replays fine and forfeit the long-context
     // spec speedup.
-    let verify_graph_ok = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
+    let verify_graph_ok = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH")
+        .ok()
+        .as_deref()
+        != Some("0")
         && tree_ok_for_graph
         && matches!(
             target.weights.embd_format,
@@ -2303,7 +2324,10 @@ fn verify_dflash_block_inner(
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
     // forward + lm_head; the recorded mode tag distinguishes replay vs
     // warmup-direct vs first-capture vs no-graph-eligible.
-    let vg_timing = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH_TIMING").ok().as_deref() == Some("1");
+    let vg_timing = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH_TIMING")
+        .ok()
+        .as_deref()
+        == Some("1");
     let mut vg_mode = "direct";
     let vg_t0 = if vg_timing {
         gpu.hip.device_synchronize()?;
@@ -2875,8 +2899,12 @@ pub fn spec_step_dflash(
     // use only for diagnostics. When disabled, zero cost beyond a handful
     // of Instant::now() calls.
     static PHASE_ON_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let phase_on = *PHASE_ON_ENV
-        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1"));
+    let phase_on = *PHASE_ON_ENV.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_SPEC_PHASES")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     if phase_on {
         gpu.hip.device_synchronize()?;
     }
@@ -2922,7 +2950,10 @@ pub fn spec_step_dflash(
     static LOGIT_DUMP_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let logit_dump_active = !use_temp_sampling
         && *LOGIT_DUMP_ENV.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
+            hipfire_config::developer_var("HIPFIRE_DFLASH_LOGIT_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
         });
     let host_path_active = rp_active || ngram_block_active || logit_dump_active;
     // HIPFIRE_DFLASH_FAST_SAMPLE (default ON, opt out with =0): in the temp>0
@@ -2937,7 +2968,8 @@ pub fn spec_step_dflash(
     // borderline `u*p_d <= p_t` accept) — validated coherent across genres
     // (no attractors), so default-on. Greedy path (temp==0) is never affected.
     let fast_sample_active = use_temp_sampling && gpu.flags.dflash_fast_sample;
-    let draft_ffn_graph_env = hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
+    let draft_ffn_graph_env =
+        hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
         ctx_slice.is_some(),
@@ -3251,23 +3283,13 @@ pub fn spec_step_dflash(
                 let pat_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
                 let seed_u32 = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
                 gpu.batched_categorical_sample_f32(
-                    &probs_dev,
-                    &tau_dev,
-                    &z_dev,
-                    &tok_dev,
-                    &pat_dev,
-                    vocab,
-                    batch,
-                    seed_u32,
+                    &probs_dev, &tau_dev, &z_dev, &tok_dev, &pat_dev, vocab, batch, seed_u32,
                 )?;
                 // Download only tokens + probs: batch×8 bytes total.
                 let mut raw_tok = vec![0i32; batch];
                 {
                     let bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            raw_tok.as_mut_ptr() as *mut u8,
-                            batch * 4,
-                        )
+                        std::slice::from_raw_parts_mut(raw_tok.as_mut_ptr() as *mut u8, batch * 4)
                     };
                     gpu.hip.memcpy_dtoh(bytes, &tok_dev.buf)?;
                 }
@@ -3549,7 +3571,7 @@ pub fn spec_step_dflash(
             let z_d_dev = c8_draft_z_dev.as_ref().unwrap();
 
             let out_dev = gpu.alloc_tensor(&[4], rdna_compute::DType::F32)?; // 4×i32 via f32 slot
-            // kernel's b parameter = number of draft comparison positions = b-1
+                                                                             // kernel's b parameter = number of draft comparison positions = b-1
             let draft_b = b - 1;
             let rng_seed = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
             gpu.chain_accept_spec_f32(
@@ -3571,9 +3593,8 @@ pub fn spec_step_dflash(
             // Download 16 bytes: {accept_len, bonus_token, rejected_at, new_rng}
             let mut out_raw = [0i32; 4];
             {
-                let bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(out_raw.as_mut_ptr() as *mut u8, 16)
-                };
+                let bytes: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(out_raw.as_mut_ptr() as *mut u8, 16) };
                 gpu.hip.memcpy_dtoh(bytes, &out_dev.buf)?;
             }
             accept_len = out_raw[0] as usize;
@@ -3682,8 +3703,7 @@ pub fn spec_step_dflash(
                         }
                     }
                     let u2 = xorshift_next_unit(rng_state);
-                    rejected_bonus =
-                        Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
+                    rejected_bonus = Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
                     break;
                 }
             }
@@ -3787,11 +3807,21 @@ pub fn spec_step_dflash(
     }
 
     // Free C8 device tensors now that accept is resolved.
-    if let Some(t) = c8_draft_probs_dev { let _ = gpu.free_tensor(t); }
-    if let Some(t) = c8_draft_tau_dev { let _ = gpu.free_tensor(t); }
-    if let Some(t) = c8_draft_z_dev { let _ = gpu.free_tensor(t); }
-    if let Some(t) = c8_draft_tokens_dev { let _ = gpu.free_tensor(t); }
-    if let Some(t) = c8_draft_p_at_token_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_probs_dev {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = c8_draft_tau_dev {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = c8_draft_z_dev {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = c8_draft_tokens_dev {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = c8_draft_p_at_token_dev {
+        let _ = gpu.free_tensor(t);
+    }
 
     // ── 7b. Seed-prediction oracle (Task #93 Phase B) ───────────────────
     // Three position-based proxies for the next cycle's `seed_token`
@@ -3823,7 +3853,11 @@ pub fn spec_step_dflash(
     if rej_proxy.is_none() {
         SEED_ORACLE_FULLACCEPT.fetch_add(1, Ordering::Relaxed);
     }
-    if hipfire_config::developer_var("HIPFIRE_DFLASH_SEED_ORACLE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_DFLASH_SEED_ORACLE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let s = read_seed_oracle_stats();
         let denom = s.total.max(1) as f32;
         eprintln!(
@@ -4405,7 +4439,12 @@ fn run_dflash_draft_for_topk_gpu(
             let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
             let positions_k: Vec<i32> = (ctx_start as i32..(position + b) as i32).collect();
             let th_offset = ctx_start * ne * h;
-            (positions_q, positions_k, Some(&host_slice[th_offset..]), effective_ctx_len)
+            (
+                positions_q,
+                positions_k,
+                Some(&host_slice[th_offset..]),
+                effective_ctx_len,
+            )
         } else {
             // GPU-resident path: scratch.target_hidden already contains all rows
             // via D2D scatter (Stage 1); thlog tracks uploaded_rows + abs_positions.
@@ -5191,7 +5230,11 @@ pub fn spec_step_ddtree_batched(
     // Dual-path proof: download the GPU mask and compare byte-for-byte with
     // the host mask_host computed by linearize_tree_with_parents above.
     // Off by default (costs one D2H per cycle).
-    if hipfire_config::developer_var("HIPFIRE_DDTREE_ASSERT_MASK").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_DDTREE_ASSERT_MASK")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         // Synchronize so the kernel has finished writing before the D2H.
         gpu.hip.device_synchronize()?;
         let n_floats = big_n * big_n;
@@ -5355,7 +5398,10 @@ pub fn spec_step_ddtree_batched(
     // verify to fix KV cache entries at committed slots (topk>1 siblings
     // at same depth otherwise race and the LAST write wins regardless of
     // which sibling was committed).
-    let force_slow = hipfire_config::developer_var("HIPFIRE_DDTREE_FORCE_SLOW").ok().as_deref() == Some("1");
+    let force_slow = hipfire_config::developer_var("HIPFIRE_DDTREE_FORCE_SLOW")
+        .ok()
+        .as_deref()
+        == Some("1");
     let spine_accept = accepted_node_indices
         .iter()
         .enumerate()
@@ -5374,7 +5420,11 @@ pub fn spec_step_ddtree_batched(
     } else if !force_slow {
         DDTREE_SLOW_COUNT.with(|c| c.set(c.get() + 1));
     }
-    if hipfire_config::developer_var("HIPFIRE_DDTREE_TAPE_DUMP").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_DDTREE_TAPE_DUMP")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let fast = DDTREE_FAST_COUNT.with(|c| c.get());
         let slow = DDTREE_SLOW_COUNT.with(|c| c.get());
         eprintln!(

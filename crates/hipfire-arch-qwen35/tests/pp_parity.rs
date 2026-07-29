@@ -107,7 +107,7 @@ fn run_pp1(path: &str, prompt: &[u32]) -> Vec<u32> {
     }
     scratch.free_gpu(&mut gpu);
     dn.free_gpu(&mut gpu);
-    kv.free_gpu(&mut gpu);
+    let _ = kv.free_gpu(&mut gpu);
     weights.free_gpu(&mut gpu);
     gpu.drain_pool();
     tokens

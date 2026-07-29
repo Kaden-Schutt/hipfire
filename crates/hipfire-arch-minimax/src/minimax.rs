@@ -922,7 +922,7 @@ impl MiniMaxState {
             final_rot,
             logits,
         } = self;
-        kv.free_gpu(gpu);
+        let _ = kv.free_gpu(gpu);
         // pos_buf is a raw DeviceBuffer (no Drop impl) — free explicitly.
         let _ = gpu.hip.free(pos_buf);
         for t in [
@@ -1065,7 +1065,6 @@ impl MiniMaxState {
     pub fn reset(&mut self) {
         self.n_tokens = 0;
     }
-
 }
 
 // ──────────────── ModelSource (safetensors) load helpers ────────────────

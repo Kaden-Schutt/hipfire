@@ -35,6 +35,7 @@ pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
 pub mod kv_adaptive;
+pub mod kv_backend;
 pub mod kv_mode;
 pub mod llama;
 pub mod llama_spec;

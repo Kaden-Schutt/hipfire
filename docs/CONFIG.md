@@ -241,6 +241,11 @@ else universal fallback **`q8`**. There is no per-arch implicit FWHT table.
 
 `kv_adaptive` is opt-in. With adaptive on, `max_seq` is the context guaranteed at the floor tier. Daemon param overrides `HIPFIRE_KV_ADAPTIVE` when set through CLI load path.
 
+`--kv-backend vmm` enables on-demand HIP VMM mapping for single-GPU Qwen3.5
+`q8`, `asym3`, and `fwht3` KV caches. The default remains `contiguous`. VMM
+currently does not compose with pipeline/expert parallelism or CASK/TriAttention
+eviction.
+
 Legacy one-shot alias: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
 
 ---
