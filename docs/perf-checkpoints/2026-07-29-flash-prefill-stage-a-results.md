@@ -205,6 +205,58 @@ Output quality: 6/6 `finish=stop` with coherent 166–227 word answers on **both
 `redline` and `hip`, answer lengths identical across backends. Flag-off remains
 inert — committed token stream identical to the pristine baseline in 3/3 runs.
 
+### Quality: perplexity and KLD vs the f32 path
+
+Measured with `crates/hipfire-runtime/examples/flash_prefill_quality.rs`, which
+scores **every** position (stride 8) in the second-half window of each chunk
+through `forward_prefill_batch` — llama-perplexity chunking semantics, DeltaNet
+reset per chunk, KV overwritten from 0 — capturing `per_token_hidden_out` and
+recovering logits per row via the lm_head gemv. Both arms score the **identical**
+token stream, so NLL is compared **pairwise**.
+
+Three existing tools could not answer this and are documented in the harness:
+`perplexity.rs` scores at `batch_size=1` via `forward_scratch` and never reaches
+the batched attention kernels; `dump_logits_qwen35` uses a fake prompt (token ids
+0,1,2,…) whose output entropy is 9–10 nats on a 248K vocab, so its top-1
+comparisons are ties; and `build_kld_ref_native` sets `HIPFIRE_KV_MODE=f32`,
+which the config validator's `memory.kv_cache` enum rejects — it panics before
+doing any work (pre-existing bug, unrelated to this branch).
+
+**Perplexity, 2048 paired positions, ctx=4096:**
+
+| metric | value |
+|---|---|
+| ppl f32 | 7.4812 |
+| ppl f16-WMMA | 7.5310 (+0.67%) |
+| paired ΔNLL | +0.0066 nats (SE 0.0087) |
+| 95% CI | [−0.0105, +0.0237] |
+| significant at 0.05 | **NO** (t = 0.762) |
+| resolvable effect | ±0.017 nats (1.7% ppl) |
+
+No detectable regression; the penalty is **bounded below +2.4% ppl at 95%
+confidence**. Note the sign is now physically sensible (f16 worse than f32) — an
+earlier 24-position version of this harness reported f16 *better*, which is
+arithmetically impossible and was the signal that it was underpowered.
+
+**KLD, 24 windows of real text (full 248K distributions):** mean 6.97e-3,
+median 4.36e-3, max 3.70e-2. For scale, this repo accepts a graded-quant change
+at KLD 0.038964 — the mean is ~5.6× below it, though the worst window
+approaches it.
+
+**Behaviour:** top-1 agreement **95.17%** (99 of 2048 positions differ). Those
+disagreements are concentrated where the model is uncertain:
+
+| | top-1 agrees | top-1 differs |
+|---|---:|---:|
+| mean NLL | 1.92 nats | 3.84 |
+| median NLL | 0.30 | 2.81 |
+| paired ΔNLL | +0.0033 | +0.0718 |
+
+At confident positions (median NLL 0.30 nats, p≈0.74) the arms agree, and the
+f32 top-1 remains inside the f16 top-8 in **99.76%** of cases — a reshuffle
+among near-ties, not a lost token. Under greedy decoding this still means
+generated text will drift; under sampling it is largely masked.
+
 ### The trade
 
 WMMA computes in f16. Measured relative L2 against the f32 reference is
