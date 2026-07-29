@@ -5115,29 +5115,6 @@ fn plan_prompt_cache(
         },
     );
     let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
-    plan_from_rendered(
-        conversation_tokens,
-        rendered,
-        cache_eligible,
-        dflash_ckpt_positions,
-        resume_enabled,
-        "dflash",
-    )
-}
-
-/// LCP / hit / resume planner shared by the Plain canonical-render path
-/// (`plan_prompt_cache`) and the jinja path (`generate_dflash` with
-/// `try_jinja`, which plans from the already-tokenized jinja render).
-/// `rendered` is the full canonical conversation stream for this turn;
-/// the cache-eligibility decision is precomputed by the caller.
-fn plan_from_rendered(
-    conversation_tokens: &[u32],
-    rendered: Vec<u32>,
-    cache_eligible: bool,
-    dflash_ckpt_positions: &[usize],
-    resume_enabled: bool,
-    trace_tag: &str,
-) -> PromptCachePlan {
     if cache_eligible {
         let prior_len = conversation_tokens.len();
         let max_match = prior_len.min(rendered.len());
@@ -5147,7 +5124,7 @@ fn plan_from_rendered(
         }
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
-                "[qwen-cache lcp {trace_tag}] prior_len={} rendered_len={} lcp={}",
+                "[qwen-cache lcp dflash] prior_len={} rendered_len={} lcp={}",
                 prior_len,
                 rendered.len(),
                 lcp
@@ -5175,7 +5152,7 @@ fn plan_from_rendered(
                 .max()
             {
                 eprintln!(
-                    "[qwen-cache resume {trace_tag}] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
+                    "[qwen-cache resume dflash] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
                     ckpt, lcp, prior_len, rendered.len(), rendered.len() - ckpt, rendered.len(),
                 );
                 return PromptCachePlan {
@@ -5528,21 +5505,13 @@ fn generate_dflash(
         return false;
     }
 
-    // Prompt-cache plan (native DFlash reuse). Decide whether this turn is a
-    // pure extension of the cached conversation. On a HIT we reuse target KV
-    // + DeltaNet[0..start_pos] and the draft's cumulative target_hidden,
-    // prefilling only the suffix; on a MISS we full-reset and prefill the
-    // whole conversation (legacy behaviour).
-    //
-    // Jinja mode plans from the already-tokenized jinja render (the same
-    // canonical stream the AR path LCPs): the end-of-turn bake stores
-    // `prompt_tokens + emitted`, so next turn's render extends byte-for-byte
-    // when the template's per-turn blocks are prefix-stable (qwen3.5/3.6
-    // templates are). A decode→encode roundtrip mismatch in the asst text
-    // shows up as a small-lcp divergence and lands on the checkpoint-resume
-    // path — worst case equals today's cold prefill, never wrong tokens.
+    // Prompt-cache plan (native DFlash reuse). For non-jinja chat with history,
+    // decide whether this turn is a pure extension of the cached conversation.
+    // On a HIT we reuse target KV + DeltaNet[0..start_pos] and the draft's
+    // cumulative target_hidden, prefilling only the suffix; on a MISS we
+    // full-reset and prefill the whole conversation (legacy behaviour).
     let cache_disabled =
-        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+        try_jinja || std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -5558,18 +5527,7 @@ fn generate_dflash(
         .as_ref()
         .map(|s| s.checkpoint_positions())
         .unwrap_or_default();
-    let cache_plan: Option<PromptCachePlan> = if try_jinja {
-        messages_history.map(|_| {
-            plan_from_rendered(
-                &m.conversation_tokens,
-                prompt_tokens.clone(),
-                !cache_disabled && m.eviction.is_none() && !m.conversation_tokens.is_empty(),
-                &dflash_ckpt_positions,
-                dflash_resume_enabled,
-                "dflash-jinja",
-            )
-        })
-    } else {
+    let cache_plan: Option<PromptCachePlan> = if !try_jinja {
         messages_history.map(|hist| {
             let tok = m.tokenizer.as_ref().unwrap();
             plan_prompt_cache(
@@ -5587,6 +5545,8 @@ fn generate_dflash(
                 dflash_resume_enabled,
             )
         })
+    } else {
+        None
     };
     let resume_from: Option<usize> = cache_plan.as_ref().and_then(|p| p.resume_from);
     // `prompt_tokens` becomes the full canonical conversation when the cache
