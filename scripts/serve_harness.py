@@ -28,7 +28,11 @@ import argparse, atexit, errno, json, os, re, shutil, signal, subprocess, sys, t
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
 # concrete token cap, not just the preset name).
-THINKING_BUDGET = {"low": 512, "med": 2048, "high": 8192, "xhigh": 24576, "max": 32768, "uncapped": 0}
+# Mirror of the Rust reasoning-budget presets. `off` resolves to a cap of 1 — the
+# engine's "no thinking" sentinel (the daemon reads `enable_thinking:
+# max_think_tokens != 1`), which is why it is not 0: 0 means `uncapped`.
+THINKING_BUDGET = {"off": 1, "low": 512, "med": 2048, "high": 8192, "xhigh": 24576,
+                   "max": 32768, "uncapped": 0}
 
 # Qwen card recipes (thinking-mode general/coding, instruct non-thinking). pp varies
 # by model (a3b general uses 1.5; 27b general uses 0) so registry mode is preferred;
@@ -159,9 +163,12 @@ def show_config(cfg):
     print(f"  kv_mode       : {cfg['kv']}   kv_backend: {cfg.get('kv_backend', 'contiguous')}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
     print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
-    print(f"  thinking_budget: {cfg['thinking_budget']} -> {cfg['thinking_cap_tokens']} tok (CONCRETE cap)")
     _cap = cfg['thinking_cap_tokens']
-    _note = ('uncapped think budget' if _cap == 0
+    _thinking_off = cfg['thinking_budget'] == 'off'
+    _resolved = 'thinking DISABLED (sentinel cap 1)' if _thinking_off else f'{_cap} tok (CONCRETE cap)'
+    print(f"  thinking_budget: {cfg['thinking_budget']} -> {_resolved}")
+    _note = ('no think block emitted' if _thinking_off
+             else 'uncapped think budget' if _cap == 0
              else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
              else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail')
     print(f"  max_tokens     : {cfg['max_tokens']}  ({_note})")
@@ -785,7 +792,8 @@ def main():
     ap.add_argument("--draft", default=None,
                     help="Optional DFlash draft path; sets HIPFIRE_DFLASH_DRAFT for the serve child. "
                          "When omitted, any caller-inherited HIPFIRE_DFLASH_DRAFT is preserved.")
-    ap.add_argument("--thinking", default="med", help="thinking_budget preset key")
+    ap.add_argument("--thinking", default="med", choices=list(THINKING_BUDGET),
+                    help="reasoning budget preset; \"off\" disables thinking (cap sentinel 1)")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--sampling", default="registry",
@@ -826,7 +834,11 @@ def main():
     show_config(cfg)
     if args.show_config:
         return
-    if cfg['thinking_cap_tokens'] and args.max_tokens <= cfg['thinking_cap_tokens']:
+    # `off` resolves to the sentinel cap 1, which is not a real think budget — no
+    # think block is emitted at all, so the think-only-output guard does not apply.
+    if (cfg['thinking_budget'] != 'off'
+            and cfg['thinking_cap_tokens']
+            and args.max_tokens <= cfg['thinking_cap_tokens']):
         sys.exit(
             f"serve_harness: max_tokens ({args.max_tokens}) <= thinking budget "
             f"'{cfg['thinking_budget']}' ({cfg['thinking_cap_tokens']} tok) guarantees "

@@ -4236,6 +4236,17 @@ fn apply_reasoning_request(
         }
     } else {
         match config_string(resolved, "reasoning.budget")?.as_str() {
+            // 1 = the engine's "no thinking" sentinel (daemon: `enable_thinking:
+            // max_think_tokens != 1`), matching what the OpenAI
+            // enable_thinking=false / reasoning_effort="none" paths send. Pair it
+            // with the closed-think assistant prefix so the turn starts in answer
+            // mode instead of relying on the template alone.
+            "off" => {
+                request["max_think_tokens"] = serde_json::json!(1);
+                request["assistant_prefix"] = serde_json::json!("closed_think");
+                request["reasoning_effort"] = serde_json::json!("none");
+                return Ok(());
+            }
             "low" => 512,
             "med" => 2048,
             "high" => 8192,

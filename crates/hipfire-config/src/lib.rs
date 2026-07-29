@@ -332,7 +332,12 @@ const KV_MODES: &[&str] = &[
     "turbo3", "turbo2",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
-const THINKING_BUDGETS: &[&str] = &["low", "med", "high", "xhigh", "max", "uncapped"];
+// `off` disables thinking outright. It resolves to a cap of 1, the engine's
+// established "no thinking" sentinel (the daemon reads
+// `enable_thinking: max_think_tokens != 1`) and the same value the OpenAI
+// `enable_thinking=false` / `reasoning_effort="none"` paths already send. It is
+// NOT 0 — 0 means `uncapped` (think until the model closes the block itself).
+const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max", "uncapped"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
