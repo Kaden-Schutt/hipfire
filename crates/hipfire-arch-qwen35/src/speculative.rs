@@ -3353,8 +3353,33 @@ pub fn spec_step_dflash(
                 let l_s = stat(gpu, &l0);
                 let x_s = stat(gpu, &x1);
                 let pc = draft_scratch.thlog.proj_cached_rows();
-                let kc0 = draft_scratch.k_ctx_cached[0].sub_offset(0, 64);
-                let k_s = stat(gpu, &kc0);
+                // Locate the first poisoned row: scan layer-0 k_ctx (smallest
+                // per-row footprint) and the fc output over the live context.
+                let scan = |g: &mut Gpu, t: &rdna_compute::GpuTensor, rows: usize| -> String {
+                    let numel = t.numel();
+                    let per_row = if rows > 0 { numel / rows.max(1) } else { 0 };
+                    match g.download_f32(t) {
+                        Ok(v) => {
+                            let first = v.iter().position(|x| x.is_nan());
+                            let nans = v.iter().filter(|x| x.is_nan()).count();
+                            match (first, per_row) {
+                                (Some(i), pr) if pr > 0 => {
+                                    format!("first_nan_row={} (elem {i}) nans={nans}", i / pr)
+                                }
+                                (Some(i), _) => format!("first_nan_elem={i} nans={nans}"),
+                                (None, _) => "clean".to_string(),
+                            }
+                        }
+                        Err(e) => format!("err({e})"),
+                    }
+                };
+                let kfull = draft_scratch.k_ctx_cached[0].sub_offset(0, draft_scratch.k_ctx_cached[0].numel());
+                let k_scan = scan(gpu, &kfull, draft_scratch.max_ctx_len);
+                let thp = draft_scratch
+                    .target_hidden_proj
+                    .sub_offset(0, effective_ctx_len * h);
+                let thp_scan = scan(gpu, &thp, effective_ctx_len);
+                let k_s = format!("{k_scan} | thp: {thp_scan}");
                 let pq = (positions_q.first().copied(), positions_q.last().copied());
                 let pk = (positions_k.first().copied(), positions_k.last().copied());
                 eprintln!(
