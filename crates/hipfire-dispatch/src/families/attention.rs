@@ -1238,6 +1238,55 @@ fn dispatch_attend(
             // gives ~16K tokens for head_dim=128. Use 8K threshold for margin.
             KernelKey::AttnQ8_0KvBatchedMasked => {
                 const Q8_BATCHED_LDS_CROSSOVER: usize = 8192;
+                // Query-tiled flash prefill. Its LDS depends only on BR/BC and
+                // never on context, so it has no capacity ceiling and no
+                // occupancy decay. Measured on gfx1151 (nh=8 nkv=2 hd=256,
+                // N=256): ~1.8x the tiled fallback at every context, but it
+                // LOSES to the LDS-backed kernel below ~10.2K (0.67x at 2048,
+                // 0.96x at 8192) because that kernel has 8x the workgroups.
+                // Break-even measured between CTX 10240 (0.95x) and 11264
+                // (1.17x), so it only takes over above MIN_CTX — where it
+                // replaces the 2.3x-worse tiled path outright.
+                // Opt-in until Stage A end-to-end validation completes.
+                // Causal non-tree only; the windowed traffic uses a separate
+                // KernelKey, and batch_size == 1 is decode.
+                let flash_optin = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
+                let flash_min_ctx: usize =
+                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_MIN_CTX")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(10240);
+                if flash_optin
+                    && io.tree_bias.is_none()
+                    && io.batch_size > 1
+                    && io.max_ctx_len > flash_min_ctx
+                {
+                    let br: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BR")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(8);
+                    let bc: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BC")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(16);
+                    return hip!(gpu.attention_q8_0_flash_prefill(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                        br,
+                        bc,
+                    ));
+                }
                 if io.max_ctx_len <= Q8_BATCHED_LDS_CROSSOVER {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.
                     let positions = io.positions.unwrap();

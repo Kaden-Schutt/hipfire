@@ -2557,6 +2557,10 @@ impl Gpu {
                     kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string(),
                 ));
                 specs.push((
+                    "attention_q8_0_flash_prefill",
+                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC.to_string(),
+                ));
+                specs.push((
                     "kv_cache_write_q8_0_batched",
                     kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.to_string(),
                 ));
