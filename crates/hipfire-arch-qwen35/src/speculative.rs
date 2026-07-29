@@ -3084,6 +3084,65 @@ pub fn spec_step_dflash(
             (None, 0)
         };
 
+        // Conditioning-row probe (observation only, zero cost unset). On a
+        // prompt-cache HIT the draft goes dead (all-zero logits → token 0);
+        // this reports whether the rows it is about to attend over are
+        // actually populated, and where the hole starts.
+        static TH_PROBE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static TH_PROBE_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static TH_PROBE_LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static TH_PROBE_BURST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let th_probe_on = *TH_PROBE_ENV.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DFLASH_TH_PROBE").ok().as_deref() == Some("1")
+        });
+        let th_probe_fire = th_probe_on && {
+            use std::sync::atomic::Ordering::Relaxed;
+            // A request boundary shows up as a position jump larger than one
+            // block (decode advances by <= b each cycle). Burst a few cycles
+            // there — that is where the cache-HIT draft dies.
+            let last = TH_PROBE_LAST.swap(position, Relaxed);
+            if position > last + 24 || position < last {
+                TH_PROBE_BURST.store(4, Relaxed);
+            }
+            let first_few = TH_PROBE_N.fetch_add(1, Relaxed) < 2;
+            let bursting = TH_PROBE_BURST
+                .fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1))
+                .is_ok();
+            first_few || bursting
+        };
+        if th_probe_fire
+        {
+            let stride = ne * h;
+            let probe_rows = [
+                0usize,
+                position / 2,
+                position.saturating_sub(40),
+                position.saturating_sub(2),
+                position.saturating_sub(1),
+            ];
+            let mut parts: Vec<String> = Vec::new();
+            for r in probe_rows {
+                let n = stride.min(64);
+                let view = draft_scratch.target_hidden.sub_offset(r * stride, n);
+                match gpu.download_f32(&view) {
+                    Ok(v) => {
+                        let amax = v.iter().fold(0f32, |a, &x| a.max(x.abs()));
+                        parts.push(format!("r{r}:amax={amax:.4}"));
+                    }
+                    Err(e) => parts.push(format!("r{r}:err({e})")),
+                }
+            }
+            eprintln!(
+                "DFLTH pos={} ctx_len={} uploaded={} proj={} full={} | {}",
+                position,
+                effective_ctx_len,
+                draft_scratch.thlog.uploaded_rows(),
+                draft_scratch.thlog.proj_cached_rows(),
+                draft_scratch.thlog.full_cached_rows(),
+                parts.join(" ")
+            );
+        }
+
         // ── 4. draft_forward ────────────────────────────────────────────────
         // noise_embedding = None: we wrote embeddings directly into
         // draft_scratch.x above via D2D (no host round-trip).
