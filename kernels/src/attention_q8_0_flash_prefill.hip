@@ -100,68 +100,82 @@ extern "C" __global__ __launch_bounds__(NTHREADS) void attention_q8_0_flash_pref
     int seq_len = 0;
     for (int r = 0; r < rows; r++) seq_len = max(seq_len, positions[q_base + r] + 1);
 
-    // ── Single K/V tile (Task 1 scope) ──────────────────────────────────
-    const int t_len = min(BC, seq_len);
+    // ── K/V tile loop with online softmax ───────────────────────────────
+    for (int t0 = 0; t0 < seq_len; t0 += BC) {
+        const int t_len = min(BC, seq_len - t0);
 
-    for (int i = tid; i < t_len * bph * 34; i += NTHREADS) {
-        const int j  = i / (bph * 34);
-        const int bo = i % (bph * 34);
-        kt[i] = k_cache[(size_t)j * row_stride + kv_blk * 34 + bo];
-        vt[i] = v_cache[(size_t)j * row_stride + kv_blk * 34 + bo];
-    }
-    __syncthreads();
+        __syncthreads();                   // protect kt/vt from the previous iteration
+        for (int i = tid; i < t_len * bph * 34; i += NTHREADS) {
+            const int j  = i / (bph * 34);
+            const int bo = i % (bph * 34);
+            const size_t off = (size_t)(t0 + j) * row_stride + kv_blk * 34 + bo;
+            kt[i] = k_cache[off];
+            vt[i] = v_cache[off];
+        }
+        __syncthreads();
 
-    // S = Q · K^T with causal mask. BR*BC entries over NTHREADS threads.
-    for (int e = tid; e < BR * BC; e += NTHREADS) {
-        const int r = e / BC;
-        const int j = e % BC;
-        float sv = -INFINITY;
-        if (r < rows && j < t_len && j <= positions[q_base + r]) {
-            float dot = 0.0f;
-            const unsigned char* kb = kt + (size_t)j * bph * 34;
-            for (int bi = 0; bi < bph; bi++) {
-                const float ks = (float)*((const _Float16*)(kb + bi * 34));
-                const float* qb = q_lds + r * head_dim + bi * 32;
-                for (int c = 0; c < 32; c++)
-                    dot += qb[c] * (ks * (float)((signed char)kb[bi * 34 + 2 + c]));
+        // S = Q · K^T with per-row causal mask.
+        for (int e = tid; e < BR * BC; e += NTHREADS) {
+            const int r = e / BC;
+            const int j = e % BC;
+            float sv = -INFINITY;
+            if (r < rows && j < t_len && (t0 + j) <= positions[q_base + r]) {
+                float dot = 0.0f;
+                const unsigned char* kb = kt + (size_t)j * bph * 34;
+                for (int bi = 0; bi < bph; bi++) {
+                    const float ks = (float)*((const _Float16*)(kb + bi * 34));
+                    const float* qb = q_lds + r * head_dim + bi * 32;
+                    for (int c = 0; c < 32; c++)
+                        dot += qb[c] * (ks * (float)((signed char)kb[bi * 34 + 2 + c]));
+                }
+                sv = dot * scale_attn;
             }
-            sv = dot * scale_attn;
+            s_lds[e] = sv;
         }
-        s_lds[e] = sv;
-    }
-    __syncthreads();
+        __syncthreads();
 
-    // Row softmax (one thread per row; Task 2 keeps this shape).
-    if (tid < rows) {
-        float mx = -1e30f;
-        for (int j = 0; j < BC; j++) mx = fmaxf(mx, s_lds[tid * BC + j]);
-        float sum = 0.0f;
-        for (int j = 0; j < BC; j++) {
-            const float e = (s_lds[tid * BC + j] == -INFINITY) ? 0.0f : __expf(s_lds[tid * BC + j] - mx);
-            s_lds[tid * BC + j] = e;
-            sum += e;
+        // Online softmax: new running max, rescale factor, running sum.
+        if (tid < rows) {
+            float mx = m_lds[tid];
+            for (int j = 0; j < BC; j++) mx = fmaxf(mx, s_lds[tid * BC + j]);
+            const float corr = (m_lds[tid] <= -1e30f) ? 1.0f : __expf(m_lds[tid] - mx);
+            float sum = 0.0f;
+            for (int j = 0; j < BC; j++) {
+                const float sv = s_lds[tid * BC + j];
+                const float e  = (sv == -INFINITY) ? 0.0f : __expf(sv - mx);
+                s_lds[tid * BC + j] = e;
+                sum += e;
+            }
+            m_lds[tid]    = mx;
+            l_lds[tid]    = l_lds[tid] * corr + sum;
+            corr_lds[tid] = corr;
         }
-        m_lds[tid] = mx;
-        l_lds[tid] = sum;
-    }
-    __syncthreads();
+        __syncthreads();
 
-    // O += P · V
+        // O = O * corr + P · V
+        if (acc_r < rows) {
+            const float corr = corr_lds[acc_r];
+            if (corr != 1.0f) for (int i = 0; i < dpt; i++) acc[i] *= corr;
+            for (int j = 0; j < t_len; j++) {
+                const float p = s_lds[acc_r * BC + j];
+                if (p == 0.0f) continue;
+                const unsigned char* vb = vt + (size_t)j * bph * 34;
+                for (int i = 0; i < dpt; i++) {
+                    const int d  = d0 + i;
+                    const int bi = d >> 5;
+                    const int bj = d & 31;
+                    const float vs = (float)*((const _Float16*)(vb + bi * 34));
+                    acc[i] += p * (vs * (float)((signed char)vb[bi * 34 + 2 + bj]));
+                }
+            }
+        }
+    }
+
+    // ── Write output ────────────────────────────────────────────────────
     if (acc_r < rows) {
-        for (int j = 0; j < t_len; j++) {
-            const float p = s_lds[acc_r * BC + j];
-            if (p == 0.0f) continue;
-            const unsigned char* vb = vt + (size_t)j * bph * 34;
-            for (int i = 0; i < dpt; i++) {
-                const int d  = d0 + i;
-                const int bi = d >> 5;
-                const int bj = d & 31;
-                const float vs = (float)*((const _Float16*)(vb + bi * 34));
-                acc[i] += p * (vs * (float)((signed char)vb[bi * 34 + 2 + bj]));
-            }
-        }
         float* o = out + (long long)(q_base + acc_r) * q_stride + h * head_dim;
-        const float inv = 1.0f / l_lds[acc_r];
+        const float denom = l_lds[acc_r];
+        const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
         for (int i = 0; i < dpt; i++) o[d0 + i] = acc[i] * inv;
     }
 }
