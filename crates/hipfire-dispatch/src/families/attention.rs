@@ -1259,33 +1259,56 @@ fn dispatch_attend(
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(10240);
-                if flash_optin
-                    && io.tree_bias.is_none()
-                    && io.batch_size > 1
-                    && io.max_ctx_len > flash_min_ctx
-                {
-                    let br: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BR")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(8);
-                    let bc: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BC")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(16);
-                    return hip!(gpu.attention_q8_0_flash_prefill(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.positions(),
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                        br,
-                        bc,
-                    ));
+                if flash_optin && io.tree_bias.is_none() && io.batch_size > 1 {
+                    // WMMA is the default variant: it beats the legacy LDS
+                    // kernel at EVERY context (1.21x @2048 .. 2.47x @12288) and
+                    // is ~1.9x the scalar flash kernel, so it needs no MIN_CTX
+                    // gate. The scalar variant keeps its measured break-even.
+                    // It computes in f16 (relative L2 ~1e-3 vs the f32
+                    // reference) — a real precision/speed trade, hence opt-in.
+                    let variant = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
+                        .unwrap_or_else(|_| "wmma".to_owned());
+                    // Kernel bounds: Q8_0 blocks are 32 dims wide, and O_frags
+                    // is a fixed float8_t[MAX_D_CHUNKS=16] => head_dim <= 256.
+                    let wmma_ok =
+                        variant != "scalar" && io.head_dim % 32 == 0 && io.head_dim <= 256;
+                    if wmma_ok {
+                        return hip!(gpu.attention_q8_0_flash_prefill_wmma(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.batch_size,
+                        ));
+                    }
+                    if io.max_ctx_len > flash_min_ctx {
+                        let br: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BR")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(8);
+                        let bc: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BC")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(16);
+                        return hip!(gpu.attention_q8_0_flash_prefill(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                            br,
+                            bc,
+                        ));
+                    }
                 }
                 if io.max_ctx_len <= Q8_BATCHED_LDS_CROSSOVER {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.

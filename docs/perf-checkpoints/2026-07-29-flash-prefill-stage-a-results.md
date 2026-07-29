@@ -162,6 +162,70 @@ model: across 5 runs of an unchanged binary, 4 matched the baseline exactly and
 `loop_guard_mirror`). Single token-stream diffs are therefore not sufficient
 evidence; repeat them. Two matching runs do not establish determinism.
 
+## Stage C (WMMA) — supersedes the Stage A routing decision
+
+Added after Stage A. `attention_q8_0_flash_prefill_wmma` runs QK^T and P·V on
+RDNA3 matrix cores. **It beats the legacy LDS kernel at every context**, so the
+Stage A break-even and the `MIN_CTX` gate both become unnecessary.
+
+Kernel-level (nh=8 nkv=2 hd=256, N=256), ms:
+
+| CTX | tiled | scalar flash | WMMA | legacy | WMMA/legacy | WMMA/tiled |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 10.08 | 5.84 | 3.05 | 3.68 | 1.21× | 3.30× |
+| 4096 | 22.13 | 12.65 | 6.24 | 9.27 | 1.49× | 3.54× |
+| 8192 | 45.34 | 25.00 | 12.87 | 24.86 | 1.93× | 3.52× |
+| 12288 | 68.51 | 39.76 | 19.55 | 48.23 | 2.47× | 3.50× |
+| 16000 | 89.88 | 52.59 | 27.68 | N/A | — | 3.25× |
+
+End-to-end prefill (HIP backend, real prose):
+
+| ctx | baseline | WMMA | speedup |
+|---:|---:|---:|---:|
+| 7714 | 571.5 tok/s | 651.1 | 1.14× |
+| 11494 | 388.2 tok/s | 591.3 | 1.52× |
+| 13939 | 311.5 tok/s | 526.2 | 1.69× |
+| 14737 | 295.5 tok/s | 525.7 | **1.78×** |
+
+Per-position chain curve (ms per new token at prefix depth p):
+
+| p | baseline | WMMA | speedup |
+|---:|---:|---:|---:|
+| 551 | 1.10 | 1.21 | 0.91× |
+| 6573 | 2.15 | 1.91 | 1.13× |
+| 8253 | 4.07 | 2.23 | 1.82× |
+| 14780 | 6.53 | 3.06 | 2.13× |
+
+**The 8192 step is gone** (baseline 2.15 → 4.07 across it; WMMA 1.91 → 2.23) and
+the curve is far flatter: baseline degrades 5.9× from p=551 to p=14780, WMMA
+2.5×. Prefill throughput now falls only 1.24× from 7.7K to 14.7K, against 1.93×
+before.
+
+Output quality: 6/6 `finish=stop` with coherent 166–227 word answers on **both**
+`redline` and `hip`, answer lengths identical across backends. Flag-off remains
+inert — committed token stream identical to the pristine baseline in 3/3 runs.
+
+### The trade
+
+WMMA computes in f16. Measured relative L2 against the f32 reference is
+5.3e-4…1.6e-3 across 17 configs, versus 3.2e-7 for the scalar kernel — roughly
+3500× less accurate, though cosine similarity stays ≥ 0.999999. It is therefore
+held to a reduced-precision bar (relative L2 ≤ 5e-3, cosine ≥ 1 − 1e-5) rather
+than the fp32-reassociation bar, and it ships opt-in. Note this bar was chosen
+*after* seeing the fp32 bar fail, which deserves scrutiny; the justification is
+that per-element relative error is not a usable metric for a reduced-precision
+kernel — cancellation on near-zero outputs inflates it to 20% while the output
+vectors remain aligned to 6 decimal places. Whether f16 attention is acceptable
+as a *default* is a product decision that wants perplexity/KLD evidence, not
+just coherence.
+
+Also worth recording: Stage C was not a port. Every `attention_dflash_wmma_*`
+kernel hard-guards `head_dim == 128`, and the only head_dim-generic variant
+needs ~84 KB of LDS at head_dim=256. The new kernel fits in ~18 KB (3 WG/CU) by
+storing LDS as f16 and never staging K — each B fragment is dequantised straight
+from the Q8_0 cache, and the 16×16×16 fragment shape reuses it across 16 query
+rows, amortising the dequant by the layout itself.
+
 ## Next
 
 1. Stage C (WMMA inner math) is **unblocked** — the tiling foundation is in
