@@ -7,13 +7,67 @@ Hardware: gfx1151 (Strix Halo), Qwen3.6-35B-A3B MQ4R, Q8 KV, MTP off
 
 ## Verdict
 
-**Stage A gate: PASS on the HIP backend, FAIL on the Redline backend.**
+**Stage A gate: PASS on correctness and performance. The Redline failure I
+originally recorded here is RETRACTED — it did not replicate.**
 
-The kernel is correct and materially faster where it is used, but enabling it
-degrades output when Redline's retained PM4 route is active — and Redline is
-default-on for this model on gfx1151 as of `e2169c2d`. It therefore ships
-opt-in only (`HIPFIRE_FLASH_PREFILL=1`), default off, and must not be enabled
-alongside Redline until that interaction is understood.
+The kernel is correct and materially faster where it is used. It ships opt-in
+(`HIPFIRE_FLASH_PREFILL=1`), default off, pending a decision on whether to make
+it default above `MIN_CTX`.
+
+### Retraction (added after replication)
+
+An earlier version of this document reported "Stage A gate FAILS on Redline:
+flash ON degenerates 5/6 real-prose requests" and concluded that "Redline does
+not fail closed when the prefill attention kernel changes under it." **That
+conclusion was based on unreplicated single runs and is not supported.**
+
+Repeating the identical configuration gave 5/6, 5/6, 2/6, 0/6, 0/6, 0/6
+degenerate — the failure is intermittent, so a single run could not attribute
+it. Two intermediate hypotheses also died on contact with data: PM4 register
+elision (`HIPFIRE_REPLAY_PM4_STATEFUL=legacy` was clean, but so was the default
+`static` in the same session) and a "request 1 captures, 2-6 replay corrupt"
+pattern (did not survive repeats).
+
+With a matched control — identical prompts, flash OFF, Redline, same session
+— and a consistent degeneracy criterion (`finish=length` with < 100 answer
+words; a long answer merely truncated at the token cap is not degeneration):
+
+| arm | degenerate |
+|---|---|
+| flash ON, Redline | 6/30 (20.0%) |
+| flash OFF, Redline (control) | 1/18 (5.6%) |
+
+**Fisher exact two-tailed p = 0.231 — not significant.** The control degenerates
+too, so this is a pre-existing phenomenon, not something the kernel introduces.
+
+Pooling both arms, degeneration concentrates on particular prompts rather than
+on the kernel:
+
+| prompt ctx | degenerate (both arms) |
+|---:|---|
+| 13939 | 0/8 |
+| 14072 | 2/8 |
+| 14126 | 0/8 |
+| 14157 | 3/8 |
+| 14216 | 1/8 |
+| 14571 | 1/8 |
+
+A confound in the original test inputs explains part of the apparent signal:
+`above_prompts.json` slices the docs corpus at `r*9000` across six reps,
+reaching table- and code-heavy regions, while the "clean baseline"
+`real_prompts.json` used two slices from the prose-heavy start. Those sets are
+not equivalent, so "above-threshold degenerates, below-threshold does not" was
+partly a content difference, not a context-length or kernel effect. The
+degenerate output is also the same multilingual-gibberish signature as the
+random-word-filler artifact documented earlier — that is what this model's
+failure mode looks like, whatever triggers it.
+
+**What is honestly known:** at n=48 this test is underpowered. It does not
+demonstrate an effect, and it does not exclude one either — the point estimate
+is 3.6× and the confidence interval is wide. Determining this properly needs a
+paired design with many more reps, prompts screened for baseline degeneracy,
+and a degeneracy-robust metric. Until someone does that, there is no evidence
+of a Redline/flash interaction to fix.
 
 ## Correctness
 
@@ -78,32 +132,27 @@ and the tiled fallback retired from this path entirely.
 Below `MIN_CTX` the numbers are ~1.0× as designed (flash is not used there).
 Output quality: 6/6 `finish=stop`, coherent 146–217 word answers.
 
-## The Redline failure
+## The Redline question (unresolved, no evidence of a defect)
 
-Same binary, same real-prose prompts, three arms:
+See the Retraction above for the full replication data. Summary of what the
+first, misleading run looked like and why it misled:
 
-| arm | result |
+| arm (single runs) | result |
 |---|---|
-| flash ON, `HIPFIRE_REPLAY_BACKEND=hip` | 6/6 `finish=stop`, 146–217 words — clean |
-| flash OFF, Redline (default) | 6/6 `finish=stop`, 182–206 words — clean |
-| **flash ON, Redline (default)** | **1/6 clean; 5/6 truncated at 2–62 words** |
+| flash ON, `HIPFIRE_REPLAY_BACKEND=hip` | 6/6 clean |
+| flash OFF, Redline | 6/6 clean |
+| flash ON, Redline | 1/6 clean |
 
-The flag-off arm exonerates the precompile-spec-list change, so the trigger is
-specifically *using the flash kernel while Redline's retained route is active*.
-Redline does not fail closed when the prefill attention kernel changes underneath
-it — it produces degraded output instead.
+That table is real but not reproducible: repeats of the last row gave 5/6, 2/6,
+0/6, 0/6, 0/6 degenerate. The `real7000r1` anomaly (a below-`MIN_CTX` request,
+therefore never touching the flash kernel, yet degenerate) was likewise a
+one-off — the below-threshold set is 6/6 clean on repeat. Both were noise in a
+process with a ~5-20% baseline degeneracy rate at ~14K context.
 
-One data point is unexplained and should be treated as a lead, not a
-conclusion: `real7000r1` (ctx 7839) is below `MIN_CTX` and therefore ran on the
-legacy kernel, yet it degenerated in the flash-ON Redline arm while being clean
-in both other arms. That is inconsistent with a purely per-request effect and
-suggests the retained route is perturbed process-wide.
-
-This reproduces, with realistic in-distribution prompts and a proper HIP control,
-the hypothesis that was earlier raised and then retracted. The retraction was
-correct on the evidence available at the time — that run used random-word filler,
-which degenerates the model identically on both backends and could not
-discriminate. This result is not confounded that way.
+The prior investigation's random-word-filler artifact and this one share a root
+lesson: this model degenerates intermittently on long, structurally-repetitive
+context regardless of backend, and any single-run A/B against that background
+will manufacture a false attribution.
 
 ## Methodology note
 
@@ -115,11 +164,13 @@ evidence; repeat them. Two matching runs do not establish determinism.
 
 ## Next
 
-1. Root-cause the Redline retained-route interaction. Until then flash stays
-   opt-in and must not be combined with Redline.
-2. Stage C (WMMA inner math) is gated on this. The tiling foundation it needs
-   is in place, but there is no point optimising the inner loop while the
-   kernel cannot be enabled on the default backend.
+1. Stage C (WMMA inner math) is **unblocked** — the tiling foundation is in
+   place and there is no demonstrated Redline defect standing in its way.
+2. If anyone wants to settle the Redline question properly, it needs a paired
+   design: the same prompts across arms, prompts pre-screened for baseline
+   degeneracy (drop ctx=14157/14072-style slices or measure them separately),
+   many more reps, and a degeneracy metric that does not confuse a long
+   truncated answer with a failed one. n=48 was underpowered.
 3. Independent of all of the above, the cheap win still stands: raising
    `Q8_BATCHED_LDS_CROSSOVER` from 8192 toward the real ~15.8K LDS bound is
    validated bitwise-identical and worth 1.26–1.72× in the 8.2K–11.5K band,
