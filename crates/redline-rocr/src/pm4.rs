@@ -184,6 +184,44 @@ impl Gfx12Pm4CommandBuffer {
         Ok(slots)
     }
 
+    /// Attribute preceding boundary commands to each dispatch span.
+    ///
+    /// Span *i* is every PM4 packet after timestamp *i* through dispatch *i*.
+    /// The entry ownership acquire is therefore part of span 0 metadata and is
+    /// never reported as a mid-tape `acquire_inter_node`.
+    pub fn dispatch_span_attributions(
+        &self,
+    ) -> Result<Vec<Pm4DispatchSpanAttribution>, Pm4BuildError> {
+        let mut attributions = Vec::new();
+        let mut pending = Pm4DispatchSpanAttribution::default();
+        let mut saw_dispatch = false;
+        let mut cursor = 0_usize;
+        while cursor < self.dwords.len() {
+            let header = self.dwords[cursor];
+            if header >> 30 != 3 {
+                return Err(Pm4BuildError::MalformedStream { dword: cursor });
+            }
+            let body = ((header >> 16) & 0x3fff) as usize + 1;
+            let next = cursor
+                .checked_add(1 + body)
+                .filter(|end| *end <= self.dwords.len())
+                .ok_or(Pm4BuildError::MalformedStream { dword: cursor })?;
+            match (header >> 8) & 0xff {
+                PACKET3_DISPATCH_DIRECT => {
+                    attributions.push(pending);
+                    pending = Pm4DispatchSpanAttribution::default();
+                    saw_dispatch = true;
+                }
+                PACKET3_EVENT_WRITE => pending.wait_compute_idle = true,
+                PACKET3_ACQUIRE_MEM if !saw_dispatch => pending.entry_acquire = true,
+                PACKET3_ACQUIRE_MEM => pending.acquire_inter_node = true,
+                _ => {}
+            }
+            cursor = next;
+        }
+        Ok(attributions)
+    }
+
     fn copy_gpu_timestamp(&mut self, address: u64) {
         const COPY_DATA_TIMESTAMP_TO_MEMORY_64: u32 = 9 | (5 << 8) | (1 << 16) | (1 << 20);
         self.dwords.extend_from_slice(&[
@@ -411,6 +449,16 @@ pub enum Pm4BuildError {
     },
 }
 
+/// Boundary commands attributed to one per-dispatch timestamp span.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Pm4DispatchSpanAttribution {
+    /// Ownership acquire emitted before the first dispatch (span 0 only).
+    pub entry_acquire: bool,
+    pub wait_compute_idle: bool,
+    /// Mid-tape acquire between dispatches (never the entry acquire).
+    pub acquire_inter_node: bool,
+}
+
 impl fmt::Display for Pm4BuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -513,6 +561,107 @@ mod tests {
         assert!(overrun.with_per_dispatch_timestamps(0x1000).is_err());
     }
     use super::*;
+
+    /// Span i owns every packet after timestamp i through dispatch i.
+    /// Entry acquire is span-0 metadata; mid-tape waits/acquires attach to the
+    /// following dispatch — never rewritten as entry_acquire.
+    #[test]
+    fn dispatch_span_attribution_follows_generated_packet_order() {
+        let mut plain = Gfx12Pm4CommandBuffer::new();
+        plain.acquire_system_gfx12();
+        // dispatch 0 — entry acquire already above
+        plain.dwords.push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+        plain.dwords.extend_from_slice(&[1, 1, 1, 0]);
+        // boundary before dispatch 1
+        plain.wait_compute_idle();
+        plain.acquire_inter_node_gfx12();
+        plain.dwords.push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+        plain.dwords.extend_from_slice(&[2, 1, 1, 0]);
+        // wait-only boundary before dispatch 2
+        plain.wait_compute_idle();
+        plain.dwords.push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+        plain.dwords.extend_from_slice(&[3, 1, 1, 0]);
+        plain.wait_compute_idle();
+
+        let attributions = plain.dispatch_span_attributions().unwrap();
+        assert_eq!(attributions.len(), 3);
+        assert_eq!(
+            attributions[0],
+            Pm4DispatchSpanAttribution {
+                entry_acquire: true,
+                wait_compute_idle: false,
+                acquire_inter_node: false,
+            }
+        );
+        assert_eq!(
+            attributions[1],
+            Pm4DispatchSpanAttribution {
+                entry_acquire: false,
+                wait_compute_idle: true,
+                acquire_inter_node: true,
+            }
+        );
+        assert_eq!(
+            attributions[2],
+            Pm4DispatchSpanAttribution {
+                entry_acquire: false,
+                wait_compute_idle: true,
+                acquire_inter_node: false,
+            }
+        );
+
+        // Timestamp walk must place the baseline before the entry acquire and
+        // each subsequent stamp immediately after its DISPATCH_DIRECT so span 0
+        // covers entry acquire → dispatch 0, span 1 covers wait+acquire →
+        // dispatch 1, etc.
+        let timed = plain.with_per_dispatch_timestamps(0x2000).unwrap();
+        let copies: Vec<usize> = timed
+            .dwords()
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| **word == packet3(PACKET3_COPY_DATA, 5, false))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(copies.len(), 4);
+
+        let opcode_at = |dword: usize| (timed.dwords()[dword] >> 8) & 0xff;
+        // baseline timestamp is the first packet
+        assert_eq!(copies[0], 0);
+        // first real command after baseline is the entry ACQUIRE_MEM
+        assert_eq!(opcode_at(copies[0] + 6), PACKET3_ACQUIRE_MEM);
+        // each post-dispatch stamp sits immediately after DISPATCH_DIRECT body
+        for &stamp in &copies[1..] {
+            assert_eq!(opcode_at(stamp - 5), PACKET3_DISPATCH_DIRECT);
+        }
+
+        // Reconstruct span contents from timestamp indices and prove flags.
+        let mut cursor = copies[0] + 6; // first dword after baseline timestamp packet
+        let mut reconstructed = Vec::new();
+        for &end in &copies[1..] {
+            let mut attr = Pm4DispatchSpanAttribution::default();
+            let mut saw_dispatch = false;
+            while cursor < end {
+                let header = timed.dwords()[cursor];
+                let body = ((header >> 16) & 0x3fff) as usize + 1;
+                let next = cursor + 1 + body;
+                match (header >> 8) & 0xff {
+                    PACKET3_DISPATCH_DIRECT => saw_dispatch = true,
+                    PACKET3_EVENT_WRITE => attr.wait_compute_idle = true,
+                    PACKET3_ACQUIRE_MEM if reconstructed.is_empty() && !saw_dispatch => {
+                        attr.entry_acquire = true;
+                    }
+                    PACKET3_ACQUIRE_MEM => attr.acquire_inter_node = true,
+                    _ => {}
+                }
+                cursor = next;
+            }
+            assert!(saw_dispatch, "each span must include its dispatch");
+            // skip the timestamp packet itself
+            cursor = end + 6;
+            reconstructed.push(attr);
+        }
+        assert_eq!(reconstructed, attributions);
+    }
 
     #[test]
     fn packet3_count_and_shader_type_match_gfx12_headers() {

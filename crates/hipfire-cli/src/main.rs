@@ -23,6 +23,8 @@ use hipfire_registry::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -30,12 +32,18 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
-    sync::{mpsc, Arc, Condvar, Mutex},
+    process::{Child, Command},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+mod setup;
+use setup::setup_command;
 
 const MODEL_SUFFIXES: &[&str] = &[
     ".hf4",
@@ -97,6 +105,8 @@ enum Commands {
     Version(OutputArgs),
     /// Update to a branch, tag, or commit and rebuild the native control plane.
     Update(UpdateArgs),
+    /// Install or repair this machine's hipfire runtime.
+    Setup(SetupArgs),
     /// Quantize a Hugging Face or local model with the Rust quantizer.
     Quantize(QuantizeArgs),
     /// Generate a TriAttention calibration sidecar.
@@ -191,6 +201,44 @@ struct UpdateArgs {
     tag: Option<String>,
     /// Install an exact git commit in detached/pinned mode.
     #[arg(long, value_name = "SHA")]
+    commit: Option<String>,
+}
+
+#[derive(Args, Debug, Default)]
+struct SetupArgs {
+    /// Source checkout to build from (set by scripts/install.sh).
+    #[arg(long, value_name = "PATH")]
+    source: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    rocm_root: Option<PathBuf>,
+    #[arg(long, value_name = "ARCH")]
+    gpu_arch: Option<String>,
+    /// auto (default) leaves replay.backend=auto so .mq4r models select Redline.
+    #[arg(long, value_parser = ["auto", "hip", "redline"])]
+    profile: Option<String>,
+    #[arg(long, short = 'y', visible_alias = "non-interactive")]
+    yes: bool,
+    /// Requested revision ref forwarded by scripts/install.sh for install.json.
+    #[arg(
+        long = "ref",
+        value_name = "REF",
+        hide = true,
+        conflicts_with_all = ["branch", "tag", "commit"]
+    )]
+    reference: Option<String>,
+    /// Requested branch forwarded by scripts/install.sh for install.json.
+    #[arg(
+        long,
+        value_name = "NAME",
+        hide = true,
+        conflicts_with_all = ["tag", "commit"]
+    )]
+    branch: Option<String>,
+    /// Requested tag forwarded by scripts/install.sh for install.json.
+    #[arg(long, value_name = "TAG", hide = true, conflicts_with = "commit")]
+    tag: Option<String>,
+    /// Requested commit forwarded by scripts/install.sh for install.json.
+    #[arg(long, value_name = "SHA", hide = true)]
     commit: Option<String>,
 }
 
@@ -309,6 +357,9 @@ struct RunArgs {
     #[arg(long)]
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    /// One-shot KV storage backend override for this model load.
+    kv_backend: Option<String>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -387,6 +438,8 @@ struct BenchArgs {
     warmups: usize,
     #[arg(long)]
     kv_mode: Option<String>,
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
     /// Prompt words for the standard benchmark.
@@ -472,6 +525,9 @@ struct ServeArgs {
     /// KV cache mode for models loaded by this service.
     #[arg(long)]
     kv_mode: Option<String>,
+    /// KV storage backend for models loaded by this service.
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    kv_backend: Option<String>,
     /// Idle model-unload timeout in seconds; zero disables eviction.
     #[arg(long, value_parser = clap::value_parser!(u64).range(0..=86400))]
     idle_timeout: Option<u64>,
@@ -548,6 +604,7 @@ fn run() -> Result<()> {
         Some(Commands::Profile(args)) => profile_command(&paths, args),
         Some(Commands::Version(output)) => version_command(&paths, output),
         Some(Commands::Update(args)) => update_command(&paths, args),
+        Some(Commands::Setup(args)) => setup_command(&paths, args),
         Some(Commands::Quantize(args)) => quantize_command(&paths, args),
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
@@ -1539,7 +1596,9 @@ fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
 }
 
 fn artifact_url(entry: &ModelEntry, file: &str) -> String {
-    let base = env::var("HIPFIRE_HF_BASE").unwrap_or_else(|_| "https://huggingface.co".into());
+    let base = env::var("HIPFIRE_HF_BASE")
+        .or_else(|_| env::var("HF_ENDPOINT"))
+        .unwrap_or_else(|_| "https://huggingface.co".into());
     format!(
         "{}/{}/resolve/main/{}",
         base.trim_end_matches('/'),
@@ -1804,6 +1863,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let force_local = process_truthy("HIPFIRE_LOCAL")
         || args.image.is_some()
         || args.kv_mode.is_some()
+        || args.kv_backend.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
         || args.draft_max.is_some()
@@ -1841,12 +1901,16 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         &model_path,
         max_tokens,
         args.kv_mode.as_deref(),
+        args.kv_backend.as_deref(),
     )?;
     let selector = args
         .speculation
         .clone()
         .unwrap_or(config_string(&resolved, "speculation.mode")?);
     apply_speculation_selector(&mut params, &selector)?;
+    // Final effective selector wins: re-project inherited draft only when DFlash
+    // remains enabled (config-off + `run --spec dflash` must still carry draft).
+    project_dflash_draft(&mut params);
     if let Some(draft) = &args.model_draft {
         params["draft"] = serde_json::json!(draft.display().to_string());
         if args.speculation.is_none() {
@@ -2057,6 +2121,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             detach: true,
             no_prewarm: true,
             kv_mode: None,
+            kv_backend: None,
             idle_timeout: None,
             tp: None,
             foreground_child: false,
@@ -2162,6 +2227,7 @@ struct ServeRuntime {
     current_max_seq: u64,
     cache_capable: bool,
     kv_override: Option<String>,
+    kv_backend_override: Option<String>,
     tp: Option<u64>,
 }
 
@@ -2627,6 +2693,9 @@ fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Resul
     if let Some(mode) = &args.kv_mode {
         command.arg("--kv-mode").arg(mode);
     }
+    if let Some(backend) = &args.kv_backend {
+        command.arg("--kv-backend").arg(backend);
+    }
     if let Some(seconds) = args.idle_timeout {
         command.arg("--idle-timeout").arg(seconds.to_string());
     }
@@ -2715,6 +2784,7 @@ fn serve_foreground(
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
+            kv_backend_override: args.kv_backend.clone(),
             tp: args.tp,
         }),
         meta: Mutex::new(ServeMeta {
@@ -3334,6 +3404,7 @@ impl ServeRuntime {
                 &path,
                 max_tokens,
                 self.kv_override.as_deref(),
+                self.kv_backend_override.as_deref(),
             )?;
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
@@ -3633,7 +3704,8 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
-        "dflash": done.get("dflash").or_else(|| done.get("mtp")),
+        "dflash": done.get("dflash"),
+        "mtp": done.get("mtp"),
     })
 }
 
@@ -4062,6 +4134,7 @@ fn load_params(
     model_path: &Path,
     max_tokens: u64,
     kv_override: Option<&str>,
+    kv_backend_override: Option<&str>,
 ) -> Result<serde_json::Value> {
     let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
     let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
@@ -4075,6 +4148,14 @@ fn load_params(
     field("memory.kv_cache")
         .expect("schema field")
         .parse_cli(&kv_mode)?;
+    let kv_backend = kv_backend_override
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "contiguous".into())
+        .to_ascii_lowercase();
+    if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
+        bail!("--kv-backend must be contiguous or vmm");
+    }
     let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
     if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
         if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
@@ -4090,6 +4171,7 @@ fn load_params(
     let mut params = serde_json::json!({
         "max_seq": max_seq,
         "kv_mode": kv_mode,
+        "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
@@ -4121,7 +4203,26 @@ fn load_params(
     });
     let selector = config_string(resolved, "speculation.mode")?;
     apply_speculation_selector(&mut params, &selector)?;
+    project_dflash_draft(&mut params);
     Ok(params)
+}
+
+/// Project inherited `HIPFIRE_DFLASH_DRAFT` after the effective speculation selector.
+///
+/// Call only once final `dflash_mode` is known. Config-off must not carry a draft;
+/// a later CLI selector (e.g. `run --spec dflash`) can opt back in here.
+fn project_dflash_draft(params: &mut serde_json::Value) {
+    if params["dflash_mode"].as_str() == Some("off") {
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("draft");
+        }
+        return;
+    }
+    if let Ok(draft) = env::var("HIPFIRE_DFLASH_DRAFT") {
+        if !draft.is_empty() {
+            params["draft"] = serde_json::json!(draft);
+        }
+    }
 }
 
 fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
@@ -4667,6 +4768,7 @@ fn open_bench_engine(
         &path,
         max_tokens,
         args.kv_mode.as_deref(),
+        args.kv_backend.as_deref(),
     )?;
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
@@ -4897,6 +4999,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
+            kv_backend: None,
             redline: false,
             prompt: Vec::new(),
         };
@@ -5114,10 +5217,37 @@ fn version_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     Ok(())
 }
 
+/// Cooperative cancel flag for `hipfire update`. SIGINT/SIGTERM set this;
+/// handlers never call `process::exit` so the armed rollback guard can run.
+static UPDATE_INTERRUPT: AtomicBool = AtomicBool::new(false);
+
+fn install_update_interrupt_handler() {
+    // `termination` enables SIGTERM alongside SIGINT. Ignore AlreadyExists so a
+    // pre-installed process handler does not abort update.
+    let _ = ctrlc::set_handler(|| {
+        UPDATE_INTERRUPT.store(true, Ordering::SeqCst);
+    });
+}
+
+fn update_interrupted() -> bool {
+    UPDATE_INTERRUPT.load(Ordering::SeqCst)
+}
+
+fn ensure_update_not_interrupted() -> Result<()> {
+    if update_interrupted() {
+        bail!("update interrupted");
+    }
+    Ok(())
+}
+
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS");
     }
+    // Install before any fetch/mutation so SIGINT cannot race past the guard.
+    install_update_interrupt_handler();
+    UPDATE_INTERRUPT.store(false, Ordering::SeqCst);
+
     let requested = parse_revision_selector(&args)?;
     let installed = paths.root.join("src");
     let managed = installed.join("Cargo.toml").is_file();
@@ -5156,14 +5286,17 @@ fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
             )
         })?;
 
+    ensure_update_not_interrupted()?;
     eprintln!(
         "fetching {} '{}' from origin...",
         selector.kind.label(),
         selector.value
     );
     let resolved = fetch_revision(&repo, selector)?;
-    let previous = git_output(&repo, &["rev-parse", "--verify", "HEAD"])?;
-    let short = previous.get(..12).unwrap_or(&previous);
+    ensure_update_not_interrupted()?;
+    let previous_head = git_output(&repo, &["rev-parse", "--verify", "HEAD"])?;
+    let previous_branch = git_output(&repo, &["symbolic-ref", "--short", "HEAD"]).ok();
+    let short = previous_head.get(..12).unwrap_or(&previous_head);
     let backup_ref = format!(
         "refs/hipfire/backups/pre-update-{}-{short}",
         unix_timestamp()
@@ -5171,10 +5304,16 @@ fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
     run_checked(
         Command::new("git")
             .current_dir(&repo)
-            .args(["update-ref", &backup_ref, &previous]),
+            .args(["update-ref", &backup_ref, &previous_head]),
         "git update-ref backup",
     )?;
     eprintln!("previous source retained at {backup_ref}");
+
+    let mut checkpoint = UpdateCheckpoint {
+        head: previous_head,
+        branch: previous_branch,
+        stash_sha: None,
+    };
 
     let dirty = !git_output(&repo, &["status", "--porcelain"])?.is_empty();
     if dirty {
@@ -5190,28 +5329,328 @@ fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
             ]),
             "git stash",
         )?;
+        checkpoint.stash_sha = Some(git_output(&repo, &["rev-parse", "stash@{0}"])?);
         eprintln!("recover later with: git -C {} stash pop", repo.display());
     }
-    checkout_revision(&repo, &resolved)?;
 
+    // Armed after clean/stashed checkpoint and before checkout. Drop/error
+    // rolls back unless explicitly committed after installer exit 0.
+    let mut guard = UpdateRollbackGuard::arm(repo.clone(), checkpoint);
+    ensure_update_not_interrupted()?;
+
+    if let Err(err) = checkout_revision(&repo, &resolved) {
+        return Err(guard.fail(err));
+    }
+    ensure_update_not_interrupted()?;
+
+    match run_update_installer(&repo, paths, &resolved) {
+        Ok(()) => {
+            guard.commit();
+            println!(
+                "hipfire updated to {} '{}' ({})",
+                resolved.selector.kind.label(),
+                resolved.selector.value,
+                resolved.commit
+            );
+            println!("verify with: hipfire version");
+            Ok(())
+        }
+        Err(err) => Err(guard.fail(err)),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UpdateCheckpoint {
+    head: String,
+    branch: Option<String>,
+    stash_sha: Option<String>,
+}
+
+/// Restores pre-update checkout/stash unless [`Self::commit`] is called after
+/// a successful installer handoff. Drop and explicit fail both roll back.
+struct UpdateRollbackGuard {
+    repo: PathBuf,
+    checkpoint: UpdateCheckpoint,
+    armed: bool,
+}
+
+impl UpdateRollbackGuard {
+    fn arm(repo: PathBuf, checkpoint: UpdateCheckpoint) -> Self {
+        Self {
+            repo,
+            checkpoint,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+
+    #[cfg(test)]
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    fn fail(mut self, err: anyhow::Error) -> anyhow::Error {
+        if let Err(restore_err) = self.rollback() {
+            eprintln!(
+                "WARNING: failed to restore pre-update checkout after failure: {restore_err}"
+            );
+            return err.context(format!("pre-update restore also failed: {restore_err}"));
+        }
+        err
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        restore_update_checkpoint(&self.repo, &self.checkpoint)
+    }
+}
+
+impl Drop for UpdateRollbackGuard {
+    fn drop(&mut self) {
+        if let Err(err) = self.rollback() {
+            eprintln!("WARNING: failed to restore pre-update checkout on drop: {err}");
+        }
+    }
+}
+
+fn run_update_installer(repo: &Path, paths: &Paths, resolved: &ResolvedRevision) -> Result<()> {
     let installer = repo.join("scripts/install.sh");
     if !installer.is_file() {
         bail!("updated checkout has no {}", installer.display());
     }
+    let recorded = recorded_install_metadata(&paths.root);
+    let mut installer_cmd = Command::new("bash");
+    installer_cmd
+        .arg(&installer)
+        .current_dir(repo)
+        .env("HIPFIRE_FORCE_REBUILD", "1");
+    #[cfg(unix)]
+    {
+        // Own process group so SIGTERM/KILL can reach the whole installer tree.
+        installer_cmd.process_group(0);
+    }
+    for arg in installer_handoff_args(
+        &resolved.selector,
+        recorded.rocm_root.as_deref(),
+        recorded.gpu_arch.as_deref(),
+    ) {
+        installer_cmd.arg(arg);
+    }
+    run_update_installer_child(installer_cmd)
+}
+
+/// Spawn the installer, poll-wait, and on interrupt TERM then KILL the group.
+fn run_update_installer_child(mut installer_cmd: Command) -> Result<()> {
+    let mut child = installer_cmd
+        .spawn()
+        .context("failed to start native installer")?;
+    let status = wait_update_installer_child(&mut child)?;
+    if update_interrupted() {
+        bail!("update interrupted");
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("native installer failed with {status}")
+    }
+}
+
+fn wait_update_installer_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if update_interrupted() {
+                    terminate_update_installer_group(child);
+                    return child
+                        .wait()
+                        .context("failed to reap interrupted native installer");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                return Err(err).context("failed to wait for native installer");
+            }
+        }
+    }
+}
+
+/// TERM the installer process group, then bounded KILL fallback; always wait/reap.
+fn terminate_update_installer_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            // Negative pid targets the process group created via process_group(0).
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
+/// Args forwarded to scripts/install.sh during noninteractive update handoff.
+fn installer_handoff_args(
+    selector: &RevisionSelector,
+    rocm_root: Option<&Path>,
+    gpu_arch: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["--yes".to_owned()];
+    match selector.kind {
+        RevisionKind::Auto => {
+            args.push("--ref".to_owned());
+            args.push(selector.value.clone());
+        }
+        RevisionKind::Branch => {
+            args.push("--branch".to_owned());
+            args.push(selector.value.clone());
+        }
+        RevisionKind::Tag => {
+            args.push("--tag".to_owned());
+            args.push(selector.value.clone());
+        }
+        RevisionKind::Commit => {
+            args.push("--commit".to_owned());
+            args.push(selector.value.clone());
+        }
+    }
+    if let Some(root) = rocm_root {
+        args.push("--rocm-root".to_owned());
+        args.push(root.to_string_lossy().into_owned());
+    }
+    if let Some(arch) = gpu_arch.map(str::trim).filter(|arch| !arch.is_empty()) {
+        args.push("--gpu-arch".to_owned());
+        args.push(arch.to_owned());
+    }
+    args
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RecordedInstallMetadata {
+    rocm_root: Option<PathBuf>,
+    gpu_arch: Option<String>,
+}
+
+fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
+    let text = match fs::read_to_string(install_home.join("install.json")) {
+        Ok(text) => text,
+        Err(_) => return RecordedInstallMetadata::default(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => return RecordedInstallMetadata::default(),
+    };
+    let rocm_root = value
+        .get("rocm_root")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from);
+    let gpu_arch = value
+        .get("gpu_arch")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|arch| !arch.is_empty())
+        .map(str::to_owned);
+    RecordedInstallMetadata {
+        rocm_root,
+        gpu_arch,
+    }
+}
+
+fn restore_update_checkpoint(repo: &Path, checkpoint: &UpdateCheckpoint) -> Result<()> {
+    // Failed-target Cargo/source mutations are wiped only after the original
+    // user work is already in the update stash, so restore cannot be blocked.
     run_checked(
-        Command::new("bash")
-            .arg(installer)
-            .current_dir(&repo)
-            .env("HIPFIRE_FORCE_REBUILD", "1"),
-        "native installer",
+        Command::new("git")
+            .current_dir(repo)
+            .args(["reset", "--hard"]),
+        "git reset failed target",
     )?;
-    println!(
-        "hipfire updated to {} '{}' ({})",
-        resolved.selector.kind.label(),
-        resolved.selector.value,
-        resolved.commit
-    );
-    println!("verify with: hipfire version");
+    run_checked(
+        Command::new("git").current_dir(repo).args(["clean", "-fd"]),
+        "git clean failed target",
+    )?;
+    if let Some(branch) = checkpoint.branch.as_deref() {
+        run_checked(
+            Command::new("git").current_dir(repo).args([
+                "checkout",
+                "-B",
+                branch,
+                &checkpoint.head,
+            ]),
+            "git restore previous branch",
+        )?;
+    } else {
+        run_checked(
+            Command::new("git")
+                .current_dir(repo)
+                .args(["checkout", "--detach", &checkpoint.head]),
+            "git restore previous commit",
+        )?;
+    }
+    if let Some(stash_sha) = checkpoint.stash_sha.as_deref() {
+        reapply_update_stash(repo, stash_sha)?;
+    }
+    Ok(())
+}
+
+fn reapply_update_stash(repo: &Path, stash_sha: &str) -> Result<()> {
+    // Preserve staged index state from the original dirty tree.
+    if let Err(err) = run_checked(
+        Command::new("git")
+            .current_dir(repo)
+            .args(["stash", "apply", "--index", stash_sha]),
+        "git stash apply --index",
+    ) {
+        bail!(
+            "failed to restore pre-update stash {stash_sha} (kept for recovery: \
+             git -C {} stash apply --index {stash_sha}): {err}",
+            repo.display()
+        );
+    }
+    // Drop only after successful apply so a conflicted restore keeps the stash.
+    if let Ok(list) = git_output(repo, &["stash", "list", "--format=%gd %H"]) {
+        for line in list.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(gd) = parts.next() else {
+                continue;
+            };
+            let Some(hash) = parts.next() else {
+                continue;
+            };
+            if hash == stash_sha || stash_sha.starts_with(hash) || hash.starts_with(stash_sha) {
+                let _ = run_checked(
+                    Command::new("git")
+                        .current_dir(repo)
+                        .args(["stash", "drop", gd]),
+                    "git stash drop",
+                );
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5305,7 +5744,7 @@ fn fetch_revision(repo: &Path, mut selector: RevisionSelector) -> Result<Resolve
             run_checked(
                 Command::new("git")
                     .current_dir(repo)
-                    .args(["fetch", "--depth", "1", "origin", &refspec]),
+                    .args(["fetch", "origin", &refspec]),
                 "git fetch branch",
             )?;
             let commit = git_output(repo, &["rev-parse", "--verify", &tracking])?;
@@ -5357,6 +5796,7 @@ fn fetch_revision(repo: &Path, mut selector: RevisionSelector) -> Result<Resolve
 
 fn checkout_revision(repo: &Path, resolved: &ResolvedRevision) -> Result<()> {
     if let Some(tracking) = &resolved.tracking_ref {
+        refuse_unpushed_branch_commits(repo, &resolved.selector.value, tracking)?;
         run_checked(
             Command::new("git").current_dir(repo).args([
                 "checkout",
@@ -5374,6 +5814,45 @@ fn checkout_revision(repo: &Path, resolved: &ResolvedRevision) -> Result<()> {
             "git checkout pinned revision",
         )
     }
+}
+
+/// Refuse to reset a local branch that still has commits not present on the
+/// resolved remote-tracking tip. Channel switches onto a different branch are
+/// unaffected when that target branch is not ahead.
+fn refuse_unpushed_branch_commits(repo: &Path, branch: &str, tracking: &str) -> Result<()> {
+    let local_ref = format!("refs/heads/{branch}");
+    let local_tip = match git_output(repo, &["rev-parse", "--verify", &local_ref]) {
+        Ok(tip) => tip,
+        Err(_) => return Ok(()),
+    };
+    let remote_tip = git_output(repo, &["rev-parse", "--verify", tracking])?;
+    if local_tip == remote_tip {
+        return Ok(());
+    }
+    // Behind (or equal ancestry): remote contains local tip → safe to fast-forward reset.
+    if is_ancestor(repo, &local_tip, &remote_tip)? {
+        return Ok(());
+    }
+    let ahead = git_output(
+        repo,
+        &["rev-list", "--count", &format!("{tracking}..{local_ref}")],
+    )
+    .ok()
+    .and_then(|count| count.parse::<u64>().ok())
+    .unwrap_or(1);
+    bail!(
+        "refusing to update branch '{branch}': {ahead} local commit(s) ahead of {tracking}; \
+         push or move them before updating"
+    );
+}
+
+fn is_ancestor(repo: &Path, maybe_ancestor: &str, commit: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .current_dir(repo)
+        .args(["merge-base", "--is-ancestor", maybe_ancestor, commit])
+        .status()
+        .with_context(|| format!("failed to compare git ancestry {maybe_ancestor} vs {commit}"))?;
+    Ok(status.success())
 }
 
 fn remote_ref_exists(repo: &Path, reference: &str) -> Result<bool> {
@@ -6214,7 +6693,7 @@ mod tests {
         fs::write(&sidecar_path, b"sidecar").unwrap();
 
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, Some(entry), &model_path, 64, None).unwrap();
+        let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], "");
         assert_eq!(params["prefill_compression"], "off");
@@ -6228,7 +6707,7 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&enabled, Some(entry), &model_path, 64, None).unwrap();
+        let params = load_params(&enabled, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
         assert_eq!(params["prefill_compression"], "off");
@@ -6236,13 +6715,167 @@ mod tests {
     }
 
     #[test]
-    fn artifact_urls_use_registry_repo_and_file() {
+    fn load_params_forwards_explicit_vmm_backend() {
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params =
+            load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
+        assert_eq!(params["kv_backend"], "vmm");
+    }
+
+    #[test]
+    fn load_params_forwards_dflash_draft_from_environment() {
+        struct EnvRestore(Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => env::set_var("HIPFIRE_DFLASH_DRAFT", value),
+                    None => env::remove_var("HIPFIRE_DFLASH_DRAFT"),
+                }
+            }
+        }
+
+        let _restore = EnvRestore(env::var_os("HIPFIRE_DFLASH_DRAFT"));
+        let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
+        env::set_var("HIPFIRE_DFLASH_DRAFT", draft);
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.mode", "dflash").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "speculation.mode=dflash".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["draft"], draft);
+    }
+
+    #[test]
+    fn run_spec_dflash_projects_inherited_draft_after_config_off() {
+        // Reviewer case: resolved config leaves DFlash off, but an inherited
+        // HIPFIRE_DFLASH_DRAFT is present and `run --spec dflash` re-enables
+        // DFlash after load_params. Draft must land on the final load params.
+        struct EnvRestore(Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => env::set_var("HIPFIRE_DFLASH_DRAFT", value),
+                    None => env::remove_var("HIPFIRE_DFLASH_DRAFT"),
+                }
+            }
+        }
+
+        let _restore = EnvRestore(env::var_os("HIPFIRE_DFLASH_DRAFT"));
+        let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
+        env::set_var("HIPFIRE_DFLASH_DRAFT", draft);
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.mode", "off").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "speculation.mode=off".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+
+        // load_params alone must not carry the draft while config mode is off.
+        let mut params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "config-off load_params must not project HIPFIRE_DFLASH_DRAFT"
+        );
+
+        // Final run-path selector: CLI `--spec dflash` then project inherited draft.
+        apply_speculation_selector(&mut params, "dflash").unwrap();
+        project_dflash_draft(&mut params);
+        assert_eq!(params["dflash_mode"], "on");
+        assert_eq!(params["draft"], draft);
+
+        // Final off must clear any previously projected draft.
+        apply_speculation_selector(&mut params, "off").unwrap();
+        project_dflash_draft(&mut params);
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "final off must drop projected HIPFIRE_DFLASH_DRAFT"
+        );
+    }
+
+    #[test]
+    fn completion_timings_preserves_speculator_identity() {
+        let completion = |done| Completion {
+            id: "req-test".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done,
+        };
+
+        let dflash = completion_timings(&completion(serde_json::json!({
+            "dflash": true,
+            "tau": 3.5,
+            "cycles": 4,
+        })));
+        assert_eq!(dflash["dflash"], true);
+        assert!(dflash["mtp"].is_null());
+
+        let mtp = completion_timings(&completion(serde_json::json!({
+            "mtp": true,
+            "tau": 2.0,
+            "cycles": 6,
+        })));
+        assert!(mtp["dflash"].is_null());
+        assert_eq!(mtp["mtp"], true);
+    }
+
+    #[test]
+    fn artifact_urls_honor_endpoint_precedence() {
+        struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => env::set_var(self.0, value),
+                    None => env::remove_var(self.0),
+                }
+            }
+        }
+
+        let _hf_base = EnvRestore("HIPFIRE_HF_BASE", env::var_os("HIPFIRE_HF_BASE"));
+        let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
         let (_, entry) = registry.model("qwen3.6:35b-a3b-mq4r").unwrap();
+        let suffix = "schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
+
         env::remove_var("HIPFIRE_HF_BASE");
+        env::remove_var("HF_ENDPOINT");
         assert_eq!(
             artifact_url(entry, &entry.file),
-            "https://huggingface.co/schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r"
+            format!("https://huggingface.co/{suffix}")
+        );
+
+        env::set_var("HF_ENDPOINT", "https://hf-mirror.example/");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://hf-mirror.example/{suffix}")
+        );
+
+        env::set_var("HIPFIRE_HF_BASE", "https://hipfire-mirror.example///");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://hipfire-mirror.example/{suffix}")
         );
     }
 
@@ -6428,6 +7061,541 @@ mod tests {
         assert_eq!(
             fs::read_to_string(installed.join("channel")).unwrap(),
             "beta\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_refuses_branch_with_unpushed_commits() {
+        fn git(repo: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {}", args.join(" "));
+        }
+
+        let root = env::temp_dir().join(format!(
+            "hipfire-update-ahead-test-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let installed = root.join("installed");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "--bare", origin.to_str().unwrap()]);
+        fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init"]);
+        git(&seed, &["config", "user.name", "hipfire test"]);
+        git(
+            &seed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        fs::write(seed.join("channel"), "master\n").unwrap();
+        git(&seed, &["add", "channel"]);
+        git(&seed, &["commit", "-m", "master"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "master"]);
+        git(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "master",
+                origin.to_str().unwrap(),
+                installed.to_str().unwrap(),
+            ],
+        );
+        git(&installed, &["config", "user.name", "hipfire test"]);
+        git(
+            &installed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        fs::write(installed.join("local_only.txt"), "keep-me\n").unwrap();
+        git(&installed, &["add", "local_only.txt"]);
+        git(&installed, &["commit", "-m", "local-only"]);
+        let local_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        let err = checkout_revision(&installed, &resolved)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ahead") && err.contains("master"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            local_head
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("local_only.txt")).unwrap(),
+            "keep-me\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn update_signal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn git_test(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {}", args.join(" "));
+    }
+
+    fn init_update_fixture(label: &str) -> (PathBuf, PathBuf) {
+        let root = env::temp_dir().join(format!(
+            "hipfire-update-{label}-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let installed = root.join("installed");
+        fs::create_dir_all(&root).unwrap();
+        git_test(&root, &["init", "--bare", origin.to_str().unwrap()]);
+        fs::create_dir_all(&seed).unwrap();
+        git_test(&seed, &["init"]);
+        git_test(&seed, &["config", "user.name", "hipfire test"]);
+        git_test(
+            &seed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        fs::write(seed.join("channel"), "master\n").unwrap();
+        git_test(&seed, &["add", "channel"]);
+        git_test(&seed, &["commit", "-m", "master"]);
+        git_test(&seed, &["branch", "-M", "master"]);
+        git_test(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_test(&seed, &["push", "-u", "origin", "master"]);
+        git_test(&seed, &["checkout", "-b", "beta"]);
+        fs::write(seed.join("channel"), "beta\n").unwrap();
+        git_test(&seed, &["commit", "-am", "beta"]);
+        git_test(&seed, &["push", "-u", "origin", "beta"]);
+        git_test(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "master",
+                origin.to_str().unwrap(),
+                installed.to_str().unwrap(),
+            ],
+        );
+        git_test(&installed, &["config", "user.name", "hipfire test"]);
+        git_test(
+            &installed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        (root, installed)
+    }
+
+    #[test]
+    fn update_handoff_forwards_recorded_rocm_root_and_gpu_arch() {
+        let home = env::temp_dir().join(format!(
+            "hipfire-update-rocm-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("install.json"),
+            r#"{"commit":"abc","ref":"master","rocm_root":"/opt/rocm/core-7.14","gpu_arch":"gfx1201","profile":"auto","installed_at":1}"#,
+        )
+        .unwrap();
+        let recorded = recorded_install_metadata(&home);
+        assert_eq!(
+            recorded.rocm_root.as_deref(),
+            Some(Path::new("/opt/rocm/core-7.14"))
+        );
+        assert_eq!(recorded.gpu_arch.as_deref(), Some("gfx1201"));
+        let args = installer_handoff_args(
+            &RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--yes".to_owned(),
+                "--branch".to_owned(),
+                "beta".to_owned(),
+                "--rocm-root".to_owned(),
+                "/opt/rocm/core-7.14".to_owned(),
+                "--gpu-arch".to_owned(),
+                "gfx1201".to_owned(),
+            ]
+        );
+
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"  ","gpu_arch":"  "}"#,
+        )
+        .unwrap();
+        let empty = recorded_install_metadata(&home);
+        assert!(empty.rocm_root.is_none());
+        assert!(empty.gpu_arch.is_none());
+        let bare = installer_handoff_args(
+            &RevisionSelector {
+                value: "deadbeef".into(),
+                kind: RevisionKind::Commit,
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            bare,
+            vec![
+                "--yes".to_owned(),
+                "--commit".to_owned(),
+                "deadbeef".to_owned(),
+            ]
+        );
+
+        // Selector remains before optional install metadata; --yes stays first.
+        let arch_only = installer_handoff_args(
+            &RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Auto,
+            },
+            None,
+            Some("gfx1100"),
+        );
+        assert_eq!(
+            arch_only,
+            vec![
+                "--yes".to_owned(),
+                "--ref".to_owned(),
+                "master".to_owned(),
+                "--gpu-arch".to_owned(),
+                "gfx1100".to_owned(),
+            ]
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn update_restores_staged_unstaged_and_untracked_after_failed_handoff() {
+        let (root, installed) = init_update_fixture("index-restore");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+
+        // Tracked file with staged + unstaged split, plus untracked work.
+        fs::write(installed.join("channel"), "staged-base\n").unwrap();
+        git_test(&installed, &["add", "channel"]);
+        fs::write(installed.join("channel"), "staged-base\nunstaged-tail\n").unwrap();
+        fs::write(installed.join("scratch.txt"), "untracked-user\n").unwrap();
+
+        run_checked(
+            Command::new("git").current_dir(&installed).args([
+                "stash",
+                "push",
+                "--include-untracked",
+                "-m",
+                "hipfire-update-index-test",
+            ]),
+            "git stash",
+        )
+        .unwrap();
+        let stash_sha = git_output(&installed, &["rev-parse", "stash@{0}"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: Some(stash_sha),
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+
+        // Installer dirties the failed target with tracked + untracked junk.
+        fs::write(installed.join("channel"), "installer-mutated\n").unwrap();
+        fs::write(installed.join("installer-junk.txt"), "leftover\n").unwrap();
+
+        restore_update_checkpoint(&installed, &checkpoint).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("channel")).unwrap(),
+            "staged-base\nunstaged-tail\n"
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("scratch.txt")).unwrap(),
+            "untracked-user\n"
+        );
+        // Index holds the staged half; worktree holds the full dirty file.
+        let cached = git_output(&installed, &["show", ":channel"]).unwrap();
+        assert_eq!(cached, "staged-base");
+        assert!(!installed.join("installer-junk.txt").exists());
+        // Successful --index apply drops the update stash.
+        let stash_list = git_output(&installed, &["stash", "list"]).unwrap_or_default();
+        assert!(
+            stash_list.is_empty(),
+            "update stash should be dropped after successful apply: {stash_list}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_installer_mutations_cannot_block_checkout_restore() {
+        let (root, installed) = init_update_fixture("dirty-target");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: None,
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+
+        // Simulate cargo/installer tracked + untracked mutations on the target.
+        fs::write(installed.join("channel"), "lockfile-like-mutation\n").unwrap();
+        fs::write(installed.join("target-artifact.bin"), "blob\n").unwrap();
+
+        restore_update_checkpoint(&installed, &checkpoint).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("channel")).unwrap(),
+            "master\n"
+        );
+        assert!(!installed.join("target-artifact.bin").exists());
+        let porcelain = git_output(&installed, &["status", "--porcelain"]).unwrap_or_default();
+        assert!(
+            porcelain.is_empty(),
+            "restored tree should be clean: {porcelain}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_rollback_guard_stays_armed_until_commit() {
+        let (root, installed) = init_update_fixture("guard-arm");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: None,
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+
+        {
+            let mut guard = UpdateRollbackGuard::arm(installed.clone(), checkpoint.clone());
+            assert!(guard.is_armed());
+            // Drop without commit must restore master.
+        }
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+
+        // Success path: commit disarms so drop leaves the new revision alone.
+        checkout_revision(&installed, &resolved).unwrap();
+        {
+            let mut guard = UpdateRollbackGuard::arm(installed.clone(), checkpoint);
+            assert!(guard.is_armed());
+            guard.commit();
+            assert!(!guard.is_armed());
+        }
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_interrupted_child_is_reaped_while_checkpoint_stays_armed() {
+        let _lock = update_signal_test_lock();
+        UPDATE_INTERRUPT.store(false, Ordering::SeqCst);
+
+        let (root, installed) = init_update_fixture("interrupt-reap");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: None,
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+
+        let mut guard = UpdateRollbackGuard::arm(installed.clone(), checkpoint);
+        assert!(guard.is_armed());
+
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg("trap 'exit 0' TERM; while true; do sleep 0.05; done")
+            .current_dir(&installed);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let child_pid = child.id();
+
+        // Arm interrupt after spawn so the wait loop takes the TERM path.
+        UPDATE_INTERRUPT.store(true, Ordering::SeqCst);
+        let status = wait_update_installer_child(&mut child).unwrap();
+        assert!(
+            !status.success() || update_interrupted(),
+            "interrupted wait should surface cancel state"
+        );
+
+        // Child must be reaped (no zombie); try_wait Ok(Some) or Err after wait.
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("installer child {child_pid} was not reaped"),
+            Err(_) => {}
+        }
+
+        // Guard remains armed until explicit fail/drop performs rollback.
+        assert!(guard.is_armed());
+        let err = guard.fail(anyhow!("update interrupted"));
+        assert!(
+            err.to_string().contains("update interrupted"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+
+        UPDATE_INTERRUPT.store(false, Ordering::SeqCst);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_restores_checkout_and_stash_after_failed_handoff() {
+        let (root, installed) = init_update_fixture("restore-basic");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(installed.join("dirty.txt"), "user-edit\n").unwrap();
+        run_checked(
+            Command::new("git").current_dir(&installed).args([
+                "stash",
+                "push",
+                "--include-untracked",
+                "-m",
+                "hipfire-update-test",
+            ]),
+            "git stash",
+        )
+        .unwrap();
+        let stash_sha = git_output(&installed, &["rev-parse", "stash@{0}"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: Some(stash_sha),
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+
+        // Simulate installer handoff failure recovery.
+        restore_update_checkpoint(&installed, &checkpoint).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("dirty.txt")).unwrap(),
+            "user-edit\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -6804,6 +7972,8 @@ mod tests {
             "11520",
             "--kv-mode",
             "q8",
+            "--kv-backend",
+            "vmm",
             "--idle-timeout",
             "0",
             "--tp",
@@ -6815,6 +7985,7 @@ mod tests {
         };
         assert_eq!(args.positionals.len(), 3);
         assert_eq!(args.kv_mode.as_deref(), Some("q8"));
+        assert_eq!(args.kv_backend.as_deref(), Some("vmm"));
         assert_eq!(args.idle_timeout, Some(0));
         assert_eq!(args.tp, Some(2));
     }

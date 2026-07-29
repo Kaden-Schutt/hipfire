@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "radiowave_recipe_evidence_summary",
+  "catalog_source_revision": "a064932c345b7ce4f9fe37c775b46c635b6d6e2f",
+  "catalog_source_path": "crates/radiowave/src/recipes.rs",
+  "raw_result_included": false,
+  "architecture": "gfx1151",
+  "date": "2026-07-25",
+  "recipe": "hipfire.memory.topk_gather_lds_transpose",
+  "verdict": "promoted",
+  "correctness": "byte-identical output",
+  "samples_per_row": 3,
+  "baseline_tokens_per_second": 25.57,
+  "candidate_tokens_per_second": 26.43,
+  "throughput_delta_pct": 3.363316,
+  "microbenchmark_baseline_us": 72.311,
+  "microbenchmark_candidate_us": 19.697,
+  "duration_delta_pct": -72.76,
+  "note": "The 21-layer cold-set microbenchmark and product ABBA result are copied from the vendored catalog. This compact record preserves that evidence; its raw result was not included in the source import."
+}

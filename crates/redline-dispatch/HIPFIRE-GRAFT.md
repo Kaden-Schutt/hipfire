@@ -5,18 +5,24 @@ This crate is copied from the standalone Redline repository at commit
 public ROCr ABI provenance is retained in `../redline-rocr/PROVENANCE.md`.
 
 The graft is default-off except for the runtime automatic default on
-single-GPU Qwen A3B `.mq4r` (`arch_id == 6`, `pp=tp=1`) when the exact GPU
-arch is `gfx1100`, `gfx1151`, or `gfx1201`, which defaults to `auto` with the
-retained PM4 transport. `gfx1200` and all other arches remain opt-in. This is
+single-GPU `.mq4r` models (`pp=tp=1`) when the exact GPU arch is
+`gfx1100`, `gfx1151`, or `gfx1201`, which defaults to `auto` with the
+retained PM4 transport. The predicate is model-family agnostic (no
+`arch_id` gate). `gfx1200` and all other arches remain opt-in. This is
 runtime default selection only — not Redline certification or registry
-admission. Explicit `HIPFIRE_REPLAY_BACKEND` and `HIPFIRE_REPLAY_TRANSPORT`
-settings take precedence. No replay mode may replace a HIP launch until warmup
-shadow validation proves shared-artifact identity, byte-exact output, intact
-guards, automatic clocks, GPU timing, and two independent speedup samples above
-the configured threshold. Any ABI, capability, parity, timeout, queue-fault,
-or cache-poison failure falls back to HIP for the process. A successful model
-swap resets the process-local controller; models outside that runtime default
-predicate return to ordinary HIP rather than inheriting a prior retained tape.
+admission. Unsupported retained routes still fail closed. Explicit
+`HIPFIRE_REPLAY_BACKEND` and `HIPFIRE_REPLAY_TRANSPORT` settings take
+precedence. The automatic eligible MQ4R product path records one ordinary
+HIP forward, prepares retained AQL/PM4, and transitions Captured→Ready
+directly on successful preparation; it does not call `observe_shadow`,
+traverse `ShadowValidated`, require two speedup observations, or install
+via the manual controller. The manual controller has the two accepted
+shadow-observation gate; repository promotion remains stricter. Any ABI,
+capability, parity, timeout, queue-fault, or cache-poison failure falls
+back to HIP for the process. A
+successful model swap resets the process-local controller; models outside
+that runtime default predicate return to ordinary HIP rather than
+inheriting a prior retained tape.
 
 The source repository's certified results are:
 

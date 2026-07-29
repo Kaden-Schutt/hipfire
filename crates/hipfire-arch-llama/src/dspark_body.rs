@@ -567,7 +567,7 @@ impl Qwen3DsparkScratch {
 
     /// Release all GPU allocations.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        self.kv.free_gpu(gpu);
+        let _ = self.kv.free_gpu(gpu);
         self.pbs.free_gpu(gpu);
         for t in [
             self.all_k,
@@ -1256,7 +1256,7 @@ impl DsparkBody for Qwen3DsparkBody {
             pbs,
         } = self.assets;
         weights.free_gpu(gpu);
-        kv.free_gpu(gpu);
+        let _ = kv.free_gpu(gpu);
         scratch.free_gpu(gpu);
         pbs.free_gpu(gpu);
     }

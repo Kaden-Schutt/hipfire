@@ -141,7 +141,7 @@ impl MtpComposeState {
         // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
         // release GPU memory (llama::KvCache has no Drop). Call the inner
         // KvCache's own free_gpu directly to properly hipFree each tensor.
-        self.mtp_kv.inner.free_gpu(gpu);
+        let _ = self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 
@@ -711,7 +711,7 @@ impl MtpComposeTreeState {
         // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
         // release GPU memory (llama::KvCache has no Drop). Call the inner
         // KvCache's own free_gpu directly to properly hipFree each tensor.
-        self.mtp_kv.inner.free_gpu(gpu);
+        let _ = self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 

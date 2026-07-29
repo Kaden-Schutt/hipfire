@@ -24,6 +24,7 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
@@ -627,9 +628,109 @@ pub(crate) fn parse_state_quant(
 
 // ─── Core arch carrier load ─────────────────────────────────────────────
 
+/// Hard-error free for unfinished qwen35 finish path: bundle + optional VL.
+fn rollback_unfinished_qwen35(
+    err: String,
+    bundle: Qwen35Bundle,
+    vision_weights: Option<qwen35_vl::VisionWeights>,
+    gpu: &mut Gpu,
+) -> String {
+    let mut notes = Vec::new();
+    if let Err(c) = hipfire_arch_qwen35::free_qwen35_bundle(bundle, gpu) {
+        notes.push(c);
+    }
+    if let Some(vw) = vision_weights {
+        vw.free_gpu(gpu);
+    }
+    if notes.is_empty() {
+        err
+    } else {
+        format!("{err}; cleanup also failed: {}", notes.join("; "))
+    }
+}
+
+/// CASK / plain eviction setup. Only hard-error stage in finish_qwen35_load
+/// before the bundle is published into LoadedModel.
+fn build_qwen35_eviction(
+    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
+    physical_cap: usize,
+    ctx: &mut LoadCtx,
+) -> Result<Option<Eviction>, String> {
+    use hipfire_arch_qwen35::qwen35::LayerType;
+    let Some(ref sidecar_path) = ctx.cask.sidecar else {
+        return Ok(None);
+    };
+    let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
+        use std::io::ErrorKind;
+        let p = Path::new(sidecar_path);
+        let why = match e.kind() {
+            ErrorKind::NotFound if p.symlink_metadata().is_ok() => {
+                format!("dangling symlink (target absent): {sidecar_path}")
+            }
+            ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
+            ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
+            ErrorKind::UnexpectedEof => format!("truncated/corrupt sidecar: {sidecar_path}"),
+            _ => format!("read error ({e}): {sidecar_path}"),
+        };
+        format!(
+            "cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)"
+        )
+    })?;
+    let fa_layer_ids: Vec<usize> = config
+        .layer_types
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            if *t == LayerType::FullAttention {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if fa_layer_ids.is_empty() {
+        eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
+        return Ok(None);
+    }
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    let base = EvictionCtx::new(
+        ctx.gpu,
+        &centers,
+        fa_layer_ids,
+        ctx.cask.budget,
+        ctx.cask.beta,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+        physical_cap,
+    )
+    .map_err(|e| format!("build EvictionCtx: {e}"))?;
+    if ctx.cask.cask_m_folding {
+        eprintln!(
+            "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
+            ctx.cask.core_frac, ctx.cask.fold_m, ctx.cask.budget, ctx.cask.beta, physical_cap
+        );
+        Ok(Some(Eviction::Cask(CaskCtx::new(
+            base,
+            ctx.cask.core_frac,
+            ctx.cask.fold_m,
+        ))))
+    } else {
+        eprintln!(
+            "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
+            ctx.cask.budget, ctx.cask.beta, physical_cap
+        );
+        Ok(Some(Eviction::Plain(base)))
+    }
+}
+
 /// Build a `LoadedModel` from a carrier `Bundle`, shared fields, and
 /// eviction/DFlash state. This is the common body for qwen35 dispatch
 /// where eviction and DFlash need per-arch type info.
+///
+/// Hard errors before publish free the bundle and any preloaded VL weights.
 fn finish_qwen35_load(
     bundle: Qwen35Bundle,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -640,139 +741,95 @@ fn finish_qwen35_load(
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
 ) -> Result<LoadedModel, String> {
-    use hipfire_arch_qwen35::qwen35::LayerType;
-    // Extract references for eviction/DFlash setup (borrow, don't move)
+    // ── Eviction (only hard-error stage before publish) ────────────
+    // Built before long-lived borrows so rollback can move `bundle`.
+    let eviction = match build_qwen35_eviction(&bundle.config, physical_cap, ctx) {
+        Ok(e) => e,
+        Err(e) => {
+            return Err(rollback_unfinished_qwen35(
+                e,
+                bundle,
+                vision_weights,
+                ctx.gpu,
+            ));
+        }
+    };
+
+    // Extract references for DFlash/spec setup (borrow, don't move)
     let config = &bundle.config;
     let dn_state = &bundle.dn_state;
-    // ── Eviction ───────────────────────────────────────────────────
-    let eviction = if let Some(ref sidecar_path) = ctx.cask.sidecar {
-        let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
-            use std::io::ErrorKind;
-            let p = Path::new(sidecar_path);
-            let why = match e.kind() {
-                ErrorKind::NotFound if p.symlink_metadata().is_ok() =>
-                    format!("dangling symlink (target absent): {sidecar_path}"),
-                ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
-                ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
-                ErrorKind::UnexpectedEof => format!("truncated/corrupt sidecar: {sidecar_path}"),
-                _ => format!("read error ({e}): {sidecar_path}"),
-            };
-            format!("cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
-        })?;
-        let fa_layer_ids: Vec<usize> = config
-            .layer_types
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| {
-                if *t == LayerType::FullAttention {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if fa_layer_ids.is_empty() {
-            eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
-            None
-        } else {
-            let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-            let base = EvictionCtx::new(
-                ctx.gpu,
-                &centers,
-                fa_layer_ids,
-                ctx.cask.budget,
-                ctx.cask.beta,
-                config.n_heads,
-                config.n_kv_heads,
-                config.head_dim,
-                n_rot,
-                config.rope_theta,
-                physical_cap,
-            )
-            .map_err(|e| format!("build EvictionCtx: {e}"))?;
-            if ctx.cask.cask_m_folding {
-                eprintln!(
-                    "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
-                    ctx.cask.core_frac,
-                    ctx.cask.fold_m,
-                    ctx.cask.budget,
-                    ctx.cask.beta,
-                    physical_cap
-                );
-                Some(Eviction::Cask(CaskCtx::new(
-                    base,
-                    ctx.cask.core_frac,
-                    ctx.cask.fold_m,
-                )))
-            } else {
-                eprintln!(
-                    "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
-                    ctx.cask.budget, ctx.cask.beta, physical_cap
-                );
-                Some(Eviction::Plain(base))
-            }
-        }
-    } else {
-        None
-    };
+
+    // Adaptive KV cannot combine with generic (DSpark/DFlash/n-gram/bundled-MTP
+    // build_speculator) drafters. Suppress before any GPU drafter alloc; native
+    // qwen35_mtp_head load below is intentionally left alone.
+    let adaptive_blocks_generic_spec = bundle.kv_adaptive.is_some();
+    if adaptive_blocks_generic_spec {
+        eprintln!(
+            "  kv_adaptive engaged — suppressing generic speculator path (DSpark/DFlash/n-gram/bundled MTP-spec)"
+        );
+    }
 
     // ── DSpark sidecar (wins over DFlash/MTP/n-gram) ───────────────
     // The drafter is a dense-qwen3 body (llama crate); it drives the qwen35
     // ModelSlot target via the SpecTarget DSpark capture hooks. Discovered as
     // `<stem>-dspark.<ext>` next to the trunk, independent of ctx.draft_path.
-    let dspark_speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if ctx.spec.dspark
-        != Some(false)
-    {
-        let base = std::path::Path::new(ctx.path);
-        let sidecar_path = match (base.parent(), base.file_stem(), base.extension()) {
-            (Some(parent), Some(stem), Some(ext)) => Some(parent.join(format!(
-                "{}-dspark.{}",
-                stem.to_string_lossy(),
-                ext.to_string_lossy()
-            ))),
-            _ => None,
-        };
-        match sidecar_path.filter(|p| p.exists()) {
-            Some(p) => {
-                eprintln!("  qwen35: opening DSpark sidecar HFQ {p:?}");
-                match hipfire_runtime::hfq::HfqFile::open(&p) {
-                    Ok(mut sidecar) => {
-                        sidecar.drop_mmap();
-                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu) {
-                            Ok(Some((dspark_weights, assets))) => {
-                                let block = dspark_weights.cfg.block_size;
-                                // Reduced-vocab drafters (ORNITH) ship a compressed
-                                // lm_head; run_heads reads vocab from lm_head.shape[0].
-                                let vocab = if dspark_weights.cfg.draft_vocab_size > 0 {
-                                    dspark_weights.cfg.draft_vocab_size
-                                } else {
-                                    assets.config.vocab_size
-                                };
-                                let stage_norm = assets.weights.output_norm.shallow_clone();
-                                // upload_raw sets dtype=Raw; the data is F16.
-                                let mut lm_head = assets.weights.output.buf.shallow_clone();
-                                lm_head.dtype = rdna_compute::DType::F16;
-                                lm_head.shape = vec![vocab];
-                                let conf_threshold =
-                                    hipfire_config::developer_var("HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD")
-                                        .ok()
-                                        .and_then(|s| s.parse().ok())
-                                        .or(ctx.spec.dspark_conf_threshold)
-                                        .unwrap_or(0.1f32);
-                                eprintln!(
+    let dspark_speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> =
+        if adaptive_blocks_generic_spec {
+            None
+        } else if ctx.spec.dspark != Some(false) {
+            let base = std::path::Path::new(ctx.path);
+            let sidecar_path = match (base.parent(), base.file_stem(), base.extension()) {
+                (Some(parent), Some(stem), Some(ext)) => Some(parent.join(format!(
+                    "{}-dspark.{}",
+                    stem.to_string_lossy(),
+                    ext.to_string_lossy()
+                ))),
+                _ => None,
+            };
+            match sidecar_path.filter(|p| p.exists()) {
+                Some(p) => {
+                    eprintln!("  qwen35: opening DSpark sidecar HFQ {p:?}");
+                    match hipfire_runtime::hfq::HfqFile::open(&p) {
+                        Ok(mut sidecar) => {
+                            sidecar.drop_mmap();
+                            match hipfire_arch_llama::dspark_body::load_qwen3_dspark(
+                                &sidecar, ctx.gpu,
+                            ) {
+                                Ok(Some((dspark_weights, assets))) => {
+                                    let block = dspark_weights.cfg.block_size;
+                                    // Reduced-vocab drafters (ORNITH) ship a compressed
+                                    // lm_head; run_heads reads vocab from lm_head.shape[0].
+                                    let vocab = if dspark_weights.cfg.draft_vocab_size > 0 {
+                                        dspark_weights.cfg.draft_vocab_size
+                                    } else {
+                                        assets.config.vocab_size
+                                    };
+                                    let stage_norm = assets.weights.output_norm.shallow_clone();
+                                    // upload_raw sets dtype=Raw; the data is F16.
+                                    let mut lm_head = assets.weights.output.buf.shallow_clone();
+                                    lm_head.dtype = rdna_compute::DType::F16;
+                                    lm_head.shape = vec![vocab];
+                                    let conf_threshold = hipfire_config::developer_var(
+                                        "HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD",
+                                    )
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .or(ctx.spec.dspark_conf_threshold)
+                                    .unwrap_or(0.1f32);
+                                    eprintln!(
                                     "  qwen35 DSpark enabled (block={}, target_layers={:?}, draft_vocab={}, conf={:.2})",
                                     block,
                                     dspark_weights.cfg.target_layer_ids,
                                     vocab,
                                     conf_threshold
                                 );
-                                match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
-                                    assets,
-                                    &dspark_weights.cfg,
-                                    ctx.gpu,
-                                ) {
-                                    Ok(body) => {
-                                        Some(hipfire_runtime::dspark_core::build_dspark_speculator(
+                                    match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+                                        assets,
+                                        &dspark_weights.cfg,
+                                        ctx.gpu,
+                                    ) {
+                                        Ok(body) => {
+                                            Some(hipfire_runtime::dspark_core::build_dspark_speculator(
                                             body,
                                             dspark_weights,
                                             stage_norm,
@@ -782,37 +839,39 @@ fn finish_qwen35_load(
                                             conf_threshold,
                                             true, // sampled verify (temp>0) supported
                                         ))
-                                    }
-                                    Err(e) => {
-                                        eprintln!("  qwen35: DSpark body build failed: {e} — AR/other");
-                                        None
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                            "  qwen35: DSpark body build failed: {e} — AR/other"
+                                        );
+                                            None
+                                        }
                                     }
                                 }
-                            }
-                            Ok(None) => {
-                                eprintln!("  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping");
-                                None
-                            }
-                            Err(e) => {
-                                eprintln!("  qwen35: WARNING DSpark sidecar load failed: {e}");
-                                None
+                                Ok(None) => {
+                                    eprintln!("  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping");
+                                    None
+                                }
+                                Err(e) => {
+                                    eprintln!("  qwen35: WARNING DSpark sidecar load failed: {e}");
+                                    None
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("  qwen35: WARNING cannot open DSpark sidecar {p:?}: {e}");
-                        None
+                        Err(e) => {
+                            eprintln!("  qwen35: WARNING cannot open DSpark sidecar {p:?}: {e}");
+                            None
+                        }
                     }
                 }
+                None => None,
             }
-            None => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // ── DFlash (skipped when a DSpark sidecar won) ─────────────────
-    let dflash = if dspark_speculator.is_some() {
+    let dflash = if adaptive_blocks_generic_spec || dspark_speculator.is_some() {
         None
     } else if let Some(dp) = ctx.draft_path {
         match hipfire_arch_qwen35::dflash_spec::load_dflash_state(
@@ -848,11 +907,15 @@ fn finish_qwen35_load(
     // MTP head KV is not FlashCASK-compacted), and arch is qwen35 (5/6). Gated
     // here — not in build_speculator — because this is the only site with a
     // `&mut Gpu` to free on decline, and the head allocates GPU buffers.
-    let mtp = if dflash.is_none()
+    let mtp = if !adaptive_blocks_generic_spec
+        && dflash.is_none()
         && dspark_speculator.is_none()
         && eviction.is_none()
         && matches!(arch_id, 5 | 6)
-        && hipfire_config::developer_var("HIPFIRE_QWEN35_MTP").ok().as_deref() == Some("1")
+        && hipfire_config::developer_var("HIPFIRE_QWEN35_MTP")
+            .ok()
+            .as_deref()
+            == Some("1")
         && ctx.path.ends_with(".mq4-mtp")
     {
         match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
@@ -894,16 +957,21 @@ fn finish_qwen35_load(
     // borrowed only for the n-gram arm's scratch construction (snapshot copied to
     // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
     // DSpark wins over DFlash/MTP/n-gram when its sidecar loaded.
-    let speculator = dspark_speculator.or_else(|| {
-        crate::spec_build::build_speculator(
-            arch_id,
-            dflash,
-            mtp,
-            eviction.is_none(),
-            physical_cap,
-            ctx.spec,
-        )
-    });
+    // When adaptive, upstream gates left dspark/dflash/mtp as None — no free needed.
+    let speculator = if adaptive_blocks_generic_spec {
+        None
+    } else {
+        dspark_speculator.or_else(|| {
+            crate::spec_build::build_speculator(
+                arch_id,
+                dflash,
+                mtp,
+                eviction.is_none(),
+                physical_cap,
+                ctx.spec,
+            )
+        })
+    };
 
     // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
     //
@@ -964,6 +1032,10 @@ fn finish_qwen35_load(
         }
     };
 
+    // Move adaptive controller out of the bundle before parking the rest in
+    // ModelState. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
+    let mut bundle = bundle;
+    let kv_adaptive = bundle.kv_adaptive.take();
     let state = Some(ModelState::Qwen35(bundle));
     let mut model = LoadedModel {
         state,
@@ -972,6 +1044,7 @@ fn finish_qwen35_load(
         vision_config,
         vision_weights,
         max_seq: ctx.max_seq,
+        kv_adaptive,
         ..LoadedModel::skeleton(
             arch_id,
             tokenizer,
@@ -982,7 +1055,7 @@ fn finish_qwen35_load(
         )
     };
     // `mtp_weights_present` drives the mtp_mode=auto serve decision (mirrors the
-    // ds4 probe set in the daemon's load handler). For qwen35 the presence of a
+    // dspark probe set in the daemon's load handler). For qwen35 the presence of a
     // loaded MTP head IS the signal.
     model.mtp_weights_present = qwen35_mtp_head.is_some();
     model.qwen35_mtp_head = qwen35_mtp_head;
@@ -1006,7 +1079,42 @@ pub fn load_model(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
+    load_model_with_kv_backend(
+        path,
+        max_seq,
+        draft_path,
+        kv_mode_override,
+        None,
+        kv_adaptive_override,
+        state_quant_override,
+        cask,
+        pp,
+        spec,
+        gpu,
+    )
+}
+
+/// Load a model with an optional per-load KV storage backend override.
+#[allow(clippy::too_many_arguments)]
+pub fn load_model_with_kv_backend(
+    path: &str,
+    max_seq: usize,
+    draft_path: Option<&str>,
+    kv_mode_override: Option<&str>,
+    kv_backend_override: Option<&str>,
+    kv_adaptive_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    pp: usize,
+    spec: SpecLoadCfg,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<LoadedModel, String> {
+    // Retry any arenas left by a prior failed teardown; refuse the load if
+    // ownership is still live so a new model cannot stack on pending VMM state.
+    ensure_vmm_ready_for_load(gpu)?;
     let src = ModelSource::from_path(path)?;
+    let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
+    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
 
     // Author-recommended sampling defaults (temp/top_p/top_k from the .hfq's baked
     // `generation_config`). Extract HERE, from the already-open source, BEFORE the
@@ -1098,6 +1206,7 @@ pub fn load_model(
         max_seq,
         draft_path,
         kv_mode_override,
+        kv_backend,
         kv_adaptive_override,
         state_quant_override,
         cask,
@@ -1119,6 +1228,12 @@ pub fn load_model(
             src.describe(),
             carrier.name(),
             other.name()
+        ));
+    }
+    if kv_backend == KvBackend::Vmm && carrier.name() != "qwen35" {
+        return Err(format!(
+            "KV backend 'vmm' currently supports qwen3.5 only (selected carrier: {})",
+            carrier.name()
         ));
     }
     let mut result = carrier.load(src, &mut ctx)?;
@@ -1622,9 +1737,18 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     })
 }
 
+/// Retry pending VMM arenas and refuse progress while any remain registered.
+pub fn ensure_vmm_ready_for_load(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    gpu.ensure_vmm_cleaned().map_err(|err| {
+        format!(
+            "refusing load: prior VMM teardown still pending ({err}); retry unload or restart the process"
+        )
+    })
+}
+
 // ─── Unload ───────────────────────────────────────────────────────────
 
-pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
     // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
     // per-rank weight / state / partial. Free per-rank weights → state → partials
@@ -1693,7 +1817,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             dev.drain_pool();
         }
         let _ = gpu;
-        return;
+        return Ok(());
         // `gpus` drops here, tearing down comms + devices.
     }
     if m.pp > 1 {
@@ -1727,7 +1851,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             g.drain_pool();
         }
         let _ = gpu;
-        return;
+        return Ok(());
     }
     if let Some(spec) = m.speculator {
         // Frees the drafter's GPU buffers (draft weights + scratch) AND its
@@ -1742,8 +1866,16 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
     }
+    let mut first_err: Option<String> = None;
+    let mut note = |r: Result<(), String>| {
+        if let Err(err) = r {
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
+        }
+    };
     if let Some(kv) = m.kv_cache {
-        kv.free_gpu(gpu);
+        note(kv.free_gpu(gpu).map_err(|e| e.to_string()));
     }
     if let Some(dn) = m.dn_state {
         dn.free_gpu(gpu);
@@ -1762,7 +1894,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.weights.free_gpu(gpu);
             }
             ModelState::Qwen35(b) => {
-                b.kv_cache.free_gpu(gpu);
+                note(b.kv_cache.free_gpu(gpu).map_err(|e| e.to_string()));
                 b.scratch.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
                 b.dn_state.free_gpu(gpu);
@@ -1770,7 +1902,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             ModelState::Llama(b) => {
                 b.scratch.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
-                b.kv.free_gpu(gpu);
+                note(b.kv.free_gpu(gpu).map_err(|e| e.to_string()));
             }
             ModelState::Lfm2Moe(b) => {
                 b.state.free_gpu(gpu);
@@ -1811,6 +1943,13 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+    // After ordinary frees/pool drain, retry any VMM arenas retained by a
+    // failed free_tensor. Success is reported only when none remain.
+    note(gpu.ensure_vmm_cleaned().map_err(|e| e.to_string()));
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

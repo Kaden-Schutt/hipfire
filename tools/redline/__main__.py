@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
-"""CLI entry: python3 -m tools.redline {golden|bench|serve-diff} ..."""
+"""CLI entry: python3 -m tools.redline {golden|bench|serve-diff|lower} ..."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in {"-h", "--help"}:
         print(
-            "usage: python3 -m tools.redline {golden|bench|serve-diff} ...",
+            "usage: python3 -m tools.redline {golden|bench|serve-diff|lower} ...",
             file=sys.stderr,
         )
         return 0 if args and args[0] in {"-h", "--help"} else 2
@@ -37,8 +37,14 @@ def main(argv: list[str] | None = None) -> int:
 
         return serve_diff_main(rest)
 
+    if command == "lower":
+        from tools.redline.lower import main as lower_main
+
+        return lower_main(rest)
+
     print(
-        f"tools.redline: unknown subcommand {command!r} (expected golden, bench, or serve-diff)",
+        f"tools.redline: unknown subcommand {command!r} "
+        f"(expected golden, bench, serve-diff, or lower)",
         file=sys.stderr,
     )
     return 2

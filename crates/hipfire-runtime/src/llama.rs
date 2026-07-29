@@ -7,11 +7,13 @@
 
 use crate::arch::{screen_weight_tensor, MmqScreenable};
 use crate::gguf::{GgmlType, GgufFile, TensorInfo};
+use crate::kv_backend::{
+    KvBackend, KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+};
 use crate::kv_mode::KvMode;
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::path::Path;
 
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3469,7 +3471,12 @@ pub fn forward_scratch_embed(
 fn llama_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// KV-cache write + single-token attention, extracted verbatim from the hand
@@ -5352,7 +5359,510 @@ pub enum KvTarget<'a> {
     Multi(&'a mut Gpus),
 }
 
+/// Single source of truth for VMM K/V byte layout.
+///
+/// - `k_bytes_per_token` / `v_bytes_per_token` are **current** encoding strides
+///   (drive mapped-token capacity, growth, and live source-prefix sizing).
+/// - `k_reserve_*` describe the virtual VA arena size (static: reserve == current;
+///   adaptive may reserve at floor while current encoding is FWHT4/Q8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmmKvLayout {
+    mode: KvMode,
+    v_mode: VMode,
+    n_kv_heads: usize,
+    head_dim: usize,
+    physical_cap: usize,
+    kv_dim: usize,
+    k_bytes_per_head: usize,
+    v_bytes_per_head: usize,
+    k_bytes_per_token: usize,
+    v_bytes_per_token: usize,
+    /// Virtual reserve bytes at the reserve tier (may differ from current).
+    k_reserve_bytes: usize,
+    v_reserve_bytes: usize,
+    k_reserve_elems: usize,
+    v_reserve_elems: usize,
+    /// Sign/angle table width. 0 = none (Q8). 128 = Givens or FWHT-128.
+    /// 256 = FWHT-256 (fwht3, or any FWHT+lloyd-V).
+    rotation_table_len: usize,
+    uses_fwht_signs: bool,
+}
+
+impl VmmKvLayout {
+    /// Checked live K source-prefix bytes for `n_positions` at the **current**
+    /// K stride. Independent of virtual reserve size — used by adaptive
+    /// transcode scratch sizing and map-before-read guards.
+    fn prefix_k_bytes(self, n_positions: usize) -> HipResult<usize> {
+        KvCache::checked_vmm_product("K source prefix", &[n_positions, self.k_bytes_per_token])
+    }
+
+    /// Checked live V source-prefix bytes for `n_positions` at the **current**
+    /// V stride. Independent of virtual reserve size.
+    fn prefix_v_bytes(self, n_positions: usize) -> HipResult<usize> {
+        KvCache::checked_vmm_product("V source prefix", &[n_positions, self.v_bytes_per_token])
+    }
+}
+
 impl KvCache {
+    fn checked_vmm_product(label: &str, factors: &[usize]) -> HipResult<usize> {
+        factors
+            .iter()
+            .try_fold(1usize, |product, &factor| product.checked_mul(factor))
+            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("VMM KV {label} size overflowed")))
+    }
+
+    fn bytes_to_f32_elems(label: &str, bytes: usize) -> HipResult<usize> {
+        bytes.checked_add(3).map(|value| value / 4).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("VMM KV {label} element count overflowed"))
+        })
+    }
+
+    /// Packed K bytes-per-head for Q8 / asym{2,3,4} / fwht{2,3,4}.
+    /// Asym and FWHT share storage at the same bit width; only rotation tables differ.
+    fn vmm_k_bytes_per_head(mode: KvMode, head_dim: usize) -> HipResult<usize> {
+        match mode {
+            KvMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM q8 requires a non-zero head_dim divisible by 32 (got head_dim={head_dim})"
+                        ),
+                    ));
+                }
+                Self::checked_vmm_product("q8 K head stride", &[head_dim / 32, 34])
+            }
+            KvMode::Asym2 | KvMode::Fwht2 => head_dim
+                .checked_div(4)
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 2-bit K head stride overflowed")),
+            KvMode::Asym3 | KvMode::Fwht3 => head_dim
+                .checked_mul(3)
+                .and_then(|n| n.checked_div(8))
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 3-bit K head stride overflowed")),
+            KvMode::Asym4 | KvMode::Fwht4 => head_dim
+                .checked_div(2)
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 4-bit K head stride overflowed")),
+            KvMode::Asym3Auto => Err(hip_bridge::HipError::new(
+                0,
+                "KV mode Asym3Auto must be resolved before VMM layout",
+            )),
+        }
+    }
+
+    /// Packed V bytes-per-head for Q8 / Lloyd{2,3,4}.
+    fn vmm_v_bytes_per_head(v_mode: VMode, head_dim: usize) -> HipResult<usize> {
+        match v_mode {
+            VMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM Q8-V requires a non-zero head_dim divisible by 32 (got head_dim={head_dim})"
+                        ),
+                    ));
+                }
+                Self::checked_vmm_product("q8 V head stride", &[head_dim / 32, 34])
+            }
+            VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4 => {
+                let bits = v_mode.bits() as usize;
+                head_dim
+                    .checked_mul(bits)
+                    .and_then(|n| n.checked_div(8))
+                    .and_then(|n| n.checked_add(4))
+                    .ok_or_else(|| {
+                        hip_bridge::HipError::new(
+                            0,
+                            &format!("VMM lloyd{bits} V head stride overflowed"),
+                        )
+                    })
+            }
+        }
+    }
+
+    /// Geometry gates shared by every static VMM mode (and legal Lloyd-V pairs).
+    fn validate_vmm_static_geometry(
+        mode: KvMode,
+        v_mode: VMode,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        if n_kv_heads == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM {mode:?} requires n_kv_heads>0 (got 0)"),
+            ));
+        }
+        match mode {
+            KvMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM q8 requires n_kv_heads>0 and a non-zero head_dim divisible by 32 (got n_kv_heads={n_kv_heads}, head_dim={head_dim})"
+                        ),
+                    ));
+                }
+                if !matches!(v_mode, VMode::Q8) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM q8 only supports VMode::Q8 (lloyd-V requires an FWHT K mode)",
+                    ));
+                }
+            }
+            KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
+                let ok_hd = match mode {
+                    KvMode::Asym3 => head_dim == 256,
+                    _ => head_dim == 128 || head_dim == 256,
+                };
+                if !ok_hd {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM {mode:?} requires head_dim={} (got {head_dim})",
+                            if matches!(mode, KvMode::Asym3) {
+                                "256"
+                            } else {
+                                "128 or 256"
+                            }
+                        ),
+                    ));
+                }
+                if !matches!(v_mode, VMode::Q8) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM {mode:?} only supports VMode::Q8 (lloyd-V requires an FWHT K mode)"
+                        ),
+                    ));
+                }
+            }
+            KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4 => match v_mode {
+                VMode::Q8 => {
+                    let ok_hd = match mode {
+                        KvMode::Fwht3 => head_dim == 256,
+                        _ => head_dim == 128 || head_dim == 256,
+                    };
+                    if !ok_hd {
+                        return Err(hip_bridge::HipError::new(
+                            0,
+                            &format!(
+                                "VMM {mode:?} requires head_dim={} (got {head_dim})",
+                                if matches!(mode, KvMode::Fwht3) {
+                                    "256"
+                                } else {
+                                    "128 or 256"
+                                }
+                            ),
+                        ));
+                    }
+                }
+                VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4 => {
+                    if head_dim != 256 {
+                        return Err(hip_bridge::HipError::new(
+                            0,
+                            &format!(
+                                "VMM lloyd-V requires head_dim=256 with FWHT K (got mode={mode:?}, head_dim={head_dim})"
+                            ),
+                        ));
+                    }
+                }
+            },
+            KvMode::Asym3Auto => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "KV mode Asym3Auto must be resolved before VMM layout",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a static VMM layout (reserve tier == current tier).
+    fn vmm_static_layout(
+        mode: KvMode,
+        v_mode: VMode,
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<VmmKvLayout> {
+        Self::validate_vmm_static_geometry(mode, v_mode, n_kv_heads, head_dim)?;
+        if physical_cap == 0 {
+            return Err(hip_bridge::HipError::new(0, "VMM physical_cap must be > 0"));
+        }
+        let kv_dim = Self::checked_vmm_product("logical", &[n_kv_heads, head_dim])?;
+        let k_bytes_per_head = Self::vmm_k_bytes_per_head(mode, head_dim)?;
+        let v_bytes_per_head = Self::vmm_v_bytes_per_head(v_mode, head_dim)?;
+        let k_bytes_per_token =
+            Self::checked_vmm_product("K token stride", &[n_kv_heads, k_bytes_per_head])?;
+        let v_bytes_per_token =
+            Self::checked_vmm_product("V token stride", &[n_kv_heads, v_bytes_per_head])?;
+        let k_reserve_bytes =
+            Self::checked_vmm_product("K reserve", &[physical_cap, k_bytes_per_token])?;
+        let v_reserve_bytes =
+            Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?;
+        let rotation_table_len = match mode {
+            KvMode::Q8 => 0,
+            KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => head_dim / 2,
+            KvMode::Fwht3 => 256,
+            KvMode::Fwht2 | KvMode::Fwht4 => {
+                // Q8-V uses 128-wide signs; lloyd-V needs 256-wide up front so
+                // constructors never replace owners after publish.
+                if matches!(v_mode, VMode::Q8) {
+                    128
+                } else {
+                    256
+                }
+            }
+            KvMode::Asym3Auto => 0,
+        };
+        let uses_fwht_signs = matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4);
+        Ok(VmmKvLayout {
+            mode,
+            v_mode,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            kv_dim,
+            k_bytes_per_head,
+            v_bytes_per_head,
+            k_bytes_per_token,
+            v_bytes_per_token,
+            k_reserve_bytes,
+            v_reserve_bytes,
+            k_reserve_elems: Self::bytes_to_f32_elems("K reserve", k_reserve_bytes)?,
+            v_reserve_elems: Self::bytes_to_f32_elems("V reserve", v_reserve_bytes)?,
+            rotation_table_len,
+            uses_fwht_signs,
+        })
+    }
+
+    /// Floor-reserved layout: current encoding strides may differ from reserve.
+    /// Adaptive uses this with start FWHT4/Q8 and floor reserve bph/v_mode.
+    fn vmm_layout_with_reserve(
+        mode: KvMode,
+        v_mode: VMode,
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+        reserve_k_bytes_per_head: usize,
+        reserve_v_mode: VMode,
+    ) -> HipResult<VmmKvLayout> {
+        Self::validate_vmm_static_geometry(mode, v_mode, n_kv_heads, head_dim)?;
+        if physical_cap == 0 {
+            return Err(hip_bridge::HipError::new(0, "VMM physical_cap must be > 0"));
+        }
+        if reserve_k_bytes_per_head == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "VMM reserve K bytes-per-head must be > 0",
+            ));
+        }
+        let kv_dim = Self::checked_vmm_product("logical", &[n_kv_heads, head_dim])?;
+        let k_bytes_per_head = Self::vmm_k_bytes_per_head(mode, head_dim)?;
+        let v_bytes_per_head = Self::vmm_v_bytes_per_head(v_mode, head_dim)?;
+        let reserve_v_bph = Self::vmm_v_bytes_per_head(reserve_v_mode, head_dim)?;
+        let k_bytes_per_token =
+            Self::checked_vmm_product("K token stride", &[n_kv_heads, k_bytes_per_head])?;
+        let v_bytes_per_token =
+            Self::checked_vmm_product("V token stride", &[n_kv_heads, v_bytes_per_head])?;
+        let k_reserve_token =
+            Self::checked_vmm_product("K reserve token", &[n_kv_heads, reserve_k_bytes_per_head])?;
+        let v_reserve_token =
+            Self::checked_vmm_product("V reserve token", &[n_kv_heads, reserve_v_bph])?;
+        let k_reserve_bytes =
+            Self::checked_vmm_product("K reserve", &[physical_cap, k_reserve_token])?;
+        let v_reserve_bytes =
+            Self::checked_vmm_product("V reserve", &[physical_cap, v_reserve_token])?;
+        // Adaptive / lloyd paths need 256-wide signs (q8→lloyd, optional fwht4→fwht3).
+        let rotation_table_len = if matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+            || !matches!(reserve_v_mode, VMode::Q8)
+            || !matches!(v_mode, VMode::Q8)
+        {
+            256
+        } else if matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4) {
+            head_dim / 2
+        } else {
+            0
+        };
+        let uses_fwht_signs = matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+            || !matches!(reserve_v_mode, VMode::Q8);
+        Ok(VmmKvLayout {
+            mode,
+            v_mode,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            kv_dim,
+            k_bytes_per_head,
+            v_bytes_per_head,
+            k_bytes_per_token,
+            v_bytes_per_token,
+            k_reserve_bytes,
+            v_reserve_bytes,
+            k_reserve_elems: Self::bytes_to_f32_elems("K reserve", k_reserve_bytes)?,
+            v_reserve_elems: Self::bytes_to_f32_elems("V reserve", v_reserve_bytes)?,
+            rotation_table_len,
+            uses_fwht_signs,
+        })
+    }
+
+    /// Back-compat wrappers used by older call sites / tests.
+    fn q8_vmm_layout(
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<(usize, usize, usize)> {
+        let layout =
+            Self::vmm_static_layout(KvMode::Q8, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
+        Ok((
+            layout.kv_dim,
+            layout.k_reserve_elems,
+            layout.k_bytes_per_token,
+        ))
+    }
+
+    fn asym3_vmm_layout(
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<(usize, usize, usize, usize, usize)> {
+        let layout =
+            Self::vmm_static_layout(KvMode::Asym3, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
+        Ok((
+            layout.kv_dim,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            layout.k_bytes_per_head,
+            layout.v_bytes_per_head,
+        ))
+    }
+
+    /// FWHT3 reuses the Asym3 packed-K / Q8-V byte layout; only the rotation
+    /// tables and `quant_fwht` flag differ from Asym3 VMM.
+    fn fwht3_vmm_layout(
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<(usize, usize, usize, usize, usize)> {
+        let layout =
+            Self::vmm_static_layout(KvMode::Fwht3, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
+        Ok((
+            layout.kv_dim,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            layout.k_bytes_per_head,
+            layout.v_bytes_per_head,
+        ))
+    }
+
+    /// Flag bundle applied by the unified static VMM constructor.
+    /// Returns (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht).
+    fn vmm_mode_flags(mode: KvMode) -> (bool, bool, bool, bool, bool) {
+        match mode {
+            KvMode::Q8 => (true, false, false, false, false),
+            KvMode::Asym2 => (false, false, false, true, false),
+            KvMode::Asym3 => (false, false, true, false, false),
+            KvMode::Asym4 => (false, true, false, false, false),
+            KvMode::Fwht2 => (false, false, false, true, true),
+            KvMode::Fwht3 => (false, false, true, false, true),
+            KvMode::Fwht4 => (false, true, false, false, true),
+            KvMode::Asym3Auto => (false, false, false, false, false),
+        }
+    }
+
+    /// Validate a backend request without touching GPU memory.
+    pub fn validate_mode_with_backend(
+        mode: KvMode,
+        backend: KvBackend,
+        single_gpu: bool,
+        dims: &KvDims,
+    ) -> HipResult<()> {
+        if mode == KvMode::Asym3Auto {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "KV mode Asym3Auto must be resolved before allocation",
+            ));
+        }
+        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{} KV cache requires head_dim=256; head_dim={} is unsupported",
+                    if mode == KvMode::Asym4 {
+                        "asym4"
+                    } else {
+                        "asym3"
+                    },
+                    dims.head_dim
+                ),
+            ));
+        }
+        if backend != KvBackend::Vmm {
+            return Ok(());
+        }
+        if !single_gpu {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "KV backend 'vmm' currently supports single-GPU qwen3.5 only",
+            ));
+        }
+        let KvLayers::Mask(is_kv_layer) = &dims.layers else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "KV backend 'vmm' requires qwen3.5's filtered FullAttention layer mask",
+            ));
+        };
+        if !is_kv_layer.iter().any(|is_kv| *is_kv) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "KV backend 'vmm' requires at least one FullAttention layer",
+            ));
+        }
+        let physical_cap = dims.physical_cap.ok_or_else(|| {
+            hip_bridge::HipError::new(0, "KV backend 'vmm' requires a physical token capacity")
+        })?;
+        if physical_cap == 0 || physical_cap > dims.max_seq {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM physical_cap must be in 1..=max_seq (got {physical_cap}, max_seq={})",
+                    dims.max_seq
+                ),
+            ));
+        }
+        match mode {
+            KvMode::Q8
+            | KvMode::Asym2
+            | KvMode::Asym3
+            | KvMode::Asym4
+            | KvMode::Fwht2
+            | KvMode::Fwht3
+            | KvMode::Fwht4 => {
+                // Default static V is Q8; Lloyd-V is validated when a constructor
+                // is invoked with an explicit v_mode.
+                Self::vmm_static_layout(
+                    mode,
+                    VMode::Q8,
+                    dims.n_kv_heads,
+                    dims.head_dim,
+                    physical_cap,
+                )?;
+            }
+            other => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "KV backend 'vmm' supports kv_mode=q8|asym2|asym3|asym4|fwht2|fwht3|fwht4 only (got {other:?})"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
         kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
@@ -5373,7 +5883,8 @@ impl KvCache {
             .chain(self.k_scales.iter())
             .chain(self.v_scales.iter())
         {
-            gpu.hip.memset(&t.buf, 0, t.buf.size())?;
+            let bytes = gpu.vmm_mapped_bytes(t).unwrap_or_else(|| t.buf.size());
+            gpu.hip.memset(&t.buf, 0, bytes)?;
         }
         Ok(())
     }
@@ -5384,33 +5895,59 @@ impl KvCache {
     /// target)` cells return `Err` rather than panic, so a future policy mis-wire
     /// surfaces as a clean load failure.
     pub fn from_mode(mode: KvMode, target: KvTarget, dims: &KvDims) -> HipResult<Self> {
-        debug_assert_ne!(
-            mode,
-            KvMode::Asym3Auto,
-            "from_mode received unresolved sentinel"
-        );
-        // GATE: asym4 and asym3 require head_dim=256. Both are validated only on
-        // Qwen 3.5 (head_dim=256); the constructors hard-assert head_dim==256 and
-        // the flash-decode paths are untested below that. Return a clean error here
-        // rather than panicking or emitting garbage inside the constructor.
-        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
-            return Err(hip_bridge::HipError::new(
+        Self::from_mode_with_backend(mode, KvBackend::Contiguous, target, dims)
+    }
+
+    pub fn from_mode_with_backend(
+        mode: KvMode,
+        backend: KvBackend,
+        target: KvTarget,
+        dims: &KvDims,
+    ) -> HipResult<Self> {
+        let single_gpu = matches!(&target, KvTarget::Single(_));
+        Self::validate_mode_with_backend(mode, backend, single_gpu, dims)?;
+        match (backend, target) {
+            (KvBackend::Contiguous, KvTarget::Single(gpu)) => {
+                Self::from_mode_single(mode, gpu, dims)
+            }
+            (KvBackend::Contiguous, KvTarget::Multi(gpus)) => {
+                Self::from_mode_multi(mode, gpus, dims)
+            }
+            (KvBackend::Vmm, KvTarget::Single(gpu)) => Self::from_mode_single_vmm(mode, gpu, dims),
+            (KvBackend::Vmm, KvTarget::Multi(_)) => Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "{} KV cache requires head_dim=256 (validated on Qwen 3.5); \
-                     head_dim={} is unsupported. Use --kv-mode q8.",
-                    match mode {
-                        KvMode::Asym4 => "asym4",
-                        KvMode::Asym3 => "asym3",
-                        _ => unreachable!(),
-                    },
-                    dims.head_dim
-                ),
-            ));
+                "KV backend 'vmm' currently supports single-GPU qwen3.5 only",
+            )),
         }
-        match target {
-            KvTarget::Single(gpu) => Self::from_mode_single(mode, gpu, dims),
-            KvTarget::Multi(gpus) => Self::from_mode_multi(mode, gpus, dims),
+    }
+
+    fn from_mode_single_vmm(mode: KvMode, gpu: &mut Gpu, dims: &KvDims) -> HipResult<Self> {
+        let KvLayers::Mask(is_kv_layer) = &dims.layers else {
+            unreachable!("VMM layer shape validated before dispatch")
+        };
+        let physical_cap = dims
+            .physical_cap
+            .expect("VMM physical capacity validated before dispatch");
+        // Static path defaults V to Q8. Carrier may call
+        // `new_gpu_vmm_capped_filtered` directly with Lloyd-V for FWHT-K.
+        match mode {
+            KvMode::Q8
+            | KvMode::Asym2
+            | KvMode::Asym3
+            | KvMode::Asym4
+            | KvMode::Fwht2
+            | KvMode::Fwht3
+            | KvMode::Fwht4 => Self::new_gpu_vmm_capped_filtered(
+                gpu,
+                is_kv_layer,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.max_seq,
+                physical_cap,
+                mode,
+                VMode::Q8,
+            ),
+            other => unreachable!("VMM mode {other:?} validated before dispatch"),
         }
     }
 
@@ -5671,6 +6208,308 @@ impl KvCache {
         Ok((k_gpu, v_gpu))
     }
 
+    /// Reserve dense virtual K/V tensors while mapping physical pages only as
+    /// the request grows. Placeholder tensors preserve absolute layer indices.
+    fn alloc_k_v_vmm_filtered(
+        gpu: &mut Gpu,
+        k_elems: usize,
+        v_elems: usize,
+        is_kv_layer: &[bool],
+    ) -> HipResult<(Vec<GpuTensor>, Vec<GpuTensor>)> {
+        let mut k_gpu = Vec::with_capacity(is_kv_layer.len());
+        let mut v_gpu = Vec::with_capacity(is_kv_layer.len());
+        let device_id = gpu.device_id;
+        let result = (|| -> HipResult<()> {
+            for &is_kv in is_kv_layer {
+                if is_kv {
+                    // SAFETY: Qwen3.5 mapped-prefix guards run before every
+                    // write, attention dispatch, and graph capture/replay.
+                    k_gpu.push(unsafe {
+                        gpu.alloc_vmm_tensor(&[k_elems], DType::F32, 0, &[device_id])?
+                    });
+                    v_gpu.push(unsafe {
+                        gpu.alloc_vmm_tensor(&[v_elems], DType::F32, 0, &[device_id])?
+                    });
+                } else {
+                    k_gpu.push(gpu.zeros(&[1], DType::F32)?);
+                    v_gpu.push(gpu.zeros(&[1], DType::F32)?);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
+        }
+        Ok((k_gpu, v_gpu))
+    }
+
+    /// Resolve the current K `KvMode` from live cache flags.
+    fn current_kv_mode(&self) -> HipResult<KvMode> {
+        if self.quant_q8 {
+            return Ok(KvMode::Q8);
+        }
+        if self.quant_asym4 {
+            return Ok(if self.quant_fwht {
+                KvMode::Fwht4
+            } else {
+                KvMode::Asym4
+            });
+        }
+        if self.quant_asym3 {
+            return Ok(if self.quant_fwht {
+                KvMode::Fwht3
+            } else {
+                KvMode::Asym3
+            });
+        }
+        if self.quant_asym2 {
+            return Ok(if self.quant_fwht {
+                KvMode::Fwht2
+            } else {
+                KvMode::Asym2
+            });
+        }
+        Err(hip_bridge::HipError::new(
+            0,
+            "VMM KV cache encoding flags are not a recognized static mode",
+        ))
+    }
+
+    /// Current K/V bytes-per-token from live flags / V mode.
+    /// Independent K and V strides — capacity is always min-of-two.
+    fn vmm_bytes_per_token(&self) -> HipResult<(usize, usize)> {
+        if self.n_kv_heads == 0 {
+            return Err(hip_bridge::HipError::new(0, "VMM KV requires n_kv_heads>0"));
+        }
+        let mode = self.current_kv_mode()?;
+        // Geometry for the live encoding; lloyd-V only legal on FWHT-K.
+        Self::validate_vmm_static_geometry(mode, self.v_mode, self.n_kv_heads, self.head_dim)?;
+        let k_bph = Self::vmm_k_bytes_per_head(mode, self.head_dim)?;
+        let v_bph = Self::vmm_v_bytes_per_head(self.v_mode, self.head_dim)?;
+        let k = Self::checked_vmm_product("K token stride", &[self.n_kv_heads, k_bph])?;
+        let v = Self::checked_vmm_product("V token stride", &[self.n_kv_heads, v_bph])?;
+        Ok((k, v))
+    }
+
+    pub fn uses_vmm_backend(&self) -> bool {
+        self.k_gpu
+            .iter()
+            .chain(self.v_gpu.iter())
+            .find(|tensor| tensor.numel() > 1)
+            .is_some_and(|tensor| tensor.buf.is_vmm_owner())
+    }
+
+    fn fast_mapped_token_capacity(&self) -> HipResult<Option<usize>> {
+        if !self.uses_vmm_backend() {
+            return Ok(None);
+        }
+        let (k_bytes_per_token, v_bytes_per_token) = self.vmm_bytes_per_token()?;
+        let capacity = [
+            ("K", self.k_gpu.as_slice(), k_bytes_per_token),
+            ("V", self.v_gpu.as_slice(), v_bytes_per_token),
+        ]
+        .into_iter()
+        .try_fold(self.physical_cap, |capacity, (label, tensors, stride)| {
+            let tensor = tensors
+                .iter()
+                .rev()
+                .find(|tensor| tensor.numel() > 1)
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!("VMM KV cache has no real {label} tensor"),
+                    )
+                })?;
+            if !tensor.buf.is_vmm_owner() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("VMM KV cache has a non-VMM real {label} tensor"),
+                ));
+            }
+            Ok(capacity.min(tensor.buf.size() / stride))
+        })?;
+        Ok(Some(capacity))
+    }
+
+    pub fn mapped_token_capacity(&self) -> HipResult<Option<usize>> {
+        if !self.uses_vmm_backend() {
+            return Ok(None);
+        }
+        let (k_bytes_per_token, v_bytes_per_token) = self.vmm_bytes_per_token()?;
+        let mut capacity = self.physical_cap;
+        for (label, tensors, bytes_per_token) in [
+            ("K", self.k_gpu.as_slice(), k_bytes_per_token),
+            ("V", self.v_gpu.as_slice(), v_bytes_per_token),
+        ] {
+            for tensor in tensors {
+                if tensor.buf.is_vmm_owner() {
+                    capacity = capacity.min(tensor.buf.size() / bytes_per_token);
+                } else if tensor.numel() > 1 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM KV cache mixes a non-VMM real {label} tensor with VMM tensors"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(Some(capacity))
+    }
+
+    pub fn require_mapped_capacity(&self, required_tokens: usize) -> HipResult<()> {
+        let Some(mapped_tokens) = self.mapped_token_capacity()? else {
+            return Ok(());
+        };
+        if required_tokens > self.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KV write requires {required_tokens} tokens but physical_cap is {}",
+                    self.physical_cap
+                ),
+            ));
+        }
+        if required_tokens > mapped_tokens {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM KV mapped prefix holds {mapped_tokens} tokens but the operation requires {required_tokens}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Grow VMM tensors for one side (K or V).
+    ///
+    /// `bytes_per_token` is the **current** encoding stride. `physical_cap` is
+    /// the constructor token horizon. Per-tensor max tokens is
+    /// `min(physical_cap, reserve_bytes / current_stride)` so adaptive
+    /// floor-reserved arenas never plan growth past the stable VA.
+    fn grow_vmm_tensors(
+        gpu: &mut Gpu,
+        tensors: &mut [GpuTensor],
+        bytes_per_token: usize,
+        physical_cap: usize,
+        required_tokens: usize,
+    ) -> HipResult<usize> {
+        if bytes_per_token == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "VMM growth requires a non-zero current byte stride",
+            ));
+        }
+        let mut grown = 0usize;
+        let device_id = gpu.device_id;
+        let minimum_growth_bytes = DEFAULT_VMM_PHYSICAL_CHUNK_BYTES;
+        for tensor in tensors {
+            if !tensor.buf.is_vmm_owner() {
+                if tensor.numel() > 1 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM KV cache contains a non-VMM real tensor",
+                    ));
+                }
+                continue;
+            }
+            let mapped = gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
+            })?;
+            let granularity = gpu.vmm_granularity(tensor).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "VMM KV tensor has no allocation granularity")
+            })?;
+            // Full reserved VA size (shape × dtype), independent of mapped prefix.
+            let reserve_bytes = tensor.byte_size();
+            let side_cap = (reserve_bytes / bytes_per_token).min(physical_cap);
+            if side_cap == 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "VMM KV reserve is smaller than one token at the current stride",
+                ));
+            }
+            if required_tokens > side_cap {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "VMM KV current-stride capacity is {side_cap} tokens but the operation requires {required_tokens}"
+                    ),
+                ));
+            }
+            let plan = KvChunkPlan::new(
+                bytes_per_token,
+                side_cap,
+                DEFAULT_KV_CHUNK_TOKENS,
+                granularity,
+                minimum_growth_bytes,
+            )
+            .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?;
+            if let Some(growth) = plan
+                .growth(mapped, required_tokens)
+                .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?
+            {
+                if gpu.graphs.capture_mode {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM KV growth requested during graph capture",
+                    ));
+                }
+                // Map before any subsequent write; owners stay at the same VA.
+                gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[device_id])?;
+                grown += 1;
+            }
+        }
+        Ok(grown)
+    }
+
+    /// Ensure both K and V mapped prefixes cover `required_tokens` at the
+    /// **current** strides. Growth is independent per side and completes before
+    /// the caller may write. Never replaces VMM owners.
+    pub fn ensure_mapped_capacity(
+        &mut self,
+        gpu: &mut Gpu,
+        required_tokens: usize,
+    ) -> HipResult<()> {
+        let Some(fast_capacity) = self.fast_mapped_token_capacity()? else {
+            return Ok(());
+        };
+        if required_tokens > self.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KV write requires {required_tokens} tokens but physical_cap is {}",
+                    self.physical_cap
+                ),
+            ));
+        }
+        if required_tokens <= fast_capacity {
+            return Ok(());
+        }
+        let (k_bytes_per_token, v_bytes_per_token) = self.vmm_bytes_per_token()?;
+        // Growth is monotonic: if a later map fails, the next call keeps the
+        // completed prefixes and fills the lagging tensors before the final guard.
+        // K and V are grown independently at their current strides.
+        Self::grow_vmm_tensors(
+            gpu,
+            &mut self.k_gpu,
+            k_bytes_per_token,
+            self.physical_cap,
+            required_tokens,
+        )?;
+        Self::grow_vmm_tensors(
+            gpu,
+            &mut self.v_gpu,
+            v_bytes_per_token,
+            self.physical_cap,
+            required_tokens,
+        )?;
+        self.require_mapped_capacity(required_tokens)?;
+        Ok(())
+    }
+
     /// Bytes of V-cache per token-position (all heads) for a given V mode.
     /// Q8 = n_kv_heads * (head_dim/32) * 34. Lloyd = n_kv_heads * (4 + head_dim*bits/8).
     fn v_bytes_per_pos(n_kv_heads: usize, head_dim: usize, v_mode: VMode) -> usize {
@@ -5883,6 +6722,14 @@ impl KvCache {
         v_floor: VMode,
         k_floor_bph: usize,
     ) -> HipResult<()> {
+        // VMM owners are never replaced after publication. Adaptive VMM must be
+        // constructed via `new_gpu_vmm_adaptive_filtered` with floor reserve.
+        if self.uses_vmm_backend() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "set_adaptive_floor_alloc refuses VMM owners; construct adaptive VMM with floor reserve up front",
+            ));
+        }
         // Mirror the set_v_mode_realloc guard: lloyd-V is 256-wide and requires
         // an FWHT K mode + head_dim == 256.
         assert!(
@@ -5941,6 +6788,20 @@ impl KvCache {
             Self::resize_real_tensors_zeroed(gpu, &mut self.k_gpu, k_elems)?;
         }
         Ok(())
+    }
+
+    /// Restore cache mode flags to the adaptive start tier (K=fwht4, V=q8)
+    /// without touching buffer owners. Used by atomic controller+cache reset.
+    pub fn restore_adaptive_start_flags(&mut self) {
+        self.quant_q8 = false;
+        self.quant_int8 = false;
+        self.quant_hfq4 = false;
+        self.quant_asym4 = true;
+        self.quant_asym3 = false;
+        self.quant_asym2 = false;
+        self.quant_fwht = true;
+        self.v_mode = VMode::Q8;
+        self.quantized = true;
     }
 
     /// Adaptive-KV: re-quantize the EXISTING V cache (all written positions of
@@ -6032,21 +6893,48 @@ impl KvCache {
             Op::Down(_, _) => (None, None),
         };
 
-        // 1-layer scratch sized to the SOURCE layer's full element count (the
-        // source record is the larger one). We copy layer→scratch (d2d) then
-        // transcode scratch→layer (non-aliasing). Crash-safe (a HIP error never
-        // half-writes the live layer) and overlap-safe (the q8→lloyd4 kernel is
-        // NOT true-in-place safe — see its header). Sized once, reused per layer.
-        let src_elems = self
-            .v_gpu
-            .iter()
-            .map(|t| t.numel())
-            .filter(|&n| n > 1)
-            .max();
+        // Map the live prefix at the CURRENT V stride before any read/write.
+        // Floor-reserved VMM VA may be larger than the mapped prefix — never
+        // size or copy from the full virtual reserve.
+        self.ensure_mapped_capacity(gpu, n_positions)?;
+        let (cur_k_bpt, cur_v_bpt) = if self.uses_vmm_backend() {
+            self.vmm_bytes_per_token()?
+        } else {
+            // Contiguous: full buffer is mapped; keep prior full-layer scratch size.
+            (0, 0)
+        };
+        let prefix_v_bytes = if self.uses_vmm_backend() {
+            Self::checked_vmm_product("V source prefix", &[n_positions, cur_v_bpt])?
+        } else {
+            0
+        };
+        let prefix_v_elems = if self.uses_vmm_backend() {
+            Self::bytes_to_f32_elems("V source prefix", prefix_v_bytes)?
+        } else {
+            0
+        };
+
+        // 1-layer scratch: VMM uses live source-prefix elems only; contiguous
+        // keeps full-layer elems (prior behavior). Copy layer→scratch then
+        // transcode scratch→layer (non-aliasing).
+        let src_elems = if self.uses_vmm_backend() {
+            if prefix_v_elems > 0 {
+                Some(prefix_v_elems)
+            } else {
+                None
+            }
+        } else {
+            self.v_gpu
+                .iter()
+                .map(|t| t.numel())
+                .filter(|&n| n > 1)
+                .max()
+        };
         let scratch = match src_elems {
             Some(n) => Some(gpu.zeros(&[n], DType::F32)?),
             None => None,
         };
+        let _ = cur_k_bpt; // K stride unused on V step
 
         // Free the scratch on EVERY exit path (GpuTensor has no Drop): capture
         // the first error, break, free, then propagate — a HIP failure mid-pass
@@ -6058,9 +6946,13 @@ impl KvCache {
                 continue;
             }
             let scratch = scratch.as_ref().unwrap();
-            // Copy the live layer into scratch (device-to-device), then read
-            // from scratch and write the compacted record back into the layer.
-            let nbytes = t.byte_size();
+            // Copy the live source prefix into scratch (device-to-device), then
+            // read from scratch and write the compacted record back into the layer.
+            let nbytes = if self.uses_vmm_backend() {
+                prefix_v_bytes
+            } else {
+                t.byte_size()
+            };
             pending = gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes);
             if pending.is_err() {
                 break;
@@ -6211,16 +7103,41 @@ impl KvCache {
             None
         };
 
-        // 1-layer scratch sized to the max real K layer's element count (the K
-        // buffer is floor-sized; the live fwht4 records occupy a prefix of it).
-        // Copy layer→scratch (d2d) then transcode scratch→layer (non-aliasing,
-        // crash-safe). Sized once, reused per layer.
-        let src_elems = self
-            .k_gpu
-            .iter()
-            .map(|t| t.numel())
-            .filter(|&n| n > 1)
-            .max();
+        // Map the live prefix at the CURRENT K stride before any read/write.
+        // Floor-reserved VMM VA may be larger than the mapped prefix — never
+        // size or copy from the full virtual reserve.
+        self.ensure_mapped_capacity(gpu, n_positions)?;
+        let (cur_k_bpt, _cur_v_bpt) = if self.uses_vmm_backend() {
+            self.vmm_bytes_per_token()?
+        } else {
+            (0, 0)
+        };
+        let prefix_k_bytes = if self.uses_vmm_backend() {
+            Self::checked_vmm_product("K source prefix", &[n_positions, cur_k_bpt])?
+        } else {
+            0
+        };
+        let prefix_k_elems = if self.uses_vmm_backend() {
+            Self::bytes_to_f32_elems("K source prefix", prefix_k_bytes)?
+        } else {
+            0
+        };
+
+        // 1-layer scratch: VMM uses live source-prefix elems only; contiguous
+        // keeps full-layer elems (prior behavior).
+        let src_elems = if self.uses_vmm_backend() {
+            if prefix_k_elems > 0 {
+                Some(prefix_k_elems)
+            } else {
+                None
+            }
+        } else {
+            self.k_gpu
+                .iter()
+                .map(|t| t.numel())
+                .filter(|&n| n > 1)
+                .max()
+        };
         let scratch = match src_elems {
             Some(n) => Some(gpu.zeros(&[n], DType::F32)?),
             None => None,
@@ -6235,7 +7152,11 @@ impl KvCache {
                 continue;
             }
             let scratch = scratch.as_ref().unwrap();
-            let nbytes = t.byte_size();
+            let nbytes = if self.uses_vmm_backend() {
+                prefix_k_bytes
+            } else {
+                t.byte_size()
+            };
             pending = gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes);
             if pending.is_err() {
                 break;
@@ -6274,6 +7195,143 @@ impl KvCache {
         }
         gpu.invalidate_for_kv_mode_switch();
         Ok(())
+    }
+
+    /// Adaptive VMM constructor: reserve at K/V floors, start encoding FWHT4/Q8.
+    /// One stable K and one stable V owner per real layer for the load lifetime.
+    /// Built on `vmm_layout_with_reserve`; never replaces owners after publish.
+    pub fn new_gpu_vmm_adaptive_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        k_floor_bph: usize,
+        v_floor: VMode,
+    ) -> HipResult<Self> {
+        if max_seq == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "adaptive VMM requires max_seq > 0",
+            ));
+        }
+        if !is_kv_layer.iter().any(|is_kv| *is_kv) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "adaptive VMM requires at least one KV-carrying layer",
+            ));
+        }
+        if matches!(v_floor, VMode::Q8) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "adaptive VMM V floor must be a lloyd tier (got Q8)",
+            ));
+        }
+        if head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("adaptive VMM requires head_dim=256 (got {head_dim})"),
+            ));
+        }
+        let layout = Self::vmm_layout_with_reserve(
+            KvMode::Fwht4,
+            VMode::Q8,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            k_floor_bph,
+            v_floor,
+        )?;
+        let (mut k_gpu, mut v_gpu) = Self::alloc_k_v_vmm_filtered(
+            gpu,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            is_kv_layer,
+        )?;
+
+        // Adaptive always needs 256-wide FWHT signs (q8→lloyd and optional fwht4→fwht3).
+        let n = layout.rotation_table_len.max(256);
+        let s1_vals = Self::gen_fwht_signs(42, n);
+        let s2_vals = Self::gen_fwht_signs(1042, n);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
+            let s1 = gpu.alloc_tensor(&[n], DType::F32)?;
+            let s2 = match gpu.alloc_tensor(&[n], DType::F32) {
+                Ok(s2) => s2,
+                Err(err) => {
+                    let _ = gpu.free_tensor(s1);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = gpu.hip.memcpy_htod(&s1.buf, &s1_bytes) {
+                let _ = gpu.free_tensor(s1);
+                let _ = gpu.free_tensor(s2);
+                return Err(err);
+            }
+            if let Err(err) = gpu.hip.memcpy_htod(&s2.buf, &s2_bytes) {
+                let _ = gpu.free_tensor(s1);
+                let _ = gpu.free_tensor(s2);
+                return Err(err);
+            }
+            Ok((s1, s2))
+        })();
+        let (s1, s2) = match tables {
+            Ok(pair) => pair,
+            Err(err) => {
+                for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                    let _ = gpu.free_tensor(tensor);
+                }
+                return Err(err);
+            }
+        };
+
+        let mut cache = Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: layout.kv_dim,
+            max_seq,
+            physical_cap: layout.physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: true, // FWHT4 start
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: true,
+            boundary_layers: 0,
+            givens_cos: Some(s1),
+            givens_sin: Some(s2),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8, // start tier
+        };
+        if let Err(err) = cache.ensure_mapped_capacity(gpu, 1) {
+            let _ = cache.free_gpu(gpu);
+            return Err(err);
+        }
+        let n_kv = is_kv_layer.iter().filter(|is_kv| **is_kv).count();
+        let mapped = match cache.mapped_token_capacity() {
+            Ok(capacity) => capacity.unwrap_or(0),
+            Err(err) => {
+                let _ = cache.free_gpu(gpu);
+                return Err(err);
+            }
+        };
+        eprintln!(
+            "KV cache: adaptive vmm ({n_kv}/{} layers; start FWHT4/Q8; K floor {}B/head V floor {:?}; reserve_k={}B reserve_v={}B; mapped_prefix={mapped} / max_seq={max_seq})",
+            is_kv_layer.len(),
+            k_floor_bph,
+            v_floor,
+            layout.k_reserve_bytes,
+            layout.v_reserve_bytes,
+        );
+        Ok(cache)
     }
 
     /// Q8_0 KV cache that skips allocation for layers flagged as non-KV.
@@ -6348,6 +7406,170 @@ impl KvCache {
             compact_offset: 0,
             v_mode: VMode::Q8,
         })
+    }
+
+    /// Unified static VMM constructor for every legal (K mode × V mode) pair.
+    ///
+    /// Reserves stable K/V VAs from [`vmm_static_layout`], maps an initial
+    /// prefix, and never replaces owners afterward. Lloyd-V is accepted only
+    /// with FWHT-K and head_dim=256 (validated by the layout table).
+    pub fn new_gpu_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mode: KvMode,
+        v_mode: VMode,
+    ) -> HipResult<Self> {
+        if physical_cap == 0 || physical_cap > max_seq_len {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM {mode:?} physical_cap must be in 1..=max_seq_len (got physical_cap={physical_cap}, max_seq_len={max_seq_len})"
+                ),
+            ));
+        }
+        if !is_kv_layer.iter().any(|is_kv| *is_kv) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM {mode:?} requires at least one KV-carrying layer"),
+            ));
+        }
+        let layout = Self::vmm_static_layout(mode, v_mode, n_kv_heads, head_dim, physical_cap)?;
+        let (mut k_gpu, mut v_gpu) = Self::alloc_k_v_vmm_filtered(
+            gpu,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            is_kv_layer,
+        )?;
+
+        // Optional rotation tables (Givens angles or FWHT signs). Built before
+        // the cache is published so a table failure can roll back arenas.
+        let rotation = if layout.rotation_table_len == 0 {
+            None
+        } else {
+            let n = layout.rotation_table_len;
+            let (a_vals, b_vals) = if layout.uses_fwht_signs {
+                (Self::gen_fwht_signs(42, n), Self::gen_fwht_signs(1042, n))
+            } else {
+                Self::gen_givens_angles(42, n)
+            };
+            let a_bytes: Vec<u8> = a_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let b_bytes: Vec<u8> = b_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
+                let a = gpu.alloc_tensor(&[n], DType::F32)?;
+                let b = match gpu.alloc_tensor(&[n], DType::F32) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        let _ = gpu.free_tensor(a);
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = gpu.hip.memcpy_htod(&a.buf, &a_bytes) {
+                    let _ = gpu.free_tensor(a);
+                    let _ = gpu.free_tensor(b);
+                    return Err(err);
+                }
+                if let Err(err) = gpu.hip.memcpy_htod(&b.buf, &b_bytes) {
+                    let _ = gpu.free_tensor(a);
+                    let _ = gpu.free_tensor(b);
+                    return Err(err);
+                }
+                Ok((a, b))
+            })();
+            match tables {
+                Ok(pair) => Some(pair),
+                Err(err) => {
+                    for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(err);
+                }
+            }
+        };
+
+        let (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht) =
+            Self::vmm_mode_flags(mode);
+        let (givens_cos, givens_sin) = match rotation {
+            Some((a, b)) => (Some(a), Some(b)),
+            None => (None, None),
+        };
+
+        let mut cache = Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: layout.kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4,
+            quant_asym3,
+            quant_asym2,
+            quant_fwht,
+            boundary_layers: 0,
+            givens_cos,
+            givens_sin,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode,
+        };
+        // Map initial prefix before any write; roll back on failure.
+        if let Err(err) = cache.ensure_mapped_capacity(gpu, 1) {
+            let _ = cache.free_gpu(gpu);
+            return Err(err);
+        }
+        let n_kv = is_kv_layer.iter().filter(|is_kv| **is_kv).count();
+        let mapped = match cache.mapped_token_capacity() {
+            Ok(capacity) => capacity.unwrap_or(0),
+            Err(err) => {
+                let _ = cache.free_gpu(gpu);
+                return Err(err);
+            }
+        };
+        let v_label = match v_mode {
+            VMode::Q8 => "Q8".to_string(),
+            VMode::Lloyd2 => "lloyd2".to_string(),
+            VMode::Lloyd3 => "lloyd3".to_string(),
+            VMode::Lloyd4 => "lloyd4".to_string(),
+        };
+        eprintln!(
+            "KV cache: {mode:?} vmm ({n_kv}/{} layers carry KV; K {}B/head + V {v_label} {}B/head; mapped_prefix={mapped} / physical_cap={physical_cap} / max_seq={max_seq_len})",
+            is_kv_layer.len(),
+            layout.k_bytes_per_head,
+            layout.v_bytes_per_head,
+        );
+        Ok(cache)
+    }
+
+    /// VMM-backed Q8 cache for Qwen3.5 hybrid stacks.
+    /// Thin wrapper over [`Self::new_gpu_vmm_capped_filtered`].
+    pub fn new_gpu_q8_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Q8,
+            VMode::Q8,
+        )
     }
 
     /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
@@ -6987,6 +8209,50 @@ impl KvCache {
         })
     }
 
+    /// VMM-backed Asym3-K/Q8-V cache for Qwen3.5 hybrid stacks.
+    /// Thin wrapper over [`Self::new_gpu_vmm_capped_filtered`].
+    pub fn new_gpu_asym3_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Asym3,
+            VMode::Q8,
+        )
+    }
+
+    /// VMM-backed FWHT3-K/Q8-V cache for Qwen3.5 hybrid stacks.
+    /// Thin wrapper over [`Self::new_gpu_vmm_capped_filtered`].
+    pub fn new_gpu_fwht3_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Fwht3,
+            VMode::Q8,
+        )
+    }
+
     /// Filtered variant of fwht3 — signed-FWHT-256 K-rotation, 3-bit centroid,
     /// V at Q8_0. Same byte layout as asym3_filtered; rotation primitive swapped
     /// to fwht_shfl_forward_256 which expects 256-element signs1/signs2.
@@ -7413,24 +8679,40 @@ impl KvCache {
 
     /// Free all GPU tensors in this cache. Call before drop to return VRAM.
     /// After calling, follow with gpu.drain_pool() to actually release memory.
-    pub fn free_gpu(self, gpu: &mut Gpu) {
+    ///
+    /// Contiguous frees keep prior log-and-continue behavior. VMM teardown
+    /// failures are aggregated and returned so unload cannot claim success
+    /// while arenas remain registered (retry via `Gpu::ensure_vmm_cleaned`).
+    pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
+        let mut first_err: Option<hip_bridge::HipError> = None;
+        let mut note = |r: HipResult<()>| {
+            if let Err(err) = r {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        };
         for t in self.k_gpu {
-            let _ = gpu.free_tensor(t);
+            note(gpu.free_tensor(t));
         }
         for t in self.v_gpu {
-            let _ = gpu.free_tensor(t);
+            note(gpu.free_tensor(t));
         }
         for t in self.k_scales {
-            let _ = gpu.free_tensor(t);
+            note(gpu.free_tensor(t));
         }
         for t in self.v_scales {
-            let _ = gpu.free_tensor(t);
+            note(gpu.free_tensor(t));
         }
         if let Some(t) = self.givens_cos {
-            let _ = gpu.free_tensor(t);
+            note(gpu.free_tensor(t));
         }
         if let Some(t) = self.givens_sin {
-            let _ = gpu.free_tensor(t);
+            note(gpu.free_tensor(t));
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 
@@ -10062,5 +11344,522 @@ mod tests {
             KvTierPlan::derive(got).unwrap().write_key,
             KvTierPlan::derive(legacy).unwrap().write_key,
         );
+    }
+
+    fn vmm_mask_dims(
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        physical_cap: usize,
+    ) -> KvDims {
+        KvDims {
+            layers: KvLayers::Mask(vec![true, false, true]),
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            physical_cap: Some(physical_cap),
+        }
+    }
+
+    fn expected_k_bph(mode: KvMode, head_dim: usize) -> usize {
+        match mode {
+            KvMode::Q8 => (head_dim / 32) * 34,
+            KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
+            KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
+            KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
+            KvMode::Asym3Auto => panic!("Asym3Auto is not a layout mode"),
+        }
+    }
+
+    fn expected_v_bph(v_mode: VMode, head_dim: usize) -> usize {
+        match v_mode {
+            VMode::Q8 => (head_dim / 32) * 34,
+            VMode::Lloyd2 => 4 + head_dim / 4,
+            VMode::Lloyd3 => 4 + (head_dim * 3) / 8,
+            VMode::Lloyd4 => 4 + head_dim / 2,
+        }
+    }
+
+    fn flag_standin(mode: KvMode, v_mode: VMode, n_kv_heads: usize, head_dim: usize) -> KvCache {
+        let (q8, a4, a3, a2, fwht) = KvCache::vmm_mode_flags(mode);
+        KvCache {
+            k_gpu: vec![],
+            v_gpu: vec![],
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: n_kv_heads * head_dim,
+            max_seq: 128,
+            physical_cap: 128,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: q8,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: a4,
+            quant_asym3: a3,
+            quant_asym2: a2,
+            quant_fwht: fwht,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode,
+        }
+    }
+
+    #[test]
+    fn adaptive_reset_invalidates_captured_execution_state() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let mut cache = flag_standin(KvMode::Fwht2, VMode::Lloyd2, 4, 256);
+        let mut adaptive = crate::kv_adaptive::KvAdaptive::from_preset(
+            crate::kv_adaptive::Preset::Aggressive,
+            128,
+            4,
+            256,
+        );
+        adaptive.cur_k = crate::kv_adaptive::KMode::Fwht2;
+        adaptive.cur_v = VMode::Lloyd2;
+        adaptive.next_step = adaptive.steps.len();
+        gpu.graphs.ar_forward_replay_enabled = true;
+        gpu.graphs.ar_forward_kernel_dirty = false;
+
+        adaptive.reset_with_cache(&mut gpu, &mut cache);
+
+        assert_eq!(cache.current_kv_mode().unwrap(), KvMode::Fwht4);
+        assert_eq!(cache.v_mode, VMode::Q8);
+        assert!(!gpu.graphs.ar_forward_replay_enabled);
+        assert!(gpu.graphs.ar_forward_kernel_dirty);
+    }
+
+    #[test]
+    fn vmm_static_layout_covers_all_seven_k_modes_with_q8_v() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 128;
+        let modes = [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ];
+        for mode in modes {
+            let layout =
+                KvCache::vmm_static_layout(mode, VMode::Q8, n_kv_heads, head_dim, physical_cap)
+                    .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
+            let k_bph = expected_k_bph(mode, head_dim);
+            let v_bph = expected_v_bph(VMode::Q8, head_dim);
+            assert_eq!(layout.k_bytes_per_head, k_bph, "mode={mode:?}");
+            assert_eq!(layout.v_bytes_per_head, v_bph, "mode={mode:?}");
+            assert_eq!(
+                layout.k_bytes_per_token,
+                n_kv_heads * k_bph,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_bytes_per_token,
+                n_kv_heads * v_bph,
+                "mode={mode:?}"
+            );
+            // Static: reserve == current.
+            assert_eq!(
+                layout.k_reserve_bytes,
+                physical_cap * layout.k_bytes_per_token,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_reserve_bytes,
+                physical_cap * layout.v_bytes_per_token,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.k_reserve_elems,
+                (layout.k_reserve_bytes + 3) / 4,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_reserve_elems,
+                (layout.v_reserve_bytes + 3) / 4,
+                "mode={mode:?}"
+            );
+            assert_eq!(layout.kv_dim, n_kv_heads * head_dim);
+            // Independent K vs V capacity at equal physical_cap is just physical_cap.
+            let k_cap = layout.k_reserve_bytes / layout.k_bytes_per_token;
+            let v_cap = layout.v_reserve_bytes / layout.v_bytes_per_token;
+            assert_eq!(k_cap.min(v_cap), physical_cap, "mode={mode:?}");
+        }
+    }
+
+    #[test]
+    fn vmm_static_layout_covers_fwht_k_with_lloyd_v() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 64;
+        let k_modes = [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4];
+        let v_modes = [VMode::Lloyd2, VMode::Lloyd3, VMode::Lloyd4];
+        for mode in k_modes {
+            for v_mode in v_modes {
+                let layout =
+                    KvCache::vmm_static_layout(mode, v_mode, n_kv_heads, head_dim, physical_cap)
+                        .unwrap_or_else(|e| panic!("{mode:?}/{v_mode:?}: {e}"));
+                assert_eq!(layout.k_bytes_per_head, expected_k_bph(mode, head_dim));
+                assert_eq!(layout.v_bytes_per_head, expected_v_bph(v_mode, head_dim));
+                // Lloyd-V forces 256-wide signs even for fwht2/4.
+                assert_eq!(layout.rotation_table_len, 256, "{mode:?}/{v_mode:?}");
+                assert!(layout.uses_fwht_signs, "{mode:?}/{v_mode:?}");
+                // Prefix helpers use current stride, not reserve.
+                let n_pos = 17;
+                assert_eq!(
+                    layout.prefix_k_bytes(n_pos).unwrap(),
+                    n_pos * layout.k_bytes_per_token
+                );
+                assert_eq!(
+                    layout.prefix_v_bytes(n_pos).unwrap(),
+                    n_pos * layout.v_bytes_per_token
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vmm_layout_rejects_illegal_pairs() {
+        // Asym-K + Lloyd-V is illegal.
+        for mode in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4, KvMode::Q8] {
+            let err = KvCache::vmm_static_layout(mode, VMode::Lloyd4, 4, 256, 64)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("lloyd-V") || err.contains("VMode::Q8"),
+                "mode={mode:?} err={err}"
+            );
+        }
+        // FWHT3 / Asym3 require head_dim=256.
+        for mode in [KvMode::Fwht3, KvMode::Asym3] {
+            let err = KvCache::vmm_static_layout(mode, VMode::Q8, 4, 128, 64)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("head_dim"), "mode={mode:?} err={err}");
+        }
+        // n_kv_heads == 0.
+        let err = KvCache::vmm_static_layout(KvMode::Fwht3, VMode::Q8, 0, 256, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("n_kv_heads>0"), "{err}");
+        // Lloyd-V with FWHT-K but head_dim != 256.
+        let err = KvCache::vmm_static_layout(KvMode::Fwht4, VMode::Lloyd2, 4, 128, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("head_dim=256"), "{err}");
+    }
+
+    #[test]
+    fn fwht3_vmm_layout_matches_asym3_byte_geometry() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 128;
+        let asym = KvCache::asym3_vmm_layout(n_kv_heads, head_dim, physical_cap).unwrap();
+        let fwht = KvCache::fwht3_vmm_layout(n_kv_heads, head_dim, physical_cap).unwrap();
+        assert_eq!(fwht, asym, "fwht3 VMM must reuse asym3 K/V byte layout");
+        // Explicit stride math: K 100 B/head, V Q8 272 B/head at head_dim=256.
+        assert_eq!(fwht.3, 4 + (head_dim * 3) / 8);
+        assert_eq!(fwht.4, (head_dim / 32) * 34);
+        let k_bytes = physical_cap * n_kv_heads * fwht.3;
+        let v_bytes = physical_cap * n_kv_heads * fwht.4;
+        assert_eq!(fwht.1, (k_bytes + 3) / 4);
+        assert_eq!(fwht.2, (v_bytes + 3) / 4);
+        assert_eq!(fwht.0, n_kv_heads * head_dim);
+    }
+
+    #[test]
+    fn vmm_layout_with_reserve_separates_current_and_floor() {
+        // Adaptive-style: current FWHT4/Q8, reserve at fwht2/lloyd2 floors.
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 1000;
+        let k_floor_bph = expected_k_bph(KvMode::Fwht2, head_dim); // 68
+        let layout = KvCache::vmm_layout_with_reserve(
+            KvMode::Fwht4,
+            VMode::Q8,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            k_floor_bph,
+            VMode::Lloyd2,
+        )
+        .unwrap();
+        // Current strides are start encoding.
+        assert_eq!(
+            layout.k_bytes_per_token,
+            n_kv_heads * expected_k_bph(KvMode::Fwht4, head_dim)
+        );
+        assert_eq!(
+            layout.v_bytes_per_token,
+            n_kv_heads * expected_v_bph(VMode::Q8, head_dim)
+        );
+        // Reserve is floor-sized.
+        assert_eq!(
+            layout.k_reserve_bytes,
+            physical_cap * n_kv_heads * k_floor_bph
+        );
+        assert_eq!(
+            layout.v_reserve_bytes,
+            physical_cap * n_kv_heads * expected_v_bph(VMode::Lloyd2, head_dim)
+        );
+        // Token capacity at start is min of reserve/current (V binds: 68/272).
+        let k_cap = layout.k_reserve_bytes / layout.k_bytes_per_token;
+        let v_cap = layout.v_reserve_bytes / layout.v_bytes_per_token;
+        assert_eq!(
+            k_cap,
+            physical_cap * k_floor_bph / expected_k_bph(KvMode::Fwht4, head_dim)
+        );
+        assert_eq!(
+            v_cap,
+            physical_cap * expected_v_bph(VMode::Lloyd2, head_dim)
+                / expected_v_bph(VMode::Q8, head_dim)
+        );
+        assert!(v_cap < k_cap, "V should bind at FWHT4/Q8 start");
+        // Source-prefix bytes remain current-stride × n_pos (not floor).
+        assert_eq!(
+            layout.prefix_k_bytes(10).unwrap(),
+            10 * layout.k_bytes_per_token
+        );
+        assert_eq!(
+            layout.prefix_v_bytes(10).unwrap(),
+            10 * layout.v_bytes_per_token
+        );
+        assert_eq!(layout.rotation_table_len, 256);
+    }
+
+    #[test]
+    fn validate_mode_admits_all_seven_static_vmm_modes() {
+        let dims = vmm_mask_dims(4, 256, 4096, 1024);
+        for mode in [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ] {
+            KvCache::validate_mode_with_backend(mode, KvBackend::Vmm, true, &dims)
+                .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
+            // Contiguous admission remains open (no VMM-only gate).
+            KvCache::validate_mode_with_backend(mode, KvBackend::Contiguous, true, &dims)
+                .unwrap_or_else(|e| panic!("contiguous mode={mode:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_mode_rejects_multi_gpu_flat_and_asym3auto_vmm() {
+        let mask = vmm_mask_dims(4, 256, 4096, 1024);
+        let err = KvCache::validate_mode_with_backend(KvMode::Fwht3, KvBackend::Vmm, false, &mask)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("single-GPU"), "{err}");
+
+        let flat = KvDims {
+            layers: KvLayers::Flat(8),
+            n_kv_heads: 4,
+            head_dim: 256,
+            max_seq: 4096,
+            physical_cap: Some(1024),
+        };
+        let err = KvCache::validate_mode_with_backend(KvMode::Fwht3, KvBackend::Vmm, true, &flat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("filtered"), "{err}");
+
+        let err =
+            KvCache::validate_mode_with_backend(KvMode::Asym3Auto, KvBackend::Vmm, true, &mask)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("Asym3Auto"), "{err}");
+    }
+
+    #[test]
+    fn vmm_bytes_per_token_matches_layout_for_all_static_modes() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        for mode in [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ] {
+            let cache = flag_standin(mode, VMode::Q8, n_kv_heads, head_dim);
+            let (k, v) = cache.vmm_bytes_per_token().unwrap();
+            assert_eq!(k, n_kv_heads * expected_k_bph(mode, head_dim), "{mode:?}");
+            assert_eq!(
+                v,
+                n_kv_heads * expected_v_bph(VMode::Q8, head_dim),
+                "{mode:?}"
+            );
+        }
+        // FWHT-K + Lloyd-V current strides.
+        for v_mode in [VMode::Lloyd2, VMode::Lloyd3, VMode::Lloyd4] {
+            let cache = flag_standin(KvMode::Fwht4, v_mode, n_kv_heads, head_dim);
+            let (k, v) = cache.vmm_bytes_per_token().unwrap();
+            assert_eq!(
+                k,
+                n_kv_heads * expected_k_bph(KvMode::Fwht4, head_dim),
+                "{v_mode:?}"
+            );
+            assert_eq!(
+                v,
+                n_kv_heads * expected_v_bph(v_mode, head_dim),
+                "{v_mode:?}"
+            );
+        }
+        // Asym-K + Lloyd-V must fail (illegal pair).
+        let bad = flag_standin(KvMode::Asym3, VMode::Lloyd3, n_kv_heads, head_dim);
+        assert!(bad.vmm_bytes_per_token().is_err());
+    }
+
+    #[test]
+    fn independent_k_v_capacity_math_from_reserve_and_current() {
+        // Simulate lopsided adaptive start: K floor 68, V floor 68, current K132/V272.
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 1000;
+        let layout = KvCache::vmm_layout_with_reserve(
+            KvMode::Fwht4,
+            VMode::Q8,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            expected_k_bph(KvMode::Fwht2, head_dim),
+            VMode::Lloyd2,
+        )
+        .unwrap();
+        let k_tokens = layout.k_reserve_bytes / layout.k_bytes_per_token;
+        let v_tokens = layout.v_reserve_bytes / layout.v_bytes_per_token;
+        // Must NOT sum K+V bytes into a shared pool.
+        let naive_shared = (layout.k_reserve_bytes + layout.v_reserve_bytes)
+            / (layout.k_bytes_per_token + layout.v_bytes_per_token);
+        assert_ne!(
+            k_tokens.min(v_tokens),
+            naive_shared,
+            "min-of-two must differ from shared-pool sum"
+        );
+        assert_eq!(k_tokens.min(v_tokens), v_tokens);
+    }
+
+    #[test]
+    fn free_gpu_empty_cache_is_ok() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let cache = KvCache {
+            k_gpu: vec![],
+            v_gpu: vec![],
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: 0,
+            max_seq: 0,
+            physical_cap: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            quantized: false,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        };
+        cache.free_gpu(&mut gpu).expect("empty free");
+    }
+
+    #[test]
+    fn free_gpu_propagates_vmm_teardown_failure_and_retries() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        let chunk = 2 * 1024 * 1024;
+        let tensor = match unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, chunk, &access) } {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("skip: VMM unavailable");
+                return;
+            }
+        };
+        let cache = KvCache {
+            k_gpu: vec![tensor],
+            v_gpu: vec![],
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: 1,
+            max_seq: 1,
+            physical_cap: 1,
+            n_kv_heads: 1,
+            head_dim: 1,
+            quantized: false,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        };
+        hip_bridge::inject_vmm_fault(hip_bridge::VmmFaultKind::Unmap, 1);
+        let err = cache
+            .free_gpu(&mut gpu)
+            .expect_err("must surface teardown fault");
+        assert!(
+            err.to_string().contains("retained") || err.to_string().contains("injected"),
+            "{err}"
+        );
+        assert_eq!(
+            gpu.vmm_allocation_count(),
+            1,
+            "ownership retained after free_gpu err"
+        );
+        hip_bridge::clear_vmm_faults();
+        gpu.ensure_vmm_cleaned().expect("retry");
+        assert_eq!(gpu.vmm_allocation_count(), 0);
+        // No new load while pending would be refused:
+        // Two unmap faults: one for free_tensor, one for ensure/retry.
+        hip_bridge::inject_vmm_fault(hip_bridge::VmmFaultKind::Unmap, 2);
+        let t2 =
+            unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, chunk, &access) }.expect("alloc");
+        let _ = gpu.free_tensor(t2).expect_err("fault");
+        assert!(gpu.vmm_allocation_count() >= 1);
+        // simulate load gate
+        let refuse = gpu.ensure_vmm_cleaned();
+        assert!(
+            refuse.is_err(),
+            "load must refuse while pending: {refuse:?}"
+        );
+        hip_bridge::clear_vmm_faults();
+        gpu.ensure_vmm_cleaned().expect("clear");
     }
 }

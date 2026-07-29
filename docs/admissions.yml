@@ -4,9 +4,10 @@
 #
 # This registry records sealed product-route evidence/admission only.
 # It does NOT select runtime defaults. Current automatic runtime selection
-# is only a3b_mq4r_redline_default (Qwen A3B MQ4R); LFM has no current
-# automatic selector. Any usable LFM retained route is explicit opt-in and
-# must still prove route support.
+# is only mq4r_redline_default (single-GPU .mq4r on exact gfx1100/gfx1151/
+# gfx1201 with pp=tp=1; model-family agnostic). Existing LFM .mq4 evidence
+# is not auto-selected because it is not .mq4r; any usable LFM retained
+# route remains explicit opt-in and must still prove route support.
 schema_version: 2
 policy:
   inferred_rows: forbidden
@@ -42,8 +43,8 @@ records:
       kernels: 15
       sequence_hash: "04305cf1254244f6"
     # Historical/product-route evidence knobs recorded with the sealed screen.
-    # These are not current automatic-default opt-outs: LFM has no runtime
-    # automatic selector. Current LFM retained use is explicit opt-in only.
+    # These are not current automatic-default opt-outs: the sealed LFM .mq4
+    # row is not auto-selected (not .mq4r). Current LFM retained use is explicit opt-in only.
     explicit_opt_outs:
       - HIPFIRE_REPLAY_BACKEND=hip
       - HIPFIRE_LFM2_GFX1201_DECODE_FUSION=0
@@ -71,8 +72,10 @@ records:
       automatic_selector: none
       note: >
         Registry evidence/admission only. Does not select runtime defaults.
-        Current automatic runtime selection is Qwen a3b_mq4r_redline_default
-        only; LFM retained replay requires explicit opt-in and route proof.
+        Current automatic runtime selection is mq4r_redline_default only
+        (.mq4r path/extension; no arch_id/model-family gate). This sealed
+        LFM .mq4 row is not auto-selected; LFM retained replay requires
+        explicit opt-in and route proof.
       forbidden_selection:
         - path_inference
         - extension_inference

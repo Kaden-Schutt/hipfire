@@ -76,7 +76,7 @@ pub mod spec_emit;
 pub use arch::Qwen35;
 
 #[cfg(feature = "deltanet")]
-pub use carrier::{load_bundle as load_qwen35_bundle, Qwen35Bundle};
+pub use carrier::{free_qwen35_bundle, load_bundle as load_qwen35_bundle, Qwen35Bundle};
 #[cfg(feature = "deltanet")]
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
 #[cfg(feature = "deltanet")]
