@@ -16,6 +16,18 @@ tok/s respectively; final turns remain at 160.3 tok/s at 18.2K, 82.5 tok/s at
 approximately 110 to 203.9 tok/s without speculative decoding or manual clock
 pinning.
 
+Single-GPU Qwen A3B `.mq4r` models now request retained PM4 by default on
+gfx1100, gfx1151, and gfx1201. gfx1200 and other architectures remain opt-in;
+the built-in `hip` configuration profile disables the automatic Redline route.
+
+gfx1151 QKVZA uses the hybrid header-load kernel for the K=2048/total_m=1281
+production shape and the all-buffer kernel for its production shape. The Silver
+baseline repairs the hybrid path's coefficient-domain numerics and certifies
+coherent retained-PM4 output. Its 114.209 tok/s high-water is 0.812 tok/s
+(0.71%, approximately 1 tok/s) below the 115.021 tok/s Golden floor. ROCm 7.14
+is only a hypothesis for that gap; neither causality nor absence of a Redline
+route regression is proven.
+
 Contributor deltas staged for this release:
 
 - #465: LLaMA Site A attention dispatch and expanded HFQ KV policy.
@@ -41,6 +53,13 @@ the installed binary and runtime images carry no Bun, Node.js, or TypeScript
 payload. Sparse typed TOML is the persistent policy surface, while environment
 variables remain for bootstrap, one-shot compatibility, and explicit developer
 experiments.
+
+Named `default`, `dev`, `hip`, and `redline` configuration profiles now have a
+clean `hipfire config profile set|create` control surface. The `hip` profile is
+an explicit automatic-Redline opt-out. Bare `hipfire config profile` opens a
+profile wizard that can select or snapshot profiles and search the complete
+typed variable catalog by key, compatibility name, environment variable,
+scope, category, or help text.
 
 Registry `recommended_settings` now lower through the typed config resolver,
 including temperature, top-p, top-k, min-p, presence penalty, repeat penalty,

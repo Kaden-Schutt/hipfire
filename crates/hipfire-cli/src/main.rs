@@ -13,10 +13,10 @@ use hipfire_client::{
     complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
 };
 use hipfire_config::{
-    canonical_config_key, developer_env_for_key, field, fields, is_developer_key, load_catalog,
-    load_env_layer, load_global, resolve, write_catalog_toml, write_global_toml, CatalogFormat,
-    ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer, ValueRule,
-    CONFIG_SCHEMA_VERSION,
+    apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
+    field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
+    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
+    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
@@ -147,6 +147,25 @@ enum ConfigAction {
     Schema(OutputArgs),
     /// Convert legacy config.json to sparse config.toml without deleting JSON.
     Migrate,
+    /// Select or create named configuration profiles.
+    Profile {
+        #[command(subcommand)]
+        action: Option<ConfigProfileAction>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigProfileAction {
+    /// Replace the global sparse config with a built-in or custom profile.
+    Set {
+        /// Built-in (`default`, `dev`, `hip`, `redline`) or custom profile name.
+        name: String,
+    },
+    /// Snapshot the current global sparse config as a new custom profile.
+    Create {
+        /// New custom profile name (not a built-in).
+        name: String,
+    },
 }
 
 #[derive(Args, Debug, Clone, Copy)]
@@ -290,6 +309,9 @@ struct RunArgs {
     #[arg(long)]
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    /// One-shot KV storage backend override for this model load.
+    kv_backend: Option<String>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -368,6 +390,8 @@ struct BenchArgs {
     warmups: usize,
     #[arg(long)]
     kv_mode: Option<String>,
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
     /// Prompt words for the standard benchmark.
@@ -453,6 +477,9 @@ struct ServeArgs {
     /// KV cache mode for models loaded by this service.
     #[arg(long)]
     kv_mode: Option<String>,
+    /// KV storage backend for models loaded by this service.
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    kv_backend: Option<String>,
     /// Idle model-unload timeout in seconds; zero disables eviction.
     #[arg(long, value_parser = clap::value_parser!(u64).range(0..=86400))]
     idle_timeout: Option<u64>,
@@ -904,6 +931,38 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             }
             Ok(())
         }
+        ConfigAction::Profile { action } => config_profile_command(paths, action),
+    }
+}
+
+fn config_profile_command(paths: &Paths, action: Option<ConfigProfileAction>) -> Result<()> {
+    let Some(action) = action else {
+        return launch_tui(paths, &["--config-profile-wizard".to_owned()]);
+    };
+    match action {
+        ConfigProfileAction::Set { name } => {
+            let mut loaded = load_global(&paths.config)?;
+            apply_config_profile(&mut loaded.layer, &paths.config, &name)?;
+            write_global_toml(&paths.config, &loaded.layer)?;
+            println!("applied configuration profile '{name}'");
+            if loaded.format == ConfigFormat::LegacyJson {
+                println!(
+                    "migrated active configuration to {}; preserved {} as a rollback copy",
+                    paths.config.config_toml.display(),
+                    paths.config.config_json.display()
+                );
+            }
+            Ok(())
+        }
+        ConfigProfileAction::Create { name } => {
+            let loaded = load_global(&paths.config)?;
+            let path = create_config_profile(&paths.config, &name, &loaded.layer)?;
+            println!(
+                "created configuration profile '{name}' at {}",
+                path.display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -918,8 +977,11 @@ fn model_config_command(
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
         .unwrap_or((None, None));
     let action = action.unwrap_or(ConfigAction::List(OutputArgs { json: false }));
-    if matches!(action, ConfigAction::Migrate | ConfigAction::Schema(_)) {
-        bail!("config migrate/schema are global; omit the model argument");
+    if matches!(
+        action,
+        ConfigAction::Migrate | ConfigAction::Schema(_) | ConfigAction::Profile { .. }
+    ) {
+        bail!("config migrate/schema/profile are global; omit the model argument");
     }
 
     match action {
@@ -1117,7 +1179,9 @@ fn model_config_command(
             }
             Ok(())
         }
-        ConfigAction::Migrate | ConfigAction::Schema(_) => unreachable!(),
+        ConfigAction::Migrate | ConfigAction::Schema(_) | ConfigAction::Profile { .. } => {
+            unreachable!()
+        }
     }
 }
 
@@ -1483,7 +1547,9 @@ fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
 }
 
 fn artifact_url(entry: &ModelEntry, file: &str) -> String {
-    let base = env::var("HIPFIRE_HF_BASE").unwrap_or_else(|_| "https://huggingface.co".into());
+    let base = env::var("HIPFIRE_HF_BASE")
+        .or_else(|_| env::var("HF_ENDPOINT"))
+        .unwrap_or_else(|_| "https://huggingface.co".into());
     format!(
         "{}/{}/resolve/main/{}",
         base.trim_end_matches('/'),
@@ -1748,6 +1814,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let force_local = process_truthy("HIPFIRE_LOCAL")
         || args.image.is_some()
         || args.kv_mode.is_some()
+        || args.kv_backend.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
         || args.draft_max.is_some()
@@ -1785,12 +1852,16 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         &model_path,
         max_tokens,
         args.kv_mode.as_deref(),
+        args.kv_backend.as_deref(),
     )?;
     let selector = args
         .speculation
         .clone()
         .unwrap_or(config_string(&resolved, "speculation.mode")?);
     apply_speculation_selector(&mut params, &selector)?;
+    // Final effective selector wins: re-project inherited draft only when DFlash
+    // remains enabled (config-off + `run --spec dflash` must still carry draft).
+    project_dflash_draft(&mut params);
     if let Some(draft) = &args.model_draft {
         params["draft"] = serde_json::json!(draft.display().to_string());
         if args.speculation.is_none() {
@@ -2001,6 +2072,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             detach: true,
             no_prewarm: true,
             kv_mode: None,
+            kv_backend: None,
             idle_timeout: None,
             tp: None,
             foreground_child: false,
@@ -2106,6 +2178,7 @@ struct ServeRuntime {
     current_max_seq: u64,
     cache_capable: bool,
     kv_override: Option<String>,
+    kv_backend_override: Option<String>,
     tp: Option<u64>,
 }
 
@@ -2571,6 +2644,9 @@ fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Resul
     if let Some(mode) = &args.kv_mode {
         command.arg("--kv-mode").arg(mode);
     }
+    if let Some(backend) = &args.kv_backend {
+        command.arg("--kv-backend").arg(backend);
+    }
     if let Some(seconds) = args.idle_timeout {
         command.arg("--idle-timeout").arg(seconds.to_string());
     }
@@ -2659,6 +2735,7 @@ fn serve_foreground(
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
+            kv_backend_override: args.kv_backend.clone(),
             tp: args.tp,
         }),
         meta: Mutex::new(ServeMeta {
@@ -3278,6 +3355,7 @@ impl ServeRuntime {
                 &path,
                 max_tokens,
                 self.kv_override.as_deref(),
+                self.kv_backend_override.as_deref(),
             )?;
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
@@ -3577,7 +3655,8 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
-        "dflash": done.get("dflash").or_else(|| done.get("mtp")),
+        "dflash": done.get("dflash"),
+        "mtp": done.get("mtp"),
     })
 }
 
@@ -4006,6 +4085,7 @@ fn load_params(
     model_path: &Path,
     max_tokens: u64,
     kv_override: Option<&str>,
+    kv_backend_override: Option<&str>,
 ) -> Result<serde_json::Value> {
     let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
     let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
@@ -4019,6 +4099,14 @@ fn load_params(
     field("memory.kv_cache")
         .expect("schema field")
         .parse_cli(&kv_mode)?;
+    let kv_backend = kv_backend_override
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "contiguous".into())
+        .to_ascii_lowercase();
+    if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
+        bail!("--kv-backend must be contiguous or vmm");
+    }
     let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
     if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
         if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
@@ -4034,6 +4122,7 @@ fn load_params(
     let mut params = serde_json::json!({
         "max_seq": max_seq,
         "kv_mode": kv_mode,
+        "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
@@ -4065,7 +4154,26 @@ fn load_params(
     });
     let selector = config_string(resolved, "speculation.mode")?;
     apply_speculation_selector(&mut params, &selector)?;
+    project_dflash_draft(&mut params);
     Ok(params)
+}
+
+/// Project inherited `HIPFIRE_DFLASH_DRAFT` after the effective speculation selector.
+///
+/// Call only once final `dflash_mode` is known. Config-off must not carry a draft;
+/// a later CLI selector (e.g. `run --spec dflash`) can opt back in here.
+fn project_dflash_draft(params: &mut serde_json::Value) {
+    if params["dflash_mode"].as_str() == Some("off") {
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("draft");
+        }
+        return;
+    }
+    if let Ok(draft) = env::var("HIPFIRE_DFLASH_DRAFT") {
+        if !draft.is_empty() {
+            params["draft"] = serde_json::json!(draft);
+        }
+    }
 }
 
 fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
@@ -4611,6 +4719,7 @@ fn open_bench_engine(
         &path,
         max_tokens,
         args.kv_mode.as_deref(),
+        args.kv_backend.as_deref(),
     )?;
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
@@ -4841,6 +4950,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
+            kv_backend: None,
             redline: false,
             prompt: Vec::new(),
         };
@@ -6091,6 +6201,7 @@ fn registry_source(source: RegistrySource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_config::CONFIG_PROFILE_NAMES;
 
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
@@ -6157,7 +6268,7 @@ mod tests {
         fs::write(&sidecar_path, b"sidecar").unwrap();
 
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, Some(entry), &model_path, 64, None).unwrap();
+        let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], "");
         assert_eq!(params["prefill_compression"], "off");
@@ -6171,7 +6282,7 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&enabled, Some(entry), &model_path, 64, None).unwrap();
+        let params = load_params(&enabled, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
         assert_eq!(params["prefill_compression"], "off");
@@ -6179,13 +6290,167 @@ mod tests {
     }
 
     #[test]
-    fn artifact_urls_use_registry_repo_and_file() {
+    fn load_params_forwards_explicit_vmm_backend() {
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params =
+            load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
+        assert_eq!(params["kv_backend"], "vmm");
+    }
+
+    #[test]
+    fn load_params_forwards_dflash_draft_from_environment() {
+        struct EnvRestore(Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => env::set_var("HIPFIRE_DFLASH_DRAFT", value),
+                    None => env::remove_var("HIPFIRE_DFLASH_DRAFT"),
+                }
+            }
+        }
+
+        let _restore = EnvRestore(env::var_os("HIPFIRE_DFLASH_DRAFT"));
+        let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
+        env::set_var("HIPFIRE_DFLASH_DRAFT", draft);
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.mode", "dflash").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "speculation.mode=dflash".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["draft"], draft);
+    }
+
+    #[test]
+    fn run_spec_dflash_projects_inherited_draft_after_config_off() {
+        // Reviewer case: resolved config leaves DFlash off, but an inherited
+        // HIPFIRE_DFLASH_DRAFT is present and `run --spec dflash` re-enables
+        // DFlash after load_params. Draft must land on the final load params.
+        struct EnvRestore(Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => env::set_var("HIPFIRE_DFLASH_DRAFT", value),
+                    None => env::remove_var("HIPFIRE_DFLASH_DRAFT"),
+                }
+            }
+        }
+
+        let _restore = EnvRestore(env::var_os("HIPFIRE_DFLASH_DRAFT"));
+        let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
+        env::set_var("HIPFIRE_DFLASH_DRAFT", draft);
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.mode", "off").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "speculation.mode=off".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+
+        // load_params alone must not carry the draft while config mode is off.
+        let mut params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "config-off load_params must not project HIPFIRE_DFLASH_DRAFT"
+        );
+
+        // Final run-path selector: CLI `--spec dflash` then project inherited draft.
+        apply_speculation_selector(&mut params, "dflash").unwrap();
+        project_dflash_draft(&mut params);
+        assert_eq!(params["dflash_mode"], "on");
+        assert_eq!(params["draft"], draft);
+
+        // Final off must clear any previously projected draft.
+        apply_speculation_selector(&mut params, "off").unwrap();
+        project_dflash_draft(&mut params);
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "final off must drop projected HIPFIRE_DFLASH_DRAFT"
+        );
+    }
+
+    #[test]
+    fn completion_timings_preserves_speculator_identity() {
+        let completion = |done| Completion {
+            id: "req-test".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done,
+        };
+
+        let dflash = completion_timings(&completion(serde_json::json!({
+            "dflash": true,
+            "tau": 3.5,
+            "cycles": 4,
+        })));
+        assert_eq!(dflash["dflash"], true);
+        assert!(dflash["mtp"].is_null());
+
+        let mtp = completion_timings(&completion(serde_json::json!({
+            "mtp": true,
+            "tau": 2.0,
+            "cycles": 6,
+        })));
+        assert!(mtp["dflash"].is_null());
+        assert_eq!(mtp["mtp"], true);
+    }
+
+    #[test]
+    fn artifact_urls_honor_endpoint_precedence() {
+        struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => env::set_var(self.0, value),
+                    None => env::remove_var(self.0),
+                }
+            }
+        }
+
+        let _hf_base = EnvRestore("HIPFIRE_HF_BASE", env::var_os("HIPFIRE_HF_BASE"));
+        let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
         let (_, entry) = registry.model("qwen3.6:35b-a3b-mq4r").unwrap();
+        let suffix = "schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
+
         env::remove_var("HIPFIRE_HF_BASE");
+        env::remove_var("HF_ENDPOINT");
         assert_eq!(
             artifact_url(entry, &entry.file),
-            "https://huggingface.co/schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r"
+            format!("https://huggingface.co/{suffix}")
+        );
+
+        env::set_var("HF_ENDPOINT", "https://hf-mirror.example/");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://hf-mirror.example/{suffix}")
+        );
+
+        env::set_var("HIPFIRE_HF_BASE", "https://hipfire-mirror.example///");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://hipfire-mirror.example/{suffix}")
         );
     }
 
@@ -6643,6 +6908,83 @@ mod tests {
     }
 
     #[test]
+    fn config_profile_set_and_create_parse_as_dedicated_actions() {
+        let set = Cli::try_parse_from(["hipfire", "config", "profile", "set", "dev"]).unwrap();
+        let Some(Commands::Config(args)) = set.command else {
+            panic!("expected config command")
+        };
+        assert!(args.model.is_none());
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Set { ref name })
+            }) if name == "dev"
+        ));
+
+        let create =
+            Cli::try_parse_from(["hipfire", "config", "profile", "create", "lab"]).unwrap();
+        let Some(Commands::Config(args)) = create.command else {
+            panic!("expected config command")
+        };
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Create { ref name })
+            }) if name == "lab"
+        ));
+
+        let bare = Cli::try_parse_from(["hipfire", "config", "profile"]).unwrap();
+        let Some(Commands::Config(args)) = bare.command else {
+            panic!("expected config command")
+        };
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile { action: None })
+        ));
+    }
+
+    #[test]
+    fn config_profile_helpers_replace_layer_and_are_global_only() {
+        assert_eq!(CONFIG_PROFILE_NAMES, &["default", "dev", "hip", "redline"]);
+        let root = env::temp_dir().join(format!("hipfire-cli-profile-{}", std::process::id()));
+        let config_paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer
+            .set(
+                "generation.temperature",
+                hipfire_config::ConfigValue::Float(0.5),
+            )
+            .unwrap();
+        apply_config_profile(&mut layer, &config_paths, "redline").unwrap();
+        assert!(layer.get("generation.temperature").is_none());
+        assert_eq!(
+            layer.get("replay.backend"),
+            Some(&hipfire_config::ConfigValue::String("redline".into()))
+        );
+
+        let model = Cli::try_parse_from([
+            "hipfire",
+            "config",
+            "qwen:test",
+            "profile",
+            "set",
+            "default",
+        ])
+        .unwrap();
+        let Some(Commands::Config(args)) = model.command else {
+            panic!("expected config command")
+        };
+        assert_eq!(args.model.as_deref(), Some("qwen:test"));
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Set { .. })
+            })
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn schema_json_preserves_default_types_and_validation_rules() {
         let bool_field = field("hardware.allow_mixed_arch").unwrap();
         assert_eq!(
@@ -6670,6 +7012,8 @@ mod tests {
             "11520",
             "--kv-mode",
             "q8",
+            "--kv-backend",
+            "vmm",
             "--idle-timeout",
             "0",
             "--tp",
@@ -6681,6 +7025,7 @@ mod tests {
         };
         assert_eq!(args.positionals.len(), 3);
         assert_eq!(args.kv_mode.as_deref(), Some("q8"));
+        assert_eq!(args.kv_backend.as_deref(), Some("vmm"));
         assert_eq!(args.idle_timeout, Some(0));
         assert_eq!(args.tp, Some(2));
     }

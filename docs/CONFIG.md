@@ -21,7 +21,22 @@ Persistent stores under `~/.hipfire/`:
 
 Copyable sparse profiles for users, kernel developers, and retained-PM4 work
 live in [`docs/configs/`](configs/README.md). They include direct mappings from
-historical `HIPFIRE_*` inputs to their persistent TOML keys.
+historical `HIPFIRE_*` inputs to their persistent TOML keys. Apply a whole
+bundle with the dedicated profile command:
+
+```bash
+hipfire config profile set default
+hipfire config profile set dev
+hipfire config profile set redline
+hipfire config profile create lab
+hipfire config profile              # interactive wizard
+```
+
+Selection replaces the complete sparse global `config.toml` with the chosen
+built-in or custom profile layer (no stale keys remain). Custom snapshots live
+under `~/.hipfire/profiles/<name>.toml`. Profile names are not schema fields and
+are never written into `config.toml`. The Settings TUI and CLI share the
+hipfire-config helpers. Profiles are global-only.
 
 Edit global settings interactively with `hipfire config`. Per-model overlays use
 the typed commands: `hipfire config <tag> list|get|set|reset ...`. Global
@@ -225,6 +240,11 @@ else universal fallback **`q8`**. There is no per-arch implicit FWHT table.
 `turbo*` values remain accepted aliases for validation/compat; resolution maps them in `resolveKvMode`.
 
 `kv_adaptive` is opt-in. With adaptive on, `max_seq` is the context guaranteed at the floor tier. Daemon param overrides `HIPFIRE_KV_ADAPTIVE` when set through CLI load path.
+
+`--kv-backend vmm` enables on-demand HIP VMM mapping for single-GPU Qwen3.5
+`q8`, `asym3`, and `fwht3` KV caches. The default remains `contiguous`. VMM
+currently does not compose with pipeline/expert parallelism or CASK/TriAttention
+eviction.
 
 Legacy one-shot alias: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
 
@@ -459,7 +479,7 @@ policy and filename/registry discovery.
 
 Note: CLI `ddtree_budget` default is `0` while bare `RuntimeConfig` default is `256` when only env/runtime path is used — CLI load params are the product path for `hipfire run`/`serve`.
 
-Redline eligibility helper `gfx12_mq4r_redline_default` (same file) is a **narrow product-default predicate** for replay backend selection (gfx12 + arch_id 6 + `.mq4r` + pp=tp=1), not a general config key. Policy: [`REDLINE.md`](REDLINE.md).
+Redline eligibility helper `a3b_mq4r_redline_default` (same file) is a **narrow runtime-default predicate** for replay backend selection (exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + `arch_id == 6` + case-insensitive `.mq4r` + pp=tp=1; `gfx1200` and all other arches remain opt-in), not a general config key and not Redline certification/registry admission. Built-in `hip` config profile or an explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
 
 ---
 

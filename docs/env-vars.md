@@ -140,8 +140,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_LFM2_PREFILL_BATCH` | **opt-in**; require `=1` | **Branch-only; not shipped** as a generic product default. Audited wording: **350M dense MQ4** cohort + **gfx1201** + this flag at `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e` (absent from `origin/beta@202282de…`). Does **not** admit Q8/other cohorts/default-on. |
 | `HIPFIRE_LFM2_PREFILL_MAX_BATCH` | default 256, cap 512 | Chunk size for batched path |
 | `HIPFIRE_LFM2_GRAPH` | LFM graph experiments | Source in LFM crate/daemon |
-| `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` | default on for eligible fixture; `=0` opts out | Request bit for exact gfx1201 350M dense-MQ4 decode fusion. **Unset or `=1`** requests fusion; **`=0`** (or any other set value) disables the request. Actual enablement still requires verified fixture evidence, gfx1201, graph off, and lowered forward (`lfm2_decode_fusion_enabled`). Listed opt-out of the admitted retained-PM4 product default in [`admissions.yml`](admissions.yml). |
-| `HIPFIRE_FORWARD_LOWERED` | default on (LFM and several other arches); `=0` opts out | Shared lowered forward escape hatch. For LFM: **unset or any value other than `0`** keeps the lowered path; **`=0`** forces the legacy hand loop. Lowered-on is required for exact decode fusion and retained-route eligibility. Listed opt-out of the admitted retained-PM4 product default in [`admissions.yml`](admissions.yml). |
+| `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` | request bit; `=0` disables | Request bit for exact gfx1201 350M dense-MQ4 decode fusion. **Unset or `=1`** requests fusion; **`=0`** (or any other set value) disables the request. Actual enablement still depends on implementation support (gfx1201, graph off, lowered forward). Recorded on the sealed LFM [`admissions.yml`](admissions.yml) evidence row; **not** an automatic Redline runtime-default opt-out (LFM has no current automatic selector). |
+| `HIPFIRE_FORWARD_LOWERED` | default on (LFM and several other arches); `=0` opts out | Shared lowered forward escape hatch. For LFM: **unset or any value other than `0`** keeps the lowered path; **`=0`** forces the legacy hand loop. Lowered-on is required for exact decode fusion where that path exists. Recorded on the sealed LFM [`admissions.yml`](admissions.yml) evidence row; **not** an automatic Redline runtime-default opt-out. |
 | Other `HIPFIRE_LFM*` | diag/trace | Inventory |
 
 Eager LFM prefill remains available when the batch flag is off **or** the GPU is not gfx1201. On gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`, selection is GPU+flag only with **no post-selection fallback** — unsupported cohorts fail closed at the **runtime fixture validation/guard** (exact 350M dense MQ4 fixture only). Source symbol `validate_350m_mq4_admission` is a fixture-shape check only; its name does **not** create a product admission — [`admissions.yml`](admissions.yml) remains the sole authority (schema v2; exactly one earned retained-PM4 product row).
@@ -171,10 +171,11 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 
 | Variable | Notes |
 |---|---|
-| `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`. Unset may select `auto` from **either** automatic product default: (1) Qwen `gfx12_mq4r_redline_default` — gfx12 + `arch_id==6` + `.mq4r` + pp=tp=1 (path/extension); or (2) exact LFM `lfm2_gfx1201_redline_default` — gfx1201 + `arch_id==11` + verified post-load `retained_fixture_evidence` + `max_seq==2048` + plain AR + pp=tp=1 (never path/extension). `=hip` is an explicit opt-out of the admitted LFM retained-PM4 default. Mismatch vs the sealed LFM row fails closed. |
+| `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`. Unset may select `auto` only from the Qwen automatic product default `a3b_mq4r_redline_default` — exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + `arch_id==6` + case-insensitive `.mq4r` + pp=tp=1 (path/extension; `gfx1200` and all other arches remain opt-in). LFM is **not** automatically selected; any usable LFM retained route is explicit opt-in and must still prove route support. The sealed LFM [`admissions.yml`](admissions.yml) row is registry evidence/admission only and does not wire runtime defaults. Runtime default ≠ Redline certification/registry admission. Built-in `hip` config profile, another explicit backend selection, or `=hip` disables the Qwen automatic default. |
 | `HIPFIRE_REPLAY_TRANSPORT` | `pm4` / AQL family |
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
+| `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | Developer-only / one-shot compat for `diagnostic.replay.route_proof_log`. When `1`/`true`/`on` (or TOML `true`), the daemon emits one post-generate retained-route proof marker per successful request: `HIPFIRE_REPLAY_ROUTE_PROOF transport=<name> position=<n> request_id=<id> replays=<count>`. Off by default; product coherence smoke enables it only via temporary serve_harness `config.toml`, not ambient env. |
 
 ### Chat template
 
@@ -271,10 +272,11 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 **Do not hand-edit rows below** except by re-running the source scan.
 **Generation method:** token scan over visible `*.rs`, `*.py`, and `*.sh`, excluding ignored/generated files.
 **Columns:** variable; up to two lexical source paths.
-**Count:** 714
+**Count:** 715
 
 | Variable | Example source path(s) |
 |---|---|
+| `HF_ENDPOINT` | crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_9B_MODEL` | scripts/bisect_9b_decode.sh |
 | `HIPFIRE_ADAPTIVE_B_DOWN` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_ADAPTIVE_B_UNSAFE` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
@@ -322,7 +324,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_CANARY_MODEL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_PREFILL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_RUNS` | scripts/gfx906_fallback_canary.sh |
-| `HIPFIRE_CASK_OFF` | crates/hipfire-loader/src/lib.rs, scripts/redline_daemon_harness.py, scripts/redline_product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
+| `HIPFIRE_CASK_OFF` | crates/hipfire-loader/src/lib.rs, scripts/redline_daemon_harness.py, tools/redline/product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
 | `HIPFIRE_CASK_SIDECAR` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_CHATML` | crates/hipfire-runtime/examples/probe_argmax_agreement.rs |
 | `HIPFIRE_CHAT_CURRENT_DATE` | crates/hipfire-runtime/src/prompt_frame.rs |
@@ -924,6 +926,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_REPLAY_PM4_QUEUES` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_STATEFUL` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_WAIT_POLICY` | crates/rdna-compute/src/replay.rs |
+| `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | crates/hipfire-config/src/lib.rs (`diagnostic.replay.route_proof_log`), crates/rdna-compute/src/replay.rs, tools/redline/product_bench.py, scripts/serve_harness.py |
 | `HIPFIRE_REPLAY_TRANSPORT` | crates/hipfire-cli/src/main.rs, crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPO` | scripts/quantize-dspark.sh |
 | `HIPFIRE_RESIDUAL_CPOL` | crates/rdna-compute/src/gemv.rs |
@@ -1010,6 +1013,6 @@ When adding a user-facing knob:
 1. Prefer a typed field + validation in `crates/hipfire-config/src/lib.rs` ([`CONFIG.md`](CONFIG.md)).
 2. Add the env name to product docs only if operators must set it outside config.
 3. Re-scan so the generated inventory stays complete.
-4. Do not document unearned or widened LFM defaults here (multi-cohort, path/extension selection, or generic default-on beyond the exact sealed [`admissions.yml`](admissions.yml) row). The earned exact LFM retained-PM4 default and its three opt-outs may be documented; planned broader admissions may not.
+4. Do not document unearned or widened LFM defaults here (multi-cohort, path/extension selection, automatic runtime default, or generic default-on beyond the exact sealed [`admissions.yml`](admissions.yml) evidence row). That LFM row is registry evidence without current automatic runtime wiring; only Qwen `a3b_mq4r_redline_default` auto-selects. Planned broader admissions may not be documented as shipped.
 
 **Last inventory verification:** 2026-07-22.

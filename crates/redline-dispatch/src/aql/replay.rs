@@ -180,8 +180,10 @@ impl SingleQueuePm4Ib {
         )
     }
 
-    /// Build a retained tape instrumented with one GPU-clock write per
-    /// dispatch, for attribution rather than certification.
+    /// Build a retained tape instrumented with one GPU-clock write after each
+    /// dispatch plus a baseline before the stream, for attribution rather than
+    /// certification. Later spans therefore include intervening boundary
+    /// packets between dispatches; span 0 includes the entry acquire.
     ///
     /// The resulting tape has a different dword count and sequence hash than
     /// the certified route, so it cannot satisfy a golden fixture — that is
@@ -418,10 +420,13 @@ impl SingleQueuePm4Ib {
 
     /// Replay once and return per-dispatch GPU-clock spans in nanoseconds.
     ///
-    /// `spans[i]` is the interval from the timestamp written before dispatch
-    /// `i` to the one written after it, so the sum is the whole retained span
-    /// and the distribution shows whether a deficit is spread evenly across
-    /// dispatches or concentrated in a few.
+    /// Instrumentation writes one baseline timestamp before the retained stream
+    /// and one timestamp after each `DISPATCH_DIRECT`. `spans[i]` is therefore
+    /// the interval from timestamp *i* to timestamp *i+1*: all PM4 commands
+    /// after timestamp *i* through dispatch *i*, including any preceding
+    /// wait/acquire boundary packets (and the entry acquire for span 0). The
+    /// sum is the whole retained span; the distribution shows whether a deficit
+    /// is spread evenly or concentrated.
     ///
     /// Requires a tape built by [`create_dispatch_profiled`]. A tape with only
     /// the two bracketing timestamps yields a single span, which is what
@@ -455,6 +460,54 @@ impl SingleQueuePm4Ib {
             spans.push((end - start).saturating_mul(1_000_000_000) / frequency_hz);
         }
         Ok(spans)
+    }
+
+    /// Replay exactly once and return both whole-tape and per-dispatch timing.
+    ///
+    /// Requires a tape built by [`create_dispatch_profiled`].
+    pub unsafe fn replay_and_wait_dispatch_profiled(
+        &mut self,
+    ) -> Result<(GpuMultiQueueTiming, Vec<u64>), ReplayError> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner()? };
+        self.read_dispatch_profile()
+    }
+
+    /// Decode the timestamps written by the most recent instrumented replay.
+    pub fn read_dispatch_profile(
+        &mut self,
+    ) -> Result<(GpuMultiQueueTiming, Vec<u64>), ReplayError> {
+        let frequency_hz = self
+            .timestamp_frequency_hz
+            .ok_or(ReplayError::ProfilingUnavailable)?;
+        let bytes = self
+            .timestamps
+            .as_mut()
+            .ok_or(ReplayError::ProfilingUnavailable)?
+            .as_mut_bytes();
+        let ticks = bytes
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        if ticks.len() < 2 {
+            return Err(ReplayError::ProfilingUnavailable);
+        }
+        let mut spans_nanoseconds = Vec::with_capacity(ticks.len() - 1);
+        for pair in ticks.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if start == 0 || end < start {
+                return Err(ReplayError::InvalidGpuTimestamp { start, end });
+            }
+            spans_nanoseconds.push((end - start).saturating_mul(1_000_000_000) / frequency_hz);
+        }
+        Ok((
+            GpuMultiQueueTiming {
+                first_start: ticks[0],
+                last_end: *ticks.last().unwrap(),
+                frequency_hz,
+            },
+            spans_nanoseconds,
+        ))
     }
 
     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {

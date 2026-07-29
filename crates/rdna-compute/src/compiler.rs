@@ -79,7 +79,7 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
 /// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
 /// recompile instead of loading a stale "invalid device image".
-const KERNEL_CACHE_ABI: u32 = 1;
+const KERNEL_CACHE_ABI: u32 = 2;
 
 /// Compiles HIP kernel sources to code objects, with caching.
 /// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
@@ -215,8 +215,9 @@ impl KernelCompiler {
         // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
         // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
         // still succeeds while every real compile fails, so hand the child the
-        // resolved root unless the operator already set one.
-        let rocm_env_root = hipfire_config::rocm::compiler_env_root();
+        // selected compiler's installation root unless the operator already
+        // set one that matches.
+        let rocm_env_root = hipfire_config::rocm::compiler_env_root(&hipcc_bin);
 
         // HIPFIRE_NO_DEVICE_COMPILER=1 makes the engine behave as if no device
         // compiler exists, so pre-compiled blobs are used verbatim instead of
@@ -366,8 +367,12 @@ impl KernelCompiler {
                 }
                 // No valid hash — only reject if hipcc can recompile
                 if !self.has_hipcc {
-                    eprintln!("  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)");
-                    eprintln!("           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.");
+                    eprintln!(
+                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
+                    );
+                    eprintln!(
+                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
+                    );
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
@@ -504,6 +509,25 @@ impl KernelCompiler {
         p.to_string()
     }
 
+    /// Core hipcc argv: genco/arch/O3, then passthrough, then -o out src.
+    fn direct_hipcc_args(
+        arch: &str,
+        src_path: &Path,
+        obj_path: &Path,
+        passthrough: Vec<String>,
+    ) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "--genco".into(),
+            format!("--offload-arch={arch}"),
+            "-O3".into(),
+        ];
+        args.extend(passthrough);
+        args.push("-o".into());
+        args.push(obj_path.to_str().unwrap().into());
+        args.push(src_path.to_str().unwrap().into());
+        args
+    }
+
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
     fn hipcc_compile(
         hipcc_bin: &Path,
@@ -523,11 +547,7 @@ impl KernelCompiler {
 
         let extra = extra_flags;
         let per_kernel = Self::per_kernel_flags(source);
-        let mut args: Vec<String> = vec![
-            "--genco".into(),
-            format!("--offload-arch={arch}"),
-            "-O3".into(),
-        ];
+        let mut passthrough: Vec<String> = Vec::new();
         // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
         // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
         // fails with "file not found". Add well-known candidates as -I flags;
@@ -546,18 +566,18 @@ impl KernelCompiler {
                 // C:\PROGRA~1\AMD\ROCm\6.4\include) which contains no spaces.
                 // Reported in #82.
                 let resolved = Self::win_short_path_if_needed(&candidate);
-                args.push(format!("-I{resolved}"));
+                passthrough.push(format!("-I{resolved}"));
                 break;
             }
         }
         for flag in extra.split_whitespace() {
-            args.push(flag.to_string());
+            passthrough.push(flag.to_string());
         }
         for flag in module_flags {
-            args.push(flag.clone());
+            passthrough.push(flag.clone());
         }
         for flag in &per_kernel {
-            args.push(flag.clone());
+            passthrough.push(flag.clone());
         }
         if !module_flags.is_empty() || !per_kernel.is_empty() {
             let flags = module_flags
@@ -567,9 +587,8 @@ impl KernelCompiler {
                 .collect::<Vec<_>>();
             eprintln!("  {name}: per-kernel flags: {}", flags.join(" "));
         }
-        args.push("-o".into());
-        args.push(obj_path.to_str().unwrap().into());
-        args.push(src_path.to_str().unwrap().into());
+
+        let args = Self::direct_hipcc_args(arch, src_path, obj_path, passthrough);
 
         let mut cmd = Command::new(hipcc_bin);
         cmd.args(&args);
@@ -768,6 +787,11 @@ mod tests {
     }
 
     #[test]
+    fn cache_abi_invalidates_pre_radiowave_compiler_entries() {
+        assert_eq!(KERNEL_CACHE_ABI, 2);
+    }
+
+    #[test]
     fn cache_hash_includes_flags_and_toolchain() {
         let source = "__global__ void kernel() {}";
         let base = test_compiler("", "hipcc 7.2").cache_hash("kernel", source);
@@ -782,6 +806,33 @@ mod tests {
         assert_ne!(
             base, toolchain_changed,
             "cache key must change when hipcc toolchain changes"
+        );
+    }
+
+    #[test]
+    fn direct_hipcc_args_keep_rocm_as_the_default_compiler() {
+        let args = KernelCompiler::direct_hipcc_args(
+            "gfx1100",
+            Path::new("kernel.hip"),
+            Path::new("kernel.hsaco"),
+            vec!["-I/opt/rocm/include".to_owned()],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--genco",
+                "--offload-arch=gfx1100",
+                "-O3",
+                "-I/opt/rocm/include",
+                "-o",
+                "kernel.hsaco",
+                "kernel.hip",
+            ]
+        );
+        assert!(
+            args.iter().all(|arg| !arg.contains("RADIOWAVE")),
+            "the product compiler must not inject Radiowave"
         );
     }
 

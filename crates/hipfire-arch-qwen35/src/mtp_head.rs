@@ -729,7 +729,7 @@ impl Qwen35MtpHeadKvCache {
         // leaks the k_gpu/v_gpu buffers. Free them explicitly. (The old
         // "they free on Drop" comment was false; see mtp_spec/mtp_compose
         // which already bypass this wrapper for the same reason.)
-        self.inner.free_gpu(gpu);
+        let _ = self.inner.free_gpu(gpu);
     }
 }
 

@@ -98,9 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     # Truly advisory: on pushes, ci-rustfmt-changed diffs vs master and surfaces
     # the whole dispatch-effort format backlog (Kevin's in-flight files included),
-    # so this is expected-red until the cleanup pass. Don't fail the run — green
-    # must mean the load-bearing build+test gates pass.
-    continue-on-error: true
+    # so keep the step visible without making the job's status check red.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -109,6 +107,7 @@ jobs:
         with:
           components: rustfmt
       - run: bash scripts/ci-rustfmt-changed.sh
+        continue-on-error: true
 
   clippy:
     name: clippy (advisory)

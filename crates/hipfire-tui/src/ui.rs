@@ -71,7 +71,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
             "Global",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Tab / BackTab    switch tabs"),
+        Line::from("  Tab / Shift+Tab  switch tabs"),
         Line::from("  ?                toggle this help"),
         Line::from("  r                refresh live data"),
         Line::from("  q                quit"),
@@ -84,10 +84,10 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     ];
     // The active-tab keys, one per line — keeps each short so nothing wraps and
     // clips inside the modal, and makes the line count (hence height) exact. The
-    // globally-listed keys (Tab/BackTab, q) are skipped to avoid duplication.
+    // globally-listed keys (Tab/Shift+Tab, q) are skipped to avoid duplication.
     for part in footer_hints(app).split('·') {
         let part = part.trim();
-        if part.is_empty() || part.starts_with("Tab/BackTab") || part == "q quit" {
+        if part.is_empty() || part.starts_with("Tab/Shift+Tab") || part == "q quit" {
             continue;
         }
         lines.push(Line::from(format!("  {part}")));
@@ -189,10 +189,10 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Per-tab keybind hints shown in the footer. Each tab lists ITS relevant keys;
-/// the global `Tab/BackTab switch · q quit` suffix is appended for non-edit
+/// the global `Tab/Shift+Tab switch · q quit` suffix is appended for non-edit
 /// states. Kept here (not in App) so the hint text lives next to the renderer.
 fn footer_hints(app: &App) -> String {
-    let global = "Tab/BackTab switch · q quit";
+    let global = "Tab/Shift+Tab switch · q quit";
     match app.tab {
         Tab::Home => format!("r refresh · {global}"),
         Tab::Dashboard => {
@@ -357,7 +357,7 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     ];
     frame.render_widget(
         List::new(actions)
-            .block(block("Tabs  (Tab / BackTab to switch)"))
+            .block(block("Tabs  (Tab / Shift+Tab to switch)"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         left[1],
     );
@@ -389,7 +389,7 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let keys = vec![
-        Row::new(["Tab / BackTab", "switch tabs"]),
+        Row::new(["Tab / Shift+Tab", "switch tabs"]),
         Row::new(["\u{2191}  \u{2193}", "move within a tab"]),
         Row::new(["Enter", "select / send"]),
         Row::new(["r", "refresh live data"]),

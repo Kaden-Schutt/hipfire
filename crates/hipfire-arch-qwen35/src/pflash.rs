@@ -239,7 +239,7 @@ impl PflashState {
             m.free_gpu(gpu);
         }
         if let Some(kv) = self.drafter_kv.take() {
-            kv.free_gpu(gpu);
+            let _ = kv.free_gpu(gpu);
         }
         self.drafter_tokenizer = None;
         self.drafter_loaded = false;
@@ -475,7 +475,9 @@ impl DrafterKvMode {
                  use fwht3 (similar throughput, better scorer accuracy)"
             ),
             Some(other) => {
-                panic!("speculation.prefill.drafter_kv={other:?} not in {{q8, fwht4, fwht3, fwht2}}")
+                panic!(
+                    "speculation.prefill.drafter_kv={other:?} not in {{q8, fwht4, fwht3, fwht2}}"
+                )
             }
         }
     }

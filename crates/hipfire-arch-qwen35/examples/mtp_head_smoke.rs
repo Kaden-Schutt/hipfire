@@ -215,7 +215,7 @@ fn main() -> HipResult<()> {
     // Free GPU buffers (not strictly required since we're exiting, but
     // confirms the free paths compile + don't panic).
     mtp_scratch.free_gpu(&mut gpu);
-    mtp_kv.free_gpu(&mut gpu);
+    let _ = mtp_kv.free_gpu(&mut gpu);
     head.free_gpu(&mut gpu);
 
     Ok(())

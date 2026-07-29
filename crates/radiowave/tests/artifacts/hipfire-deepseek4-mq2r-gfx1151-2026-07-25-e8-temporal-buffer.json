@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "kind": "radiowave_recipe_evidence_summary",
+  "catalog_source_revision": "a064932c345b7ce4f9fe37c775b46c635b6d6e2f",
+  "catalog_source_path": "crates/radiowave/src/recipes.rs",
+  "raw_result_included": false,
+  "architecture": "gfx1151",
+  "date": "2026-07-25",
+  "recipe": "hipfire.cache.mfp4_e8_u4_temporal_buffer",
+  "verdict": "promoted",
+  "correctness": "byte-identical output",
+  "samples_per_row": 3,
+  "baseline_tokens_per_second": 25.87,
+  "candidate_tokens_per_second": 26.63,
+  "throughput_delta_pct": 2.937766,
+  "note": "Temporal cpol0 won; non-temporal cpol20/cpol22 regressed large tensors by 40-50%. This compact record preserves the vendored catalog evidence; its raw result was not included in the source import."
+}

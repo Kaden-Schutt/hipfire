@@ -1301,7 +1301,7 @@ impl Lfm2MoeState {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        self.kv.free_gpu(gpu);
+        let _ = self.kv.free_gpu(gpu);
         for t in self.conv_states {
             let _ = gpu.free_tensor(t);
         }

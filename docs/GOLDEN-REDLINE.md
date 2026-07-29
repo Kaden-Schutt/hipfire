@@ -7,8 +7,8 @@ retained-PM4 routes on gfx1100, gfx1151, and gfx1201.
 |---|---|
 | Page state | **branch-implemented** |
 | Fixture registry | [`registry/redline-golden-v1.json`](../registry/redline-golden-v1.json) |
-| Runner | [`scripts/golden-redline.py`](../scripts/golden-redline.py) |
-| Product harness | [`scripts/redline_product_bench.py`](../scripts/redline_product_bench.py) |
+| Runner | [`tools/redline/golden.py`](../tools/redline/golden.py) (`python3 -m tools.redline golden`) |
+| Product harness | [`tools/redline/product_bench.py`](../tools/redline/product_bench.py) (`python3 -m tools.redline bench`) |
 | Certification policy | [`REDLINE.md`](REDLINE.md) |
 
 This runner is developer orchestration. Persistent product configuration still
@@ -21,7 +21,7 @@ not create a model/route admission; admissions remain owned exclusively by
 From a source checkout:
 
 ```bash
-python3 scripts/golden-redline.py
+python3 -m tools.redline golden
 ```
 
 The runner:
@@ -44,19 +44,19 @@ Useful forms:
 
 ```bash
 # Show fixtures without touching a GPU.
-python3 scripts/golden-redline.py --list
+python3 -m tools.redline golden --list
 
 # Pull the model when absent and pin it as the default after a pass.
-python3 scripts/golden-redline.py --pull --set-default --yes
+python3 -m tools.redline golden --pull --set-default --yes
 
 # Select a physical device on a multi-GPU host.
-python3 scripts/golden-redline.py --device 3
+python3 -m tools.redline golden --device 3
 
 # Print the exact command without building, hashing, loading, or running.
-python3 scripts/golden-redline.py --arch gfx1201 --dry-run
+python3 -m tools.redline golden --arch gfx1201 --dry-run
 
 # Audit an existing report; exact source and daemon hashes are mandatory here.
-python3 scripts/golden-redline.py \
+python3 -m tools.redline golden \
   --arch gfx1100 \
   --report /path/to/report.json \
   --strict-binary
@@ -68,7 +68,7 @@ clock convergence. It does not relax the acceptance gates.
 
 ## Reproducing on a box that disagrees
 
-`golden-redline.py` pins the model, sampling profile, benchmark contract, PM4
+`python3 -m tools.redline golden` pins the model, sampling profile, benchmark contract, PM4
 policy and route identity — but not the compiled code objects or the host
 toolchain. When a contributor reports the same route identity (same dispatch
 count, kernel count and sequence hash) with different throughput, the
@@ -123,6 +123,32 @@ above uses the newer positive route-proof reports where available. The
 gfx1151 record also pins the sealed certification payload, HIP-source
 aggregate, dispatch-source aggregate, 23-HSACO manifest, model, and daemon
 hashes.
+
+### gfx1151 Silver baseline
+
+**Silver** is the coherent stopgap on the path back to, and then beyond, the
+gfx1151 Golden result. It does not lower or replace the Golden acceptance
+floor above.
+
+The preserved Silver source snapshot is
+`8445fca2acd462d8e9d7547de2fe3823874c24bb`. Its daemon SHA-256 is
+`73a89a1ea57f8938ea02e264ebdd55b8d0b11f950a95f08def4553f580dc795f`;
+both reports use the same 604-launch / 23-kernel tape with sequence hash
+`42f566b752920679`.
+
+| Evidence | PM4 median | What it proves | Report SHA-256 |
+|---|---:|---|---|
+| Silver high-water | **114.209 tok/s** | Stationary 8-run measurement and complete retained-route proof | `27f04979fc98fe8315936916c67e9b4560fafde0c2408a909c3d069bb81f8234` |
+| Silver coherence certification | **113.652 tok/s** | Same daemon and tape; HIP and retained-PM4 CLI/serve Flagstaff checks passed | `c728740e9f0446124d75ea850cb363c79cf0dfa4c37d52b1386d7fcc8902f681` |
+
+The high-water report predates the embedded coherence step. Coherence is
+therefore certified by the later same-binary report, not inferred from the
+114.209 tok/s number alone. The retained route is unchanged. Against the
+115.021 tok/s Golden floor, the Silver high-water is 0.812 tok/s slower
+(0.71%, conventionally reported as the small approximately 1 tok/s loss).
+ROCm 7.14 is only a hypothesis for that gap; neither causality nor absence of
+a Redline route regression is proven. Silver remains a stopgap and never a
+Golden reproduction.
 
 Results are classified explicitly:
 

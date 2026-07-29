@@ -14,25 +14,25 @@ use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, LayerProgram, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
-use hipfire_dispatch::pipeline::{GemvInput, Step, execute_steps};
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::{DispatchError, RotationPlan};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{
-    self, EmbeddingFormat, ParoRotation, WeightTensor, f16_to_f32, fused_rmsnorm_rotate_for_mq,
-    fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
-    rotate_x_mq_batched_for, weight_gemv_prerotated, weight_gemv_swiglu_residual,
+    self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, weight_gemv_prerotated,
+    weight_gemv_swiglu_residual, EmbeddingFormat, ParoRotation, WeightTensor,
 };
-use hipfire_runtime::model_load::{LoadedWeights, WeightSource, load_weights as rt_load_weights};
+use hipfire_runtime::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::paro::{paro_load_norm, paro_text_prefix};
 use hipfire_runtime::tp_shard::ShardConfig;
 use hipfire_runtime::weight_backend::{
-    HfqBackend, ParoBackend, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding,
-    resolve_lm_head, reupload_f16_as_f32,
+    dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, resolve_lm_head,
+    reupload_f16_as_f32, HfqBackend, ParoBackend,
 };
-use hipfire_runtime::{MmqScreenable, screen_weight_tensor};
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
@@ -418,14 +418,12 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 /// Only the HFQ MoE path (`load_moe_ffn`) honors the keep-map; the
 /// ParoQuant path does not (see `paro_load_moe_ffn`).
 pub fn apply_reap_plan(config: &mut Qwen35Config) -> Result<(), String> {
-    if let Some(plan) =
-        hipfire_reap::plan::ReapPlan::from_config(
-            "qwen35",
-            None,
-            config.n_layers,
-            config.num_experts,
-        )?
-    {
+    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
+        "qwen35",
+        None,
+        config.n_layers,
+        config.num_experts,
+    )? {
         config.num_experts = plan.kept_per_layer();
         config.reap_keep = Some(std::sync::Arc::new(plan));
     }
@@ -2893,7 +2891,11 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             #[inline]
             fn e2m1(n: u8) -> f32 {
                 let m = E2M1_MAG[(n & 0x7) as usize];
-                if (n & 0x8) != 0 { -m } else { m }
+                if (n & 0x8) != 0 {
+                    -m
+                } else {
+                    m
+                }
             }
             // E4M3 (unsigned scale, bias 7, 3 mantissa) — bit-identical to the
             // quantizer `e4m3_scale_decode` and the gfx942 kernel decode.
@@ -2974,7 +2976,11 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     e = p7 | lsb;
                 }
                 let c = (e as i32 - 7) as f32;
-                if coset == 1 { c + 0.5 } else { c }
+                if coset == 1 {
+                    c + 0.5
+                } else {
+                    c
+                }
             }
             const QUANT_STEP: f32 = 0.88;
             let row_bytes = 16 + 17 * (n / 32);
@@ -3043,7 +3049,11 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     e = p7 | lsb;
                 }
                 let c = (e as i32 - 7) as f32;
-                if coset == 1 { c + 0.5 } else { c }
+                if coset == 1 {
+                    c + 0.5
+                } else {
+                    c
+                }
             }
             const QUANT_STEP_SOA: f32 = 0.88;
             // Decode assuming n = k_row; figure out m_rows from total bytes.
@@ -4094,7 +4104,10 @@ pub(crate) fn load_moe_ffn(
     // (garbage). Expect incoherent output when set on an AWQ file; that
     // *confirms* the indexed AWQ kernel is the firing path. The real
     // AWQ-vs-plain A/B uses two separately quantized files.
-    let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ").ok().as_deref() != Some("0");
+    let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")
+        .ok()
+        .as_deref()
+        != Some("0");
     let awq_present = experts
         .iter()
         .filter(|e| e.down.awq_scale.is_some())
@@ -4519,8 +4532,12 @@ static EXPERT_STATS: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 static EXPERT_STATS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 fn expert_stats_enabled() -> bool {
-    *EXPERT_STATS_ON
-        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_MOE_EXPERT_STATS").ok().as_deref() == Some("1"))
+    *EXPERT_STATS_ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_MOE_EXPERT_STATS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 fn capture_expert_stats(
     gpu: &Gpu,
@@ -4825,6 +4842,8 @@ fn forward_from_x_gpu(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
 ) -> HipResult<GpuTensor> {
+    let required_tokens = checked_kv_end(pos, 1, "forward_from_x_gpu")?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
 
     // Allocate a temporary scratch bundle. repeat_window=1 (unused in this path).
@@ -5103,7 +5122,11 @@ impl Qwen35Scratch {
                 _ => {
                     let graph_capable_arch =
                         gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
-                    if graph_capable_arch { 2 } else { 1 }
+                    if graph_capable_arch {
+                        2
+                    } else {
+                        1
+                    }
                 }
             },
 
@@ -5159,7 +5182,11 @@ impl Qwen35Scratch {
                 // error). Idempotent if already computed.
                 gpu.ensure_mq_signs()?;
             }
-            if hipfire_config::developer_var("HIPFIRE_PREFILL_REUSE_PBS").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_PREFILL_REUSE_PBS")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 let max_batch = hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
@@ -5277,6 +5304,26 @@ impl Qwen35ScratchSet {
     }
 }
 
+fn checked_kv_end(start_pos: usize, token_count: usize, site: &str) -> HipResult<usize> {
+    start_pos.checked_add(token_count).ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!("{site}: KV token range overflow ({start_pos} + {token_count})"),
+        )
+    })
+}
+
+#[inline]
+fn ar_graph_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_AR_GRAPH_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -5289,6 +5336,10 @@ pub fn forward_scratch(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch")?;
+    // Grow before any possible AR graph capture/replay. Stable virtual
+    // addresses keep existing graph pointer arguments valid.
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
     // hipGraph capture for MoE was previously gated off-by-default behind
     // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
@@ -5474,6 +5525,9 @@ pub fn forward_scratch(
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
+        if ar_graph_trace_enabled() {
+            eprintln!("[qwen-ar-graph] replay pos={pos}");
+        }
     } else if use_graph && gpu.graphs.ar_forward_kernel_dirty {
         // ── Direct path (kernel-dirty): kernels are dirty (init or post-
         // model-load). Capture would trip "hipMalloc not permitted under
@@ -5508,6 +5562,9 @@ pub fn forward_scratch(
         )?;
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
+        if ar_graph_trace_enabled() {
+            eprintln!("[qwen-ar-graph] capture pos={pos}");
+        }
         // Intra-generate replay (2026-06-12): promote this fresh capture to the
         // replay graph immediately so the NEXT token replays (cheap: pos memcpy
         // + graph_launch) instead of re-capturing + re-instantiating every
@@ -6201,6 +6258,10 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         n,
         pbs.max_batch
     );
+    let required_tokens = checked_kv_end(start_pos, n, "captured prefill")?;
+    // This entry may already be inside graph capture, so it must only validate
+    // capacity preflighted by its caller.
+    kv_cache.require_mapped_capacity(required_tokens)?;
 
     // Defense-in-depth: this entry point bypasses the eligibility check
     // in `forward_prefill_batch_with_pbs`, so the caller is responsible
@@ -6345,7 +6406,10 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     // Without this guard, a captured call would reach the dispatch arms
     // and try to load gfx12 kernels that are still community-CI-pending.
     let arch_is_gfx12 = matches!(arch, "gfx1200" | "gfx1201");
-    let lloyd_gfx12_optin = hipfire_config::developer_var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
+    let lloyd_gfx12_optin = hipfire_config::developer_var("HIPFIRE_LLOYD_GFX12")
+        .ok()
+        .as_deref()
+        == Some("1");
     if lloyd_in_dense && arch_is_gfx12 && !lloyd_gfx12_optin {
         return Err(hip_bridge::HipError::new(
             0,
@@ -6464,7 +6528,7 @@ pub fn forward_prefill_batch_with_pbs(
 /// Like `forward_prefill_batch`, but accepts a caller-owned `PrefillBatchScratch`
 /// so the ~25 per-cycle tensor allocations can be amortized across many calls.
 ///
-/// `pbs = None` preserves the original behavior (per-call allocate + free);
+/// `pbs = None` allocates and frees a right-sized scratch per call;
 /// `pbs = Some(&pbs)` reuses the provided scratch. The provided scratch's
 /// `max_batch` determines the chunk size — `tokens` is processed in chunks of
 /// up to `pbs.max_batch`. Callers driving DFlash verify should size `pbs`
@@ -6527,6 +6591,8 @@ pub fn forward_prefill_batch_with_pbs_opts(
     if n == 0 {
         return Ok(());
     }
+    let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_batch")?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
 
     // Cross-path safety: refuse MQ3 / MQ3-Lloyd weights inside any MoE
     // layer (attention OR FFN), mirroring the captured-path guard at
@@ -6705,17 +6771,25 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // Allocate the batch scratch once per call (or reuse a caller-owned one).
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains
     // ownership across DFlash cycles to avoid ~25 per-cycle tensor alloc/free
-    // pairs on the hot verify path. When None we fall back to the original
-    // allocate-here / free-on-exit pattern so unmodified callers behave the
-    // same. The chunk size is `pbs.max_batch` so a caller-owned scratch sized
-    // to e.g. `block_size` or `1 + tree_budget` keeps DFlash verify in one
-    // chunk without the full 256-row MAX_BATCH footprint.
+    // pairs on the hot verify path. When None, size the allocation to this
+    // call's largest possible chunk and allocate the DeltaNet S-state tape only
+    // for tree verify. Plain prefill never consumes that tape, and short
+    // prompts should not pay the full 256-row scratch footprint. The chunk size
+    // is `pbs.max_batch` so a caller-owned scratch sized to e.g. `block_size`
+    // or `1 + tree_budget` keeps DFlash verify in one chunk.
     let mut own_pbs: Option<PrefillBatchScratch> = None;
     let result = (|| -> HipResult<()> {
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
             None => {
-                own_pbs = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
+                let (owned_max_batch, cap_gdn_tape) =
+                    owned_prefill_scratch_plan(n, max_batch, tree_verify.is_some());
+                own_pbs = Some(PrefillBatchScratch::new_opt(
+                    gpu,
+                    config,
+                    owned_max_batch,
+                    cap_gdn_tape,
+                )?);
                 own_pbs.as_ref().unwrap()
             }
         };
@@ -6918,7 +6992,10 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // flipped) in a follow-up commit.
     let lloyd_mq3_with_gfx12_wmma = matches!(dt, DType::MQ3G256Lloyd)
         && matches!(arch, "gfx1200" | "gfx1201")
-        && hipfire_config::developer_var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_GFX12")
+            .ok()
+            .as_deref()
+            == Some("1");
 
     // Lloyd-MQ4 (MQ4G256Lloyd) on gfx11: shipped as part of issue #182.
     // Uses the gemm_*_mq4g256_lloyd_wmma family; group stride differs
@@ -6939,7 +7016,10 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // Lloyd-MQ4 on gfx12 (RDNA4): same opt-in gate as Lloyd-MQ3.
     let lloyd_mq4_with_gfx12_wmma = matches!(dt, DType::MQ4G256Lloyd)
         && matches!(arch, "gfx1200" | "gfx1201")
-        && hipfire_config::developer_var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_GFX12")
+            .ok()
+            .as_deref()
+            == Some("1");
 
     // MFP4G32E8 on gfx11/gfx1151/gfx12: the mfp4-E8 A3B model takes the
     // batched-prefill path (FWHT-rotated activations + dequant→F16 GEMM for
@@ -6965,7 +7045,10 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
                 | "gfx1200"
                 | "gfx1201"
         )
-        && hipfire_config::developer_var("HIPFIRE_E8_GFX12").ok().as_deref() == Some("1");
+        && hipfire_config::developer_var("HIPFIRE_E8_GFX12")
+            .ok()
+            .as_deref()
+            == Some("1");
 
     mq3_uniform_with_wmma
         || mq3_uniform_with_gfx10_scalar
@@ -7239,6 +7322,22 @@ fn moe_ffn_batched_admissible_for_dtypes(
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
 
+/// Plan scratch owned by one prefill call.
+///
+/// Large prompts retain the configured chunk size, while a short prompt gets
+/// exactly one right-sized chunk. The DeltaNet S-state tape is consumed only by
+/// tree verify; ordinary prefill advances recurrent state in place.
+#[inline]
+fn owned_prefill_scratch_plan(
+    n: usize,
+    configured_max_batch: usize,
+    tree_verify: bool,
+) -> (usize, bool) {
+    debug_assert!(n > 0);
+    debug_assert!(configured_max_batch >= MIN_BATCH);
+    (configured_max_batch.min(n.max(MIN_BATCH)), tree_verify)
+}
+
 /// Whether `forward_prefill_batch_with_pbs` will take the tape-capturing
 /// batched (PBS) path for an `n`-token call — equivalently, whether a `GdnTape`
 /// handed to that forward will actually be populated. When this is false the
@@ -7291,7 +7390,9 @@ pub fn prefill_batch_pbs_eligible(
     let moe_topk_ok =
         moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts);
     let admit_mq6 = mq6_batched_admit_enabled_from_env(
-        hipfire_config::developer_var("HIPFIRE_MOE_MQ6_ADMIT").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MOE_MQ6_ADMIT")
+            .ok()
+            .as_deref(),
         arch,
     );
     let has_dn = weights
@@ -7343,7 +7444,11 @@ pub fn prefill_batch_pbs_eligible(
         // A3B engine policy quantizes attention as Q8 (admitted alongside MQ4).
         && all_dtypes_ok;
     // HIPFIRE_DEBUG_BATCH=1: print per-component eligibility to stderr.
-    if hipfire_config::developer_var("HIPFIRE_DEBUG_BATCH").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_DEBUG_BATCH")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[hipfire::batch_eligible] result={result} \
              arch={arch} n={n} n>={MIN_BATCH}={} \
@@ -7404,7 +7509,9 @@ fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, arch: &str, has_wmma: b
 
 fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
     q8_prefill_wmma_enabled_from_env(
-        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_WMMA").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_WMMA")
+            .ok()
+            .as_deref(),
         gpu.arch.as_str(),
         gpu.arch_caps.has_wmma(),
     )
@@ -7430,7 +7537,10 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) 
             | "gfx1152"
             | "gfx1200"
             | "gfx1201"
-    ) && hipfire_config::developer_var("HIPFIRE_E8_GFX12").ok().as_deref() == Some("1");
+    ) && hipfire_config::developer_var("HIPFIRE_E8_GFX12")
+        .ok()
+        .as_deref()
+        == Some("1");
 
     // PARO admit is default-on. Set HIPFIRE_PARO_BATCHED=0 to force the old
     // fallback path while bisecting or debugging.
@@ -7441,7 +7551,11 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) 
     // .claude/plans/magical-marinating-hippo.md.
     static PARO_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let admit_paro = *PARO_ADMIT.get_or_init(|| {
-        paro_batched_admit_enabled_from_env(hipfire_config::developer_var("HIPFIRE_PARO_BATCHED").ok().as_deref())
+        paro_batched_admit_enabled_from_env(
+            hipfire_config::developer_var("HIPFIRE_PARO_BATCHED")
+                .ok()
+                .as_deref(),
+        )
     });
 
     moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro, admit_e8)
@@ -8467,6 +8581,8 @@ fn forward_prefill_chunk(
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+    let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_chunk")?;
+    kv_cache.require_mapped_capacity(required_tokens)?;
     debug_assert!(
         routed_out.is_none()
             || band
@@ -12157,6 +12273,8 @@ pub fn forward_scratch_with_hidden(
     scratch: &Qwen35Scratch,
     hidden_rb: &mut HiddenStateRingBuffer,
 ) -> HipResult<()> {
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_with_hidden")?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
     let pos_i32 = pos as i32;
     gpu.hip
@@ -12203,6 +12321,8 @@ pub fn forward_scratch_embed(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed")?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let pos_i32 = pos as i32;
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
@@ -13786,8 +13906,8 @@ fn q35_superop(kind: SuperOpKind, code: u32) -> SuperOp {
 /// SEQUENCE mirrors the matching hand arm in `forward_scratch_layers` exactly
 /// (per the decode-forward variant map). Pure → unit-testable.
 fn lower_variant(v: Q35Variant) -> LayerProgram {
-    use SuperOpKind::{Attend, Moe, Norm, Proj, Recurrent, ResidualGemv};
     use q35_op::*;
+    use SuperOpKind::{Attend, Moe, Norm, Proj, Recurrent, ResidualGemv};
     match v {
         Q35Variant::DeltaNet => vec![
             q35_superop(Proj, PROJ_QKVZA),
@@ -14624,7 +14744,12 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
 /// (still present in forward_scratch_layers); any other value (or unset) → lowered.
 fn forward_lowered_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// Exact gfx1151 admission gate for its certified Radiowave decode bundle.
@@ -14690,8 +14815,12 @@ fn gated_norm_mq_rotate_enabled(
 /// the established multi-dispatch path.
 fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED
-        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_QWEN35_FA_PREP_FUSE").ok().as_deref() != Some("0"));
+    let enabled = *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_QWEN35_FA_PREP_FUSE")
+            .ok()
+            .as_deref()
+            != Some("0")
+    });
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     enabled
         && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
@@ -14737,8 +14866,12 @@ fn qkvza_scalar_prep_enabled(
     w_alpha: &WeightTensor,
 ) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED
-        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_QKVZA_SCALAR_PREP").ok().as_deref() == Some("1"));
+    let enabled = *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_QKVZA_SCALAR_PREP")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     let dtype = wqkv.gpu_dtype;
     enabled
         && gpu.arch_caps.is_gfx1100()
@@ -14762,8 +14895,12 @@ fn conv_scalar_prep_enabled(
     quant: StateQuant,
 ) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED
-        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_CONV_SCALAR_PREP").ok().as_deref() == Some("1"));
+    let enabled = *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_CONV_SCALAR_PREP")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     let shape = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
         && gpu.arch_caps.is_gfx1100()
@@ -15207,12 +15344,13 @@ pub fn forward_prefill_batch_ep(
 
     let ep_timing = hipfire_config::developer_var("HIPFIRE_EP_PREFILL_TIMING").is_ok();
     let ep_skip_ar = hipfire_config::developer_var("HIPFIRE_EP_SKIP_ALLREDUCE").is_ok(); // DIAGNOSTIC ONLY (wrong output)
-    // Peer-direct all-reduce (bypass RCCL): the routed-partial sum goes through
-    // Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
-    // vs RCCL's ~40 ms/call on hiptrx (gfx1201, PCIe). DEFAULT ON; opt back to
-    // RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared
-    // with TP), lazily sized to the largest count seen.
-    let ep_peer_ar = hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE").as_deref() != Ok("0");
+                                                                                         // Peer-direct all-reduce (bypass RCCL): the routed-partial sum goes through
+                                                                                         // Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
+                                                                                         // vs RCCL's ~40 ms/call on hiptrx (gfx1201, PCIe). DEFAULT ON; opt back to
+                                                                                         // RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared
+                                                                                         // with TP), lazily sized to the largest count seen.
+    let ep_peer_ar =
+        hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE").as_deref() != Ok("0");
     let mut t_chunk = 0.0f64;
     let mut t_ar = 0.0f64;
     let mut t_add = 0.0f64;
@@ -17847,6 +17985,21 @@ mod tests {
         assert!(prefill_should_emit_last_token_logits(true, true));
         assert!(prefill_should_emit_last_token_logits(false, false));
         assert!(!prefill_should_emit_last_token_logits(true, false));
+    }
+
+    #[test]
+    fn owned_prefill_scratch_is_right_sized_without_tree_tape() {
+        assert_eq!(owned_prefill_scratch_plan(1, 256, false), (2, false));
+        assert_eq!(owned_prefill_scratch_plan(2, 256, false), (2, false));
+        assert_eq!(owned_prefill_scratch_plan(32, 256, false), (32, false));
+        assert_eq!(owned_prefill_scratch_plan(256, 256, false), (256, false));
+        assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+    }
+
+    #[test]
+    fn owned_prefill_scratch_preserves_tree_verify_tape() {
+        assert_eq!(owned_prefill_scratch_plan(22, 256, true), (22, true));
+        assert_eq!(owned_prefill_scratch_plan(64, 64, true), (64, true));
     }
 
     #[test]

@@ -716,6 +716,17 @@ fn render_tail_opens_think(rendered: &str) -> bool {
     rendered.trim_end().ends_with("<think>")
 }
 
+/// Reduce the authoritative rendered-prompt state to the signal consumed by
+/// speculative emitters. Jinja owns the generation suffix, so the request's
+/// `assistant_prefix` is not authoritative once rendering succeeds.
+fn spec_assistant_prefix(started_in_think: bool) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+    if started_in_think {
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    } else {
+        hipfire_runtime::prompt_frame::AssistantPrefix::Plain
+    }
+}
+
 fn emit_gen_start(stdout: &mut std::io::Stdout, id: &str, started_in_think: bool) {
     let envelope = serde_json::json!({
         "type": "gen_start",
@@ -912,6 +923,256 @@ fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
     });
     let _ = writeln!(stdout, "{line}");
     let _ = stdout.flush();
+}
+
+/// Fail-closed policy for ordinary single-GPU Qwen35 AR when
+/// `forward_prefill_batch` / `forward_scratch` returns `Err` (VMM map/growth,
+/// allocation, or other HipResult failure). Injected map failure must never
+/// panic the daemon or emit a token whose trunk KV write did not commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QwenArForwardFailAction {
+    /// Emit one request-scoped `{"type":"error",...}` and stop the request.
+    emit_request_error: bool,
+    /// Cold-reset uncommitted DN/KV/seq so unload + retry stay safe.
+    reset_uncommitted_state: bool,
+    /// Must stay false: never emit/commit the token whose KV write failed.
+    emit_failed_token: bool,
+    /// Adaptive poison is sticky across request failures.
+    clear_adaptive_poison: bool,
+}
+
+fn qwen_ar_forward_fail_action() -> QwenArForwardFailAction {
+    QwenArForwardFailAction {
+        emit_request_error: true,
+        reset_uncommitted_state: true,
+        emit_failed_token: false,
+        clear_adaptive_poison: false,
+    }
+}
+
+fn qwen_ar_forward_fail_message(phase: &str, err: impl std::fmt::Display) -> String {
+    format!("{phase}: {err}")
+}
+
+/// VL no-eviction KV admission cap.
+///
+/// Adaptive floor-reserved caches guarantee `max_seq` at the floor tier; the
+/// start tier (FWHT4/Q8) has a smaller `current_cap`, so long multi-chunk VL
+/// must be admitted against the floor window (`max_seq`) while
+/// `maybe_downshift` keeps each committed write inside the live stride.
+/// Non-adaptive paths keep the historical `physical_cap` contract.
+fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: bool) -> usize {
+    if adaptive_engaged {
+        max_seq
+    } else {
+        physical_cap
+    }
+}
+
+/// Cold-reset VL trunk after a GPU/VMM/adaptive failure so the next request
+/// cannot inherit partial DN/KV/seq or mismatched conversation history.
+///
+/// Takes disjoint fields (`dn`/`kv` from `m.state`, controller + host counters
+/// on `LoadedModel`) so callers holding `kv`/`dn` do not need `&mut LoadedModel`.
+/// Adaptive poison stays sticky: only non-poisoned controllers are
+/// `reset_with_cache`'d back to FWHT4/Q8.
+fn vl_cold_reset_uncommitted(
+    gpu: &mut rdna_compute::Gpu,
+    dn: &qwen35::DeltaNetState,
+    kv: &mut hipfire_runtime::llama::KvCache,
+    kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+) {
+    for s in &dn.s_matrices {
+        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+    }
+    for s in &dn.s_scales {
+        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+    }
+    for s in &dn.conv_states {
+        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+    }
+    kv.compact_offset = 0;
+    if let Some(ad) = kv_adaptive.as_mut() {
+        if !ad.is_poisoned() {
+            ad.reset_with_cache(gpu, kv);
+        }
+    }
+    *seq_pos = 0;
+    conversation_tokens.clear();
+    free_checkpoints(prefill_checkpoints, gpu);
+}
+
+/// Fail-closed adaptive downshift after a committed VL KV write.
+/// Returns `true` when the request must stop (controller already poisoned).
+/// On Err: cold-reset trunk (poison sticky) + request error, no further tokens.
+fn vl_adaptive_downshift_fail_closed(
+    kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
+    seq_pos: &mut usize,
+    gpu: &mut rdna_compute::Gpu,
+    kv: &mut hipfire_runtime::llama::KvCache,
+    dn: &qwen35::DeltaNetState,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    phase: &str,
+) -> bool {
+    let Some(ad) = kv_adaptive.as_mut() else {
+        return false;
+    };
+    let committed = *seq_pos;
+    match ad.maybe_downshift(gpu, kv, committed) {
+        Ok(applied) => {
+            for step in &applied {
+                eprintln!(
+                    "[adaptive-kv] downshift @ pos {} ({}): {:?} (K={:?} V={:?})",
+                    committed, phase, step, ad.cur_k, ad.cur_v
+                );
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "[adaptive-kv] maybe_downshift error @ pos {} ({}): {:?} — poisoning model",
+                committed, phase, e
+            );
+            // maybe_downshift already poisons on partial failure; cold-reset
+            // leaves poison sticky (reset_with_cache skipped when poisoned).
+            vl_cold_reset_uncommitted(
+                gpu,
+                dn,
+                kv,
+                kv_adaptive,
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+            );
+            write_error(
+                stdout,
+                id,
+                &format!("adaptive KV transition failed during {phase}: {e}"),
+            );
+            true
+        }
+    }
+}
+
+/// Request-scoped VL GPU/VMM failure: cold-reset uncommitted trunk state, then
+/// emit error. Never panics; never streams a token for the failed write.
+fn vl_forward_fail(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    phase: &str,
+    err: impl std::fmt::Display,
+    gpu: &mut rdna_compute::Gpu,
+    dn: &qwen35::DeltaNetState,
+    kv: &mut hipfire_runtime::llama::KvCache,
+    kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+) {
+    vl_cold_reset_uncommitted(
+        gpu,
+        dn,
+        kv,
+        kv_adaptive,
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+    );
+    write_error(stdout, id, &format!("VL {phase}: {err}"));
+}
+
+/// Contract: MTP adaptive downshift sites must see the same exclusive committed
+/// positions the chunked prefill helper writes. Pure schedule — no GPU.
+#[cfg(test)]
+mod mtp_adaptive_route_contract {
+    /// Exact adaptive×MTP prefill invariant:
+    /// external chunk size ≤ PREFILL_MAX_BATCH (= adaptive margin), and
+    /// maybe_downshift runs at each exclusive committed boundary so a long
+    /// prompt cannot hit the start-tier side_cap before return. A single
+    /// whole-prompt prefill + post-only downshift is insufficient.
+    #[test]
+    fn mtp_adaptive_prefill_boundaries_match_chunk_schedule() {
+        use hipfire_arch_qwen35::mtp_spec::mtp_prefill_committed_boundaries;
+        use hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH;
+        assert_eq!(
+            mtp_prefill_committed_boundaries(600, 0, PREFILL_MAX_BATCH),
+            vec![256, 512, 600]
+        );
+        assert!(mtp_prefill_committed_boundaries(0, 0, PREFILL_MAX_BATCH).is_empty());
+        // Gaps never exceed one prefill chunk (margin safety).
+        let b = mtp_prefill_committed_boundaries(10_000, 0, PREFILL_MAX_BATCH);
+        let mut prev = 0usize;
+        for &pos in &b {
+            assert!(pos - prev <= PREFILL_MAX_BATCH);
+            prev = pos;
+        }
+    }
+
+    #[test]
+    fn mtp_forward_fail_is_request_error_not_token() {
+        // Mirror AR policy for MTP prefill/spec HipResult (VMM growth, etc.):
+        // emit request error, never the failed token; poison stays sticky.
+        let action = super::qwen_ar_forward_fail_action();
+        assert!(action.emit_request_error);
+        assert!(!action.emit_failed_token);
+        assert!(!action.clear_adaptive_poison);
+    }
+
+    /// Decode-cycle invariant: downshift seq_pos is the live committed prefix
+    /// only. Rejected verify length is (n_verify - advance) and lives strictly
+    /// past that prefix — never included in maybe_downshift's seq_pos.
+    #[test]
+    fn mtp_decode_downshift_uses_committed_prefix_only() {
+        let cur_pos = 1000usize;
+        let max_n = 3usize;
+        let n_verify = max_n + 1; // last_committed + candidates
+        let advance = 2usize; // e.g. accept 1 + bonus
+        let committed_end = cur_pos + advance;
+        let reject_suffix_end = cur_pos + n_verify;
+        assert!(committed_end < reject_suffix_end);
+        // maybe_downshift(committed_end) covers [0, committed_end); rejected
+        // [committed_end, reject_suffix_end) must not be required at new tier.
+        assert_eq!(reject_suffix_end - committed_end, n_verify - advance);
+    }
+}
+
+/// Pure gate for the deferred EP (tp>1) load handoff.
+///
+/// After a new EP model is constructed, the prior model is unloaded. The new
+/// model may be published only when that prior unload succeeds (or there was
+/// no prior model — caller passes `Ok(())` in that case). A failed prior
+/// unload must never install/emit `loaded` for the new model.
+fn ep_deferred_may_publish(prior_unload: &Result<(), String>) -> bool {
+    prior_unload.is_ok()
+}
+
+/// Hard-error text when deferred prior unload fails (and optional new-model
+/// rollback also fails). Always names the prior failure; appends rollback
+/// failure when present so neither is log-and-ignored.
+fn ep_deferred_handoff_error_message(prior_err: &str, rollback_err: Option<&str>) -> String {
+    match rollback_err {
+        None => format!("prior unload failed: {prior_err}"),
+        Some(rb) => {
+            format!("prior unload failed: {prior_err}; new-model rollback also failed: {rb}")
+        }
+    }
+}
+
+/// Whether the deferred-EP load path must run `ensure_vmm_ready_for_load`
+/// before constructing a new EP model.
+///
+/// Only when there is no live prior model (`model_present == false`): a
+/// failed deferred prior unload leaves `model=None` while VMM arenas may
+/// still be pending. Do NOT preflight when a live deferred prior still
+/// occupies `model` — that path tears down after successful new load.
+fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool {
+    load_tp > 1 && !model_present
 }
 
 enum ImageSource<'a> {
@@ -1371,7 +1632,41 @@ fn main() {
                     }
                     pflash_cfg = None;
                     if let Some(m) = model.take() {
-                        hipfire_loader::unload_model(m, &mut gpu);
+                        if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","message":{}}}"#,
+                                serde_json::to_string(&format!("prior unload failed: {err}"))
+                                    .unwrap()
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","message":{}}}"#,
+                            serde_json::to_string(&err).unwrap()
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
+                // EP path: when no live prior model remains (fresh daemon, or
+                // after deferred prior unload failed and left model=None with
+                // pending VMM), refuse to construct a new EP model until
+                // orphan teardown clears. Skip when a live deferred prior
+                // still sits in `model` — unload stays deferred until after
+                // successful new-model construction.
+                if ep_deferred_needs_vmm_preflight(load_tp, model.is_some()) {
+                    if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","message":{}}}"#,
+                            serde_json::to_string(&err).unwrap()
+                        );
+                        let _ = stdout.flush();
+                        continue;
                     }
                 }
 
@@ -1441,6 +1736,12 @@ fn main() {
                 let kv_mode_override = msg
                     .get("params")
                     .and_then(|p| p.get("kv_mode"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let kv_backend_override = msg
+                    .get("params")
+                    .and_then(|p| p.get("kv_backend"))
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
@@ -1776,14 +2077,29 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
+                let requested_kv_backend = kv_backend_override
+                    .as_deref()
+                    .unwrap_or("contiguous")
+                    .to_ascii_lowercase();
+                if tp > 1 && requested_kv_backend != "contiguous" {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"KV backend '{}' requires tp=1"}}"#,
+                        requested_kv_backend
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
                 let loaded = if tp > 1 {
                     hipfire_loader::load_model_ep(path, max_seq, tp)
                 } else {
-                    hipfire_loader::load_model(
+                    hipfire_loader::load_model_with_kv_backend(
                         path,
                         max_seq,
                         draft_path.as_deref(),
                         kv_mode_override.as_deref(),
+                        kv_backend_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,
@@ -1795,14 +2111,18 @@ fn main() {
                 match loaded {
                     Ok(mut m) => {
                         // FIX #1 (deferred EP unload): the new EP model loaded
-                        // successfully — NOW it's safe to free the prior model
-                        // (single-GPU/pp models were already unloaded eagerly
-                        // above; this branch only fires for the deferred tp>1
-                        // path). The prior model's PFlash drafter (pflash_state)
-                        // is part of that prior model, so it's torn down here in
-                        // the same drainer-before-unload order used elsewhere:
-                        // unload_drafter queues the drafter tensors into the
-                        // pool, then unload_model drains it.
+                        // successfully — NOW unload the prior model before
+                        // publishing (single-GPU/pp models were already unloaded
+                        // eagerly above; this branch only fires for deferred
+                        // tp>1). Prior PFlash drafter is part of that prior
+                        // model, so tear it down first in the same
+                        // drafter-before-unload order used elsewhere.
+                        //
+                        // Transactional: if prior unload fails, do NOT install
+                        // or emit `loaded` for the new model. Explicitly unload
+                        // the newly built EP model, clear associated fresh
+                        // state, and emit a hard error covering prior failure
+                        // and any rollback failure.
                         if load_tp > 1 {
                             if let Some(mut pf) = pflash_state.take() {
                                 if let Some(mut dg) = pflash_drafter_gpu.take() {
@@ -1814,8 +2134,28 @@ fn main() {
                                 }
                             }
                             pflash_cfg = None;
-                            if let Some(old) = model.take() {
-                                hipfire_loader::unload_model(old, &mut gpu);
+                            let prior_unload = if let Some(old) = model.take() {
+                                hipfire_loader::unload_model(old, &mut gpu)
+                            } else {
+                                Ok(())
+                            };
+                            if !ep_deferred_may_publish(&prior_unload) {
+                                let prior_err = prior_unload
+                                    .err()
+                                    .unwrap_or_else(|| "prior unload failed".to_string());
+                                // Roll back the newly built EP model — GpuTensor
+                                // has no Drop; must free explicitly.
+                                let rollback_err = match hipfire_loader::unload_model(m, &mut gpu) {
+                                    Ok(()) => None,
+                                    Err(e) => Some(e),
+                                };
+                                // model stays None; pflash already cleared above.
+                                let msg = ep_deferred_handoff_error_message(
+                                    &prior_err,
+                                    rollback_err.as_deref(),
+                                );
+                                write_error(&mut stdout, "", &msg);
+                                continue;
                             }
                         }
                         let arch = match m.arch_id {
@@ -1829,12 +2169,13 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let redline_default = hipfire_runtime::config::gfx12_mq4r_redline_default(
+                        let redline_default = hipfire_runtime::config::a3b_mq4r_redline_default(
                             &gpu.arch, path, m.arch_id, pp, tp,
                         );
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
-                                "[redline] enabling fail-closed gfx12 MQ4R default (transport={})",
+                                "[redline] enabling fail-closed A3B MQ4R default on {} (transport={})",
+                                gpu.arch,
                                 gpu.replay.transport_name()
                             );
                         }
@@ -2096,6 +2437,7 @@ fn main() {
                 };
 
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                gpu.replay.begin_replay_observation_window();
                 let prompt = msg
                     .get("prompt")
                     .and_then(|v| v.as_str())
@@ -2473,8 +2815,12 @@ fn main() {
                         if let Some(b) = m.deepseek4_mut() {
                             b.state.reset();
                         }
-                        if let Some(ref mut ad) = m.kv_adaptive {
-                            ad.reset();
+                        if let Some(ad) = m.kv_adaptive.as_mut() {
+                            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+                                ad.reset_with_cache(&mut gpu, &mut b.kv_cache);
+                            } else {
+                                ad.reset();
+                            }
                         }
                     }
                     if image_base64.is_some() && image.is_some() {
@@ -2657,6 +3003,9 @@ fn main() {
                         &stop_seqs, // hunt3 M-F
                     );
                 }
+                if let Some(marker) = gpu.replay.replay_observation_marker(id) {
+                    eprintln!("{marker}");
+                }
             }
 
             "reset" => {
@@ -2742,8 +3091,12 @@ fn main() {
                     // Restore adaptive-KV controller to start tier (q8/fwht4)
                     // so thresholds fire correctly on the fresh conversation
                     // instead of staying pinned at the floor tier.
-                    if let Some(ref mut ad) = m.kv_adaptive {
-                        ad.reset();
+                    if let Some(ad) = m.kv_adaptive.as_mut() {
+                        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+                            ad.reset_with_cache(&mut gpu, &mut b.kv_cache);
+                        } else {
+                            ad.reset();
+                        }
                     }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
@@ -2771,10 +3124,27 @@ fn main() {
                     }
                 }
                 pflash_cfg = None;
-                if let Some(m) = model.take() {
-                    hipfire_loader::unload_model(m, &mut gpu);
+                let unload_result = if let Some(m) = model.take() {
+                    hipfire_loader::unload_model(m, &mut gpu)
+                } else {
+                    // No model: still retry any process-global pending VMM arenas.
+                    hipfire_loader::ensure_vmm_ready_for_load(&mut gpu)
+                };
+                match unload_result {
+                    Ok(()) => {
+                        let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
+                    }
+                    Err(err) => {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","message":{}}}"#,
+                            serde_json::to_string(&format!(
+                                "unload incomplete: {err}; VMM arenas retained for retry"
+                            ))
+                            .unwrap()
+                        );
+                    }
                 }
-                let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
             }
 
@@ -3373,6 +3743,8 @@ fn main() {
                                 "packets": identity.packet_count,
                                 "queue_id": identity.queue_id,
                                 "command_dwords": identity.command_dwords,
+                                "queues": identity.queue_count,
+                                "phases": identity.phase_count,
                             })
                         });
                         let sequence = gpu.replay.capture_summary();
@@ -3674,6 +4046,243 @@ fn main() {
                         "blob": blob_snapshot.json(),
                     })
                 );
+                let _ = stdout.flush();
+            }
+
+            "redline_dispatch_profile" => {
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(128) as usize;
+                let warmup_replays = msg
+                    .get("warmup_replays")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(5) as usize;
+                let sample_replays = msg
+                    .get("sample_replays")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(20) as usize;
+                let validate_correctness = msg
+                    .get("validate_correctness")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+                let eligible = model.as_ref().is_some_and(|loaded| {
+                    loaded.pp == 1
+                        && loaded.ep.is_none()
+                        && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+                });
+                let launch_count = gpu.replay.recorded_launches().len();
+                if !eligible || launch_count == 0 || sample_replays == 0 {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "redline_dispatch_profile requires captured single-GPU Qwen3.5 and sample_replays > 0",
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
+                let route = gpu.replay.capture_summary();
+                let prepared = match gpu
+                    .replay
+                    .prepare_pm4_dispatch_profile(gpu.device_id as usize, launch_count)
+                {
+                    Ok(summary) => summary,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("retained PM4 dispatch-profile prepare failed: {reason}"),
+                            })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let boundaries = gpu
+                    .replay
+                    .prepared_pm4_dispatch_boundaries()
+                    .expect("dispatch-profile prepare installed boundary metadata");
+                let dispatches = gpu
+                    .replay
+                    .recorded_launches()
+                    .iter()
+                    .zip(boundaries)
+                    .enumerate()
+                    .map(|(index, (launch, boundary))| {
+                        serde_json::json!({
+                            "index": index,
+                            "kernel": launch.kernel,
+                            "previous_kernel": index.checked_sub(1).map(|previous| {
+                                gpu.replay.recorded_launches()[previous].kernel.as_str()
+                            }),
+                            "grid": launch.grid,
+                            "block": launch.block,
+                            "boundary": {
+                                "entry_acquire": boundary.entry_acquire,
+                                "wait_compute_idle": boundary.wait_compute_idle,
+                                "acquire_inter_node": boundary.acquire_inter_node,
+                                "acquire_vmem": boundary.acquire_vmem,
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                let result = (|| -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
+                    let loaded = model.as_mut().expect("eligibility checked");
+                    let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                    redline_reset_qwen(&mut gpu, bundle)?;
+                    redline_prime_qwen(&mut gpu, bundle, context)?;
+                    for _ in 0..warmup_replays {
+                        qwen35::prepare_scratch_inputs(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101,
+                            context,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        // SAFETY: the loaded model owns every captured pointer.
+                        unsafe { gpu.replay.replay_pm4_dispatch_profile(context) }?;
+                    }
+
+                    let mut samples = Vec::with_capacity(sample_replays);
+                    for sample in 0..sample_replays {
+                        qwen35::prepare_scratch_inputs(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101,
+                            context,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let started = Instant::now();
+                        // SAFETY: the loaded model owns every captured pointer.
+                        let profile = unsafe { gpu.replay.replay_pm4_dispatch_profile(context) }?;
+                        if profile.spans_nanoseconds.len() != launch_count {
+                            return Err(format!(
+                                "dispatch span length mismatch: expected {launch_count}, got {}",
+                                profile.spans_nanoseconds.len()
+                            ));
+                        }
+                        let total_gpu_ns = profile
+                            .timing
+                            .last_end
+                            .saturating_sub(profile.timing.first_start)
+                            .saturating_mul(1_000_000_000)
+                            / profile.timing.frequency_hz;
+                        samples.push(serde_json::json!({
+                            "sample": sample,
+                            "host_ns": started.elapsed().as_nanos(),
+                            "total_gpu_ns": total_gpu_ns,
+                            "spans_ns": profile.spans_nanoseconds,
+                        }));
+                    }
+
+                    let correctness = if validate_correctness {
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                        redline_reset_qwen(&mut gpu, bundle)?;
+                        redline_prime_qwen(&mut gpu, bundle, context)?;
+                        qwen35::prepare_scratch_inputs(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101,
+                            context,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        // SAFETY: the loaded model owns every captured pointer.
+                        unsafe { gpu.replay.replay_pm4_dispatch_profile(context) }?;
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
+                        let instrumented = redline_qwen_snapshot(&gpu, bundle)?;
+
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                        redline_reset_qwen(&mut gpu, bundle)?;
+                        redline_prime_qwen(&mut gpu, bundle, context)?;
+                        qwen35::forward_scratch(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101,
+                            context,
+                            &mut bundle.kv_cache,
+                            &mut bundle.dn_state,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
+                        let hip = redline_qwen_snapshot(&gpu, bundle)?;
+                        serde_json::json!({
+                            "performed": true,
+                            "bit_exact": instrumented == hip,
+                            "logits_equal": instrumented.logits == hip.logits,
+                            "kv_equal": instrumented.kv == hip.kv,
+                            "recurrent_equal": instrumented.recurrent == hip.recurrent,
+                            "instrumented_pm4": instrumented.json(),
+                            "hip": hip.json(),
+                        })
+                    } else {
+                        serde_json::json!({"performed": false})
+                    };
+                    Ok((samples, correctness))
+                })();
+
+                match result {
+                    Ok((samples, correctness)) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "schema_version": 1,
+                                "type": "redline_dispatch_profile",
+                                "context_tokens": context,
+                                "warmup_replays": warmup_replays,
+                                "sample_replays": sample_replays,
+                                "steady_state": true,
+                                "exactly_once_per_sample": true,
+                                "timestamp_semantics": "baseline before stream plus post-dispatch stamps; span i is PM4 after timestamp i through dispatch i (entry acquire in span 0; later spans include intervening boundary packets)",
+                                "route": {
+                                    "launches": route.launch_count,
+                                    "unique_kernels": route.unique_kernel_count,
+                                    "sequence_hash": format!("{:016x}", route.sequence_hash),
+                                    "command_dwords": prepared.1,
+                                    "timestamp_slots": route.launch_count + 1,
+                                    "queue_id": prepared.2,
+                                },
+                                "dispatches": dispatches,
+                                "samples": samples,
+                                "correctness": correctness,
+                            })
+                        );
+                    }
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("retained PM4 dispatch profile failed: {reason}"),
+                            })
+                        );
+                    }
+                }
                 let _ = stdout.flush();
             }
 
@@ -5403,6 +6012,20 @@ fn generate_dflash(
     // so the caller must fall through to the arch's AR path. Every other exit
     // (success, abort, error) has already written its envelope → true.
 ) -> bool {
+    // Adaptive KV has no maybe_downshift on the generic spec path. Fail closed
+    // rather than run DSpark/DFlash/ngram past floor-reserved capacity. The
+    // error envelope is written here, so this counts as handled (true) — the
+    // caller must NOT also emit an AR response.
+    if m.kv_adaptive.is_some() {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"kv_adaptive cannot use generic speculative decode (DFlash/DSpark/n-gram); use AR or native MTP"}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        return true;
+    }
+
     // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
     // SpecStats that this function used to drive inline now live behind the
     // arch-generic `Speculator` trait (the loader's `DflashSpeculator`) and the
@@ -5429,6 +6052,10 @@ fn generate_dflash(
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -5470,7 +6097,10 @@ fn generate_dflash(
             frame.render()
         };
         match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!(
                     "[daemon] jinja render failed in dflash path ({e}) — falling back to Plain"
@@ -5704,6 +6334,10 @@ fn generate_dflash(
         spec.set_sampling(temp, top_p, top_k, cactus_delta);
     }
     let prefill_tokens_full = prefill_tokens.len();
+    // The Jinja prompt can open `<think>` without emitting that token during
+    // generation. Prime both the client channel router and the speculative
+    // think-budget tracker from the rendered tail, exactly as the AR path does.
+    emit_gen_start(stdout, id, started_in_think);
     let run = match generate_spec(
         m,
         gpu,
@@ -5720,7 +6354,7 @@ fn generate_dflash(
             tools: emit_tools,
             stop: stop.to_vec(),
             max_think: max_think_tokens,
-            assistant_prefix,
+            assistant_prefix: spec_assistant_prefix(started_in_think),
             think_mode: ThinkMode::NonThink,
             decoded_vocab: None,
         },
@@ -5878,6 +6512,18 @@ fn generate_spec(
     // drafters ignore it. The daemon's routing gate enforces that invariant.
     temp: f32,
 ) -> Option<SpecRun> {
+    // Adaptive KV has no maybe_downshift on the generic spec path. Fail closed
+    // rather than run unsupported speculation past floor-reserved capacity.
+    if m.kv_adaptive.is_some() {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"kv_adaptive cannot use generic speculative decode (DFlash/DSpark/n-gram); use AR or native MTP"}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        return None;
+    }
+
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // Acquire the target via the RAII slot guard — it restores the bundle into
@@ -6442,11 +7088,16 @@ fn generate_spec(
 ///
 /// Call sequence (mirrors `mtp_only_demo`):
 ///   1. cold-reset trunk DeltaNet/KV (v1 is single-turn — no LCP cache),
-///   2. `prefill_trunk_and_mtp_cache` (trunk batched prefill + MTP private KV
-///      fill over the prompt positions),
+///   2. `prefill_trunk_and_mtp_cache_with_boundary` (chunked ≤ PREFILL_MAX_BATCH
+///      trunk+MTP fill; adaptive `maybe_downshift` at each committed boundary),
 ///   3. seed token = trunk argmax at the last prefill position,
 ///   4. loop `spec_step_mtp_compressed_serial` (the production path), committing
-///      `result.committed` and advancing `cur_pos += result.advance` each cycle.
+///      `result.committed` and advancing `cur_pos += result.advance` each cycle,
+///      then adaptive downshift at the new committed trunk position.
+///
+/// Fail-closed: prefill/spec HipResult and adaptive transition errors free MTP
+/// state, restore the Qwen35 bundle, emit a request error, and never emit a
+/// token after a failed KV commit. Adaptive poison stays sticky on `m.kv_adaptive`.
 ///
 /// Per-request lifecycle (state-bleed guard, the serve-multiturn class): the
 /// `MtpSpecState` (which owns the trunk DN snapshot + the MTP-private KV cache)
@@ -6496,6 +7147,18 @@ fn generate_qwen35_mtp(
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
     use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
+
+    // Adaptive poison is sticky until unload. Fail at preflight — never
+    // reset_with_cache or clear poison on a poisoned controller.
+    if let Some(ad) = m.kv_adaptive.as_ref() {
+        if ad.is_poisoned() {
+            let reason = ad
+                .poison_reason()
+                .unwrap_or("adaptive KV is poisoned; unload/reload required");
+            emit_error_with_id(stdout, id, reason);
+            return;
+        }
+    }
 
     // ── Resolve the proven-durable MTP config ──────────────────────────
     // K defaults to 3 (max_n); p_min defaults to 0.4. Both env-overridable so
@@ -6620,6 +7283,18 @@ fn generate_qwen35_mtp(
     if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
         b.kv_cache.compact_offset = 0;
     }
+    // Adaptive start-tier restore for single-turn MTP (no LCP): a prior AR
+    // request may have left the controller at a lower tier / next_step>0.
+    // reset_with_cache restores FWHT4/Q8 + next_step=0 and cache mode flags
+    // together. Poisoned controllers are never reset/cleared here (preflight
+    // already refused the request).
+    if let Some(ad) = m.kv_adaptive.as_mut() {
+        if !ad.is_poisoned() {
+            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+                ad.reset_with_cache(gpu, &mut b.kv_cache);
+            }
+        }
+    }
 
     // ── Take the bundle → build a transient ModelSlot ───────────────────
     // The mtp_spec helpers take `&mut ModelSlot`; the daemon owns the qwen35
@@ -6632,6 +7307,7 @@ fn generate_qwen35_mtp(
         scratch,
         kv_cache,
         dn_state,
+        kv_adaptive: _,
     } = match m.state.take() {
         Some(ModelState::Qwen35(b)) => b,
         _ => {
@@ -6650,6 +7326,7 @@ fn generate_qwen35_mtp(
                 scratch,
                 kv_cache,
                 dn_state,
+                kv_adaptive: None,
             }));
             return;
         }
@@ -6699,6 +7376,7 @@ fn generate_qwen35_mtp(
             scratch: target.scratch,
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
+            kv_adaptive: None,
         }));
         return;
     }
@@ -6724,6 +7402,7 @@ fn generate_qwen35_mtp(
                     scratch: target.scratch,
                     kv_cache: target.kv_cache,
                     dn_state: target.dn_state,
+                    kv_adaptive: None,
                 }));
                 return;
             }
@@ -6735,10 +7414,28 @@ fn generate_qwen35_mtp(
     if let Some(cvs) = cvs_opt {
         if let Err(e) = state.mtp_scratch.ensure_compressed_logits(gpu, cvs) {
             emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
+            state.free_gpu(gpu);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights: target.weights,
+                scratch: target.scratch,
+                kv_cache: target.kv_cache,
+                dn_state: target.dn_state,
+                kv_adaptive: None,
+            }));
             return;
         }
         if let Err(e) = state.ensure_compressed_lm_logits(gpu, cvs) {
             emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
+            state.free_gpu(gpu);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights: target.weights,
+                scratch: target.scratch,
+                kv_cache: target.kv_cache,
+                dn_state: target.dn_state,
+                kv_adaptive: None,
+            }));
             return;
         }
     }
@@ -6770,16 +7467,47 @@ fn generate_qwen35_mtp(
 
     let t0 = Instant::now();
 
-    // ── Prefill: trunk batched + MTP private-KV fill (trunk-spine) ──────
+    // ── Prefill: chunked trunk + MTP private-KV fill (committed boundaries) ─
+    // Adaptive controllers live on `m.kv_adaptive` (not the transient slot).
+    // Boundary hook downshifts at exclusive committed pos before the next chunk
+    // can write past the current-tier capacity. Prefill/spec HipResult failures
+    // (incl. lazy VMM growth) are request errors — never unwrap/panic.
     let head = m.qwen35_mtp_head.as_ref().unwrap();
-    let prefill_res = mtp_spec::prefill_trunk_and_mtp_cache(
-        gpu,
-        &mut target,
-        head,
-        &mut state,
-        &prompt_tokens,
-        0,
-    );
+    let prefill_res = {
+        let adaptive = &mut m.kv_adaptive;
+        mtp_spec::prefill_trunk_and_mtp_cache_with_boundary(
+            gpu,
+            &mut target,
+            head,
+            &mut state,
+            &prompt_tokens,
+            0,
+            |gpu, target, committed_pos| {
+                if let Some(ad) = adaptive.as_mut() {
+                    match ad.maybe_downshift(gpu, &mut target.kv_cache, committed_pos) {
+                        Ok(steps) => {
+                            for step in steps {
+                                eprintln!(
+                                    "[adaptive-kv] downshift @ pos {} (mtp prefill): {:?} (K={:?} V={:?})",
+                                    committed_pos, step, ad.cur_k, ad.cur_v
+                                );
+                            }
+                            Ok(())
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[adaptive-kv] maybe_downshift error @ pos {} (mtp prefill): {:?} — poisoning model",
+                                committed_pos, e
+                            );
+                            Err(e)
+                        }
+                    }
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    };
     if let Err(e) = prefill_res {
         emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
         state.free_gpu(gpu);
@@ -6789,6 +7517,7 @@ fn generate_qwen35_mtp(
             scratch: target.scratch,
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
+            kv_adaptive: None,
         }));
         return;
     }
@@ -6808,6 +7537,7 @@ fn generate_qwen35_mtp(
                 scratch: target.scratch,
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
+                kv_adaptive: None,
             }));
             return;
         }
@@ -6968,6 +7698,35 @@ fn generate_qwen35_mtp(
             None => break, // defensive: spec_step always commits ≥ 1
         };
         cur_pos += result.advance;
+        // Adaptive KV: downshift ONLY the committed/live trunk prefix
+        // [0, cur_pos) at the block boundary. Spec verify may have written a
+        // rejected suffix at [cur_pos, cur_pos+(max_n+1-advance)); those slots
+        // stay at the pre-transition tier and are guaranteed overwritten
+        // in-order by the next cycle's verify before any new-tier read treats
+        // them as history (mtp_spec trunk KV rollback is intentionally a no-op).
+        // Fail-closed — do not emit further tokens on transition error.
+        if let Some(ad) = m.kv_adaptive.as_mut() {
+            match ad.maybe_downshift(gpu, &mut target.kv_cache, cur_pos) {
+                Ok(steps) => {
+                    for step in steps {
+                        eprintln!(
+                            "[adaptive-kv] downshift @ pos {} (mtp decode): {:?} (K={:?} V={:?})",
+                            cur_pos, step, ad.cur_k, ad.cur_v
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[adaptive-kv] maybe_downshift error @ pos {} (mtp decode): {:?} — poisoning model",
+                        cur_pos, e
+                    );
+                    step_error = Some(format!(
+                        "adaptive KV transition failed during mtp decode: {e}"
+                    ));
+                    break;
+                }
+            }
+        }
         if result.hit_eos || hit_eos {
             break;
         }
@@ -7012,14 +7771,43 @@ fn generate_qwen35_mtp(
                 let mut advance_toks = Vec::with_capacity(close_ids.len());
                 advance_toks.push(last_committed);
                 advance_toks.extend_from_slice(&close_ids[..close_ids.len() - 1]);
-                if let Err(e) = mtp_spec::prefill_trunk_and_mtp_cache(
-                    gpu,
-                    &mut target,
-                    head,
-                    &mut state,
-                    &advance_toks,
-                    cur_pos,
-                ) {
+                let think_prefill = {
+                    let adaptive = &mut m.kv_adaptive;
+                    let start = cur_pos;
+                    mtp_spec::prefill_trunk_and_mtp_cache_with_boundary(
+                        gpu,
+                        &mut target,
+                        head,
+                        &mut state,
+                        &advance_toks,
+                        start,
+                        |gpu, target, committed_pos| {
+                            if let Some(ad) = adaptive.as_mut() {
+                                match ad.maybe_downshift(gpu, &mut target.kv_cache, committed_pos) {
+                                    Ok(steps) => {
+                                        for step in steps {
+                                            eprintln!(
+                                                "[adaptive-kv] downshift @ pos {} (mtp think-close): {:?} (K={:?} V={:?})",
+                                                committed_pos, step, ad.cur_k, ad.cur_v
+                                            );
+                                        }
+                                        Ok(())
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[adaptive-kv] maybe_downshift error @ pos {} (mtp think-close): {:?} — poisoning model",
+                                            committed_pos, e
+                                        );
+                                        Err(e)
+                                    }
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                };
+                if let Err(e) = think_prefill {
                     step_error = Some(format!("think force-close: {e:?}"));
                     break;
                 }
@@ -7049,6 +7837,7 @@ fn generate_qwen35_mtp(
         scratch: target.scratch,
         kv_cache: target.kv_cache,
         dn_state: target.dn_state,
+        kv_adaptive: None,
     }));
 
     if let Some(e) = step_error {
@@ -7201,7 +7990,11 @@ fn generate_multi(
             b.kv_cache.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            ad.reset();
+            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+                ad.reset_with_cache(gpu, &mut b.kv_cache);
+            } else {
+                ad.reset();
+            }
         }
     }
 
@@ -8234,6 +9027,18 @@ fn generate(
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
     hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    // Adaptive KV poison is sticky until unload/reload. Refuse generation so a
+    // partial tier transition cannot continue writing into mixed-tier state.
+    if let Some(ad) = m.kv_adaptive.as_ref() {
+        if ad.is_poisoned() {
+            let reason = ad
+                .poison_reason()
+                .unwrap_or("adaptive KV is poisoned; unload/reload required");
+            write_error(stdout, id, reason);
+            return;
+        }
+    }
+
     // Expert-parallel (task #26): route to generate_ep BEFORE any arch
     // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
@@ -8856,7 +9661,13 @@ fn generate(
             "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
         );
     }
-    if m.speculator.is_some() && !force_ar_chat && (qwen_dflash_route || llama_dflash_route) {
+    // Adaptive KV: never enter generate_dflash for qwen (no maybe_downshift on
+    // generic spec). Fall through to AR; llama non-adaptive path unchanged.
+    if m.speculator.is_some()
+        && !force_ar_chat
+        && (qwen_dflash_route || llama_dflash_route)
+        && !(m.kv_adaptive.is_some() && (m.arch_id == 5 || m.arch_id == 6))
+    {
         // One-time visibility: temp + top_p + top_k ARE now honored on the
         // DFlash spec sampled path (identical (top_k,top_p) nucleus truncation on
         // draft + target → lossless == AR-at-(top_k,top_p)). Only min_p remains
@@ -8994,7 +9805,11 @@ fn generate(
             b.kv.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            ad.reset();
+            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+                ad.reset_with_cache(gpu, &mut b.kv_cache);
+            } else {
+                ad.reset();
+            }
         }
     }
 
@@ -9869,6 +10684,34 @@ fn generate(
         let scratch = &b.scratch;
         let kv = &mut b.kv_cache;
         let dn = &mut b.dn_state;
+        // Cold-reset after uncommitted AR prefill/decode failure. Mirrors
+        // multi-GPU `reset_pp_uncommitted_state!` and the prefill-abort path:
+        // DN is non-reversible, so partial forward must not poison the next
+        // turn. Adaptive poison stays sticky (`clear_adaptive_poison: false`).
+        macro_rules! reset_ar_uncommitted_state {
+            () => {{
+                debug_assert!(qwen_ar_forward_fail_action().reset_uncommitted_state);
+                debug_assert!(!qwen_ar_forward_fail_action().clear_adaptive_poison);
+                for s in &dn.s_matrices {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &dn.s_scales {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &dn.conv_states {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                kv.compact_offset = 0;
+                if let Some(ad) = m.kv_adaptive.as_mut() {
+                    if !ad.is_poisoned() {
+                        ad.reset_with_cache(gpu, kv);
+                    }
+                }
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                free_checkpoints(&mut m.prefill_checkpoints, gpu);
+            }};
+        }
 
         // Prefill this turn's tokens via the batched prefill entry point.
         // On gfx11+ for MQ4/HFQ4/MQ6/HFQ6 weights this hits the WMMA GEMM
@@ -9916,10 +10759,22 @@ fn generate(
                 let space = window.saturating_sub(m.seq_pos).max(1);
                 let chunk_len = remaining.len().min(space);
                 let (chunk, rest) = remaining.split_at(chunk_len);
-                qwen35::forward_prefill_batch(
+                if let Err(e) = qwen35::forward_prefill_batch(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
-                )
-                .unwrap();
+                ) {
+                    let action = qwen_ar_forward_fail_action();
+                    if action.reset_uncommitted_state {
+                        reset_ar_uncommitted_state!();
+                    }
+                    if action.emit_request_error {
+                        write_error(
+                            stdout,
+                            id,
+                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        );
+                    }
+                    return;
+                }
                 m.seq_pos += chunk_len;
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
@@ -9944,10 +10799,22 @@ fn generate(
                 }
                 let end = (start + chunk_max).min(new_tokens.len());
                 let chunk = &new_tokens[start..end];
-                qwen35::forward_prefill_batch(
+                if let Err(e) = qwen35::forward_prefill_batch(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
-                )
-                .unwrap();
+                ) {
+                    let action = qwen_ar_forward_fail_action();
+                    if action.reset_uncommitted_state {
+                        reset_ar_uncommitted_state!();
+                    }
+                    if action.emit_request_error {
+                        write_error(
+                            stdout,
+                            id,
+                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        );
+                    }
+                    return;
+                }
                 m.seq_pos += chunk.len();
                 // Adaptive KV: downshift BETWEEN prefill chunks the moment the
                 // start-tier (q8/fwht4) buffer fills, so a long prompt can't
@@ -9967,7 +10834,22 @@ fn generate(
                             }
                         }
                         Err(e) => {
-                            eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — skipping", m.seq_pos, e);
+                            eprintln!(
+                                "[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — poisoning model",
+                                m.seq_pos, e
+                            );
+                            // maybe_downshift already poisons on partial failure; surface hard.
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","id":"{}","message":{}}}"#,
+                                id,
+                                serde_json::to_string(&format!(
+                                    "adaptive KV transition failed during prefill: {e}"
+                                ))
+                                .unwrap_or_else(|_| "\"adaptive KV transition failed\"".into())
+                            );
+                            let _ = stdout.flush();
+                            return;
                         }
                     }
                 }
@@ -10000,11 +10882,13 @@ fn generate(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
             kv.compact_offset = 0;
-            // Reset Llama KV too (decode-abort path does the same) so a model
-            // carrying both caches can't be left with a stale RoPE phase on the
-            // next cold prefill. No-op when Llama state is absent.
-            if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-                b.kv.compact_offset = 0;
+            // Abort clears the conversation; restore adaptive start tier with the
+            // cache flags so the next request is not stuck at a downshifted floor.
+            // Poison is sticky and is intentionally NOT cleared here.
+            if let Some(ad) = m.kv_adaptive.as_mut() {
+                if !ad.is_poisoned() {
+                    ad.reset_with_cache(gpu, kv);
+                }
             }
             m.seq_pos = 0;
             m.conversation_tokens.clear();
@@ -10037,7 +10921,21 @@ fn generate(
                     }
                 }
                 Err(e) => {
-                    eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — skipping", m.seq_pos, e);
+                    eprintln!(
+                        "[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — poisoning model",
+                        m.seq_pos, e
+                    );
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","id":"{}","message":{}}}"#,
+                        id,
+                        serde_json::to_string(&format!(
+                            "adaptive KV transition failed after prefill: {e}"
+                        ))
+                        .unwrap_or_else(|_| "\"adaptive KV transition failed\"".into())
+                    );
+                    let _ = stdout.flush();
+                    return;
                 }
             }
         }
@@ -10287,6 +11185,7 @@ fn generate(
             // Emit aborted+done so the CLI's drain loop terminates
             // cleanly without an extra max_tokens worth of wasted decode.
             if check_abort(id) {
+                gpu.replay.invalidate_replay_observation_window();
                 // Client cancelled mid-decode. The tokens generated so far were
                 // advanced into the DeltaNet recurrent state (`dn`) and pushed to
                 // `m.conversation_tokens`, but they are UNCOMMITTED — the client
@@ -10329,6 +11228,33 @@ fn generate(
                 let _ = stdout.flush();
                 return;
             }
+            // Write this token's K/V to the cache BEFORE any client-visible
+            // emit so a VMM map/growth failure cannot stream a token whose
+            // trunk write never committed. Successful path still advances
+            // conversation/stream state and emits with the same semantics as
+            // before (generated++, push, committed, token text).
+            //
+            // Under eviction, m.seq_pos is the *physical* write slot; we
+            // advance and call maybe_evict immediately so the next write
+            // never overruns physical_cap. compact_offset bookkeeping on
+            // the cache itself keeps RoPE phase correct across evictions.
+            if let Err(e) = qwen35::forward_scratch(
+                gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch,
+            ) {
+                let action = qwen_ar_forward_fail_action();
+                debug_assert!(!action.emit_failed_token);
+                if action.reset_uncommitted_state {
+                    reset_ar_uncommitted_state!();
+                }
+                if action.emit_request_error {
+                    write_error(
+                        stdout,
+                        id,
+                        &qwen_ar_forward_fail_message("forward_scratch decode", e),
+                    );
+                }
+                return;
+            }
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
@@ -10355,19 +11281,6 @@ fn generate(
                 );
                 let _ = stdout.flush();
             }
-
-            // Write this token's K/V to the cache FIRST so the next turn
-            // always starts from a fully-written context. Breaking before
-            // forward_scratch used to leave a hole at the im_end/eos
-            // position — the next turn then attended over zero-init K/V
-            // at that slot.
-            //
-            // Under eviction, m.seq_pos is the *physical* write slot; we
-            // advance and call maybe_evict immediately so the next write
-            // never overruns physical_cap. compact_offset bookkeeping on
-            // the cache itself keeps RoPE phase correct across evictions.
-            qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch)
-                .unwrap();
             m.seq_pos += 1;
             // Checkpoint during decode too, so a long generated turn (e.g. a
             // big code emission) can be resumed mid-region if the NEXT turn's
@@ -10406,7 +11319,21 @@ fn generate(
                         }
                     }
                     Err(e) => {
-                        eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — skipping", m.seq_pos, e);
+                        eprintln!(
+                            "[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — poisoning model",
+                            m.seq_pos, e
+                        );
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","id":"{}","message":{}}}"#,
+                            id,
+                            serde_json::to_string(&format!(
+                                "adaptive KV transition failed during decode: {e}"
+                            ))
+                            .unwrap_or_else(|_| "\"adaptive KV transition failed\"".into())
+                        );
+                        let _ = stdout.flush();
+                        return;
                     }
                 }
             }
@@ -10511,10 +11438,25 @@ fn generate(
                     let budget_left = max_tokens.saturating_sub(generated);
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {
-                        qwen35::forward_scratch(
+                        // KV write before any emit — same contract as the main
+                        // decode step (no token whose trunk write failed).
+                        if let Err(e) = qwen35::forward_scratch(
                             gpu, weights, config, t, m.seq_pos, kv, dn, scratch,
-                        )
-                        .unwrap();
+                        ) {
+                            let action = qwen_ar_forward_fail_action();
+                            debug_assert!(!action.emit_failed_token);
+                            if action.reset_uncommitted_state {
+                                reset_ar_uncommitted_state!();
+                            }
+                            if action.emit_request_error {
+                                write_error(
+                                    stdout,
+                                    id,
+                                    &qwen_ar_forward_fail_message("forward_scratch think_close", e),
+                                );
+                            }
+                            return;
+                        }
                         m.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
@@ -10684,6 +11626,38 @@ fn generate(
                     .saturating_add(nl.len());
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
+                        // KV before emit: budget-alert injection must not stream
+                        // a token if trunk VMM/forward fails mid-nudge.
+                        if let Err(e) = qwen35::forward_scratch(
+                            gpu, weights, config, tok, m.seq_pos, kv, dn, scratch,
+                        ) {
+                            let action = qwen_ar_forward_fail_action();
+                            debug_assert!(!action.emit_failed_token);
+                            if action.reset_uncommitted_state {
+                                reset_ar_uncommitted_state!();
+                            }
+                            if action.emit_request_error {
+                                write_error(
+                                    stdout,
+                                    id,
+                                    &qwen_ar_forward_fail_message(
+                                        "forward_scratch budget_alert",
+                                        e,
+                                    ),
+                                );
+                            }
+                            return;
+                        }
+                        m.seq_pos += 1;
+                        if let Some(ref ev) = m.eviction {
+                            if let Some(hipfire_runtime::triattn::EvictionResult {
+                                new_physical: new_phys,
+                                ..
+                            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                            {
+                                m.seq_pos = new_phys;
+                            }
+                        }
                         m.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
                         emit_committed_event(
@@ -10709,20 +11683,6 @@ fn generate(
                                 serde_json::to_string(&t).unwrap_or_default()
                             );
                             let _ = stdout.flush();
-                        }
-                        qwen35::forward_scratch(
-                            gpu, weights, config, tok, m.seq_pos, kv, dn, scratch,
-                        )
-                        .unwrap();
-                        m.seq_pos += 1;
-                        if let Some(ref ev) = m.eviction {
-                            if let Some(hipfire_runtime::triattn::EvictionResult {
-                                new_physical: new_phys,
-                                ..
-                            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                            {
-                                m.seq_pos = new_phys;
-                            }
                         }
                         generated += 1;
                     }
@@ -10826,8 +11786,22 @@ fn generate(
         // and DeltaNet state stay in sync with seq_pos.
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
             for &t in &nl {
-                qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
-                    .unwrap();
+                if let Err(e) =
+                    qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
+                {
+                    let action = qwen_ar_forward_fail_action();
+                    if action.reset_uncommitted_state {
+                        reset_ar_uncommitted_state!();
+                    }
+                    if action.emit_request_error {
+                        write_error(
+                            stdout,
+                            id,
+                            &qwen_ar_forward_fail_message("forward_scratch trailer", e),
+                        );
+                    }
+                    return;
+                }
                 m.seq_pos += 1;
                 if let Some(ref ev) = m.eviction {
                     if let Some(hipfire_runtime::triattn::EvictionResult {
@@ -13962,6 +14936,18 @@ fn generate_vl(
         repeat_window,
         max_think_tokens,
     } = *params;
+    // Adaptive KV poison is sticky until unload/reload. Refuse VL generation so a
+    // partial tier transition cannot continue writing into mixed-tier state.
+    // Mirror generate() — reset preserves poison, so VL must refuse independently.
+    if let Some(ad) = m.kv_adaptive.as_ref() {
+        if ad.is_poisoned() {
+            let reason = ad
+                .poison_reason()
+                .unwrap_or("adaptive KV is poisoned; unload/reload required");
+            write_error(stdout, id, reason);
+            return;
+        }
+    }
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
 
@@ -14099,7 +15085,11 @@ fn generate_vl(
             b.kv_cache.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            ad.reset();
+            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+                ad.reset_with_cache(gpu, &mut b.kv_cache);
+            } else {
+                ad.reset();
+            }
         }
     }
 
@@ -14152,17 +15142,19 @@ fn generate_vl(
     }
     .build_with_user_tokens(&user_body);
 
-    // KV-budget guard — physical_cap without eviction, absolute window with.
-    // Mirrors the textual generate() contract; reserves trailer slots so
-    // natural im_end termination can still write the ChatML \n.
+    // KV-budget guard — tier-aware without eviction, absolute window with.
+    // Adaptive admits against max_seq (floor-tier guarantee); non-adaptive keeps
+    // physical_cap. Reserves trailer slots so natural im_end can write ChatML \n.
     let trailer = nl.len();
     let absolute_pos_vl = m.seq_pos.saturating_add(kv.compact_offset);
+    let adaptive_engaged = m.kv_adaptive.is_some();
+    let no_evict_cap = vl_no_eviction_kv_cap(m.physical_cap, m.max_seq, adaptive_engaged);
     let over_budget = if m.eviction.is_none() {
         m.seq_pos
             .saturating_add(prompt_tokens.len())
             .saturating_add(max_tokens)
             .saturating_add(trailer)
-            > m.physical_cap
+            > no_evict_cap
     } else {
         absolute_pos_vl
             .saturating_add(prompt_tokens.len())
@@ -14174,7 +15166,7 @@ fn generate_vl(
         write_error(stdout, id, &format!(
             "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
             m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
-            if m.eviction.is_none() { m.physical_cap } else { m.max_seq },
+            if m.eviction.is_none() { no_evict_cap } else { m.max_seq },
         ));
         return;
     }
@@ -14189,9 +15181,32 @@ fn generate_vl(
         vision_config.temporal_patch_size,
         vision_config.spatial_merge_size,
     );
-    let visual_tokens =
-        qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
-            .expect("vision forward failed");
+    let visual_tokens = match qwen35_vl::vision_forward(
+        gpu,
+        vision_weights,
+        vision_config,
+        &patches,
+        grid_h,
+        grid_w,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            vl_forward_fail(
+                stdout,
+                id,
+                "vision_forward",
+                e,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
+            return;
+        }
+    };
 
     let im_end_token = if im_end.len() == 1 {
         Some(im_end[0])
@@ -14216,31 +15231,114 @@ fn generate_vl(
 
     // Prefill with vision token embedding for image_pad positions. VL
     // prefill is per-token (forward_scratch_embed isn't batched), so we
-    // advance m.seq_pos in-loop and call maybe_evict after every write.
+    // advance m.seq_pos in-loop and call maybe_evict / maybe_downshift after
+    // every committed write. Lazy VMM map/growth failures and adaptive
+    // transition errors are request-scoped (no panic, no later token emit).
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
         if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
-            qwen35::forward_scratch_embed(gpu, weights, config, emb, m.seq_pos, kv, dn, scratch)
-                .expect("forward_scratch_embed failed");
+            if let Err(e) =
+                qwen35::forward_scratch_embed(gpu, weights, config, emb, m.seq_pos, kv, dn, scratch)
+            {
+                vl_forward_fail(
+                    stdout,
+                    id,
+                    "forward_scratch_embed (prefill)",
+                    e,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                );
+                return;
+            }
             visual_idx += 1;
-        } else {
+        } else if let Err(e) =
             qwen35::forward_scratch(gpu, weights, config, token, m.seq_pos, kv, dn, scratch)
-                .expect("forward_scratch failed");
+        {
+            vl_forward_fail(
+                stdout,
+                id,
+                "forward_scratch (prefill)",
+                e,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
+            return;
         }
         m.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
-            if let Some(hipfire_runtime::triattn::EvictionResult {
-                new_physical: new_phys,
-                ..
-            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-            {
-                m.seq_pos = new_phys;
+            match ev.maybe_evict(gpu, kv, m.seq_pos) {
+                Ok(Some(hipfire_runtime::triattn::EvictionResult {
+                    new_physical: new_phys,
+                    ..
+                })) => {
+                    m.seq_pos = new_phys;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    vl_forward_fail(
+                        stdout,
+                        id,
+                        "maybe_evict (prefill)",
+                        e,
+                        gpu,
+                        dn,
+                        kv,
+                        &mut m.kv_adaptive,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                    );
+                    return;
+                }
             }
+        }
+        // Adaptive KV: downshift BETWEEN prefill tokens the moment the
+        // start-tier buffer fills so a long multi-chunk visual+text prompt
+        // cannot overflow current-stride capacity before decode begins.
+        if vl_adaptive_downshift_fail_closed(
+            &mut m.kv_adaptive,
+            &mut m.seq_pos,
+            gpu,
+            kv,
+            dn,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            stdout,
+            id,
+            "vl-prefill",
+        ) {
+            return;
         }
     }
 
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
+
+    // Adaptive KV: post-prefill catch-up before first sample/decode write.
+    if vl_adaptive_downshift_fail_closed(
+        &mut m.kv_adaptive,
+        &mut m.seq_pos,
+        gpu,
+        kv,
+        dn,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        stdout,
+        id,
+        "vl-post-prefill",
+    ) {
+        return;
+    }
 
     // hunt3 M-D: repeat-penalty / n-gram-block history must be scoped to the
     // GENERATED tokens only (mirrors the text path's `ngram_scope_start` set to
@@ -14259,7 +15357,25 @@ fn generate_vl(
     // Attractor-block uses CPU-side mutation of the downloaded logits
     // vector (`block_attractor_unclosed_cpu`) instead of the previous
     // GPU memcpy + redownload — saves a full vocab-sized DMA per token.
-    let mut logits = gpu.download_f32(&scratch.logits).unwrap();
+    let mut logits = match gpu.download_f32(&scratch.logits) {
+        Ok(v) => v,
+        Err(e) => {
+            vl_forward_fail(
+                stdout,
+                id,
+                "download_f32 (post-prefill)",
+                e,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
+            return;
+        }
+    };
     if let Some((open, close)) = think_pair {
         block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
     }
@@ -14306,8 +15422,76 @@ fn generate_vl(
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     while generated < max_tokens {
+        // Commit KV for this sampled token BEFORE any client-visible emit so a
+        // lazy VMM map/growth failure cannot stream an uncommitted token.
+        // Order: forward → seq_pos++ → evict → downshift → then
+        // generated/conversation/committed/token text. On failure: cold-reset
+        // + request error only (no failed token). Terminators break after a
+        // successful commit (same as AR).
+        if let Err(e) =
+            qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch)
+        {
+            vl_forward_fail(
+                stdout,
+                id,
+                "forward_scratch (decode)",
+                e,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
+            return;
+        }
+        m.seq_pos += 1;
+        if let Some(ref ev) = m.eviction {
+            match ev.maybe_evict(gpu, kv, m.seq_pos) {
+                Ok(Some(hipfire_runtime::triattn::EvictionResult {
+                    new_physical: new_phys,
+                    ..
+                })) => {
+                    m.seq_pos = new_phys;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    vl_forward_fail(
+                        stdout,
+                        id,
+                        "maybe_evict (decode)",
+                        e,
+                        gpu,
+                        dn,
+                        kv,
+                        &mut m.kv_adaptive,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                    );
+                    return;
+                }
+            }
+        }
+        if vl_adaptive_downshift_fail_closed(
+            &mut m.kv_adaptive,
+            &mut m.seq_pos,
+            gpu,
+            kv,
+            dn,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            stdout,
+            id,
+            "vl-decode",
+        ) {
+            return;
+        }
+
         generated += 1;
         m.conversation_tokens.push(next_token);
+        streamed_tokens.push(next_token);
         emit_committed_event(
             stdout,
             id,
@@ -14315,7 +15499,6 @@ fn generate_vl(
             generated - 1,
             t0.elapsed().as_millis() as u64,
         );
-        streamed_tokens.push(next_token);
 
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[emitted_bytes..];
@@ -14358,19 +15541,25 @@ fn generate_vl(
             break;
         }
 
-        qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch)
-            .unwrap();
-        m.seq_pos += 1;
-        if let Some(ref ev) = m.eviction {
-            if let Some(hipfire_runtime::triattn::EvictionResult {
-                new_physical: new_phys,
-                ..
-            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-            {
-                m.seq_pos = new_phys;
+        logits = match gpu.download_f32(&scratch.logits) {
+            Ok(v) => v,
+            Err(e) => {
+                vl_forward_fail(
+                    stdout,
+                    id,
+                    "download_f32 (decode)",
+                    e,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                );
+                return;
             }
-        }
-        logits = gpu.download_f32(&scratch.logits).unwrap();
+        };
         // hunt3 M-D: scope ngram-block + repeat-penalty history to generated-only.
         let vl_ngram_scope = &m.conversation_tokens[vl_ngram_scope_start..];
         llama::apply_ngram_block(&mut logits, vl_ngram_scope);
@@ -14401,19 +15590,66 @@ fn generate_vl(
                     let budget_left = max_tokens.saturating_sub(generated);
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {
-                        qwen35::forward_scratch(
+                        // KV write before any emit — same contract as main decode.
+                        if let Err(e) = qwen35::forward_scratch(
                             gpu, weights, config, t, m.seq_pos, kv, dn, scratch,
-                        )
-                        .unwrap();
+                        ) {
+                            vl_forward_fail(
+                                stdout,
+                                id,
+                                "forward_scratch (vl-think-close)",
+                                e,
+                                gpu,
+                                dn,
+                                kv,
+                                &mut m.kv_adaptive,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                            );
+                            return;
+                        }
                         m.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
-                            if let Some(hipfire_runtime::triattn::EvictionResult {
-                                new_physical: new_phys,
-                                ..
-                            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                            {
-                                m.seq_pos = new_phys;
+                            match ev.maybe_evict(gpu, kv, m.seq_pos) {
+                                Ok(Some(hipfire_runtime::triattn::EvictionResult {
+                                    new_physical: new_phys,
+                                    ..
+                                })) => {
+                                    m.seq_pos = new_phys;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    vl_forward_fail(
+                                        stdout,
+                                        id,
+                                        "maybe_evict (vl-think-close)",
+                                        e,
+                                        gpu,
+                                        dn,
+                                        kv,
+                                        &mut m.kv_adaptive,
+                                        &mut m.seq_pos,
+                                        &mut m.conversation_tokens,
+                                        &mut m.prefill_checkpoints,
+                                    );
+                                    return;
+                                }
                             }
+                        }
+                        if vl_adaptive_downshift_fail_closed(
+                            &mut m.kv_adaptive,
+                            &mut m.seq_pos,
+                            gpu,
+                            kv,
+                            dn,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            stdout,
+                            id,
+                            "vl-think-close",
+                        ) {
+                            return;
                         }
                         m.conversation_tokens.push(t);
                         streamed_tokens.push(t);
@@ -14458,7 +15694,25 @@ fn generate_vl(
                     if generated >= max_tokens {
                         break;
                     }
-                    logits = gpu.download_f32(&scratch.logits).unwrap();
+                    logits = match gpu.download_f32(&scratch.logits) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            vl_forward_fail(
+                                stdout,
+                                id,
+                                "download_f32 (vl-think-close)",
+                                e,
+                                gpu,
+                                dn,
+                                kv,
+                                &mut m.kv_adaptive,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                            );
+                            return;
+                        }
+                    };
                     block_attractor_unclosed_cpu(
                         &mut logits,
                         &m.conversation_tokens,
@@ -14481,16 +15735,65 @@ fn generate_vl(
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
     if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
-            qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+            if let Err(e) =
+                qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
+            {
+                vl_forward_fail(
+                    stdout,
+                    id,
+                    "forward_scratch (vl-trailer)",
+                    e,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                );
+                return;
+            }
             m.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
-                if let Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                {
-                    m.seq_pos = new_phys;
+                match ev.maybe_evict(gpu, kv, m.seq_pos) {
+                    Ok(Some(hipfire_runtime::triattn::EvictionResult {
+                        new_physical: new_phys,
+                        ..
+                    })) => {
+                        m.seq_pos = new_phys;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        vl_forward_fail(
+                            stdout,
+                            id,
+                            "maybe_evict (vl-trailer)",
+                            e,
+                            gpu,
+                            dn,
+                            kv,
+                            &mut m.kv_adaptive,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                        );
+                        return;
+                    }
                 }
+            }
+            if vl_adaptive_downshift_fail_closed(
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                gpu,
+                kv,
+                dn,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                stdout,
+                id,
+                "vl-trailer",
+            ) {
+                return;
             }
             m.conversation_tokens.push(t);
         }
@@ -14530,18 +15833,6 @@ fn generate_vl(
     let _ = stdout.flush();
 }
 
-/// dots.ocr (arch_id=8) VL generation. Single-image, greedy decode —
-/// the phase-3 bring-up serving path that promotes the standalone
-/// `ocr_e2e` example into the daemon.
-///
-/// Flow: preprocess image → `build_prompt_ids` (HF-exact framing) →
-/// `vision_forward` → per-token prefill splicing merged visual
-/// embeddings at `<|imgpad|>` slots → greedy decode to EOS, streaming
-/// tokens in the daemon's JSONL protocol.
-///
-/// MVP scope: greedy only (sampling params ignored), single image,
-/// per-token prefill, `--image <path>` only (base64 deferred). The text
-/// side is Qwen2; the decode state reuses `m.qwen2_state`.
 fn generate_vl_dots_ocr(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -15442,12 +16733,24 @@ mod tool_call_parser_tests {
 mod render_tail_think_tests {
     use super::{
         asst_turn_fingerprint, normalize_asst_turn_for_fingerprint, render_tail_opens_think,
+        spec_assistant_prefix,
     };
+    use hipfire_runtime::prompt_frame::AssistantPrefix;
 
     #[test]
     fn qwen_jinja_think_tail_primes_reasoning_channel() {
-        assert!(render_tail_opens_think(
-            "<|im_start|>assistant\n<think>\n"
+        assert!(render_tail_opens_think("<|im_start|>assistant\n<think>\n"));
+    }
+
+    #[test]
+    fn speculative_emitter_uses_rendered_think_state() {
+        assert!(matches!(
+            spec_assistant_prefix(true),
+            AssistantPrefix::OpenThink
+        ));
+        assert!(matches!(
+            spec_assistant_prefix(false),
+            AssistantPrefix::Plain
         ));
     }
 
@@ -15471,5 +16774,34 @@ mod render_tail_think_tests {
             asst_turn_fingerprint(&normalized, &[]),
             asst_turn_fingerprint("visible answer", &[])
         );
+    }
+}
+
+#[cfg(test)]
+mod vl_adaptive_admission_tests {
+    use super::vl_no_eviction_kv_cap;
+
+    #[test]
+    fn adaptive_admits_against_max_seq_not_start_tier_physical() {
+        // physical_cap may equal max_seq at load, but the important case is
+        // that adaptive never silently shrinks admission to start-tier cap.
+        let physical_cap = 8192;
+        let max_seq = 32768;
+        assert_eq!(
+            vl_no_eviction_kv_cap(physical_cap, max_seq, true),
+            max_seq,
+            "adaptive VL must admit against floor-tier max_seq"
+        );
+        assert_eq!(
+            vl_no_eviction_kv_cap(physical_cap, max_seq, false),
+            physical_cap,
+            "non-adaptive VL keeps physical_cap contract"
+        );
+    }
+
+    #[test]
+    fn equal_caps_identical_either_mode() {
+        assert_eq!(vl_no_eviction_kv_cap(4096, 4096, false), 4096);
+        assert_eq!(vl_no_eviction_kv_cap(4096, 4096, true), 4096);
     }
 }

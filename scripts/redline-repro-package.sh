@@ -3,7 +3,7 @@
 #
 # WHY THIS EXISTS
 #
-# scripts/golden-redline.py pins the model, sampling profile, benchmark
+# `python3 -m tools.redline golden` pins the model, sampling profile, benchmark
 # contract, PM4 policy and route identity — but NOT the compiled code objects
 # or the host toolchain. Contributors reproducing the gfx1201 fixture have
 # reported PM4 slower than HIP on the same source commit, the same model
@@ -441,7 +441,7 @@ cmd_run() {
 
   echo
   echo "  running golden fixture for $arch ..."
-  "${env_prefix[@]}" "$PY" scripts/golden-redline.py --arch "$arch" ${passthrough[@]+"${passthrough[@]}"}
+  "${env_prefix[@]}" "$PY" -m tools.redline golden --arch "$arch" ${passthrough[@]+"${passthrough[@]}"}
 }
 
 [ $# -gt 0 ] || usage 1
