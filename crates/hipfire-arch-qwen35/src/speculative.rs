@@ -3132,13 +3132,18 @@ pub fn spec_step_dflash(
                     Err(e) => parts.push(format!("r{r}:err({e})")),
                 }
             }
+            let x_pre = match gpu.download_f32(&draft_scratch.x.sub_offset(h, h)) {
+                Ok(v) => format!("{:.4}", v.iter().fold(0f32, |a, &x| a.max(x.abs()))),
+                Err(e) => format!("err({e})"),
+            };
             eprintln!(
-                "DFLTH pos={} ctx_len={} uploaded={} proj={} full={} | {}",
+                "DFLTH pos={} ctx_len={} uploaded={} proj={} full={} x_pre={} | {}",
                 position,
                 effective_ctx_len,
                 draft_scratch.thlog.uploaded_rows(),
                 draft_scratch.thlog.proj_cached_rows(),
                 draft_scratch.thlog.full_cached_rows(),
+                x_pre,
                 parts.join(" ")
             );
         }
