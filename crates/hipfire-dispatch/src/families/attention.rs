@@ -1250,10 +1250,27 @@ fn dispatch_attend(
                 // Opt-in until Stage A end-to-end validation completes.
                 // Causal non-tree only; the windowed traffic uses a separate
                 // KernelKey, and batch_size == 1 is decode.
-                let flash_optin = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                // DEFAULT-ON for gfx11xx (RDNA3/3.5), where the WMMA kernel is
+                // validated: faster than the legacy LDS kernel at every context
+                // (1.21x @2048 .. 2.47x @12288), no measurable perplexity
+                // regression (paired n=2048: +0.0066 nats, 95% CI
+                // [-0.0105,+0.0237], not significant; bounded < +2.4% ppl), and
+                // top-1 preserved at 95.2% with divergence confined to
+                // near-ties (f32 top-1 stays inside f16 top-8 in 99.76%).
+                //
+                // Other arches stay OFF by default: the kernel's
+                // __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 is RDNA3+ only,
+                // and gfx12 needs the _gfx12 intrinsic variant this kernel does
+                // not use. HIPFIRE_FLASH_PREFILL=0 forces off anywhere.
+                let flash_default_on = gpu.arch.starts_with("gfx11");
+                let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
                     .ok()
                     .as_deref()
-                    == Some("1");
+                {
+                    Some("0") | Some("off") | Some("false") => false,
+                    Some("1") | Some("on") | Some("true") => true,
+                    _ => flash_default_on,
+                };
                 let flash_min_ctx: usize =
                     hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_MIN_CTX")
                         .ok()
@@ -1270,8 +1287,10 @@ fn dispatch_attend(
                         .unwrap_or_else(|_| "wmma".to_owned());
                     // Kernel bounds: Q8_0 blocks are 32 dims wide, and O_frags
                     // is a fixed float8_t[MAX_D_CHUNKS=16] => head_dim <= 256.
-                    let wmma_ok =
-                        variant != "scalar" && io.head_dim % 32 == 0 && io.head_dim <= 256;
+                    let wmma_ok = variant != "scalar"
+                        && gpu.arch.starts_with("gfx11")
+                        && io.head_dim % 32 == 0
+                        && io.head_dim <= 256;
                     if wmma_ok {
                         return hip!(gpu.attention_q8_0_flash_prefill_wmma(
                             io.q,
