@@ -23,7 +23,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
     EvictRetain, PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator,
 };
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
+use hip_bridge::{HipResult, KernargBlob};
 use std::path::Path;
 
 // ─── DDTree side state ────────────────────────────────────────────────
@@ -105,12 +106,17 @@ pub fn load_dflash_state(
     // copy on any prompt longer than block_size+1 tokens. Size it to the
     // larger of the two so both paths fit.
     let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
+    // Ring capacity: only needs to hold one prefill chunk plus safety margin
+    // for the staging→commit→scatter pipeline. The draft only reads
+    // `block_size` tokens back from current head; the full ctx_capacity
+    // (== max_seq) is wasted allocation — 1.6+ GiB at 16K on 27B.
+    let ring_cap = staging_max_batch.max(max_n * 2);
     let hidden_rb = HiddenStateRingBuffer::new(
         gpu,
         target_config.n_layers,
         draft_config.num_extract(),
         target_config.dim,
-        ctx_capacity,
+        ring_cap,
         staging_max_batch,
     )
     .map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
@@ -304,23 +310,60 @@ impl Speculator for DflashSpeculator {
             return Ok(PrefillOutcome::Aborted);
         }
 
-        // Prime/extend the draft's GPU target_hidden buffer. On a hit, scatter
+        // Prime/extend the draft's GPU target_hidden buffer (Q8). On a hit, scatter
         // only the suffix rows at `prefill_start` (the prefix is preserved);
-        // on a miss, scatter all prompt rows from 0.
+        // on a miss, scatter all prompt rows from 0. Uses th_dequant_scratch as
+        // FP32 staging; after each chunk, quantize to th_q8_cache.
         let (scatter_off, scatter_len) = if cache_hit {
             (prefill_start, prefill_tokens.len())
         } else {
             (0, prompt_tokens.len())
         };
-        if let Err(e) = scatter_hidden_block_to_interleaved(
-            gpu,
-            &self.df.hidden_rb,
-            &self.df.draft_scratch.target_hidden,
-            scatter_off,
-            scatter_len,
-            scatter_len,
-        ) {
-            eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+        let ne_h = self.df.draft_config.num_extract() * self.df.draft_config.hidden;
+        let th_q8_row_bytes = ((ne_h + 31) / 32) * 34;
+        let max_chunk = self.df.draft_scratch.th_dequant_scratch.shape[0] / ne_h;
+        let mut pos: usize = 0;
+        while pos < scatter_len {
+            let chunk = (scatter_len - pos).min(max_chunk);
+            // block_size = scatter_len - pos, so start_slot points to the correct
+            // token in the ring buffer for this chunk (see scatter fn docs).
+            let block_size = scatter_len - pos;
+            if let Err(e) = scatter_hidden_block_to_interleaved(
+                gpu,
+                &self.df.hidden_rb,
+                &self.df.draft_scratch.th_dequant_scratch,
+                scatter_off + pos,
+                block_size,
+                chunk,
+            ) {
+                eprintln!("[dflash] scatter chunk failed: {e}");
+                break;
+            }
+            // Quantize staging → th_q8_cache
+            let th_q8_off = (scatter_off + pos) * th_q8_row_bytes;
+            let n_elems = chunk * ne_h;
+            if let Err(e) = gpu.ensure_kernel_public("quant_f32_to_q8",
+                rdna_compute::QUANT_F32_TO_Q8_SRC, "quant_f32_to_q8")
+            {
+                eprintln!("[dflash] quant kernel failed: {e}");
+                break;
+            }
+            let n_blk = (n_elems + 31) / 32;
+            let grid = [n_blk as u32, 1, 1];
+            let block = [32u32, 1, 1];
+            let mut ka = KernargBlob::new();
+            ka.push_ptr(self.df.draft_scratch.th_dequant_scratch.buf.as_ptr());
+            let dst = unsafe {
+                (self.df.draft_scratch.th_q8_cache.as_ptr() as *mut u8).add(th_q8_off)
+                    as *mut std::ffi::c_void
+            };
+            ka.push_ptr(dst);
+            ka.push_i32(n_elems as i32);
+            if let Err(e) = gpu.launch_kernel_blob("quant_f32_to_q8", grid, block, 0, ka.as_mut_slice()) {
+                eprintln!("[dflash] quant launch failed: {e}");
+                break;
+            }
+            pos += chunk;
         }
         self.df.draft_scratch.thlog.seed_prompt(prompt_tokens.len());
         if let Some(ckpt) = resume_from {

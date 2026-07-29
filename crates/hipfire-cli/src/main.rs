@@ -478,6 +478,9 @@ struct ServeArgs {
     /// Expert-parallel degree.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// Explicit DFlash draft model.
+    #[arg(long, alias = "md")]
+    model_draft: Option<PathBuf>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
@@ -2059,6 +2062,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             kv_mode: None,
             idle_timeout: None,
             tp: None,
+            model_draft: None,
             foreground_child: false,
         };
         detach_serve(paths, &serve_args, &host, port)?;
@@ -2163,6 +2167,7 @@ struct ServeRuntime {
     cache_capable: bool,
     kv_override: Option<String>,
     tp: Option<u64>,
+    model_draft: Option<PathBuf>,
 }
 
 struct ServeShared {
@@ -2633,6 +2638,9 @@ fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Resul
     if let Some(tp) = args.tp {
         command.arg("--tp").arg(tp.to_string());
     }
+    if let Some(draft) = &args.model_draft {
+        command.arg("--model-draft").arg(draft);
+    }
     let mut child = command.spawn().context("failed to detach native serve")?;
     let probe_host = match host {
         "0.0.0.0" => "127.0.0.1",
@@ -2716,6 +2724,7 @@ fn serve_foreground(
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             tp: args.tp,
+            model_draft: args.model_draft.clone(),
         }),
         meta: Mutex::new(ServeMeta {
             current_model: None,
@@ -3337,6 +3346,17 @@ impl ServeRuntime {
             )?;
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
+            }
+            if let Some(draft) = &self.model_draft {
+                if !draft.as_os_str().is_empty() {
+                    params["draft"] = serde_json::json!(draft.display().to_string());
+                    if params.get("speculation").and_then(|v| v.as_str()) != Some("off") {
+                        params["dflash_mode"] = serde_json::json!("on");
+                        params["mtp_mode"] = serde_json::json!("off");
+                        params["ngram_draft"] = serde_json::json!(false);
+                        params["dspark_mode"] = serde_json::json!("off");
+                    }
+                }
             }
             let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
             if minimum_max_seq.is_some() {

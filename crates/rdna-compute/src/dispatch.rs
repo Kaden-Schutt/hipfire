@@ -1410,6 +1410,10 @@ impl Gpu {
     ///    captured this launch (HIP records the blob pointer, not the data);
     ///  - building `kernargs` with the layout matching the kernel signature
     ///    (use `hip_bridge::KernargBlob` for correct alignment).
+    pub fn get_kernel_function(&self, name: &str) -> Option<&hip_bridge::Function> {
+        self.functions.get(name)
+    }
+
     pub fn launch_kernel_blob(
         &self,
         func_name: &str,

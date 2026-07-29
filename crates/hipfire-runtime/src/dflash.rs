@@ -618,6 +618,21 @@ pub struct DflashScratch {
     pub k_cat: GpuTensor, // [L + B, kv_dim]
     pub v_cat: GpuTensor, // [L + B, kv_dim]
 
+    // Q8_0 block-quantized KV cache (per-layer). 34 bytes per 32 elements.
+    // Decompressed to fp32 k_cat/v_cat at concat time.
+    pub k_q8_cache: Vec<hip_bridge::DeviceBuffer>,
+    pub v_q8_cache: Vec<hip_bridge::DeviceBuffer>,
+
+    // Q8_0 block-quantized target_hidden and target_hidden_proj.
+    // Persistently stored in Q8; dequantized to small FP32 scratch on read.
+    pub th_q8_cache: hip_bridge::DeviceBuffer,
+    pub thp_q8_cache: hip_bridge::DeviceBuffer,
+    // FP32 scratch for dequant: sized for max_block (delta) × dim.
+    // th_dequant_scratch: block_size × num_extract × hidden
+    // thp_dequant_scratch: block_size × hidden
+    pub th_dequant_scratch: GpuTensor,
+    pub thp_dequant_scratch: GpuTensor,
+
     // Positions (i32).
     pub positions_q: GpuTensor, // [B]       i32
     pub positions_k: GpuTensor, // [L + B]   i32
@@ -719,20 +734,32 @@ impl DflashScratch {
             None
         };
 
-        // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
-        // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
-        // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
-        // = 128 MB. Trivial vs 24 GB VRAM.
-        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
-        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_graphs = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_warmed_up = Vec::with_capacity(cfg.n_layers);
+        // Q8_0 block-quantized KV cache. 34 bytes per 32 elements vs 128 bytes for FP32.
+        // Allocates ((max_ctx_len * kv_dim + 31) / 32) * 34 bytes per layer per buffer.
+        let q8_bytes_per_layer = ((l * kvd + 31) / 32) * 34;
+        let mut k_q8_cache = Vec::with_capacity(cfg.n_layers);
+        let mut v_q8_cache = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
-            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
-            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            k_q8_cache.push(gpu.hip.malloc(q8_bytes_per_layer)?);
+            v_q8_cache.push(gpu.hip.malloc(q8_bytes_per_layer)?);
             draft_ffn_graphs.push(HashMap::new());
             draft_ffn_warmed_up.push(HashSet::new());
         }
+        // Legacy FP32 caches — kept zero-size for struct compatibility.
+        let mut k_ctx_cached = Vec::with_capacity(0);
+        let mut v_ctx_cached = Vec::with_capacity(0);
+
+        // Q8_0 block-quantized target_hidden and target_hidden_proj.
+        let th_q8_bytes = ((l * ne * h + 31) / 32) * 34;
+        let thp_q8_bytes = ((l * h + 31) / 32) * 34;
+        let th_q8_cache = gpu.hip.malloc(th_q8_bytes)?;
+        let thp_q8_cache = gpu.hip.malloc(thp_q8_bytes)?;
+        // FP32 scratch for dequant: max_block (delta) × dim.
+        let dequant_max_batch = b.max(256);
+        let th_dequant_scratch = gpu.alloc_tensor(&[dequant_max_batch * ne * h], DType::F32)?;
+        let thp_dequant_scratch = gpu.alloc_tensor(&[dequant_max_batch * h], DType::F32)?;
 
         Ok(DflashScratch {
             max_block_size: b,
@@ -751,10 +778,10 @@ impl DflashScratch {
             residual_attn: gpu.alloc_tensor(&[b * h], DType::F32)?,
             residual_ffn: gpu.alloc_tensor(&[b * h], DType::F32)?,
 
-            target_hidden: gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
-            target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
-            k_ctx: gpu.alloc_tensor(&[l * kvd], DType::F32)?,
-            v_ctx: gpu.alloc_tensor(&[l * kvd], DType::F32)?,
+            target_hidden: gpu.alloc_tensor(&[1], DType::F32)?, // zero-size — Q8 only
+            target_hidden_proj: gpu.alloc_tensor(&[1], DType::F32)?, // zero-size — Q8 only
+            k_ctx: gpu.alloc_tensor(&[b.max(256) * kvd], DType::F32)?, // delta scratch, not full ctx
+            v_ctx: gpu.alloc_tensor(&[b.max(256) * kvd], DType::F32)?,
 
             k_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
             v_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
@@ -766,6 +793,12 @@ impl DflashScratch {
             thlog: TargetHiddenLog::new(),
             k_ctx_cached,
             v_ctx_cached,
+            k_q8_cache,
+            v_q8_cache,
+            th_q8_cache,
+            thp_q8_cache,
+            th_dequant_scratch,
+            thp_dequant_scratch,
             draft_ffn_graphs,
             draft_ffn_warmed_up,
         })
@@ -1311,23 +1344,57 @@ pub fn draft_forward_opts(
     let cached_rows = scratch.thlog.proj_cached_rows();
     let delta = l.saturating_sub(cached_rows);
     if delta > 0 {
-        let src_offset_elems = cached_rows * ne * h;
-        let dst_offset_elems = cached_rows * h;
-        let th_slice = scratch
-            .target_hidden
-            .sub_offset(src_offset_elems, delta * ne * h);
-        let thp_slice = scratch
-            .target_hidden_proj
-            .sub_offset(dst_offset_elems, delta * h);
-        gemm_dispatch(
-            gpu,
-            &th_slice,
-            &weights.fc,
-            &thp_slice,
-            delta,
-            scratch.mq_x_rot.as_ref(),
-        )?;
-        gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, delta, h, eps)?;
+        // ── 1a. Chunked fc projection from Q8: dequant chunk → fc → norm → quantize ──
+        let th_q8_row_bytes = ((ne * h + 31) / 32) * 34;
+        let thp_q8_row_bytes = ((h + 31) / 32) * 34;
+        let max_chunk = scratch.th_dequant_scratch.shape[0] / (ne * h);
+        let mut processed: usize = 0;
+        while processed < delta {
+            let chunk = (delta - processed).min(max_chunk);
+            let cur_row = cached_rows + processed;
+
+            // Dequant target_hidden Q8 → th_dequant_scratch (FP32 staging)
+            let n_th = chunk * ne * h;
+            let q8_src_off = cur_row * th_q8_row_bytes;
+            {
+                let n_blk = (n_th + 31) / 32;
+                let grid = [n_blk as u32, 1, 1];
+                let block = [32u32, 1, 1];
+                gpu.ensure_kernel_public("dequant_q8_to_f32",
+                    rdna_compute::DEQUANT_Q8_TO_F32_SRC, "dequant_q8_to_f32")?;
+                let mut ka = hip_bridge::KernargBlob::new();
+                let src = unsafe { (scratch.th_q8_cache.as_ptr() as *mut u8).add(q8_src_off) as *const std::ffi::c_void };
+                ka.push_ptr(src);
+                ka.push_ptr(scratch.th_dequant_scratch.buf.as_ptr());
+                ka.push_i32(n_th as i32);
+                gpu.launch_kernel_blob("dequant_q8_to_f32", grid, block, 0, ka.as_mut_slice())?;
+            }
+
+            // fc GEMM + rmsnorm, output to thp_dequant_scratch
+            let thp_sc = &scratch.thp_dequant_scratch;
+            let thp_out = thp_sc.sub_offset(0, chunk * h);
+            gemm_dispatch(gpu, &scratch.th_dequant_scratch, &weights.fc,
+                &thp_out, chunk, scratch.mq_x_rot.as_ref())?;
+            gpu.rmsnorm_batched(&thp_out, &weights.hidden_norm, &thp_out, chunk, h, eps)?;
+
+            // Quantize thp → Q8
+            let n_thp = chunk * h;
+            let q8_thp_off = cur_row * thp_q8_row_bytes;
+            {
+                let n_blk = (n_thp + 31) / 32;
+                let grid = [n_blk as u32, 1, 1];
+                let block = [32u32, 1, 1];
+                gpu.ensure_kernel_public("quant_f32_to_q8",
+                    rdna_compute::QUANT_F32_TO_Q8_SRC, "quant_f32_to_q8")?;
+                let mut ka = hip_bridge::KernargBlob::new();
+                ka.push_ptr(thp_out.buf.as_ptr());
+                let dst = unsafe { (scratch.thp_q8_cache.as_ptr() as *mut u8).add(q8_thp_off) as *mut std::ffi::c_void };
+                ka.push_ptr(dst);
+                ka.push_i32(n_thp as i32);
+                gpu.launch_kernel_blob("quant_f32_to_q8", grid, block, 0, ka.as_mut_slice())?;
+            }
+            processed += chunk;
+        }
     }
 
     // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
@@ -1417,41 +1484,75 @@ pub fn draft_forward_opts(
         // applying it to delta rows of the cache is exactly equivalent
         // to applying it to the full k_cat post-concat. V has no
         // draft-level norm so v_ctx_cached stores raw GEMM output.
-        let k_cache_layer = &scratch.k_ctx_cached[li];
-        let v_cache_layer = &scratch.v_ctx_cached[li];
+        let k_cache_layer = &scratch.k_ctx;
+        let v_cache_layer = &scratch.v_ctx;
         if delta > 0 {
-            let src_offset_elems = cached_rows * h;
             let dst_offset_elems = cached_rows * kvd;
-            let thp_slice = scratch
-                .target_hidden_proj
-                .sub_offset(src_offset_elems, delta * h);
-            let k_slot = k_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
-            let v_slot = v_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
-            gemm_dispatch(
-                gpu,
-                &thp_slice,
-                &layer.wk,
-                &k_slot,
-                delta,
-                scratch.mq_x_rot.as_ref(),
-            )?;
-            gemm_dispatch(
-                gpu,
-                &thp_slice,
-                &layer.wv,
-                &v_slot,
-                delta,
-                scratch.mq_x_rot.as_ref(),
-            )?;
-            // Per-head RMSNorm on K delta rows only. batch = delta × n_kv_heads.
-            gpu.rmsnorm_batched(
-                &k_slot,
-                &layer.k_norm,
-                &k_slot,
-                delta * cfg.n_kv_heads,
-                hd,
-                eps,
-            )?;
+            // Dequant target_hidden_proj delta: Q8 → thp_dequant_scratch
+            let thp_q8_row_bytes = ((h + 31) / 32) * 34;
+            let thp_q8_off = cached_rows * thp_q8_row_bytes;
+            let n_thp = delta * h;
+            let max_dequant = scratch.thp_dequant_scratch.shape[0] / h;
+            let mut p: usize = 0;
+            while p < delta {
+                let chunk = (delta - p).min(max_dequant);
+                let cur_row = cached_rows + p;
+                let dequant_n = chunk * h;
+                let q8_src = unsafe {
+                    (scratch.thp_q8_cache.as_ptr() as *mut u8).add(cur_row * thp_q8_row_bytes) as *const std::ffi::c_void
+                };
+                {
+                    let n_blk = (dequant_n + 31) / 32;
+                    let grid = [n_blk as u32, 1, 1];
+                    let block = [32u32, 1, 1];
+                    gpu.ensure_kernel_public("dequant_q8_to_f32",
+                        rdna_compute::DEQUANT_Q8_TO_F32_SRC, "dequant_q8_to_f32")?;
+                    let mut ka = hip_bridge::KernargBlob::new();
+                    ka.push_ptr(q8_src);
+                    ka.push_ptr(scratch.thp_dequant_scratch.buf.as_ptr());
+                    ka.push_i32(dequant_n as i32);
+                    gpu.launch_kernel_blob("dequant_q8_to_f32", grid, block, 0, ka.as_mut_slice())?;
+                }
+                let k_off = 0usize; // scratch at row 0, not absolute ctx offset
+                let k_slot = k_cache_layer.sub_offset(k_off, chunk * kvd);
+                let v_slot = v_cache_layer.sub_offset(k_off, chunk * kvd);
+                gemm_dispatch(gpu, &scratch.thp_dequant_scratch, &layer.wk,
+                    &k_slot, chunk, scratch.mq_x_rot.as_ref())?;
+                gemm_dispatch(gpu, &scratch.thp_dequant_scratch, &layer.wv,
+                    &v_slot, chunk, scratch.mq_x_rot.as_ref())?;
+                gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot,
+                    chunk * cfg.n_kv_heads, hd, eps)?;
+                // Quantize scratch → k_q8_cache at absolute ctx offset
+                let q8_row_bytes = ((kvd + 31) / 32) * 34;
+                let q8_off = cur_row * q8_row_bytes;
+                let n_qe = chunk * kvd;
+                {
+                    let n_blk = (n_qe + 31) / 32;
+                    let grid = [n_blk as u32, 1, 1];
+                    let block = [32u32, 1, 1];
+                    gpu.ensure_kernel_public("quant_f32_to_q8",
+                        rdna_compute::QUANT_F32_TO_Q8_SRC, "quant_f32_to_q8")?;
+                    let mut ka = hip_bridge::KernargBlob::new();
+                    ka.push_ptr(k_slot.buf.as_ptr());
+                    let dst = unsafe { (scratch.k_q8_cache[li].as_ptr() as *mut u8).add(q8_off) as *mut std::ffi::c_void };
+                    ka.push_ptr(dst);
+                    ka.push_i32(n_qe as i32);
+                    gpu.launch_kernel_blob("quant_f32_to_q8", grid, block, 0, ka.as_mut_slice())?;
+                }
+                {
+                    let n_blk = (n_qe + 31) / 32;
+                    let grid = [n_blk as u32, 1, 1];
+                    let block = [32u32, 1, 1];
+                    let mut ka = hip_bridge::KernargBlob::new();
+                    ka.push_ptr(v_slot.buf.as_ptr());
+                    let dst = unsafe { (scratch.v_q8_cache[li].as_ptr() as *mut u8).add(q8_off) as *mut std::ffi::c_void };
+                    ka.push_ptr(dst);
+                    ka.push_i32(n_qe as i32);
+                    gpu.launch_kernel_blob("quant_f32_to_q8", grid, block, 0, ka.as_mut_slice())?;
+                }
+                p += chunk;
+            }
+
         }
 
         if let Some(t) = t0 {
@@ -1465,24 +1566,58 @@ pub fn draft_forward_opts(
         };
 
         // Concat K = [K_ctx_cached | K_noise] → k_cat [L + B, kv_dim].
-        // The cached K prefix is already post-k_norm (applied incrementally
-        // above); the noise tail still needs k_norm applied below.
-        let ctx_bytes = (l * kvd) * 4;
+        // The cached K prefix is already post-k_norm; the noise tail still
+        // needs k_norm below. K prefix is stored as Q8 blocks — dequant
+        // directly into k_cat via the dequant_q8_to_f32 kernel.
         let noise_bytes = (b * kvd) * 4;
-        gpu.hip
-            .memcpy_dtod_at(&scratch.k_cat.buf, 0, &k_cache_layer.buf, 0, ctx_bytes)?;
+        {
+            let n_elems = l * kvd;
+            let grid = [((n_elems + 255) / 256) as u32, 1, 1];
+            let block = [256u32, 1, 1];
+            gpu.ensure_kernel_public(
+                "dequant_q8_to_f32",
+                rdna_compute::DEQUANT_Q8_TO_F32_SRC,
+                "dequant_q8_to_f32",
+            )?;
+            // Dequant K: k_q8_cache[li] → k_cat[0..l, kv_dim]
+            {
+                use hip_bridge::KernargBlob;
+                let mut ka = KernargBlob::new();
+                ka.push_ptr(scratch.k_q8_cache[li].as_ptr());
+                ka.push_ptr(scratch.k_cat.buf.as_ptr());
+                ka.push_i32(n_elems as i32);
+                gpu.launch_kernel_blob(
+                    "dequant_q8_to_f32",
+                    grid, block, 0,
+                    ka.as_mut_slice(),
+                )?;
+            }
+            // Dequant V: v_q8_cache[li] → v_cat[0..l, kv_dim]
+            {
+                use hip_bridge::KernargBlob;
+                let mut ka = KernargBlob::new();
+                ka.push_ptr(scratch.v_q8_cache[li].as_ptr());
+                ka.push_ptr(scratch.v_cat.buf.as_ptr());
+                ka.push_i32(n_elems as i32);
+                gpu.launch_kernel_blob(
+                    "dequant_q8_to_f32",
+                    grid, block, 0,
+                    ka.as_mut_slice(),
+                )?;
+            }
+        }
+        // Append noise tail (FP32) after the dequant'd context prefix.
+        let ctx_bytes_fp32 = (l * kvd) * 4;
         gpu.hip.memcpy_dtod_at(
             &scratch.k_cat.buf,
-            ctx_bytes,
+            ctx_bytes_fp32,
             &scratch.k_noise.buf,
             0,
             noise_bytes,
         )?;
-        gpu.hip
-            .memcpy_dtod_at(&scratch.v_cat.buf, 0, &v_cache_layer.buf, 0, ctx_bytes)?;
         gpu.hip.memcpy_dtod_at(
             &scratch.v_cat.buf,
-            ctx_bytes,
+            ctx_bytes_fp32,
             &scratch.v_noise.buf,
             0,
             noise_bytes,

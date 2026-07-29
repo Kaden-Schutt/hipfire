@@ -3898,9 +3898,7 @@ pub fn spec_step_dflash(
         let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
         target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
     } else {
-        // Fast path: scatter straight from hidden_rb into draft scratch on GPU.
-        // No D2H, no CPU reshape, no next-cycle H2D.
-        //
+        // Fast path: scatter straight from hidden_rb into Q8 cache via FP32 staging.
         // Verify just wrote B slots to hidden_rb; we want the first
         // `rows_to_keep` (= accept+1) of those. Pass block_size=b so the
         // scatter function aligns to the verify-block origin, not the
@@ -3908,11 +3906,32 @@ pub fn spec_step_dflash(
         scatter_hidden_block_to_interleaved(
             gpu,
             hidden_rb,
-            &draft_scratch.target_hidden,
-            position,
+            &draft_scratch.th_dequant_scratch,
+            0,  // staging is at offset 0 — Q8 offset handles logical position
             b,
             rows_to_keep,
         )?;
+        // Quantize staging → th_q8_cache at logical position
+        let ne_h = draft_cfg.num_extract() * draft_cfg.hidden;
+        let th_q8_row_bytes = ((ne_h + 31) / 32) * 34;
+        let th_q8_off = position * th_q8_row_bytes;
+        let n_elems = rows_to_keep * ne_h;
+        {
+            use hip_bridge::KernargBlob;
+            let n_blk = (n_elems + 31) / 32;
+            let grid = [n_blk as u32, 1, 1];
+            let block = [32u32, 1, 1];
+            gpu.ensure_kernel_public("quant_f32_to_q8",
+                rdna_compute::QUANT_F32_TO_Q8_SRC, "quant_f32_to_q8")?;
+            let mut ka = KernargBlob::new();
+            ka.push_ptr(draft_scratch.th_dequant_scratch.buf.as_ptr());
+            let dst = unsafe {
+                (draft_scratch.th_q8_cache.as_ptr() as *mut u8).add(th_q8_off) as *mut std::ffi::c_void
+            };
+            ka.push_ptr(dst);
+            ka.push_i32(n_elems as i32);
+            gpu.launch_kernel_blob("quant_f32_to_q8", grid, block, 0, ka.as_mut_slice())?;
+        }
         // Keep draft_forward's incremental-upload tracker in sync so any future
         // ctx_slice=Some call in the same session doesn't try to re-upload what
         // GPU already has, and track the absolute positions of the appended
@@ -5724,8 +5743,24 @@ pub fn seed_target_hidden_suffix_abortable(
 }
 
 /// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident
-/// `target_hidden` and `target_hidden_abs_positions`, so the draft's cross-
+/// `target_hidden` (Q8) and `target_hidden_abs_positions`, so the draft's cross-
 /// attention sees the same subset of context target now has.
+
+/// IEEE 754 binary16 → binary32 conversion (no dependency on `half` crate).
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) as u32) << 31;
+    let exp = (bits >> 10) & 0x1f;
+    let man = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        if man == 0 { return f32::from_bits(sign); }
+        f32::from_bits(sign | ((-14i32 + 127) as u32) << 23 | (man << 13))
+    } else if exp == 31 {
+        if man == 0 { f32::from_bits(sign | 0x7f800000) }
+        else { f32::from_bits(sign | 0x7fc00000 | (man << 13)) }
+    } else {
+        f32::from_bits(sign | ((exp as u32 - 15 + 127) << 23) | (man << 13))
+    }
+}
 ///
 /// `retain_mask` is the source-position retain selection returned by
 /// `EvictionCtx::maybe_evict` (ascending, length == budget). An empty
@@ -5758,18 +5793,37 @@ pub fn apply_eviction_retain_to_draft(
         return Ok(());
     }
     let row_floats = ne * h;
-    // Download only the populated prefix of target_hidden. `alloc_tensor`
-    // is sized to max_ctx_len — we just need `physical` rows.
-    let mut host = vec![0f32; physical * row_floats];
+    // Download target_hidden from Q8 cache. Each row = ceil(row_floats/32) Q8 blocks.
+    let q8_block_bytes = 34; // 2B f16 scale + 32B int8
+    let q8_blocks_per_row = (row_floats + 31) / 32;
+    let q8_bytes_per_row = q8_blocks_per_row * q8_block_bytes;
+    let q8_total = physical * q8_bytes_per_row;
+    let mut q8_host = vec![0u8; q8_total];
     {
         let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(
-                host.as_mut_ptr() as *mut u8,
-                host.len() * std::mem::size_of::<f32>(),
-            )
+            std::slice::from_raw_parts_mut(q8_host.as_mut_ptr() as *mut u8, q8_total)
         };
         gpu.hip
-            .memcpy_dtoh(bytes, &draft_scratch.target_hidden.buf)?;
+            .memcpy_dtoh(bytes, &draft_scratch.th_q8_cache)?;
+    }
+    // Dequant Q8 → FP32 on CPU
+    let mut host = vec![0f32; physical * row_floats];
+    for row in 0..physical {
+        let q8_row = &q8_host[row * q8_bytes_per_row..(row + 1) * q8_bytes_per_row];
+        let f32_row = &mut host[row * row_floats..(row + 1) * row_floats];
+        for blk in 0..q8_blocks_per_row {
+            let block = &q8_row[blk * q8_block_bytes..(blk + 1) * q8_block_bytes];
+            // Read f16 scale from first 2 bytes (raw u16 → f32)
+            let scale_bits = u16::from_le_bytes([block[0], block[1]]);
+            let scale_f32 = f16_to_f32(scale_bits);
+            let base = blk * 32;
+            for lane in 0..32 {
+                let idx = base + lane;
+                if idx < row_floats {
+                    f32_row[idx] = (block[2 + lane] as i8 as f32) * scale_f32;
+                }
+            }
+        }
     }
     let budget = retain_mask.len();
     let mut compacted = Vec::with_capacity(budget * row_floats);
@@ -5786,11 +5840,31 @@ pub fn apply_eviction_retain_to_draft(
                 .expect("retain_mask index out of range for abs_positions"),
         );
     }
+    // Upload compacted FP32 → staging → quantize to th_q8_cache
     let dst_bytes = budget * row_floats * std::mem::size_of::<f32>();
     let compacted_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(compacted.as_ptr() as *const u8, dst_bytes) };
+    // Upload to staging (th_dequant_scratch at offset 0)
     gpu.hip
-        .memcpy_htod(&draft_scratch.target_hidden.buf, compacted_bytes)?;
+        .memcpy_htod(&draft_scratch.th_dequant_scratch.buf, compacted_bytes)?;
+    // Quantize staging → th_q8_cache (rows 0..budget)
+    let th_q8_row_bytes = ((row_floats + 31) / 32) * 34;
+    let n_elems = budget * row_floats;
+    {
+        let n_blk = (n_elems + 31) / 32;
+        let grid = [n_blk as u32, 1, 1];
+        let block = [32u32, 1, 1];
+        gpu.ensure_kernel_public("quant_f32_to_q8",
+            rdna_compute::QUANT_F32_TO_Q8_SRC, "quant_f32_to_q8")?;
+        let mut ka = hip_bridge::KernargBlob::new();
+        ka.push_ptr(draft_scratch.th_dequant_scratch.buf.as_ptr());
+        let dst = unsafe {
+            (draft_scratch.th_q8_cache.as_ptr() as *mut u8).add(0) as *mut std::ffi::c_void
+        };
+        ka.push_ptr(dst);
+        ka.push_i32(n_elems as i32);
+        gpu.launch_kernel_blob("quant_f32_to_q8", grid, block, 0, ka.as_mut_slice())?;
+    }
     // Replace the row layout with the compacted positions and invalidate the
     // per-layer k_ctx/v_ctx projection cache (indexed by the pre-eviction row
     // layout, now stale — rebuilt on the next draft_forward; one slow cycle per

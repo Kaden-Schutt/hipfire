@@ -4578,6 +4578,18 @@ pub const EMBEDDING_Q8_BATCHED_SRC: &str =
 pub const EMBEDDING_F16_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_f16_batched.hip");
 
+// ── DFlash Q8 cache helpers ────────────────────────────────────────────
+
+/// Q8_0 block quantize: FP32 → Q8_0 (2-byte f16 scale + 32 int8, 34 bytes per 32 elems).
+/// Grid = ceil(n_elems / 32), block = 256. Used by DFlash to compress the draft's
+/// KV cache (k_ctx_cached / v_ctx_cached) before storage.
+pub const QUANT_F32_TO_Q8_SRC: &str = include_str!("../../../kernels/src/quant_f32_to_q8.hip");
+
+/// Q8_0 block dequantize: Q8_0 → FP32. Reverse of the above.
+/// Grid = ceil(n_elems / 32), block = 256. Decompresses the draft's KV cache
+/// during concat into k_cat / v_cat for the attention kernel.
+pub const DEQUANT_Q8_TO_F32_SRC: &str = include_str!("../../../kernels/src/dequant_q8_to_f32.hip");
+
 /// DSpark bidirectional staging assembly. Builds the per-stage attention
 /// key/value buffer `staged[block, head_dim, stage_w]` on-GPU from the
 /// committed main_kv ring + the block KV, replacing a host d2h+assemble+h2d
