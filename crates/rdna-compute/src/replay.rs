@@ -1002,6 +1002,208 @@ fn launches_are_independent(left: &RecordedHipLaunch, right: &RecordedHipLaunch)
         .any(|left| right.iter().any(|right| left.conflicts(*right)))
 }
 
+/// Opt-in flag for the antichain-widening reorder pass. Default off: the pass
+/// permutes a certified launch sequence, which is strictly more aggressive than
+/// omitting a wait, so it stays behind an explicit switch until it has its own
+/// shadow and product evidence.
+///
+/// Reorder window, or `None` when the pass is off. A window of W permits a
+/// launch to move at most W positions, which bounds how far the pass can
+/// deviate from the certified sequence while still gathering nearby
+/// independent launches. `on`/`1`/`true` means unlimited.
+fn pm4_reorder_window_from_config(name: &str) -> Option<usize> {
+    let value = hipfire_config::process_value(name)?;
+    match value.as_str() {
+        "0" | "false" | "off" | "" => None,
+        "1" | "true" | "on" | "max" => Some(usize::MAX),
+        other => match other.parse::<usize>() {
+            Ok(window) if window >= 2 => Some(window),
+            _ => {
+                eprintln!(
+                    "WARNING: {name}={other:?}: expected off, on, or an integer window >= 2; \
+                     leaving the recorded order untouched"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Architectures admitted to the single-IB reorder pass. `gfx1151` is the arch
+/// the pass was certified on upstream; `gfx1201` is admitted here so the pass
+/// can be screened against the gfx12 retained route, and remains default-off.
+fn pm4_single_ib_reorder_from_config(device_name: &str) -> Option<usize> {
+    (device_name.eq_ignore_ascii_case("gfx1151") || device_name.eq_ignore_ascii_case("gfx1201"))
+        .then(|| pm4_reorder_window_from_config("HIPFIRE_REPLAY_PM4_SINGLE_IB_REORDER"))
+        .flatten()
+}
+
+/// Permute the recorded launch order so mutually independent launches become
+/// adjacent, widening the antichains `pm4_phase_plan` can form.
+///
+/// `pm4_phase_plan` only groups launches that are already CONSECUTIVE in the
+/// recorded HIP order, so a launch independent of one ten positions away can
+/// never share its phase. On the ds4 gfx1151 route that leaves 567 of 2319
+/// boundaries independent yet almost all of them isolated pairs, capping every
+/// parallel phase at width 2 no matter how many queues are requested, because
+/// `lane_count = min(requested, phase.indices.len())`. Queue count was never
+/// the constraint; adjacency was.
+///
+/// Two launches that do not conflict may be reordered freely; two that do
+/// conflict must keep their recorded relative order. The result is therefore a
+/// topological order of the conflict DAG, produced by a stable level-by-level
+/// Kahn schedule. Each emitted level is the full ready set, which is pairwise
+/// independent by construction: if two launches conflicted, the later one would
+/// still hold the earlier as an unemitted predecessor and could not be ready.
+///
+/// Launches with no recovered `accesses` conflict with everything (see
+/// `launches_are_independent`), so they pin their own position and act as
+/// ordering barriers. That keeps the pass fail-closed on anything the resource
+/// model could not prove.
+///
+/// Returns the identity order if the schedule cannot be validated, so a failure
+/// degrades to today's behaviour rather than to a reordered tape.
+fn pm4_width_reorder(recorded: &[RecordedHipLaunch], window: usize) -> Vec<usize> {
+    let n = recorded.len();
+    let identity = || (0..n).collect::<Vec<usize>>();
+    if n == 0 || window < 2 {
+        return identity();
+    }
+
+    // Schedule chunk-locally. Launches in different chunks keep their recorded
+    // relative order by construction, so only within-chunk pairs can move and
+    // no launch travels further than `window` positions. That bounds how far
+    // the pass can deviate from the certified sequence, and makes the window a
+    // bisection handle when a reordering turns out not to replay.
+    let mut order = Vec::with_capacity(n);
+    let mut start = 0usize;
+    while start < n {
+        let end = start.saturating_add(window).min(n);
+        let span = end - start;
+
+        // Conflict edges only ever point forward, so the graph is acyclic by
+        // construction and Kahn's algorithm always drains it.
+        let mut successors: Vec<Vec<usize>> = vec![Vec::new(); span];
+        let mut indegree = vec![0usize; span];
+        for i in 0..span {
+            for j in (i + 1)..span {
+                if !launches_are_independent(&recorded[start + i], &recorded[start + j]) {
+                    successors[i].push(j);
+                    indegree[j] += 1;
+                }
+            }
+        }
+
+        let mut scheduled = 0usize;
+        let mut ready: Vec<usize> = (0..span).filter(|index| indegree[*index] == 0).collect();
+        while !ready.is_empty() {
+            // Ascending original index keeps the permutation deterministic, so
+            // the retained tape and its sequence hash reproduce across runs.
+            ready.sort_unstable();
+            let level = std::mem::take(&mut ready);
+            for index in level.iter().copied() {
+                order.push(start + index);
+                scheduled += 1;
+            }
+            for index in level {
+                for successor in successors[index].iter().copied() {
+                    indegree[successor] -= 1;
+                    if indegree[successor] == 0 {
+                        ready.push(successor);
+                    }
+                }
+            }
+        }
+        if scheduled != span {
+            eprintln!(
+                "WARNING: PM4 width reorder drained {scheduled} of {span} launches in chunk \
+                 [{start}, {end}); retaining recorded order"
+            );
+            return identity();
+        }
+        start = end;
+    }
+
+    if order.len() != n {
+        eprintln!(
+            "WARNING: PM4 width reorder produced {} of {} launches; retaining recorded order",
+            order.len(),
+            n
+        );
+        return identity();
+    }
+
+    // Independently verify against the conflict relation over ALL pairs rather
+    // than trusting the scheduler or the chunking argument: every conflicting
+    // pair must keep its recorded relative order.
+    let mut position = vec![usize::MAX; n];
+    for (slot, index) in order.iter().copied().enumerate() {
+        if index >= n || position[index] != usize::MAX {
+            eprintln!("WARNING: PM4 width reorder is not a permutation; retaining recorded order");
+            return identity();
+        }
+        position[index] = slot;
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if !launches_are_independent(&recorded[i], &recorded[j]) && position[i] >= position[j] {
+                eprintln!(
+                    "WARNING: PM4 width reorder violated dependency {i} -> {j}; \
+                     retaining recorded order"
+                );
+                return identity();
+            }
+        }
+    }
+    order
+}
+
+/// Stable FNV-1a over the executed launch sequence, so a reordered tape reports
+/// an execution identity distinct from the recorded `sequence_hash`.
+fn replay_sequence_hash<'a>(launches: impl IntoIterator<Item = &'a RecordedHipLaunch>) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for launch in launches {
+        for byte in launch.kernel.as_bytes().iter().copied().chain([0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for value in launch
+            .grid
+            .iter()
+            .chain(&launch.block)
+            .chain([&launch.shared_mem])
+        {
+            for byte in value.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        match launch.grid_binding {
+            None => {
+                hash ^= 0;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            Some(ReplayGridBinding::PositionCeilDiv {
+                axis,
+                addend,
+                divisor,
+            }) => {
+                hash ^= 1;
+                hash = hash.wrapping_mul(0x100000001b3);
+                for byte in [axis]
+                    .into_iter()
+                    .chain(addend.to_le_bytes())
+                    .chain(divisor.to_le_bytes())
+                {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+    }
+    hash
+}
+
 /// Partition the original HIP stream into ordered phases. Parallel phases are
 /// maximal consecutive pairwise-independent antichains that meet the selected
 /// width floor. Narrow antichains are folded back into the surrounding serial
@@ -2682,6 +2884,35 @@ impl ReplayController {
         }
         let mut dispatch_boundaries = Vec::new();
         let (graph, command_dwords) = if queue_limit == 1 {
+            let recorded = &self.recorded[..prefix];
+            let order = match pm4_single_ib_reorder_from_config(device.name()) {
+                None => (0..prefix).collect::<Vec<_>>(),
+                Some(window) => {
+                    let order = pm4_width_reorder(recorded, window);
+                    let moved = order
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|(slot, index)| *slot != *index)
+                        .count();
+                    let max_displacement = order
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(slot, index)| slot.abs_diff(index))
+                        .max()
+                        .unwrap_or(0);
+                    let sequence_hash =
+                        replay_sequence_hash(order.iter().map(|index| &recorded[*index]));
+                    eprintln!(
+                        "[redline] single-IB reorder(arch={}, window={window}, scheduler=level): \
+                         moved={moved}/{prefix} max_displacement={max_displacement} \
+                         execution_sequence_hash={sequence_hash:016x}",
+                        device.name()
+                    );
+                    order
+                }
+            };
             let mut commands = Pm4Commands::new(
                 pm4_architecture,
                 self.pm4_register_policy,
@@ -2691,10 +2922,10 @@ impl ReplayController {
             );
             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
             let mut resource_frontier = ResourceFrontier::default();
-            for index in 0..prefix {
+            for (position, index) in order.iter().copied().enumerate() {
                 let mut boundary = Pm4DispatchBoundary::default();
-                if index != 0 {
-                    let previous_launch = &self.recorded[index - 1];
+                if position != 0 {
+                    let previous_launch = &self.recorded[order[position - 1]];
                     let current_launch = &self.recorded[index];
                     let previous = previous_launch.kernel.as_str();
                     let current = current_launch.kernel.as_str();
@@ -2747,8 +2978,7 @@ impl ReplayController {
             // Falls back to the host pool with a warning when no device-local
             // pool exists.
             static IB_VMEM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-                hipfire_config::developer_var("HIPFIRE_REDLINE_IB_POOL").as_deref()
-                    == Ok("vmem")
+                hipfire_config::developer_var("HIPFIRE_REDLINE_IB_POOL").as_deref() == Ok("vmem")
             });
             let ib_pool = if *IB_VMEM {
                 match KernargPool::discover_device_local(&device) {
