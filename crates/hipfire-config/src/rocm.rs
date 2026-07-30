@@ -147,9 +147,35 @@ pub fn roots() -> Vec<PathBuf> {
     out
 }
 
-/// The first candidate root that exists on disk.
+/// Does this directory carry the device-compile prerequisites, i.e. is it a
+/// real ROCm root rather than a shim that merely exists?
+///
+/// Some installs keep `/opt/rocm` as a directory holding only version
+/// symlinks (`core`, `core-7`, `core-7.14`) with no `include/`, `lib/` or
+/// `bin/` of its own. Such a path passes `is_dir` but resolves every header
+/// and library lookup to nothing, so existence alone is not a usable test.
+pub fn is_complete_root(path: &Path) -> bool {
+    path.join("include")
+        .join("hip")
+        .join("hip_runtime.h")
+        .is_file()
+}
+
+/// The first candidate root that is actually usable, falling back to the first
+/// that merely exists.
+///
+/// Preferring completeness is what lets rule 6 (`/opt/rocm/core-*`) win on
+/// installs where rule 5 (`/opt/rocm`) is a shim directory. On a conventional
+/// install `/opt/rocm` is complete and is still chosen first, so the ordering
+/// documented above is unchanged for everyone else. The `is_dir` fallback
+/// keeps behaviour identical when nothing validates.
 pub fn root() -> Option<PathBuf> {
-    roots().into_iter().find(|p| p.is_dir())
+    let candidates = roots();
+    candidates
+        .iter()
+        .find(|p| is_complete_root(p))
+        .cloned()
+        .or_else(|| candidates.into_iter().find(|p| p.is_dir()))
 }
 
 /// ROCm version string from `<root>/.info/version`, if readable.
@@ -245,7 +271,11 @@ fn compiler_env_root_from(compiler: &Path, configured: Option<&Path>) -> Option<
         None => {
             // Resolution failed — keep prior semantics: leave an explicit
             // ROCM_PATH alone, otherwise supply the discovered install root.
-            if configured.is_some() { None } else { root() }
+            if configured.is_some() {
+                None
+            } else {
+                root()
+            }
         }
     }
 }
@@ -345,6 +375,37 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["core-7.14", "core-7", "core-6.4"]);
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn is_complete_root_rejects_a_shim_directory() {
+        let tmp = std::env::temp_dir().join(format!("hipfire-rocm-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // A shim root: exists, holds only version symlink targets, no headers.
+        // This is the real layout on installs that keep the tree under
+        // /opt/rocm/core-<ver>.
+        let shim = tmp.join("rocm");
+        std::fs::create_dir_all(shim.join("core-7.14").join("include").join("hip")).unwrap();
+        std::fs::write(
+            shim.join("core-7.14")
+                .join("include")
+                .join("hip")
+                .join("hip_runtime.h"),
+            b"// marker",
+        )
+        .unwrap();
+
+        assert!(
+            !is_complete_root(&shim),
+            "a directory with no include/hip/hip_runtime.h must not count as a root"
+        );
+        assert!(
+            is_complete_root(&shim.join("core-7.14")),
+            "the versioned sibling carrying the headers is the real root"
+        );
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }

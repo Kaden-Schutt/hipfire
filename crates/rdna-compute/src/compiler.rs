@@ -774,11 +774,39 @@ impl KernelCompiler {
         // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
         // fails with "file not found". Add well-known candidates as -I flags;
         // existence-checked so wrong paths on other distros don't leak in.
-        let hip_path = std::env::var("HIP_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
-        for candidate in [
-            format!("{hip_path}/include"),
-            "/opt/rocm/include".to_string(),
-        ] {
+        //
+        // Candidates come from the centralised resolver rather than a bare
+        // HIP_PATH read: installs that keep the real tree in
+        // `/opt/rocm/core-<ver>` leave `/opt/rocm` a shim with no `include/`,
+        // so both of the previously hardcoded candidates miss and NO -I was
+        // emitted at all. `rocm::roots()` enumerates the versioned siblings in
+        // priority order, and the existence check below still gates each one.
+        //
+        // Tell the device compiler where ROCm is rather than relying on its
+        // self-relative probe. That probe needs marker files (`bin/.hipVersion`
+        // and friends) which some installs omit; without them clang reports
+        // "cannot find ROCm device library" and, once headers are supplied by
+        // -I alone, still resolves device math like `rsqrtf` against the host
+        // `/usr/include/math.h` instead of the HIP runtime wrapper. Only a
+        // complete root is passed, so a shim directory can never be handed to
+        // clang as authoritative; on a conventional install this resolves to
+        // the same path clang would have found by itself.
+        if let Some(root) = hipfire_config::rocm::root() {
+            if hipfire_config::rocm::is_complete_root(&root) {
+                let root = root.to_string_lossy();
+                passthrough.push(format!("--rocm-path={root}"));
+                passthrough.push(format!("--hip-path={root}"));
+            }
+        }
+        let mut candidates: Vec<String> = hipfire_config::rocm::roots()
+            .iter()
+            .map(|root| root.join("include").to_string_lossy().into_owned())
+            .collect();
+        if let Ok(hip_path) = std::env::var("HIP_PATH") {
+            candidates.insert(0, format!("{hip_path}/include"));
+        }
+        candidates.push("/opt/rocm/include".to_string());
+        for candidate in candidates {
             if Path::new(&candidate).join("hip/hip_runtime.h").exists() {
                 // Windows hipcc (hipcc.bat) re-tokenises its argv on the inner
                 // clang.exe command line WITHOUT preserving quoting around
