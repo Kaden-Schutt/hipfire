@@ -8,7 +8,15 @@
       "min_vram_gb": 2.0,
       "default_kv_mode": "q8",
       "desc": "386 / 5100 tok/s",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      }
     },
     "qwen3.5:4b": {
       "repo": "schuttdev/hipfire-qwen3.5-4b",
@@ -17,7 +25,41 @@
       "min_vram_gb": 4.1,
       "default_kv_mode": "q8",
       "desc": "169 / 1900 tok/s",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      }
     },
     "qwen3.5:9b": {
       "repo": "schuttdev/hipfire-qwen3.5-9b",
@@ -26,7 +68,41 @@
       "min_vram_gb": 6.8,
       "default_kv_mode": "q8",
       "desc": "125 / 1720 tok/s",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      }
     },
     "qwen3.5:27b": {
       "repo": "schuttdev/hipfire-qwen3.5-27b",
@@ -34,7 +110,41 @@
       "size_gb": 15.0,
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
-      "desc": "45 / 489 tok/s, 16GB+"
+      "desc": "45 / 489 tok/s, 16GB+",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      }
     },
     "qwen3.5:35b-a3b": {
       "repo": "schuttdev/hipfire-qwen3.5-35b-a3b",
@@ -42,7 +152,41 @@
       "size_gb": 19.7,
       "min_vram_gb": 22,
       "default_kv_mode": "q8",
-      "desc": "MoE 35B/3B-active, 115 tok/s"
+      "desc": "MoE 35B/3B-active, 115 tok/s",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      }
     },
     "deepseek-v4-flash": {
       "repo": "nwoolmer/hipfire-deepseek-v4-flash",
