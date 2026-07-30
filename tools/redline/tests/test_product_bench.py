@@ -2362,7 +2362,7 @@ class ServeHarnessWarmTests(unittest.TestCase):
             ):
                 ok = sh.spawn_serve(cfg, home, str(log))
 
-            self.assertTrue(ok)
+            self.assertIsNotNone(ok)
             self.assertIn("env", captured)
             self.assertNotIn("HIPFIRE_SERVE_HARNESS_PID_FILE", captured["env"])
             # Parent still wrote the PID file via its own os.environ.

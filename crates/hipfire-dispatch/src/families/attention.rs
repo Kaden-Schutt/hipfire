@@ -1375,7 +1375,24 @@ fn dispatch_attend(
                     } else {
                         8192
                     };
-                if io.max_ctx_len <= crossover {
+                // PR #554 (gfx12 M4 Q8 KV reuse): when the M4 tile is eligible the
+                // single-pass LDS kernel is skipped REGARDLESS of context, i.e. the
+                // crossover above is bypassed, not retuned. The three gates are
+                // arch-disjoint by construction: #553's WMMA path requires gfx11,
+                // `q8_prefill_m4_eligible` requires gfx12, and the crossover governs
+                // whatever both decline.
+                let use_m4 = io.flash_partials.is_some_and(|partials| {
+                    rdna_compute::attention::q8_prefill_m4_eligible(
+                        &gpu.arch,
+                        io.n_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                        partials.numel(),
+                        io.tree_bias.is_some(),
+                    )
+                });
+                if io.max_ctx_len <= crossover && !use_m4 {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_q8_0_kv_batched_masked(
