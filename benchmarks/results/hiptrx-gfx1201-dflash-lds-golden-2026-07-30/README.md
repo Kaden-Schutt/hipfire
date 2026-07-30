@@ -65,4 +65,15 @@ leave both objects in `$CWD/.hipfire_kernels/gfx1201/` (not under `HOME`) —
   hipGraph capture `max_ctx_len` is baked as `kv_cache.physical_cap` to size the
   attention LDS for the worst case.
 
-Raw logs: `ldson_r{1,2,3}.log`, `ldsoff_r{1,2,3}.log` (unedited stdout+stderr).
+## Raw logs
+
+Not committed: `benchmarks/results/RETENTION.md` excludes `**/*.log` as raw,
+noisy, non-reproducible context, and `.gitignore:123` enforces it. Every
+per-rep number from those logs is reproduced in the table above, so this file
+is the distilled record the policy asks for.
+
+The unedited stdout+stderr is retained on hiptrx under
+`~/ctx2048-golden-dflash-ldson-m4off-2026-07-30/r{1,2,3}.log` and
+`~/ctx2048-golden-dflash-ldsoff-m4off-2026-07-30/r{1,2,3}.log`, alongside the
+ctx-4096 grid, the boundary sweep, and the route-rule acceptance test. The
+`Reproduce` section above regenerates them from scratch.
