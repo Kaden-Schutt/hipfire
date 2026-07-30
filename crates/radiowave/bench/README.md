@@ -14,6 +14,12 @@ comparison because their WMMA register layouts and devices differ.
 `nominal_operand_gbps` is input bytes divided by kernel time, not a hardware
 HBM counter.
 
+`Relative to matching FP16` is computed as `FP16-control median / OCP median`,
+so values above 1.0 mean that the OCP-input recipe is faster. The gfx11 FP16
+control is not a previous OCP backend: it consumes operands predecoded to FP16
+and calls the native gfx11 FP16 WMMA builtin. The new gfx11 OCP recipes instead
+decode FP8 bytes inside the kernel before calling that same FP16 WMMA builtin.
+
 ## Correctness
 
 Inputs are deterministic finite E4M3 or E5M2 values. Before reporting timing,
