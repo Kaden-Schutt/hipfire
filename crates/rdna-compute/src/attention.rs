@@ -154,6 +154,41 @@ fn q8_prefill_m4_min_ctx() -> usize {
     })
 }
 
+/// Whether DFlash speculative decode is driving this process.
+///
+/// Set by `spec_step_dflash` — the entry both halves of the DFlash policy
+/// funnel through (`dflash_spec.rs`, serve; `dflash_spec_demo.rs`, bench).
+/// Consulted by [`q8_prefill_m4_eligible`] to disable the four-query tile on
+/// the spec route unconditionally.
+///
+/// MEASURED 2026-07-30, gfx1201 R9700, pinned 3.6-27B trunk `86a5f80f…`,
+/// 27B DFlash golden run, 6 reps per cell, within-cell spreads <= 0.46%:
+///   M4 on  -> 241.86 tok/s (LDS off) / 262.23 (LDS on)
+///   M4 off -> 251.97 tok/s (LDS off) / 273.55 (LDS on)
+/// The tile COSTS 4.01% / 4.14% on spec decode. On AR prefill the same tile
+/// WINS: crossover ~1024, +1.9% at pp 2048 rising to a +4.5-4.9% plateau from
+/// pp 4096 (3 GPUs, A/B/B/A, agreeing to +-0.0006). ROUTE is the separator,
+/// not context — hence a route flag rather than a higher ctx floor.
+///
+/// A ctx floor cannot substitute for this. Under hipGraph capture
+/// `qwen35.rs` bakes `max_ctx_len = kv_cache.physical_cap` so the attention
+/// kernel's LDS is sized for the worst case; any load whose physical cap
+/// clears the floor therefore still admits the tile into verify, and
+/// `HIPFIRE_VERIFY_GRAPH` is default-on, so that is the common case rather
+/// than a corner.
+static DFLASH_SPEC_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the DFlash spec-decode route active for the remainder of the process.
+pub fn set_dflash_spec_active(active: bool) {
+    DFLASH_SPEC_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True once DFlash spec decode has run in this process.
+pub fn dflash_spec_active() -> bool {
+    DFLASH_SPEC_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn q8_prefill_m4_eligible(
     arch: &str,
     n_heads: usize,
@@ -171,6 +206,7 @@ pub fn q8_prefill_m4_eligible(
         0
     };
     q8_prefill_m4_enabled()
+        && !dflash_spec_active()
         && arch.starts_with("gfx12")
         && !tree_mode
         && batch_size % 4 == 0

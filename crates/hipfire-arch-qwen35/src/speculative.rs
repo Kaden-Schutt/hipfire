@@ -2890,6 +2890,15 @@ pub fn spec_step_dflash(
     repeat_penalty: f32,
     repeat_window: usize,
 ) -> HipResult<SpecStepResult> {
+    // Route marker for the four-query Q8 prefill tile (#554). Verify is a
+    // prefill-batch forward with no tree bias, so it satisfies every shape
+    // condition the tile gates on and gets admitted into spec decode, where it
+    // MEASURED -4.01% / -4.14% on the 27B golden run. A context floor cannot
+    // exclude it: under graph capture `max_ctx_len` is the physical cap, not
+    // the live length. The tile still WINS 1.9-4.9% on AR prefill, so the
+    // separator is the route, and this is where both halves of the DFlash
+    // policy (serve + bench) meet.
+    rdna_compute::attention::set_dflash_spec_active(true);
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
     // doing adaptive-B based on rolling τ can shrink to save per-iter cost.
