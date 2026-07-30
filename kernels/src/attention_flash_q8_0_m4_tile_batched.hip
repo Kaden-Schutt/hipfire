@@ -90,17 +90,34 @@ __global__ void attention_flash_q8_0_m4_tile_batched(
     extern __shared__ float sdata[];
     float (*scores)[TILE_SIZE] = (float (*)[TILE_SIZE])sdata;
 
+    // Hoisted per-thread block indices. d0 = tid * dpt with dpt in {4,8} and
+    // head_dim a multiple of 32, so d0 .. d0+dpt-1 never straddles a 32-quant
+    // block: bi and the byte offset are loop-invariant, and the dpt quants this
+    // thread needs are CONTIGUOUS. That makes the per-element scale reload and
+    // the per-element byte load both removable (the same hoist+widen applied to
+    // attention_flash_q8_0_tile_batched: 16 VMEM/lane/row -> 2). Bit-exact:
+    // identical values in identical accumulation order, only the load shape
+    // changes.
+    const int bi0 = d0 / 32;
+    const int bj0 = d0 % 32;
+    const size_t kb_base = (size_t)(kv_head_blk + bi0) * 34;
+    const bool wide8 = (dpt == 8);
+
     for (int t_local = 0; t_local < max_tile_len; t_local++) {
         const int t = tile_start + t_local;
+        const unsigned char* kb = k_cache + (size_t)t * row_stride + kb_base;
+        const float ks = (float)*((const _Float16*)kb);   // ONE scale load per row
+        unsigned long long packed = 0;                     // ONE widened quant load
+        if (wide8) {
+            __builtin_memcpy(&packed, kb + 2 + bj0, 8);
+        } else {
+            unsigned int p4;
+            __builtin_memcpy(&p4, kb + 2 + bj0, 4);
+            packed = p4;
+        }
         float dot[BLOCK_M] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int i = 0; i < dpt; i++) {
-            const int d = d0 + i;
-            const int bi = d / 32;
-            const int bj = d % 32;
-            const unsigned char* kb =
-                k_cache + (size_t)t * row_stride + (kv_head_blk + bi) * 34;
-            const float ks = (float)*((const _Float16*)kb);
-            const float kval = ks * (float)((signed char)kb[2 + bj]);
+            const float kval = ks * (float)((signed char)((packed >> (8 * i)) & 0xFFull));
 #pragma unroll
             for (int m = 0; m < BLOCK_M; m++) {
                 dot[m] += mq[m][i] * kval;
@@ -142,14 +159,20 @@ __global__ void attention_flash_q8_0_m4_tile_batched(
     float out_vec[BLOCK_M][8] = {};
     for (int t_local = 0; t_local < max_tile_len; t_local++) {
         const int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * row_stride;
+        // Same hoist+widen as the K loop above: one scale load and one widened
+        // quant load per row instead of one of each per element.
+        const unsigned char* vbh = v_cache + (size_t)t * row_stride + kb_base;
+        const float vs = (float)*((const _Float16*)vbh);
+        unsigned long long vpacked = 0;
+        if (wide8) {
+            __builtin_memcpy(&vpacked, vbh + 2 + bj0, 8);
+        } else {
+            unsigned int p4;
+            __builtin_memcpy(&p4, vbh + 2 + bj0, 4);
+            vpacked = p4;
+        }
         for (int i = 0; i < dpt; i++) {
-            const int d = d0 + i;
-            const int bi = d / 32;
-            const int bj = d % 32;
-            const unsigned char* vbh = vb + (kv_head_blk + bi) * 34;
-            const float vs = (float)*((const _Float16*)vbh);
-            const float vval = vs * (float)((signed char)vbh[2 + bj]);
+            const float vval = vs * (float)((signed char)((vpacked >> (8 * i)) & 0xFFull));
 #pragma unroll
             for (int m = 0; m < BLOCK_M; m++) {
                 if (t_local < tile_len[m])

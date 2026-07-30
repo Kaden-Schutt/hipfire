@@ -101,12 +101,56 @@ fn wmma_fa_min_batch() -> usize {
     })
 }
 
-/// Experimental four-query Q8 prefill tile. Default-off while the KV-sharing
-/// layout is being validated across the supported architecture matrix.
+/// Four-query Q8 prefill tile (PR #554), with the hoist+widen ported into its K
+/// and V loops. DEFAULT-ON — `q8_prefill_m4_eligible` already restricts it to
+/// gfx12, causal non-tree prefill, head_dim 128/256, M4-aligned batch, sufficient
+/// partial capacity, and `>= q8_prefill_m4_min_ctx()`; this switch only decides
+/// whether that gate is consulted at all. `HIPFIRE_Q8_PREFILL_M4=0` forces off.
+///
+/// MEASURED 2026-07-30, gfx1201 R9700, pinned 3.6-27B trunk `86a5f80f…`,
+/// `bench --matrix` A/B/B/A runs 3 warmups 10, spreads 0.08-0.13%:
+///   pp 4096 1.0486x | 8192 1.0496x | 16384 1.0639x | 20480 1.0698x
+/// The win GROWS with context. Submitted-as-is it LOST at every point
+/// (0.9925 / 0.9563 / 0.9246 / 0.9153) because its per-element scale reload and
+/// scalar byte load competed with the shipped tiled-kernel hoist; the two axes are
+/// orthogonal (reuse across queries, widening across dims), so composing them wins
+/// where picking one did not. The port is bit-exact vs the unhoisted tile
+/// (byte-identical decoded text), so default-on adds no quality risk.
 pub fn q8_prefill_m4_enabled() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_M4").map_or(false, |v| v == "1")
+        !matches!(
+            hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_M4")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
+    })
+}
+
+/// Context floor for the four-query tile. MEASURED 2026-07-30 on gfx1201 (R9700,
+/// pinned 3.6-27B trunk, serve harness, DFlash on): with no floor the tile is
+/// admitted by LINEAR DFlash verify — which carries no tree bias and is a causal
+/// Q8 batched prefill call at B=16 / head_dim 256, so it satisfies every other
+/// condition — and there it COSTS 5.9% (96.3 -> 90.65 tok/s). Proof it was
+/// actually running in verify: per-turn tau moved (2.24 -> 2.20, 1.20 -> 1.18,
+/// 1.45 -> 1.32), and tau is an acceptance count, not a timing artefact.
+///
+/// Cause is regime, not correctness: the tile pays for global partials plus a
+/// separate reduce launch, which the single-pass LDS kernel avoids, so at verify
+/// contexts (tens of tokens, one tile) the overhead dominates. Same reason
+/// `HIPFIRE_FLASH_PREFILL_MIN_CTX` exists for the gfx11 flash kernel.
+///
+/// 1024 is provisional: it cleanly separates the verify regime from bulk prefill
+/// without touching any measured prefill point. Set from a crossover sweep once
+/// the hoisted tile is characterised.
+fn q8_prefill_m4_min_ctx() -> usize {
+    static GATE: OnceLock<usize> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_M4_MIN_CTX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1024)
     })
 }
 
@@ -132,6 +176,7 @@ pub fn q8_prefill_m4_eligible(
         && batch_size % 4 == 0
         && matches!(head_dim, 128 | 256)
         && partial_rows >= 4
+        && max_ctx_len >= q8_prefill_m4_min_ctx()
 }
 
 impl Gpu {
